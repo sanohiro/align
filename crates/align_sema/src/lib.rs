@@ -1170,6 +1170,77 @@ fn canonical_type_name(
     }
 }
 
+// --- pub-interface exposure check (M15 S1b) --------------------------------------------------
+//
+// A `pub` item's signature must name only `pub` types: a private type reachable from a module's
+// public interface would be summarized by NAME only in the interface summary (S1a), so a change to
+// its layout would not flip the unit's interface hash → a stale-object miscompile once summaries are
+// consumed (S1b). Every `Type` reachable from a `pub` fn's params/return, a `pub` struct's fields,
+// or a `pub` sum type's payloads is walked here; any same-module user type it names must be `pub`.
+//
+// Cross-module `mod.Type` access already requires the target `pub` (see `canonical_type_name`), so
+// this check only enforces same-module visibility; generic args of a qualified type are still walked
+// (they may name a same-module private type). Type-parameter names (`T`) resolve to `Ty::Param`, not
+// real types, so they are exempt. Builtins/primitives are never in `type_table`, so they are skipped.
+
+/// The constant context of one exposure walk: the module the `pub` item lives in, the type table, the
+/// enclosing item's type-parameter names (exempt — they are `Ty::Param`, not real types), and the
+/// item / position labels for the diagnostic. Held once and threaded through the recursion.
+struct ExposureCtx<'a> {
+    cur_module: &'a str,
+    type_table: &'a ModTypes,
+    type_params: &'a std::collections::HashSet<&'a str>,
+    item_kind: &'a str,
+    item_name: &'a str,
+    position: &'a str,
+}
+
+/// Recursively verify that every same-module user type named in `ty` (a type reachable from a `pub`
+/// item's signature) is itself `pub`. This walks EVERY `ast::Type` constructor (`Named`/`Tuple`/`Fn`)
+/// exhaustively — no wildcard — so nested exposure (`Option<array<Secret>>`, `fn(Secret) -> ()`,
+/// `(i64, Secret)`) is caught. Emits a diagnostic (never panics) per violation.
+fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics) {
+    match ty {
+        ast::Type::Named { path, args, span } => {
+            if path.segments.len() == 1 {
+                let bare = path.segments[0].name.as_str();
+                // A type-parameter name is `Ty::Param`, not a real type — never an exposure. Only
+                // same-module user types live in `type_table[cur_module]`; a builtin (`i32`, `array`,
+                // `Option`, `str`, `vec4`, …), the reserved `Error` / `argon2_params`, or an unknown
+                // name is absent → skipped (unknowns are reported by the resolution passes, not here).
+                let is_private_user_type = !cx.type_params.contains(bare)
+                    && cx.type_table.get(cx.cur_module).and_then(|m| m.get(bare)).is_some_and(|e| !e.is_pub);
+                if is_private_user_type {
+                    let (kind, name, position) = (cx.item_kind, cx.item_name, cx.position);
+                    diags.error(
+                        format!(
+                            "pub {kind} '{name}' exposes private type '{bare}' in {position} \
+                             (a type reachable from a module's public interface must itself be pub)"
+                        ),
+                        *span,
+                    );
+                }
+            }
+            // A qualified `mod.Type` is already `pub`-checked by cross-module access; still walk its
+            // generic arguments — they may name a same-module private type (`mod.Wrapper<Secret>`).
+            for a in args {
+                check_type_exposure(a, cx, diags);
+            }
+        }
+        ast::Type::Tuple { elems, .. } => {
+            for e in elems {
+                check_type_exposure(e, cx, diags);
+            }
+        }
+        ast::Type::Fn { params, ret, .. } => {
+            for p in params {
+                check_type_exposure(p, cx, diags);
+            }
+            check_type_exposure(ret, cx, diags);
+        }
+    }
+}
+
 // --- top-level constants ---------------------------------------------------------------------
 //
 // A top-level `NAME := expr` is a **compile-time constant**: it is evaluated to a scalar / string
@@ -1632,6 +1703,73 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 }
                 ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
                 ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => unreachable!(),
+            }
+        }
+    }
+
+    // Pass 0a-2 (M15 S1b): a `pub` item's signature may name only `pub` types — a private type must
+    // not leak through a public interface (the interface summary would name it without its
+    // definition, so its layout change could not flip the unit's interface hash). `type_table` is now
+    // complete, so a same-module bare type name can be classified as user/pub. `pub const`s are NOT
+    // walked: a constant's type is restricted to a scalar / `str` (Pass 0d), never a user type, so it
+    // can never expose one. `extern` fns take FFI-safe scalars only (validated in Pass 1), likewise.
+    for m in modules {
+        for item in &m.file.items {
+            match item {
+                ast::Item::Fn(f) if matches!(f.vis, ast::Vis::Pub) => {
+                    let tps: std::collections::HashSet<&str> =
+                        f.type_params.iter().map(|t| t.name.name.as_str()).collect();
+                    let base = ExposureCtx {
+                        cur_module: &m.path,
+                        type_table: &type_table,
+                        type_params: &tps,
+                        item_kind: "fn",
+                        item_name: &f.name.name,
+                        position: "its parameter type",
+                    };
+                    for p in &f.params {
+                        check_type_exposure(&p.ty, &base, diags);
+                    }
+                    if let Some(ret) = &f.ret {
+                        let ctx = ExposureCtx { position: "its return type", ..base };
+                        check_type_exposure(ret, &ctx, diags);
+                    }
+                }
+                ast::Item::Struct(s) if matches!(s.vis, ast::Vis::Pub) => {
+                    let tps: std::collections::HashSet<&str> =
+                        s.type_params.iter().map(|t| t.name.name.as_str()).collect();
+                    for fld in &s.fields {
+                        let position = format!("field '{}'", fld.name.name);
+                        let ctx = ExposureCtx {
+                            cur_module: &m.path,
+                            type_table: &type_table,
+                            type_params: &tps,
+                            item_kind: "struct",
+                            item_name: &s.name.name,
+                            position: &position,
+                        };
+                        check_type_exposure(&fld.ty, &ctx, diags);
+                    }
+                }
+                ast::Item::Enum(e) if matches!(e.vis, ast::Vis::Pub) => {
+                    let tps: std::collections::HashSet<&str> =
+                        e.type_params.iter().map(|t| t.name.name.as_str()).collect();
+                    for v in &e.variants {
+                        let position = format!("the payload of variant '{}'", v.name.name);
+                        for pt in &v.payload {
+                            let ctx = ExposureCtx {
+                                cur_module: &m.path,
+                                type_table: &type_table,
+                                type_params: &tps,
+                                item_kind: "sum type",
+                                item_name: &e.name.name,
+                                position: &position,
+                            };
+                            check_type_exposure(pt, &ctx, diags);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }

@@ -33,13 +33,17 @@
 //!   unit base falls back to the entry unit (conservative — the entry unit always links). Stored as
 //!   data; **not** folded into `interface_hash` (capabilities are a link-summary concern, doc-10 §6.4).
 //!
-//! ## Known finding (out of S1a scope — do NOT fix here)
+//! ## Interface self-containment (S1b, ENFORCED)
 //!
-//! Sema does **not** reject a `pub` fn whose signature references a NON-`pub` type (verified: a `pub
-//! fn make() -> Secret` over a private `Secret` type-checks and its cross-module caller binds the
-//! value). The M15 completeness argument assumes this is rejected. Until it is, such a summary names
-//! the private type in the signature but does **not** carry its definition (the interface is not
-//! self-contained in that case). Recorded, not worked around.
+//! Sema rejects a `pub` item whose signature references a NON-`pub` type — a `pub fn`'s params /
+//! return, a `pub` struct's fields, and a `pub` sum type's payloads may name only `pub` types (a
+//! `pub const`'s type is scalar / `str`-only, so it can never name a user type). This is the M15
+//! completeness invariant: a private type reachable from the public interface would be named in a
+//! summary WITHOUT its definition, so its layout change could not flip the unit's `interface_hash`
+//! (a stale-object miscompile once summaries are consumed). With the rejection in place, every type
+//! named in an interface summary is `pub` and therefore carried with its full definition — the
+//! interface is self-contained. Enforced in `align_sema` (Pass 0a-2); see
+//! `crates/align_driver/tests/pub_exposure.rs`.
 
 mod codec;
 mod hash;
