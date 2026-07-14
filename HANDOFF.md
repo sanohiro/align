@@ -8,8 +8,18 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (later the same day), **M15 separate-compilation design SETTLED by
-the owner-mandated two-lens review** (language/soundness + driver/artifacts/cache lenses run in
+_Last updated: 2026-07-14 (third update this day), **M15 S0 SHIPPED — cyclic imports are now a
+hard error, MERGED as #444** (workspace **1945 green** + clippy clean; gemini's one medium —
+`&'a str`-borrowing DFS maps, zero per-node allocations — applied pre-merge). `check()` records
+every import edge independently of the `seen` dedup, then a white/grey/black DFS from the entry
+module reports the first cycle (direct/transitive/self-import) with the full path at the
+closing edge's span; **diamond reconvergence stays legal** (Black ≠ Grey — pinned by a
+build-and-run positive control); sema still runs after the diagnostic (accumulate contract).
+`draft.md` §17 has the DAG paragraph (settled wording), `docs/language-spec.md` mirrors it in
+one sentence. **Next M15 step = S1 (interface summary: canonical serialization + interface/impl
+hashes + per-unit sema against imported summaries — effect bits, type defs, template ASTs; per
+the roadmap slice plan).** Previous update: 2026-07-14 (earlier), **M15 separate-compilation
+design SETTLED by the owner-mandated two-lens review** (language/soundness + driver/artifacts/cache lenses run in
 parallel, integrated; full settlement + S0–SV slice plan recorded in the roadmap M15 section =
 the implementation source of truth; open-questions item updated in place). Headline soundness
 result: **the unit interface is COMPLETE** — escape/region is already body-blind (no hidden
@@ -600,9 +610,9 @@ manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targ
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
 Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
 Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
-paragraph): (a) **M15 implementation, starting at S0** (cyclic-import hard error + `draft.md`
-§17) **then S1** (interface summary + hashes) — the settled slice plan S0–SV is in the roadmap
-M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+paragraph): (a) **M15 implementation, S1 next** (S0 cyclic-imports SHIPPED as #444; S1 =
+interface summary + interface/impl hashes + per-unit sema against imported summaries) — the
+settled slice plan S0–SV is in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
 lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth

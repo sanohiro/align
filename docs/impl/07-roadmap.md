@@ -2590,7 +2590,8 @@ it can. Consistent with the owner rubric: the goal was chosen deliberately, and 
 does not block the optimizer's return.
 
 **M15 slice plan:** **S0** cyclic-import hard error + `draft.md` §17 no-cycles rule (tiny,
-shared prerequisite). **S1** interface summary — canonical serialization (no map-iteration
+shared prerequisite) — **SHIPPED 2026-07-14 as #444** (white/grey/black DFS over
+dedup-independent import edges; diamond reconvergence pinned legal; 5 tests, 1945 green). **S1** interface summary — canonical serialization (no map-iteration
 order, no process-local ids) + interface/impl hashes + per-unit sema against imported
 summaries (effect bits, type defs, template ASTs). **S2** per-unit codegen + N-object link
 (visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
