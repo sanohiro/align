@@ -401,7 +401,10 @@ fn partition_capabilities(
     let owning_unit = |fn_name: &str| -> Option<&String> {
         let mut best: Option<(&String, usize)> = None;
         for (base, unit) in &base_to_unit {
-            let matches = fn_name == base || fn_name.starts_with(&format!("{base}$"));
+            let matches = fn_name == base
+                || (fn_name.len() > base.len()
+                    && fn_name.starts_with(base.as_str())
+                    && fn_name.as_bytes()[base.len()] == b'$');
             if matches && best.is_none_or(|(_, len)| base.len() > len) {
                 best = Some((unit, base.len()));
             }
