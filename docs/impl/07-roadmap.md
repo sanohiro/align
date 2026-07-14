@@ -2394,6 +2394,30 @@ cheaper lever. PGO/BOLT sequencing unchanged.
   triple/datalayout mismatch on `link_in_module` (clear the `.bc` module's triple/datalayout
   before linking if LLVM objects).
 
+**M14 Slice 2 SHIPPED (2026-07-14, #443).** Implemented exactly per the settlement above; all
+seven gates landed (`crates/align_driver/tests/rt_lto.rs`, 9 tests incl. the gate-review
+additions). End-to-end through the real driver: **`eq_count` 2.95× under `--rt-lto`**
+(identical hit counts ON/OFF), numeric control 1.01×, compile-time delta **+2 ms**
+(bound ≤ ~100 ms), flag-off objects proven byte-identical to pre-change main, `bench/rt_lto/`
+records the numbers, `bench/binary_size` unaffected. Mutation teeth verified both directions
+twice (implementer + independent adversarial gate; gate verdict SHIP, zero confirmed defects).
+Three recorded deviations from the settlement, all verified: (a) inkwell 0.9's
+`MemoryBuffer::create_from_memory_range[_copy]` asserts a trailing nul and passes `len-1` to
+LLVM — a raw `include_bytes!` slice would lose its last bitcode byte, so the parse path
+nul-appends into a temp `Vec` (confirmed against inkwell source); (b) `-Cpanic=abort` on the
+artifact compile drops `rust_eh_personality`, leaving `bcmp` the sole undefined symbol;
+(c) `emit-llvm --stage raw --rt-lto` also links (the pre-opt lens gate 4 needs). Gate
+follow-ups shipped in the same PR: the unparseable-bitcode fallback + re-annotation is
+regression-pinned (drives `emit_llvm_ir` with garbage bytes through the public `Option` seam),
+the dev-profile/non-build-verb rejections have negative CLI tests, and the datalayout
+force-overwrite became a fail-loud guard (mismatch → loud diagnostic + fallback + re-annotate;
+today's layouts are identical so no current-path change). gemini review reflected pre-merge
+(3/3 applied: `--target $TARGET` on the build.rs bitcode compile for cross-compiled alignc;
+portable `now_ms()` replacing GNU `date +%s%N` in `bench/rt_lto`; underscore-tolerant symbol
+matching in the `.bc` pin). Still parked on this slice: the **per-target-cpu runtime variant +
+cache key** (the `hash64` native-tuning lever, deferred with the doc-10 §2 key spec) and
+`utf8_valid` behind its own ≥ 1.15× bench.
+
 **PGO stays sequenced after — do NOT reorder it ahead on "LTO is thin" grounds:** its
 block-layout/hot-cold-split win is already MOOT per M13 Slice V (`noreturn` attrs make fail
 edges cold; a real `!prof` prototype was byte-identical and reverted); instrument PGO is

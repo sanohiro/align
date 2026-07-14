@@ -8,7 +8,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **M14 Slice 1 (LTO ceiling probe) DONE — ABOVE GATE, proceed to
+_Last updated: 2026-07-14, **M14 Slice 2 (runtime-bitcode LTO) SHIPPED — MERGED as #443**
+(design settled the same day by a two-lens review — soundness + build-integration — recorded
+as "M14 Slice 2 design SETTLED" + "M14 Slice 2 SHIPPED" in the roadmap M14 section; adversarial
+gate verdict SHIP with zero confirmed defects; gemini 3/3 findings applied pre-merge; workspace
+**1940 green** + clippy clean). Mechanism: the four memcmp-class primitives
+(`str_eq`/`starts_with`/`ends_with`/`eq_ignore_case`) + their sole callee `safe_slice` extracted
+verbatim to `align_runtime/src/str_prims.rs` (ONE source, compiled twice), compiled standalone to
+a minimal `.bc` by the new `align_driver/build.rs` (`rustc --emit=llvm-bc -O -Ccodegen-units=1
+-Cpanic=abort --target $TARGET`) and **baked into `alignc` via `include_bytes!`** — the staleness
+question dissolved (same `cargo build` regenerates it, same rustc = no LLVM-major skew). Opt-in
+**`--rt-lto`** (valid on build/run/emit-obj/size/emit-llvm; diagnostic-rejected on
+dev/small/tiny + non-build verbs, both negative-tested) parses it from memory, links into the
+RAW module, sheds exactly the guarded `rt_contract` attrs (attr-xor pinned:
+`(has body) != (carries curated attrs)`), `mark_internal`s the merged bodies directly (export
+roots untouched by construction), then runs the ONE existing opt pipeline — never a second
+(the probe's double-opt is what regressed `str_cmp`). **`str_cmp` exclusion is STRUCTURAL** —
+its body never exists in the artifact (defined symbols in the `.bc` == the guarded four,
+undefined == {bcmp}, pinned). Numbers through the REAL driver: **`eq_count` 2.95× under
+`--rt-lto`** (identical hit counts), numeric control 1.01×, **compile-time +2 ms**, flag-off
+objects **byte-identical** to pre-change main; `bench/rt_lto/` records them. Mutation teeth
+verified both directions TWICE (implementer + independent gate). Fail-loud paths pinned:
+unparseable-bitcode fallback re-annotates the guarded declares (regression test through the
+public `Option<&[u8]>` seam), and datalayout mismatch is a loud fallback, never a
+force-overwrite. Three recorded deviations, all source-verified: inkwell 0.9's
+`MemoryBuffer::create_from_memory_range[_copy]` asserts a trailing nul and passes `len-1` (a
+raw `include_bytes!` slice would silently lose the last bitcode byte → nul-append shim);
+`-Cpanic=abort` drops `rust_eh_personality`; `emit-llvm --stage raw --rt-lto` also links (the
+pre-opt attr-xor lens). Parked on this slice with records: the per-target-cpu runtime variant
++ cache key (the `hash64` native-tuning lever) and `utf8_valid` behind its own ≥ 1.15× bench.
+Previous update: 2026-07-13, **M14 Slice 1 (LTO ceiling probe) DONE — ABOVE GATE, proceed to
 Slice 2** (full record + tables in the roadmap M14 section, commit `52ecfb1`) **and the
 `bench/binary_size` portability port MERGED as #442** — Codex-audit item 2 is now closed in
 full. Probe verdict (median of 7, 1M short strings, znver3): **`str_eq` 2.12× native / 2.35×
@@ -546,12 +575,13 @@ is pinned unchanged by construction; the owed Linux full-suite re-verification i
 manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
 -D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
-Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, and the M14 LTO probe are all
-DONE 2026-07-13 — see the _Last updated_ paragraph): (a) **M14 Slice 2** — runtime-bitcode LTO
-for the inlinable string primitives, per-symbol guarded per the probe verdict (source of truth =
-the roadmap M14 section incl. the probe record; probe scaffolding was left in the 2026-07-13
-session scratchpad, rebuild it if gone); (b) **M15 separate-compilation two-lens design review**
-(owner-mandated; sequenced after the probe verdict, which is now in); (c) cache-first C0
+Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, AND M14
+Slice 2 `--rt-lto` #443 are all DONE — see the _Last updated_ paragraph): (a) **M15
+separate-compilation two-lens design review** (owner-mandated; sequenced after the probe
+verdict, which is in — the natural next big item; design-question list in the roadmap M15
+section; NOTE the new `--rt-lto` merge machinery is the ThinLTO substrate M15 item 5 refers
+to); (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning lever
+parked on Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
 `docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (d)
