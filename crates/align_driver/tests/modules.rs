@@ -302,3 +302,85 @@ fn a_module_using_a_builtin_must_import_it() {
     let main = "module main\nimport geom\nfn main() -> i32 = 0\n";
     assert!(check_multi_errs("mod-cap", &[("geom.align", geom), ("main.align", main)], "main.align"));
 }
+
+// --- M15 S0: the module import graph must be a DAG (`draft.md` §17) ---------------------------
+
+#[test]
+fn a_direct_two_module_cycle_is_a_compile_error() {
+    // `util.a` imports `util.b`, `util.b` imports `util.a` back: a direct cycle, named in full in
+    // the diagnostic (the `draft.md` §17 example wording).
+    let a = "module util.a\nimport util.b\n";
+    let b = "module util.b\nimport util.a\n";
+    let main = "module main\nimport util.a\nfn main() -> i32 = 0\n";
+    let out = check_multi_diagnostics(
+        "mod-cycle-direct",
+        &[("util/a.align", a), ("util/b.align", b), ("main.align", main)],
+        "main.align",
+    );
+    assert!(out.contains("cyclic import"), "expected a cyclic-import error:\n{out}");
+    assert!(out.contains("util.a"), "the cycle message must name util.a:\n{out}");
+    assert!(out.contains("util.b"), "the cycle message must name util.b:\n{out}");
+}
+
+#[test]
+fn a_transitive_three_module_cycle_names_the_full_path() {
+    // `a` -> `b` -> `c` -> `a`: a transitive cycle, not adjacent in the source.
+    let a = "module a\nimport b\n";
+    let b = "module b\nimport c\n";
+    let c = "module c\nimport a\n";
+    let main = "module main\nimport a\nfn main() -> i32 = 0\n";
+    let out = check_multi_diagnostics(
+        "mod-cycle-transitive",
+        &[("a.align", a), ("b.align", b), ("c.align", c), ("main.align", main)],
+        "main.align",
+    );
+    assert!(out.contains("cyclic import"), "expected a cyclic-import error:\n{out}");
+    assert!(out.contains("a -> b -> c -> a"), "expected the full cycle path a -> b -> c -> a:\n{out}");
+}
+
+#[test]
+fn a_module_importing_itself_is_a_compile_error() {
+    let a = "module a\nimport a\n";
+    let main = "module main\nimport a\nfn main() -> i32 = 0\n";
+    let out = check_multi_diagnostics("mod-cycle-self", &[("a.align", a), ("main.align", main)], "main.align");
+    assert!(out.contains("cyclic import"), "expected a cyclic-import error:\n{out}");
+    assert!(out.contains("a -> a"), "expected the self-import path a -> a:\n{out}");
+}
+
+#[test]
+fn a_diamond_import_is_not_a_cycle() {
+    if !backend_available() {
+        return;
+    }
+    // `main` imports `b` and `c`; both import `d`. A DAG, not a cycle: the shared dependency
+    // reconverges but is never re-entered while still open on the DFS path (the `seen` dedup
+    // already handled loading `d` once; this is the positive control for the cycle check itself).
+    let d = "module d\npub fn base() -> i64 = 10\n";
+    let b = "module b\nimport d\npub fn get() -> i64 = d.base() + 1\n";
+    let c = "module c\nimport d\npub fn get() -> i64 = d.base() + 2\n";
+    let main = "module main\nimport b\nimport c\nfn main() -> i32 = (b.get() + c.get()) as i32\n";
+    let out = build_and_run_multi(
+        "mod-diamond-ok",
+        &[("d.align", d), ("b.align", b), ("c.align", c), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(23)); // (10 + 1) + (10 + 2)
+}
+
+#[test]
+fn a_straight_import_chain_is_not_a_cycle() {
+    if !backend_available() {
+        return;
+    }
+    // `main` imports `a` -> `b` -> `c`, a straight chain with no reconvergence at all.
+    let c = "module c\npub fn get() -> i64 = 40\n";
+    let b = "module b\nimport c\npub fn get() -> i64 = c.get() + 1\n";
+    let a = "module a\nimport b\npub fn get() -> i64 = b.get() + 1\n";
+    let main = "module main\nimport a\nfn main() -> i32 = a.get() as i32\n";
+    let out = build_and_run_multi(
+        "mod-chain-ok",
+        &[("a.align", a), ("b.align", b), ("c.align", c), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(42));
+}

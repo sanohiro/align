@@ -419,7 +419,8 @@ functions and types with `pub`; `import geom` resolves by filename to `geom.alig
 directory (nested `import util.math` → `util/math.align`). A cross-module reference is qualified —
 `geom.area(...)` for a function, `geom.Point` for a type — reaching only `pub` members; a bare name
 resolves within the calling module (an imported type must be qualified). Each module has its own
-function and type namespace, so two modules may reuse a name. (Constructing an imported sum type's
+function and type namespace, so two modules may reuse a name. The import graph must be a DAG —
+cyclic imports are a compile error. (Constructing an imported sum type's
 variant — `geom.Color.Red` — is a later slice.) (`draft.md` §17.)
 
 ## Core library

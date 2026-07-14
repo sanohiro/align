@@ -52,11 +52,20 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         .unwrap_or_else(|| "main".to_string());
 
     let mut loaded = vec![Loaded { path: entry_path.clone(), ast: entry_ast, is_entry: true }];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path]);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
+
+    // Edges of the module import graph (`importer path` -> `(imported modpath, import span)`),
+    // collected for every `import` seen below regardless of the `seen` dedup — the dedup exists
+    // only to avoid loading a shared module twice (the diamond case: `main` imports `b` and `c`,
+    // both import `d`), not to license cycles. [`detect_import_cycles`] walks this graph
+    // afterwards to tell that legal reconvergence apart from an actual cycle.
+    let mut edges: std::collections::HashMap<String, Vec<(String, align_span::Span)>> =
+        std::collections::HashMap::new();
 
     // Breadth-first over user-module imports, resolving each to `<entry-dir>/<name>.align`.
     let mut i = 0;
     while i < loaded.len() {
+        let cur_path = loaded[i].path.clone();
         let imports: Vec<align_ast::Path> =
             loaded[i].ast.imports.iter().filter(|p| user_import(p)).cloned().collect();
         i += 1;
@@ -64,6 +73,7 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
             // The dotted module path (`util.math`) and the matching file path under the entry
             // directory (`util/math.align`): each segment is a directory, the last names the file.
             let modpath = imp.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+            edges.entry(cur_path.clone()).or_default().push((modpath.clone(), imp.span));
             if !seen.insert(modpath.clone()) {
                 continue; // already loaded (shared / cyclic import)
             }
@@ -99,6 +109,14 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         }
     }
 
+    // The unit import graph must be a DAG (`draft.md` §17, M15 S0): a cycle of `import`s — direct,
+    // transitive, or a module importing itself — is a compile error, not something the `seen`
+    // dedup above should silently absorb. Sema still runs afterwards (this stage "continues as far
+    // as possible on failure, accumulating diagnostics" — `align_diag`'s contract): a cyclic import
+    // graph does not itself confuse per-module sema, and running it may surface further, genuinely
+    // separate errors.
+    detect_import_cycles(&entry_path, &edges, &mut diags);
+
     let modules: Vec<align_sema::Module> = loaded
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
@@ -106,6 +124,75 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let hir = align_sema::check_program(&modules, &mut diags);
 
     Checked { hir, diags }
+}
+
+/// Reject a cyclic module import graph (`check`'s `edges` map: importer path -> `(imported
+/// modpath, import span)`), M15 S0 — `draft.md` §17 requires the import graph to be a DAG. A
+/// standard depth-first white/grey/black walk from `start` (the entry module): white = unvisited,
+/// grey = open on the current DFS path, black = fully explored. A White target recurses; a Black
+/// target is a **diamond** (already fully explored via an earlier sibling branch — `b` and `c` both
+/// importing `d` is legal reconvergence, not a cycle) and is skipped; a Grey target means the edge
+/// closes a cycle back to a module still open on the current path, direct (`a` -> `b` -> `a`),
+/// transitive, or a self-import (`a` -> `a`) — reported once, at the closing edge's span, and the
+/// walk stops (no cascading cyclic-import diagnostics for the same cycle).
+fn detect_import_cycles(
+    start: &str,
+    edges: &std::collections::HashMap<String, Vec<(String, align_span::Span)>>,
+    diags: &mut Diagnostics,
+) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Grey,
+        Black,
+    }
+
+    fn visit(
+        node: &str,
+        edges: &std::collections::HashMap<String, Vec<(String, align_span::Span)>>,
+        color: &mut std::collections::HashMap<String, Color>,
+        path: &mut Vec<String>,
+        diags: &mut Diagnostics,
+    ) -> bool {
+        color.insert(node.to_string(), Color::Grey);
+        path.push(node.to_string());
+        if let Some(outs) = edges.get(node) {
+            for (target, span) in outs {
+                match color.get(target.as_str()).copied().unwrap_or(Color::White) {
+                    Color::White => {
+                        if visit(target, edges, color, path, diags) {
+                            return true;
+                        }
+                    }
+                    Color::Grey => {
+                        // `target` is still open on the current DFS path: this edge is the back
+                        // edge that closes the cycle. Render the path from `target`'s position on
+                        // the stack through the current node, then back to `target`.
+                        let start_ix = path.iter().position(|p| p == target).unwrap_or(0);
+                        let mut cycle: Vec<&str> = path[start_ix..].iter().map(String::as_str).collect();
+                        cycle.push(target.as_str());
+                        diags.error(
+                            format!(
+                                "cyclic import: {} (the module import graph must be a DAG; merge \
+                                 the modules or extract the shared part into a module both import)",
+                                cycle.join(" -> ")
+                            ),
+                            *span,
+                        );
+                        return true;
+                    }
+                    Color::Black => {} // fully explored on an earlier branch: a diamond, not a cycle
+                }
+            }
+        }
+        path.pop();
+        color.insert(node.to_string(), Color::Black);
+        false
+    }
+
+    let mut color = std::collections::HashMap::new();
+    let mut path = Vec::new();
+    visit(start, edges, &mut color, &mut path, diags);
 }
 
 /// Lower the sema-checked HIR down to MIR.
