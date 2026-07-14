@@ -347,7 +347,9 @@ pub fn check_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> 
 /// directory (and every artifact under it) is removed when the returned value is dropped.
 pub struct PerUnitBuilt {
     pub walk: PerUnitWalk,
-    dir: PathBuf,
+    /// The project's temp directory — every per-unit artifact (objects, linked executables) belongs
+    /// here so it is removed automatically when `_proj` drops.
+    pub dir: PathBuf,
     _proj: TempProject,
 }
 
@@ -425,6 +427,7 @@ pub fn nm_symbols(obj: &std::path::Path) -> Option<Vec<(char, String)>> {
         .env("LC_ALL", "C")
         .output()
         .expect("run llvm-nm");
+    assert!(out.status.success(), "llvm-nm failed: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     let mut syms = Vec::new();
     for line in text.lines() {

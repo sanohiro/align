@@ -509,20 +509,17 @@ fn partition_impl_hashes(
     let mut out: HashMap<String, Hash128> = HashMap::new();
     for (unit, mut idxs) in fns_by_unit {
         idxs.sort_by(|&a, &b| mir.fns[a].name.cmp(&mir.fns[b].name));
-        // Stable, location-free text of just this unit's functions. `program_to_string` prints only
-        // `fns`, referencing types by id (no type-table lookup), so a minimal sub-program with the
-        // filtered functions and empty type tables prints identically to the same functions in the
-        // full program.
-        let sub = align_mir::Program {
-            fns: idxs.iter().map(|&i| mir.fns[i].clone()).collect(),
-            externs: Vec::new(),
-            imported_fns: Vec::new(),
-            link_libs: Vec::new(),
-            structs: Vec::new(),
-            enums: Vec::new(),
-            tuples: Vec::new(),
-        };
-        out.insert(unit, Hash128::of(align_mir::print::program_to_string(&sub).as_bytes()));
+        // Stable, location-free text of just this unit's functions, printed by reference one
+        // function at a time (`function_to_string` prints types by id, never through a program's
+        // type tables, so it needs no `Program` wrapper — and so no cloning every `Function` into a
+        // temporary one just to print it). Concatenated in the same sorted, declaration-order-
+        // independent order the old whole-`Program` printing established.
+        let mut text = String::new();
+        for &i in &idxs {
+            text.push_str(&align_mir::print::function_to_string(&mir.fns[i]));
+            text.push('\n');
+        }
+        out.insert(unit, Hash128::of(text.as_bytes()));
     }
     out
 }

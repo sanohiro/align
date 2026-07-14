@@ -391,7 +391,10 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWa
                 is_entry,
                 mir,
                 summary,
-                dep_interface_hashes: dep_hashes_by_unit.get(p.as_str()).map(|h| (*h).clone()).unwrap_or_default(),
+                dep_interface_hashes: dep_hashes_by_unit
+                    .get(p.as_str())
+                    .unwrap_or_else(|| panic!("missing dependency hashes for unit '{p}' — walk order must produce deps first"))
+                    .to_vec(),
             })
         })
         .collect();

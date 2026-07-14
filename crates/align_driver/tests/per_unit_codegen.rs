@@ -234,14 +234,9 @@ fn gate_d_capability_union_is_libz_only() {
     // End-to-end: the linked binary records exactly the libz dependency among gated libraries.
     let objs = per.emit_objects(false);
     let obj_refs: Vec<&std::path::Path> = objs.iter().map(|p| p.as_path()).collect();
-    let exe = std::env::temp_dir().join(format!("align-gd-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
-    struct C(PathBuf);
-    impl Drop for C {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _c = C(exe.clone());
+    // Lives inside `per.dir` (the project's temp dir), so it is removed automatically when `per`
+    // drops — no separate cleanup guard needed.
+    let exe = per.dir.join(format!("align-gd{}", std::env::consts::EXE_SUFFIX));
     link_objects(&obj_refs, &exe, &libs, Profile::Release).expect("link");
     if let Some(readobj) = align_driver::llvm_tool("llvm-readobj") {
         let needed = needed_libs(&readobj, &exe);
