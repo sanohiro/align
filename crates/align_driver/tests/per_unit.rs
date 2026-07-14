@@ -172,6 +172,17 @@ fn cross_module_move_misuse_rejects() {
     assert!(r.diags.has_errors());
 }
 
+#[test]
+fn same_module_fn_value_in_non_entry_unit_accepts() {
+    // Regression: a same-module bare function used as a `map` callable inside a NON-entry unit must
+    // be accepted by both the whole-program and the per-unit checker (they share the resolution
+    // path). Before the fix the whole-program checker rejected it with `undefined function`.
+    let util = "module util\nfn dbl(x: i64) -> i64 = x * 2\npub fn doubled(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  data := [1, 2, 3]\n  return util.doubled(data[..]) as i32\n}\n";
+    let r = assert_same_verdict("s1b-fnval-nonentry", &[("util.align", util), ("main.align", main)], "main.align");
+    assert!(!r.diags.has_errors());
+}
+
 // ---- Gate 1: negative cases (both must reject) ----------------------------------------------------
 
 #[test]
