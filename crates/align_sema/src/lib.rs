@@ -10717,7 +10717,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// Check a `map`/`where` stage function against the current element type, returning
     /// its return type. `is_pred` requires a `bool` result.
     fn check_stage_fn(&mut self, fname: &ast::Ident, elem: Ty, is_pred: bool) -> Ty {
-        let Some(sig) = self.sigs.get(&fname.name) else {
+        // Resolve the bare name to its mangled codegen name in the caller's own module (exactly as a
+        // direct call does via `resolve_local_fn`) before the signature lookup: outside the entry
+        // module functions are keyed `module$name`, so a bare `sigs` lookup would miss them.
+        let Some(sig) = self.resolve_local_fn(&fname.name).and_then(|m| self.sigs.get(&m)) else {
             self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
             return Ty::Error;
         };
@@ -10740,7 +10743,12 @@ impl<'a, 't> Checker<'a, 't> {
     /// to a synthetic top-level function (`lift_lambda`); a named function is checked in place.
     fn resolve_stage_fn(&mut self, sf: &StageFn, elem: Ty, is_pred: bool) -> Option<(String, Ty, Vec<Expr>)> {
         match sf {
-            StageFn::Named(fname) => Some((fname.name.clone(), self.check_stage_fn(fname, elem, is_pred), Vec::new())),
+            StageFn::Named(fname) => {
+                // Lower to the mangled codegen name (module-qualified outside the entry module), the
+                // same target a direct call would use; `check_stage_fn` reports an undefined name.
+                let func = self.resolve_local_fn(&fname.name).unwrap_or_else(|| fname.name.clone());
+                Some((func, self.check_stage_fn(fname, elem, is_pred), Vec::new()))
+            }
             StageFn::Lambda { params, body, span } => {
                 let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
                 self.lift_lambda(params, body, &[elem], expected_ret, *span)
@@ -10930,7 +10938,14 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
             return None;
         };
-        let Some(sig) = self.sigs.get(&fname.name) else {
+        // Resolve the bare callable to its mangled codegen name in the caller's own module (as a
+        // direct call does), then look up the signature and lower to that same mangled name — so a
+        // same-module fn-value works identically inside and outside the entry module.
+        let Some(mangled) = self.resolve_local_fn(&fname.name) else {
+            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+            return None;
+        };
+        let Some(sig) = self.sigs.get(&mangled) else {
             self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
             return None;
         };
@@ -10951,7 +10966,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return None;
         }
-        Some((fname.name, ret, Vec::new()))
+        Some((mangled, ret, Vec::new()))
     }
 
     /// The `idx`-th parameter type of a *named* function argument, to seed an inline-literal source's
@@ -10961,7 +10976,10 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(arg.kind, ast::ExprKind::Lambda { .. }) {
             return None;
         }
-        self.pipeline_fn_name(arg).and_then(|f| self.sigs.get(&f.name).cloned()).and_then(|s| s.params.get(idx).copied())
+        self.pipeline_fn_name(arg)
+            .and_then(|f| self.resolve_local_fn(&f.name))
+            .and_then(|m| self.sigs.get(&m).cloned())
+            .and_then(|s| s.params.get(idx).copied())
     }
 
     /// The signature of a *named* function argument (`None` for a lambda or an unresolved name) —
@@ -10970,7 +10988,9 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(arg.kind, ast::ExprKind::Lambda { .. }) {
             return None;
         }
-        self.pipeline_fn_name(arg).and_then(|f| self.sigs.get(&f.name).cloned())
+        self.pipeline_fn_name(arg)
+            .and_then(|f| self.resolve_local_fn(&f.name))
+            .and_then(|m| self.sigs.get(&m).cloned())
     }
 
     fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<RawStage>) {
@@ -11045,7 +11065,10 @@ impl<'a, 't> Checker<'a, 't> {
         let elem_expected = match raw_stages.first() {
             // A named first `map` fixes the element type from its parameter; a lambda's parameter
             // type is inferred (the literal defaults), so there is no hint to pull.
-            Some(RawStage::Map(StageFn::Named(fname))) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
+            Some(RawStage::Map(StageFn::Named(fname))) => self
+                .resolve_local_fn(&fname.name)
+                .and_then(|m| self.sigs.get(&m))
+                .and_then(|s| s.params.first().copied()),
             None => elem_expected_no_stages,
             _ => None,
         };

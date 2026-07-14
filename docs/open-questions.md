@@ -2352,16 +2352,38 @@ either Pure-only keys or exactly-once input-order key evaluation before that rew
 now fails closed for unknown higher-order targets, but that mechanism does not choose the language
 contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
-### By-name fn-value references fail in non-entry modules (pre-existing, surfaced 2026-07-14)
+### By-name fn-value references fail in non-entry modules — FIXED (PR pending), 2026-07-14
 
-Found by the M15 S1b adversarial gate; reproduces identically on the whole-program path that
+Found by the M15 S1b adversarial gate; reproduced identically on the whole-program path that
 S1b did not touch, so pre-existing. Inside a NON-ENTRY module, referencing a same-module
-function by bare name as a fn-value (`xs.map(dbl)` where `fn dbl` is defined beside it) fails
-with `undefined function: 'dbl'`; the entry module accepts the same code. Direct calls
-(`dbl(x)`) and out-param pipelines (`map_into`) work cross-module. Likely a mangling/lookup
-gap in the fn-value resolution path (non-entry fns are mangled `module$name`; the fn-value
-lookup probably misses the mangled form). Fix in sema resolution; add an entry-vs-non-entry
-parity test over fn-values (`map(f)` / `f` as value / passing to `par_map`).
+function by bare name as a fn-value (`xs.map(dbl)` where `fn dbl` is defined beside it) failed
+with `undefined function: 'dbl'`; the entry module accepted the same code.
+
+**Root cause:** the pipeline/reducer callable-resolution paths (`check_stage_fn`,
+`resolve_stage_fn`, `resolve_fn`, and the `named_param_hint`/`named_sig`/`check_pipeline`
+element-type peeks in `crates/align_sema/src/lib.rs`) looked the callable up in `self.sigs`
+by its **bare** name and lowered it to that bare name — but outside the entry module functions
+are keyed `module$name` (`mangle_fn`), so both the lookup and the codegen target missed. The
+value-expression path (`f := double`, line ~8157) already resolved through `resolve_local_fn`
+and was unaffected. **Fix:** every callable position now resolves the bare name through
+`resolve_local_fn` (the same helper the direct-call path uses) before the `sigs` lookup and
+lowers to that mangled name — so same-module fn-values behave identically in entry and
+non-entry modules, and the effect machinery (which keys on the mangled name) accepts a Pure
+non-entry `par_map` callee and rejects an Impure one. Whole-program and per-unit checkers agree
+(differential test added). Tests: `crates/align_driver/tests/modules.rs` (6 new) +
+`per_unit.rs` (1 new).
+
+**Remaining (separate, still open):** a QUALIFIED cross-module fn-value —
+`xs.map(util.dbl)` / `reduce(util.add)` — is still rejected (`'.map()' needs a function …`).
+`pipeline_fn_name` only accepts a single-segment path, so a `mod.fn` callable never reaches
+resolution; this is the same pre-existing limitation the S1b gate observed for `par_map`
+qualified callees. Out of scope for the same-module fix above; add qualified-callable support
+(map/reduce/par_map/sort_by_key) as a follow-up.
+
+Note: the recorded repro snippet `pub fn doubled(xs) -> array<i64> = xs.map(dbl)` does not
+type-check in *either* module — a `map` must end in a reduction (`.sum()`) or an out-param sink
+(`map_into`); there is no bare `map`→`array` collect. The bug reproduces cleanly with a valid
+terminal, which is what the tests use.
 
 ### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15; design SETTLED 2026-07-14
 

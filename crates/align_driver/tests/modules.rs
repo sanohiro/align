@@ -384,3 +384,99 @@ fn a_straight_import_chain_is_not_a_cycle() {
     );
     assert_eq!(out.status.code(), Some(42));
 }
+
+// ---- Same-module fn-value references inside a non-entry module -------------------------------------
+// Regression: a bare same-module function used as a pipeline/reducer callable (`xs.map(f)`,
+// `reduce(f)`, `par_map(f)`, `sort_by_key(f)`) resolved the BARE name only, so outside the entry
+// module — where functions are mangled `module$name` — it failed with `undefined function`. The
+// fn-value resolution now goes through the same module mangling a direct call uses.
+
+#[test]
+fn non_entry_module_map_fn_value_runs() {
+    if !backend_available() {
+        return;
+    }
+    // The recorded repro (adapted to a valid terminal: `map` must end in a reduction). `dbl` is a
+    // private same-module function used as a `map` callable inside a NON-entry module.
+    let util = "module util\nfn dbl(x: i64) -> i64 = x * 2\npub fn doubled(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  data := [1, 2, 3]\n  return util.doubled(data[..]) as i32\n}\n";
+    let out = build_and_run_multi("mod-fnval-map", &[("util.align", util), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(12)); // (1 + 2 + 3) * 2
+}
+
+#[test]
+fn non_entry_module_reduce_fn_value_runs() {
+    if !backend_available() {
+        return;
+    }
+    // A same-module named fold passed to `reduce` inside a non-entry module.
+    let util = "module util\nfn add(a: i64, b: i64) -> i64 = a + b\npub fn total(xs: slice<i64>) -> i64 = xs.reduce(0, add)\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  data := [4, 5, 6]\n  return util.total(data[..]) as i32\n}\n";
+    let out = build_and_run_multi("mod-fnval-reduce", &[("util.align", util), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(15));
+}
+
+#[test]
+fn non_entry_module_sort_by_key_fn_value_runs() {
+    if !backend_available() {
+        return;
+    }
+    // `sort_by_key` also resolves its key function through the same fn-value path.
+    let util = "module util\nfn neg(x: i64) -> i64 = -x\npub fn top(xs: slice<i64>) -> i64 = xs.sort_by_key(neg)[0]\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  data := [3, 1, 2]\n  return util.top(data[..]) as i32\n}\n";
+    let out = build_and_run_multi("mod-fnval-sort", &[("util.align", util), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(3)); // sorted by -x => descending => first is the max
+}
+
+#[test]
+fn entry_and_non_entry_fn_value_forms_parity() {
+    // Every fn-value form accepted in the entry module is accepted identically in a non-entry module.
+    let forms = [
+        "xs.map(dbl).sum()",
+        "xs.par_map(dbl).sum()",
+        "xs.reduce(0, dbl2)",
+        "xs.sort_by_key(dbl)[0]",
+    ];
+    let prelude = "fn dbl(x: i64) -> i64 = x * 2\nfn dbl2(a: i64, b: i64) -> i64 = a + b\n";
+    for form in forms {
+        // Entry-module version.
+        let entry = format!("module main\n{prelude}fn run(xs: slice<i64>) -> i64 = {form}\nfn main() -> i32 = 0\n");
+        assert!(
+            !check_multi_errs("mod-parity-entry", &[("main.align", &entry)], "main.align"),
+            "entry-module form rejected: {form}"
+        );
+        // Non-entry version: the same functions live in `util`, imported by `main`.
+        let util = format!("module util\n{prelude}pub fn run(xs: slice<i64>) -> i64 = {form}\n");
+        let main = "module main\nimport util\nfn main() -> i32 = 0\n";
+        assert!(
+            !check_multi_errs("mod-parity-nonentry", &[("util.align", &util), ("main.align", main)], "main.align"),
+            "non-entry form rejected but entry accepted: {form}"
+        );
+    }
+}
+
+#[test]
+fn non_entry_par_map_over_pure_fn_accepts_impure_rejects() {
+    // Effect parity: `par_map` over a non-entry same-module Pure fn is accepted; over an Impure one
+    // (it performs I/O) it is rejected — the effect machinery keys on the mangled name too.
+    let pure = "module util\nfn dbl(x: i64) -> i64 = x * 2\npub fn go(xs: slice<i64>) -> i64 = xs.par_map(dbl).sum()\n";
+    let main = "module main\nimport util\nfn main() -> i32 = 0\n";
+    assert!(
+        !check_multi_errs("mod-parmap-pure", &[("util.align", pure), ("main.align", main)], "main.align"),
+        "par_map over a non-entry Pure fn should be accepted"
+    );
+    let impure = "module util\nfn shout(x: i64) -> i64 {\n  print(x)\n  return x * 2\n}\npub fn go(xs: slice<i64>) -> i64 = xs.par_map(shout).sum()\n";
+    assert!(
+        check_multi_errs("mod-parmap-impure", &[("util.align", impure), ("main.align", main)], "main.align"),
+        "par_map over a non-entry Impure fn should be rejected"
+    );
+}
+
+#[test]
+fn non_entry_undefined_callable_still_errors() {
+    // Negative control: a genuinely undefined name in a non-entry callable position still errors.
+    let util = "module util\npub fn go(xs: slice<i64>) -> i64 = xs.map(nope).sum()\n";
+    let main = "module main\nimport util\nfn main() -> i32 = 0\n";
+    let diags = check_multi_diagnostics("mod-fnval-undef", &[("util.align", util), ("main.align", main)], "main.align");
+    assert!(diags.contains("undefined function: 'nope'"), "expected undefined-function error, got:\n{diags}");
+}
