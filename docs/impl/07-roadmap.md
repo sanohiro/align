@@ -2683,7 +2683,34 @@ calls it; (f) private-body edit flips impl_hash only, comment-only edit flips ne
 `explain-opt` / `emit-llvm` / `emit-obj --export` surfaces (S2b); incremental caching + parallel unit
 compilation (S3); consumer-side monomorphs are attributed to their template's unit in the
 `impl_hash` partition (sound — a template-body change flips the producer's interface hash, which the
-consumer keys on). **S3** the incremental cache per the
+consumer keys on).
+
+**Measured cross-unit aggregate follow-up (2026-07-14; directional probe, worth retaining only as
+a ThinLTO gate):** M15 creates the real non-inlined boundary that the M13 Slice-5 ABI-flattening
+deferral said could change the result, so tuple return was re-probed rather than assumed. On the
+Ryzen 9 5950X host (`x86_64`, LLVM 22.1.8, release/O2, native CPU), one entry unit called one imported
+unit 200 million times and immediately summed either a returned tuple or an equivalent scalar
+result. Median of seven balanced AB/BA runs:
+
+| result | tuple | scalar control | tuple/control |
+|---|---:|---:|---:|
+| 2 x `i64` | 221 ms | 219 ms | 1.01x |
+| 4 x `i64` | 306 ms | 221 ms | 1.38x |
+| 8 x `i64` | 408 ms | 222 ms | 1.84x |
+
+The machine code explains the crossover: two values return in `rax`/`rdx`; four and eight use a
+hidden 32/64-byte return buffer, with the producer storing every field and the consumer loading every
+field. The same sources on the whole-program path take 1-2 ms because inlining/SROA removes the
+boundary and folds the loop. This is deliberately a call-heavy positive-case upper bound, not a
+claim that ordinary tuple construction is slow. **Verdict:** retain a wide-tuple param/return case in
+the future cross-unit ThinLTO acceptance matrix; do NOT add tuple-specific field reordering, type-
+interning work, or a custom flattening ABI now. ThinLTO is the one already-settled mechanism that
+removes the producer/consumer boundary and recovers scalar replacement for structs, tuples, and
+other aggregates together. The gate must require the 4/8-value `sret` store/load round trip to vanish
+for the inlinable positive case while a deliberately non-inline dynamic control retains a valid
+cross-unit ABI.
+
+**S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
 bundle: the doc-10 §7 invalidation matrix per-unit, N=1 byte-identity vs today, cold-vs-hit
 byte-identity, and fail-closed effect-bit gates incl. a stale/absent-interface mutation.
