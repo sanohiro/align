@@ -1078,6 +1078,15 @@ pub struct Module<'f> {
     /// functions are mangled `module$fn`, so single-file programs are byte-identical and two modules
     /// may share a function name.
     pub is_entry: bool,
+    /// M15 S1b: an **interface-only** dependency module — its `ast::File` was reconstructed from an
+    /// already-checked [`InterfaceSummary`] (its public surface rendered back to source + re-parsed),
+    /// not from the dependency's real source. Its types / consts / signatures / generic templates are
+    /// registered so the unit-under-check can resolve `dep.name`, but its own bodies are NOT
+    /// type-checked, its non-generic functions are NOT emitted into the program, and it produces NO
+    /// diagnostics (it was checked when the dependency itself was the unit-under-check). Cross-unit
+    /// effect bits for its `pub` functions arrive out-of-band via `external_effects`
+    /// ([`check_program_with_effects`]). Always `false` in the whole-program build path.
+    pub interface_only: bool,
 }
 
 /// The codegen name of a function: plain in the entry module (so `main` stays `main` and single-file
@@ -1237,6 +1246,309 @@ fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics
                 check_type_exposure(p, cx, diags);
             }
             check_type_exposure(ret, cx, diags);
+        }
+    }
+}
+
+// --- generic-`pub`-fn body reference check (M15 S1b, gate finding D1) --------------------------
+//
+// A generic `pub` fn's BODY is part of its interface: the interface summary (S1a) ships the template
+// so importing modules can monomorphize it, and the body is then type-checked in the CONSUMER's
+// namespace, where the defining module's PRIVATE items do not exist. A body that named a private
+// same-module item would be accepted whole-program but rejected per-unit (the D1 accept/reject
+// divergence, plus a synthesized-file span leaking into a user diagnostic). So a generic `pub` fn
+// body may reference only `pub` same-module items — a private same-module fn, const, type, or enum
+// variant is forbidden. Allowed: its own params/locals, its type parameters, builtins/pipeline ops,
+// and qualified `mod.x` (already `pub`-enforced cross-module). Non-generic `pub` fns are NOT affected
+// (their bodies stay in their own unit); private generic fns are unaffected. Enforced at the PRODUCER
+// in ordinary sema, so `check` and `check-per-unit` agree — differential parity is restored.
+
+/// The constant context of one generic-`pub`-fn body walk: the defining module, the item-visibility
+/// lookups (same as sema's own resolution tables), and the enclosing fn's name + type-parameter
+/// names. Threaded through the recursion.
+struct GenericBodyCtx<'a> {
+    cur_module: &'a str,
+    fn_name: &'a str,
+    type_params: &'a std::collections::HashSet<&'a str>,
+    mod_table: &'a ModuleTable,
+    const_by_module: &'a HashMap<String, HashMap<String, (String, bool)>>,
+    type_table: &'a ModTypes,
+}
+
+/// Walks a generic `pub` fn body, tracking a lexical scope stack so a local/param named like a
+/// private item (a local `helper` shadowing a private `fn helper`) is legal. Emits one diagnostic
+/// per private reference (never panics). Every `ast::ExprKind` / `Stmt` / `Type` constructor is
+/// matched exhaustively (no wildcard arm) so a newly added node cannot silently skip this check.
+struct GenericBodyWalker<'a, 'd> {
+    cx: &'a GenericBodyCtx<'a>,
+    /// Lexical scopes of in-scope local names (params/lambda params/`let`/match bindings). A name
+    /// present in any frame shadows a same-module item.
+    scopes: Vec<std::collections::HashSet<String>>,
+    diags: &'d mut Diagnostics,
+}
+
+impl<'a, 'd> GenericBodyWalker<'a, 'd> {
+    fn is_local(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| s.contains(name))
+    }
+    fn bind(&mut self, name: &str) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name.to_string());
+        }
+    }
+    fn err(&mut self, kind: &str, name: &str, span: Span) {
+        let fn_name = self.cx.fn_name;
+        self.diags.error(
+            format!(
+                "pub generic fn '{fn_name}' references private {kind} '{name}' in its body \
+                 (a generic template is instantiated in importing modules, so its body may \
+                 reference only pub items)"
+            ),
+            span,
+        );
+    }
+
+    /// A bare name in VALUE position (a `Path` expression, a call callee, a fn value, or the receiver
+    /// of a `Type.Variant` construction / `Type.field` access). If it is not a local and names a
+    /// PRIVATE same-module fn / const / type, it is rejected. A pub item, a module, a builtin, or an
+    /// unknown name is left to normal resolution. The three namespaces are effectively disjoint, so
+    /// the first match wins. (A same-module type appears in value position as the receiver of an enum
+    /// construction `Priv.V(..)` / a struct's associated access — a private one is a body leak; a bare
+    /// enum-variant name in a `match` pattern is NOT checked here, since a private-enum *value* can
+    /// only be obtained by a construction or call already rejected above, or a param/return already
+    /// rejected by the signature-exposure check.)
+    fn check_value_name(&mut self, name: &str, span: Span) {
+        if self.is_local(name) {
+            return;
+        }
+        if let Some((_, is_pub)) = self.cx.mod_table.get(self.cx.cur_module).and_then(|mi| mi.fns.get(name)) {
+            if !*is_pub {
+                self.err("fn", name, span);
+            }
+            return;
+        }
+        if let Some((_, is_pub)) = self.cx.const_by_module.get(self.cx.cur_module).and_then(|m| m.get(name)) {
+            if !*is_pub {
+                self.err("const", name, span);
+            }
+            return;
+        }
+        if self.cx.type_table.get(self.cx.cur_module).and_then(|m| m.get(name)).is_some_and(|e| !e.is_pub) {
+            self.err("type", name, span);
+        }
+    }
+
+    /// A single-segment type NAME (a struct-literal type or a `Named` type). A same-module user type
+    /// must be `pub`; a type parameter (`T`) is exempt (substituted at instantiation); a builtin /
+    /// unknown name is absent from `type_table` → skipped.
+    fn check_type_name(&mut self, bare: &str, span: Span) {
+        let is_private = !self.cx.type_params.contains(bare)
+            && self.cx.type_table.get(self.cx.cur_module).and_then(|m| m.get(bare)).is_some_and(|e| !e.is_pub);
+        if is_private {
+            self.err("type", bare, span);
+        }
+    }
+
+    /// A `Type` written inside the body (a `let` / lambda-param annotation, an `as` cast target).
+    /// Walks `Named`/`Tuple`/`Fn` exhaustively (mirrors `check_type_exposure`), including the generic
+    /// args of a qualified `mod.Type` (they may name a same-module private type).
+    fn walk_type(&mut self, ty: &ast::Type) {
+        match ty {
+            ast::Type::Named { path, args, span } => {
+                if path.segments.len() == 1 {
+                    self.check_type_name(&path.segments[0].name, *span);
+                }
+                for a in args {
+                    self.walk_type(a);
+                }
+            }
+            ast::Type::Tuple { elems, .. } => {
+                for e in elems {
+                    self.walk_type(e);
+                }
+            }
+            ast::Type::Fn { params, ret, .. } => {
+                for p in params {
+                    self.walk_type(p);
+                }
+                self.walk_type(ret);
+            }
+        }
+    }
+
+    fn walk_block(&mut self, b: &ast::Block) {
+        self.scopes.push(std::collections::HashSet::new());
+        for st in &b.stmts {
+            self.walk_stmt(st);
+        }
+        if let Some(t) = &b.tail {
+            self.walk_expr(t);
+        }
+        self.scopes.pop();
+    }
+
+    fn walk_stmt(&mut self, st: &ast::Stmt) {
+        match st {
+            // The initializer is walked BEFORE the name is bound, so a local `helper := helper()`
+            // reference on the right resolves to the item (not yet in scope) — and a private one is
+            // then correctly reported. Once bound, later references to the local shadow the item.
+            ast::Stmt::Let { name, ty, init, .. } => {
+                self.walk_expr(init);
+                if let Some(t) = ty {
+                    self.walk_type(t);
+                }
+                self.bind(&name.name);
+            }
+            ast::Stmt::LetTuple { names, init, .. } => {
+                self.walk_expr(init);
+                for n in names.iter().flatten() {
+                    self.bind(&n.name);
+                }
+            }
+            ast::Stmt::Assign { place, value } => {
+                self.walk_expr(place);
+                self.walk_expr(value);
+            }
+            ast::Stmt::Return(opt) => {
+                if let Some(e) = opt {
+                    self.walk_expr(e);
+                }
+            }
+            ast::Stmt::Break { value, .. } => {
+                if let Some(e) = value {
+                    self.walk_expr(e);
+                }
+            }
+            ast::Stmt::Expr(e) => self.walk_expr(e),
+        }
+    }
+
+    fn walk_expr(&mut self, e: &ast::Expr) {
+        match &e.kind {
+            ast::ExprKind::Unit
+            | ast::ExprKind::Int(_)
+            | ast::ExprKind::Float(_)
+            | ast::ExprKind::Char(_)
+            | ast::ExprKind::Str(_)
+            | ast::ExprKind::Bool(_)
+            | ast::ExprKind::FieldShorthand(_) => {}
+            ast::ExprKind::Path(p) => {
+                // A qualified `mod.x` is `pub`-enforced cross-module (and a `base.field` chain is
+                // structural) — only a single-segment bare name can reach a same-module item.
+                if p.segments.len() == 1 {
+                    self.check_value_name(&p.segments[0].name, p.segments[0].span);
+                }
+            }
+            ast::ExprKind::Unary { expr, .. } => self.walk_expr(expr),
+            ast::ExprKind::Cast { expr, ty } => {
+                self.walk_expr(expr);
+                self.walk_type(ty);
+            }
+            ast::ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            ast::ExprKind::Call { callee, args } => {
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
+            ast::ExprKind::FieldAccess { recv, .. } => self.walk_expr(recv),
+            ast::ExprKind::If { cond, then, els } => {
+                self.walk_expr(cond);
+                self.walk_block(then);
+                if let Some(e2) = els {
+                    self.walk_expr(e2);
+                }
+            }
+            ast::ExprKind::Block(b) => self.walk_block(b),
+            ast::ExprKind::StructLit { name, fields } => {
+                if name.segments.len() == 1 {
+                    self.check_type_name(&name.segments[0].name, name.segments[0].span);
+                }
+                for f in fields {
+                    self.walk_expr(&f.value);
+                }
+            }
+            ast::ExprKind::ElseUnwrap { opt, fallback } => {
+                self.walk_expr(opt);
+                self.walk_expr(fallback);
+            }
+            ast::ExprKind::Try(inner) => self.walk_expr(inner),
+            ast::ExprKind::Loop(b) => self.walk_block(b),
+            ast::ExprKind::Arena(b) => self.walk_block(b),
+            ast::ExprKind::Unsafe(b) => self.walk_block(b),
+            ast::ExprKind::TaskGroup(b) => self.walk_block(b),
+            ast::ExprKind::ArrayLit(elems) => {
+                for el in elems {
+                    self.walk_expr(el);
+                }
+            }
+            ast::ExprKind::Index { recv, index } => {
+                self.walk_expr(recv);
+                self.walk_expr(index);
+            }
+            ast::ExprKind::SliceRange { recv, start, end } => {
+                self.walk_expr(recv);
+                if let Some(s) = start {
+                    self.walk_expr(s);
+                }
+                if let Some(en) = end {
+                    self.walk_expr(en);
+                }
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                self.scopes.push(std::collections::HashSet::new());
+                for p in params {
+                    if let Some(t) = &p.ty {
+                        self.walk_type(t);
+                    }
+                    self.bind(&p.name.name);
+                }
+                // The lambda body is a block; it introduces its own inner scope for `let`s, but the
+                // parameter scope pushed here holds the params for the whole body.
+                for st in &body.stmts {
+                    self.walk_stmt(st);
+                }
+                if let Some(t) = &body.tail {
+                    self.walk_expr(t);
+                }
+                self.scopes.pop();
+            }
+            ast::ExprKind::Match { scrutinee, arms } => {
+                self.walk_expr(scrutinee);
+                for arm in arms {
+                    self.scopes.push(std::collections::HashSet::new());
+                    // A pattern binds payload names as locals for the arm body. Variant NAMES are not
+                    // item references (they resolve against the scrutinee's enum, not by name), and a
+                    // private-enum value can only reach a `match` via a construction/call/param that
+                    // the checks above (or signature exposure) already reject — so nothing to check.
+                    match &arm.pattern {
+                        ast::MatchPattern::Variant { bindings, .. } => {
+                            for b in bindings {
+                                self.bind(&b.name);
+                            }
+                        }
+                        ast::MatchPattern::Or { .. } | ast::MatchPattern::Wildcard(_) => {}
+                    }
+                    self.walk_expr(&arm.body);
+                    self.scopes.pop();
+                }
+            }
+            ast::ExprKind::Tuple(elems) => {
+                for el in elems {
+                    self.walk_expr(el);
+                }
+            }
+            ast::ExprKind::TupleIndex { recv, .. } => self.walk_expr(recv),
+            ast::ExprKind::Template(parts) => {
+                for part in parts {
+                    if let ast::TemplatePart::Hole(inner) = part {
+                        self.walk_expr(inner);
+                    }
+                }
+            }
         }
     }
 }
@@ -1623,12 +1935,30 @@ impl<'a, 'd> ConstEval<'a, 'd> {
 /// Analyze a single file into a typed program (the single-module entry point; tests and the
 /// single-file driver path use this). Multi-file compilation goes through [`check_program`].
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
-    check_program(&[Module { path: "main".to_string(), file, is_entry: true }], diags)
+    check_program(&[Module { path: "main".to_string(), file, is_entry: true, interface_only: false }], diags)
 }
 
 /// Analyze a set of modules (the entry file plus its transitively-imported user modules) into one
-/// typed program. Errors are pushed to `diags`.
+/// typed program. Errors are pushed to `diags`. The whole-program build path: every module is a real
+/// source module, and every cross-module call's effect is derived from the callee's own body.
 pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
+    check_program_with_effects(modules, &HashMap::new(), diags)
+}
+
+/// M15 S1b per-unit checking: like [`check_program`], but any [`Module::interface_only`] module is a
+/// dependency reconstructed from its already-checked interface summary, and `external_effects` carries
+/// the 3-valued effect bit (keyed by **canonical / mangled** name) of every imported non-generic
+/// `pub` function. A cross-unit call to a function not present in the checked program (i.e. an
+/// interface-only dependency's non-generic `pub` fn) takes its effect from `external_effects`;
+/// **fail-closed** — a call target absent from the map is treated as `Impure` **and** unknown-indirect,
+/// so it is rejected at a `par_map`/parallel boundary and never optimistically Pure. Generic imported
+/// functions are NOT in `external_effects`: their monomorphs are instantiated into this program and
+/// their effects recomputed from the instantiated body.
+pub fn check_program_with_effects(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) -> Program {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -1714,6 +2044,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // walked: a constant's type is restricted to a scalar / `str` (Pass 0d), never a user type, so it
     // can never expose one. `extern` fns take FFI-safe scalars only (validated in Pass 1), likewise.
     for m in modules {
+        // An interface-only dependency was reconstructed from its summary, whose self-containment was
+        // already enforced when the dependency was itself checked (S1a's producer invariant); re-running
+        // the exposure check on synthesized source would only risk spurious cross-module diagnostics.
+        if m.interface_only {
+            continue;
+        }
         for item in &m.file.items {
             match item {
                 ast::Item::Fn(f) if matches!(f.vis, ast::Vis::Pub) => {
@@ -2112,6 +2448,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Unused-import lint (warning): an `import` whose module is never referenced in the file. A
     // builtin (`core.json`) is matched by its `json.*` namespace; a user module by its dotted path.
     for m in modules {
+        // Interface-only dependencies emit no diagnostics (they were linted when checked as the unit),
+        // and their synthesized imports are derived to be exactly the ones their surface needs.
+        if m.interface_only {
+            continue;
+        }
         let mut refs = std::collections::HashSet::new();
         collect_refs(&m.file.items, &mut refs);
         // Used iff some collected prefix equals `needle` or is `needle.` + more (allocation-free).
@@ -2196,6 +2537,46 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             eval.value(canonical);
         }
         const_table.values = eval.values;
+    }
+
+    // Pass 0e (M15 S1b, gate finding D1): a generic `pub` fn's BODY is part of its interface — the
+    // interface summary ships the template and it is monomorphized in importing modules, where the
+    // defining module's PRIVATE items do not exist. So a generic `pub` fn body may reference only
+    // `pub` same-module items. Run now that `mod_table` (fn vis), `const_table` (const vis), and
+    // `type_table` (type vis) are all complete. Interface-only dependencies are skipped — they were
+    // checked as their own unit at production time.
+    {
+        for m in modules {
+            if m.interface_only {
+                continue;
+            }
+            for item in &m.file.items {
+                let ast::Item::Fn(f) = item else { continue };
+                if !matches!(f.vis, ast::Vis::Pub) || f.type_params.is_empty() {
+                    continue; // only a generic `pub` fn ships its body in the interface summary
+                }
+                let tps: std::collections::HashSet<&str> =
+                    f.type_params.iter().map(|t| t.name.name.as_str()).collect();
+                let cx = GenericBodyCtx {
+                    cur_module: &m.path,
+                    fn_name: &f.name.name,
+                    type_params: &tps,
+                    mod_table: &mod_table,
+                    const_by_module: &const_table.by_module,
+                    type_table: &type_table,
+                };
+                let mut walker = GenericBodyWalker { cx: &cx, scopes: Vec::new(), diags };
+                // The parameter scope is the outermost frame (params shadow same-module items).
+                walker.scopes.push(std::collections::HashSet::new());
+                for p in &f.params {
+                    walker.bind(&p.name.name);
+                }
+                match &f.body {
+                    ast::FnBody::Block(b) => walker.walk_block(b),
+                    ast::FnBody::Expr(e) => walker.walk_expr(e),
+                }
+            }
+        }
     }
 
     // Pass 1: collect function signatures so calls can resolve regardless of order. `sigs` is keyed
@@ -2408,10 +2789,23 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         .collect();
     let empty_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Interface-only dependency modules (M15 S1b): their signatures / types / generic templates are
+    // registered above so this unit resolves `dep.name`, but their own bodies are NOT type-checked and
+    // their non-generic functions are NOT emitted into `program.fns` (they live in the dependency's own
+    // object). A *generic* imported function is still in `generic_decls` above, so an instantiation
+    // requested by this unit is monomorphized on demand and emitted here as a consumer-internal symbol.
+    let interface_only_modules: std::collections::HashSet<&str> =
+        modules.iter().filter(|m| m.interface_only).map(|m| m.path.as_str()).collect();
+
     // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
     // every generic call and processed to a fixpoint below.
     let mut worklist: std::collections::VecDeque<(String, Vec<Ty>)> = std::collections::VecDeque::new();
     for &(module, is_entry, f) in &all_fns {
+        // Do not check or emit an interface-only dependency's own functions (see above); its generic
+        // templates are reached only through the monomorphization worklist below.
+        if interface_only_modules.contains(module) {
+            continue;
+        }
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -2511,8 +2905,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             .collect();
         f.drop_locals = drops;
     }
-    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11).
-    check_parallelism(&program, diags);
+    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11). Cross-unit
+    // callees (interface-only dependencies' non-generic `pub` fns) take their effect from
+    // `external_effects`; fail-closed for an absent target.
+    check_parallelism(&program, external_effects, diags);
     program
 }
 
@@ -2523,8 +2919,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 /// moves) is Pure. A `par_map(f)` whose `f` is Impure is rejected. (`f` is `(T) -> R` with no `out`
 /// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
 /// as it stands.)
-fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
-    let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program);
+fn check_parallelism(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) {
+    let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program, external_effects);
     // The `par_map` function must be Pure.
     for (func, span) in parmaps {
         if unknown.contains(&func) {
@@ -2567,7 +2967,16 @@ struct EffectSets {
 /// Compute the transitive impure / unknown effect sets (and the `par_map` callees) over the whole
 /// program. The single source of truth for both the `par_map` Pure requirement ([`check_parallelism`])
 /// and the M15 per-function effect bit ([`fn_effects`]).
-fn compute_effect_sets(program: &Program) -> EffectSets {
+///
+/// `external_effects` (M15 S1b) carries the effect bit of every imported non-generic `pub` function
+/// (keyed by canonical / mangled name) whose body is NOT in this program (an interface-only
+/// dependency). A call edge to such a function seeds its effect here; **fail-closed** — a callee that
+/// is neither in this program nor in `external_effects` is treated as BOTH impure and unknown-indirect,
+/// so it can never be optimistically Pure at a parallel boundary.
+fn compute_effect_sets(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) -> EffectSets {
     use std::collections::HashMap;
     // Per function: directly observable effect + the set of functions it calls (incl. pipeline
     // stage/reducer functions) + the `par_map` callees to verify.
@@ -2583,6 +2992,33 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(scan.parmaps);
     }
+    // Cross-unit call targets (M15 S1b): any callee that is not a function of THIS program is an
+    // interface-only dependency's function. Seed its effect from `external_effects`; a target absent
+    // from that map is fail-closed to both impure and unknown-indirect (never optimistically Pure).
+    let mut ext_impure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ext_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for callees in calls.values() {
+        for callee in callees {
+            if direct.contains_key(callee.as_str()) {
+                continue; // a function of this program — handled by its own body scan above
+            }
+            match external_effects.get(callee) {
+                Some(FnEffect::Pure) => {}
+                Some(FnEffect::Impure) => {
+                    ext_impure.insert(callee.clone());
+                }
+                Some(FnEffect::Unknown) => {
+                    ext_unknown.insert(callee.clone());
+                }
+                None => {
+                    // Fail-closed: an unknown cross-unit target (a corrupted / absent summary bit, or
+                    // any name the interface does not carry) is treated as maximally effectful.
+                    ext_impure.insert(callee.clone());
+                    ext_unknown.insert(callee.clone());
+                }
+            }
+        }
+    }
     // Transitive propagation: build a reverse call graph (callee -> callers)
     // and propagate impurity starting from directly impure functions using a worklist.
     let mut reverse_calls: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -2594,7 +3030,10 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         }
     }
 
-    let propagate = |seeds: &HashMap<&str, bool>| {
+    // Propagate along the reverse call graph from an initial seed set. `seeds` are this program's own
+    // directly-effectful functions; `ext_seeds` are cross-unit callees whose effect the seed carries
+    // (they have no body here, so they are seeds only, never propagation intermediates with edges).
+    let propagate = |seeds: &HashMap<&str, bool>, ext_seeds: &std::collections::HashSet<String>| {
         let mut affected = std::collections::HashSet::new();
         let mut worklist = Vec::new();
         for (name, &active) in seeds {
@@ -2602,6 +3041,11 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
                 let n = name.to_string();
                 affected.insert(n.clone());
                 worklist.push(n);
+            }
+        }
+        for name in ext_seeds {
+            if affected.insert(name.clone()) {
+                worklist.push(name.clone());
             }
         }
         while let Some(callee) = worklist.pop() {
@@ -2617,8 +3061,8 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         }
         affected
     };
-    let impure = propagate(&direct);
-    let unknown = propagate(&direct_unknown);
+    let impure = propagate(&direct, &ext_impure);
+    let unknown = propagate(&direct_unknown, &ext_unknown);
     EffectSets { impure, unknown, parmaps }
 }
 
@@ -2627,8 +3071,15 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
 /// impure is classified so even if it also has an unknown-effect indirect call); everything the
 /// analysis cannot place in either set is `Pure`. Reuses [`compute_effect_sets`], so it always agrees
 /// with the `par_map` Pure check.
-pub fn fn_effects(program: &Program) -> std::collections::HashMap<String, FnEffect> {
-    let EffectSets { impure, unknown, .. } = compute_effect_sets(program);
+///
+/// `external_effects` (M15 S1b): the effect bits of imported non-generic `pub` functions whose bodies
+/// are not in `program` (an interface-only dependency), so a unit's own `pub` fn that transitively
+/// calls an impure imported fn is correctly classified impure. Pass an empty map for whole-program.
+pub fn fn_effects(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) -> std::collections::HashMap<String, FnEffect> {
+    let EffectSets { impure, unknown, .. } = compute_effect_sets(program, external_effects);
     program
         .fns
         .iter()

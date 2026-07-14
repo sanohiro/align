@@ -422,7 +422,9 @@ resolves within the calling module (an imported type must be qualified). Each mo
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,
-so a module's public interface is self-contained. The import graph must be a DAG —
+so a module's public interface is self-contained. A **generic** `pub` fn's *body* is part of its
+interface (its template is instantiated in importers), so it may reference only `pub` same-module
+items — a private same-module fn/type/const in a generic `pub` body is rejected. The import graph must be a DAG —
 cyclic imports are a compile error. (Constructing an imported sum type's
 variant — `geom.Color.Red` — is a later slice.) (`draft.md` §17.)
 

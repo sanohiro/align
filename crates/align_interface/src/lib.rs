@@ -251,8 +251,25 @@ pub fn build_summaries(
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
 ) -> Vec<InterfaceSummary> {
-    let effects: HashMap<String, Effect> =
-        align_sema::fn_effects(program).into_iter().map(|(k, v)| (k, v.into())).collect();
+    build_summaries_with_effects(modules, program, mir, sources, &HashMap::new())
+}
+
+/// Like [`build_summaries`], but folds `external_effects` (M15 S1b: the effect bits of imported
+/// non-generic `pub` functions whose bodies are not in `program`) into the per-unit effect
+/// classification, so a unit's own `pub` fn that transitively calls an impure imported fn is recorded
+/// impure in its summary. The whole-program producer path passes an empty map (all callees are in
+/// `program`); the per-unit producer passes the union of its transitive dependencies' effect bits.
+pub fn build_summaries_with_effects(
+    modules: &[align_sema::Module],
+    program: &align_sema::hir::Program,
+    mir: &align_mir::Program,
+    sources: &HashMap<String, String>,
+    external_effects: &HashMap<String, align_sema::FnEffect>,
+) -> Vec<InterfaceSummary> {
+    let effects: HashMap<String, Effect> = align_sema::fn_effects(program, external_effects)
+        .into_iter()
+        .map(|(k, v)| (k, v.into()))
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
 
     let mut summaries = Vec::with_capacity(modules.len());
@@ -433,4 +450,182 @@ fn partition_capabilities(
         }
     }
     caps_by_unit
+}
+
+// ---- M15 S1b: reconstruct a dependency's public surface as source (consumer-side per-unit sema) ----
+//
+// The seam between the whole-program checker and per-unit checking is deliberately narrow: rather
+// than a second resolver over summaries, an imported unit's `InterfaceSummary` is rendered back to
+// Align source and re-parsed by the EXISTING parser into an `ast::File`, then fed to
+// `align_sema::check_program_with_effects` as an interface-only `Module`. Every table-building and
+// resolution pass in sema is thus reused unchanged — one resolution code path. Generic templates and
+// const values are stored as source text in the summary (they MUST be re-parsed regardless), so
+// render-to-source unifies the whole reconstruction into a single `parse_file` call in the driver.
+
+/// Render a UTF-8 type reference back to source. Every summary type is `Named`/`Tuple`/`Fn` (see
+/// [`convert_type`]); a named type with args is `path<a, b>`, the unit type is its sentinel `()`.
+fn render_itype(t: &IType) -> String {
+    match t {
+        IType::Named { path, args } => {
+            if args.is_empty() {
+                path.clone()
+            } else {
+                let a = args.iter().map(render_itype).collect::<Vec<_>>().join(", ");
+                format!("{path}<{a}>")
+            }
+        }
+        IType::Tuple(elems) => {
+            let e = elems.iter().map(render_itype).collect::<Vec<_>>().join(", ");
+            format!("({e})")
+        }
+        IType::Fn { params, ret } => {
+            let p = params.iter().map(render_itype).collect::<Vec<_>>().join(", ");
+            format!("fn({p}) -> {}", render_itype(ret))
+        }
+    }
+}
+
+/// The unit-type sentinel produced by [`unit_type`] — an omitted `-> ()` return.
+fn is_unit_itype(t: &IType) -> bool {
+    matches!(t, IType::Named { path, args } if path == "()" && args.is_empty())
+}
+
+/// `<T, U: Ord>` for a generic declaration; empty for a non-generic one.
+fn render_type_params(tps: &[ITypeParam]) -> String {
+    if tps.is_empty() {
+        return String::new();
+    }
+    let inner = tps
+        .iter()
+        .map(|t| match &t.bound {
+            Some(b) => format!("{}: {}", t.name, b),
+            None => t.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{inner}>")
+}
+
+fn render_struct(s: &IStructDef) -> String {
+    // `pub` first, then attributes (parser order): `pub layout(C) align(16) Name { ... }`.
+    let mut out = String::from("pub ");
+    if s.c_repr {
+        out.push_str("layout(C) ");
+    }
+    if let Some(a) = s.align {
+        out.push_str(&format!("align({a}) "));
+    }
+    out.push_str(&s.name);
+    out.push_str(&render_type_params(&s.type_params));
+    out.push_str(" {\n");
+    for (name, ty) in &s.fields {
+        out.push_str(&format!("    {name}: {},\n", render_itype(ty)));
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn render_enum(e: &IEnumDef) -> String {
+    let mut out = String::from("pub ");
+    out.push_str(&e.name);
+    out.push_str(&render_type_params(&e.type_params));
+    out.push_str(" {\n");
+    for (name, payload) in &e.variants {
+        if payload.is_empty() {
+            out.push_str(&format!("    {name},\n"));
+        } else {
+            let ps = payload.iter().map(render_itype).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("    {name}({ps}),\n"));
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn render_fn(f: &IFnSig) -> String {
+    if let Some(body) = &f.generic_body {
+        // A generic `pub` template ships its full declaration (incl. body) as source — the consumer
+        // monomorphizes it. `fd.span` starts at `fn`, so re-add the `pub` the slice omitted.
+        let trimmed = body.trim_start();
+        if trimmed.starts_with("pub") {
+            return format!("{body}\n");
+        }
+        return format!("pub {trimmed}\n");
+    }
+    // A non-generic `pub` fn: signature only, with an empty body. The body is never type-checked (the
+    // module is interface-only) and the function is never emitted into the consumer's program; the
+    // signature exists only so the consumer resolves `dep.f(...)`. Parameter names are synthesized
+    // (the summary is positional — names are not an interface property).
+    let params = f
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let out = if p.is_out { "out " } else { "" };
+            format!("{out}arg{i}: {}", render_itype(&p.ty))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret = if is_unit_itype(&f.ret) { String::new() } else { format!(" -> {}", render_itype(&f.ret)) };
+    format!("pub fn {}({params}){ret} {{}}\n", f.name)
+}
+
+/// Render an imported unit's `InterfaceSummary` back to Align source: exactly its public surface, as
+/// the consumer's per-unit sema must re-parse it to resolve `dep.name`. `dep_units` are the names of
+/// the other units in the transitive dependency set; each is `import`ed so any module reference in a
+/// generic template body (which is opaque here) still resolves. Interface-only modules emit no
+/// diagnostics in sema, so the (possibly unused) imports are silent.
+pub fn summary_to_source(summary: &InterfaceSummary, dep_units: &[&str]) -> String {
+    let mut out = String::new();
+    for dep in dep_units {
+        if *dep != summary.unit {
+            out.push_str(&format!("import {dep}\n"));
+        }
+    }
+    for c in &summary.consts {
+        out.push_str("pub ");
+        out.push_str(&c.name);
+        if let Some(ty) = &c.ty {
+            out.push_str(": ");
+            out.push_str(&render_itype(ty));
+        }
+        out.push_str(" := ");
+        out.push_str(&c.value_src);
+        out.push('\n');
+    }
+    for s in &summary.structs {
+        out.push_str(&render_struct(s));
+    }
+    for e in &summary.enums {
+        out.push_str(&render_enum(e));
+    }
+    for f in &summary.fns {
+        out.push_str(&render_fn(f));
+    }
+    out
+}
+
+/// The cross-unit effect seeds an importer needs: the 3-valued effect bit of every **non-generic**
+/// `pub` function in `summary`, keyed by its canonical (mangled) name. Generic functions are excluded
+/// — their monomorphs are instantiated into the importer's own program and their effects recomputed
+/// from the instantiated body. `is_entry` is the imported unit's entry flag (always `false` for a real
+/// dependency; the parameter mirrors [`align_sema::Module::is_entry`]).
+pub fn summary_effects(
+    summary: &InterfaceSummary,
+    is_entry: bool,
+) -> HashMap<String, align_sema::FnEffect> {
+    let mut m = HashMap::new();
+    for f in &summary.fns {
+        if f.generic_body.is_some() {
+            continue;
+        }
+        let canonical = mangle(&summary.unit, is_entry, &f.name);
+        let e = match f.effect {
+            Effect::Pure => align_sema::FnEffect::Pure,
+            Effect::Impure => align_sema::FnEffect::Impure,
+            Effect::Unknown => align_sema::FnEffect::Unknown,
+        };
+        m.insert(canonical, e);
+    }
+    m
 }

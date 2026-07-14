@@ -34,7 +34,7 @@ fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
     let modules: Vec<align_sema::Module> = units
         .iter()
         .zip(&asts)
-        .map(|(u, ast)| align_sema::Module { path: u.path.to_string(), file: ast, is_entry: u.is_entry })
+        .map(|(u, ast)| align_sema::Module { path: u.path.to_string(), file: ast, is_entry: u.is_entry, interface_only: false })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
     assert!(!diags.has_errors(), "program should type-check");

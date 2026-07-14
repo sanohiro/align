@@ -2614,7 +2614,30 @@ fixtures had used exactly this hole (private struct through `pub fn` `soa<T>`) a
 corrected — the rule bites on real code. `draft.md` §17 + the language-spec digest carry the
 rule; the S1a "known finding" note is flipped to an ENFORCED invariant. **(2) still standing
 for S1b proper: consumers must key on the TRANSITIVE set of imported units' interface hashes**
-(foreign type references are by-name in the canonical surface). **S2**
+(foreign type references are by-name in the canonical surface). **S1b (consumer) SHIPPED
+2026-07-14**: per-unit sema against imported summaries. Seam = **summary→source→re-parse** (NOT a
+second resolver): an imported unit's public surface is rendered back to Align source
+(`align_interface::summary_to_source`) and re-parsed by the EXISTING parser into an interface-only
+`Module` (`Module::interface_only`), so every sema table-building + resolution pass is reused unchanged
+— ONE resolution path (generic templates and const values must be re-parsed regardless, so
+render-to-source unifies the whole reconstruction). Cross-unit effect bits seed
+`compute_effect_sets`/`fn_effects`/`check_parallelism` via the new `check_program_with_effects`; a
+callee absent from the seed map is **fail-closed** to impure + unknown-indirect (never optimistically
+Pure). Driver `check_per_unit` walks the DAG bottom-up (topo post-order), reconstructs each transitive
+dep from its summary, checks each unit, re-derives its own summary, and records the **transitive
+(unit, interface_hash) dependency set** per unit — the S3 cache-key input (`PerUnitCheck`; dev verb
+`alignc check-per-unit`). Gates (25 new tests): differential accept/reject parity vs whole-program
+`check_program` over a 20+-case corpus (cross fns/types/sums/consts/generics/effects/Move-structs +
+negatives); blindness (a dep private-body edit leaves a dependent's verdict + interface hash + dep-hash
+set identical); effect fail-closed (Pure accepts / Impure·Unknown·ABSENT reject at `par_map`;
+sequential impure imports stay legal); cross-unit generics instantiated in-consumer with effects
+recomputed on instantiation; the A→B→C transitive-hash test (a C `pub`-signature change flips main's
+dep set; a C private-body OR non-generic-`pub`-fn-body edit does not); N=1 whole-program path
+byte-identical (`check_program` delegates to `check_program_with_effects` with an empty seed map).
+Honest remainder: per-unit summary production runs per-unit MIR lowering for capabilities only
+(capabilities are outside the interface hash, so this does not affect any S1b gate); the
+private-cross-unit-access diagnostic differs by design ("unknown" per-unit vs "private" whole-program —
+verdict identical). **S2**
 per-unit codegen + N-object link
 (visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification

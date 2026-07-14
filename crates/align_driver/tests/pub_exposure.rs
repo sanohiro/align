@@ -161,3 +161,125 @@ fn pub_generic_fn_over_its_own_type_params_is_legal() {
                fn main() -> i32 = pick(1, 2) as i32\n";
     assert!(!check_errs("pub-generic-params", src), "a generic pub fn over its own params must be legal");
 }
+
+// ---- generic `pub` fn BODY may reference only pub items (M15 S1b, gate finding D1) ----------------
+//
+// A generic `pub` fn's body is part of its interface: the summary ships the template and it is
+// monomorphized in importing modules, where the defining module's PRIVATE items do not exist. So a
+// generic `pub` fn body may reference only `pub` same-module items. Enforced at the producer in
+// ordinary sema (both checkers), so `check` and `check-per-unit` agree — see the differential parity
+// case in `per_unit.rs`. Non-generic `pub` fns and private generic fns are NOT affected.
+
+#[test]
+fn generic_pub_fn_body_referencing_private_fn_is_rejected() {
+    // D1 (single-file view): the generic `pub` template `bump` calls the private `helper`.
+    let src = "fn helper(x: i64) -> i64 = x + 1\n\
+               pub fn bump<T>(x: T, n: i64) -> i64 = helper(n)\n\
+               fn main() -> i32 = bump(0, 41) as i32\n";
+    let d = check_diagnostics("gen-body-private-fn", src);
+    assert!(
+        d.contains("pub generic fn 'bump' references private fn 'helper' in its body"),
+        "expected the private-fn body-reference error, got:\n{d}"
+    );
+}
+
+#[test]
+fn generic_pub_fn_body_referencing_private_type_annotation_is_rejected() {
+    // A private type named in a `let` annotation inside the template body.
+    let src = "Secret { v: i64 }\n\
+               pub fn wrap<T>(x: T) -> i64 {\n  s: Secret := Secret { v: 1 }\n  return s.v\n}\n\
+               fn main() -> i32 = wrap(0) as i32\n";
+    let d = check_diagnostics("gen-body-private-type-anno", src);
+    assert!(
+        d.contains("pub generic fn 'wrap' references private type 'Secret' in its body"),
+        "expected the private-type body-reference error, got:\n{d}"
+    );
+}
+
+#[test]
+fn generic_pub_fn_body_referencing_private_type_struct_literal_is_rejected() {
+    // The struct-literal type name itself names a private type.
+    let src = "Secret { v: i64 }\n\
+               pub fn wrap<T>(x: T) -> i64 {\n  s := Secret { v: 1 }\n  return s.v\n}\n\
+               fn main() -> i32 = wrap(0) as i32\n";
+    let d = check_diagnostics("gen-body-private-type-lit", src);
+    assert!(
+        d.contains("pub generic fn 'wrap' references private type 'Secret' in its body"),
+        "expected the private-type struct-literal error, got:\n{d}"
+    );
+}
+
+#[test]
+fn generic_pub_fn_body_referencing_private_const_is_rejected() {
+    // A private top-level constant referenced from the template body.
+    let src = "SECRET := 42\n\
+               pub fn add<T>(x: T) -> i64 = SECRET + 1\n\
+               fn main() -> i32 = add(0) as i32\n";
+    let d = check_diagnostics("gen-body-private-const", src);
+    assert!(
+        d.contains("pub generic fn 'add' references private const 'SECRET' in its body"),
+        "expected the private-const body-reference error, got:\n{d}"
+    );
+}
+
+#[test]
+fn generic_pub_fn_body_referencing_private_enum_construction_is_rejected() {
+    // Constructing a private enum inside the template body names the private type as the receiver of
+    // `Shape.Circle(..)` — a body leak even with no `match` (the construction alone is the reference).
+    let src = "Shape { Circle(i64), Square(i64) }\n\
+               pub fn mk<T>(x: T) -> i64 {\n  s := Shape.Circle(3)\n  return 0\n}\n\
+               fn main() -> i32 = mk(0) as i32\n";
+    let d = check_diagnostics("gen-body-private-enum", src);
+    assert!(
+        d.contains("pub generic fn 'mk' references private type 'Shape' in its body"),
+        "expected the private-enum construction error, got:\n{d}"
+    );
+}
+
+#[test]
+fn generic_pub_fn_body_referencing_pub_helper_is_legal() {
+    // A `pub` helper (fn / const / type) is part of the interface, so the template may use it.
+    let src = "pub SCALE := 10\n\
+               pub fn helper(x: i64) -> i64 = x + 1\n\
+               pub Wrap { v: i64 }\n\
+               pub fn bump<T>(x: T, n: i64) -> i64 {\n  w := Wrap { v: helper(n) + SCALE }\n  return w.v\n}\n\
+               fn main() -> i32 = bump(0, 41) as i32\n";
+    assert!(!check_errs("gen-body-pub-helper", src), "a generic pub body may reference pub items");
+}
+
+#[test]
+fn generic_pub_fn_body_local_shadowing_private_fn_is_legal() {
+    // A local named like a private fn shadows it (scoping respected) — no reference to the item.
+    let src = "fn helper(x: i64) -> i64 = x + 1\n\
+               pub fn bump<T>(x: T) -> i64 {\n  helper := 7\n  return helper + 1\n}\n\
+               fn main() -> i32 = bump(0) as i32\n";
+    assert!(!check_errs("gen-body-local-shadow", src), "a local shadowing a private fn must be legal");
+}
+
+#[test]
+fn generic_pub_fn_body_using_only_type_params_is_legal() {
+    // Type parameters are substituted at instantiation — never a same-module item reference.
+    let src = "pub fn id<T>(x: T) -> T {\n  y: T := x\n  return y\n}\n\
+               fn main() -> i32 = id(0) as i32\n";
+    assert!(!check_errs("gen-body-type-params", src), "type params used in a generic body must be legal");
+}
+
+#[test]
+fn non_generic_pub_fn_body_may_reference_private_items() {
+    // A NON-generic `pub` fn's body stays in its own unit (never shipped as a template), so it may
+    // freely reference private same-module items.
+    let src = "fn helper(x: i64) -> i64 = x + 1\n\
+               SECRET := 5\n\
+               pub fn bump(n: i64) -> i64 = helper(n) + SECRET\n\
+               fn main() -> i32 = bump(41) as i32\n";
+    assert!(!check_errs("nongeneric-pub-body", src), "a non-generic pub body may reference private items");
+}
+
+#[test]
+fn private_generic_fn_body_may_reference_private_items() {
+    // A PRIVATE generic fn is not part of any interface, so its body may reference private items.
+    let src = "fn helper(x: i64) -> i64 = x + 1\n\
+               fn bump<T>(x: T, n: i64) -> i64 = helper(n)\n\
+               fn main() -> i32 = bump(0, 41) as i32\n";
+    assert!(!check_errs("private-generic-body", src), "a private generic body may reference private items");
+}

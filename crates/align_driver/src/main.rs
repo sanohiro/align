@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   alignc check     <file>   lexer -> parser -> sema. Print diagnostics
+//!   alignc check-per-unit <file>  Check each unit against its imports' interface summaries (M15 S1b)
 //!   alignc emit-interface <file>  Print each unit's interface summary + interface/impl hashes (M15)
 //!   alignc emit-mir  <file>   Print MIR as text
 //!   alignc emit-llvm <file>   Print LLVM IR as text (--stage raw|optimized; default raw)
@@ -101,6 +102,7 @@ fn main() -> ExitCode {
 
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
+        (Some("check-per-unit"), Some(p)) => run_check_per_unit(p),
         (Some("emit-interface"), Some(p)) => run_emit_interface(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
         (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports, rt_lto),
@@ -250,6 +252,7 @@ fn usage() {
          \n\
          commands:\n  \
            check      check through lexer/parser/sema\n  \
+           check-per-unit  check each unit against its imports' interface summaries (M15 S1b)\n  \
            emit-interface  print each unit's interface summary + interface/impl hashes\n  \
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text (--stage raw|optimized; default raw)\n  \
@@ -332,6 +335,36 @@ fn run_check(path: &str) -> ExitCode {
         println!("ok: checked {} function(s)", checked.hir.fns.len());
         ExitCode::SUCCESS
     }
+}
+
+/// `alignc check-per-unit <file>` (M15 S1b, dev verb): check the program **per unit** — each unit
+/// against only its own AST plus the interface summaries of its (transitively-closed) imports, walking
+/// the import DAG bottom-up. Prints each unit's transitive interface-hash dependency set (the S3 cache
+/// key input). This is an additive capability that proves the separate-compilation seam; it does not
+/// replace the whole-program `check`/`build` path.
+fn run_check_per_unit(path: &str) -> ExitCode {
+    let Some(src) = read(path) else {
+        return ExitCode::FAILURE;
+    };
+    let mut sm = SourceMap::new();
+    let result = align_driver::check_per_unit(&mut sm, path, &src);
+    if !result.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &result.diags));
+    }
+    if result.diags.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    for (unit, deps) in &result.dep_interface_hashes {
+        println!("unit {unit}");
+        if deps.is_empty() {
+            println!("  (no dependencies)");
+        }
+        for (dep, hash) in deps {
+            println!("  depends on {dep} @ {}", hash.to_hex());
+        }
+    }
+    println!("ok: checked {} unit(s) per-unit", result.dep_interface_hashes.len());
+    ExitCode::SUCCESS
 }
 
 /// `alignc emit-interface <file>` (M15 S1a, dev verb): print each unit's interface summary — its
