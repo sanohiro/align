@@ -2707,7 +2707,7 @@ the future cross-unit ThinLTO acceptance matrix; do NOT add tuple-specific field
 interning work, or a custom flattening ABI now. ThinLTO is the one already-settled mechanism that
 removes the producer/consumer boundary and recovers scalar replacement for structs, tuples, and
 other aggregates together. The gate must require the 4/8-value `sret` store/load round trip to vanish
-for the inlineable positive case while a deliberately non-inline dynamic control retains a valid
+for the inlinable positive case while a deliberately non-inline dynamic control retains a valid
 cross-unit ABI.
 
 **S3** the incremental cache per the
