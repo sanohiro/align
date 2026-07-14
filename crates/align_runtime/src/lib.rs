@@ -8,6 +8,15 @@
 //! [`align_rt_print_i64`]. Formatting lives here (not in codegen) so it can later be
 //! swapped for a SIMD itoa without touching the compiler (`open-questions.md` Future).
 
+// The `memcmp`-class fast-path string primitives (`str_eq`/`starts_with`/`ends_with`/
+// `eq_ignore_case`) + their sole helper `safe_slice` live in their own file so the driver's
+// `build.rs` can compile exactly them to a standalone bitcode artifact for `--rt-lto` (M14 Slice 2,
+// `docs/impl/07-roadmap.md`). ONE source of truth: this same file is compiled into the staticlib
+// here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
+// `align_rt_str_*` symbols.
+mod str_prims;
+pub use str_prims::*;
+
 /// Builtin `print` for integers: write the decimal value + newline to stdout.
 ///
 /// M1 widens every integer argument to `i64` in codegen and routes it here. `bool`,
@@ -108,22 +117,12 @@ pub struct AlignStr {
     pub len: i64,
 }
 
-// FFI-boundary helpers. `safe_len` validates an i64 length (Err if negative or > isize::MAX).
-// `safe_slice` constructs a `&[T]` from an FFI pointer and i64 length, returning an empty slice
-// if len <= 0, ptr is null, or the total byte size would exceed isize::MAX.
+// FFI-boundary helper. `safe_len` validates an i64 length (Err if negative or > isize::MAX). The
+// companion `safe_slice` moved to `str_prims.rs` (re-exported above) so the `--rt-lto` bitcode
+// artifact can be compiled from exactly the fast-path string set.
 #[inline(always)]
 fn safe_len(len: i64) -> Result<usize, ()> {
     usize::try_from(len).map_err(|_| ()).and_then(|x| if x <= isize::MAX as usize { Ok(x) } else { Err(()) })
-}
-
-#[inline(always)]
-unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
-    let Ok(n) = isize::try_from(len) else { return &[] };
-    if n <= 0 || ptr.is_null() { return &[] }
-    let n = n as usize;
-    let size = std::mem::size_of::<T>();
-    if size > 0 && n > isize::MAX as usize / size { return &[] }
-    unsafe { std::slice::from_raw_parts(ptr, n) }
 }
 
 /// `str.clone()` — deep-copy the bytes of a `str` view into a fresh heap buffer, returning an
@@ -6243,31 +6242,6 @@ pub unsafe extern "C" fn align_rt_compress_zstd_decompress(ptr: *const u8, len: 
     unsafe { publish_buffer(zstd_decompress_impl(data), out) }
 }
 
-/// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
-///
-/// # Safety
-/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
-    // `alen < 0` guards the FFI boundary the same way as `eq_ignore_case`: an equal-and-negative
-    // length would otherwise wrap to a huge `usize` in `from_raw_parts` (UB). Real lengths are >= 0.
-    if alen != blen || alen < 0 {
-        return 0;
-    }
-    // Same view, or both empty: equal without touching memory. This also avoids
-    // `from_raw_parts` on a (possibly null) pointer of a zero-length view, which is UB.
-    if a == b || alen == 0 {
-        return 1;
-    }
-    let (x, y) = unsafe {
-        (
-            safe_slice(a, alen),
-            safe_slice(b, blen),
-        )
-    };
-    (x == y) as i32
-}
-
 /// Byte-lexicographic order of two `str` views (`Ord(str)`, 2026-07-09): returns -1 if `a < b`,
 /// 0 if equal, 1 if `a > b`. This is `memcmp` over the shared prefix with the shorter string
 /// ordering first on a tie (Rust's `<[u8]>::cmp` is exactly this) — deterministic and locale-free
@@ -6361,76 +6335,6 @@ pub unsafe extern "C" fn align_rt_str_rfind(hptr: *const u8, hlen: i64, nptr: *c
         Some(i) => i as i64,
         None => -1,
     }
-}
-
-/// `s.eq_ignore_ascii_case(other)` (M5, `core.string`) — 1 if the two byte runs are equal with ASCII
-/// letters compared case-insensitively (non-ASCII bytes compare exactly), else 0. Not Unicode
-/// case-folding (that stays package-level). Backed by `[u8]::eq_ignore_ascii_case`.
-///
-/// # Safety
-/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_eq_ignore_case(aptr: *const u8, alen: i64, bptr: *const u8, blen: i64) -> i32 {
-    // `alen < 0` guards the FFI boundary: a (never-expected) negative length would otherwise survive
-    // the `alen != blen` check when both are equal-and-negative, then wrap to a huge `usize` in
-    // `from_raw_parts` (UB). Real `str` lengths are always >= 0; this is pure defense in depth.
-    if alen != blen || alen < 0 {
-        return 0;
-    }
-    if aptr == bptr || alen == 0 {
-        return 1;
-    }
-    let (a, b) = unsafe {
-        (
-            safe_slice(aptr, alen),
-            safe_slice(bptr, blen),
-        )
-    };
-    a.eq_ignore_ascii_case(b) as i32
-}
-
-/// `s.starts_with(prefix)` (M5, `core.string`) — 1 if `s` begins with `prefix`'s bytes, else 0.
-///
-/// # Safety
-/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_starts_with(hptr: *const u8, hlen: i64, pptr: *const u8, plen: i64) -> i32 {
-    if plen <= 0 {
-        return 1;
-    }
-    if plen > hlen {
-        return 0;
-    }
-    let (hay, pre) = unsafe {
-        (
-            safe_slice(hptr, plen),
-            safe_slice(pptr, plen),
-        )
-    };
-    (hay == pre) as i32
-}
-
-/// `s.ends_with(suffix)` (M5, `core.string`) — 1 if `s` ends with `suffix`'s bytes, else 0.
-///
-/// # Safety
-/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_ends_with(hptr: *const u8, hlen: i64, sptr: *const u8, slen: i64) -> i32 {
-    if slen <= 0 {
-        return 1;
-    }
-    if slen > hlen {
-        return 0;
-    }
-    // Compare the trailing `slen` bytes of the haystack against the suffix.
-    let tail = unsafe { hptr.add((hlen - slen) as usize) };
-    let (hay, suf) = unsafe {
-        (
-            safe_slice(tail, slen),
-            safe_slice(sptr, slen),
-        )
-    };
-    (hay == suf) as i32
 }
 
 /// Wrap a `&[u8]` sub-slice of an already-valid `str` buffer as an `AlignStr` view. The slice

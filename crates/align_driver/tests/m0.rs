@@ -42,7 +42,7 @@ fn m0_compiles_and_runs_with_exit_code() {
     let dir = std::env::temp_dir();
     let obj = dir.join("align-test-m0.o");
     let exe = dir.join("align-test-m0");
-    align_driver::emit_object_file(&mir, &obj, align_driver::BuildTarget::Baseline, align_driver::Profile::Release, &[]).expect("codegen");
+    align_driver::emit_object_file(&mir, &obj, align_driver::BuildTarget::Baseline, align_driver::Profile::Release, &[], false).expect("codegen");
     align_driver::link_executable(&obj, &exe, &mir.link_libs, align_driver::Profile::Release).expect("link");
 
     let status = std::process::Command::new(&exe).status().expect("run");

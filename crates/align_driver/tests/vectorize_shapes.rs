@@ -54,7 +54,7 @@ fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    emit_llvm_ir(&mir, BuildTarget::Cpu(cpu.to_string()), optimized, &[]).expect("emit llvm ir")
+    emit_llvm_ir(&mir, BuildTarget::Cpu(cpu.to_string()), optimized, &[], false).expect("emit llvm ir")
 }
 
 /// Optimized IR (the `-O2` lens — "what LLVM did").

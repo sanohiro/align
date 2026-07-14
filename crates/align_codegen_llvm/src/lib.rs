@@ -27,6 +27,7 @@ use inkwell::debug_info::{
     DWARFSourceLanguage, DebugInfoBuilder,
 };
 use inkwell::intrinsics::Intrinsic;
+use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
@@ -254,15 +255,47 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
 /// Creates exactly one `TargetMachine` for the whole compile and threads it through both
 /// `build_module` (data layout / triple / ABI classification) and `write_object` (optimization +
 /// object emission), so the two stages always agree on the same target settings.
-pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String]) -> Result<(), CodegenError> {
+/// `rt_lto` = the baked `--rt-lto` runtime bitcode (`Some(bytes)`), or `None` for the default
+/// (flag-off) path, which stays byte-identical to before this slice. When `Some`, the fast-path
+/// string primitives' bodies are linked into the RAW module and internalized before the single opt
+/// run, so the optimizer can inline them (probe: `str_eq` 2.1×) — M14 Slice 2. Probe-then-annotate:
+/// the baked bitcode is parsed FIRST; only if that succeeds are the guarded declares left
+/// un-curated. An unparseable artifact emits a loud diagnostic and falls back to the flag-off path
+/// with the curated contract intact (never silently dropped).
+pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String], rt_lto: Option<&[u8]>) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
-    build_module(&ctx, &module, program, &tm, None, exports)?;
+    // Probe the baked bitcode before deciding whether to skip curating the guarded declares.
+    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
+    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    if let Some(rt) = rt_module {
+        // On a datalayout mismatch `link_in_rt_lto` falls back on its own (loud diagnostic, guarded
+        // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
+        link_in_rt_lto(&ctx, &module, rt)?;
+    }
     // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
     apply_size_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// Parse the baked `--rt-lto` bitcode for [`emit_object`] / [`emit_llvm_ir`], turning a parse failure
+/// into the fail-loud fallback: a diagnostic on stderr naming the cause, then `None` so the caller
+/// re-curates the guarded declares and emits the flag-off object. Kept out of `parse_rt_lto_module`
+/// (which stays a pure `Result`) so the "diagnose + fall back" policy lives at exactly one seam.
+fn probe_rt_lto<'c>(ctx: &'c Context, bitcode: &[u8]) -> Option<Module<'c>> {
+    match parse_rt_lto_module(ctx, bitcode) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!(
+                "alignc: --rt-lto disabled: cannot parse baked runtime bitcode ({e}); \
+                 falling back to the runtime staticlib. This is a compiler build defect, not a \
+                 problem with your program."
+            );
+            None
+        }
+    }
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
@@ -277,13 +310,28 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
 ///
 /// Creates exactly one `TargetMachine` for the whole call and reuses it for both `build_module`
 /// and (when `optimized`) the opt pipeline.
-pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, exports: &[String]) -> Result<String, CodegenError> {
+/// `rt_lto` is the observation lens for the `--rt-lto` gates. `Some(bytes)` links the fast-path
+/// string bitcode into the RAW module and internalizes it (the merge is part of what codegen
+/// produces pre-opt), regardless of `optimized`, so both lenses are available:
+/// - `--stage raw --rt-lto` = post-link / **pre-opt**: the guarded four carry bodies with their
+///   `rt_contract` attrs shed, `str_cmp` is still an attributed declare — the attr-xor + link view.
+/// - `--stage optimized --rt-lto` = after the one `O2` run: the merged/inlined shape (an
+///   `x == "literal"` filter with no `call @align_rt_str_eq`).
+///
+/// `None` is the default path, byte-identical to before this slice (no link, no probe).
+pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, exports: &[String], rt_lto: Option<&[u8]>) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     // Diagnostic lens: codegen opt pinned to `Default` (no size attrs, pipeline `O2` below) so the
     // IR-shape suite stays profile-independent and byte-identical.
     let tm = create_target_machine(target, OptimizationLevel::Default)?;
-    build_module(&ctx, &module, program, &tm, None, exports)?;
+    // Probe-then-annotate mirrors `emit_object`. Linked into the raw module (before any opt run) so
+    // `--stage raw --rt-lto` exposes the pre-opt merged shape for the attr-xor gate.
+    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
+    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    if let Some(rt) = rt_module {
+        link_in_rt_lto(&ctx, &module, rt)?;
+    }
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
@@ -332,7 +380,8 @@ pub fn collect_opt_remarks(
     // `sink` is freed.
     let _detach_guard = DiagnosticHandlerGuard { ctx: ctx.raw() };
 
-    let built = build_module(&ctx, &module, program, &tm, Some(debug), &[]);
+    // `explain-opt` never auto-enables `--rt-lto` (the default lens stays curated-declare shape).
+    let built = build_module(&ctx, &module, program, &tm, Some(debug), &[], false);
     let ran = built.and_then(|()| run_opt_pipeline(&module, &tm, "default<O2>"));
 
     drop(_detach_guard);
@@ -433,6 +482,7 @@ fn build_module<'c>(
     tm: &TargetMachine,
     debug: Option<&DebugInfo>,
     exports: &[String],
+    rt_lto_skip_guarded: bool,
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -1924,7 +1974,9 @@ fn build_module<'c>(
     // M13 Slice 5A — every `align_rt_*` declare now exists; hand-annotate the audited subset whose
     // contract is provable from the runtime body (LLVM can't see those Rust bodies and never inlines
     // the calls, so it infers nothing without this). Fail-safe: an unlisted symbol gets no attribute.
-    apply_rt_contract_attrs(ctx, module);
+    // `rt_lto_skip_guarded` (the `--rt-lto` path) additionally withholds curation from the guarded
+    // set — they are about to gain real bodies whose attributes LLVM infers (M14 Slice 2).
+    apply_rt_contract_attrs(ctx, module, rt_lto_skip_guarded);
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
     // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
     // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
@@ -3184,15 +3236,45 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
     }
 }
 
+/// The `align_rt_*` symbols whose bodies the `--rt-lto` bitcode artifact defines (M14 Slice 2):
+/// the `memcmp`-class fast-path string primitives the probe measured as an LTO win (`str_eq` 2.1×).
+/// `str_cmp` is deliberately EXCLUDED (it regressed ~0.72× under post-link reoptimization);
+/// `utf8_valid` is excluded from v1 (SIMD body + non-argument feature-detect memory, unmeasured).
+/// This set is the single seam for two structural facts: (a) `apply_rt_contract_attrs` skips
+/// hand-curating these declares when `--rt-lto` is on (they will gain real bodies whose attributes
+/// LLVM infers — a stale curated attr shadowing a visible body is a latent miscompile), and (b)
+/// `link_in_rt_lto` sheds exactly [`rt_contract`]'s attrs from each once its body is merged in.
+const RT_LTO_GUARDED: &[&str] = &[
+    "align_rt_str_eq",
+    "align_rt_str_starts_with",
+    "align_rt_str_ends_with",
+    "align_rt_str_eq_ignore_case",
+];
+
+/// Whether `sym` is a `--rt-lto` guarded symbol (see [`RT_LTO_GUARDED`]).
+fn is_rt_lto_guarded(sym: &str) -> bool {
+    RT_LTO_GUARDED.contains(&sym)
+}
+
 /// Apply `RT_CONTRACT_ATTRS` to every runtime declaration in the module. Runs once, after all
 /// `align_rt_*` declares are created. Filters to `align_rt_`-prefixed *declarations* (zero basic
 /// blocks) so it can never touch an Align-generated definition; a symbol without a contract entry is
 /// left untouched (the fail-safe default).
-fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
+///
+/// `skip_guarded` = the `--rt-lto` path: the guarded set ([`RT_LTO_GUARDED`]) is left UN-annotated
+/// because [`link_in_rt_lto`] is about to give each a real body (curating a declare we then define
+/// would just shadow LLVM's body-derived inference — the probe's `rt_contract` split). Off (`false`,
+/// the flag-off default and the fallback re-annotate) → curate every contracted declare, today's
+/// behavior. The decision is made by the caller AFTER probing the baked bitcode (probe-then-annotate),
+/// so an unparseable artifact re-annotates correctly instead of silently dropping the contract.
+fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>, skip_guarded: bool) {
     for f in module.get_functions() {
         let name = f.get_name();
         let Ok(name) = name.to_str() else { continue };
         if !name.starts_with("align_rt_") || f.count_basic_blocks() != 0 {
+            continue;
+        }
+        if skip_guarded && is_rt_lto_guarded(name) {
             continue;
         }
         let Some(c) = rt_contract(name) else { continue };
@@ -3216,6 +3298,112 @@ fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
             );
         }
     }
+}
+
+/// Strip exactly [`rt_contract`]`(sym)`'s hand-curated attributes from a now-body-carrying runtime
+/// function `f` (the `--rt-lto` safety-net shed). Once a body is visible, LLVM's own FunctionAttrs
+/// pass infers memory/`nofree`/etc. from the real code; a stale hand-curated attr shadowing that
+/// body is a latent miscompile (the `rt_contract` split, M14 Slice 2). We remove ONLY this symbol's
+/// curated attrs — never a blanket all-attr wipe, which would also strip rustc's body-derived attrs
+/// and *weaken* the result. `remove_enum_attribute` is a no-op when the attribute is absent, so this
+/// is safe even though `apply_rt_contract_attrs(skip_guarded=true)` already withheld them on the
+/// declare (the merged definition could still carry them from a future annotate path).
+fn shed_rt_contract_attrs<'c>(f: FunctionValue<'c>, c: &RtContract) {
+    use inkwell::attributes::AttributeLoc;
+    for a in c.fn_attrs {
+        f.remove_enum_attribute(AttributeLoc::Function, enum_kind_id(a));
+    }
+    if c.memory.is_some() {
+        f.remove_enum_attribute(AttributeLoc::Function, enum_kind_id("memory"));
+    }
+    for &p in c.read_ptr_params {
+        f.remove_enum_attribute(AttributeLoc::Param(p), enum_kind_id("readonly"));
+        f.remove_enum_attribute(AttributeLoc::Param(p), enum_kind_id("captures"));
+    }
+}
+
+/// Parse the baked `--rt-lto` bitcode (`build.rs` → `str_prims.bc`, `include_bytes!`) into a module
+/// in `ctx`. The probe half of "probe-then-annotate": the caller decides whether to skip curating
+/// the guarded declares based on whether THIS succeeds, so an unparseable artifact never leaves the
+/// contract silently dropped.
+///
+/// inkwell 0.9's `create_from_memory_range_copy` *asserts* a trailing nul byte and hands LLVM
+/// `len - 1` bytes (the nul is treated as one-past-the-end) — a raw `include_bytes!` bitcode slice
+/// has no such nul, so passing it directly silently drops the final bitcode byte ("Invalid bitcode
+/// signature"). We copy the bitcode into a `Vec` with an appended nul so the constructor copies
+/// exactly `bitcode.len()` real bytes.
+fn parse_rt_lto_module<'c>(ctx: &'c Context, bitcode: &[u8]) -> Result<Module<'c>, String> {
+    let mut with_nul = Vec::with_capacity(bitcode.len() + 1);
+    with_nul.extend_from_slice(bitcode);
+    with_nul.push(0);
+    let buf = MemoryBuffer::create_from_memory_range_copy(&with_nul, "align_rt_lto");
+    Module::parse_bitcode_from_buffer(&buf, ctx).map_err(|e| e.to_string())
+}
+
+/// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
+/// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
+/// the program's — a mismatch means blindly overwriting it (the old unconditional
+/// `rt.set_data_layout`) would silently relayout the runtime's types/offsets to a target it was not
+/// baked for, a latent miscompile; instead this falls back exactly like an unparseable artifact
+/// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
+/// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
+/// datalayout too (now known equal); (2) `link_in_module` (the definitions replace the program's
+/// external `align_rt_*` declares); (3) for every `align_rt_*` function that now has a body, shed its
+/// `rt_contract` attrs ([`shed_rt_contract_attrs`]) and set it `internal` DIRECTLY (never the
+/// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
+/// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
+/// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
+/// run (the probe's double-opt is what regressed `str_cmp`).
+///
+/// On the datalayout-mismatch fallback (step 0), no merge happens and this re-curates the guarded
+/// declares itself (`apply_rt_contract_attrs(ctx, module, false)`) before returning `Ok(())` — the
+/// caller passed `rt_lto_skip_guarded = true` to `build_module` on the strength of the bitcode merely
+/// parsing, so without this the guarded declares would be left permanently un-curated.
+fn link_in_rt_lto<'c>(ctx: &'c Context, module: &Module<'c>, rt: Module<'c>) -> Result<(), CodegenError> {
+    // (0) A parsed-but-wrong-target artifact is the same class of compiler build defect as an
+    // unparseable one — fail loud, fall back, never force a mismatched layout onto the runtime's IR.
+    // Compared via a bool first (rather than holding the `Ref<DataLayout>` borrows across the branch
+    // below) so `rt`'s data-layout `RefCell` is free again before `rt.set_data_layout` needs it
+    // mutably on the match path.
+    let want = module.get_data_layout();
+    let matches = rt.get_data_layout().as_str() == want.as_str();
+    if !matches {
+        eprintln!(
+            "alignc: --rt-lto disabled: baked runtime bitcode datalayout ({:?}) does not match the \
+             program's ({:?}); falling back to the runtime staticlib. This is a compiler build \
+             defect, not a problem with your program.",
+            rt.get_data_layout().as_str(),
+            want.as_str()
+        );
+        apply_rt_contract_attrs(ctx, module, false);
+        return Ok(());
+    }
+    // (1) Match target so the linker never complains about a triple mismatch (cosmetic — datalayout
+    // is already confirmed equal above).
+    rt.set_triple(&module.get_triple());
+    rt.set_data_layout(&want);
+    // (2) Merge. On success `rt` is consumed; its `align_rt_*` definitions override the program's
+    // external declares of the same name.
+    module
+        .link_in_module(rt)
+        .map_err(|e| CodegenError::Target(format!("--rt-lto: linking runtime bitcode failed: {e}")))?;
+    // (3) Normalize every runtime symbol that now carries a body.
+    for f in module.get_functions() {
+        let name = f.get_name();
+        let Ok(name) = name.to_str() else { continue };
+        if !name.starts_with("align_rt_") || f.count_basic_blocks() == 0 {
+            continue;
+        }
+        if let Some(c) = rt_contract(name) {
+            shed_rt_contract_attrs(f, &c);
+        }
+        mark_internal(f);
+    }
+    // (4) A merged module that does not verify is a compiler bug (our own baked bitcode), not a user
+    // error — surface it loudly rather than emitting a broken object.
+    module
+        .verify()
+        .map_err(|e| CodegenError::Target(format!("--rt-lto: merged module failed verification: {e}")))
 }
 
 /// Apply the size-optimization function attributes for the build `profile` to every Align-generated
@@ -7948,7 +8136,7 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[]).unwrap()
+        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
     // -- Build profiles reach the backend (Codex audit item 3) ------------------------------------
@@ -7979,7 +8167,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &program, &tm, None, &[]).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
         apply_size_attrs(&ctx, &module, profile);
 
         let optsize = inkwell::attributes::Attribute::get_named_enum_kind_id("optsize");
@@ -8071,7 +8259,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[]).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
     }
 
     fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
@@ -8115,7 +8303,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[]).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
     fn soa_allocation_case_ir(len: Operand, row: StructDef, optimized: bool) -> String {
@@ -8156,7 +8344,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[]).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
     }
 
     #[test]
@@ -8496,7 +8684,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &program, &tm, None, &[]).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
 
         let captures = inkwell::attributes::Attribute::get_named_enum_kind_id("captures");
         let readonly = inkwell::attributes::Attribute::get_named_enum_kind_id("readonly");

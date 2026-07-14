@@ -1,0 +1,13 @@
+// M14 Slice 2 `--rt-lto` benchmark kernel (docs/impl/07-roadmap.md).
+//
+// `eq_count` is the idiomatic constant-length equality filter the Slice-1 probe measured at ~2.1x
+// under runtime-bitcode LTO: linking `align_rt_str_eq`'s body lets the optimizer fold the literal's
+// length (5) into an inline `icmp len, 5` fast path, rejecting the majority (length != 5) with no
+// call/bcmp. `sum_sq_pos` is the numeric non-regression control — already vectorized with zero
+// in-loop runtime calls, so `--rt-lto` must leave it unchanged (probe: 1.000x).
+fn is_hello(x: str) -> bool = x == "hello"
+pub fn eq_count(s: slice<str>) -> i64 = s.where(is_hello).count()
+
+fn pos(x: i64) -> bool = x > 0
+fn sq(x: i64) -> i64 = x * x
+pub fn sum_sq_pos(s: slice<i64>) -> i64 = s.where(pos).map(sq).sum()

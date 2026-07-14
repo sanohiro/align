@@ -2334,6 +2334,66 @@ and its kin — `starts/ends_with`, `eq_ignore_case`, `utf8_valid`), **per-symbo
 via the deferred **per-target-cpu runtime variant + cache key** (already parked on this slice), the
 cheaper lever. PGO/BOLT sequencing unchanged.
 
+**M14 Slice 2 design SETTLED (2026-07-14, two-lens review: soundness + build-integration).**
+
+- **Guarded set v1 = the memcmp-class four:** `str_eq`, `starts_with`, `ends_with`,
+  `eq_ignore_case`. **`utf8_valid` EXCLUDED from v1** — it is the sole candidate touching
+  non-argument memory (the SIMD feature-detect global its `rt_contract` entry already withholds
+  `memory` for), its body is a SIMD kernel whose inlining is bloat, and its win is unmeasured;
+  add later only behind its own ≥ 1.15× bench. `str_cmp` stays out per the probe.
+- **The minimal artifact is a CORRECTNESS requirement, not a size nicety.** Once a body is
+  visible in the merged module, `default<O2>` inlines it regardless of `internal` linkage —
+  linking the full runtime `.bc` would reintroduce the measured 0.72× `str_cmp` regression.
+  The per-symbol guard is therefore realized *structurally*: only guarded bodies exist in the
+  `.bc`; every other `align_rt_*` stays an external declare resolved from the `.a`.
+- **One source of truth, compiled twice.** The four fns + their sole private callee
+  `safe_slice` move to `crates/align_runtime/src/str_prims.rs` (`mod str_prims; pub use`),
+  compiled (a) into the normal staticlib and (b) standalone to bitcode by an `align_driver`
+  `build.rs` (`rustc --emit=llvm-bc -O -Ccodegen-units=1`, `rerun-if-changed`), **baked into
+  `alignc` via `include_bytes!`** and parsed from an in-memory buffer at link time. Baking
+  dissolves the staleness question (the same `cargo build` regenerates it; the same rustc
+  builds both sides, so no LLVM-major skew for this artifact) — the earlier "fold `.bc` into
+  the runtime staleness check" idea is moot under this shape.
+- **Pipeline placement: link into the RAW module, then the ONE existing opt run.** The merge
+  (parse + `link_in_module` + internalize + shed) slots between `build_module` and
+  `write_object`'s single `run_opt_pipeline`; never a second optimization run (the probe's
+  double-opt over already-optimized IR is exactly what regressed `str_cmp`). Post-link, every
+  `align_rt_` symbol that now has a body is set `internal` **directly** (`mark_internal`),
+  never via the internalize pass — the `{main} ∪ --export`-roots model stays untouched by
+  construction, and no runtime symbol is externally defined in the merged module, so no
+  duplicate-external vs the `.a` at final link.
+- **Attr xor = "never curate what you'll merge" + a safety-net shed.** With the flag on,
+  `apply_rt_contract_attrs` SKIPS the guarded set; a post-link pass strips exactly
+  `rt_contract(name)`'s attrs from any body-carrying symbol. A blanket all-attr shed is
+  rejected (it would also strip rustc's own body-derived attrs and *weaken* the result).
+  Strict per-symbol xor pinned by a test: over all `align_rt_` fns,
+  `(has body) != (carries its curated attrs)`.
+- **Flag surface: explicit orthogonal `--rt-lto`** on `build`/`run`/`emit-obj`/`size` and
+  `emit-llvm --stage optimized` (the observation lens for the gates); NOT folded into `fast`
+  in v1 (the win is string-workload-specific and leans on constant-length literal targets;
+  Nothing-hidden favors naming the mechanism). Rejected with a diagnostic on `dev` (O0 cannot
+  inline) and `small`/`tiny` (the `optsize` sweep conflicts with fast-path inlining). Default
+  (flag-off) path byte-identical; `explain-opt` and the default lenses never auto-enable it.
+- **Fail-loud fallback:** unparseable baked bitcode → loud diagnostic naming the cause, fall
+  back to the flag-off object+`.a` path **and re-annotate the guarded declares** (a fallback
+  must not silently drop their curated contract).
+- **Gates:** (1) IR-shape positive — an `x == "literal"` kernel: `call @align_rt_str_eq`
+  absent under `--rt-lto`, present without; mutation-checked BOTH directions. (2) `str_cmp`
+  negative — an `Ord(str)` kernel under `--rt-lto` still contains
+  `call @align_rt_str_cmp` AND its declare keeps the curated attrs. (3) artifact symbol-set
+  pin — defined `align_rt_` symbols in the `.bc` == the guarded set exactly; undefined ⊆ a
+  small allowlist (`memcmp`/`bcmp`/…; no Rust-std leakage). (4) the attr-xor test. (5)
+  `--export` + `--rt-lto`: exported symbol stays external, no `align_rt_` external define in
+  the object. (6) OFF-path byte-identity: the existing IR-shape/lens suites unchanged. (7)
+  end-to-end bench through the real driver (`alignc build --rt-lto`) + the `bench/binary_size`
+  guard + an explicit compile-time bound (target ≤ ~100 ms over flag-off on a small program;
+  the probe's 0.25 s was the FULL runtime `.bc`).
+- **Spikes before the main work:** inkwell `MemoryBuffer`/`parse_bitcode_from_buffer`/
+  `link_in_module` under `llvm22-1` (unused in the workspace today); the `build.rs`-invokes-
+  rustc standalone compile (str_prims must be dependency-free — it is: slice ops only);
+  triple/datalayout mismatch on `link_in_module` (clear the `.bc` module's triple/datalayout
+  before linking if LLVM objects).
+
 **PGO stays sequenced after — do NOT reorder it ahead on "LTO is thin" grounds:** its
 block-layout/hot-cold-split win is already MOOT per M13 Slice V (`noreturn` attrs make fail
 edges cold; a real `!prof` prototype was byte-identical and reverted); instrument PGO is

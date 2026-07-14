@@ -55,8 +55,36 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Pull the boolean `--rt-lto` flag (M14 Slice 2): opt-in in-process link of the fast-path string
+    // primitives' bitcode into the program module before the one opt run. Orthogonal to `--profile`
+    // (Nothing-hidden: the mechanism is named, not folded into `fast`).
+    let (rt_lto, args) = parse_rt_lto(&args);
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    // `--rt-lto` only means something where codegen runs the optimizer over a real build/lens.
+    if rt_lto {
+        if !matches!(
+            cmd,
+            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm")
+        ) {
+            eprintln!(
+                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
+                cmd.unwrap_or("<none>")
+            );
+            return ExitCode::FAILURE;
+        }
+        // `dev` is O0 (nothing inlines, so LTO buys nothing); `small`/`tiny` run the `optsize`/
+        // `minsize` sweep, which conflicts with fast-path inlining. Reject rather than silently no-op.
+        if matches!(profile, Profile::Dev | Profile::Small | Profile::Tiny) {
+            eprintln!(
+                "alignc: --rt-lto is incompatible with the `{}` profile (it needs an inlining \
+                 pipeline; use `release` or `fast`)",
+                profile.name()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
 
     // `--export` only means something where codegen produces a standalone object/IR with linker-
     // visible symbols (`emit-obj`/`emit-llvm`); anywhere else a nonempty export set would either be
@@ -73,12 +101,12 @@ fn main() -> ExitCode {
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports),
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports, rt_lto),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
-        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports),
+        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
-        (Some("size"), Some(p)) => size::run_size(p, target, profile),
+        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto),
         // `explain-opt <file> [--verbose]` — report what the `-O2` middle-end did to the data path
         // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
         (Some("explain-opt"), Some(p)) => {
@@ -87,9 +115,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) => run_build(p, target, profile),
+        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -123,6 +151,21 @@ fn parse_exports(args: &[String]) -> Result<(Vec<String>, Vec<String>), ()> {
         i += 1;
     }
     Ok((exports, rest))
+}
+
+/// Pull the boolean `--rt-lto` flag out of `args` (M14 Slice 2), returning whether it was present and
+/// the remaining arguments. A valueless flag — repeated occurrences are idempotent.
+fn parse_rt_lto(args: &[String]) -> (bool, Vec<String>) {
+    let mut rt_lto = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "--rt-lto" {
+            rt_lto = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (rt_lto, rest)
 }
 
 /// Validate `exports` against the lowered `mir`: every name must match a `Function::name` in the
@@ -219,7 +262,9 @@ fn usage() {
          --profile     dev (O0), release (O2, default), fast (O3), small (Os), tiny (Oz)\n  \
          --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
                        name's linkage external instead of the default internal, so a no-`main`\n  \
-                       library/benchmark object exposes it to the linker"
+                       library/benchmark object exposes it to the linker\n  \
+         --rt-lto      (build/run/emit-obj/size/emit-llvm; release/fast only) link the fast-path\n  \
+                       string primitives' bitcode into the program and inline it before the opt run"
     );
 }
 
@@ -296,7 +341,7 @@ fn run_emit_mir(path: &str) -> ExitCode {
     }
 }
 
-fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[String]) -> ExitCode {
+fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[String], rt_lto: bool) -> ExitCode {
     // `--stage raw|optimized` picks the lens (default `raw` = today's semantics, the pre-opt IR
     // codegen emitted). `optimized` runs the `-O2` pipeline first (what LLVM did: inlined, fused,
     // vectorized). Any other value is a hard argument error, not a panic.
@@ -313,7 +358,7 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[St
     if let Some(code) = check_exports(&mir, exports, path) {
         return code;
     }
-    match emit_llvm_ir(&mir, target, optimized, exports) {
+    match emit_llvm_ir(&mir, target, optimized, exports, rt_lto) {
         Ok(ir) => {
             print!("{ir}");
             ExitCode::SUCCESS
@@ -355,7 +400,7 @@ fn parse_stage(rest: &[String]) -> Result<bool, String> {
     Ok(optimized)
 }
 
-fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile, exports: &[String]) -> ExitCode {
+fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
@@ -363,7 +408,7 @@ fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Pro
         return code;
     }
     let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
-    match emit_object_file(&mir, &obj, target, profile, exports) {
+    match emit_object_file(&mir, &obj, target, profile, exports, rt_lto) {
         Ok(()) => {
             println!("alignc: wrote object: {}", obj.display());
             ExitCode::SUCCESS
@@ -430,7 +475,7 @@ impl Drop for ArtifactStage {
 
 /// Turn MIR into an object and link it into an executable. Returns the `exe` path. `profile` selects
 /// both the codegen pipeline and the link-time strip choice (one mechanism, `Profile`).
-fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile) -> Result<(), ExitCode> {
+fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool) -> Result<(), ExitCode> {
     let object_stage = ArtifactStage::temp("align-object").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
@@ -438,7 +483,7 @@ fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarg
     let obj = object_stage.path().join("program.o");
     // `build`/`run`/`size` never take `--export` — they always produce a linked executable whose
     // only linker-visible symbol is `main`, so no export roots apply here.
-    if let Err(e) = emit_object_file(mir, &obj, target, profile, &[]) {
+    if let Err(e) = emit_object_file(mir, &obj, target, profile, &[], rt_lto) {
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
@@ -459,12 +504,12 @@ fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarg
     Ok(())
 }
 
-fn run_build(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
+fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let exe = PathBuf::from(stem(path));
-    match build_to(path, &mir, &exe, target, profile) {
+    match build_to(path, &mir, &exe, target, profile, rt_lto) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -473,7 +518,7 @@ fn run_build(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
     }
 }
 
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile) -> ExitCode {
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
@@ -485,7 +530,7 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_to(path, &mir, &exe, target, profile) {
+    if let Err(code) = build_to(path, &mir, &exe, target, profile, rt_lto) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the
