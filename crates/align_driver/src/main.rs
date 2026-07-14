@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   alignc check     <file>   lexer -> parser -> sema. Print diagnostics
+//!   alignc emit-interface <file>  Print each unit's interface summary + interface/impl hashes (M15)
 //!   alignc emit-mir  <file>   Print MIR as text
 //!   alignc emit-llvm <file>   Print LLVM IR as text (--stage raw|optimized; default raw)
 //!   alignc emit-obj  <file>   Write an object file (no link, no `main` required)
@@ -24,8 +25,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    check, emit_llvm_ir, emit_object_file, format_diagnostics, link_executable, lower_to_mir,
-    unknown_exports, BuildTarget, Profile,
+    build_interface_summaries, check, emit_llvm_ir, emit_object_file, format_diagnostics,
+    link_executable, lower_to_mir, unknown_exports, BuildTarget, Profile,
 };
 use align_span::SourceMap;
 
@@ -100,6 +101,7 @@ fn main() -> ExitCode {
 
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
+        (Some("emit-interface"), Some(p)) => run_emit_interface(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
         (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports, rt_lto),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
@@ -248,6 +250,7 @@ fn usage() {
          \n\
          commands:\n  \
            check      check through lexer/parser/sema\n  \
+           emit-interface  print each unit's interface summary + interface/impl hashes\n  \
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text (--stage raw|optimized; default raw)\n  \
            emit-obj   write an object file (<file> [out.o]; no link, no `main` needed)\n  \
@@ -329,6 +332,50 @@ fn run_check(path: &str) -> ExitCode {
         println!("ok: checked {} function(s)", checked.hir.fns.len());
         ExitCode::SUCCESS
     }
+}
+
+/// `alignc emit-interface <file>` (M15 S1a, dev verb): print each unit's interface summary — its
+/// interface / impl hashes, exported signatures with effect bits, exported type defs, consts, and
+/// capability set. A human-readable rendering of [`build_interface_summaries`]; the byte artifact is
+/// the crate's `serialize`. Deterministic (units and exported items are name-sorted at build time).
+fn run_emit_interface(path: &str) -> ExitCode {
+    let Some(src) = read(path) else {
+        return ExitCode::FAILURE;
+    };
+    let mut sm = SourceMap::new();
+    let (summaries, diags) = build_interface_summaries(&mut sm, path, &src);
+    if !diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &diags));
+    }
+    if diags.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    for s in &summaries {
+        println!("unit {}", s.unit);
+        println!("  interface_hash {}", s.interface_hash.to_hex());
+        println!("  impl_hash      {}", s.impl_hash.to_hex());
+        if !s.capabilities.is_empty() {
+            println!("  capabilities   {}", s.capabilities.join(", "));
+        }
+        for f in &s.fns {
+            let tps = if f.type_params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", f.type_params.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", "))
+            };
+            println!("  pub fn {}{} [{:?}]", f.name, tps, f.effect);
+        }
+        for st in &s.structs {
+            println!("  pub struct {} ({} field(s))", st.name, st.fields.len());
+        }
+        for e in &s.enums {
+            println!("  pub enum {} ({} variant(s))", e.name, e.variants.len());
+        }
+        for c in &s.consts {
+            println!("  pub const {}", c.name);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_emit_mir(path: &str) -> ExitCode {
