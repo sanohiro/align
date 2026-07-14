@@ -155,21 +155,26 @@ fn gate3_baked_bitcode_symbol_set() {
     assert_eq!(defined_rt, want, "baked .bc must define exactly the guarded four");
 
     // Undefined symbols ⊆ a small allowlist — no Rust-std `_ZN` leakage, no undefined `align_rt_*`.
+    // Mach-O/COFF C-mangling prepends a leading `_` to every symbol, so `_ZN...` becomes `__ZN...`,
+    // `align_rt_...` becomes `_align_rt_...`, and an allowlisted name like `bcmp` becomes `_bcmp` —
+    // strip one leading underscore before matching (falling back to the raw name when there is none)
+    // so the checks stay platform-independent.
     let allow = ["bcmp", "memcmp", "memcpy", "memmove", "memset"];
     for l in undefined.lines() {
         let Some(sym) = l.split_whitespace().last() else {
             continue;
         };
+        let unprefixed = sym.strip_prefix('_').unwrap_or(sym);
         assert!(
-            !sym.starts_with("_ZN"),
+            !sym.starts_with("_ZN") && !sym.starts_with("__ZN"),
             "Rust-std symbol leaked into the .bc (not self-contained): {sym}"
         );
         assert!(
-            !sym.starts_with("align_rt_"),
+            !unprefixed.starts_with("align_rt_"),
             "an align_rt_* symbol is undefined in the .bc (missing a callee): {sym}"
         );
         assert!(
-            allow.contains(&sym),
+            allow.contains(&unprefixed),
             "unexpected undefined symbol {sym} — extend the allowlist only after auditing it"
         );
     }

@@ -21,6 +21,9 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo")).join("str_prims.bc");
     // rustc that cargo is driving this build with — the same LLVM major as inkwell, by construction.
     let rustc = std::env::var("RUSTC").expect("RUSTC set by cargo");
+    // The actual compilation target (may differ from the host when cross-compiling `alignc`) — the
+    // baked bitcode must match the triple/datalayout of the final binary, not the machine building it.
+    let target = std::env::var("TARGET").expect("TARGET set by cargo");
 
     // Rebuild the bitcode whenever the shared source changes (never drifts from the staticlib copy).
     println!("cargo:rerun-if-changed={}", src.display());
@@ -36,7 +39,9 @@ fn main() {
             "-O",
             "-Ccodegen-units=1",
             "-Cpanic=abort",
+            "--target",
         ])
+        .arg(&target)
         .arg(&src)
         .arg("-o")
         .arg(&out)

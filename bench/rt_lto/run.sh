@@ -8,6 +8,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# now_ms -> current time in milliseconds on stdout. `date +%s%N` (nanosecond) is a GNU extension
+# absent on macOS/BSD `date`; perl's Time::HiRes is on the repo's portability baseline (see
+# bench/binary_size/lib.sh for the sibling portable-helper pattern) and gives sub-second resolution
+# everywhere. Falls back to whole-second `date +%s` (coarser, but always available) if perl is
+# missing.
+now_ms() {
+  perl -MTime::HiRes=time -e 'printf("%d\n", time()*1000)' 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+}
+
 mode="${1:-native}"
 case "$mode" in
   native) align_tgt="native" ;;
@@ -34,10 +43,10 @@ EXPORTS=(--export eq_count --export sum_sq_pos)
 compile_ms() {  # $1... = extra alignc args
   local best=999999 i t0 t1 ms
   for i in 1 2 3 4 5; do
-    t0=$(date +%s%N)
+    t0=$(now_ms)
     "$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt" "${EXPORTS[@]}" "$@" >/dev/null
-    t1=$(date +%s%N)
-    ms=$(( (t1 - t0) / 1000000 ))
+    t1=$(now_ms)
+    ms=$(( t1 - t0 ))
     (( ms < best )) && best=$ms
   done
   echo "$best"
