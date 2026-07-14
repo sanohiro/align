@@ -25,25 +25,30 @@ pub struct Checked {
 /// (multi-file, slice B1). User modules resolve by filename convention: `import geom` →
 /// `<entry-dir>/geom.align`, which must declare `module geom`. Builtin imports (`core.*`/`std.*`)
 /// are not files. Diagnostics are collected into `Checked.diags`.
-pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
-    let mut diags = Diagnostics::new();
+/// A parsed source module (kept alive so `align_sema::Module` borrows into its `ast` are valid).
+struct LoadedUnit {
+    path: String,
+    ast: align_ast::File,
+    is_entry: bool,
+    /// The module's full source text — retained for the M15 interface summary (generic template
+    /// bodies + const values are recorded as source slices, and `impl_hash` is over these bytes).
+    src: String,
+}
+
+// A user-module import is one whose first segment is neither `core` nor `std` (builtins).
+fn user_import(p: &align_ast::Path) -> bool {
+    p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
+}
+
+/// lexer -> parser for the entry file plus its transitively-imported **user** modules, plus the
+/// cyclic-import (DAG) check. The shared front half of [`check`] and [`build_interface_summaries`];
+/// behavior-identical to the former inline loader.
+fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Diagnostics) -> Vec<LoadedUnit> {
     let entry_dir = std::path::Path::new(name).parent().map(|p| p.to_path_buf());
 
-    /// A parsed source module awaiting checking (kept alive so the `Module` borrows are valid).
-    struct Loaded {
-        path: String,
-        ast: align_ast::File,
-        is_entry: bool,
-    }
-
-    // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
-    fn user_import(p: &align_ast::Path) -> bool {
-        p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
-    }
-
     // The entry module's own name is its `module` decl, or `main` by default.
-    let entry_tokens = align_lexer::tokenize(source_map.add_file(name, src), src, &mut diags);
-    let entry_ast = align_parser::parse_file(entry_tokens, &mut diags);
+    let entry_tokens = align_lexer::tokenize(source_map.add_file(name, src), src, diags);
+    let entry_ast = align_parser::parse_file(entry_tokens, diags);
     let entry_path = entry_ast
         .module
         .as_ref()
@@ -51,7 +56,8 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "main".to_string());
 
-    let mut loaded = vec![Loaded { path: entry_path.clone(), ast: entry_ast, is_entry: true }];
+    let mut loaded =
+        vec![LoadedUnit { path: entry_path.clone(), ast: entry_ast, is_entry: true, src: src.to_string() }];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
 
     // Edges of the module import graph (`importer path` -> `(imported modpath, import span)`),
@@ -94,8 +100,8 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
                 }
             };
             let fid = source_map.add_file(file_path.display().to_string(), msrc.clone());
-            let toks = align_lexer::tokenize(fid, &msrc, &mut diags);
-            let mast = align_parser::parse_file(toks, &mut diags);
+            let toks = align_lexer::tokenize(fid, &msrc, diags);
+            let mast = align_parser::parse_file(toks, diags);
             // The file must declare the full `module util.math` (path ↔ filename agreement).
             let declared = mast.module.as_ref().map(|m| m.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."));
             if declared.as_deref() != Some(modpath.as_str()) {
@@ -105,7 +111,7 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
                     imp.span,
                 );
             }
-            loaded.push(Loaded { path: modpath, ast: mast, is_entry: false });
+            loaded.push(LoadedUnit { path: modpath, ast: mast, is_entry: false, src: msrc });
         }
     }
 
@@ -115,8 +121,14 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     // as possible on failure, accumulating diagnostics" — `align_diag`'s contract): a cyclic import
     // graph does not itself confuse per-module sema, and running it may surface further, genuinely
     // separate errors.
-    detect_import_cycles(&entry_path, &edges, &mut diags);
+    detect_import_cycles(&entry_path, &edges, diags);
 
+    loaded
+}
+
+pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
+    let mut diags = Diagnostics::new();
+    let loaded = load_units(source_map, name, src, &mut diags);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
@@ -124,6 +136,33 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let hir = align_sema::check_program(&modules, &mut diags);
 
     Checked { hir, diags }
+}
+
+/// M15 S1a producer entry point: run the frontend for the entry file + its transitively-imported
+/// user modules, and — if it type-checks cleanly — build one [`align_interface::InterfaceSummary`]
+/// per unit (with its interface / impl hashes). Additive: it does not touch the build/run path. On
+/// any frontend error, returns no summaries plus the diagnostics (a summary of an ill-typed program
+/// would be meaningless).
+pub fn build_interface_summaries(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+) -> (Vec<align_interface::InterfaceSummary>, Diagnostics) {
+    let mut diags = Diagnostics::new();
+    let loaded = load_units(source_map, name, src, &mut diags);
+    let modules: Vec<align_sema::Module> = loaded
+        .iter()
+        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
+        .collect();
+    let hir = align_sema::check_program(&modules, &mut diags);
+    if diags.has_errors() {
+        return (Vec::new(), diags);
+    }
+    let mir = lower_to_mir(&hir);
+    let sources: std::collections::HashMap<String, String> =
+        loaded.iter().map(|l| (l.path.clone(), l.src.clone())).collect();
+    let summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
+    (summaries, diags)
 }
 
 /// Reject a cyclic module import graph (`check`'s `edges` map: importer path -> `(imported

@@ -1,0 +1,22 @@
+[package]
+name = "align_interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# M15 separate compilation, Slice 1a (producer side): extract one canonical, hashable interface
+# summary per unit (module) from a checked whole program, splitting interface identity from
+# implementation identity. Depends on ast/sema/mir/hash but NOT codegen, so the driver and the
+# future incremental cache can use it without dragging LLVM in (docs/impl/07-roadmap.md M15 S1;
+# docs/impl/10-cache-first-optimization.md §6.4).
+[dependencies]
+align_span = { path = "../align_span" }
+align_ast = { path = "../align_ast" }
+align_sema = { path = "../align_sema" }
+align_mir = { path = "../align_mir" }
+align_hash = { path = "../align_hash" }
+
+[dev-dependencies]
+align_diag = { path = "../align_diag" }
+align_lexer = { path = "../align_lexer" }
+align_parser = { path = "../align_parser" }

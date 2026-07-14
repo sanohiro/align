@@ -2386,6 +2386,50 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 /// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
 /// as it stands.)
 fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
+    let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program);
+    // The `par_map` function must be Pure.
+    for (func, span) in parmaps {
+        if unknown.contains(&func) {
+            diags.error(
+                format!("'par_map' requires a Pure function, but '{func}' calls a function value whose effect is not statically known"),
+                span,
+            );
+        } else if impure.contains(&func) {
+            diags.error(
+                format!("'par_map' requires a Pure function, but '{func}' has a side effect (it reads/writes I/O); use `reduce` for an accumulation"),
+                span,
+            );
+        }
+    }
+}
+
+/// The three-valued effect classification of a function (the M15 per-`pub`-fn interface bit). The
+/// analysis distinguishes all three today: [`FnEffect::Impure`] = transitively performs an
+/// observable side effect (I/O); [`FnEffect::Unknown`] = transitively calls a function *value* whose
+/// effect is not statically known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a
+/// `par_map`/parallel boundary both `Impure` and `Unknown` are rejected (fail-closed); the split is
+/// kept because the M15 interface summary records it verbatim and the diagnostics differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FnEffect {
+    Pure,
+    Impure,
+    Unknown,
+}
+
+/// The transitive effect sets over the whole program's call graph, keyed by canonical function name.
+struct EffectSets {
+    /// Functions that (transitively) perform an observable side effect.
+    impure: std::collections::HashSet<String>,
+    /// Functions that (transitively) call a function value of statically-unknown effect.
+    unknown: std::collections::HashSet<String>,
+    /// Every `par_map` callee to verify Pure, with the call site's span.
+    parmaps: Vec<(String, Span)>,
+}
+
+/// Compute the transitive impure / unknown effect sets (and the `par_map` callees) over the whole
+/// program. The single source of truth for both the `par_map` Pure requirement ([`check_parallelism`])
+/// and the M15 per-function effect bit ([`fn_effects`]).
+fn compute_effect_sets(program: &Program) -> EffectSets {
     use std::collections::HashMap;
     // Per function: directly observable effect + the set of functions it calls (incl. pipeline
     // stage/reducer functions) + the `par_map` callees to verify.
@@ -2437,20 +2481,30 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
     };
     let impure = propagate(&direct);
     let unknown = propagate(&direct_unknown);
-    // The `par_map` function must be Pure.
-    for (func, span) in parmaps {
-        if unknown.contains(&func) {
-            diags.error(
-                format!("'par_map' requires a Pure function, but '{func}' calls a function value whose effect is not statically known"),
-                span,
-            );
-        } else if impure.contains(&func) {
-            diags.error(
-                format!("'par_map' requires a Pure function, but '{func}' has a side effect (it reads/writes I/O); use `reduce` for an accumulation"),
-                span,
-            );
-        }
-    }
+    EffectSets { impure, unknown, parmaps }
+}
+
+/// The three-valued effect bit for every function in `program`, keyed by canonical (mangled) name —
+/// the M15 interface-summary input. `Impure` takes precedence over `Unknown` (a function known to be
+/// impure is classified so even if it also has an unknown-effect indirect call); everything the
+/// analysis cannot place in either set is `Pure`. Reuses [`compute_effect_sets`], so it always agrees
+/// with the `par_map` Pure check.
+pub fn fn_effects(program: &Program) -> std::collections::HashMap<String, FnEffect> {
+    let EffectSets { impure, unknown, .. } = compute_effect_sets(program);
+    program
+        .fns
+        .iter()
+        .map(|f| {
+            let e = if impure.contains(&f.name) {
+                FnEffect::Impure
+            } else if unknown.contains(&f.name) {
+                FnEffect::Unknown
+            } else {
+                FnEffect::Pure
+            };
+            (f.name.clone(), e)
+        })
+        .collect()
 }
 
 /// Walks a function body to collect its directly-observable effect, the functions it calls (incl.

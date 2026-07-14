@@ -1056,6 +1056,27 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
     }
 }
 
+/// The capabilities a single function's body requires — the gated external libraries its builtins
+/// call into (`libz`/`libzstd`/`libcrypto`/`libssl`). The per-function granularity that the M15
+/// per-unit interface summary unions over a unit's functions; the classification source of truth is
+/// [`rvalue_capability`], shared with [`collect_capability_libs`], so the two never drift. Emitted in
+/// first-seen order (deduped); an empty vec for a function with no gated feature.
+#[inline(never)]
+pub fn function_capabilities(f: &Function) -> Vec<Capability> {
+    let mut caps: Vec<Capability> = Vec::new();
+    for blk in &f.blocks {
+        for s in &blk.stmts {
+            let Stmt::Let(_, rv) = s else { continue };
+            if let Some(cap) = rvalue_capability(rv)
+                && !caps.contains(&cap)
+            {
+                caps.push(cap);
+            }
+        }
+    }
+    caps
+}
+
 /// The `-l<name>` libraries required by the capability-bearing builtins used anywhere in `fns`,
 /// deduplicated, in a deterministic order. Appended to `Program.link_libs` by [`lower_program`] so
 /// the driver links only what is used. A pure program (no gated feature) yields an empty list.
@@ -1063,14 +1084,9 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
 fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
     let mut caps: Vec<Capability> = Vec::new();
     for f in fns {
-        for blk in &f.blocks {
-            for s in &blk.stmts {
-                let Stmt::Let(_, rv) = s else { continue };
-                if let Some(cap) = rvalue_capability(rv)
-                    && !caps.contains(&cap)
-                {
-                    caps.push(cap);
-                }
+        for cap in function_capabilities(f) {
+            if !caps.contains(&cap) {
+                caps.push(cap);
             }
         }
     }
