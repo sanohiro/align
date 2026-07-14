@@ -2346,11 +2346,11 @@ Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`
 ### `sort_by_key` key effects and evaluation count — OPEN
 
 Ordinary sequential stage/reducer effects are settled above, but comparison sorting is a distinct
-contract. The current insertion sort calls a key function O(n²) times in comparison-dependent order;
-the planned decorate-sort-undecorate rewrite would call it exactly once per surviving element. Settle
-either Pure-only keys or exactly-once input-order key evaluation before that rewrite. The effect graph
-now fails closed for unknown higher-order targets, but that mechanism does not choose the language
-contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
+contract. The shipped decorate-sort-undecorate implementation calls the key exactly once per
+surviving element in input order; that implementation behavior still needs to become the explicit
+language contract (or be restricted to Pure keys). The effect graph now fails closed for unknown
+higher-order targets, but that mechanism does not choose the language contract; do not add a
+rejection until this item settles. Full context: `impl/12` §3.2.
 
 ### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 
@@ -3278,6 +3278,22 @@ orthogonal lever there.
 ### SoA conversion trigger
 Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
 
+### Lazy multi-source pipeline (`zip`) — P1 measured design candidate, consumer-gated
+
+**Recorded 2026-07-14.** The shipped pipeline fuses work derived from one input element but has no
+canonical runtime-array/slice shape for `out[i] = f(a[i], b[i], c[i])`. Retain one lazy `zip`
+pipeline source as the preferred direction, not `map2`/`map_with` or numbered `zip2`/`zip3`
+siblings: equal runtime lengths (mismatch abort before iteration), increasing-index evaluation,
+no allocated tuple array, and per-index tuple values expected to disappear in SSA. First slice is
+Copy-scalar arrays/slices; `map_into` proves its output disjoint from every source without claiming
+that sources are mutually disjoint. A directional clang-22 ceiling probe for
+`a + b*c` measured a fused loop 1.44-1.75x faster than two passes with an already-allocated
+temporary across 256..8,388,608 `f32` elements. The real ship gate is an Align consumer plus
+equal-LLVM IR/assembly: one allocation-free vector loop, no tuple storage, and exact
+length/effect/trap/alias behavior on x86-64 and arm64. Runtime-length `dot` may reuse the machinery,
+but ordered floating-point reduction must not be silently reassociated. Full measurement and design
+gate: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.3.
+
 ### Tuples / multi-value returns — design SETTLED (see Settled); implementation in progress
 The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
@@ -3316,6 +3332,20 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 **External library linking — SHIPPED (2026-07-01):** an `extern "C" link("name")` clause names a library to link (`-lname`); sema validates + dedupes into `hir`/`mir::Program.link_libs`, and the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay auto-linked). The name is charset-validated (`[A-Za-z0-9._+-]`) and passed as a single `-l<name>` argv (no flag/shell injection). `ast::ExternBlock.link`.
 
 **FFI v1 — COMPLETE (2026-07-01).** The shipped surface: `extern "C"` decls + `unsafe`-gated calls; scalar/`raw`/`()` signatures; `layout(C)` struct-by-pointer (`raw.load`/`store`); `str`/`slice`/`bytes` views (data-pointer + separate length); `link("name")` external libraries. That is a coherent, tested v1 — the `std`/`pkg` C-engine wrapper strategy (zstd/sqlite/…) can be built on it (own the memory wrappers, borrow the engines, pass buffers by pointer+len).
+
+**Measured optimization follow-up (2026-07-14) — recommended, consumer-gated.** The direct call and
+view ABI are already at the useful floor; retain three generic additions rather than inventing a
+second FFI ABI: (1) extend the guarded, per-symbol `--rt-lto` mechanism to optional pkg-provided
+matching bitcode only after a real fine-grained foreign call clears the ~1.15x wall-time gate;
+(2) make a loop-contained extern that actually blocks vectorization/fusion visible in `explain-opt`,
+with shaped-op/batch/LTO suggestions rather than a blanket warning; (3) when the first backend pkg
+needs a persistent context/buffer, design one pkg-definable opaque Move resource with exactly-once
+Drop so `raw` and explicit destroy do not leak through the safe API. Foreign `readonly`/`noalias`/
+`nounwind`/Pure contracts remain deferred behind a concrete missed-optimization IR: a false contract
+is a miscompile or race, so visible-body inference or an audited generated wrapper is preferred over
+casual user annotations. Whole-backend LTO, automatic batching, an FFI fastcall, and LLM-specific
+surface are not adopted. Full rationale, gates, and the measured 2.95x-positive/0.72x-negative LTO
+evidence: `impl/14-llm-inference-focus-audit.md` §7.
 
 **Deliberately out of FFI v1** (draft §15 "Not in FFI v1", decided 2026-07-01 — defer over ship-half-right):
 - **A struct by value** — SHIPPED for **x86-64 SysV (Linux) only** (`feat/ffi-byvalue-sysv`). A `layout(C)` struct ≤ 16 bytes is passed/returned in registers via the SysV AMD64 classification (each eightbyte INTEGER→`i64` slot / SSE→`double` slot; a two-register value returns as an `{T0,T1}` aggregate). The compiler emits exactly clang's coerced IR, so a call is binary-compatible with a real C callee — proven by a compiled-C-helper harness (`crates/align_driver/tests/ffi_byval.rs`) that links a `cc`-built by-value callee and round-trips every eightbyte pattern ({i32,i32}/{i64,i64}/{f64,f64}/{f32,f32} packed/{i32,f32} merge/mixed {i64,f64} return). This is the one FFI corner a wrong per-target rule *silently miscompiles*, so it is structurally fenced: **codegen refuses on any non-SysV target** (diagnostic: pass by pointer instead) rather than guessing; a **> 16-byte MEMORY-class struct is rejected** (redundant with struct-by-pointer); and — the subtle one — a struct argument that would **fall to memory under register pressure** is rejected too. SysV's all-or-nothing rule passes a struct in registers only if every eightbyte fits in the class registers left after preceding args, else the whole struct goes `byval` on the stack; clang implements that reclassification in its frontend, and a flattened `{i64,i64}` at the exhaustion boundary makes LLVM split the struct across the last register and the stack (verified round-trip corruption vs a clang `byval` callee), so those signatures are refused rather than miscompiled (reorder the struct earlier, or pass by pointer). In every accepted case the struct fits in registers and per-eightbyte flattening is byte-identical to clang's own flattened parameter form. Still deferred: AAPCS64 (other arches), and the MEMORY-class `byval`/`sret` path (added only when a concrete wrapper needs a large by-value struct).
@@ -3816,6 +3846,16 @@ library methods — the OpenCV `cv::Mat` / numpy `ndarray` shape. Rationale: sig
 wants pitch/ROI views; `soa` already gives planar (RRR GGG BBB) layout — the superior form
 interleaved formats must convert to. Belongs M10+, after a concrete consumer.
 
+**Measured qualification 2026-07-14:** runtime row pitch did not prevent LLVM from vectorizing a
+fixed 3x3 stencil, so keep this as a minimal std view rather than new indexing/layout syntax. The
+valuable consumer-side work is a dedicated dynamic stencil/window-dot operation carrying
+known-stride, legal traversal-order, alias, and interior/border facts: an output-lane implementation
+was about 8-9x faster than the natural dynamic nested loop, while cache-friendly legal loop
+interchange was about 31x faster than column-strided traversal in the measured controls. Treat
+separable kernels as an explicit API property because the two-pass transform changes ordered
+floating-point evaluation. See `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.2. Build remains
+consumer-gated; these results do not justify an image-specific feature or a general loop DSL.
+
 ### Zero-copy serialization (Cap'n Proto / FlatBuffers class) (Future)
 
 **Recorded 2026-07-04 (external design-note review adoption).** Align's region system makes zero-copy
@@ -3863,6 +3903,15 @@ benchmarked components (tokenizer, sampling, KV-cache manager, quantized CPU mat
 probe-backed std prerequisites (mmap views, buffered/`writev` sink-first I/O, runtime-dispatched SIMD
 scan, `task_group` I/O overlap, network pipelining) are exactly the P0/P1 rails above — so this
 direction does not add core work, it *consumes* it.
+
+**Measured engine-focus audit 2026-07-14:** `impl/14-llm-inference-focus-audit.md` adds no language
+surface. It prioritizes execution-order model/tier layout over blanket page advice; a backend-chosen
+KV descriptor/layout (ordered CPU fallback probes found complementary K-score and V-accumulation
+layouts worth roughly 5-14x, with an explicit K-append tradeoff); and conditional stable MoE expert
+grouping (worth roughly 1.3-1.6x only for the measured large/diverse-route batch, neutral at batch 1
+or when a four-expert hot set already fits cache). Quantized matvec/attention/`matmul_id` remain
+borrowed-backend operations first. The real engine must profile cold/warm, prefill/decode, context,
+batch, route skew, cache/tier residency, and bytes moved before selecting any policy.
 
 **Mining-adjacent tooling** (profiler / autotuner / energy-aware scheduler / pool client) shares the
 "make cost visible" instinct but is a **weaker** north star: ASIC/electricity economics dominate, mature

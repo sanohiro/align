@@ -73,6 +73,8 @@ After those are closed, the highest-value performance refinements from this audi
    `where`; do not preserve the current unsafe speculative-execution trick merely to get vector code.
 4. Remove a redundant URL/request copy in `http.get_many`, and complete the already-planned I/O
    uninitialized-buffer and `io.copy` syscall fast paths.
+5. Add the measured total-order stable-sort fast path: avoid unused tiny scratch, detect a fully
+   ordered input, and skip comparison-merging adjacent runs whose boundary is already ordered.
 
 The priority is cache traffic, not novelty. A global replacement allocator, blanket `alwaysinline`,
 and compiler-internal SIMD over enum-heavy MIR are not recommended.
@@ -189,9 +191,10 @@ each element that reaches them; a false `where` suppresses the suffix. `any`/`al
 short-circuit. Inferred effects restrict transformations rather than source acceptance. Explicit
 `par_map` remains Pure-required.
 
-`sort_by_key` is separated into its own Open item: the current comparison sort calls its key O(n²)
-times, while decoration would call exactly N times. The effect graph can now fail closed at Pure
-boundaries, but no rejection lands before the key-evaluation contract itself settles.
+`sort_by_key` is separated into its own Open item. The implementation now decorates in input order
+and calls the key exactly N times, but the source contract has not yet made that behavior normative.
+The effect graph can fail closed at Pure boundaries, but no rejection lands before the key-evaluation
+contract itself settles.
 
 Section 3.1 is independent: even after choosing Pure-only, a Pure callable may abort and cannot be
 speculated without the stronger inactive-lane proof.
@@ -379,13 +382,44 @@ alignment checked-add with ordinary add fails the exact intrinsic-count gate.
 | `map_into(out)` | No output allocation; one length-preserving loop into caller storage | Best materializing path; scoped input/output alias metadata removes overlap checks |
 | `to_soa` | One contiguous aligned arena buffer, one fused transpose | Good representation; wide schemas may benefit from already-planned blocking |
 | `partition` | Two upper-bound output buffers, one pass | Predictable but write-stream/RSS heavy; measure compaction before changing |
-| `sort` / `sort_by_key` | Materialize, then insertion-sort | Fusion boundary is correct, but the current O(n^2) algorithm/key recomputation is a serious **ALREADY PLANNED** replacement (stable O(n log n) plus decorate-sort-undecorate) |
+| `sort` / `sort_by_key` | Materialize, stable bottom-up merge sort with 32-element insertion runs; decorate keys once | Good worst-case/stability shape; measured ordered-run adaptation below remains unimplemented |
 | `scan` | Loop-carried dependency | Correctly scalar in the general case; lack of vectorization is not a missed LLVM flag |
 
 The upper-bound allocation used by filtering does not necessarily touch every page: malloc-backed
 unused capacity is generally demand-paged, and right-sizing group outputs already measured as a
 no-op. Do not add a second count pass merely to make capacity equal length. It would evaluate a Pure
 or Impure predicate twice, alter effects/trap timing, and add memory traffic.
+
+**Adaptive stable-sort probe (2026-07-14, Ryzen 9 5950X, clang 22 O3, one pinned core):** the current
+MIR algorithm was reproduced as 32-element stable insertion runs followed by bottom-up stable merges,
+one same-size scratch allocation, and a full copy-back after every pass. A candidate retained that
+shape but (1) returned before scratch allocation when the whole input was already ordered and
+(2) copied an adjacent run pair without comparison-merging when its boundary was already ordered.
+The benchmark included copying the fixed source into the working array, used balanced AB/BA order,
+and repeated the medians twice:
+
+| `u64` input state | 1,024 elements | 100,000 elements | 1,000,000 elements |
+|---|---:|---:|---:|
+| already sorted | 10-18x | 21-35x | 22-30x |
+| only a tail swap | 3.1-3.7x | 2.9-3.1x | 2.6-2.8x |
+| 1% adjacent swaps | 3.8-4.0x | 3.1-3.3x | 2.8-3.1x |
+| random / reverse / 16-value cardinality | 0.97-1.03x | 0.98-1.02x | 0.98-1.02x |
+
+A whole-input precheck alone is rejected: at 1,024 elements the tail-swap control regressed 17-19%
+because it scanned the entire input and then paid the unchanged sort. The combined ordered-boundary
+path recovers that work and keeps the same stable O(n log n) worst case. Adopt it as a **P1 measured
+backend/MIR refinement**, with no source/API change, only for keys with a total order (integers,
+characters, and byte-ordered strings). IEEE floats with NaNs must retain the current merge path unless
+a separate exact legality proof is carried; `!(right < left)` is not a transitive boundary proof in
+the presence of NaN. For `sort_by_key`, run the check after exactly-once input-order decoration so key
+effects/evaluation count do not change.
+
+The current implementation also allocates its element scratch (and `sort_by_key` key ping scratch)
+before sorting even when `len <= 32`, although no merge pass can read it. Avoiding that unused
+allocation measured 2.3x at two elements and 1.4x at eight; 16-32 elements were small/noisy. Delay
+only the unused ping buffers, retain the insertion run, and gate this mechanical cleanup by zero
+scratch allocations plus the document-13 short-size matrix rather than claiming a broad throughput
+win.
 
 ### 4.2 SHIPPED / GOOD — vectorization parity with C
 
@@ -410,7 +444,136 @@ in the recorded runs). Cheap `par_map` is the important negative control: its cu
 runtime thunk loses to the sequential/vectorized loop, which is why document 11's whole-range kernel
 is already the priority rather than “more threads” or manual SIMD at the call site.
 
-### 4.3 Correct way to recover SIMD after the `where` fix
+**Native machine-code recheck (2026-07-14, Ryzen 9 5950X, LLVM 22 release/O2):** exported opaque
+slice kernels confirm that the vector IR reaches real AVX2 instructions, not merely vector-looking
+IR. `map(x*2).sum()` uses 256-bit `vpaddq` loads/accumulators plus a horizontal reduction;
+`where(x>0).sum()` uses `vpcmpgtq` + `vpand` + `vpaddq`; and `map_into` uses YMM loads, `vpaddq`, and
+YMM stores. For 1,048,576 cached `i64` elements, those first two kernels were 1.40x and 2.25x faster
+than an equal clang-22 O3 control compiled with loop/SLP vectorization disabled (median of nine,
+32 calls/sample).
+
+The associative wrapping-product reduction also vectorizes and measured 2.31x over its scalar
+control. AVX2 has no packed 64-bit integer multiply, so LLVM correctly synthesizes it from several
+`vpmuludq`/shift/add instructions; this is a real speedup on this host but remains target-cost-model
+work, not a promise that every vector IR operation maps to one instruction. The semantic negative
+controls also reach the expected machine shape: prefix `scan` is scalar because of its loop-carried
+dependency, and ordered `f64` sum uses scalar `vaddsd` because reassociation would change IEEE
+results. At the explicit fixed-vector layer, `vec4<i32>` dot lowers to one `vpmulld` plus horizontal
+`vpaddd`, while `fma(vec4<f32>,...)` lowers to one `vfmadd213ps`.
+
+**Dynamic-window convolution probe (2026-07-14, same host/profile):** this is the important
+loop-nest qualification to the positive result above. A directly written safe 3-tap loop
+(`dst[i] = src[i]*3 + src[i+1]*5 + src[i+2]*7`) already auto-vectorizes across output positions:
+YMM 4-lane i64 / 8-lane f32 loads and stores, safe vector-prefix bounds, scalar tail, and a runtime
+overlap check. Over 1,048,576 outputs it took about 0.21 ms (i64) / 0.10 ms (f32), versus about
+0.46 / 0.36 ms for scalar controls and about 0.21 / 0.10 ms for equal clang auto-vectorized
+controls. The ordinary loop path is therefore already good when the tap count is statically exposed.
+
+A truly dynamic kernel was then written as the natural nested loop: for each output, reduce
+`src[i+k] * kernel[k]` over runtime `k`. LLVM vectorizes the inner i64 dot, but repeats vector setup,
+bounds reasoning, and a horizontal reduction for every output; it leaves ordered f32 scalar. A
+semantics-preserving AVX2 ceiling instead put adjacent **outputs** in lanes and advanced `k` in the
+original order, keeping one vector accumulator per output block. It used multiply+add rather than
+FMA, and matched the scalar f32 bytes exactly. For 65,536 outputs:
+
+| runtime taps | i64 current / output-lane | speedup | f32 current / output-lane | speedup |
+|---:|---:|---:|---:|---:|
+| 3 | 0.140 / 0.034 ms | 4.1x | 0.085 / 0.011 ms | 7.7x |
+| 8 | 0.266 / 0.075 ms | 3.6x | 0.223 / 0.020 ms | 11.2x |
+| 16 | 0.519 / 0.155 ms | 3.3x | 0.442 / 0.037 ms | 12.0x |
+| 64 | 0.818 / 0.572 ms | 1.4x | 2.052 / 0.209 ms | 9.8x |
+
+This promotes dynamic convolution/window-dot to a **P1 measured design candidate**, but not to a
+generic loop-pass tweak: LLVM does not reliably choose the profitable outer/output-lane
+vectorization from the nested scalar source. Give MIR an explicit convolution/window-dot vocabulary
+only after the surface question (`convolve(kernel, out)` versus virtual
+`windows(kernel.len()).map(dot(kernel)).map_into(out)`) is settled. Its acceptance gate must pin
+empty/oversized kernels, exact output length, source/output non-aliasing, scalar tails, wrapping
+integer arithmetic, byte-exact ordered FP without implicit FMA, and equivalent AVX2/NEON paths.
+
+**Strided-2D/cache probe (2026-07-14, Ryzen 9 5950X, clang 22 O3, one pinned core):** a
+768x1536 `f32` image with runtime row pitch (`width + 32`) shows that a minimal strided view does not
+itself block optimization. A directly written fixed 3x3 interior stencil took 0.48-0.58 ms and its
+machine code used YMM loads/multiply/add across adjacent output columns. Expressing the same taps as
+a runtime nested loop took 6.28-6.45 ms; an explicit eight-output AVX2 kernel preserving tap order
+and avoiding implicit FMA took 0.72-0.79 ms and was byte-identical. The missing optimization is again
+dynamic output-lane vectorization, not a need to make row pitch part of the language syntax.
+
+The dynamic square-kernel results reinforce the same boundary:
+
+| kernel | natural nested loop | output-lane SIMD | explicit separable two-pass |
+|---:|---:|---:|---:|
+| 3x3 | 6.24-6.41 ms | 0.73-0.80 ms (8.0-8.7x) | 0.47-0.52 ms (12-13x) |
+| 7x7 | 29.9-30.4 ms | 3.21-3.36 ms (8.9-9.5x) | 0.75-0.76 ms (39-40x) |
+| 15x15 | 136.9-138.5 ms | 17.5-17.6 ms (7.8-7.9x) | 1.48-1.68 ms (82-93x) |
+
+The separable path is deliberately **not** an automatic compiler transform: it requires the user or
+kernel API to state separability and changed the ordered `f32` result slightly (maximum observed
+absolute difference `1.79e-7`). It belongs in an explicit library/kernel operation, not hidden
+algebraic inference.
+
+Cache order was even more important in a 4096x4096 `u32` column-sum control (64 MiB active data).
+Walking each column with a roughly 16 KiB row stride took 67.1-69.5 ms. Loop interchange retained the
+per-column reduction order while streaming rows contiguously and took 2.17-2.24 ms (about 31x);
+64-column tiling took 4.54-4.92 ms (about 14-15x). Therefore generalize the measured P1
+convolution/window-dot candidate to a consumer-gated strided 2D/N-D stencil operation and carry
+known-stride, traversal-order legality, alias, and interior/border facts in MIR. Prefer legal loop
+interchange first and backend-chosen tiling only when per-output state or another constraint needs
+it. Keep ROI/border policy and separability explicit in the library operation. Do not add
+image-specific syntax or a general polyhedral loop system from this result.
+
+### 4.3 P1 MEASURED DESIGN CANDIDATE — lazy multi-source `zip`
+
+The current pipeline is fundamentally single-source. It can fuse arbitrary work derived from one
+element, and `map_into` can write one disjoint destination, but it cannot directly express the
+common pure shape `out[i] = f(a[i], b[i], c[i])` over runtime arrays/slices. An application can
+materialize intermediate arrays or fall back to an indexed `loop`; the former adds avoidable memory
+traffic, while the latter leaves the pipeline's canonical counted-loop, equal-length, alias, and
+fusion facts behind. Residual addition, gating, AXPY-class work, multiple-column transforms, and a
+future runtime-length dot are all consumers. This is a core dataflow gap, not an LLM algorithm.
+
+**Directional ceiling probe (2026-07-14, Ryzen 9 5950X, clang 22 O3 `-march=native`, balanced
+AB/BA, median of nine):** compute `out[i] = a[i] + b[i] * c[i]` either as one fused loop or as two
+loops with `tmp[i] = b[i] * c[i]`. Allocation was outside the timed region, so the comparison gives
+the staged form every benefit except its unavoidable extra write/read traffic:
+
+| `f32` elements | fused ns/element | staged ns/element | fused speedup |
+|---:|---:|---:|---:|
+| 256 | 0.048 | 0.070 | 1.44x |
+| 4,096 | 0.110 | 0.173 | 1.58x |
+| 65,536 | 0.141 | 0.209 | 1.49x |
+| 1,048,576 | 0.169 | 0.294 | 1.75x |
+| 8,388,608 | 0.584 | 0.947 | 1.62x |
+
+Retain a **consumer-gated P1 core design** with this preferred semantic shape:
+
+```align
+zip(a, b, c)
+  .map(fn v { v.0 + v.1 * v.2 })
+  .map_into(out)
+```
+
+- `zip` is a lazy pipeline source, never an allocated array of tuples. Each tuple is an SSA value
+  assembled for one index and should disappear after inlining.
+- Every input has the same runtime length; mismatch aborts before the loop, matching `map_into`'s
+  existing length-contract policy. Evaluation remains in increasing input-index order.
+- First slice: two or more arrays/slices of Copy scalar elements. Tuple-valued storage, Move
+  elements, strided/indexed inputs, and parallel `zip` stay out until separate consumers prove them.
+- `map`/`where`/reducers reuse their existing effect and inactive-lane legality. `map_into` must prove
+  the destination disjoint from **every** source and emit destination-vs-source alias scopes, but
+  must not claim that source inputs are disjoint from one another.
+- A runtime-length `dot` can later consume the same multi-source loop machinery. Do not silently
+  turn ordered floating-point `zip(...).map(mul).sum()` into a reassociated dot; an explicit fast
+  dot needs its own numeric contract.
+
+Acceptance requires an Align implementation to show one allocation-free counted loop, no tuple
+storage, expected SIMD on x86-64 and arm64, exact mismatch/effect/trap order, and parity with a
+manually fused equal-LLVM C control. Compare against both staged materialization and an indexed-loop
+control so the feature is adopted for canonical expression/fusion, not because the control was
+artificially weak. Do not add `map2`/`map_with`, `zip2`/`zip3`, or an automatic multi-array fusion
+heuristic as parallel mechanisms; settle one `zip` source spelling with the first real consumer.
+
+### 4.4 Correct way to recover SIMD after the `where` fix
 
 Do not choose between semantics and SIMD. Split the problem by legality:
 
@@ -839,6 +1002,45 @@ The document-11 whole-range `par_map` kernel is the critical example: it removes
 per-element indirect callback and exposes the loop to LLVM. That existing plan has higher value than
 adding portable-SIMD operations to compiler passes.
 
+### 8.7 Classical bit tricks — preserve semantics, not folklore
+
+The techniques catalogued in older optimization guides remain relevant, but not as a blanket
+source-to-source "bit hack" pass. Separate them by what survives modern targets:
+
+| Technique family | Current policy |
+|---|---|
+| saturating/overflowing arithmetic, rotate, popcount, leading/trailing-zero count, byte swap, min/max, widening/narrowing, multiply-high, and explicit average rounding | Represent the operation's exact semantics in core/MIR when a real consumer exists, then lower through LLVM intrinsics or target selection. Do not expand it early into shifts, masks, and branches. |
+| branchless select, carry/borrow tests, strength reduction, unrolling, and software pipelining | Emit ordinary SSA/control-flow plus the strongest legal alias/effect/range facts. Let LLVM choose by target, but retain machine-code gates for hot shapes because idiom recognition and cost models are not infallible. |
+| SWAR packing several byte lanes into one scalar word, packed-scalar multiply, and large lookup tables | Keep only inside a measured leaf kernel when real SIMD is unavailable or the scalar word is itself the natural representation. These forms can obstruct auto-vectorization, increase cache traffic, and encode endian/rounding assumptions. They are not language semantics. |
+| approximations such as reciprocal tables, reduced precision, or fast inverse square root | Never substitute implicitly. They change numerical semantics and belong behind an explicit approximate operation with an accuracy contract and an end-to-end workload. |
+| manual prefetch, alignment padding, tiling, and cache-oblivious/block algorithms | Still important, but primarily memory-layout/algorithm decisions rather than bit tricks. Adopt only from cache-miss/bandwidth evidence; the backend already handles routine instruction scheduling and constant arithmetic. |
+
+The branchless case is deliberately conditional. A predictable branch can be cheaper because it
+avoids loading/computing the unchosen side. A data-dependent unpredictable branch or a SIMD lane
+choice can be much cheaper as a mask/select. Selection is legal only when evaluating both sides is
+safe; section 3's inactive-lane rule remains load-bearing.
+
+**Representative probe (2026-07-14, Ryzen 9 5950X, clang/LLVM 22, `-O3 -march=znver3`, median of
+nine):** over 1 MiB of bytes, a semantic unsigned saturating-add loop lowered to `vpaddusb` and took
+27.3 us, while an equivalent source expansion through widen/add/clamp/pack took 59.5 us (2.17x
+slower). Align already takes the good path: `slice<u8>.map(x.saturating_add(100)).map_into(out)`
+forms `llvm.uadd.sat.v32i8` and native `vpaddusb`. This is evidence for preserving semantic
+intrinsics, not for adding a new saturating feature.
+
+For a mixed-width `u8` condition selecting `i32` values, clang's ordinary ternary loop chose a
+per-lane conditional-load shape on AVX2. The equivalent XOR/mask expression vectorized to
+`vblendvps`: 1M random selections took 2.55 ms versus 0.111 ms (23.0x), and the all-true control took
+0.246 ms versus 0.111 ms (2.21x). This is a specific cost-model miss, not a universal branchless
+rule. Preserve explicit MIR `select` for proven-safe lane choices and inspect native code for named
+hot kernels rather than teaching users the XOR identity.
+
+Conversely, the classic four-byte SWAR floor-average expression measured at parity with the natural
+byte loop (26.8 versus 26.1 us per 1 MiB); LLVM vectorized the natural loop. Scalar rotate and
+population count became single `rol` and `popcnt` instructions from semantic expressions/builtins.
+Therefore do not add a general SWAR rewrite. A future core numeric/bit-operation audit should cover
+the first row's missing semantic primitives, but each new surface still needs a concrete codec,
+hash, bitset, image/DSP, or parsing consumer and scalar/vector differential tests.
+
 ---
 
 ## 9. Boundary with documents 10 and 11
@@ -852,7 +1054,7 @@ Do not count the following as new findings from this audit:
   queue batching, packed task records, and false-sharing measurement;
 - generic CPU vs blocking-I/O pool split;
 - zero-size arena allocation, reader/`io.copy` zero-fill removal, JSON final-copy measurement;
-- O(n^2) `sort`/`sort_by_key` replacement and one-time key decoration;
+- the shipped O(n log n) `sort`/`sort_by_key` replacement and one-time key decoration;
 - Linux `io.copy` sendfile/splice/io_uring-class fast paths, scoped mmap views, and mmap advice/prefetch;
 - Base64 SIMD as an encoding backlog item.
 
@@ -861,6 +1063,7 @@ effect conflict, two now-fixed closure-region UAFs, Unit indirect-call ABI misma
 buffered-`io.copy` data loss, allocation byte-overflow hardening requirement, per-callsite
 initialized-before-read arena proof/gate, exact-final-destination codec fill, hex SIMD and macOS
 copy-path probes, HTTP request-copy removal, and sequential SIMD stream compaction.
+The measured total-order adaptive stable-sort path and tiny unused-scratch removal are also new here.
 
 The document-11 nested scheduler deadlock and lifted/higher-order effect holes are fixed. The
 function-type effect bit remains the precision path, not a second source mechanism.
@@ -911,8 +1114,12 @@ of integer wrap.
 ### Slice P1 — cache traffic and visible loops
 
 - implement and benchmark arena initialized-before-read/uninitialized vs conservative-zeroed separation;
+- build lazy multi-source `zip` only with its first real consumer; gate it on one allocation-free,
+  tuple-storage-free vector loop and exact length/alias/effect semantics;
 - direct-fill exact codec destinations, then evaluate already-planned Base64 SIMD and the separate
   measure-first hex SIMD probe;
+- add the total-order ordered-input/run-boundary stable-sort path and delay merge-only scratch until
+  a merge pass can execute; retain the current path for float/NaN keys;
 - execute document 11's range-kernel and low-lock scheduler sequence;
 - land the already-planned I/O uninitialized-read-buffer work.
 
