@@ -26,8 +26,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_interface_summaries, check, emit_llvm_ir, emit_object_file, format_diagnostics,
-    link_executable, lower_to_mir, unknown_exports, BuildTarget, Profile,
+    build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_file,
+    format_diagnostics, link_executable, link_objects, lower_to_mir, unknown_exports, BuildTarget,
+    Profile,
 };
 use align_span::SourceMap;
 
@@ -68,10 +69,10 @@ fn main() -> ExitCode {
     if rt_lto {
         if !matches!(
             cmd,
-            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm")
+            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm") | Some("build-per-unit")
         ) {
             eprintln!(
-                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
+                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`/`build-per-unit` (got `{}`)",
                 cmd.unwrap_or("<none>")
             );
             return ExitCode::FAILURE;
@@ -120,6 +121,10 @@ fn main() -> ExitCode {
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
         (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto),
+        // `build-per-unit <file>` — the M15 S2 separate-compilation path: compile each unit to its
+        // own object and link the N objects. Dev surface; the default `build` stays whole-program
+        // until S2b flips it. Produces the same executable (`<stem>` in cwd).
+        (Some("build-per-unit"), Some(p)) => run_build_per_unit(p, target, profile, rt_lto),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto),
         _ => {
@@ -260,6 +265,7 @@ fn usage() {
            explain-opt report what the -O2 optimizer did to the data path (--verbose for detail)\n  \
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
+           build-per-unit  build an executable via per-unit separate compilation (M15 S2)\n  \
            run        build and run (returns the exit code)\n  \
            size       build then report the executable's size breakdown\n  \
          \n\
@@ -596,6 +602,78 @@ fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) ->
         }
         Err(code) => code,
     }
+}
+
+/// `alignc build-per-unit <file>` (M15 S2): compile each unit to its OWN object under the
+/// separate-compilation visibility model, then link the N objects into one executable. Capability
+/// libraries are unioned deterministically across units. The default `build` stays whole-program
+/// (byte-identical) until S2b promotes this to the sole path.
+fn run_build_per_unit(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
+    let Some(src) = read(path) else {
+        return ExitCode::FAILURE;
+    };
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, path, &src);
+    if !walk.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &walk.diags));
+    }
+    if walk.diags.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    if walk.units.is_empty() {
+        eprintln!("alignc: no units to build");
+        return ExitCode::FAILURE;
+    }
+
+    // One object per unit, emitted into a process-private staging directory. Objects are named by a
+    // per-unit index (not the module path, which may contain `.`), keeping the filenames simple.
+    let object_stage = match ArtifactStage::temp("align-per-unit-obj") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("alignc: cannot create object staging directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(walk.units.len());
+    // Deterministic capability union across units, first-seen order (units are bottom-up).
+    let mut link_libs: Vec<String> = Vec::new();
+    for (i, unit) in walk.units.iter().enumerate() {
+        let obj = object_stage.path().join(format!("unit{i}.o"));
+        // `build`-family commands never take `--export` (the only linker-visible definition is the
+        // entry's `main`; a unit's `pub` fns are external so cross-unit calls resolve).
+        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, &[], rt_lto) {
+            eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
+            return ExitCode::FAILURE;
+        }
+        obj_paths.push(obj);
+        for lib in &unit.mir.link_libs {
+            if !link_libs.contains(lib) {
+                link_libs.push(lib.clone());
+            }
+        }
+    }
+
+    let exe = PathBuf::from(stem(path));
+    let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let publish_stage = match ArtifactStage::in_dir(parent, "align-publish") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("alignc: cannot create executable staging directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let staged_exe = publish_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
+    let obj_refs: Vec<&Path> = obj_paths.iter().map(|p| p.as_path()).collect();
+    if let Err(e) = link_objects(&obj_refs, &staged_exe, &link_libs, profile) {
+        eprintln!("alignc: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::rename(&staged_exe, &exe) {
+        eprintln!("alignc: cannot publish executable {}: {e}", exe.display());
+        return ExitCode::FAILURE;
+    }
+    println!("alignc: built executable (per-unit, {} unit(s)): {}", walk.units.len(), exe.display());
+    ExitCode::SUCCESS
 }
 
 fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {

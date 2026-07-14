@@ -14,6 +14,17 @@ pub fn program_to_string(p: &Program) -> String {
     out
 }
 
+/// The same stable, location-free text [`program_to_string`] prints for one function, without
+/// needing to wrap it in a [`Program`] (and so without cloning it into one) — types are printed by
+/// id, never resolved through the program's type tables, so a single [`Function`] prints identically
+/// in or out of a program. Used by callers that hash or display one function at a time (e.g. the
+/// per-unit `impl_hash` split).
+pub fn function_to_string(f: &Function) -> String {
+    let mut out = String::new();
+    fn_to_string(&mut out, f);
+    out
+}
+
 fn fn_to_string(out: &mut String, f: &Function) {
     let params: Vec<String> = f
         .params

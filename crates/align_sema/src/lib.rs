@@ -2800,10 +2800,27 @@ pub fn check_program_with_effects(
     // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
     // every generic call and processed to a fixpoint below.
     let mut worklist: std::collections::VecDeque<(String, Vec<Ty>)> = std::collections::VecDeque::new();
+    // M15 S2: bodyless declarations of imported non-generic `pub` functions this unit may call
+    // cross-unit (their bodies live in the dependency's object). Empty in the whole-program path
+    // (there are no interface-only modules), so the default build is byte-identical. A *generic*
+    // imported `pub` fn is NOT declared here — the consumer monomorphizes it into its own object as
+    // an internal symbol (reached through the worklist above), never a cross-unit call.
+    let mut imported_fns: Vec<hir::ImportedFn> = Vec::new();
     for &(module, is_entry, f) in &all_fns {
         // Do not check or emit an interface-only dependency's own functions (see above); its generic
         // templates are reached only through the monomorphization worklist below.
         if interface_only_modules.contains(module) {
+            let is_generic = !f.type_params.is_empty();
+            if !is_generic && matches!(f.vis, ast::Vis::Pub) {
+                let mangled = mangle_fn(module, is_entry, &f.name.name);
+                if let Some(sig) = sigs.get(&mangled) {
+                    imported_fns.push(hir::ImportedFn {
+                        name: mangled,
+                        params: sig.params.clone(),
+                        ret: sig.ret,
+                    });
+                }
+            }
             continue;
         }
         let mangled = mangle_fn(module, is_entry, &f.name.name);
@@ -2829,6 +2846,11 @@ pub fn check_program_with_effects(
                 );
             }
         } else {
+            // M15 S2 visibility: a non-entry `pub` user function is a candidate external symbol
+            // under separate compilation (its `module$name` mangling is collision-free). The entry
+            // unit's functions are never imported (nothing imports the entry), so they stay
+            // internal — which also keeps a single-file (N=1) build byte-identical to today.
+            checked.exportable = !is_entry && matches!(f.vis, ast::Vis::Pub);
             worklist.extend(cx.instantiations);
             fns.push(checked);
             fns.extend(lifted);
@@ -2856,7 +2878,7 @@ pub fn check_program_with_effects(
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
     }
-    let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types };
+    let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types, imported_fns };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -7303,6 +7325,7 @@ impl<'a, 't> Checker<'a, 't> {
             body,
             span: f.span,
             drop_locals: Vec::new(),
+            exportable: false,
         }
     }
 
@@ -10893,6 +10916,7 @@ impl<'a, 't> Checker<'a, 't> {
             body: body_fin,
             span,
             drop_locals: Vec::new(),
+            exportable: false,
         });
 
         // Restore the enclosing function's state.

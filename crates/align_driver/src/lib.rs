@@ -194,7 +194,7 @@ pub struct PerUnitCheck {
 /// each dependency's public surface is rendered back to source and re-parsed into an interface-only
 /// module (one resolution path — the existing sema passes), and cross-unit effect bits are seeded
 /// fail-closed.
-pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitCheck {
+fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags);
@@ -272,6 +272,9 @@ pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
     }
 
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
+    // Per-unit compilation artifacts, keyed by unit path: (summary, per-unit MIR, is_entry). Populated
+    // only for cleanly-checked units; assembled bottom-up into `PerUnitArtifact`s at the end.
+    let mut mirs: HashMap<String, (align_interface::InterfaceSummary, MirProgram, bool)> = HashMap::new();
     let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
     // Cache of each dependency's synthesized interface AST, keyed by module path. Rendered and
     // parsed exactly once per dependency (not once per importer): `summary_to_source` is called
@@ -351,7 +354,13 @@ pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
                 is_entry: u.is_entry,
                 interface_only: false,
             }];
-            let mir = lower_to_mir(&program);
+            // Per-unit MIR (S2): the unit's own fns + in-consumer monomorphs, with the
+            // separate-compilation visibility bits set (`pub` fns external, imported callees carried
+            // as external declares). The summary is byte-identical whether lowered per-unit or
+            // whole-program (its `impl_hash` hashes MIR *fns*, its capabilities partition MIR fns —
+            // neither sees the exportable bit or the declare list), so `check_per_unit`'s summaries
+            // are unchanged by this while `build_per_unit` reuses the same MIR for codegen.
+            let mir = lower_to_mir_per_unit(&program);
             let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
             let mut built = align_interface::build_summaries_with_effects(
                 &unit_module,
@@ -361,16 +370,77 @@ pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
                 &external_effects,
             );
             if let Some(s) = built.pop() {
-                summaries.insert(u.path.clone(), s);
+                summaries.insert(u.path.clone(), s.clone());
+                mirs.insert(u.path.clone(), (s, mir, u.is_entry));
             }
         }
     }
 
-    // Emit summaries in bottom-up order (deterministic, dependency-first).
-    let summaries: Vec<align_interface::InterfaceSummary> =
-        order.iter().filter_map(|p| summaries.remove(p)).collect();
+    // Assemble one artifact per cleanly-checked unit, in bottom-up (dependency-first) order. A unit
+    // that failed to check contributes none (its errors are in `diags`). `dep_interface_hashes` stays
+    // the FULL per-order list (an entry for every unit, clean or not) — that is the S1b dev-verb
+    // contract `check_per_unit` returns unchanged; each clean unit's artifact carries its own copy.
+    let dep_hashes_by_unit: HashMap<&str, &Vec<(String, align_interface::Hash128)>> =
+        dep_interface_hashes.iter().map(|(u, h)| (u.as_str(), h)).collect();
+    let units: Vec<PerUnitArtifact> = order
+        .iter()
+        .filter_map(|p| {
+            let (summary, mir, is_entry) = mirs.remove(p)?;
+            Some(PerUnitArtifact {
+                unit: p.clone(),
+                is_entry,
+                mir,
+                summary,
+                dep_interface_hashes: dep_hashes_by_unit
+                    .get(p.as_str())
+                    .unwrap_or_else(|| panic!("missing dependency hashes for unit '{p}' — walk order must produce deps first"))
+                    .to_vec(),
+            })
+        })
+        .collect();
 
-    PerUnitCheck { summaries, dep_interface_hashes, diags }
+    let _ = summaries; // superseded by `units[*].summary`; retained above only for the walk's seeding.
+    PerUnitWalk { units, dep_interface_hashes, diags }
+}
+
+/// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
+/// external declares for imported `pub` callees), its interface summary, and its transitive
+/// dependency interface-hash set (the S3 cache-key input). Produced bottom-up by [`build_per_unit`].
+pub struct PerUnitArtifact {
+    pub unit: String,
+    pub is_entry: bool,
+    pub mir: MirProgram,
+    pub summary: align_interface::InterfaceSummary,
+    pub dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
+}
+
+/// The per-unit compilation result: one artifact per cleanly-checked unit (bottom-up), the FULL
+/// per-order transitive dependency-hash list (an entry for every unit, whether or not it checked
+/// cleanly — the S1b `check_per_unit` contract), and the union of all per-unit diagnostics. See
+/// [`build_per_unit`].
+pub struct PerUnitWalk {
+    pub units: Vec<PerUnitArtifact>,
+    pub dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)>,
+    pub diags: Diagnostics,
+}
+
+/// M15 S2 per-unit build (library entry): walk the import DAG bottom-up, check each unit against its
+/// imports' interface summaries, and lower each cleanly-checked unit to its OWN MIR under the
+/// separate-compilation visibility model. Returns one [`PerUnitArtifact`] per unit (MIR + summary +
+/// dependency hashes), ready for per-unit codegen + N-object link. Additive: the whole-program
+/// [`check`]/build path is untouched. On any error, the affected unit contributes no artifact and the
+/// error is in `diags` (the caller must not link a partial build).
+pub fn build_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
+    walk_per_unit(source_map, name, src)
+}
+
+/// M15 S1b: check every unit **per-unit** (see [`build_per_unit`] for the shared walk). This is the
+/// check-only projection: it discards the per-unit MIR and returns just the summaries + dependency
+/// hashes + diagnostics (the S1b dev-verb contract).
+pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitCheck {
+    let walk = walk_per_unit(source_map, name, src);
+    let summaries = walk.units.into_iter().map(|u| u.summary).collect();
+    PerUnitCheck { summaries, dep_interface_hashes: walk.dep_interface_hashes, diags: walk.diags }
 }
 
 /// Reject a cyclic module import graph (`check`'s `edges` map: importer path -> `(imported
@@ -446,6 +516,14 @@ fn detect_import_cycles(
 /// Lower the sema-checked HIR down to MIR.
 pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
     align_mir::lower_program(hir)
+}
+
+/// M15 S2 per-unit lowering: lower ONE unit's checked HIR to MIR under the separate-compilation
+/// visibility model — a non-entry `pub` function gets `external` linkage, and imported `pub` callees
+/// become external declares (`align_mir::lower_program_per_unit`). The whole-program [`lower_to_mir`]
+/// keeps every function `internal` and drops declares, so the default object stays byte-identical.
+pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
+    align_mir::lower_program_per_unit(hir)
 }
 
 /// Lower to MIR with source locations (each statement records the line/col it came from), for

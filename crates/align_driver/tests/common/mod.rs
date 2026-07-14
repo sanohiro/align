@@ -6,9 +6,9 @@
 #![allow(dead_code, unused_imports)]
 
 pub use align_driver::{
-    backend_available, check, check_per_unit, emit_llvm_ir, emit_object_file, link_executable,
-    link_objects, lower_to_mir, BuildTarget, Hash128, InterfaceSummary, ObjectFormat, PerUnitCheck,
-    Profile,
+    backend_available, build_per_unit, check, check_per_unit, emit_llvm_ir, emit_object_file,
+    link_executable, link_objects, lower_to_mir, lower_to_mir_per_unit, BuildTarget, Hash128,
+    InterfaceSummary, ObjectFormat, PerUnitArtifact, PerUnitCheck, PerUnitWalk, Profile,
 };
 pub use align_span::SourceMap;
 
@@ -340,6 +340,110 @@ pub fn check_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> 
     let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
     let mut sm = SourceMap::new();
     check_per_unit(&mut sm, &entry_path.display().to_string(), &entry_src)
+}
+
+/// M15 S2 per-unit build harness: write `files` to a fresh temp dir, run [`build_per_unit`], and keep
+/// the project alive so the per-unit objects can be emitted, linked, run, and inspected. The temp
+/// directory (and every artifact under it) is removed when the returned value is dropped.
+pub struct PerUnitBuilt {
+    pub walk: PerUnitWalk,
+    /// The project's temp directory — every per-unit artifact (objects, linked executables) belongs
+    /// here so it is removed automatically when `_proj` drops.
+    pub dir: PathBuf,
+    _proj: TempProject,
+}
+
+impl PerUnitBuilt {
+    /// Emit each cleanly-checked unit's object into the project directory (`unit<i>.o`, unit order),
+    /// returning the object paths. Uses the release profile / baseline target (the suite default).
+    pub fn emit_objects(&self, rt_lto: bool) -> Vec<PathBuf> {
+        self.emit_objects_with(Profile::Release, rt_lto)
+    }
+
+    /// [`emit_objects`] with an explicit profile — `Dev` (O0) keeps internal symbols (privates,
+    /// consumer-side monomorphs) observable for a visibility assertion that `Release` would inline away.
+    pub fn emit_objects_with(&self, profile: Profile, rt_lto: bool) -> Vec<PathBuf> {
+        let mut objs = Vec::with_capacity(self.walk.units.len());
+        for (i, u) in self.walk.units.iter().enumerate() {
+            let obj = self.dir.join(format!("unit{i}.o"));
+            emit_object_file(&u.mir, &obj, BuildTarget::Baseline, profile, &[], rt_lto)
+                .unwrap_or_else(|e| panic!("codegen for unit `{}`: {e}", u.unit));
+            objs.push(obj);
+        }
+        objs
+    }
+
+    /// The deterministic capability-library union across units (first-seen, unit order).
+    pub fn link_libs_union(&self) -> Vec<String> {
+        let mut libs: Vec<String> = Vec::new();
+        for u in &self.walk.units {
+            for l in &u.mir.link_libs {
+                if !libs.contains(l) {
+                    libs.push(l.clone());
+                }
+            }
+        }
+        libs
+    }
+
+    /// Emit + link the N objects into an executable, run it, and return its `Output`.
+    pub fn link_and_run(&self) -> std::process::Output {
+        let objs = self.emit_objects(false);
+        let obj_refs: Vec<&std::path::Path> = objs.iter().map(|p| p.as_path()).collect();
+        let exe = self.dir.join(format!("a{}", std::env::consts::EXE_SUFFIX));
+        link_objects(&obj_refs, &exe, &self.link_libs_union(), Profile::Release).expect("link");
+        std::process::Command::new(&exe).output().expect("run")
+    }
+
+    /// The artifact for the named unit.
+    pub fn unit(&self, name: &str) -> &PerUnitArtifact {
+        self.walk.units.iter().find(|u| u.unit == name).unwrap_or_else(|| panic!("unit `{name}` not built"))
+    }
+}
+
+/// Write a multi-file program to a fresh temp dir and run the M15 S2 per-unit build over it.
+pub fn build_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> PerUnitBuilt {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let dir = proj.dir.clone();
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, &entry_path.display().to_string(), &entry_src);
+    assert!(
+        !walk.diags.has_errors(),
+        "unexpected per-unit errors:\n{}",
+        align_driver::format_diagnostics(&sm, &walk.diags)
+    );
+    PerUnitBuilt { walk, dir, _proj: proj }
+}
+
+/// The defined/undefined symbols of an object file via `llvm-nm`, one `(kind, name)` per line
+/// (kind is nm's single-letter type: `T`/`t` text, `U` undefined, etc.). `None` if `llvm-nm` is
+/// not discoverable (the caller skips the assertion).
+pub fn nm_symbols(obj: &std::path::Path) -> Option<Vec<(char, String)>> {
+    let tool = align_driver::llvm_tool("llvm-nm")?;
+    let out = std::process::Command::new(&tool)
+        .arg(obj)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run llvm-nm");
+    assert!(out.status.success(), "llvm-nm failed: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut syms = Vec::new();
+    for line in text.lines() {
+        // Format: "<addr-or-blank> <kind> <name>" — an undefined symbol has a blank address column.
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            [kind, name] if kind.len() == 1 => {
+                syms.push((kind.chars().next().unwrap(), (*name).to_string()));
+            }
+            [_addr, kind, name] if kind.len() == 1 => {
+                syms.push((kind.chars().next().unwrap(), (*name).to_string()));
+            }
+            _ => {}
+        }
+    }
+    Some(syms)
 }
 
 /// Whether checking a multi-file program (`entry` + the other `files`) produces any error.

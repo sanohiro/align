@@ -2657,7 +2657,33 @@ Final: **2006 green** (1969 + 37), clippy clean. Pre-existing bug surfaced by th
 (`map(dbl)`) fails with "undefined function" inside a NON-ENTRY module (direct calls and
 `map_into` work) — recorded in `open-questions.md` Open. **S2**
 per-unit codegen + N-object link
-(visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
+(visibility model, capability union, per-unit rt-lto). **S2 first stage SHIPPED 2026-07-14**
+(dev surface, additive — the default `build`/`run`/`emit-obj` stay whole-program and byte-identical
+until S2b flips them): `build_per_unit` walks the DAG bottom-up producing one `PerUnitArtifact`
+(per-unit MIR + summary + dep hashes) per cleanly-checked unit; a new `alignc build-per-unit` verb
+links the N objects. Visibility model wired end-to-end: a non-entry `pub` user fn gets `external`
+linkage (`hir::Fn.exportable` → `mir::Function.exportable`, set only by `lower_program_per_unit`;
+whole-program `lower_program` forces every fn internal for byte-identity), the entry unit's fns stay
+internal (nothing imports the entry — this is also what makes N=1 byte-identical), and imported `pub`
+callees become external Align-ABI declares (`hir::Program.imported_fns` → `mir::Program.imported_fns`
+→ codegen `declare_imported_fn`, mirroring `declare_fn`'s signature/ABI so the linker binds the call;
+generics stay consumer-side monomorphs, never cross-unit declares). Capability sets union
+deterministically across units at final link. Per-unit `--rt-lto` merges the baked bitcode into each
+unit's raw module (the guarded-skip/shed logic is already per-module). `impl_hash` upgraded off the
+S1a source-byte stand-in to the unit's own MIR functions, stable-printed + location-free
+(`partition_impl_hashes`) — a comment-only edit that lowers identically no longer over-invalidates.
+Gates (6 new, `crates/align_driver/tests/per_unit_codegen.rs`): (a) N=1 object byte-identical to the
+whole-program object + identical run; (b) multi-file cross-unit calls / imported struct / Move-array
+return / in-consumer generic run identical to whole-program; (c) `llvm-nm` visibility — non-entry
+`pub` fns external-defined, privates/monomorphs not external, entry `main` external, cross-unit call
+site an undefined extern reference; (d) capability union is libz-only when one unit uses compress and
+another none; (e) per-unit `--rt-lto` inlines `align_rt_str_eq` in the NON-entry unit, flag-off still
+calls it; (f) private-body edit flips impl_hash only, comment-only edit flips neither. 2019 green.
+**Honest remainders (S2b/S3):** the default-path flip to per-unit (S2b); per-unit `alignc size` /
+`explain-opt` / `emit-llvm` / `emit-obj --export` surfaces (S2b); incremental caching + parallel unit
+compilation (S3); consumer-side monomorphs are attributed to their template's unit in the
+`impl_hash` partition (sound — a template-body change flips the producer's interface hash, which the
+consumer keys on). **S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
 bundle: the doc-10 §7 invalidation matrix per-unit, N=1 byte-identity vs today, cold-vs-hit
 byte-identity, and fail-closed effect-bit gates incl. a stale/absent-interface mutation.

@@ -271,6 +271,7 @@ pub fn build_summaries_with_effects(
         .map(|(k, v)| (k, v.into()))
         .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
+    let impl_hash_by_unit = partition_impl_hashes(modules, mir);
 
     let mut summaries = Vec::with_capacity(modules.len());
     for m in modules {
@@ -389,9 +390,17 @@ pub fn build_summaries_with_effects(
             impl_hash: Hash128 { lo: 0, hi: 0 },
         };
         summary.interface_hash = Hash128::of(&codec::encode_interface_surface(&summary));
-        // TODO(m15-s2): replace source-byte impl identity with the unit's own canonical
-        // location-free MIR (doc-10 §6.2), once MIR is per-unit separable.
-        summary.impl_hash = Hash128::of(src.as_bytes());
+        // impl_hash (M15 S2): the fingerprint of the unit's OWN implementation — its MIR functions
+        // (its bodies + the monomorphs/thunks that carry its base name), stable-printed and
+        // location-free (the MIR text printer ignores `stmt_lines`). Replaces the S1a source-byte
+        // stand-in: hashing the compiled shape means a whitespace/comment-only edit that lowers to
+        // identical MIR no longer over-invalidates the object, while any real body change flips it.
+        // A unit whose MIR the whole-program producer did not separate falls back to source bytes.
+        // Honest intermediate (recorded): the printed form carries this compile's struct/enum/tuple
+        // ids; deterministic within the per-unit build path (the only path S3 caches), which is what
+        // the incremental key requires. See `partition_impl_hashes`.
+        summary.impl_hash =
+            impl_hash_by_unit.get(&m.path).copied().unwrap_or_else(|| Hash128::of(src.as_bytes()));
         summaries.push(summary);
     }
     summaries
@@ -450,6 +459,69 @@ fn partition_capabilities(
         }
     }
     caps_by_unit
+}
+
+/// The per-unit `impl_hash` (M15 S2): partition `mir.fns` into the unit that owns each function (same
+/// longest-base-match rule as [`partition_capabilities`] — a monomorph / lifted thunk / C-`main`
+/// wrapper shares its base's unit; an unowned function falls to the entry unit), then hash each
+/// unit's functions' stable, location-free MIR text (names sorted so the encoding is
+/// declaration-order-independent). A body edit changes that unit's printed MIR and so its
+/// `impl_hash`; a pure comment/whitespace edit that lowers identically does not. Consumers never key
+/// on `impl_hash` (only on `interface_hash`), so this fingerprint drives exactly one thing: whether
+/// the unit's own object must be re-emitted.
+fn partition_impl_hashes(
+    modules: &[align_sema::Module],
+    mir: &align_mir::Program,
+) -> HashMap<String, Hash128> {
+    let mut base_to_unit: HashMap<String, String> = HashMap::new();
+    let mut entry_unit: Option<String> = None;
+    for m in modules {
+        if m.is_entry {
+            entry_unit = Some(m.path.clone());
+        }
+        for item in &m.file.items {
+            if let align_ast::Item::Fn(fd) = item {
+                base_to_unit.insert(mangle(&m.path, m.is_entry, &fd.name.name), m.path.clone());
+            }
+        }
+    }
+    let owning_unit = |fn_name: &str| -> Option<&String> {
+        let mut best: Option<(&String, usize)> = None;
+        for (base, unit) in &base_to_unit {
+            let matches = fn_name == base
+                || (fn_name.len() > base.len()
+                    && fn_name.starts_with(base.as_str())
+                    && fn_name.as_bytes()[base.len()] == b'$');
+            if matches && best.is_none_or(|(_, len)| base.len() > len) {
+                best = Some((unit, base.len()));
+            }
+        }
+        best.map(|(u, _)| u)
+    };
+
+    // Bucket each MIR function's index by owning unit.
+    let mut fns_by_unit: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, f) in mir.fns.iter().enumerate() {
+        let Some(unit) = owning_unit(&f.name).or(entry_unit.as_ref()) else { continue };
+        fns_by_unit.entry(unit.clone()).or_default().push(i);
+    }
+
+    let mut out: HashMap<String, Hash128> = HashMap::new();
+    for (unit, mut idxs) in fns_by_unit {
+        idxs.sort_by(|&a, &b| mir.fns[a].name.cmp(&mir.fns[b].name));
+        // Stable, location-free text of just this unit's functions, printed by reference one
+        // function at a time (`function_to_string` prints types by id, never through a program's
+        // type tables, so it needs no `Program` wrapper — and so no cloning every `Function` into a
+        // temporary one just to print it). Concatenated in the same sorted, declaration-order-
+        // independent order the old whole-`Program` printing established.
+        let mut text = String::new();
+        for &i in &idxs {
+            text.push_str(&align_mir::print::function_to_string(&mir.fns[i]));
+            text.push('\n');
+        }
+        out.insert(unit, Hash128::of(text.as_bytes()));
+    }
+    out
 }
 
 // ---- M15 S1b: reconstruct a dependency's public surface as source (consumer-side per-unit sema) ----
