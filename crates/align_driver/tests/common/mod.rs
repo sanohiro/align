@@ -290,3 +290,15 @@ pub fn check_multi_errs(name: &str, files: &[(&str, &str)], entry: &str) -> bool
     let mut sm = SourceMap::new();
     check(&mut sm, &entry_path.display().to_string(), &entry_src).diags.has_errors()
 }
+
+/// The rendered diagnostics from checking a multi-file program (`entry` + the other `files`) — the
+/// multi-file counterpart of [`check_diagnostics`], for negative tests that assert the *message*
+/// (e.g. a cyclic-import error naming the cycle), not just that some error occurred.
+pub fn check_multi_diagnostics(name: &str, files: &[(&str, &str)], entry: &str) -> String {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_path.display().to_string(), &entry_src);
+    align_driver::format_diagnostics(&sm, &checked.diags)
+}
