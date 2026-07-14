@@ -28,10 +28,17 @@ once per walk (O(N²) → O(N)). **Pre-existing bug surfaced by the gate and rec
 `open-questions.md` Open:** by-name fn-value references (`map(dbl)`) fail in NON-ENTRY modules
 on the untouched whole-program path too (direct calls / `map_into` fine — likely a mangled-name
 gap in fn-value resolution). **The earlier 238/1/1 flake is now IDENTIFIED:**
-`align_runtime::tests::http_server_no_fd_leak_across_cycles`, a timing flake under load
-(recurred once during the #447 review-fix verification; passes in isolation and on rerun).
-**Next M15 step = S2 (per-unit codegen + N-object link)**; the fn-value bug is a small
-independent fix that can go first. Implementation shape of the merged slice: seam =
+`align_runtime::tests::http_server_no_fd_leak_across_cycles`, a timing flake under
+full-suite parallel load (passes in isolation and on rerun) — it recurred THREE times on
+2026-07-14 (post-#446, during the #447 review-fix verification, post-#448 merge), always the
+same 238/1/1 signature. Noisy enough to deserve a small hardening slice (serialize the test
+or make the fd-count check retry-bounded WITHOUT weakening its leak-detection teeth) — queue
+it behind the M15 slices. **The non-entry fn-value bug is FIXED, MERGED as #448** (2013
+green): the six pipeline/reducer callable-resolution sites now route through the same
+`resolve_local_fn` as direct calls; the open-questions entry is narrowed to the qualified
+cross-module callable remainder (`map(util.dbl)` — `pipeline_fn_name` single-segment
+limitation, same class as the recorded `par_map` one). **Next M15 step = S2 (per-unit codegen
++ N-object link).** Implementation shape of the merged slice: seam =
 **summary→source→re-parse**: an imported unit's public surface is rendered back
 to Align source (`align_interface::summary_to_source`) and re-parsed by the EXISTING parser into an
 interface-only `Module` (`Module::interface_only`), so ALL sema table-building + resolution passes
