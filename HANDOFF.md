@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (fourth update this day), **M15 S1a SHIPPED — the unit interface
+_Last updated: 2026-07-14 (fifth update this day), **M15 S1b entry gate SHIPPED — a `pub`
+interface may name only `pub` types, MERGED as #446** (workspace **1969 green** + clippy
+clean; gemini zero findings). Flake note for the record: ONE post-merge full-suite run showed
+a single failure in the `align_runtime` test binary (238/1/1 at 0.50 s; the specific test name
+was not captured); the full suite re-ran clean (1969/0/1) and the binary passed 5/5 targeted
+re-runs — treated as a one-off timing flake under transient load, not a regression; if it
+recurs, capture the test name. Sema pass 0a-2: `check_type_exposure` recurses exhaustively over
+all `ast::Type` constructors (Named/Tuple/Fn, no wildcard — a new constructor is a compile
+error there) for every `pub` fn signature (type params exempt), `pub` struct field, and `pub`
+sum payload, incl. generic args of qualified types (`mod.Wrapper<Secret>`); cross-module
+private access was ALREADY rejected, so the check is same-module-only; `pub const`
+(scalar/`str`-only) and `extern` fns (FFI scalars) are structurally exempt — documented +
+tested. Diagnostic names item/type/position. **Signal: 8 existing SoA fixtures used exactly
+this hole** (private struct exposed via `pub fn` over `soa<T>`/`array<T>`) and were corrected.
+This closes S1a-recorded entry gate (1); **gate (2) — transitive imported-unit interface-hash
+keying — still governs S1b proper** (per-unit sema consuming summaries), which is the next
+M15 step. Previous update: 2026-07-14 (fourth update), **M15 S1a SHIPPED — the unit interface
 summary (producer side), MERGED as #445** (workspace **1957 green** + clippy clean;
 adversarial gate SHIP — fuzzed reader panic-free across 2900+ probes; gemini's one medium —
 allocation-free unit-prefix match — applied pre-merge). New crate `align_interface` (ast/sema/
@@ -629,10 +645,10 @@ manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targ
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
 Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
 Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
-paragraph): (a) **M15 implementation, S1b next** (S0 #444 + S1a #445 SHIPPED; S1b = per-unit
-sema consuming imported summaries — start with its MANDATORY entry gate, the sema rejection of
-`pub` signatures exposing non-`pub` types, then transitive interface-hash keying) — the
-settled slice plan S0–SV + the S1a record are in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+paragraph): (a) **M15 implementation, S1b proper next** (S0 #444 + S1a #445 + the S1b entry
+gate #446 all SHIPPED; S1b = per-unit sema consuming imported summaries, keyed on the
+TRANSITIVE imported-unit interface-hash set) — the settled slice plan S0–SV + the S1a/#446
+records are in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
 lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth

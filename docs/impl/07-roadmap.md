@@ -2601,12 +2601,20 @@ no drift; generic template bodies as source text; capabilities as data, delibera
 the interface hash), hand-rolled versioned fail-closed codec (fuzzed panic-free incl.
 allocation-bomb prefixes), `interface_hash` includes effect bits + template bodies,
 `impl_hash` = source bytes with `TODO(m15-s2)` → per-unit MIR; driver `emit-interface` verb;
-12 tests incl. the 5 hash-split gates; adversarial gate SHIP. **S1b (consumer) has TWO entry
+12 tests incl. the 5 hash-split gates; adversarial gate SHIP. **S1b (consumer) had TWO entry
 gates recorded by the S1a review: (1) MANDATORY sema rejection of a `pub` signature exposing a
-non-`pub` type** — today accepted (empirically confirmed); a private type is summarized by
-name only, so its layout change would NOT flip the interface hash → stale-object miscompile
-once consumers exist; **(2) consumers must key on the TRANSITIVE set of imported units'
-interface hashes** (foreign type references are by-name in the canonical surface). **S2**
+non-`pub` type** — a private type is summarized by name only, so its layout change would NOT
+flip the interface hash → stale-object miscompile once consumers exist. **Gate (1) SHIPPED
+2026-07-14 as #446**: sema pass 0a-2 walks every `pub` fn signature / struct field / sum
+payload, `check_type_exposure` recurses exhaustively over all `ast::Type` constructors (no
+wildcard) incl. generic args of qualified types; cross-module private access was already
+rejected so the check is same-module-only; `pub const` (scalar/`str`-only) and `extern`
+(FFI-scalar-only) are structurally exempt, documented + tested; 12 tests; 8 existing SoA
+fixtures had used exactly this hole (private struct through `pub fn` `soa<T>`) and were
+corrected — the rule bites on real code. `draft.md` §17 + the language-spec digest carry the
+rule; the S1a "known finding" note is flipped to an ENFORCED invariant. **(2) still standing
+for S1b proper: consumers must key on the TRANSITIVE set of imported units' interface hashes**
+(foreign type references are by-name in the canonical surface). **S2**
 per-unit codegen + N-object link
 (visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
