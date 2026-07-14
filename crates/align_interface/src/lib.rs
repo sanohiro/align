@@ -262,72 +262,86 @@ pub fn build_summaries(
         let mut consts: Vec<IConst> = Vec::new();
 
         for item in &m.file.items {
+            // Exhaustive over `align_ast::Item` on purpose (no `_` catch-all): a new variant must be
+            // triaged here explicitly rather than silently dropped from the interface surface.
             match item {
-                align_ast::Item::Fn(fd) if is_pub(fd.vis) => {
-                    let is_generic = !fd.type_params.is_empty();
-                    let effect = if is_generic {
-                        // A generic template's effect is derived by the consumer on instantiation; its
-                        // body ships in `generic_body`. Reserve Unknown.
-                        Effect::Unknown
-                    } else {
-                        let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
-                        // Fail-closed: a non-generic pub fn missing from the effect map is Impure.
-                        effects.get(&canonical).copied().unwrap_or(Effect::Impure)
-                    };
-                    fns.push(IFnSig {
-                        name: fd.name.name.clone(),
-                        type_params: convert_type_params(&fd.type_params),
-                        params: fd
-                            .params
-                            .iter()
-                            .map(|p| IParam { is_out: p.is_out, ty: convert_type(&p.ty) })
-                            .collect(),
-                        ret: convert_ret(&fd.ret),
-                        effect,
-                        generic_body: is_generic.then(|| safe_slice(src, fd.span)),
-                    });
+                align_ast::Item::Fn(fd) => {
+                    if is_pub(fd.vis) {
+                        let is_generic = !fd.type_params.is_empty();
+                        let effect = if is_generic {
+                            // A generic template's effect is derived by the consumer on instantiation;
+                            // its body ships in `generic_body`. Reserve Unknown.
+                            Effect::Unknown
+                        } else {
+                            let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
+                            // Fail-closed: a non-generic pub fn missing from the effect map is Impure.
+                            effects.get(&canonical).copied().unwrap_or(Effect::Impure)
+                        };
+                        fns.push(IFnSig {
+                            name: fd.name.name.clone(),
+                            type_params: convert_type_params(&fd.type_params),
+                            params: fd
+                                .params
+                                .iter()
+                                .map(|p| IParam { is_out: p.is_out, ty: convert_type(&p.ty) })
+                                .collect(),
+                            ret: convert_ret(&fd.ret),
+                            effect,
+                            generic_body: is_generic.then(|| safe_slice(src, fd.span)),
+                        });
+                    }
+                    // Non-pub fns are module-private: not part of the exported interface surface.
                 }
-                align_ast::Item::Struct(sd) if is_pub(sd.vis) => {
-                    let is_generic = !sd.type_params.is_empty();
-                    structs.push(IStructDef {
-                        name: sd.name.name.clone(),
-                        type_params: convert_type_params(&sd.type_params),
-                        fields: sd
-                            .fields
-                            .iter()
-                            .map(|f| (f.name.name.clone(), convert_type(&f.ty)))
-                            .collect(),
-                        align: sd.align,
-                        c_repr: sd.c_repr,
-                        generic_body: is_generic.then(|| safe_slice(src, sd.span)),
-                    });
+                align_ast::Item::Struct(sd) => {
+                    if is_pub(sd.vis) {
+                        let is_generic = !sd.type_params.is_empty();
+                        structs.push(IStructDef {
+                            name: sd.name.name.clone(),
+                            type_params: convert_type_params(&sd.type_params),
+                            fields: sd
+                                .fields
+                                .iter()
+                                .map(|f| (f.name.name.clone(), convert_type(&f.ty)))
+                                .collect(),
+                            align: sd.align,
+                            c_repr: sd.c_repr,
+                            generic_body: is_generic.then(|| safe_slice(src, sd.span)),
+                        });
+                    }
+                    // Non-pub structs are module-private: not part of the exported interface surface.
                 }
-                align_ast::Item::Enum(ed) if is_pub(ed.vis) => {
-                    let is_generic = !ed.type_params.is_empty();
-                    enums.push(IEnumDef {
-                        name: ed.name.name.clone(),
-                        type_params: convert_type_params(&ed.type_params),
-                        variants: ed
-                            .variants
-                            .iter()
-                            .map(|v| {
-                                (v.name.name.clone(), v.payload.iter().map(convert_type).collect())
-                            })
-                            .collect(),
-                        generic_body: is_generic.then(|| safe_slice(src, ed.span)),
-                    });
+                align_ast::Item::Enum(ed) => {
+                    if is_pub(ed.vis) {
+                        let is_generic = !ed.type_params.is_empty();
+                        enums.push(IEnumDef {
+                            name: ed.name.name.clone(),
+                            type_params: convert_type_params(&ed.type_params),
+                            variants: ed
+                                .variants
+                                .iter()
+                                .map(|v| {
+                                    (v.name.name.clone(), v.payload.iter().map(convert_type).collect())
+                                })
+                                .collect(),
+                            generic_body: is_generic.then(|| safe_slice(src, ed.span)),
+                        });
+                    }
+                    // Non-pub enums are module-private: not part of the exported interface surface.
                 }
-                align_ast::Item::Const(cd) if is_pub(cd.vis) => {
-                    consts.push(IConst {
-                        name: cd.name.name.clone(),
-                        ty: cd.ty.as_ref().map(convert_type),
-                        value_src: safe_slice(src, cd.value.span),
-                    });
+                align_ast::Item::Const(cd) => {
+                    if is_pub(cd.vis) {
+                        consts.push(IConst {
+                            name: cd.name.name.clone(),
+                            ty: cd.ty.as_ref().map(convert_type),
+                            value_src: safe_slice(src, cd.value.span),
+                        });
+                    }
+                    // Non-pub consts are module-private: not part of the exported interface surface.
                 }
-                // Private items and `extern` blocks are not part of the interface surface. (An
-                // `extern "C"` import is a link/impl concern; exporting a body via `extern "C"` is
-                // explicitly out of M15.)
-                _ => {}
+                align_ast::Item::Extern(..) => {}
+                // extern fns are import-only (a bodyless FFI declaration bound to a C symbol), never
+                // part of a unit's exported interface. (An `extern "C"` import is a link/impl concern;
+                // exporting a body via `extern "C"` is explicitly out of M15.)
             }
         }
 

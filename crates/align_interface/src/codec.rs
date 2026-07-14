@@ -17,6 +17,16 @@ use crate::{Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IStructDef, IType
 /// part of the hashed surface).
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
+/// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
+/// text) — never user input — so a hard panic is the correct fail-loud behavior here, matching the
+/// repo convention that panics are for compiler-internal invariants. (The reader stays Err-based:
+/// a malformed/truncated buffer from disk is untrusted and must return [`DecodeError`], never panic.)
+fn u32_len(n: usize) -> u32 {
+    u32::try_from(n)
+        .unwrap_or_else(|_| panic!("interface summary field exceeds u32::MAX bytes — the format uses u32 length prefixes"))
+}
+
 // ---- writer -------------------------------------------------------------------------------------
 
 struct Writer {
@@ -49,7 +59,7 @@ impl Writer {
         }
     }
     fn str(&mut self, s: &str) {
-        self.u32(s.len() as u32);
+        self.u32(u32_len(s.len()));
         self.buf.extend_from_slice(s.as_bytes());
     }
     fn opt_str(&mut self, s: &Option<String>) {
@@ -63,7 +73,7 @@ impl Writer {
     }
     /// Write a length prefix and then invoke `f` once per element.
     fn seq<T>(&mut self, items: &[T], mut f: impl FnMut(&mut Writer, &T)) {
-        self.u32(items.len() as u32);
+        self.u32(u32_len(items.len()));
         for it in items {
             f(self, it);
         }
