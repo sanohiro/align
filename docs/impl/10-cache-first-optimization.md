@@ -479,6 +479,53 @@ Gate on functions with disjoint large fixed arrays/struct temporaries: optimized
 slot reuse, cache/TLB counters, and full behavior tests. Scalar allocas promoted by mem2reg are the
 negative control; they should show no benefit.
 
+### 8.5 MEASURED FUTURE — consumer-gated indexed-read locality
+
+Sequential, known-stride, and data-dependent indexed access are different execution shapes, but this
+does not justify source syntax or a general access-pattern optimizer. The current structural split is
+the right default: ordinary array/pipeline nodes expose contiguous loops; SoA projections expose
+contiguous columns; explicit index/gather nodes remain visibly indexed. When the first reusable
+selection-vector, index-list, or `bitset` consumer lands, MIR must preserve two additional legality
+facts rather than infer them late from pointer arithmetic:
+
+```text
+access order       contiguous / known-stride / data-dependent-index
+reordering         forbidden / read-only-and-order-insensitive
+```
+
+Do not add a first-class `AccessPlan` type before that consumer. The facts may initially remain
+properties of its dedicated MIR node. They must never authorize reordering an Impure callable,
+ordered floating-point reduction, trapping operation, scatter with duplicate indices, or observable
+output order.
+
+**Ceiling probe (2026-07-14, Ryzen 9 5950X, LLVM 22, `-O3 -march=znver3`):** one wrapping `u32`
+reduction performed 1,048,576 read-only indexed loads. Random indices were compared with natural
+LLVM code, scalar code, explicit AVX2 gather, fixed-distance software prefetch, full sorting, and a
+stable counting pass that grouped indices by 4 KiB source block. The construction timings below
+include allocation and release of the reordered index buffer and counting scratch. Corrected
+steady-state medians were repeated twice after a memory barrier was added between identical calls:
+
+| source working set | random natural | block-grouped execution | block-plan construction | conservative reuse break-even |
+|---:|---:|---:|---:|---:|
+| 32 KiB | 0.206–0.216 ms | 0.192–0.193 ms | 2.53 ms | 109–179 uses |
+| 512 KiB | 0.481–0.542 ms | 0.194–0.195 ms | 2.44–2.47 ms | 7–9 uses |
+| 8 MiB | 0.874–1.232 ms | 0.268–0.269 ms | 1.32–1.39 ms | 2–3 uses |
+| 128 MiB | 7.89–8.51 ms | 3.50–5.02 ms | 2.22 ms | 1 use in this probe |
+
+The useful result is not “sort random access.” Full sorting cost 34–49 ms and needed roughly
+9–2,100 reuses depending on the working set. Explicit AVX2 gather was generally slower than the
+natural/scalar lowering. Per-element software prefetch regressed cache-resident cases; it helped the
+128 MiB random case by roughly 1.2–1.4x at the best tested distance, which is target- and
+latency-specific and does not earn a generic compiler mechanism.
+
+Record one narrow future plan: if a visible operation constructs a read-only, order-insensitive
+index/selection plan and reuses it across multiple large column reductions, probe cache-block
+grouping behind the unchanged source operation. Keep direct indexed execution for short, cached,
+single-use, ordered, trapping, or effectful cases. Adoption requires an end-to-end consumer on x86
+and arm64, construction/allocation included, exact duplicate-index behavior, no float reassociation,
+and a simple working-set/reuse gate. Otherwise record-and-close it. No new language surface is
+recommended.
+
 ---
 
 ## 9. Cache-sensitive benchmark methodology
@@ -519,6 +566,32 @@ L1/LLC/TLB misses where available
 Hardware counters and cold/warm separation are already in the external audit checklist. The new
 requirement here is balanced ordering plus the hierarchy-boundary working-set sweep. Cross-platform
 tests must still run without counters; counters enrich a benchmark, never gate functional CI.
+
+### 9.3 Sweep the relevant data and runtime state, not only byte size
+
+**Cross-audit 2026-07-14:** the current records already cover most state-dependent crossovers, but
+they were scattered across documents 10-13. The missing active case was presorted/ordered-run input
+for the now-shipped stable merge sort; document 12 records its measured adaptive path. Use this matrix
+when accepting any future fast path so a single uniform-random, warm-cache throughput number cannot
+stand in for the operation's real state space:
+
+| State axis | Required representative cases when relevant |
+|---|---|
+| order/locality | sorted, reverse, ordered runs, random; contiguous, known-stride, indexed |
+| predicate distribution | 0/1/10/50/90/99/100% selectivity; clustered and random masks |
+| key distribution | dense range, sparse range, low/high cardinality, all-unique, duplicates, skew and collision stress |
+| value structure | ASCII/mixed UTF-8; invalid head/middle/tail; repetitive/incompressible bytes; zero/extreme values and float NaN/Inf where legal |
+| reuse and warmth | one-shot/reused plan; cold/warm cache, allocator, CPU dispatch, thread pool, and file mapping |
+| representation boundary | element width, alignment, legal alias/overlap, page boundary, cache/TLB working-set transitions |
+| concurrency | uniform, one straggler, alternating and heavy-tailed cost; nested and blocking work; worker-count sweep |
+| external capability/state | regular file/socket/pipe/special file, buffered lookahead, target ISA and portable fallback |
+
+This is a selection checklist, not a Cartesian-product requirement. Each optimization names the axes
+that can change its algorithm or cost class, includes adversarial negative controls, and preserves a
+simple default when a reliable low-cost discriminator is unavailable. Runtime adaptation stays an
+implementation detail only when results, error/effect order, allocation visibility, and worst-case
+complexity remain within the source contract; otherwise require an explicit shaped operation or do
+not adopt the transform.
 
 ---
 
@@ -564,6 +637,8 @@ After benchmark export roots and balanced measurement work:
 2. wide AoS→SoA blocked construction;
 3. `task_group` batch claiming/completion;
 4. stack lifetimes only after MIR liveness.
+5. reusable read-only indexed block plans only with a selection-vector/index-list/`bitset` consumer
+   and the §8.5 working-set/reuse gate.
 
 Record below-gate results and close them, following the arena-reuse and cold-edge precedents. Do not
 keep an unearned second mechanism.

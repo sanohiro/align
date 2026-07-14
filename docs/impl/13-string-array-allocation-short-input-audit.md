@@ -59,7 +59,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `path.normalize` | component Vec + output Vec + final malloc/copy | **CONFIRMED P1** direct-final-buffer opportunity |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
-| O(n²) sorting | insertion sort at every size | **ALREADY PLANNED** hybrid stable O(n log n), keep tiny base case |
+| sorting | stable O(n log n), but allocates unused merge scratch at tiny N and ignores ordered runs | **MEASURED P1** adaptive total-order path in document 12; keep insertion base case |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
 freeing them without owner/view liveness would convert a leak into a UAF.
@@ -316,6 +316,28 @@ allocation/copy. Sequence the two measurements independently. A nonescaping stac
 measure-first layer; do not combine both mechanisms in the first benchmark so the attribution stays
 clear.
 
+**Measured ceiling (2026-07-14, Ryzen 9 5950X, release/native):** a one-write builder was opened with
+`capacity == payload length`, filled, and consumed through the current owned-copy freeze or through
+the existing non-arena `finish` transfer as a current-host proxy for a malloc/realloc-compatible
+owned freeze. The proxy result was freed after every iteration; on this Linux host Rust's system
+allocator and `align_rt_free` are the same glibc malloc/free family. Median of nine samples:
+
+| payload | current copy freeze | transfer proxy | current/proxy |
+|---:|---:|---:|---:|
+| 1 KiB | 48.8 ns | 43.6 ns | 1.12x |
+| 4 KiB | 103.4 ns | 67.3 ns | 1.54x |
+| 16 KiB | 472.1 ns | 163.2 ns | 2.89x |
+| 64 KiB | 1.98 us | 0.94 us | 2.10x |
+| 256 KiB | 157.0 us | 4.21 us | 37.3x |
+| 1 MiB | 742.0 us | 18.5 us | 40.1x |
+
+The jump above the allocator's large-allocation crossover includes the real cost of creating,
+touching, and freeing the second large allocation, not just memcpy throughput. At 8-64 bytes the
+result was small/noisy, so this does not justify a short-string representation change. It does
+confirm the raw-buffer transfer as **P1 for medium/large owned freezes**; the implementation gate
+must additionally cover unknown/geometrically grown capacity and non-glibc targets rather than
+depending on this proxy's allocator compatibility.
+
 ### 6.4 CONFIRMED P1 — remove staging copies in `read_dir` and DNS results
 
 `fs.read_dir` collects every UTF-8 name into `Vec<Vec<u8>>`, then allocates each final Align string
@@ -343,18 +365,32 @@ Gate short paths, deep paths, repeated `..`, root clamping, repeated separators,
 components. Require one payload allocation, zero final full-output copy, byte-identical output, and
 no more than 3% regression for already-normal short paths.
 
-### 6.6 MEASURE FIRST — repeated-needle plan hoisting and JSON escape scan
+### 6.6 MEASURED — repeated-needle plan hoisting and JSON escape scan
 
 For one search, keep `memchr::memmem`. For a pipeline applying the same loop-invariant needle to many
-strings, the one-shot API rebuilds a Finder/FinderRev each call. Probe preparing the same memchr
-finder once outside the loop, especially for many haystacks of 0/1/7/15/31/63/64/128 bytes and
-needles of 1/2/4/8/16/32 bytes. Implement this as MIR/runtime plan hoisting first; do not add a public
-Pattern type unless a real dynamic consumer cannot use compiler hoisting.
+strings, the one-shot API rebuilds a Finder/FinderRev each call. Implement preparation as MIR/runtime
+plan hoisting first; do not add a public Pattern type unless a real dynamic consumer cannot use
+compiler hoisting.
 
 `builder_write_json_str` still scans escape-free long content byte by byte. A scalar prefix followed
-by a block classifier for quote, backslash, or `<0x20` may help long strings, but per-write ABI and
-allocation dominate short records. Gate escape-free, sparse, and dense inputs; a short scalar path
-is mandatory, and the existing scalar encoder remains the differential oracle.
+by a block classifier for quote, backslash, or `<0x20` helps long strings, but per-write ABI and
+allocation dominate short records. A short scalar path is mandatory, and the existing scalar
+encoder remains the differential oracle.
+
+**Measured kernels (2026-07-14, Ryzen 9 5950X, release/native, median of nine):** reusing one
+`memchr::memmem::Finder` for a no-match repeated search was 2.5-6.1x faster than reconstructing the
+one-shot search at 32-128-byte haystacks (4/16-byte needles), 1.5-2.2x at 1 KiB, and only 1.0-1.1x at
+16 KiB where scanning dominates. This confirms plan hoisting for the compiler-visible
+same-needle/many-strings shape, not a replacement for one-shot `find` and not a new public Pattern
+type.
+
+For JSON encoding, a single-pass AVX2 32-byte classifier was compared with the current scalar scan
+while reusing the same sufficiently-sized output Vec (allocation excluded). It produced identical
+bytes for clean, sparse-escape (one per 97 bytes), and dense-escape (one per 8 bytes) inputs. At 32
+bytes and above it was 3.1-17.1x faster on clean input, 3.6-5.7x at 256 bytes through 16 KiB on sparse
+input, and 1.3-1.5x on dense input. At 8 bytes SIMD setup was 22-29% slower. Promote the long-string
+classifier to **P1 with a scalar `<32` crossover**; the adoption gate remains an end-to-end builder
+benchmark on x86 baseline/v3 and arm64 plus differential tails and every control-byte class.
 
 ### 6.7 ALREADY PLANNED — do not duplicate
 
@@ -401,6 +437,25 @@ Separate refinements:
 4. Feed future internal `Exact/AtMost` cardinality into one reserve/direct-fill plan. Do not add a
    user capacity parameter merely because the compiler lacks that summary today.
 
+**Measured (2026-07-14, Ryzen 9 5950X, release/native, median of nine):** an exported
+`array_builder<u64>` push loop was compared with one existing bulk `append` and an exact
+malloc/copy/free direct-fill ceiling. `build()` was included in every builder path and remained
+zero-copy.
+
+| elements | per-element push | one append | direct fill | push/append |
+|---:|---:|---:|---:|---:|
+| 1 | 22.2 ns | 21.3 ns | 9.1 ns | 1.04x |
+| 4 | 35.6 ns | 21.5 ns | 8.4 ns | 1.65x |
+| 16 | 119.7 ns | 21.9 ns | 8.7 ns | 5.46x |
+| 1,024 | 4.90 us | 87.8 ns | 72.1 ns | 55.8x |
+| 100,000 | 471.4 us | 14.0 us | 14.4 us | 33.7x |
+
+At 100K, bulk append and exact direct fill are at parity: payload copying is already the right
+shape, while the opaque call per pushed element is the large gap. Removing the header helps tiny
+builders (append/direct was 2.3-2.6x at 1-16 elements) but saves only about 13 ns in absolute terms.
+Prioritize compiler-selected bulk/direct fill from cardinality over a header-only rewrite; retain
+the latter as the tiny-builder allocation cleanup.
+
 Gate 0–4 elements on one fewer allocation and at least 15% allocator-inclusive improvement; 1K/1M
 append and push controls may not regress over 3%. Pin optimized IR for no per-element call only in
 the direct-fill/bulk case — header attributes alone cannot remove it.
@@ -427,6 +482,14 @@ headers. A bound `cs := xs.chunks(n)` may continue to materialize until the lang
 section 10 is settled. Gate on allocation 1→0, no `N*16` header stores, source-region correctness,
 and byte-identical final partial chunks. Document 11's later explicit-parallel result elision is
 related but does not by itself remove these producer headers.
+
+**Measured (2026-07-14, same host/profile):** for the direct consumer `chunks(k).len()`, current
+materialization versus the virtual count formula took 613.6 ns versus 1.5 ns for 1,024 headers
+(`k=1`, 396x), and 37.9 us versus 1.5 ns for 65,536 headers (about 25,000x). Even one header was
+9.4 ns versus 1.6 ns. With `k=64`, 1,024 source elements/16 headers still measured 17.2 ns versus
+1.5 ns, and 65,536 elements/1,024 headers measured 606.2 ns versus 1.5 ns. This strongly confirms
+the `.len()` fold and direct-index virtualization; pipeline consumers still need their own
+end-to-end gate because they do real work after producing each virtual view.
 
 ### 8.3 CONFIRMED P1 — write str-group results directly into existing outputs
 
@@ -465,10 +528,10 @@ literals:
 Sweep 1..4096 elements around L1/code-size/frame thresholds. Require at least 15% on the positive
 large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 
-### 8.5 ALREADY PLANNED — keep one owner
+### 8.5 SHIPPED / ALREADY PLANNED — keep one owner
 
-- replace O(n²) sort/sort_by_key with stable O(n log n), retaining insertion sort as the tiny base
-  case and decorating keys once;
+- stable O(n log n) sort/sort_by_key with a tiny insertion base and once-decorated keys is shipped;
+  document 12 adds the measured ordered-run/tiny-scratch refinement;
 - donate a uniquely owned unbound temporary buffer to compatible map/where/scan materialization:
   document 10 §8.1; extend to sort only through the same ownership proof;
 - SIMD stable compaction for selective materializers: document 12, measure first;
@@ -562,7 +625,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### P3 — larger portfolios after measurement
 
-1. Replace large sorting while retaining the tiny insertion base case.
+1. Add document 12's measured total-order ordered-run sort path while retaining the tiny insertion
+   base case; remove only scratch that no merge pass can read.
 2. Pool large constant array literals after the top-level aggregate-constant surface exists.
 3. Run unique-buffer donation, repeated-needle plan, JSON escape scan, and short-N group strategy
    gates independently.
