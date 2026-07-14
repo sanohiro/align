@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (third update this day), **M15 S0 SHIPPED — cyclic imports are now a
+_Last updated: 2026-07-14 (fourth update this day), **M15 S1a SHIPPED — the unit interface
+summary (producer side), MERGED as #445** (workspace **1957 green** + clippy clean;
+adversarial gate SHIP — fuzzed reader panic-free across 2900+ probes; gemini's one medium —
+allocation-free unit-prefix match — applied pre-merge). New crate `align_interface` (ast/sema/
+mir/hash deps, NO codegen): per-unit `InterfaceSummary` = `pub` signatures incl. `out[i]` +
+full exported type defs + consts + **a 3-valued effect bit (Pure/Impure/Unknown) taken from
+the SAME `compute_effect_sets` the parallel-safety gates use** (refactored out of
+`check_parallelism` — single source of truth) + generic template bodies (source text) +
+capabilities (as data, deliberately OUTSIDE the interface hash — link-summary concern).
+Canonical codec: versioned, u32-LE length prefixes (loud guard), name-sorted exports,
+fail-closed reader. `interface_hash` INCLUDES effect bits + template bodies (the settlement's
+two easy-to-miss cases, both pinned by hash-split tests); `impl_hash` = source bytes,
+`TODO(m15-s2)` → per-unit MIR. Driver: `load_units` + `build_interface_summaries` +
+`emit-interface` verb; pipeline byte-identical to pre-change main (gate-proven). **S1b (the
+consumer side) has TWO recorded entry gates: (1) MANDATORY first — sema must reject a `pub`
+signature exposing a non-`pub` type** (today accepted, empirically confirmed; private types
+are summarized by NAME only → a layout change would not flip the interface hash → stale-object
+miscompile once summaries are consumed); **(2) consumers key on the TRANSITIVE imported-unit
+interface-hash set** (foreign type refs are by-name). Both are in the roadmap S1 record.
+Previous update: 2026-07-14 (third update), **M15 S0 SHIPPED — cyclic imports are now a
 hard error, MERGED as #444** (workspace **1945 green** + clippy clean; gemini's one medium —
 `&'a str`-borrowing DFS maps, zero per-node allocations — applied pre-merge). `check()` records
 every import edge independently of the `seen` dedup, then a white/grey/black DFS from the entry
@@ -610,9 +629,10 @@ manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targ
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
 Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
 Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
-paragraph): (a) **M15 implementation, S1 next** (S0 cyclic-imports SHIPPED as #444; S1 =
-interface summary + interface/impl hashes + per-unit sema against imported summaries) — the
-settled slice plan S0–SV is in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+paragraph): (a) **M15 implementation, S1b next** (S0 #444 + S1a #445 SHIPPED; S1b = per-unit
+sema consuming imported summaries — start with its MANDATORY entry gate, the sema rejection of
+`pub` signatures exposing non-`pub` types, then transitive interface-hash keying) — the
+settled slice plan S0–SV + the S1a record are in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
 lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth

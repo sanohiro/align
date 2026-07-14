@@ -2593,7 +2593,21 @@ does not block the optimizer's return.
 shared prerequisite) — **SHIPPED 2026-07-14 as #444** (white/grey/black DFS over
 dedup-independent import edges; diamond reconvergence pinned legal; 5 tests, 1945 green). **S1** interface summary — canonical serialization (no map-iteration
 order, no process-local ids) + interface/impl hashes + per-unit sema against imported
-summaries (effect bits, type defs, template ASTs). **S2** per-unit codegen + N-object link
+summaries (effect bits, type defs, template ASTs). Split in implementation: **S1a (producer)
+SHIPPED 2026-07-14 as #445** — new crate `align_interface` (no codegen dep): per-unit
+`InterfaceSummary` (signatures incl. `out[i]`, full exported type defs, consts, the 3-valued
+effect bit taken from the SAME `compute_effect_sets` the parallel gates use — single source,
+no drift; generic template bodies as source text; capabilities as data, deliberately outside
+the interface hash), hand-rolled versioned fail-closed codec (fuzzed panic-free incl.
+allocation-bomb prefixes), `interface_hash` includes effect bits + template bodies,
+`impl_hash` = source bytes with `TODO(m15-s2)` → per-unit MIR; driver `emit-interface` verb;
+12 tests incl. the 5 hash-split gates; adversarial gate SHIP. **S1b (consumer) has TWO entry
+gates recorded by the S1a review: (1) MANDATORY sema rejection of a `pub` signature exposing a
+non-`pub` type** — today accepted (empirically confirmed); a private type is summarized by
+name only, so its layout change would NOT flip the interface hash → stale-object miscompile
+once consumers exist; **(2) consumers must key on the TRANSITIVE set of imported units'
+interface hashes** (foreign type references are by-name in the canonical surface). **S2**
+per-unit codegen + N-object link
 (visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
 bundle: the doc-10 §7 invalidation matrix per-unit, N=1 byte-identity vs today, cold-vs-hit
