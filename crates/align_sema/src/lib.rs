@@ -1250,6 +1250,309 @@ fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics
     }
 }
 
+// --- generic-`pub`-fn body reference check (M15 S1b, gate finding D1) --------------------------
+//
+// A generic `pub` fn's BODY is part of its interface: the interface summary (S1a) ships the template
+// so importing modules can monomorphize it, and the body is then type-checked in the CONSUMER's
+// namespace, where the defining module's PRIVATE items do not exist. A body that named a private
+// same-module item would be accepted whole-program but rejected per-unit (the D1 accept/reject
+// divergence, plus a synthesized-file span leaking into a user diagnostic). So a generic `pub` fn
+// body may reference only `pub` same-module items — a private same-module fn, const, type, or enum
+// variant is forbidden. Allowed: its own params/locals, its type parameters, builtins/pipeline ops,
+// and qualified `mod.x` (already `pub`-enforced cross-module). Non-generic `pub` fns are NOT affected
+// (their bodies stay in their own unit); private generic fns are unaffected. Enforced at the PRODUCER
+// in ordinary sema, so `check` and `check-per-unit` agree — differential parity is restored.
+
+/// The constant context of one generic-`pub`-fn body walk: the defining module, the item-visibility
+/// lookups (same as sema's own resolution tables), and the enclosing fn's name + type-parameter
+/// names. Threaded through the recursion.
+struct GenericBodyCtx<'a> {
+    cur_module: &'a str,
+    fn_name: &'a str,
+    type_params: &'a std::collections::HashSet<&'a str>,
+    mod_table: &'a ModuleTable,
+    const_by_module: &'a HashMap<String, HashMap<String, (String, bool)>>,
+    type_table: &'a ModTypes,
+}
+
+/// Walks a generic `pub` fn body, tracking a lexical scope stack so a local/param named like a
+/// private item (a local `helper` shadowing a private `fn helper`) is legal. Emits one diagnostic
+/// per private reference (never panics). Every `ast::ExprKind` / `Stmt` / `Type` constructor is
+/// matched exhaustively (no wildcard arm) so a newly added node cannot silently skip this check.
+struct GenericBodyWalker<'a, 'd> {
+    cx: &'a GenericBodyCtx<'a>,
+    /// Lexical scopes of in-scope local names (params/lambda params/`let`/match bindings). A name
+    /// present in any frame shadows a same-module item.
+    scopes: Vec<std::collections::HashSet<String>>,
+    diags: &'d mut Diagnostics,
+}
+
+impl<'a, 'd> GenericBodyWalker<'a, 'd> {
+    fn is_local(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| s.contains(name))
+    }
+    fn bind(&mut self, name: &str) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name.to_string());
+        }
+    }
+    fn err(&mut self, kind: &str, name: &str, span: Span) {
+        let fn_name = self.cx.fn_name;
+        self.diags.error(
+            format!(
+                "pub generic fn '{fn_name}' references private {kind} '{name}' in its body \
+                 (a generic template is instantiated in importing modules, so its body may \
+                 reference only pub items)"
+            ),
+            span,
+        );
+    }
+
+    /// A bare name in VALUE position (a `Path` expression, a call callee, a fn value, or the receiver
+    /// of a `Type.Variant` construction / `Type.field` access). If it is not a local and names a
+    /// PRIVATE same-module fn / const / type, it is rejected. A pub item, a module, a builtin, or an
+    /// unknown name is left to normal resolution. The three namespaces are effectively disjoint, so
+    /// the first match wins. (A same-module type appears in value position as the receiver of an enum
+    /// construction `Priv.V(..)` / a struct's associated access — a private one is a body leak; a bare
+    /// enum-variant name in a `match` pattern is NOT checked here, since a private-enum *value* can
+    /// only be obtained by a construction or call already rejected above, or a param/return already
+    /// rejected by the signature-exposure check.)
+    fn check_value_name(&mut self, name: &str, span: Span) {
+        if self.is_local(name) {
+            return;
+        }
+        if let Some((_, is_pub)) = self.cx.mod_table.get(self.cx.cur_module).and_then(|mi| mi.fns.get(name)) {
+            if !*is_pub {
+                self.err("fn", name, span);
+            }
+            return;
+        }
+        if let Some((_, is_pub)) = self.cx.const_by_module.get(self.cx.cur_module).and_then(|m| m.get(name)) {
+            if !*is_pub {
+                self.err("const", name, span);
+            }
+            return;
+        }
+        if self.cx.type_table.get(self.cx.cur_module).and_then(|m| m.get(name)).is_some_and(|e| !e.is_pub) {
+            self.err("type", name, span);
+        }
+    }
+
+    /// A single-segment type NAME (a struct-literal type or a `Named` type). A same-module user type
+    /// must be `pub`; a type parameter (`T`) is exempt (substituted at instantiation); a builtin /
+    /// unknown name is absent from `type_table` → skipped.
+    fn check_type_name(&mut self, bare: &str, span: Span) {
+        let is_private = !self.cx.type_params.contains(bare)
+            && self.cx.type_table.get(self.cx.cur_module).and_then(|m| m.get(bare)).is_some_and(|e| !e.is_pub);
+        if is_private {
+            self.err("type", bare, span);
+        }
+    }
+
+    /// A `Type` written inside the body (a `let` / lambda-param annotation, an `as` cast target).
+    /// Walks `Named`/`Tuple`/`Fn` exhaustively (mirrors `check_type_exposure`), including the generic
+    /// args of a qualified `mod.Type` (they may name a same-module private type).
+    fn walk_type(&mut self, ty: &ast::Type) {
+        match ty {
+            ast::Type::Named { path, args, span } => {
+                if path.segments.len() == 1 {
+                    self.check_type_name(&path.segments[0].name, *span);
+                }
+                for a in args {
+                    self.walk_type(a);
+                }
+            }
+            ast::Type::Tuple { elems, .. } => {
+                for e in elems {
+                    self.walk_type(e);
+                }
+            }
+            ast::Type::Fn { params, ret, .. } => {
+                for p in params {
+                    self.walk_type(p);
+                }
+                self.walk_type(ret);
+            }
+        }
+    }
+
+    fn walk_block(&mut self, b: &ast::Block) {
+        self.scopes.push(std::collections::HashSet::new());
+        for st in &b.stmts {
+            self.walk_stmt(st);
+        }
+        if let Some(t) = &b.tail {
+            self.walk_expr(t);
+        }
+        self.scopes.pop();
+    }
+
+    fn walk_stmt(&mut self, st: &ast::Stmt) {
+        match st {
+            // The initializer is walked BEFORE the name is bound, so a local `helper := helper()`
+            // reference on the right resolves to the item (not yet in scope) — and a private one is
+            // then correctly reported. Once bound, later references to the local shadow the item.
+            ast::Stmt::Let { name, ty, init, .. } => {
+                self.walk_expr(init);
+                if let Some(t) = ty {
+                    self.walk_type(t);
+                }
+                self.bind(&name.name);
+            }
+            ast::Stmt::LetTuple { names, init, .. } => {
+                self.walk_expr(init);
+                for n in names.iter().flatten() {
+                    self.bind(&n.name);
+                }
+            }
+            ast::Stmt::Assign { place, value } => {
+                self.walk_expr(place);
+                self.walk_expr(value);
+            }
+            ast::Stmt::Return(opt) => {
+                if let Some(e) = opt {
+                    self.walk_expr(e);
+                }
+            }
+            ast::Stmt::Break { value, .. } => {
+                if let Some(e) = value {
+                    self.walk_expr(e);
+                }
+            }
+            ast::Stmt::Expr(e) => self.walk_expr(e),
+        }
+    }
+
+    fn walk_expr(&mut self, e: &ast::Expr) {
+        match &e.kind {
+            ast::ExprKind::Unit
+            | ast::ExprKind::Int(_)
+            | ast::ExprKind::Float(_)
+            | ast::ExprKind::Char(_)
+            | ast::ExprKind::Str(_)
+            | ast::ExprKind::Bool(_)
+            | ast::ExprKind::FieldShorthand(_) => {}
+            ast::ExprKind::Path(p) => {
+                // A qualified `mod.x` is `pub`-enforced cross-module (and a `base.field` chain is
+                // structural) — only a single-segment bare name can reach a same-module item.
+                if p.segments.len() == 1 {
+                    self.check_value_name(&p.segments[0].name, p.segments[0].span);
+                }
+            }
+            ast::ExprKind::Unary { expr, .. } => self.walk_expr(expr),
+            ast::ExprKind::Cast { expr, ty } => {
+                self.walk_expr(expr);
+                self.walk_type(ty);
+            }
+            ast::ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            ast::ExprKind::Call { callee, args } => {
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
+            ast::ExprKind::FieldAccess { recv, .. } => self.walk_expr(recv),
+            ast::ExprKind::If { cond, then, els } => {
+                self.walk_expr(cond);
+                self.walk_block(then);
+                if let Some(e2) = els {
+                    self.walk_expr(e2);
+                }
+            }
+            ast::ExprKind::Block(b) => self.walk_block(b),
+            ast::ExprKind::StructLit { name, fields } => {
+                if name.segments.len() == 1 {
+                    self.check_type_name(&name.segments[0].name, name.segments[0].span);
+                }
+                for f in fields {
+                    self.walk_expr(&f.value);
+                }
+            }
+            ast::ExprKind::ElseUnwrap { opt, fallback } => {
+                self.walk_expr(opt);
+                self.walk_expr(fallback);
+            }
+            ast::ExprKind::Try(inner) => self.walk_expr(inner),
+            ast::ExprKind::Loop(b) => self.walk_block(b),
+            ast::ExprKind::Arena(b) => self.walk_block(b),
+            ast::ExprKind::Unsafe(b) => self.walk_block(b),
+            ast::ExprKind::TaskGroup(b) => self.walk_block(b),
+            ast::ExprKind::ArrayLit(elems) => {
+                for el in elems {
+                    self.walk_expr(el);
+                }
+            }
+            ast::ExprKind::Index { recv, index } => {
+                self.walk_expr(recv);
+                self.walk_expr(index);
+            }
+            ast::ExprKind::SliceRange { recv, start, end } => {
+                self.walk_expr(recv);
+                if let Some(s) = start {
+                    self.walk_expr(s);
+                }
+                if let Some(en) = end {
+                    self.walk_expr(en);
+                }
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                self.scopes.push(std::collections::HashSet::new());
+                for p in params {
+                    if let Some(t) = &p.ty {
+                        self.walk_type(t);
+                    }
+                    self.bind(&p.name.name);
+                }
+                // The lambda body is a block; it introduces its own inner scope for `let`s, but the
+                // parameter scope pushed here holds the params for the whole body.
+                for st in &body.stmts {
+                    self.walk_stmt(st);
+                }
+                if let Some(t) = &body.tail {
+                    self.walk_expr(t);
+                }
+                self.scopes.pop();
+            }
+            ast::ExprKind::Match { scrutinee, arms } => {
+                self.walk_expr(scrutinee);
+                for arm in arms {
+                    self.scopes.push(std::collections::HashSet::new());
+                    // A pattern binds payload names as locals for the arm body. Variant NAMES are not
+                    // item references (they resolve against the scrutinee's enum, not by name), and a
+                    // private-enum value can only reach a `match` via a construction/call/param that
+                    // the checks above (or signature exposure) already reject — so nothing to check.
+                    match &arm.pattern {
+                        ast::MatchPattern::Variant { bindings, .. } => {
+                            for b in bindings {
+                                self.bind(&b.name);
+                            }
+                        }
+                        ast::MatchPattern::Or { .. } | ast::MatchPattern::Wildcard(_) => {}
+                    }
+                    self.walk_expr(&arm.body);
+                    self.scopes.pop();
+                }
+            }
+            ast::ExprKind::Tuple(elems) => {
+                for el in elems {
+                    self.walk_expr(el);
+                }
+            }
+            ast::ExprKind::TupleIndex { recv, .. } => self.walk_expr(recv),
+            ast::ExprKind::Template(parts) => {
+                for part in parts {
+                    if let ast::TemplatePart::Hole(inner) = part {
+                        self.walk_expr(inner);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- top-level constants ---------------------------------------------------------------------
 //
 // A top-level `NAME := expr` is a **compile-time constant**: it is evaluated to a scalar / string
@@ -2234,6 +2537,46 @@ pub fn check_program_with_effects(
             eval.value(canonical);
         }
         const_table.values = eval.values;
+    }
+
+    // Pass 0e (M15 S1b, gate finding D1): a generic `pub` fn's BODY is part of its interface — the
+    // interface summary ships the template and it is monomorphized in importing modules, where the
+    // defining module's PRIVATE items do not exist. So a generic `pub` fn body may reference only
+    // `pub` same-module items. Run now that `mod_table` (fn vis), `const_table` (const vis), and
+    // `type_table` (type vis) are all complete. Interface-only dependencies are skipped — they were
+    // checked as their own unit at production time.
+    {
+        for m in modules {
+            if m.interface_only {
+                continue;
+            }
+            for item in &m.file.items {
+                let ast::Item::Fn(f) = item else { continue };
+                if !matches!(f.vis, ast::Vis::Pub) || f.type_params.is_empty() {
+                    continue; // only a generic `pub` fn ships its body in the interface summary
+                }
+                let tps: std::collections::HashSet<&str> =
+                    f.type_params.iter().map(|t| t.name.name.as_str()).collect();
+                let cx = GenericBodyCtx {
+                    cur_module: &m.path,
+                    fn_name: &f.name.name,
+                    type_params: &tps,
+                    mod_table: &mod_table,
+                    const_by_module: &const_table.by_module,
+                    type_table: &type_table,
+                };
+                let mut walker = GenericBodyWalker { cx: &cx, scopes: Vec::new(), diags };
+                // The parameter scope is the outermost frame (params shadow same-module items).
+                walker.scopes.push(std::collections::HashSet::new());
+                for p in &f.params {
+                    walker.bind(&p.name.name);
+                }
+                match &f.body {
+                    ast::FnBody::Block(b) => walker.walk_block(b),
+                    ast::FnBody::Expr(e) => walker.walk_expr(e),
+                }
+            }
+        }
     }
 
     // Pass 1: collect function signatures so calls can resolve regardless of order. `sigs` is keyed

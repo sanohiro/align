@@ -214,6 +214,48 @@ fn wrong_field_on_imported_type_rejects() {
     assert_same_verdict("s1b-badfield", &[("geom.align", geom), ("main.align", main)], "main.align");
 }
 
+#[test]
+fn generic_pub_fn_body_referencing_private_item_rejects_in_both() {
+    // Gate finding D1: a generic `pub` fn's body ships in the interface summary (it is monomorphized
+    // in the importing module), so a reference to a private same-module item was accepted whole-program
+    // but rejected per-unit — an accept/reject divergence, plus a synthesized `<interface:gen>` span
+    // leaking into the user diagnostic. Now rejected at the PRODUCER in ordinary sema, so both checkers
+    // agree at the template's real source span.
+    let producer = "module gen\nfn helper(x: i64) -> i64 = x + 1\npub fn bump<T>(x: T, n: i64) -> i64 = helper(n)\n";
+    let main = "module main\nimport gen\nfn main() -> i32 = gen.bump(0, 41) as i32\n";
+    let files = [("gen.align", producer), ("main.align", main)];
+    let r = assert_same_verdict("s1b-generic-body-private", &files, "main.align");
+    assert!(r.diags.has_errors());
+    // The whole-program message names the private reference at the template's real span — no
+    // synthesized interface-file location leaks through.
+    let d = check_multi_diagnostics("s1b-generic-body-private-msg", &files, "main.align");
+    assert!(
+        d.contains("pub generic fn 'bump' references private fn 'helper' in its body"),
+        "expected the producer-side body-reference error, got:\n{d}"
+    );
+    assert!(!d.contains("<interface:"), "no synthesized interface-file span may leak into the diagnostic:\n{d}");
+}
+
+#[test]
+fn generic_pub_fn_body_over_pub_items_and_qualified_import_accepts() {
+    // A generic `pub` template may reference `pub` same-module items and qualified `mod.f` imports —
+    // both are part of the interface (or already cross-module `pub`-enforced). Both checkers accept.
+    let cfg = "module cfg\npub fn scale(x: i64) -> i64 = x * 2\n";
+    let producer = concat!(
+        "module gen\n",
+        "import cfg\n",
+        "pub fn helper(x: i64) -> i64 = x + 1\n",
+        "pub fn bump<T>(x: T, n: i64) -> i64 = cfg.scale(helper(n))\n",
+    );
+    let main = "module main\nimport gen\nfn main() -> i32 = gen.bump(0, 20) as i32\n";
+    let r = assert_same_verdict(
+        "s1b-generic-body-pub",
+        &[("cfg.align", cfg), ("gen.align", producer), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!r.diags.has_errors());
+}
+
 // ---- Gate 3: effect bits fail-closed across units -------------------------------------------------
 
 // `par_map` requires a named local function (a qualified `mod.fn` is rejected by both checkers), so a
