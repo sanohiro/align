@@ -2505,6 +2505,104 @@ remaining items (PGO/BOLT evaluation) are independent and may be reordered aroun
 owner's discretion. The cache record's C0 artifact-correctness slice is independent of that verdict
 and may land immediately; it is mandatory before M15 parallel compilation.
 
+**M15 design SETTLED (2026-07-14, two-lens review: language/soundness + driver/artifacts/cache;
+implementation NOT started).** Per-question decisions:
+
+1. **Unit = one module (one `.align` file).** Already the boundary for namespaces, visibility,
+   and mangling (`module$name`); subtree/package units would invent an aggregation concept the
+   compiler has no representation for (pkg-layer, deferred). **Unit graph = driver-discovered
+   from the existing BFS import walk; NO manifest file** (a second source of truth that can
+   drift). **One new language RULE, no new syntax: cyclic imports become a hard error** —
+   tolerated today by the BFS `seen`-dedup collapse; the unit DAG is required for bottom-up
+   effect-bit computation and incremental/parallel ordering. Update `draft.md` §17.
+2. **The unit interface is COMPLETE — the headline soundness result.** Restriction-driven:
+   three of the four whole-program analyses need NO body summary. Escape/region is already
+   body-blind (a call's result region = conservative fold of the caller's own argument
+   regions; sound cross-unit because Align has no hidden escape channel — no mutable globals,
+   escapes only via arg-regions/return; GUARD recorded: any future mutable-global feature
+   forces a stores-arg-i summary). Move/Copy is a pure function of type definitions. MoveCheck's
+   uniform by-value-move ABI is caller-derivable from types alone. The ONE genuinely
+   whole-program analysis — purity/effect — reduces to a **3-valued per-`pub`-fn effect bit
+   (Pure / Impure / Unknown)** computed bottom-up over the unit DAG from dependencies' already-
+   emitted interfaces; **fail-CLOSED: missing or Unknown ⇒ Impure + unknown-indirect ⇒ rejected
+   at `par_map`/parallel boundaries** (the exact shape of the shipped #433 unknown-HOF
+   rejection; the audited fail-open-wildcard class is designed out). Interface contents =
+   exported signatures **incl. `out[i]` markers** + FULL exported type/enum/tuple definitions
+   (fields/payloads incl. `align(N)`/`layout(C)`) + const values + effect bits + generic `pub`
+   template bodies + the unit's capability set.
+3. **Generics: instantiate-in-consumer** — today's monomorphizer already IS one (templates as
+   AST, worklist + `mono_args` in sema; MIR asserts no `Ty::Param` survives). The producer
+   serializes generic `pub` template ASTs into the interface; consumers instantiate with the
+   EXISTING machinery, emitting monomorphs into their own object as **`internal`** symbols.
+   **v1 accepts duplicate monomorphs across consumer objects** (correct under internal
+   linkage; bounded bloat) — cross-unit dedup via `linkonce_odr` + stable deterministic
+   mangling is the recorded deferral, natural at the ThinLTO boundary. Honest cost, accepted:
+   a generic `pub` fn's body is part of its interface (C++-template-like) — editing it
+   invalidates consumers. The pre-existing generic-over-generic gap is orthogonal; deferred.
+4. **Symbol visibility replaces "internalize is safe by construction":** external =
+   `{main} ∪ CLI --export ∪ each unit's pub fns` (globally mangled, collision-free);
+   internal/private = private fns, lifted thunks, consumer-side monomorphs. Whole-build
+   internalization of never-imported `pub` fns is deferred (v1 relies on the always-on
+   gc-sections/as-needed). Capabilities: per-unit `link_libs` unioned deterministically at
+   final link (the same monotonic-superset soundness as today's single-TU set). `emit-obj`'s
+   contract becomes per-unit object + interface. **`extern "C"` export-of-body stays OUT of
+   M15** — the `map_into`/out-param noalias trust chain (sema's own separate-compilation
+   warning) requires every caller to be Align-checked; import-only FFI is unaffected.
+5. **Cross-unit optimization: v1 ships NONE.** When it lands (post-v1) it is real ThinLTO
+   (summary-based, parallel — it COMPOSES with incrementality), NOT full-LTO-over-N
+   (re-monolithizes and kills the incrementality M15 buys; at most a measured opt-in stopgap).
+   The artifact anticipates ThinLTO with no format break: reserved (v1-absent) bitcode +
+   thin-summary envelope parts, plus an explicitly-keyed **cross-unit-opt input digest in the
+   codegen key that is EMPTY in v1** (ThinLTO later populates it, deliberately trading hit
+   rate for cross-module inlining). **`--rt-lto` under multi-unit v1 merges the baked bitcode
+   per unit** into each unit's raw module before that unit's single opt run (hot loops live in
+   arbitrary units; merged bodies are internal and DCE'd post-inline, so duplication is
+   negligible — the "merge once" shape returns when a final-link opt run exists).
+6. **Incremental driver on the doc-10 contract** (never mtime). Per-unit artifact = a keyed,
+   extensible envelope of CAS-addressed parts: interface summary (**interface hash**),
+   implementation object (**impl hash**), link summary (capabilities + export roots).
+   Consumers depend on interface hashes ONLY → a private-body edit recompiles that unit +
+   relinks, all dependents hit (THE headline win). The interface hash INCLUDES effect bits and
+   generic template bodies — the two places an "implementation-only" edit is actually an
+   interface change; both lenses independently flagged this as the most likely place to get
+   the invalidation boundary wrong. Action keys: frontend = unit source hash · direct-dep
+   interface hashes · builtin schema · frontend schema id; codegen = doc-10 §6.2 per unit
+   (+ rt-lto bitcode digest + the empty-in-v1 cross-unit-opt digest); link = doc-10 §6.3
+   (ordered object digests · runtime CONTENT digest replacing the mtime check · format/flags/
+   linker identity · deterministic capability union). Atomic publication extends the shipped
+   C0 private-staging per unit; corruption recovery = digest-verify on read, evict + rebuild;
+   structured hit/miss with first-differing-key-component reasons from slice 1 (tests assert
+   invalidation, not elapsed time). **Parallel unit compilation is UNBLOCKED** (verified:
+   codegen creates a fresh LLVM `Context` per entry, C0 is shipped; the only process-global is
+   explain-opt's remark cl::opts — that verb stays serial). CLI: `build`/`run` merged (+
+   optional per-unit hit/miss summary); `size` merged with optional per-unit breakdown;
+   `emit-llvm` per-unit (= the truth with no cross-unit opt); `explain-opt` per-unit in its
+   own located-MIR namespace.
+
+**Migration: hard cutover, no dual path — separate compilation at N=1 IS whole-program
+compilation** (a single-file program → one unit → one object, byte-identical to today; this
+protects the reproducibility baseline and the rt-lto byte-identity gates, and satisfies the
+no-back-compat rule with a single code path). **Recorded honest trade (owner-visible):**
+multi-file programs LOSE cross-module inlining in v1 — today every file merges into one module
+and inlines freely; v1 makes cross-unit `pub` calls opaque at unit boundaries. Single-file
+programs are unaffected. ThinLTO restores the optimization later, and the format is built so
+it can. Consistent with the owner rubric: the goal was chosen deliberately, and the format
+does not block the optimizer's return.
+
+**M15 slice plan:** **S0** cyclic-import hard error + `draft.md` §17 no-cycles rule (tiny,
+shared prerequisite). **S1** interface summary — canonical serialization (no map-iteration
+order, no process-local ids) + interface/impl hashes + per-unit sema against imported
+summaries (effect bits, type defs, template ASTs). **S2** per-unit codegen + N-object link
+(visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
+doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
+bundle: the doc-10 §7 invalidation matrix per-unit, N=1 byte-identity vs today, cold-vs-hit
+byte-identity, and fail-closed effect-bit gates incl. a stale/absent-interface mutation.
+Deferred-with-records: ThinLTO + monomorph dedup (`linkonce_odr` + deterministic mangling),
+whole-build `pub` internalization, cross-host executable caching, manifest/package-level
+units, caching failed frontend results (blocked on the doc-10 §5 diagnostic-determinism fix),
+escape precision bits (borrows-arg-i/returns-fresh), the generic-over-generic fix, and
+`extern "C"` body export.
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).

@@ -8,7 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14, **M14 Slice 2 (runtime-bitcode LTO) SHIPPED — MERGED as #443**
+_Last updated: 2026-07-14 (later the same day), **M15 separate-compilation design SETTLED by
+the owner-mandated two-lens review** (language/soundness + driver/artifacts/cache lenses run in
+parallel, integrated; full settlement + S0–SV slice plan recorded in the roadmap M15 section =
+the implementation source of truth; open-questions item updated in place). Headline soundness
+result: **the unit interface is COMPLETE** — escape/region is already body-blind (no hidden
+escape channel), Move/Copy is type-derived, MoveCheck is caller-derivable, and the one
+genuinely whole-program analysis (purity/effect) reduces to a 3-valued per-`pub`-fn effect bit computed
+bottom-up over the unit DAG, **fail-CLOSED** (missing/Unknown ⇒ Impure+unknown-indirect ⇒
+rejected at parallel boundaries — the #433 pattern; the fail-open-wildcard class is designed
+out). Unit = one module/file; driver-discovered DAG; **new rule: cyclic imports = hard error**
+(no other language-surface change); generics = instantiate-in-consumer (serialized template
+ASTs; duplicate `internal` monomorphs accepted in v1, `linkonce_odr` dedup deferred to
+ThinLTO); visibility = `{main} ∪ --export ∪ pub` external; **v1 = ZERO cross-unit
+optimization** — artifact = keyed envelope of CAS parts (interface/impl/link hashes; consumers
+depend on interface hashes ONLY — the hash INCLUDES effect bits + generic template bodies, the
+two easy-to-miss interface changes), reserved bitcode parts + an empty-in-v1 cross-unit-opt
+codegen-key digest make ThinLTO a later addition, not a format break; incremental cache per
+the doc-10 contract (never mtime), parallel unit compile verified UNBLOCKED (fresh LLVM
+`Context` per codegen entry + shipped C0); hard cutover — **N=1 IS whole-program,
+byte-identical** (protects the reproducibility + rt-lto gates). Recorded honest trade:
+multi-file programs lose cross-module inlining until ThinLTO. `--rt-lto` merges per-unit in
+v1. `extern "C"` export-of-body stays out (noalias trust chain). Next M15 step = **S0
+(cyclic-import hard error + draft.md §17)** then S1 (interface summary). Earlier same day:
+**M14 Slice 2 (runtime-bitcode LTO) SHIPPED — MERGED as #443**
 (design settled the same day by a two-lens review — soundness + build-integration — recorded
 as "M14 Slice 2 design SETTLED" + "M14 Slice 2 SHIPPED" in the roadmap M14 section; adversarial
 gate verdict SHIP with zero confirmed defects; gemini 3/3 findings applied pre-merge; workspace
@@ -575,13 +598,12 @@ is pinned unchanged by construction; the owed Linux full-suite re-verification i
 manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
 -D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
-Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, AND M14
-Slice 2 `--rt-lto` #443 are all DONE — see the _Last updated_ paragraph): (a) **M15
-separate-compilation two-lens design review** (owner-mandated; sequenced after the probe
-verdict, which is in — the natural next big item; design-question list in the roadmap M15
-section; NOTE the new `--rt-lto` merge machinery is the ThinLTO substrate M15 item 5 refers
-to); (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning lever
-parked on Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
+Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
+Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
+paragraph): (a) **M15 implementation, starting at S0** (cyclic-import hard error + `draft.md`
+§17) **then S1** (interface summary + hashes) — the settled slice plan S0–SV is in the roadmap
+M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
 `docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (d)

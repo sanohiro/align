@@ -2352,17 +2352,27 @@ either Pure-only keys or exactly-once input-order key evaluation before that rew
 now fails closed for unknown higher-order targets, but that mechanism does not choose the language
 contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
-### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15
+### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15; design SETTLED 2026-07-14
 
 Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not
 remain Align's only compilation model: separate compilation is REQUIRED, near-term.
 Language-level modules already exist; the missing piece is per-unit compilation +
-incremental builds. The full design-question list (unit boundary + artifact format, cross-unit
-inference summaries for escape/region/effect/MoveCheck, generics monomorphization strategy,
-the M13 internalization/capability-linking interactions, ThinLTO un-mooting, incremental
-driver) lives in the roadmap **M15** section — settle by a two-lens design review before any
-code. Soundness note: every escape/effect gate audited to date assumes whole-program
-visibility; unit interfaces must carry summaries or be conservative, never fail-open.
+incremental builds. **Design SETTLED 2026-07-14 by the mandated two-lens review
+(language/soundness + driver/artifacts/cache); the full settlement + slice plan (S0–SV) is the
+"M15 design SETTLED" block in the roadmap M15 section — that is the implementation source of
+truth.** Key decisions: unit = one module/file, driver-discovered DAG (new rule: cyclic imports
+= hard error, no new syntax otherwise); the unit interface is COMPLETE (escape/Move/MoveCheck
+need no body summaries by construction; purity reduces to a 3-valued per-`pub`-fn effect bit,
+fail-CLOSED — missing/Unknown ⇒ Impure+unknown-indirect ⇒ rejected at parallel boundaries);
+generics = instantiate-in-consumer with serialized template ASTs, duplicate internal monomorphs
+accepted in v1; visibility = `{main} ∪ --export ∪ pub}` external, everything else internal;
+v1 ships ZERO cross-unit optimization (real ThinLTO later — the artifact envelope reserves
+bitcode/summary parts and the codegen key carries an empty-in-v1 cross-unit-opt digest so no
+format break); incremental cache on the doc-10 contract with interface-vs-impl hash split
+(interface hash INCLUDES effect bits + generic template bodies); hard cutover (N=1 IS
+whole-program, byte-identical). Recorded honest trade: multi-file programs lose cross-module
+inlining until ThinLTO; single-file unaffected. `extern "C"` export-of-body stays out of M15
+(out-param noalias trust chain). Implementation NOT started; item stays Open until M15 ships.
 
 **Cache-first companion audit (2026-07-12):** `impl/10-cache-first-optimization.md` is the durable
 detail for this item's artifact identity and invalidation questions. Its confirmed pre-M15
