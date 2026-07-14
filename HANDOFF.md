@@ -8,7 +8,33 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (seventh update this day), **M15 S2 first stage SHIPPED — per-unit
+_Last updated: 2026-07-15, **M15 S2b SHIPPED — the default build is per-unit, MERGED as #453**
+(workspace **2035 green** (2022 + 13) + clippy clean; gemini review ZERO findings; design settled
+by a two-lens review — driver/UX + soundness/byte-identity — integrated before implementation;
+full record in the roadmap M15 S2b paragraph). Hard cutover: `build`/`run`/`emit-obj`/`size` all
+route through the per-unit pipeline; the `build-per-unit` verb, `build_to`, and `front_to_mir`
+are DELETED (no-backward-compat). **N=1 stays byte-identical to the whole-program object/exe by
+construction** (entry-unit fns internal), now pinned by a sweep across profiles + `--rt-lto`.
+`emit-llvm`/`emit-mir` emit each unit bottom-up with a unit banner ONLY when N>1 (N=1
+byte-identical); `--stage optimized` optimizes each unit in isolation — the truth under zero
+cross-unit opt (a cross-unit `pub` call visibly stays un-inlined while intra-unit calls inline).
+`explain-opt` captures remarks SERIALLY per unit (process-global cl::opts) with per-unit sections
+when N>1, via new `lower_program_per_unit_located` (carries BOTH exportable bits and
+`stmt_lines`; factored through `lower_program_impl`, no lowering-body duplication). `emit-obj`
+N>1 writes one `<module>.o` per unit; a single `[out.o]` positional with N>1 is a hard error
+with guidance. **`--export` is ENTRY-UNIT-ONLY, fail-closed**: a name defined in a non-entry
+unit errors naming the defining unit + "mark it `pub`" (non-entry `pub` fns are already
+external — the one way to export them); never a silent no-op. `check` STAYS whole-program sema
+(better "private" diagnostics; verdicts identical per S1b — note the per-unit "unknown" wording
+is now the default multi-file BUILD-time experience, recorded as accepted). 13 new gates in
+`crates/align_driver/tests/per_unit_surface.rs` (N=1 identity sweep, CLI-level equivalence,
+export routing/fail-closed errors, emit-llvm banners + opaque boundary, explain-opt N=1
+identity + sections, size multi-file, ≥3-unit run-to-run determinism, capability union
+libz-only, rt-lto multi-file smoke). **Next M15 step = S3: incremental cache per the doc-10
+contract + parallel unit compilation + hit/miss observability**; then SV (verification bundle).
+Still queued behind the M15 slices: the `http_server_no_fd_leak_across_cycles` flake-hardening
+slice and the qualified cross-module fn-value remainder (`map(util.dbl)`, open-questions).
+Previous update: 2026-07-14 (seventh update this day), **M15 S2 first stage SHIPPED — per-unit
 codegen + N-object link, MERGED as #449** (workspace **2019 green** + clippy clean;
 adversarial gate SHIP — it built a 15-type-class cross-unit ABI parity matrix, all IDENTICAL
 whole-program vs per-unit, incl. big-struct by-value, Result/Option aggregates, Move
