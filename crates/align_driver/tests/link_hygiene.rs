@@ -146,12 +146,31 @@ fn plain_main_stays_external_no_wrapper() {
     if !backend_available() {
         return;
     }
-    // A non-`Result` `main` IS the C entry directly (no wrapper, no `align_main`), so it keeps the
-    // symbol name `main` and external linkage; a sibling helper is still internalized.
-    let ir = emit_llvm("fn helper(x: i64) -> i64 = x + 1\nfn main() {\n  print(helper(41))\n}\n");
+    // An `-> i32` `main` IS the C entry directly (no wrapper, no `align_main`) — its LLVM return
+    // type already matches the C ABI's `i32` — so it keeps the symbol name `main` and external
+    // linkage; a sibling helper is still internalized.
+    let ir = emit_llvm("fn helper(x: i64) -> i64 = x + 1\nfn main() -> i32 {\n  print(helper(41))\n  return 0\n}\n");
     assert_external(&ir, "main");
     assert_internal(&ir, "helper");
-    assert!(!ir.contains("@align_main"), "a plain `main` needs no `align_main` body:\n{ir}");
+    assert!(!ir.contains("@align_main"), "an `-> i32` `main` needs no `align_main` body:\n{ir}");
+}
+
+#[test]
+fn unit_main_gets_the_c_entry_wrapper() {
+    if !backend_available() {
+        return;
+    }
+    // A `Unit`-returning `main` is NOT the C entry directly (it lowers to `void`, and the C ABI's
+    // `main` must return `i32` — leaving `main` void would leave the return register undefined,
+    // `docs/open-questions.md` "Unit-returning `fn main()` yields a nondeterministic exit code").
+    // It is renamed `align_main` (internal) and gets a generated external `main` wrapper that
+    // always returns a defined `i32`, same shape as the `Result`-returning case.
+    let ir = emit_llvm("fn helper(x: i64) -> i64 = x + 1\nfn main() {\n  print(helper(41))\n}\n");
+    assert_external(&ir, "main");
+    assert_internal(&ir, "align_main");
+    assert_internal(&ir, "helper");
+    assert!(ir.contains("call void @align_main()"), "wrapper must call align_main:\n{ir}");
+    assert!(ir.contains("ret i32 0"), "wrapper must return a defined 0:\n{ir}");
 }
 
 #[test]

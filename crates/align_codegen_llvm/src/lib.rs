@@ -574,8 +574,8 @@ fn build_module<'c>(
         })
         .collect();
 
-    // Pass 1: declare all functions so calls resolve regardless of order. A
-    // `Result`-returning `main` is emitted under `align_main`; a C `main` wrapper is
+    // Pass 1: declare all functions so calls resolve regardless of order. A `Result`- or
+    // `Unit`-returning `main` is emitted under `align_main`; a C `main` wrapper is
     // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
@@ -2233,9 +2233,16 @@ fn build_module<'c>(
     if let Some(dc) = &debug_ctx {
         dc.dib.finalize();
     }
-    // A Result-returning main needs a C `main` wrapper that maps Ok/Err to an exit code (and, when
-    // `main(args: array<str>)`, marshals argv into the `array<str>` argument).
-    if let Some(f) = program.fns.iter().find(|f| f.name == "main" && matches!(f.ret, Ty::Result(..))) {
+    // A `Result`- or `Unit`-returning main needs a C `main` wrapper: `Result` maps Ok/Err to an
+    // exit code (and, when `main(args: array<str>)`, marshals argv into the `array<str>`
+    // argument — the argv form is Result-only, sema-enforced); `Unit` has no error to report, so
+    // the wrapper just calls `align_main` and always returns a defined `0` (the bug this fixes —
+    // previously a `()`-returning `main` WAS the C entry directly, declared `void`, and `ret void`
+    // left the C ABI's i32 return register undefined; see `docs/open-questions.md` "Unit-returning
+    // `fn main()` yields a nondeterministic exit code").
+    if let Some(f) =
+        program.fns.iter().find(|f| f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit))
+    {
         emit_main_wrapper(ctx, module, funcs["main"], f.ret, !f.params.is_empty())?;
     }
     Ok(())
@@ -2252,18 +2259,25 @@ fn first_fn_line(f: &Function) -> u32 {
         .unwrap_or(1)
 }
 
-/// The LLVM symbol for a function: a `Result`-returning `main` is emitted as
-/// `align_main` (the C `main` is a generated wrapper); everything else keeps its name.
+/// The LLVM symbol for a function: a `Result`- or `Unit`-returning `main` is emitted as
+/// `align_main` (the C `main` is a generated wrapper that always returns a defined `i32`);
+/// everything else keeps its name. (An `-> i32` `main` needs no wrapper — it already returns
+/// the C ABI's type directly — so it keeps the `main` symbol and IS the C entry.)
 fn symbol_name(f: &Function) -> &str {
-    if f.name == "main" && matches!(f.ret, Ty::Result(..)) {
+    if f.name == "main" && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit) {
         "align_main"
     } else {
         &f.name
     }
 }
 
-/// Emit the C `main` for a `Result<(), Error>`-returning Align `main`: call it, and on
-/// `Err(code)` report the error and exit with `code`, else exit 0.
+/// Emit the C `main` for a `Result<(), Error>`- or `Unit`-returning Align `main` (renamed
+/// `align_main`, see [`symbol_name`]): call it, then materialize a **defined** `i32` exit code —
+/// on `Err(code)` report the error and exit with `code`; on `Ok` or a plain `Unit` return, exit 0.
+/// A `Unit` `align_main` is `void`, so there is no tag/payload to inspect; the wrapper's only job
+/// for that case is to turn the void call into `ret i32 0` (never leave the ABI return register
+/// undefined — the bug this function exists to close for the `Unit` case, `has_args` always
+/// `false` there since sema restricts the `args: array<str>` form to a `Result`-returning `main`).
 fn emit_main_wrapper<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -2271,8 +2285,8 @@ fn emit_main_wrapper<'c>(
     ret: Ty,
     has_args: bool,
 ) -> Result<(), CodegenError> {
-    if !matches!(ret, Ty::Result(_, _)) {
-        return Err(CodegenError::Lowering("main wrapper on a non-Result".into()));
+    if !matches!(ret, Ty::Result(_, _)) && ret != Ty::Unit {
+        return Err(CodegenError::Lowering("main wrapper on a non-Result, non-Unit return".into()));
     }
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
@@ -2316,9 +2330,13 @@ fn emit_main_wrapper<'c>(
         vec![]
     };
 
-    let res = builder
-        .build_call(align_main, &call_args, "r")
-        .map_err(lower)?
+    let call = builder.build_call(align_main, &call_args, "r").map_err(lower)?;
+    if ret == Ty::Unit {
+        // `align_main` is `void(...)` — nothing to inspect, just materialize a defined `0`.
+        builder.build_return(Some(&i32t.const_int(0, false))).map_err(lower)?;
+        return Ok(());
+    }
+    let res = call
         .try_as_basic_value()
         .basic()
         .ok_or_else(|| CodegenError::Lowering("main returned void".into()))?
@@ -2990,10 +3008,12 @@ fn declare_fn<'c>(
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
     // Every Align program function is module-private (internal) EXCEPT:
-    //  - the C entry: a `()`-returning `main` keeps the symbol name `main` and IS the C entry
-    //    (`crt0` resolves it by name), so it must stay external. A `Result`-returning `main` is
-    //    emitted as `align_main` here (internal) and its external C `main` wrapper is generated
-    //    separately. No other function is named `main`.
+    //  - the C entry: an `-> i32` `main` keeps the symbol name `main` and IS the C entry (`crt0`
+    //    resolves it by name), so it must stay external — its LLVM return type is already the C
+    //    ABI's `i32`, so no wrapper is needed. A `Result`- or `Unit`-returning `main` is emitted as
+    //    `align_main` here (internal) instead, and its external C `main` wrapper — which always
+    //    returns a defined `i32` (`0`, an `Err` exit code, or `0` for a plain `Unit` return; see
+    //    `emit_main_wrapper`) — is generated separately. No other function is named `main`.
     //  - an explicit export root (`emit-obj`/`emit-llvm --export <name>`, M13 Codex-audit item
     //    1). Exporting a function makes it BOTH a linker-visible external symbol AND a DCE root in
     //    the same step (`external` linkage keeps LLVM's `globaldce`/`internalize`-style passes from
