@@ -147,18 +147,19 @@ fn detect_import_cycles(
         Black,
     }
 
-    fn visit(
-        node: &str,
-        edges: &std::collections::HashMap<String, Vec<(String, align_span::Span)>>,
-        color: &mut std::collections::HashMap<String, Color>,
-        path: &mut Vec<String>,
+    fn visit<'a>(
+        node: &'a str,
+        edges: &'a std::collections::HashMap<String, Vec<(String, align_span::Span)>>,
+        color: &mut std::collections::HashMap<&'a str, Color>,
+        path: &mut Vec<&'a str>,
         diags: &mut Diagnostics,
     ) -> bool {
-        color.insert(node.to_string(), Color::Grey);
-        path.push(node.to_string());
+        color.insert(node, Color::Grey);
+        path.push(node);
         if let Some(outs) = edges.get(node) {
             for (target, span) in outs {
-                match color.get(target.as_str()).copied().unwrap_or(Color::White) {
+                let target = target.as_str();
+                match color.get(target).copied().unwrap_or(Color::White) {
                     Color::White => {
                         if visit(target, edges, color, path, diags) {
                             return true;
@@ -168,9 +169,9 @@ fn detect_import_cycles(
                         // `target` is still open on the current DFS path: this edge is the back
                         // edge that closes the cycle. Render the path from `target`'s position on
                         // the stack through the current node, then back to `target`.
-                        let start_ix = path.iter().position(|p| p == target).unwrap_or(0);
-                        let mut cycle: Vec<&str> = path[start_ix..].iter().map(String::as_str).collect();
-                        cycle.push(target.as_str());
+                        let start_ix = path.iter().position(|&p| p == target).unwrap_or(0);
+                        let mut cycle = path[start_ix..].to_vec();
+                        cycle.push(target);
                         diags.error(
                             format!(
                                 "cyclic import: {} (the module import graph must be a DAG; merge \
@@ -186,7 +187,7 @@ fn detect_import_cycles(
             }
         }
         path.pop();
-        color.insert(node.to_string(), Color::Black);
+        color.insert(node, Color::Black);
         false
     }
 
