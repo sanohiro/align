@@ -273,6 +273,13 @@ pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
 
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
     let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
+    // Cache of each dependency's synthesized interface AST, keyed by module path. Rendered and
+    // parsed exactly once per dependency (not once per importer): `summary_to_source` is called
+    // with the DEP'S OWN transitive closure, never the importer's, so the rendered source (and
+    // therefore the parsed AST) is importer-independent and safe to share across every unit that
+    // imports it. Without this, the bottom-up walk below would re-render and re-parse every
+    // transitive dependency's summary once per importer — O(N^2) in the DAG's fan-in.
+    let mut interface_ast_cache: HashMap<String, align_ast::File> = HashMap::new();
 
     for unit_path in &order {
         let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
@@ -285,30 +292,39 @@ pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
             .collect();
         dep_interface_hashes.push((unit_path.clone(), hset));
 
-        // Reconstruct each transitive dependency as an interface-only module from its summary.
-        let tdep_refs: Vec<&str> = tdeps.iter().map(|s| s.as_str()).collect();
-        let mut synth_files: Vec<(String, align_ast::File)> = Vec::new();
+        // Reconstruct each transitive dependency as an interface-only module from its summary,
+        // reusing (or populating) `interface_ast_cache` so each dependency is rendered and parsed
+        // exactly once across the whole bottom-up walk, not once per importer.
         let mut external_effects: HashMap<String, align_sema::FnEffect> = HashMap::new();
         for d in &tdeps {
             let Some(dep_summary) = summaries.get(d) else { continue };
-            let source = align_interface::summary_to_source(dep_summary, &tdep_refs);
-            // Parse the synthesized surface with the real parser (one resolution path). Synthesized
-            // source is compiler-internal and always well-formed; its parse diagnostics are discarded.
-            let mut sink = Diagnostics::new();
-            let fid = source_map.add_file(format!("<interface:{d}>"), source.clone());
-            let toks = align_lexer::tokenize(fid, &source, &mut sink);
-            let ast = align_parser::parse_file(toks, &mut sink);
-            synth_files.push((d.clone(), ast));
+            if !interface_ast_cache.contains_key(d) {
+                // Render using `d`'s OWN transitive closure (never the importer's `tdeps`): that
+                // is what makes the rendered source, and therefore the parsed AST, independent of
+                // which importer triggered the parse — and so safe to cache and share.
+                let d_tdeps = transitive(d, &direct_deps);
+                let d_tdep_refs: Vec<&str> = d_tdeps.iter().map(|s| s.as_str()).collect();
+                let source = align_interface::summary_to_source(dep_summary, &d_tdep_refs);
+                // Parse the synthesized surface with the real parser (one resolution path). Synthesized
+                // source is compiler-internal and always well-formed; its parse diagnostics are discarded.
+                let mut sink = Diagnostics::new();
+                let fid = source_map.add_file(format!("<interface:{d}>"), source.clone());
+                let toks = align_lexer::tokenize(fid, &source, &mut sink);
+                let ast = align_parser::parse_file(toks, &mut sink);
+                interface_ast_cache.insert(d.clone(), ast);
+            }
             external_effects.extend(align_interface::summary_effects(dep_summary, false));
         }
 
-        let mut modules: Vec<align_sema::Module> = synth_files
+        let mut modules: Vec<align_sema::Module> = tdeps
             .iter()
-            .map(|(path, ast)| align_sema::Module {
-                path: path.clone(),
-                file: ast,
-                is_entry: false,
-                interface_only: true,
+            .filter_map(|d| {
+                interface_ast_cache.get(d).map(|ast| align_sema::Module {
+                    path: d.clone(),
+                    file: ast,
+                    is_entry: false,
+                    interface_only: true,
+                })
             })
             .collect();
         modules.push(align_sema::Module {
