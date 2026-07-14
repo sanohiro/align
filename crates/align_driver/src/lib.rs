@@ -12,6 +12,9 @@ pub use align_codegen_llvm::{
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
 pub use align_mir::Program as MirProgram;
+/// M15 interface-summary types (re-exported so callers can name the [`check_per_unit`] result without
+/// depending on `align_interface` directly).
+pub use align_interface::{Hash128, InterfaceSummary};
 
 pub mod explain;
 
@@ -131,7 +134,7 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let loaded = load_units(source_map, name, src, &mut diags);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
-        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
+        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
 
@@ -152,7 +155,7 @@ pub fn build_interface_summaries(
     let loaded = load_units(source_map, name, src, &mut diags);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
-        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
+        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
     if diags.has_errors() {
@@ -163,6 +166,195 @@ pub fn build_interface_summaries(
         loaded.iter().map(|l| (l.path.clone(), l.src.clone())).collect();
     let summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
     (summaries, diags)
+}
+
+/// M15 S1b per-unit check result. `check_per_unit` walks the import DAG bottom-up, checking each
+/// unit against the already-checked *interface summaries* of its (transitive) imports — never their
+/// ASTs — and re-deriving each unit's own summary from that per-unit check.
+pub struct PerUnitCheck {
+    /// One interface summary per unit that checked cleanly, in bottom-up (dependency-first) order.
+    /// A unit whose body fails to check contributes no summary (a summary of an ill-typed unit is
+    /// meaningless), so dependents of a broken unit see it as an absent dependency.
+    pub summaries: Vec<align_interface::InterfaceSummary>,
+    /// For each unit (by module path, bottom-up), the TRANSITIVE set of imported units it depended
+    /// on, each paired with that dependency's `interface_hash`. This is the S3 incremental-cache key
+    /// input: a unit must be re-checked when any entry here changes. Foreign type references are
+    /// by-name in the canonical surface, so the dependency is transitive, not just direct.
+    pub dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)>,
+    /// The union of every unit's per-unit diagnostics (each unit's diagnostics are emitted once, when
+    /// that unit is the unit-under-check; interface-only dependencies emit none).
+    pub diags: Diagnostics,
+}
+
+/// M15 S1b: check every unit **per-unit**, each against only its own AST plus the interface summaries
+/// of its (transitively-closed) imports — the literal reading of `draft.md` §17 ("each module is
+/// checked against the already-checked interfaces of its imports"). This is an ADDITIVE capability
+/// proving the separate-compilation seam; it does not replace the whole-program [`check`] build path
+/// (S2 flips codegen). Units are processed bottom-up over the import DAG (S0 guarantees acyclicity);
+/// each dependency's public surface is rendered back to source and re-parsed into an interface-only
+/// module (one resolution path — the existing sema passes), and cross-unit effect bits are seeded
+/// fail-closed.
+pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitCheck {
+    use std::collections::HashMap;
+    let mut diags = Diagnostics::new();
+    let loaded = load_units(source_map, name, src, &mut diags);
+
+    let by_path: HashMap<&str, &LoadedUnit> = loaded.iter().map(|l| (l.path.as_str(), l)).collect();
+    // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
+    let direct_deps: HashMap<String, Vec<String>> = loaded
+        .iter()
+        .map(|l| {
+            let deps: Vec<String> = l
+                .ast
+                .imports
+                .iter()
+                .filter(|p| user_import(p))
+                .map(|p| p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."))
+                .filter(|d| by_path.contains_key(d.as_str()))
+                .collect();
+            (l.path.clone(), deps)
+        })
+        .collect();
+
+    // Transitive dependency closure of `start` (excluding `start`), deterministic (import order).
+    fn transitive(start: &str, direct: &HashMap<String, Vec<String>>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        fn go(
+            node: &str,
+            direct: &HashMap<String, Vec<String>>,
+            seen: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+        ) {
+            if let Some(deps) = direct.get(node) {
+                for d in deps {
+                    if seen.insert(d.clone()) {
+                        go(d, direct, seen, order);
+                        order.push(d.clone());
+                    }
+                }
+            }
+        }
+        go(start, direct, &mut seen, &mut order);
+        order
+    }
+
+    // Bottom-up (dependency-first) order: DFS post-order from the entry unit. All loaded units are
+    // reachable from the entry (they were loaded by following its imports). A `visited` guard makes
+    // this terminate even if S0's cycle check already flagged a cycle (a best-effort order then).
+    let entry = loaded.iter().find(|l| l.is_entry).map(|l| l.path.clone()).unwrap_or_default();
+    let mut order: Vec<String> = Vec::new();
+    {
+        let mut visited = std::collections::HashSet::new();
+        fn post(
+            node: &str,
+            direct: &HashMap<String, Vec<String>>,
+            visited: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+        ) {
+            if !visited.insert(node.to_string()) {
+                return;
+            }
+            if let Some(deps) = direct.get(node) {
+                for d in deps {
+                    post(d, direct, visited, order);
+                }
+            }
+            order.push(node.to_string());
+        }
+        post(&entry, &direct_deps, &mut visited, &mut order);
+        // Include any unit not reachable from the entry (defensive; normally none).
+        for l in &loaded {
+            if !visited.contains(&l.path) {
+                post(&l.path, &direct_deps, &mut visited, &mut order);
+            }
+        }
+    }
+
+    let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
+    let mut dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)> = Vec::new();
+
+    for unit_path in &order {
+        let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
+        let tdeps = transitive(unit_path, &direct_deps);
+
+        // The S3 cache key input: this unit's transitive dependency interface hashes.
+        let hset: Vec<(String, align_interface::Hash128)> = tdeps
+            .iter()
+            .filter_map(|d| summaries.get(d).map(|s| (d.clone(), s.interface_hash)))
+            .collect();
+        dep_interface_hashes.push((unit_path.clone(), hset));
+
+        // Reconstruct each transitive dependency as an interface-only module from its summary.
+        let tdep_refs: Vec<&str> = tdeps.iter().map(|s| s.as_str()).collect();
+        let mut synth_files: Vec<(String, align_ast::File)> = Vec::new();
+        let mut external_effects: HashMap<String, align_sema::FnEffect> = HashMap::new();
+        for d in &tdeps {
+            let Some(dep_summary) = summaries.get(d) else { continue };
+            let source = align_interface::summary_to_source(dep_summary, &tdep_refs);
+            // Parse the synthesized surface with the real parser (one resolution path). Synthesized
+            // source is compiler-internal and always well-formed; its parse diagnostics are discarded.
+            let mut sink = Diagnostics::new();
+            let fid = source_map.add_file(format!("<interface:{d}>"), source.clone());
+            let toks = align_lexer::tokenize(fid, &source, &mut sink);
+            let ast = align_parser::parse_file(toks, &mut sink);
+            synth_files.push((d.clone(), ast));
+            external_effects.extend(align_interface::summary_effects(dep_summary, false));
+        }
+
+        let mut modules: Vec<align_sema::Module> = synth_files
+            .iter()
+            .map(|(path, ast)| align_sema::Module {
+                path: path.clone(),
+                file: ast,
+                is_entry: false,
+                interface_only: true,
+            })
+            .collect();
+        modules.push(align_sema::Module {
+            path: u.path.clone(),
+            file: &u.ast,
+            is_entry: u.is_entry,
+            interface_only: false,
+        });
+
+        let mut u_diags = Diagnostics::new();
+        let program = align_sema::check_program_with_effects(&modules, &external_effects, &mut u_diags);
+        let had_errors = u_diags.has_errors();
+        for d in u_diags.iter() {
+            diags.push(d.clone());
+        }
+
+        if !had_errors {
+            // Re-derive THIS unit's own summary from its per-unit check (bottom-up: dependencies are
+            // already summarized). Only the unit's real module is passed, so exactly one summary is
+            // built. Its `interface_hash` folds cross-unit effect bits (`external_effects`).
+            let unit_module = [align_sema::Module {
+                path: u.path.clone(),
+                file: &u.ast,
+                is_entry: u.is_entry,
+                interface_only: false,
+            }];
+            let mir = lower_to_mir(&program);
+            let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
+            let mut built = align_interface::build_summaries_with_effects(
+                &unit_module,
+                &program,
+                &mir,
+                &sources,
+                &external_effects,
+            );
+            if let Some(s) = built.pop() {
+                summaries.insert(u.path.clone(), s);
+            }
+        }
+    }
+
+    // Emit summaries in bottom-up order (deterministic, dependency-first).
+    let summaries: Vec<align_interface::InterfaceSummary> =
+        order.iter().filter_map(|p| summaries.remove(p)).collect();
+
+    PerUnitCheck { summaries, dep_interface_hashes, diags }
 }
 
 /// Reject a cyclic module import graph (`check`'s `edges` map: importer path -> `(imported

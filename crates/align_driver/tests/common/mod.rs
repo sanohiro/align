@@ -6,8 +6,9 @@
 #![allow(dead_code, unused_imports)]
 
 pub use align_driver::{
-    backend_available, check, emit_llvm_ir, emit_object_file, link_executable, link_objects,
-    lower_to_mir, BuildTarget, ObjectFormat, Profile,
+    backend_available, check, check_per_unit, emit_llvm_ir, emit_object_file, link_executable,
+    link_objects, lower_to_mir, BuildTarget, Hash128, InterfaceSummary, ObjectFormat, PerUnitCheck,
+    Profile,
 };
 pub use align_span::SourceMap;
 
@@ -280,6 +281,65 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
+}
+
+/// The outcome of running BOTH the whole-program checker and the M15 S1b per-unit checker on the
+/// same multi-file program — the differential-equivalence gate's raw material.
+pub struct DiffCheck {
+    /// Whole-program `check` reported at least one error.
+    pub whole_errors: bool,
+    /// Per-unit `check_per_unit` reported at least one error.
+    pub per_unit_errors: bool,
+    /// Rendered whole-program diagnostics (for a failing assertion's message).
+    pub whole_diags: String,
+    /// Rendered per-unit diagnostics (for a failing assertion's message).
+    pub per_unit_diags: String,
+    /// The full per-unit result (summaries + transitive hash sets).
+    pub per_unit: PerUnitCheck,
+}
+
+/// Run the whole-program checker and the per-unit checker on the same multi-file program and return
+/// both verdicts + rendered diagnostics. The entry is compiled by path so `import`s resolve from disk.
+pub fn diff_check_multi(name: &str, files: &[(&str, &str)], entry: &str) -> DiffCheck {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+
+    let mut sm_whole = SourceMap::new();
+    let whole = check(&mut sm_whole, &entry_name, &entry_src);
+
+    let mut sm_per = SourceMap::new();
+    let per_unit = check_per_unit(&mut sm_per, &entry_name, &entry_src);
+
+    DiffCheck {
+        whole_errors: whole.diags.has_errors(),
+        per_unit_errors: per_unit.diags.has_errors(),
+        whole_diags: align_driver::format_diagnostics(&sm_whole, &whole.diags),
+        per_unit_diags: align_driver::format_diagnostics(&sm_per, &per_unit.diags),
+        per_unit,
+    }
+}
+
+/// Assert whole-program and per-unit checking agree on the accept/reject verdict for a multi-file
+/// program, and return the per-unit result for further inspection.
+pub fn assert_same_verdict(name: &str, files: &[(&str, &str)], entry: &str) -> PerUnitCheck {
+    let d = diff_check_multi(name, files, entry);
+    assert_eq!(
+        d.whole_errors, d.per_unit_errors,
+        "verdict mismatch for `{name}`:\n== whole-program ({}) ==\n{}\n== per-unit ({}) ==\n{}",
+        d.whole_errors, d.whole_diags, d.per_unit_errors, d.per_unit_diags
+    );
+    d.per_unit
+}
+
+/// Run the M15 S1b per-unit checker on a multi-file program written to a fresh temp directory.
+pub fn check_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> PerUnitCheck {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let mut sm = SourceMap::new();
+    check_per_unit(&mut sm, &entry_path.display().to_string(), &entry_src)
 }
 
 /// Whether checking a multi-file program (`entry` + the other `files`) produces any error.

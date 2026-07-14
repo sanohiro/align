@@ -1078,6 +1078,15 @@ pub struct Module<'f> {
     /// functions are mangled `module$fn`, so single-file programs are byte-identical and two modules
     /// may share a function name.
     pub is_entry: bool,
+    /// M15 S1b: an **interface-only** dependency module — its `ast::File` was reconstructed from an
+    /// already-checked [`InterfaceSummary`] (its public surface rendered back to source + re-parsed),
+    /// not from the dependency's real source. Its types / consts / signatures / generic templates are
+    /// registered so the unit-under-check can resolve `dep.name`, but its own bodies are NOT
+    /// type-checked, its non-generic functions are NOT emitted into the program, and it produces NO
+    /// diagnostics (it was checked when the dependency itself was the unit-under-check). Cross-unit
+    /// effect bits for its `pub` functions arrive out-of-band via `external_effects`
+    /// ([`check_program_with_effects`]). Always `false` in the whole-program build path.
+    pub interface_only: bool,
 }
 
 /// The codegen name of a function: plain in the entry module (so `main` stays `main` and single-file
@@ -1623,12 +1632,30 @@ impl<'a, 'd> ConstEval<'a, 'd> {
 /// Analyze a single file into a typed program (the single-module entry point; tests and the
 /// single-file driver path use this). Multi-file compilation goes through [`check_program`].
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
-    check_program(&[Module { path: "main".to_string(), file, is_entry: true }], diags)
+    check_program(&[Module { path: "main".to_string(), file, is_entry: true, interface_only: false }], diags)
 }
 
 /// Analyze a set of modules (the entry file plus its transitively-imported user modules) into one
-/// typed program. Errors are pushed to `diags`.
+/// typed program. Errors are pushed to `diags`. The whole-program build path: every module is a real
+/// source module, and every cross-module call's effect is derived from the callee's own body.
 pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
+    check_program_with_effects(modules, &HashMap::new(), diags)
+}
+
+/// M15 S1b per-unit checking: like [`check_program`], but any [`Module::interface_only`] module is a
+/// dependency reconstructed from its already-checked interface summary, and `external_effects` carries
+/// the 3-valued effect bit (keyed by **canonical / mangled** name) of every imported non-generic
+/// `pub` function. A cross-unit call to a function not present in the checked program (i.e. an
+/// interface-only dependency's non-generic `pub` fn) takes its effect from `external_effects`;
+/// **fail-closed** — a call target absent from the map is treated as `Impure` **and** unknown-indirect,
+/// so it is rejected at a `par_map`/parallel boundary and never optimistically Pure. Generic imported
+/// functions are NOT in `external_effects`: their monomorphs are instantiated into this program and
+/// their effects recomputed from the instantiated body.
+pub fn check_program_with_effects(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) -> Program {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -1714,6 +1741,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // walked: a constant's type is restricted to a scalar / `str` (Pass 0d), never a user type, so it
     // can never expose one. `extern` fns take FFI-safe scalars only (validated in Pass 1), likewise.
     for m in modules {
+        // An interface-only dependency was reconstructed from its summary, whose self-containment was
+        // already enforced when the dependency was itself checked (S1a's producer invariant); re-running
+        // the exposure check on synthesized source would only risk spurious cross-module diagnostics.
+        if m.interface_only {
+            continue;
+        }
         for item in &m.file.items {
             match item {
                 ast::Item::Fn(f) if matches!(f.vis, ast::Vis::Pub) => {
@@ -2112,6 +2145,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Unused-import lint (warning): an `import` whose module is never referenced in the file. A
     // builtin (`core.json`) is matched by its `json.*` namespace; a user module by its dotted path.
     for m in modules {
+        // Interface-only dependencies emit no diagnostics (they were linted when checked as the unit),
+        // and their synthesized imports are derived to be exactly the ones their surface needs.
+        if m.interface_only {
+            continue;
+        }
         let mut refs = std::collections::HashSet::new();
         collect_refs(&m.file.items, &mut refs);
         // Used iff some collected prefix equals `needle` or is `needle.` + more (allocation-free).
@@ -2408,10 +2446,23 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         .collect();
     let empty_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Interface-only dependency modules (M15 S1b): their signatures / types / generic templates are
+    // registered above so this unit resolves `dep.name`, but their own bodies are NOT type-checked and
+    // their non-generic functions are NOT emitted into `program.fns` (they live in the dependency's own
+    // object). A *generic* imported function is still in `generic_decls` above, so an instantiation
+    // requested by this unit is monomorphized on demand and emitted here as a consumer-internal symbol.
+    let interface_only_modules: std::collections::HashSet<&str> =
+        modules.iter().filter(|m| m.interface_only).map(|m| m.path.as_str()).collect();
+
     // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
     // every generic call and processed to a fixpoint below.
     let mut worklist: std::collections::VecDeque<(String, Vec<Ty>)> = std::collections::VecDeque::new();
     for &(module, is_entry, f) in &all_fns {
+        // Do not check or emit an interface-only dependency's own functions (see above); its generic
+        // templates are reached only through the monomorphization worklist below.
+        if interface_only_modules.contains(module) {
+            continue;
+        }
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -2511,8 +2562,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             .collect();
         f.drop_locals = drops;
     }
-    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11).
-    check_parallelism(&program, diags);
+    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11). Cross-unit
+    // callees (interface-only dependencies' non-generic `pub` fns) take their effect from
+    // `external_effects`; fail-closed for an absent target.
+    check_parallelism(&program, external_effects, diags);
     program
 }
 
@@ -2523,8 +2576,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 /// moves) is Pure. A `par_map(f)` whose `f` is Impure is rejected. (`f` is `(T) -> R` with no `out`
 /// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
 /// as it stands.)
-fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
-    let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program);
+fn check_parallelism(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) {
+    let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program, external_effects);
     // The `par_map` function must be Pure.
     for (func, span) in parmaps {
         if unknown.contains(&func) {
@@ -2567,7 +2624,16 @@ struct EffectSets {
 /// Compute the transitive impure / unknown effect sets (and the `par_map` callees) over the whole
 /// program. The single source of truth for both the `par_map` Pure requirement ([`check_parallelism`])
 /// and the M15 per-function effect bit ([`fn_effects`]).
-fn compute_effect_sets(program: &Program) -> EffectSets {
+///
+/// `external_effects` (M15 S1b) carries the effect bit of every imported non-generic `pub` function
+/// (keyed by canonical / mangled name) whose body is NOT in this program (an interface-only
+/// dependency). A call edge to such a function seeds its effect here; **fail-closed** — a callee that
+/// is neither in this program nor in `external_effects` is treated as BOTH impure and unknown-indirect,
+/// so it can never be optimistically Pure at a parallel boundary.
+fn compute_effect_sets(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) -> EffectSets {
     use std::collections::HashMap;
     // Per function: directly observable effect + the set of functions it calls (incl. pipeline
     // stage/reducer functions) + the `par_map` callees to verify.
@@ -2583,6 +2649,33 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(scan.parmaps);
     }
+    // Cross-unit call targets (M15 S1b): any callee that is not a function of THIS program is an
+    // interface-only dependency's function. Seed its effect from `external_effects`; a target absent
+    // from that map is fail-closed to both impure and unknown-indirect (never optimistically Pure).
+    let mut ext_impure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ext_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for callees in calls.values() {
+        for callee in callees {
+            if direct.contains_key(callee.as_str()) {
+                continue; // a function of this program — handled by its own body scan above
+            }
+            match external_effects.get(callee) {
+                Some(FnEffect::Pure) => {}
+                Some(FnEffect::Impure) => {
+                    ext_impure.insert(callee.clone());
+                }
+                Some(FnEffect::Unknown) => {
+                    ext_unknown.insert(callee.clone());
+                }
+                None => {
+                    // Fail-closed: an unknown cross-unit target (a corrupted / absent summary bit, or
+                    // any name the interface does not carry) is treated as maximally effectful.
+                    ext_impure.insert(callee.clone());
+                    ext_unknown.insert(callee.clone());
+                }
+            }
+        }
+    }
     // Transitive propagation: build a reverse call graph (callee -> callers)
     // and propagate impurity starting from directly impure functions using a worklist.
     let mut reverse_calls: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -2594,7 +2687,10 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         }
     }
 
-    let propagate = |seeds: &HashMap<&str, bool>| {
+    // Propagate along the reverse call graph from an initial seed set. `seeds` are this program's own
+    // directly-effectful functions; `ext_seeds` are cross-unit callees whose effect the seed carries
+    // (they have no body here, so they are seeds only, never propagation intermediates with edges).
+    let propagate = |seeds: &HashMap<&str, bool>, ext_seeds: &std::collections::HashSet<String>| {
         let mut affected = std::collections::HashSet::new();
         let mut worklist = Vec::new();
         for (name, &active) in seeds {
@@ -2602,6 +2698,11 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
                 let n = name.to_string();
                 affected.insert(n.clone());
                 worklist.push(n);
+            }
+        }
+        for name in ext_seeds {
+            if affected.insert(name.clone()) {
+                worklist.push(name.clone());
             }
         }
         while let Some(callee) = worklist.pop() {
@@ -2617,8 +2718,8 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
         }
         affected
     };
-    let impure = propagate(&direct);
-    let unknown = propagate(&direct_unknown);
+    let impure = propagate(&direct, &ext_impure);
+    let unknown = propagate(&direct_unknown, &ext_unknown);
     EffectSets { impure, unknown, parmaps }
 }
 
@@ -2627,8 +2728,15 @@ fn compute_effect_sets(program: &Program) -> EffectSets {
 /// impure is classified so even if it also has an unknown-effect indirect call); everything the
 /// analysis cannot place in either set is `Pure`. Reuses [`compute_effect_sets`], so it always agrees
 /// with the `par_map` Pure check.
-pub fn fn_effects(program: &Program) -> std::collections::HashMap<String, FnEffect> {
-    let EffectSets { impure, unknown, .. } = compute_effect_sets(program);
+///
+/// `external_effects` (M15 S1b): the effect bits of imported non-generic `pub` functions whose bodies
+/// are not in `program` (an interface-only dependency), so a unit's own `pub` fn that transitively
+/// calls an impure imported fn is correctly classified impure. Pass an empty map for whole-program.
+pub fn fn_effects(
+    program: &Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) -> std::collections::HashMap<String, FnEffect> {
+    let EffectSets { impure, unknown, .. } = compute_effect_sets(program, external_effects);
     program
         .fns
         .iter()

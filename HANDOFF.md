@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (fifth update this day), **M15 S1b entry gate SHIPPED — a `pub`
+_Last updated: 2026-07-14 (sixth update this day), **M15 S1b (consumer) IMPLEMENTED on branch
+`m15-s1b-consume-summaries` (not yet PR'd)** — per-unit sema consuming imported interface
+summaries. Seam = **summary→source→re-parse**: an imported unit's public surface is rendered back
+to Align source (`align_interface::summary_to_source`) and re-parsed by the EXISTING parser into an
+interface-only `Module` (`Module::interface_only`), so ALL sema table-building + resolution passes
+are reused unchanged — ONE resolution path (generic templates + const values must be re-parsed
+anyway, so render-to-source unifies it; NO second resolver). Cross-unit effect bits seed
+`compute_effect_sets`/`fn_effects`/`check_parallelism` via new `check_program_with_effects`;
+a callee absent from the seed map is **fail-closed** to impure + unknown-indirect. Driver
+`check_per_unit` walks the DAG bottom-up, reconstructs each transitive dep, checks each unit,
+re-derives its summary, and records the **transitive (unit, interface_hash) set** per unit —
+the S3 cache-key input (`PerUnitCheck`; dev verb `alignc check-per-unit`). 25 new tests (21
+per_unit differential/blindness/transitive + 4 effect fail-closed); workspace green; clippy
+`-D warnings` clean. Honest remainder: per-unit summary production runs per-unit MIR lowering for
+capabilities only (outside the interface hash); private-cross-unit-access diagnostic differs by
+design ("unknown" per-unit vs "private" whole-program — verdict identical); S2 (per-unit codegen)
+and S3 (incremental cache) remain. Previous update: 2026-07-14 (fifth update), **M15 S1b entry
+gate SHIPPED — a `pub`
 interface may name only `pub` types, MERGED as #446** (workspace **1969 green** + clippy
 clean; gemini zero findings). Flake note for the record: ONE post-merge full-suite run showed
 a single failure in the `align_runtime` test binary (238/1/1 at 0.50 s; the specific test name
