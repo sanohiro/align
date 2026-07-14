@@ -26,9 +26,6 @@ const TOP_SYMBOLS: usize = 10;
 
 /// `alignc size <file>`: build with `profile`, then print the size breakdown of the executable.
 pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
-    let Some(mir) = crate::front_to_mir(path) else {
-        return ExitCode::FAILURE;
-    };
     // Keep the complete executable private through the report. Another `size` process cannot
     // replace or remove it while llvm-readobj/llvm-nm are inspecting it.
     let stage = match crate::ArtifactStage::temp("align-size") {
@@ -39,7 +36,8 @@ pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool)
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = crate::build_to(path, &mir, &exe, target, profile, rt_lto) {
+    // Build via the per-unit path (M15 S2b), then report on the single final executable.
+    if let Err(code) = crate::build_per_unit_to(path, &exe, target, profile, rt_lto) {
         return code;
     }
     let res = report(&exe, profile);

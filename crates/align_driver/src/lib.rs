@@ -36,6 +36,10 @@ struct LoadedUnit {
     /// The module's full source text — retained for the M15 interface summary (generic template
     /// bodies + const values are recorded as source slices, and `impl_hash` is over these bytes).
     src: String,
+    /// The module's source file path on disk (the entry file's given `name`, or a resolved
+    /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own
+    /// `DebugInfo` (its basename is what LLVM's remark strings — and thus the report — attribute to).
+    file: String,
 }
 
 // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
@@ -59,8 +63,13 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "main".to_string());
 
-    let mut loaded =
-        vec![LoadedUnit { path: entry_path.clone(), ast: entry_ast, is_entry: true, src: src.to_string() }];
+    let mut loaded = vec![LoadedUnit {
+        path: entry_path.clone(),
+        ast: entry_ast,
+        is_entry: true,
+        src: src.to_string(),
+        file: name.to_string(),
+    }];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
 
     // Edges of the module import graph (`importer path` -> `(imported modpath, import span)`),
@@ -114,7 +123,13 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
                     imp.span,
                 );
             }
-            loaded.push(LoadedUnit { path: modpath, ast: mast, is_entry: false, src: msrc });
+            loaded.push(LoadedUnit {
+                path: modpath,
+                ast: mast,
+                is_entry: false,
+                src: msrc,
+                file: file_path.display().to_string(),
+            });
         }
     }
 
@@ -194,7 +209,7 @@ pub struct PerUnitCheck {
 /// each dependency's public surface is rendered back to source and re-parsed into an interface-only
 /// module (one resolution path — the existing sema passes), and cross-unit effect bits are seeded
 /// fail-closed.
-fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
+fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: bool) -> PerUnitWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags);
@@ -360,7 +375,11 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWa
             // whole-program (its `impl_hash` hashes MIR *fns*, its capabilities partition MIR fns —
             // neither sees the exportable bit or the declare list), so `check_per_unit`'s summaries
             // are unchanged by this while `build_per_unit` reuses the same MIR for codegen.
-            let mir = lower_to_mir_per_unit(&program);
+            let mir = if located {
+                lower_to_mir_per_unit_located(&program, source_map)
+            } else {
+                lower_to_mir_per_unit(&program)
+            };
             let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
             let mut built = align_interface::build_summaries_with_effects(
                 &unit_module,
@@ -395,6 +414,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWa
                     .get(p.as_str())
                     .unwrap_or_else(|| panic!("missing dependency hashes for unit '{p}' — walk order must produce deps first"))
                     .to_vec(),
+                file: by_path.get(p.as_str()).map(|u| u.file.clone()).unwrap_or_default(),
             })
         })
         .collect();
@@ -412,6 +432,9 @@ pub struct PerUnitArtifact {
     pub mir: MirProgram,
     pub summary: align_interface::InterfaceSummary,
     pub dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
+    /// The unit's source file path on disk — its basename is what `explain-opt`'s per-unit
+    /// `DebugInfo` names, so LLVM's remarks attribute to the right file in the aggregated report.
+    pub file: String,
 }
 
 /// The per-unit compilation result: one artifact per cleanly-checked unit (bottom-up), the FULL
@@ -431,14 +454,22 @@ pub struct PerUnitWalk {
 /// [`check`]/build path is untouched. On any error, the affected unit contributes no artifact and the
 /// error is in `diags` (the caller must not link a partial build).
 pub fn build_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
-    walk_per_unit(source_map, name, src)
+    walk_per_unit(source_map, name, src, false)
+}
+
+/// M15 S2b per-unit build with **source locations** — like [`build_per_unit`], but each unit's MIR is
+/// lowered with `Block::stmt_lines` populated ([`lower_to_mir_per_unit_located`]). Used by
+/// `alignc explain-opt`, which compiles each unit in isolation and captures LLVM's optimization
+/// remarks per unit (the remarks need the debug locations to attribute back to user source).
+pub fn build_per_unit_located(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
+    walk_per_unit(source_map, name, src, true)
 }
 
 /// M15 S1b: check every unit **per-unit** (see [`build_per_unit`] for the shared walk). This is the
 /// check-only projection: it discards the per-unit MIR and returns just the summaries + dependency
 /// hashes + diagnostics (the S1b dev-verb contract).
 pub fn check_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitCheck {
-    let walk = walk_per_unit(source_map, name, src);
+    let walk = walk_per_unit(source_map, name, src, false);
     let summaries = walk.units.into_iter().map(|u| u.summary).collect();
     PerUnitCheck { summaries, dep_interface_hashes: walk.dep_interface_hashes, diags: walk.diags }
 }
@@ -524,6 +555,13 @@ pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
 /// keeps every function `internal` and drops declares, so the default object stays byte-identical.
 pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
     align_mir::lower_program_per_unit(hir)
+}
+
+/// M15 S2b per-unit lowering **with source locations** — [`lower_to_mir_per_unit`] plus populated
+/// `Block::stmt_lines` (`align_mir::lower_program_per_unit_located`). Used by `explain-opt`, which
+/// compiles each unit in isolation and needs the debug locations for LLVM's per-unit remarks.
+pub fn lower_to_mir_per_unit_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
+    align_mir::lower_program_per_unit_located(hir, source_map)
 }
 
 /// Lower to MIR with source locations (each statement records the line/col it came from), for
