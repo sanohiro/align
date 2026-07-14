@@ -270,7 +270,9 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
     build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
     if let Some(rt) = rt_module {
-        link_in_rt_lto(&module, rt)?;
+        // On a datalayout mismatch `link_in_rt_lto` falls back on its own (loud diagnostic, guarded
+        // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
+        link_in_rt_lto(&ctx, &module, rt)?;
     }
     // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
@@ -328,7 +330,7 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
     build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
     if let Some(rt) = rt_module {
-        link_in_rt_lto(&module, rt)?;
+        link_in_rt_lto(&ctx, &module, rt)?;
     }
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
@@ -3339,18 +3341,47 @@ fn parse_rt_lto_module<'c>(ctx: &'c Context, bitcode: &[u8]) -> Result<Module<'c
 }
 
 /// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
-/// merged bodies (M14 Slice 2). Steps: (1) match the incoming module's triple/datalayout to the
-/// program's so `link_in_module` never warns/refuses on a mismatch; (2) `link_in_module` (the
-/// definitions replace the program's external `align_rt_*` declares); (3) for every `align_rt_*`
-/// function that now has a body, shed its `rt_contract` attrs ([`shed_rt_contract_attrs`]) and set
-/// it `internal` DIRECTLY (never the internalize pass — the `{main} ∪ --export` roots model stays
-/// untouched, and no runtime symbol is externally defined, so there is no duplicate-external vs the
-/// `.a` at final link); (4) `verify` the merged module. Runs on the RAW module, BEFORE the single
-/// `run_opt_pipeline` — never a second opt run (the probe's double-opt is what regressed `str_cmp`).
-fn link_in_rt_lto<'c>(module: &Module<'c>, rt: Module<'c>) -> Result<(), CodegenError> {
-    // (1) Match target so the linker never complains about a triple/datalayout mismatch.
+/// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
+/// the program's — a mismatch means blindly overwriting it (the old unconditional
+/// `rt.set_data_layout`) would silently relayout the runtime's types/offsets to a target it was not
+/// baked for, a latent miscompile; instead this falls back exactly like an unparseable artifact
+/// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
+/// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
+/// datalayout too (now known equal); (2) `link_in_module` (the definitions replace the program's
+/// external `align_rt_*` declares); (3) for every `align_rt_*` function that now has a body, shed its
+/// `rt_contract` attrs ([`shed_rt_contract_attrs`]) and set it `internal` DIRECTLY (never the
+/// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
+/// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
+/// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
+/// run (the probe's double-opt is what regressed `str_cmp`).
+///
+/// On the datalayout-mismatch fallback (step 0), no merge happens and this re-curates the guarded
+/// declares itself (`apply_rt_contract_attrs(ctx, module, false)`) before returning `Ok(())` — the
+/// caller passed `rt_lto_skip_guarded = true` to `build_module` on the strength of the bitcode merely
+/// parsing, so without this the guarded declares would be left permanently un-curated.
+fn link_in_rt_lto<'c>(ctx: &'c Context, module: &Module<'c>, rt: Module<'c>) -> Result<(), CodegenError> {
+    // (0) A parsed-but-wrong-target artifact is the same class of compiler build defect as an
+    // unparseable one — fail loud, fall back, never force a mismatched layout onto the runtime's IR.
+    // Compared via a bool first (rather than holding the `Ref<DataLayout>` borrows across the branch
+    // below) so `rt`'s data-layout `RefCell` is free again before `rt.set_data_layout` needs it
+    // mutably on the match path.
+    let want = module.get_data_layout();
+    let matches = rt.get_data_layout().as_str() == want.as_str();
+    if !matches {
+        eprintln!(
+            "alignc: --rt-lto disabled: baked runtime bitcode datalayout ({:?}) does not match the \
+             program's ({:?}); falling back to the runtime staticlib. This is a compiler build \
+             defect, not a problem with your program.",
+            rt.get_data_layout().as_str(),
+            want.as_str()
+        );
+        apply_rt_contract_attrs(ctx, module, false);
+        return Ok(());
+    }
+    // (1) Match target so the linker never complains about a triple mismatch (cosmetic — datalayout
+    // is already confirmed equal above).
     rt.set_triple(&module.get_triple());
-    rt.set_data_layout(&module.get_data_layout());
+    rt.set_data_layout(&want);
     // (2) Merge. On success `rt` is consumed; its `align_rt_*` definitions override the program's
     // external declares of the same name.
     module

@@ -267,3 +267,90 @@ fn gate6_off_path_unchanged_by_flag() {
         "flag-off raw IR must NOT contain a merged align_rt_str_eq body:\n{off_raw}"
     );
 }
+
+// -- Gate 7: unparseable bitcode falls back and re-annotates the guarded declares ----------------
+
+#[test]
+fn gate7_unparseable_bitcode_falls_back_and_reannotates() {
+    if !backend() {
+        return;
+    }
+    // Goes straight through `align_codegen_llvm::emit_llvm_ir` (not the driver's bool-flag wrapper,
+    // which can only pass the real baked bitcode) so an unparseable `Some(bytes)` can reach the
+    // probe-then-annotate seam directly.
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "eq_fallback", EQ_KERNEL);
+    assert!(
+        !checked.diags.has_errors(),
+        "kernel failed to compile:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let exports: Vec<String> = vec!["eq_count".to_string()];
+    let out = align_codegen_llvm::emit_llvm_ir(&mir, &BuildTarget::Baseline, false, &exports, Some(b"not bitcode"))
+        .expect("unparseable --rt-lto bitcode must fall back, not error");
+    // The merge did not happen: the runtime symbol stays an opaque declare, not a define.
+    let decl = out
+        .lines()
+        .find(|l| l.starts_with("declare") && l.contains("@align_rt_str_eq"))
+        .unwrap_or_else(|| panic!("no declare for align_rt_str_eq after the fallback:\n{out}"));
+    assert!(
+        !out.lines().any(|l| l.starts_with("define") && l.contains("@align_rt_str_eq")),
+        "the fallback must not leave a merged align_rt_str_eq body:\n{out}"
+    );
+    // The fallback re-curates the guarded declare's contract attrs — same as the flag-off path.
+    assert!(
+        decl.contains("readonly captures(none)"),
+        "the fallback declare must be re-annotated with the curated `readonly captures(none)` params: {decl}"
+    );
+}
+
+// -- CLI: --rt-lto flag-surface rejections (subprocess, real binary; convention per
+// -- `build_profiles.rs`'s `bad_profile_is_a_diagnostic_not_a_panic`) ----------------------------
+
+const HELLO: &str = "fn main() -> i32 {\n  print(\"hello, align\")\n  return 0\n}\n";
+
+/// Write `body` to a fresh temp `.align` file tagged by `tag` (kept distinct across parallel test
+/// threads by the process id), returning its path.
+fn write_cli_src(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("align-rtlto-cli-{}-{}.align", std::process::id(), tag));
+    std::fs::write(&path, HELLO).expect("write src");
+    path
+}
+
+#[test]
+fn cli_rt_lto_rejects_dev_profile() {
+    let src = write_cli_src("dev");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .arg("build")
+        .arg(&src)
+        .args(["--rt-lto", "--profile", "dev"])
+        .output()
+        .expect("run alignc build");
+    let _ = std::fs::remove_file(&src);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "--rt-lto + dev profile must fail:\n{err}");
+    assert!(
+        err.contains("alignc: --rt-lto is incompatible with the `dev` profile"),
+        "diagnostic must name the profile incompatibility:\n{err}"
+    );
+}
+
+#[test]
+fn cli_rt_lto_rejects_non_build_verb() {
+    let src = write_cli_src("check");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .arg("check")
+        .arg(&src)
+        .arg("--rt-lto")
+        .output()
+        .expect("run alignc check");
+    let _ = std::fs::remove_file(&src);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "--rt-lto on `check` must fail:\n{err}");
+    assert!(
+        err.contains("alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`"),
+        "diagnostic must name the valid verb set:\n{err}"
+    );
+}
+
