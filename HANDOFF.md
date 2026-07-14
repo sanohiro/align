@@ -8,7 +8,27 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (sixth update this day), **M15 S1b (consumer) SHIPPED — MERGED as
+_Last updated: 2026-07-14 (seventh update this day), **M15 S2 first stage SHIPPED — per-unit
+codegen + N-object link, MERGED as #449** (workspace **2019 green** + clippy clean;
+adversarial gate SHIP — it built a 15-type-class cross-unit ABI parity matrix, all IDENTICAL
+whole-program vs per-unit, incl. big-struct by-value, Result/Option aggregates, Move
+string/array, `out` slice, Unit return; gemini 4/4 mediums applied pre-merge). New
+`alignc build-per-unit` + `build_per_unit()`: `walk_per_unit` → per-unit sema (S1b) → new
+`lower_program_per_unit` (own fns + consumer monomorphs; `mir.imported_fns` carries imported
+`pub` signatures) → per-unit `emit_object` (new `declare_imported_fn` shares ONE `abi_map_ty`
+with `declare_fn` — declare/definition signatures structurally cannot diverge, extracted per
+the gate) → deterministic capability union → existing `link_objects`. **N=1 byte-identity is
+EXACT** (fs::read equality; key refinement: the ENTRY unit's pub fns stay internal — importing
+the entry would be a cycle, rejected by S0, and this is what makes N=1 exactly today's
+whole-program object). `--rt-lto` merges per unit; `impl_hash` upgraded to stable-printed
+location-free per-unit MIR (clone-free via new `align_mir::print::function_to_string`;
+process-deterministic, declaration-reorder-robust; closes the S1a TODO). Default paths
+untouched. Remainders → S2b: default flip + per-unit `size`/`explain-opt`/`emit-llvm`/
+`emit-obj --export`; S3: incremental cache + parallel compile. **NEW pre-existing bug found by
+the gate (open-questions):** Unit-returning `fn main()` returns a NONDETERMINISTIC exit code
+(return register left undefined by the C-entry wrapper; same binary gave 88/216/168/120/104)
+— small codegen fix queued next. Previous update: 2026-07-14 (sixth update), **M15 S1b
+(consumer) SHIPPED — MERGED as
 #447, workspace 2006 green (1969 + 37) + clippy clean** — per-unit sema consuming imported
 interface summaries; full record in the roadmap M15 S1b paragraph. Adversarial gate verdict
 SHIP-with-fixes: the render-to-source seam proven FAITHFUL (`layout(C)`/`align(N)`/field
@@ -691,10 +711,11 @@ manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targ
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
 Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
 Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
-paragraph): (a) **M15 implementation, S2 next** (S0 #444 + S1a #445 + entry gate #446 + S1b
-#447 all SHIPPED; S2 = per-unit codegen + N-object link: visibility model, capability union,
-per-unit rt-lto — slice plan + all records in the roadmap M15 section; optional small
-pre-step: the non-entry fn-value bug in `open-questions.md` Open); (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+paragraph): (a) **M15 implementation, S2b next** (S0 #444, S1a #445, #446, S1b #447, fn-value
+#448, S2-first-stage #449 all SHIPPED; S2b = flip the default build to per-unit + migrate
+`size`/`explain-opt`/`emit-llvm`/`emit-obj --export` + remove the whole-program-only path per
+the hard-cutover settlement — slice plan + records in the roadmap M15 section; small pre-step
+queued: the Unit-main nondeterministic-exit-code fix in `open-questions.md`); (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
 lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth

@@ -2352,7 +2352,17 @@ either Pure-only keys or exactly-once input-order key evaluation before that rew
 now fails closed for unknown higher-order targets, but that mechanism does not choose the language
 contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
-### By-name fn-value references fail in non-entry modules — FIXED (PR pending), 2026-07-14
+### Unit-returning `fn main()` yields a nondeterministic exit code (pre-existing, surfaced 2026-07-14)
+
+Found by the M15 S2 adversarial gate; reproduces on the untouched whole-program path, so
+pre-existing (not an S2 regression — the per-unit object is byte-identical; the garbage is a
+runtime return-register artifact). A `fn main()` with Unit return produces a different exit
+code per run of the SAME binary (observed 88/216/168/120/104 across five runs);
+`fn main() -> i32` with `return 0` is clean. Fix: the C-entry `main` wrapper must materialize
+a defined `0` return when the Align `main` returns Unit (today the return register is left
+undefined). Small codegen fix + a repeated-run determinism test (same binary N times → rc 0).
+
+### By-name fn-value references fail in non-entry modules — FIXED as #448, 2026-07-14
 
 Found by the M15 S1b adversarial gate; reproduced identically on the whole-program path that
 S1b did not touch, so pre-existing. Inside a NON-ENTRY module, referencing a same-module
