@@ -2352,7 +2352,7 @@ either Pure-only keys or exactly-once input-order key evaluation before that rew
 now fails closed for unknown higher-order targets, but that mechanism does not choose the language
 contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
-### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED (PR pending), 2026-07-14
+### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 
 Found by the M15 S2 adversarial gate; reproduced on the untouched whole-program path, so
 pre-existing (not an S2 regression — the per-unit object was byte-identical; the garbage was a

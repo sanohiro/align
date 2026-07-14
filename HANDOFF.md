@@ -27,7 +27,12 @@ untouched. Remainders → S2b: default flip + per-unit `size`/`explain-opt`/`emi
 `emit-obj --export`; S3: incremental cache + parallel compile. **NEW pre-existing bug found by
 the gate (open-questions):** Unit-returning `fn main()` returns a NONDETERMINISTIC exit code
 (return register left undefined by the C-entry wrapper; same binary gave 88/216/168/120/104)
-— small codegen fix queued next. Previous update: 2026-07-14 (sixth update), **M15 S1b
+— **FIXED the same day, MERGED as #450** (workspace **2022 green**; gemini zero findings):
+the existing Result-main wrapper mechanism generalized — a Unit `main` is renamed
+`align_main` (internal) and the C-entry wrapper emits `call void @align_main()` +
+unconditional `ret i32 0`; `-> i32` main untouched; pre-fix nondeterminism reproduced via
+stash then pinned by run-same-binary-5× determinism tests on BOTH paths + a `link_hygiene`
+IR-shape pin. Previous update: 2026-07-14 (sixth update), **M15 S1b
 (consumer) SHIPPED — MERGED as
 #447, workspace 2006 green (1969 + 37) + clippy clean** — per-unit sema consuming imported
 interface summaries; full record in the roadmap M15 S1b paragraph. Adversarial gate verdict
