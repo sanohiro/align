@@ -2685,6 +2685,50 @@ compilation (S3); consumer-side monomorphs are attributed to their template's un
 `impl_hash` partition (sound — a template-body change flips the producer's interface hash, which the
 consumer keys on).
 
+**S2b SHIPPED 2026-07-14 — default flip + full per-unit CLI surface (hard cutover, no dual path).**
+The per-unit path is now the ONLY build path; the whole-program build path and the `build-per-unit`
+dev verb are DELETED (no compat shim). Settled by a two-lens review and implemented exactly:
+- **Default flip / path merge.** `build`/`run`/`emit-obj`/`size` now go through `build_per_unit_to`
+  (per-unit walk → per-unit `emit_object` → deterministic capability union → `link_objects`). The
+  whole-program `build_to` helper and the `build-per-unit` verb are gone; `build-per-unit` is now an
+  unknown-command usage error, and it is dropped from the usage text and the `--rt-lto` valid-verb
+  list (whose rejection text no longer names it). Success message unified to `alignc: built
+  executable: <path>` (the "(per-unit, N unit(s))" variant is gone — per-unit is no longer a
+  variant). `lower_program` (whole-program lowering) SURVIVES as the primitive behind
+  `build_interface_summaries`/`emit-interface` + library tests — it is just no longer a build path.
+- **`check` STAYS whole-program** (better diagnostics: "private to module" vs a per-unit "unknown";
+  verdicts were proven identical in S1b). `check-per-unit`/`emit-interface` stay as dev verbs.
+- **`emit-llvm` + `emit-mir` per unit.** N>1 emits each unit bottom-up, each preceded by a banner
+  (`; ==== unit: <mod> ====` for LLVM, `// ==== unit: <mod> ====` for MIR); `--stage raw|optimized`
+  applies per unit (each unit optimized in isolation — the truth under zero cross-unit opt, so a
+  cross-unit `pub` call stays an opaque call while an intra-unit call inlines). N=1 = no banner,
+  byte-identical to the pre-flip output.
+- **`explain-opt` per unit, SERIALLY** (LLVM remark capture uses process-global `cl::opt`s), bottom-up,
+  one aggregated report with a per-unit `==== unit: <mod> (<file>) ====` section header when N>1;
+  N=1 = no header, byte-identical. Needed a new `lower_program_per_unit_located` (per-unit lowering
+  carrying BOTH the `exportable` bits and `stmt_lines` line plumbing), factored through the existing
+  `lower_program_impl` (no lowering-body duplication); each `PerUnitArtifact` now carries its source
+  `file` so the unit's own `DebugInfo` attributes remarks to the right basename.
+- **`emit-obj` N>1 + `--export`.** N=1 unchanged/byte-identical (`<stem>.o` or the given `[out.o]`).
+  N>1 writes one object per unit named `<module-path>.o` (e.g. `util.math` → `util.math.o`); a single
+  `[out.o]` positional with N>1 is a HARD ERROR ("one object per unit; omit the output path").
+  `--export` is ENTRY-UNIT-ONLY: validated fail-closed against the ENTRY unit's MIR and applied only
+  to the entry's `emit_object`; a name defined in a non-entry unit is a hard error naming that unit
+  and telling the user to mark it `pub` (a non-entry `pub` fn is already external — the one way to
+  export it); a name defined nowhere is the existing listed unknown-export error. Never a silent
+  no-op.
+- **Tests.** 13 new gates (`crates/align_driver/tests/per_unit_surface.rs`): N=1 object+exe identity
+  across every profile {dev,release,fast,small,tiny} (+ `--rt-lto` where legal); CLI
+  `build`/`run`/`size` byte-match a library whole-program reference + the removed verb errors;
+  `emit-obj` multi-file filenames/visibility/`--export` (applied / wrong-unit / unknown / `[out.o]`
+  rejected); `emit-llvm` banner+determinism+N=1 identity+opaque cross-unit boundary; `explain-opt`
+  per-unit sections + N=1 no-header; `size` multi-file total == the built exe's on-disk size; a
+  ≥3-unit DAG builds byte-identically twice; CLI capability union is libz-only; `--rt-lto` multi-file
+  inlines in the non-entry unit + rejections. **Workspace 2035 green, clippy clean.**
+- **Honest remainders = S3:** incremental caching + parallel unit compilation; per-unit `size`
+  breakdown / interface-file emission (out of S2b scope by settlement); the pre-existing qualified
+  cross-module fn-value bug (`map(util.dbl)`, already Open in `open-questions.md`).
+
 **Measured cross-unit aggregate follow-up (2026-07-14; directional probe, worth retaining only as
 a ThinLTO gate):** M15 creates the real non-inlined boundary that the M13 Slice-5 ABI-flattening
 deferral said could change the result, so tuple return was re-probed rather than assumed. On the

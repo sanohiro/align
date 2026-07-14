@@ -20,7 +20,7 @@ use std::process::ExitCode;
 
 use align_span::SourceMap;
 
-use crate::{check, collect_opt_remarks, format_diagnostics, lower_to_mir_located, BuildTarget, DebugInfo};
+use crate::{build_per_unit_located, collect_opt_remarks, format_diagnostics, BuildTarget, DebugInfo};
 
 /// What LLVM did to a construct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,9 +406,25 @@ fn vectorize_miss_reason(reason: &str) -> (ReasonCode, String) {
     )
 }
 
+/// The `DebugInfo` naming a unit's source file: its basename is what the remark strings — and thus
+/// the report — attribute to; the directory is its parent (or `.`).
+fn unit_debug(file_path: &str) -> DebugInfo {
+    let p = PathBuf::from(file_path);
+    let file = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| file_path.to_string());
+    let directory = p.parent().map(|d| d.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
+    DebugInfo { file, directory }
+}
+
 /// `alignc explain-opt <file> [--verbose]` — compile, capture remarks, and print the report. Exit
 /// code: `0` = compiled + report produced (missed optimizations are not errors); `1` = compile
 /// error / bad args (`docs/impl/09-explain-opt.md`).
+///
+/// M15 S2b: the program is compiled **per unit** (each unit in isolation, so a cross-unit `pub` call
+/// is an opaque boundary — exactly what the linked build produces). Units run **serially** bottom-up:
+/// LLVM's remark capture uses process-global `cl::opt`s, so two units must never capture at once. The
+/// output is one aggregated report; when the program is more than one unit each section is preceded by
+/// a per-unit header naming the unit and its file. A single-unit program has no header — byte-identical
+/// to the pre-flip whole-program report.
 pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -418,31 +434,36 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
         }
     };
     let mut sm = SourceMap::new();
-    let checked = check(&mut sm, path, &src);
-    if !checked.diags.is_empty() {
-        eprint!("{}", format_diagnostics(&sm, &checked.diags));
+    let walk = build_per_unit_located(&mut sm, path, &src);
+    if !walk.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &walk.diags));
     }
-    if checked.diags.has_errors() {
+    if walk.diags.has_errors() {
         return ExitCode::FAILURE;
     }
-    let mir = lower_to_mir_located(&checked.hir, &sm);
+    if walk.units.is_empty() {
+        eprintln!("alignc: no units to analyze");
+        return ExitCode::FAILURE;
+    }
 
-    // The DIFile that names the module: base the shown file on the input path (its basename is what
-    // the remark strings — and thus the report — carry), the directory on its parent.
-    let p = PathBuf::from(path);
-    let file = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
-    let directory = p.parent().map(|d| d.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
-    let debug = DebugInfo { file, directory };
-
-    let remarks = match collect_opt_remarks(&mir, target, &debug) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("alignc: {e}");
-            return ExitCode::FAILURE;
+    let multi = walk.units.len() > 1;
+    let mut out = String::new();
+    for unit in &walk.units {
+        let debug = unit_debug(&unit.file);
+        let remarks = match collect_opt_remarks(&unit.mir, target.clone(), &debug) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("alignc: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = Report::build(&remarks);
+        if multi {
+            let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
         }
-    };
-    let report = Report::build(&remarks);
-    print!("{}", report.render(verbose));
+        out.push_str(&report.render(verbose));
+    }
+    print!("{out}");
     ExitCode::SUCCESS
 }
 

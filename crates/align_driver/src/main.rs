@@ -27,8 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_file,
-    format_diagnostics, link_executable, link_objects, lower_to_mir, unknown_exports, BuildTarget,
-    Profile,
+    format_diagnostics, link_objects, unknown_exports, BuildTarget, PerUnitWalk, Profile,
 };
 use align_span::SourceMap;
 
@@ -69,10 +68,10 @@ fn main() -> ExitCode {
     if rt_lto {
         if !matches!(
             cmd,
-            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm") | Some("build-per-unit")
+            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm")
         ) {
             eprintln!(
-                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`/`build-per-unit` (got `{}`)",
+                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
                 cmd.unwrap_or("<none>")
             );
             return ExitCode::FAILURE;
@@ -121,10 +120,6 @@ fn main() -> ExitCode {
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
         (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto),
-        // `build-per-unit <file>` — the M15 S2 separate-compilation path: compile each unit to its
-        // own object and link the N objects. Dev surface; the default `build` stays whole-program
-        // until S2b flips it. Produces the same executable (`<stem>` in cwd).
-        (Some("build-per-unit"), Some(p)) => run_build_per_unit(p, target, profile, rt_lto),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto),
         _ => {
@@ -177,17 +172,57 @@ fn parse_rt_lto(args: &[String]) -> (bool, Vec<String>) {
     (rt_lto, rest)
 }
 
-/// Validate `exports` against the lowered `mir`: every name must match a `Function::name` in the
-/// program, or this is a hard failure listing every unknown name (never a silent no-op — a typo'd
-/// export name must not compile a wrong object with no diagnostic). Returns the failure `ExitCode`
-/// on rejection, `None` when every export resolves.
-fn check_exports(mir: &align_mir::Program, exports: &[String], path: &str) -> Option<ExitCode> {
-    let unknown = unknown_exports(mir, exports);
-    if unknown.is_empty() {
+/// Validate the `--export` roots against the **entry unit** (M15 S2b): `--export` is entry-unit-only
+/// — every root must name a function defined in the entry unit's MIR, applied only to the entry
+/// unit's object. Fail-closed, three outcomes per unresolved name:
+///   * defined in the entry unit → OK (kept external in the entry object).
+///   * defined in a *non-entry* unit → hard error naming that unit. `--export` cannot reach it; a
+///     non-entry `pub` function is already external (that is the one way to export it), so the fix is
+///     to mark it `pub`, not to `--export` it.
+///   * defined nowhere → the listed unknown-export error (a typo'd name never silently no-ops).
+///
+/// Returns the failing `ExitCode` on any rejection, `None` when every root resolves in the entry unit.
+fn check_exports_entry(walk: &PerUnitWalk, exports: &[String], path: &str) -> Option<ExitCode> {
+    if exports.is_empty() {
         return None;
     }
-    eprintln!("alignc: unknown export(s): {} (not defined in {path})", unknown.join(", "));
-    Some(ExitCode::FAILURE)
+    let Some(entry) = walk.units.iter().find(|u| u.is_entry) else {
+        // A clean walk always compiles its entry, so this is unreachable after `walk_or_report`;
+        // fail closed rather than silently drop the exports if it ever is not.
+        eprintln!("alignc: cannot apply --export: no entry unit was compiled");
+        return Some(ExitCode::FAILURE);
+    };
+    let not_in_entry = unknown_exports(&entry.mir, exports);
+    if not_in_entry.is_empty() {
+        return None;
+    }
+    // A non-entry unit `u` mangles its functions `u$name`; match the source name against that suffix
+    // (or the bare name defensively) to tell "defined in another unit" apart from "defined nowhere".
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut rejected = false;
+    for name in not_in_entry {
+        let suffix = format!("${name}");
+        if let Some(u) = walk
+            .units
+            .iter()
+            .find(|u| !u.is_entry && u.mir.fns.iter().any(|f| f.name == name || f.name.ends_with(&suffix)))
+        {
+            rejected = true;
+            eprintln!(
+                "alignc: --export '{name}' names a function defined in unit '{u}', not the entry unit; \
+                 --export applies only to the entry unit. Mark it `pub` in `{u}` to export it \
+                 (a non-entry `pub` function already has external linkage).",
+                u = u.unit
+            );
+        } else {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        eprintln!("alignc: unknown export(s): {} (not defined in {path})", unknown.join(", "));
+        rejected = true;
+    }
+    rejected.then_some(ExitCode::FAILURE)
 }
 
 /// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
@@ -265,7 +300,6 @@ fn usage() {
            explain-opt report what the -O2 optimizer did to the data path (--verbose for detail)\n  \
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
-           build-per-unit  build an executable via per-unit separate compilation (M15 S2)\n  \
            run        build and run (returns the exit code)\n  \
            size       build then report the executable's size breakdown\n  \
          \n\
@@ -290,18 +324,25 @@ fn read(path: &str) -> Option<String> {
     }
 }
 
-/// check -> MIR. On error, print diagnostics and return `None`.
-fn front_to_mir(path: &str) -> Option<align_mir::Program> {
+/// Run the per-unit walk for `path` (front end → per-unit sema → per-unit MIR, bottom-up over the
+/// import DAG), printing any diagnostics. Returns the walk on success (at least one unit), or `None`
+/// on a read/parse/check error (diagnostics already emitted). This is the shared front half of every
+/// codegen verb (`build`/`run`/`size`/`emit-obj`/`emit-llvm`/`emit-mir`) after the M15 S2b flip.
+fn walk_or_report(path: &str) -> Option<PerUnitWalk> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
-    let checked = check(&mut sm, path, &src);
-    if !checked.diags.is_empty() {
-        eprint!("{}", format_diagnostics(&sm, &checked.diags));
+    let walk = build_per_unit(&mut sm, path, &src);
+    if !walk.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &walk.diags));
     }
-    if checked.diags.has_errors() {
+    if walk.diags.has_errors() {
         return None;
     }
-    Some(lower_to_mir(&checked.hir))
+    if walk.units.is_empty() {
+        eprintln!("alignc: no units to build");
+        return None;
+    }
+    Some(walk)
 }
 
 /// `fmt <file> [--write]` — format the source. Without `--write`, print the formatted text to
@@ -418,13 +459,22 @@ fn run_emit_interface(path: &str) -> ExitCode {
 }
 
 fn run_emit_mir(path: &str) -> ExitCode {
-    match front_to_mir(path) {
-        Some(mir) => {
-            print!("{}", align_mir::print::program_to_string(&mir));
-            ExitCode::SUCCESS
+    let Some(walk) = walk_or_report(path) else {
+        return ExitCode::FAILURE;
+    };
+    // Per unit, bottom-up. N=1 prints exactly the single unit's MIR (byte-identical to the pre-flip
+    // whole-program dump — a single-file program's per-unit MIR equals its whole-program MIR). N>1
+    // precedes each unit with a banner comment so the units are distinguishable in one stream.
+    let multi = walk.units.len() > 1;
+    let mut out = String::new();
+    for unit in &walk.units {
+        if multi {
+            out.push_str(&format!("// ==== unit: {} ====\n", unit.unit));
         }
-        None => ExitCode::FAILURE,
+        out.push_str(&align_mir::print::program_to_string(&unit.mir));
     }
+    print!("{out}");
+    ExitCode::SUCCESS
 }
 
 fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[String], rt_lto: bool) -> ExitCode {
@@ -438,22 +488,34 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[St
             return ExitCode::FAILURE;
         }
     };
-    let Some(mir) = front_to_mir(path) else {
+    let Some(walk) = walk_or_report(path) else {
         return ExitCode::FAILURE;
     };
-    if let Some(code) = check_exports(&mir, exports, path) {
+    // `--export` is entry-unit-only (validated against the entry unit's MIR; applied only to it).
+    if let Some(code) = check_exports_entry(&walk, exports, path) {
         return code;
     }
-    match emit_llvm_ir(&mir, target, optimized, exports, rt_lto) {
-        Ok(ir) => {
-            print!("{ir}");
-            ExitCode::SUCCESS
+    // Each unit is optimized in isolation (that is the truth under zero cross-unit optimization): a
+    // cross-unit `pub` call stays an opaque call, while an intra-unit call inlines. N=1 = byte-
+    // identical to the pre-flip whole-program IR; N>1 banners each unit.
+    let multi = walk.units.len() > 1;
+    let mut out = String::new();
+    for unit in &walk.units {
+        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
+        let ir = match emit_llvm_ir(&unit.mir, target.clone(), optimized, unit_exports, rt_lto) {
+            Ok(ir) => ir,
+            Err(e) => {
+                eprintln!("alignc: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if multi {
+            out.push_str(&format!("; ==== unit: {} ====\n", unit.unit));
         }
-        Err(e) => {
-            eprintln!("alignc: {e}");
-            ExitCode::FAILURE
-        }
+        out.push_str(&ir);
     }
+    print!("{out}");
+    ExitCode::SUCCESS
 }
 
 /// Parse `--stage raw|optimized` (or `--stage=…`) out of the trailing `emit-llvm` args. Returns
@@ -487,23 +549,50 @@ fn parse_stage(rest: &[String]) -> Result<bool, String> {
 }
 
 fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> ExitCode {
-    let Some(mir) = front_to_mir(path) else {
+    let Some(walk) = walk_or_report(path) else {
         return ExitCode::FAILURE;
     };
-    if let Some(code) = check_exports(&mir, exports, path) {
+    // `--export` is entry-unit-only (validated against the entry unit's MIR; applied only to it).
+    if let Some(code) = check_exports_entry(&walk, exports, path) {
         return code;
     }
-    let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
-    match emit_object_file(&mir, &obj, target, profile, exports, rt_lto) {
-        Ok(()) => {
-            println!("alignc: wrote object: {}", obj.display());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("alignc: codegen failed: {e}");
-            ExitCode::FAILURE
-        }
+    if let [unit] = walk.units.as_slice() {
+        // N=1: byte-identical to the pre-flip whole-program object — `<stem>.o` (or the given output
+        // path), with any `--export` applied to the single (entry) unit.
+        let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
+        return match emit_object_file(&unit.mir, &obj, target, profile, exports, rt_lto) {
+            Ok(()) => {
+                println!("alignc: wrote object: {}", obj.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("alignc: codegen failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
+    // N>1: one object per unit, named `<module-path>.o` in the current directory. A single `[out.o]`
+    // positional is ambiguous (it can name only one of N objects) — a hard error with guidance, never
+    // a silent pick of one unit.
+    if let Some(out) = out {
+        eprintln!(
+            "alignc: a multi-unit program emits one object per unit ('<module>.o'); \
+             omit the output path (got '{out}')"
+        );
+        return ExitCode::FAILURE;
+    }
+    for unit in &walk.units {
+        let obj = PathBuf::from(format!("{}.o", unit.unit));
+        // Exports apply only to the entry unit (a non-entry `pub` fn is already external via per-unit
+        // lowering); every other unit emits with no export roots.
+        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
+        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, unit_exports, rt_lto) {
+            eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
+            return ExitCode::FAILURE;
+        }
+        println!("alignc: wrote object: {}", obj.display());
+    }
+    ExitCode::SUCCESS
 }
 
 /// Use the source file name (without extension) as the output name.
@@ -559,27 +648,45 @@ impl Drop for ArtifactStage {
     }
 }
 
-/// Turn MIR into an object and link it into an executable. Returns the `exe` path. `profile` selects
-/// both the codegen pipeline and the link-time strip choice (one mechanism, `Profile`).
-fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool) -> Result<(), ExitCode> {
-    let object_stage = ArtifactStage::temp("align-object").map_err(|e| {
+/// Compile `path` **per unit** (walk the import DAG bottom-up, one object per unit under the
+/// separate-compilation visibility model) and link the N objects into `exe`. The one build path for
+/// `build`/`run`/`size` after the M15 S2b flip. Objects stage in a process-private directory (named
+/// by a per-unit index, not the `.`-containing module path); capability libraries are unioned
+/// deterministically first-seen across units; the executable is published to `exe` by same-directory
+/// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
+fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool) -> Result<(), ExitCode> {
+    let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
+    let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
     })?;
-    let obj = object_stage.path().join("program.o");
-    // `build`/`run`/`size` never take `--export` — they always produce a linked executable whose
-    // only linker-visible symbol is `main`, so no export roots apply here.
-    if let Err(e) = emit_object_file(mir, &obj, target, profile, &[], rt_lto) {
-        eprintln!("alignc: codegen failed: {e}");
-        return Err(ExitCode::FAILURE);
+    let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(walk.units.len());
+    // Deterministic capability union across units, first-seen order (units are bottom-up).
+    let mut link_libs: Vec<String> = Vec::new();
+    for (i, unit) in walk.units.iter().enumerate() {
+        let obj = object_stage.path().join(format!("unit{i}.o"));
+        // `build`/`run`/`size` never take `--export` (the only linker-visible definition is the
+        // entry's `main`; a unit's `pub` fns are external so cross-unit calls resolve).
+        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, &[], rt_lto) {
+            eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
+            return Err(ExitCode::FAILURE);
+        }
+        obj_paths.push(obj);
+        for lib in &unit.mir.link_libs {
+            if !link_libs.contains(lib) {
+                link_libs.push(lib.clone());
+            }
+        }
     }
+
     let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let output_stage = ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
+    let publish_stage = ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
         eprintln!("alignc: cannot create executable staging directory: {e}");
         ExitCode::FAILURE
     })?;
-    let staged_exe = output_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
-    if let Err(e) = link_executable(&obj, &staged_exe, &mir.link_libs, profile) {
+    let staged_exe = publish_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
+    let obj_refs: Vec<&Path> = obj_paths.iter().map(|p| p.as_path()).collect();
+    if let Err(e) = link_objects(&obj_refs, &staged_exe, &link_libs, profile) {
         eprintln!("alignc: {e}");
         return Err(ExitCode::FAILURE);
     }
@@ -591,11 +698,8 @@ fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarg
 }
 
 fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
-    let Some(mir) = front_to_mir(path) else {
-        return ExitCode::FAILURE;
-    };
     let exe = PathBuf::from(stem(path));
-    match build_to(path, &mir, &exe, target, profile, rt_lto) {
+    match build_per_unit_to(path, &exe, target, profile, rt_lto) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -604,82 +708,7 @@ fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) ->
     }
 }
 
-/// `alignc build-per-unit <file>` (M15 S2): compile each unit to its OWN object under the
-/// separate-compilation visibility model, then link the N objects into one executable. Capability
-/// libraries are unioned deterministically across units. The default `build` stays whole-program
-/// (byte-identical) until S2b promotes this to the sole path.
-fn run_build_per_unit(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
-    let Some(src) = read(path) else {
-        return ExitCode::FAILURE;
-    };
-    let mut sm = SourceMap::new();
-    let walk = build_per_unit(&mut sm, path, &src);
-    if !walk.diags.is_empty() {
-        eprint!("{}", format_diagnostics(&sm, &walk.diags));
-    }
-    if walk.diags.has_errors() {
-        return ExitCode::FAILURE;
-    }
-    if walk.units.is_empty() {
-        eprintln!("alignc: no units to build");
-        return ExitCode::FAILURE;
-    }
-
-    // One object per unit, emitted into a process-private staging directory. Objects are named by a
-    // per-unit index (not the module path, which may contain `.`), keeping the filenames simple.
-    let object_stage = match ArtifactStage::temp("align-per-unit-obj") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("alignc: cannot create object staging directory: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(walk.units.len());
-    // Deterministic capability union across units, first-seen order (units are bottom-up).
-    let mut link_libs: Vec<String> = Vec::new();
-    for (i, unit) in walk.units.iter().enumerate() {
-        let obj = object_stage.path().join(format!("unit{i}.o"));
-        // `build`-family commands never take `--export` (the only linker-visible definition is the
-        // entry's `main`; a unit's `pub` fns are external so cross-unit calls resolve).
-        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, &[], rt_lto) {
-            eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
-            return ExitCode::FAILURE;
-        }
-        obj_paths.push(obj);
-        for lib in &unit.mir.link_libs {
-            if !link_libs.contains(lib) {
-                link_libs.push(lib.clone());
-            }
-        }
-    }
-
-    let exe = PathBuf::from(stem(path));
-    let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let publish_stage = match ArtifactStage::in_dir(parent, "align-publish") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("alignc: cannot create executable staging directory: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let staged_exe = publish_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
-    let obj_refs: Vec<&Path> = obj_paths.iter().map(|p| p.as_path()).collect();
-    if let Err(e) = link_objects(&obj_refs, &staged_exe, &link_libs, profile) {
-        eprintln!("alignc: {e}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = std::fs::rename(&staged_exe, &exe) {
-        eprintln!("alignc: cannot publish executable {}: {e}", exe.display());
-        return ExitCode::FAILURE;
-    }
-    println!("alignc: built executable (per-unit, {} unit(s)): {}", walk.units.len(), exe.display());
-    ExitCode::SUCCESS
-}
-
 fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
-    let Some(mir) = front_to_mir(path) else {
-        return ExitCode::FAILURE;
-    };
     let stage = match ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
@@ -688,7 +717,7 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_to(path, &mir, &exe, target, profile, rt_lto) {
+    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the
