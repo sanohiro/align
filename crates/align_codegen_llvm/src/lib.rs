@@ -2939,6 +2939,32 @@ fn int_bits(ty: Ty) -> u32 {
     }
 }
 
+/// Shared param/return ABI type mapping used by both [`declare_fn`] (defines a function) and
+/// [`declare_imported_fn`] (declares an external cross-unit call target). Structs / struct-arrays /
+/// tuples / enums pass and return by value as their aggregate LLVM type; everything else falls back
+/// to `abi_type` (scalars + Option/Result/slice/str). A single shared helper means a new `Ty` variant
+/// special-cased here is special-cased for *both* callers — a declare-vs-definition LLVM signature
+/// divergence between them would be an ABI mismatch (ill-formed IR / memory corruption at the call
+/// boundary), so the two match arms must never be free to drift apart.
+fn abi_map_ty<'c>(
+    ctx: &'c Context,
+    ty: Ty,
+    struct_types: &[StructType<'c>],
+    enum_types: &[StructType<'c>],
+    tuple_types: &[StructType<'c>],
+) -> BasicTypeEnum<'c> {
+    match ty {
+        Ty::Struct(id) => struct_types[id as usize].into(),
+        Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
+        Ty::Tuple(id) => tuple_types[id as usize].into(),
+        // No array-typed params/returns arise yet (arrays coerce to slices at calls),
+        // but mirror `llvm_type` so it stays correct once array annotations land.
+        Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types).array_type(n).into(),
+        Ty::Enum(id) => enum_types[id as usize].into(),
+        _ => abi_type(ctx, ty, struct_types, enum_types),
+    }
+}
+
 // The type-table + `exports` parameters are each independently threaded through from `build_module`
 // (no natural grouping struct exists yet for "the type tables"); splitting them into a bag-of-fields
 // struct would obscure more than it clarifies for a single call site.
@@ -2953,20 +2979,7 @@ fn declare_fn<'c>(
     tuple_types: &[StructType<'c>],
     exports: &[String],
 ) -> FunctionValue<'c> {
-    // Structs / struct-arrays / tuples pass and return by value as their aggregate LLVM type
-    // (`abi_type` covers scalars + Option/Result/slice/str).
-    let map = |ty: Ty| -> BasicTypeEnum<'c> {
-        match ty {
-            Ty::Struct(id) => struct_types[id as usize].into(),
-            Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
-            Ty::Tuple(id) => tuple_types[id as usize].into(),
-            // No array-typed params/returns arise yet (arrays coerce to slices at calls),
-            // but mirror `llvm_type` so it stays correct once array annotations land.
-            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types).array_type(n).into(),
-            Ty::Enum(id) => enum_types[id as usize].into(),
-            _ => abi_type(ctx, ty, struct_types, enum_types),
-        }
-    };
+    let map = |ty: Ty| -> BasicTypeEnum<'c> { abi_map_ty(ctx, ty, struct_types, enum_types, tuple_types) };
     let param_types: Vec<BasicMetadataTypeEnum> =
         f.params.iter().map(|s| map(f.slots[*s as usize]).into()).collect();
     let fn_ty = if f.ret == Ty::Unit {
@@ -3021,16 +3034,7 @@ fn declare_imported_fn<'c>(
     enum_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
 ) -> FunctionValue<'c> {
-    let map = |ty: Ty| -> BasicTypeEnum<'c> {
-        match ty {
-            Ty::Struct(id) => struct_types[id as usize].into(),
-            Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
-            Ty::Tuple(id) => tuple_types[id as usize].into(),
-            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types).array_type(n).into(),
-            Ty::Enum(id) => enum_types[id as usize].into(),
-            _ => abi_type(ctx, ty, struct_types, enum_types),
-        }
-    };
+    let map = |ty: Ty| -> BasicTypeEnum<'c> { abi_map_ty(ctx, ty, struct_types, enum_types, tuple_types) };
     let param_types: Vec<BasicMetadataTypeEnum> = imp.params.iter().map(|&ty| map(ty).into()).collect();
     let fn_ty = if imp.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
