@@ -17,7 +17,7 @@ fn ok(src: &str) -> bool {
 #[test]
 fn a_soa_column_sum_type_checks() {
     assert!(ok(concat!(
-        "P { a: i64, b: i64, c: i64 }\n",
+        "pub P { a: i64, b: i64, c: i64 }\n",
         "pub fn col_sum(ps: soa<P>) -> i64 = ps.a.sum()\n",
     )));
 }
@@ -26,7 +26,7 @@ fn a_soa_column_sum_type_checks() {
 fn a_soa_column_feeds_a_where_map_reduce_pipeline() {
     // `ps.field` is a `slice<FieldTy>`, so the full scalar pipeline runs over the column.
     assert!(ok(concat!(
-        "P { a: i64, b: i64 }\n",
+        "pub P { a: i64, b: i64 }\n",
         "pub fn k(ps: soa<P>) -> i64 = ps.a.where(pos).map(dbl).sum()\n",
         "fn pos(x: i64) -> bool = x > 0\n",
         "fn dbl(x: i64) -> i64 = x + x\n",
@@ -36,7 +36,7 @@ fn a_soa_column_feeds_a_where_map_reduce_pipeline() {
 #[test]
 fn a_float_column_projects_too() {
     assert!(ok(concat!(
-        "Body { mass: f64, x: f64, y: f64 }\n",
+        "pub Body { mass: f64, x: f64, y: f64 }\n",
         "pub fn total_mass(b: soa<Body>) -> f64 = b.mass.sum()\n",
     )));
 }
@@ -51,13 +51,13 @@ fn soa_with_a_str_field_is_allowed() {
     // A `str` column is a 16-byte `{ptr,len}` view column (zero-copy into the decode input); the
     // soa is well-formed, and a primitive column still projects/reduces as before.
     assert!(ok(concat!(
-        "Rec { id: i64, name: str }\n",
+        "pub Rec { id: i64, name: str }\n",
         "pub fn k(r: soa<Rec>) -> i64 = r.id.sum()\n",
     )));
     // Nested/owned columns (a struct field) stay rejected — only scalars and `str`.
     assert!(!ok(concat!(
-        "Inner { a: i64 }\n",
-        "Rec { id: i64, sub: Inner }\n",
+        "pub Inner { a: i64 }\n",
+        "pub Rec { id: i64, sub: Inner }\n",
         "pub fn k(r: soa<Rec>) -> i64 = r.id.sum()\n",
     )));
 }
@@ -67,7 +67,7 @@ fn soa_with_mixed_width_fields_is_allowed() {
     // Mixed widths are fine: each column's start is padded to the field's alignment in codegen, so
     // `i8` then `i64` keeps the i64 column naturally aligned for any length.
     assert!(ok(concat!(
-        "P { tag: i8, value: i64 }\n",
+        "pub P { tag: i8, value: i64 }\n",
         "pub fn k(ps: soa<P>) -> i64 = ps.value.sum()\n",
     )));
 }
@@ -76,7 +76,7 @@ fn soa_with_mixed_width_fields_is_allowed() {
 fn a_filtered_aggregate_over_two_columns_type_checks() {
     // `where(.active)` filters by one column, `.pay` reads another — a column-spanning pipeline.
     assert!(ok(concat!(
-        "Row { active: bool, pay: i64 }\n",
+        "pub Row { active: bool, pay: i64 }\n",
         "pub fn total(rs: soa<Row>) -> i64 = rs.where(.active).pay.sum()\n",
     )));
 }
@@ -86,7 +86,7 @@ fn a_whole_struct_stage_over_soa_is_rejected() {
     // A `where(fn)` / `map(fn)` taking the whole struct would gather every column — rejected (no
     // panic); filter a field with `where(.field)` instead.
     assert!(!ok(concat!(
-        "Row { active: i64, pay: i64 }\n",
+        "pub Row { active: i64, pay: i64 }\n",
         "pub fn total(rs: soa<Row>) -> i64 = rs.where(act).pay.sum()\n",
         "fn act(r: Row) -> bool = r.active > 0\n",
     )));
@@ -95,7 +95,7 @@ fn a_whole_struct_stage_over_soa_is_rejected() {
 #[test]
 fn projecting_an_unknown_column_is_rejected() {
     assert!(!ok(concat!(
-        "P { a: i64, b: i64 }\n",
+        "pub P { a: i64, b: i64 }\n",
         "pub fn k(ps: soa<P>) -> i64 = ps.z.sum()\n",
     )));
 }
@@ -104,7 +104,7 @@ fn projecting_an_unknown_column_is_rejected() {
 fn a_soa_pipeline_must_select_a_column_first() {
     // Summing the soa itself is meaningless — a column must be chosen.
     assert!(!ok(concat!(
-        "P { a: i64, b: i64 }\n",
+        "pub P { a: i64, b: i64 }\n",
         "pub fn k(ps: soa<P>) -> i64 = ps.sum()\n",
     )));
 }
@@ -116,7 +116,7 @@ fn the_compiled_object_exports_the_kernel() {
     }
     // The kernel compiles all the way through codegen (the column projection + reduction lower).
     let src = concat!(
-        "P { a: i64, b: i64, c: i64, d: i64 }\n",
+        "pub P { a: i64, b: i64, c: i64, d: i64 }\n",
         "pub fn col_sum(ps: soa<P>) -> i64 = ps.c.sum()\n",
     );
     let mut sm = SourceMap::new();
@@ -530,25 +530,25 @@ fn group_by_non_i64_key_is_rejected() {
 fn group_by_agg_multi_type_checks() {
     // A str-key AoS array, multiple aggregates in one `.agg(...)`: keys + one i64 column per aggregate.
     assert!(ok(concat!(
-        "Row { name: str, a: i64, b: i64 }\n",
+        "pub Row { name: str, a: i64, b: i64 }\n",
         "pub fn k(xs: array<Row>) -> i64 {\n  g := xs.group_by(.name).agg(sum(.a), max(.b), count())\n  return g.1.sum()\n}\n",
     )));
 }
 
 #[test]
 fn group_by_agg_empty_is_rejected() {
-    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg().1.sum()\n"));
+    assert!(!ok("pub Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg().1.sum()\n"));
 }
 
 #[test]
 fn group_by_agg_unknown_aggregate_is_rejected() {
-    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(median(.a)).1.sum()\n"));
+    assert!(!ok("pub Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(median(.a)).1.sum()\n"));
 }
 
 #[test]
 fn group_by_agg_non_i64_value_is_rejected() {
     // `sum(.name)` over a str field — values must be i64 (first cut).
-    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(sum(.name)).1.sum()\n"));
+    assert!(!ok("pub Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(sum(.name)).1.sum()\n"));
 }
 
 #[test]
