@@ -75,6 +75,11 @@ pub struct Program {
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<hir::ExternFn>,
+    /// M15 S2 (per-unit compilation): imported `pub` functions called cross-unit but defined in
+    /// another unit's object. Codegen emits an external Align-ABI `declare` for each so a
+    /// `Rvalue::Call` keyed by the mangled `module$name` resolves at link time. **Empty in the
+    /// whole-program path** (byte-identity), populated only by per-unit lowering.
+    pub imported_fns: Vec<hir::ImportedFn>,
     /// External libraries to link (`-l<name>`), passed through from HIR; consumed by the driver.
     pub link_libs: Vec<String>,
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
@@ -104,6 +109,11 @@ pub struct Function {
     pub value_tys: Vec<Ty>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    /// M15 S2: whether this function gets `external` linkage under separate compilation (a non-entry
+    /// `pub` user function; see [`hir::Fn::exportable`]). **Always `false` from whole-program
+    /// lowering** ([`lower_program`]) so the default object is byte-identical to today; set from HIR
+    /// only by per-unit lowering ([`lower_program_per_unit`]).
+    pub exportable: bool,
 }
 
 impl Function {
@@ -1109,25 +1119,39 @@ fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
 /// Lower a whole HIR program to MIR (a normal build: no source lines — `Block::stmt_lines` stays
 /// empty).
 pub fn lower_program(program: &hir::Program) -> Program {
-    lower_program_impl(program, None)
+    lower_program_impl(program, None, false)
 }
 
 /// Lower with source locations, so each MIR statement records the (line, col) it came from. Used by
 /// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
 /// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))))
+    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), false)
+}
+
+/// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
+/// model — a non-entry `pub` user function ([`hir::Fn::exportable`]) gets `external` linkage in the
+/// object (so a dependent unit's object resolves the cross-unit call), and the unit's imported
+/// `pub` callees ([`hir::Program::imported_fns`]) are carried through as bodyless external declares.
+/// The whole-program [`lower_program`] forces every function `internal` and drops any declares, so
+/// the default object stays byte-identical to today; per-unit lowering is the only path that turns
+/// these bits on.
+pub fn lower_program_per_unit(program: &hir::Program) -> Program {
+    lower_program_impl(program, None, true)
 }
 
 // Inlined into the two thin entry points above so a normal build gains no extra call frame at the
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
-fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>) -> Program {
+fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
     let fns: Vec<Function> = program
         .fns
         .iter()
         .map(|f| {
             let mut mf = lower_fn(f, &program.tuples, &program.structs, lines.as_ref());
+            // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
+            // every function `internal` for byte-identity.
+            mf.exportable = per_unit && f.exportable;
             fuse_builder_writes(&mut mf);
             mf
         })
@@ -1143,6 +1167,9 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>) ->
     Program {
         fns,
         externs: program.externs.clone(),
+        // Cross-unit `pub` callee declares are a per-unit-only concern; the whole-program path has
+        // every callee body in `fns`, so its declare list is empty (byte-identity).
+        imported_fns: if per_unit { program.imported_fns.clone() } else { Vec::new() },
         link_libs,
         structs: program.structs.clone(),
         enums: program.enums.clone(),
@@ -1554,6 +1581,8 @@ fn lower_fn(
         value_tys: b.value_tys,
         blocks,
         entry,
+        // Set by `lower_program_impl` after this returns (needs the whole-program vs per-unit mode).
+        exportable: false,
     }
 }
 

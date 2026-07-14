@@ -582,6 +582,20 @@ fn build_module<'c>(
         let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types, exports);
         funcs.insert(f.name.clone(), fv);
     }
+    // M15 S2 (per-unit): imported `pub` functions this unit calls but does not define. Each is an
+    // external, bodyless `declare` under the same Align ABI a defining unit emits (`declare_imported_fn`
+    // mirrors `declare_fn`'s signature computation), keyed by the mangled `module$name` so a
+    // `Rvalue::Call` resolves. The linker binds it to the owning unit's exported definition. Empty in
+    // the whole-program path (every callee body is in `program.fns`), so this loop is a no-op there.
+    for imp in &program.imported_fns {
+        // A name collision with a locally-defined function would be a driver bug (a unit must not both
+        // define and import the same symbol); prefer the local definition and skip the declare.
+        if funcs.contains_key(&imp.name) {
+            continue;
+        }
+        let fv = declare_imported_fn(ctx, module, imp, &struct_types, &enum_types, &tuple_types);
+        funcs.insert(imp.name.clone(), fv);
+    }
     // A by-value struct in an `extern "C"` signature uses the SysV AMD64 register ABI, which we
     // implement for x86-64 Linux only. On any other target we refuse rather than guess a per-target
     // register rule (that is the one FFI corner a wrong rule *silently miscompiles*) — the user must
@@ -2983,9 +2997,48 @@ fn declare_fn<'c>(
     // observationally identical to keying on `f.name` for the entire non-`main` case — the export
     // roots the driver validates (`align_driver::unknown_exports`, matched against `Function::name`)
     // still name exactly what the caller wrote.
-    if symbol != "main" && !exports.iter().any(|e| e == symbol) {
+    //  - a per-unit `pub` export (M15 S2): a non-entry `pub` user function keeps `external` linkage
+    //    so a dependent unit's object can resolve the cross-unit call. `f.exportable` is set only by
+    //    per-unit lowering; the whole-program path leaves it `false`, so the default object is
+    //    byte-identical (every function but `main`/`--export` still internalizes).
+    if symbol != "main" && !exports.iter().any(|e| e == symbol) && !f.exportable {
         mark_internal(fv);
     }
+    fv
+}
+
+/// M15 S2: declare an imported `pub` function (a cross-unit call target defined in another unit's
+/// object) as an external, bodyless LLVM `declare`. The signature is computed exactly as
+/// [`declare_fn`] does for a definition (structs / struct-arrays / tuples / enums pass and return by
+/// value as their aggregate type; scalars/views via `abi_type`), so the call type matches the
+/// owning unit's definition and the linker binds them. Linkage stays external (an undefined symbol
+/// cannot be internal); `nounwind` matches the Align contract every program function carries.
+fn declare_imported_fn<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    imp: &align_sema::hir::ImportedFn,
+    struct_types: &[StructType<'c>],
+    enum_types: &[StructType<'c>],
+    tuple_types: &[StructType<'c>],
+) -> FunctionValue<'c> {
+    let map = |ty: Ty| -> BasicTypeEnum<'c> {
+        match ty {
+            Ty::Struct(id) => struct_types[id as usize].into(),
+            Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
+            Ty::Tuple(id) => tuple_types[id as usize].into(),
+            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types, enum_types).array_type(n).into(),
+            Ty::Enum(id) => enum_types[id as usize].into(),
+            _ => abi_type(ctx, ty, struct_types, enum_types),
+        }
+    };
+    let param_types: Vec<BasicMetadataTypeEnum> = imp.params.iter().map(|&ty| map(ty).into()).collect();
+    let fn_ty = if imp.ret == Ty::Unit {
+        ctx.void_type().fn_type(&param_types, false)
+    } else {
+        map(imp.ret).fn_type(&param_types, false)
+    };
+    let fv = module.add_function(&imp.name, fn_ty, None);
+    mark_nounwind(ctx, fv);
     fv
 }
 

@@ -81,6 +81,27 @@ pub struct Program {
     /// checking. A `Ty::Fn` value is a function pointer (Copy / `Static`, no environment yet —
     /// non-capturing first-class functions, slice ①).
     pub fn_types: Vec<FnTy>,
+    /// M15 S2 (per-unit compilation): imported `pub` functions this unit *calls* but whose bodies
+    /// live in another unit's object. Each is a bodyless declaration (its already-mangled
+    /// `module$name` symbol + the signature resolved into this unit's type universe); codegen emits
+    /// an external LLVM `declare` for each so a cross-unit `Rvalue::Call` resolves. **Empty in the
+    /// whole-program build path** (every callee's body is in `fns`), so the default object stays
+    /// byte-identical — populated only when checking a unit against interface-only dependencies.
+    pub imported_fns: Vec<ImportedFn>,
+}
+
+/// A cross-unit `pub` function call target (M15 S2): the callee's mangled symbol plus its
+/// signature, with no body. Codegen turns each into an external LLVM `declare` under the same
+/// Align ABI a defining unit would emit for the function, so the linker resolves the call against
+/// the unit that owns the definition. See [`Program::imported_fns`].
+#[derive(Clone, Debug)]
+pub struct ImportedFn {
+    /// The already-mangled `module$name` symbol (collision-free across units).
+    pub name: String,
+    /// Parameter types, in declaration order (this unit's `Ty` universe).
+    pub params: Vec<Ty>,
+    /// The return type; [`crate::Ty::Unit`] for a `()` return.
+    pub ret: Ty,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +192,13 @@ pub struct Fn {
     /// values are excluded (the arena bulk-frees them). Populated after move/escape analysis
     /// (MMv2 slice 4).
     pub drop_locals: Vec<LocalId>,
+    /// M15 S2: this is a non-entry, non-generic `pub` **user** function — a candidate external
+    /// symbol under separate compilation (its `module$name` mangling is globally collision-free).
+    /// The *fact* is mode-independent; whether it actually gets `external` linkage is decided at
+    /// lowering (whole-program lowering forces every function `internal` for byte-identity; per-unit
+    /// lowering honors this bit). `false` for the entry unit's functions (nothing imports the
+    /// entry), monomorphs, and lifted lambdas.
+    pub exportable: bool,
 }
 
 #[derive(Clone, Debug)]
