@@ -8,9 +8,31 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-14 (sixth update this day), **M15 S1b (consumer) IMPLEMENTED on branch
-`m15-s1b-consume-summaries` (not yet PR'd)** — per-unit sema consuming imported interface
-summaries. Seam = **summary→source→re-parse**: an imported unit's public surface is rendered back
+_Last updated: 2026-07-14 (sixth update this day), **M15 S1b (consumer) SHIPPED — MERGED as
+#447, workspace 2006 green (1969 + 37) + clippy clean** — per-unit sema consuming imported
+interface summaries; full record in the roadmap M15 S1b paragraph. Adversarial gate verdict
+SHIP-with-fixes: the render-to-source seam proven FAITHFUL (`layout(C)`/`align(N)`/field
+order/`out[i]`/Move classification/const escaping all round-trip; const "injection" content
+stays a string value; no external summary-loading surface this slice) and the whole-program
+path proven unaffected (every callee is in `program.fns` → effect-seeding loop is a no-op).
+Its one confirmed defect — a generic `pub` template body referencing a private helper:
+whole-program accepted, per-unit rejected with a leaked `<interface:…>` location — was fixed
+as a **new language rule extending #446: a generic `pub` fn's body may reference only `pub`
+items** (sema pass 0e: exhaustive expr/stmt/type/pattern walker + lexical scope stack so
+locals shadow item names; runs inside `check_program_with_effects`, so both checkers agree by
+construction; diagnostic at the real template span; match-pattern variant names deliberately
+unchecked with recorded reasoning; `draft.md` §17 + language-spec carry the rule; NO existing
+fixture used the hole). gemini applied pre-merge: parsed interface ASTs cached — each dep
+rendered with its OWN transitive closure (importer-independent → soundly cacheable), parsed
+once per walk (O(N²) → O(N)). **Pre-existing bug surfaced by the gate and recorded in
+`open-questions.md` Open:** by-name fn-value references (`map(dbl)`) fail in NON-ENTRY modules
+on the untouched whole-program path too (direct calls / `map_into` fine — likely a mangled-name
+gap in fn-value resolution). **The earlier 238/1/1 flake is now IDENTIFIED:**
+`align_runtime::tests::http_server_no_fd_leak_across_cycles`, a timing flake under load
+(recurred once during the #447 review-fix verification; passes in isolation and on rerun).
+**Next M15 step = S2 (per-unit codegen + N-object link)**; the fn-value bug is a small
+independent fix that can go first. Implementation shape of the merged slice: seam =
+**summary→source→re-parse**: an imported unit's public surface is rendered back
 to Align source (`align_interface::summary_to_source`) and re-parsed by the EXISTING parser into an
 interface-only `Module` (`Module::interface_only`), so ALL sema table-building + resolution passes
 are reused unchanged — ONE resolution path (generic templates + const values must be re-parsed
@@ -662,10 +684,10 @@ manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targ
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
 Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, the M14 LTO probe, M14
 Slice 2 `--rt-lto` #443, AND the M15 design review are all DONE — see the _Last updated_
-paragraph): (a) **M15 implementation, S1b proper next** (S0 #444 + S1a #445 + the S1b entry
-gate #446 all SHIPPED; S1b = per-unit sema consuming imported summaries, keyed on the
-TRANSITIVE imported-unit interface-hash set) — the settled slice plan S0–SV + the S1a/#446
-records are in the roadmap M15 section; (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
+paragraph): (a) **M15 implementation, S2 next** (S0 #444 + S1a #445 + entry gate #446 + S1b
+#447 all SHIPPED; S2 = per-unit codegen + N-object link: visibility model, capability union,
+per-unit rt-lto — slice plan + all records in the roadmap M15 section; optional small
+pre-step: the non-entry fn-value bug in `open-questions.md` Open); (b) **per-target-cpu runtime variant + cache key** — the `hash64` native-tuning
 lever parked on M14 Slice 2 (roadmap M14 section + doc-10 §2 key spec); (c) cache-first C0
 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth

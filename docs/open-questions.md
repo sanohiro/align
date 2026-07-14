@@ -2352,6 +2352,17 @@ either Pure-only keys or exactly-once input-order key evaluation before that rew
 now fails closed for unknown higher-order targets, but that mechanism does not choose the language
 contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
+### By-name fn-value references fail in non-entry modules (pre-existing, surfaced 2026-07-14)
+
+Found by the M15 S1b adversarial gate; reproduces identically on the whole-program path that
+S1b did not touch, so pre-existing. Inside a NON-ENTRY module, referencing a same-module
+function by bare name as a fn-value (`xs.map(dbl)` where `fn dbl` is defined beside it) fails
+with `undefined function: 'dbl'`; the entry module accepts the same code. Direct calls
+(`dbl(x)`) and out-param pipelines (`map_into`) work cross-module. Likely a mangling/lookup
+gap in the fn-value resolution path (non-entry fns are mangled `module$name`; the fn-value
+lookup probably misses the mangled form). Fix in sema resolution; add an entry-vs-non-entry
+parity test over fn-values (`map(f)` / `f` as value / passing to `par_map`).
+
 ### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15; design SETTLED 2026-07-14
 
 Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not

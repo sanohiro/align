@@ -2637,7 +2637,25 @@ byte-identical (`check_program` delegates to `check_program_with_effects` with a
 Honest remainder: per-unit summary production runs per-unit MIR lowering for capabilities only
 (capabilities are outside the interface hash, so this does not affect any S1b gate); the
 private-cross-unit-access diagnostic differs by design ("unknown" per-unit vs "private" whole-program —
-verdict identical). **S2**
+verdict identical). **MERGED as #447 (2026-07-14)** after the adversarial gate (SHIP-with-fixes)
+and gemini. The gate verified the render-to-source seam FAITHFUL end-to-end (`layout(C)`/
+`align(N)`/field order/`out[i]`/Move classification/const escaping all round-trip; const
+"injection" content stays a string value; no external summary-loading surface exists this
+slice) and proved the whole-program path unaffected (every callee is in `program.fns`, so the
+effect-seeding loop is a no-op). Its one confirmed defect (D1) drove a **new language rule
+extending #446: a generic `pub` fn's body may reference only `pub` items** — a private
+same-module fn/type/const in a template body is rejected at the definition (sema pass 0e,
+exhaustive expr/stmt/type/pattern walker with a lexical scope stack — locals shadow item
+names; runs in `check_program_with_effects`, so both checkers agree by construction; the
+`<interface:…>` synthesized-location leak is gone; match-pattern variant names deliberately
+not checked — a private-enum value cannot reach a `match` except through already-rejected
+construction/signature paths). No existing fixture used the hole. gemini's finding applied:
+parsed interface ASTs are cached — each dep is rendered with its OWN transitive closure
+(importer-independent, hence soundly cacheable) and parsed once per walk (O(N²) → O(N)).
+Final: **2006 green** (1969 + 37), clippy clean. Pre-existing bug surfaced by the gate
+(NOT S1b, reproduces on untouched whole-program `check`): a by-name fn-value reference
+(`map(dbl)`) fails with "undefined function" inside a NON-ENTRY module (direct calls and
+`map_into` work) — recorded in `open-questions.md` Open. **S2**
 per-unit codegen + N-object link
 (visibility model, capability union, per-unit rt-lto). **S3** the incremental cache per the
 doc-10 contract + parallel unit compilation + hit/miss observability. **SV** verification
