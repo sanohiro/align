@@ -25,7 +25,7 @@ use align_driver::{llvm_tool, target_object_format, BuildTarget, ObjectFormat, P
 const TOP_SYMBOLS: usize = 10;
 
 /// `alignc size <file>`: build with `profile`, then print the size breakdown of the executable.
-pub fn run_size(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
+pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
     let Some(mir) = crate::front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
@@ -39,7 +39,7 @@ pub fn run_size(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = crate::build_to(path, &mir, &exe, target, profile) {
+    if let Err(code) = crate::build_to(path, &mir, &exe, target, profile, rt_lto) {
         return code;
     }
     let res = report(&exe, profile);

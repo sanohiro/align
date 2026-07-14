@@ -142,16 +142,34 @@ pub fn collect_opt_remarks(
 /// program-function names (matched against source-level `Function::name`, validate with
 /// [`unknown_exports`] first) that keep `external` linkage instead of the default whole-program
 /// `internal`. Empty for every caller except `emit-obj`/`emit-llvm`.
-pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String]) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports).map_err(|e| e.to_string())
+/// The fast-path string-primitive bitcode (`build.rs` → `str_prims.bc`), baked into `alignc`. Passed
+/// to codegen as the `--rt-lto` artifact when `rt_lto` is set; parsing/linking it is codegen's job
+/// (`link_in_rt_lto`), with a fail-loud fallback to the runtime staticlib on an unparseable artifact.
+/// Baking dissolves the staleness question — the same `cargo build` regenerates it (M14 Slice 2).
+const RT_LTO_BITCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/str_prims.bc"));
+
+/// The baked `--rt-lto` bitcode when `rt_lto` is on, else `None` (the byte-identical flag-off path).
+fn rt_lto_bytes(rt_lto: bool) -> Option<&'static [u8]> {
+    rt_lto.then_some(RT_LTO_BITCODE)
+}
+
+/// The baked `--rt-lto` fast-path string-primitive bitcode (`build.rs` → `str_prims.bc`). Exposed
+/// read-only for the M14 Slice-2 artifact gates (the symbol-set pin: `llvm-nm` must show the guarded
+/// four as the only defined `align_rt_*` symbols) and any tooling that inspects the artifact.
+pub fn rt_lto_bitcode() -> &'static [u8] {
+    RT_LTO_BITCODE
+}
+
+pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
+    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
 /// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
 /// export-roots list as [`emit_object_file`].
-pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool, exports: &[String]) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports).map_err(|e| e.to_string())
+pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool, exports: &[String], rt_lto: bool) -> Result<String, String> {
+    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
 
 /// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).
