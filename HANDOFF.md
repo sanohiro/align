@@ -8,7 +8,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (eighth update this day), **INTRA-FRAME BORROW LIVENESS IS ENFORCED —
+_Last updated: 2026-07-15 (ninth update this day), **ESCAPE PROVENANCE CLASSIFICATION IS
+FAIL-CLOSED — MERGED as #461** (workspace **2102 green** = 2101 passed + one ignored manual
+probe; clippy `-D warnings` clean). `EscapeCheck::region_of`, local-slice provenance,
+region-bearing type classification, and recursive slice-type classification now use exhaustive
+`ExprKind` / `Ty` matches with no permissive wildcard: a new node or type is a compile error until
+its escape semantics are explicit. The dependency audit corrected the older literal-MIR placement:
+`align_mir` consumes safety-verified HIR and depends on `align_sema`, while escape regions derive
+`drop_locals`, so the ideal follow-up is a sema-owned region CFG/dataflow pass at the checked-HIR
+boundary. Gemini's one medium documentation-style finding was applied, replied to, and resolved;
+thread-aware inspection found zero unresolved threads, and the English validation comment is on the
+PR. **Next recommended soundness structural item:** build that flow-sensitive region/drop-state
+pass, including per-path owned-region/drop flags. Fully-escaping function values remain deliberately
+deferred pending a consumer and settled heap-owned environment/drop semantics. Previous update:
+2026-07-15 (eighth update this day), **INTRA-FRAME BORROW LIVENESS IS ENFORCED —
 MERGED as #460** (workspace **2102 green** = 2101 passed + one ignored manual probe; clippy
 `-D warnings` clean). `MoveCheck` now carries shared borrow provenance/invalidation flow state next
 to its move state: source moves/replacements and reallocating buffer operations invalidate

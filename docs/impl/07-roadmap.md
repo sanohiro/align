@@ -23,7 +23,7 @@ verification bundle) are complete. The workspace is 2102 green (2101 passed + on
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
-broader escape-analysis structural gate is now in place: expression provenance, local-slice
+broader escape-analysis structural gate shipped as #461: expression provenance, local-slice
 provenance, and their type classifiers are exhaustive, so a new HIR/type variant cannot silently
 fall through a permissive wildcard. **Next recommended soundness structural item:** build the
 flow-sensitive region/drop-state pass; the dependency audit keeps safety validation and drop
