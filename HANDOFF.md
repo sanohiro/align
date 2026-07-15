@@ -17,7 +17,7 @@ view `Frame`, so local use (including lifted pipeline lambdas) is accepted but r
 the hidden owner is rejected. Static-only templates fold in HIR to pooled literals with no builder
 or allocation. Six dedicated tests cover the fold, 20,000 loop iterations, JSON encode, lambda
 consumption, early `?`, and rejected escape. The complete workspace is green (**2164 total = 2163 passed + one
-ignored manual probe**). PR #473 was squash-merged as `9242c60` after Gemini feedback was applied,
+ignored manual probe**). Ready PR: **#474**. PR #473 was squash-merged as `9242c60` after Gemini feedback was applied,
 answered, resolved, and summarized. **Next recommended allocation-audit item:** borrow filesystem/
 path ABI strings and construct C strings directly. Previous update: 2026-07-15 (twenty-first update
 this day), **DEFINITE-NULL DESTRUCTOR CALLS ARE
