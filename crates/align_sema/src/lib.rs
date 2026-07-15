@@ -1022,6 +1022,13 @@ fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs))
 }
 
+/// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
+/// sema/MIR boundary predicate: free-standing owned values and Move tuples get path-local cleanup;
+/// arena-only `box`/`Task` values do not.
+pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+    is_owned_droppable(ty, structs) || ty_tuple_is_move(ty, tuples)
+}
+
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
@@ -2998,7 +3005,7 @@ pub fn check_program_with_effects(
             loop_borrow_breaks: Vec::new(),
         }
         .check();
-        let (region, drop_individual) = {
+        let (region, drop_individual, drop_individual_exprs) = {
             let mut ec = EscapeCheck {
                 f,
                 diags,
@@ -3007,6 +3014,7 @@ pub fn check_program_with_effects(
                 state: EscapeState::default(),
                 drop_region: std::collections::HashMap::new(),
                 drop_individual: std::collections::HashMap::new(),
+                drop_individual_exprs: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 task_group_regions: Vec::new(),
                 flow: EscapeFlowCfg::new(),
@@ -3014,7 +3022,7 @@ pub fn check_program_with_effects(
                 loop_exit_blocks: Vec::new(),
             };
             ec.check();
-            (ec.drop_region, ec.drop_individual)
+            (ec.drop_region, ec.drop_individual, ec.drop_individual_exprs)
         };
         // Every resource-owning local gets a path-local MIR drop flag. The flag is set after a
         // write iff that path installed an individually owned value, and cleared for arena values,
@@ -3040,6 +3048,7 @@ pub fn check_program_with_effects(
             .collect();
         f.drop_locals = drops;
         f.drop_individual_locals = individual;
+        f.drop_individual_exprs = drop_individual_exprs;
     }
     // Pass 4: refine the inferred effect bit carried by each function-value type, then enforce the
     // `par_map` Pure requirement (`draft.md` §11). Cross-unit callees take their effect from
@@ -4303,6 +4312,10 @@ struct EscapeCheck<'a> {
     /// escape Region because an owned call result is heap-owned even when its borrowed arguments
     /// conservatively shorten `region_of(Call)`.
     drop_individual: std::collections::HashMap<LocalId, bool>,
+    /// Static allocation provenance for every owned expression inspected by the flow pass. A
+    /// control-flow expression records each branch separately; MIR combines these constants with
+    /// runtime local flags at the same CFG join that combines the value.
+    drop_individual_exprs: std::collections::HashMap<Span, bool>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
     /// Region of each active `task_group`, innermost last. A spawned closure may execute as late as
@@ -4598,11 +4611,11 @@ impl<'a> EscapeCheck<'a> {
 
     /// Whether an owned expression's storage is individually released rather than arena-bulk
     /// released. This is allocation provenance, deliberately separate from borrow/escape Region.
-    fn drop_is_individual(&self, e: &Expr, depth: u32) -> bool {
-        if matches!(e.ty, Ty::DynSliceArray(_)) {
-            return true;
-        }
-        match &e.kind {
+    fn drop_is_individual(&mut self, e: &Expr, depth: u32) -> bool {
+        let individual = if matches!(e.ty, Ty::DynSliceArray(_)) {
+            true
+        } else {
+            match &e.kind {
             // A callee cannot return arena-owned storage across its function boundary, even when
             // `region_of(Call)` is shortened by an arena-borrowing argument.
             ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
@@ -4619,11 +4632,39 @@ impl<'a> EscapeCheck<'a> {
                 .value
                 .as_ref()
                 .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
+            // A value-carrying branch is statically individual only when every continuing arm is.
+            // Each arm is still recorded separately below, so MIR can select its exact constant or
+            // a moved local's runtime flag alongside the selected value.
+            ExprKind::If { then, els, .. } => {
+                let then_individual = then
+                    .value
+                    .as_ref()
+                    .is_none_or(|value| self.drop_is_individual(value, depth));
+                let else_individual = els
+                    .value
+                    .as_ref()
+                    .is_none_or(|value| self.drop_is_individual(value, depth));
+                then_individual && else_individual
+            }
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .all(|arm| self.drop_is_individual(&arm.body, depth)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
+            }
             // A Move struct's Drop releases its owned fields; borrowed fields may shorten the
             // struct's escape Region but do not change those fields' allocation provenance.
             ExprKind::StructLit { .. } if matches!(e.ty, Ty::Struct(_)) => true,
             _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
-        }
+            }
+        };
+        // The same syntax node can be replayed at more than one CFG state. Retain the conservative
+        // conjunction; runtime local moves do not consume this static entry.
+        self.drop_individual_exprs
+            .entry(e.span)
+            .and_modify(|known| *known &= individual)
+            .or_insert(individual);
+        individual
     }
 
     /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
@@ -5384,8 +5425,8 @@ impl<'a> EscapeCheck<'a> {
                 if is_owned_droppable(init.ty, self.structs)
                     || ty_tuple_is_move(init.ty, self.tuples)
                 {
-                    self.drop_individual
-                        .insert(*local, self.drop_is_individual(init, depth));
+                    let individual = self.drop_is_individual(init, depth);
+                    self.drop_individual.insert(*local, individual);
                 }
                 if self.region_bearing(init.ty) {
                     let mut r = self.region_of(init, depth);
@@ -8769,6 +8810,7 @@ impl<'a, 't> Checker<'a, 't> {
             span: f.span,
             drop_locals: Vec::new(),
             drop_individual_locals: Vec::new(),
+            drop_individual_exprs: std::collections::HashMap::new(),
             exportable: false,
         }
     }
@@ -12436,6 +12478,7 @@ impl<'a, 't> Checker<'a, 't> {
             span,
             drop_locals: Vec::new(),
             drop_individual_locals: Vec::new(),
+            drop_individual_exprs: std::collections::HashMap::new(),
             exportable: false,
         });
 

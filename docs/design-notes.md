@@ -204,6 +204,13 @@ ever); they are an analysis result, not a surface type. Restriction-as-informati
 lattice keeps the checker simple and preserves the optimizer's no-alias / contiguous /
 arena-lifetime facts.
 
+**Escape joins and cleanup joins are different facts.** A region join deliberately keeps the
+shortest lifetime any path may produce; using that conservative result to choose `free` would lose
+which path actually allocated the value. Every resource-owning slot therefore has a path-local
+individual-vs-arena bit. Value-carrying `block` / `if` / `match` / `else` / `?` lower that bit beside
+the value and select both on the same CFG edge. This keeps the one region lattice conservative for
+safety while making cleanup exact, without visible lifetime or ownership-mode syntax.
+
 **Explicit `.clone()` over a hidden copy-on-escape.** A zero-copy decoded view that needs to
 outlive its input is cloned *explicitly*; the compiler never inserts the copy silently. The
 cache-friendly fast path — borrow the input bytes, process, discard — is identical either
