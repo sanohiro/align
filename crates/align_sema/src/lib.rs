@@ -3914,9 +3914,10 @@ struct EscapeCheck<'a> {
     region: std::collections::HashMap<LocalId, Region>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
-    /// Slice locals bound to a view of *function-local* array storage (an array literal or
-    /// local array materialized in this frame). Such a slice borrows the stack frame and so
-    /// must not be returned. A slice *parameter* borrows the caller and is never in this set.
+    /// Locals whose value is, or transitively contains, a slice of *function-local* storage (an
+    /// array literal or local array materialized in this frame). Such a slice borrows the stack
+    /// frame and so must not be returned, even through an `Option` / `Result` wrapper. A slice
+    /// *parameter* borrows the caller and is never in this set.
     local_backed_slice: std::collections::HashSet<LocalId>,
     /// Region of each active `task_group`, innermost last. A spawned closure may execute as late as
     /// the group's `wait`, so every capture must outlive the innermost group even when `spawn`
@@ -3944,7 +3945,7 @@ impl<'a> EscapeCheck<'a> {
         // its dedicated message below; the region branch skips it so the diagnostic is unchanged and
         // not duplicated. An **arena-backed `bytes` view** (`fs.read_bytes_view`) is *not*
         // local-backed, so it flows to the region branch and gets the "allocated in an arena" message.
-        let local_backed = matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e);
+        let local_backed = self.mentions_slice(e.ty) && self.slice_is_local(e);
         if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
@@ -3954,8 +3955,14 @@ impl<'a> EscapeCheck<'a> {
             self.diags.error(msg.to_string(), e.span);
         }
         if local_backed {
+            let wrapped = !matches!(e.ty, Ty::Slice(_));
             self.diags.error(
-                "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
+                if wrapped {
+                    "cannot return a value containing a slice that views a local array (it is freed when the function returns)"
+                } else {
+                    "cannot return a slice that views a local array (it is freed when the function returns)"
+                }
+                .to_string(),
                 e.span,
             );
         }
@@ -3967,7 +3974,7 @@ impl<'a> EscapeCheck<'a> {
     /// with a `break`-specific message.
     fn check_break_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
-        let local_backed = matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e);
+        let local_backed = self.mentions_slice(e.ty) && self.slice_is_local(e);
         if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot `break` a view that borrows local storage out of the loop (it is dropped at the end of the iteration); use `.clone()` to break an owned value"
@@ -3977,8 +3984,14 @@ impl<'a> EscapeCheck<'a> {
             self.diags.error(msg.to_string(), e.span);
         }
         if local_backed {
+            let wrapped = !matches!(e.ty, Ty::Slice(_));
             self.diags.error(
-                "cannot `break` a slice that views a local array out of the loop (it is freed at the end of the iteration)".to_string(),
+                if wrapped {
+                    "cannot `break` a value containing a slice that views a local array out of the loop (it is freed at the end of the iteration)"
+                } else {
+                    "cannot `break` a slice that views a local array out of the loop (it is freed at the end of the iteration)"
+                }
+                .to_string(),
                 e.span,
             );
         }
@@ -4063,6 +4076,15 @@ impl<'a> EscapeCheck<'a> {
     /// [`ty_mentions_slice`] (which also covers `Ty::Struct` defensively).
     fn mentions_slice(&self, ty: Ty) -> bool {
         ty_mentions_slice(ty, self.structs, self.tuples)
+    }
+
+    /// Whether a compiler-generated local carries a slice-bearing type. Keep the lookup checked:
+    /// malformed HIR must not turn an escape-analysis diagnostic into a compiler panic.
+    fn local_mentions_slice(&self, local: LocalId) -> bool {
+        self.f
+            .locals
+            .get(local as usize)
+            .is_some_and(|l| self.mentions_slice(l.ty))
     }
 
     /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
@@ -4385,10 +4407,10 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Whether a `slice<T>`-typed expression borrows *function-local* array storage (and so
-    /// cannot be returned). An array literal / local array materializes in this frame; a
-    /// slice parameter borrows the caller (safe). A call returns a local-backed slice iff any
-    /// argument it borrows is itself local-backed (the callee can only re-borrow its args).
+    /// Whether a slice-bearing expression contains a borrow of *function-local* storage (and so
+    /// cannot be returned). An array literal / local array materializes in this frame; a slice
+    /// parameter borrows the caller (safe). Wrappers preserve this provenance, as do calls (a
+    /// callee can only re-borrow its arguments) and value-carrying control-flow expressions.
     fn slice_is_local(&self, e: &Expr) -> bool {
         match &e.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
@@ -4400,6 +4422,18 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
             ExprKind::Local(p) => self.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::CallFnValue { callee, args } => {
+                self.slice_is_local(callee) || args.iter().any(|a| self.slice_is_local(a))
+            }
+            ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner) => self.slice_is_local(inner),
+            ExprKind::ResultMapErr { result, .. } => self.slice_is_local(result),
+            ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
+            ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
+            ExprKind::StructLit { fields, .. } => fields.iter().any(|f| self.slice_is_local(f)),
+            ExprKind::Field { root, .. } => self.local_backed_slice.contains(root),
             ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
             ExprKind::If { then, els, .. } => {
                 then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
@@ -4459,7 +4493,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                     self.region.insert(*local, r);
                 }
-                if matches!(init.ty, Ty::Slice(_)) && self.slice_is_local(init) {
+                if self.mentions_slice(init.ty) && self.slice_is_local(init) {
                     self.local_backed_slice.insert(*local);
                 }
                 // A local bound to a *fixed* array (`xs := [1, 2, 3]`) owns frame storage, so any
@@ -4504,10 +4538,10 @@ impl<'a> EscapeCheck<'a> {
                 if matches!(self.region.get(local).copied(), Some(Region::Arena(_))) {
                     drop_old.set(false);
                 }
-                // Conservative without a dataflow join: a binding that is *ever* assigned a
-                // local-backed slice stays local-backed (a later branch could reach `return`
-                // while the binding still holds the local array). We never clear the flag.
-                if matches!(value.ty, Ty::Slice(_)) && self.slice_is_local(value) {
+                // Conservative without a dataflow join: a binding that is *ever* assigned a value
+                // containing a local-backed slice stays local-backed (a later branch could reach
+                // `return` while it still holds the local array). We never clear the flag.
+                if self.mentions_slice(value.ty) && self.slice_is_local(value) {
                     self.local_backed_slice.insert(*local);
                 }
                 if self.region_bearing(value.ty) {
@@ -4595,6 +4629,13 @@ impl<'a> EscapeCheck<'a> {
                     for l in locals.iter().flatten() {
                         self.decl_depth.insert(*l, depth);
                         self.region.insert(*l, r);
+                    }
+                }
+                if self.mentions_slice(init.ty) && self.slice_is_local(init) {
+                    for l in locals.iter().flatten() {
+                        if self.local_mentions_slice(*l) {
+                            self.local_backed_slice.insert(*l);
+                        }
                     }
                 }
             }
@@ -4763,6 +4804,15 @@ impl<'a> EscapeCheck<'a> {
                         for b in &a.bindings {
                             self.decl_depth.insert(*b, depth);
                             self.region.insert(*b, sr);
+                        }
+                    }
+                }
+                if self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee) {
+                    for a in arms {
+                        for b in &a.bindings {
+                            if self.local_mentions_slice(*b) {
+                                self.local_backed_slice.insert(*b);
+                            }
                         }
                     }
                 }

@@ -1944,7 +1944,19 @@ Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align
 
 **Borrow-liveness gap (recorded 2026-07-06, net Slice 2 review):** the region analysis tracks *where* a borrow may point, not *how long its source stays live* — intra-frame borrow invalidation is not modeled. A `Frame`-region borrow (`c.reader()`/`c.writer()` on a `tcp_conn`, `buffer.bytes()`, `cli.get_str`, a `str`-borrow of a `string` field) stays type-checked as usable for the rest of the frame even after its source is reassigned (`drop_old` closes/frees the underlying resource) or moved out — a use-after-close/use-after-free window the checker doesn't see. For sockets (std.net Slice 2) the consequence is sharper than for files/buffers: a reassigned `tcp_conn` frees its fd back to the kernel, so a stale reader/writer can silently read/write a **reused fd** (a different, unrelated connection) instead of merely crashing. The fix is the same borrow-liveness dataflow the escape-check → MIR-dataflow structural item above already calls for — recorded here so the socket-fd-reuse sharpening isn't lost. **Re-confirmed 2026-07-10** (std.http `get_many` gate review): `mut resp := http.parse(…)?; v := resp.body(); resp = http.parse(…)?; use(v)` passes `check` cleanly (`alignc check` → `ok`), and `array<response>` inherits the same hole one level up — `v := rs[0].body()` borrows the whole array (`rs[i]` views are region-bound to the array, not the element), so reassigning the `rs` binding itself (`rs = cl.get_many(…)?`) `drop_old`-frees every old element before the store, dangling `v`; this repro (`mut rs := cl.get_many(…)?; …; rs = cl.get_many(…)?`) also passes `check` cleanly.
 
-**Wrapper-hidden local-slice escape through a function return (found 2026-07-10, #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }` passes `check` today — a frame-local array's slice escapes the function inside a `Result`/`Option` wrapper → use-after-free. The bare form (`return xs[..]`) is rejected at function boundaries via `slice_is_local`, but that check is not wrapper-transparent. Correct fix: a wrapper-transparent local-slice check at `check_return_escape`/`check_break_escape`, mirroring `region_bearing`'s transparency. Do NOT fix it by folding frame-local slices into `region_of` (gemini's #406 suggestion): empirically proven to over-reject safe programs — a slice of an arena-local array escaping an inner arena while staying in the function gets wrongly rejected, because `Region::Frame` is folded without fixing the `arena(0)`-vs-`Static` conflation.
+**Wrapper-hidden local-slice escape through a function return — FIXED 2026-07-15 (found in the
+#406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`
+previously passed `check`: a frame-local array's slice escaped inside a `Result`/`Option` wrapper,
+creating a use-after-free. The bare form was already rejected via `slice_is_local`, but that check
+was not wrapper-transparent. The fix keeps local-storage provenance separate from `region_of` and
+makes it type-transparent at `check_return_escape` / `check_break_escape`: `Option`/`Result`, tuple,
+struct, call, and value-carrying control-flow forms recurse to their slice-bearing payloads. A local
+bound or reassigned to such a wrapper retains the provenance; tuple destructuring and `match`
+payload bindings propagate it to slice-bearing locals. This deliberately does **not** fold
+frame-local slices into `region_of`: that alternative over-rejects a safe slice of an arena-local
+array that leaves the inner arena but remains within the function because of the existing
+`arena(0)`-vs-`Static` distinction. Negative tests cover direct `Ok(xs[..])`, a wrapped local, and a
+`match` payload; a caller-provided slice wrapped in a local `Result` remains returnable.
 
 ### 2026-07-02 internal review (multi-agent: 4 deep-dive tracks + independent Opus/Codex design passes)
 
