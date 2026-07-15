@@ -118,11 +118,11 @@ count = count + 1
 
 The default is immutable.
 
-A `mut` binding's **memory region is fixed at its initialization**: reassigning it with a value from
-a different region — an `arena`-allocated value where the binding holds a heap one, or vice versa —
-is a compile error (the drop/free schedule is bound to the region, so a region change would leak or
-double-free). Reassignment within the same region is fine. Allocate the new value in the same region,
-or use a separate binding.
+A `mut` binding may hold arena-owned storage on one path and individually heap-owned storage on
+another, provided every assigned value outlives the binding's scope. The compiler tracks the
+shortest possible region for escape safety and a separate path-local ownership bit for cleanup.
+Reassignment drops an old heap value exactly once, never individually frees arena storage, and
+transfers the selected ownership bit when the value moves.
 
 A name binds **once** per scope chain: re-declaring a name already visible — in the same scope,
 or shadowing an outer binding or a parameter — is a compile error. Rebinding hides a state change
@@ -675,6 +675,23 @@ Explicit clone.
 ```align
 other := data.clone()
 ```
+
+Value-carrying control flow preserves two independent facts. The inferred **region** is a
+conservative lifetime bound used to reject escapes. An owned value also carries an internal
+path-local **cleanup bit**: set for individually owned storage, clear for arena-owned, moved, or
+uninitialized storage. A control-flow join selects that bit on the same edge that selects the value;
+it is not recomputed from the joined region.
+
+| Value form | Result region | Owned move / drop behavior |
+|---|---|---|
+| `{ ...; value }` | The trailing value's region. | Moves the trailing owned value and forwards its cleanup bit; the moved source is cleared. |
+| `if c { a } else { b }` | The shorter of the continuing arms' regions. | Each arm stores its value and cleanup bit into the join; only the selected pair reaches the consumer. |
+| `match x { ... }` | The shortest region among the continuing arm values. | A payload binding inherits `x`'s bit; each selected arm then forwards its result bit and clears any moved source. |
+| `opt else fallback` | The shorter of the `Some`/`Ok` payload and fallback regions. | `Some`/`Ok` moves the payload and clears the container; the fallback moves normally. Their bits join with the value. |
+| `result?` | The `Ok` payload's region. | `Ok` moves the payload and its bit, clearing the input; `Err` drops live individually owned locals, closes regions, and returns early. |
+
+The table is exhaustive for value-carrying control syntax. Adding another form requires choosing
+both columns and adding the corresponding regression cells.
 
 ### 6.4 Arena
 

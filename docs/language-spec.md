@@ -198,6 +198,14 @@ explicit heap
 unsafe
 ```
 
+Escape lifetime and cleanup provenance are separate inferred facts. A value-carrying block keeps
+its trailing value's region; `if` and `match` take the shortest continuing-arm region;
+`else`-unwrap takes the shorter of the payload and fallback; `?` keeps the `Ok` payload region.
+For an owned value, the same selected edge forwards a path-local bit that distinguishes individual
+heap ownership from arena ownership. Moves clear the source; scope exit drops only a live
+individually owned value. A `mut` binding may therefore change allocation region when every assigned
+value outlives its scope, without leaking heap storage or individually freeing arena storage.
+
 ### Error handling
 
 ```text

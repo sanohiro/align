@@ -19,7 +19,7 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2127 green (2126 passed + one ignored manual
+verification bundle) are complete. The workspace is 2137 green (2136 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
@@ -37,10 +37,13 @@ while diagnostics replay once in source order. Function-value effects shipped as
 `FnTy` entries carry inferred `Pure` / `Impure` / `Unknown`, mutable locals join assigned targets,
 imported summaries and FFI pointers use the same representation, and indirect consumers read the
 type bit instead of treating address-taking as a call edge. Unknown HOF parameters remain
-fail-closed. **Next recommended structural item:** record the 1:1 value-carrying-control-flow matrix
-for region composition and owned move/drop behavior, with one regression gate per cell. No
-receiver-specific borrow patch remains queued. Fully-escaping function values remain deliberately
-deferred pending a settled heap-owned environment/drop model and a consumer.
+fail-closed. The value-carrying-control-flow matrix shipped as #466: `draft.md` records region
+composition and owned move/drop behavior for block / `if` / `match` / `else`-unwrap / `?`, and the
+10-cell regression file pins both facts for every form. The audit closed four heap-leak gaps by
+carrying the selected arm's individual-vs-arena bit through the same MIR join as its value. No
+mandatory implementation slice or receiver-specific borrow patch remains queued. Fully-escaping
+function values remain deliberately deferred pending a settled heap-owned environment/drop model
+and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core

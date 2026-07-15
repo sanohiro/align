@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 use align_span::{SourceMap, Span};
 use std::rc::Rc;
 
@@ -1354,6 +1354,10 @@ struct Builder {
     /// Per-slot over-alignment, parallel to `slots` (`None` for temporaries and plain locals).
     slot_align: Vec<Option<u32>>,
     value_tys: Vec<Ty>,
+    /// Runtime ownership bit attached to a lowered SSA value. Value-carrying control flow stores a
+    /// bit beside its result slot and attaches the joined load here, so the consuming `let` /
+    /// assignment forwards the exact selected path instead of recomputing from a joined Region.
+    value_drop_flags: Vec<Option<Operand>>,
     blocks: Vec<BBuild>,
     cur: BlockId,
     /// The enclosing function's return type (so `?` can build the propagated Result).
@@ -1371,6 +1375,9 @@ struct Builder {
     /// Locals whose declaration initializer is individually owned (the initial flag value after
     /// their `let`; parameters in this set are live at entry).
     drop_individual_locals: Vec<Slot>,
+    /// Static per-expression allocation provenance produced by escape analysis. Branch lowering
+    /// combines these constants with path-local flags loaded from moved locals.
+    drop_individual_exprs: std::collections::HashMap<Span, bool>,
     /// Tuple defs — to tell whether a `Ty::Tuple` slot is a Move tuple (holds an owned element),
     /// which `null_moved_source` must null on move so its exit `Drop` doesn't double-free.
     tuples: Vec<hir::TupleDef>,
@@ -1464,7 +1471,17 @@ impl Builder {
     fn fresh_value(&mut self, ty: Ty) -> ValueId {
         let v = self.value_tys.len() as ValueId;
         self.value_tys.push(ty);
+        self.value_drop_flags.push(None);
         v
+    }
+
+    fn attach_value_drop_flag(&mut self, value: ValueId, flag: Operand) {
+        self.value_drop_flags[value as usize] = Some(flag);
+    }
+
+    fn value_drop_flag(&self, operand: &Operand) -> Option<Operand> {
+        let Operand::Value(value) = operand else { return None };
+        self.value_drop_flags.get(*value as usize).and_then(Clone::clone)
     }
 
     /// A fresh alias-scope id for a `map_into` loop — its `in`/`out` scopes are declared disjoint
@@ -1564,6 +1581,7 @@ fn lower_fn(
         slots,
         slot_align,
         value_tys: Vec::new(),
+        value_drop_flags: Vec::new(),
         blocks: Vec::new(),
         cur: 0,
         ret: f.ret,
@@ -1572,6 +1590,7 @@ fn lower_fn(
         drop_locals: f.drop_locals.clone(),
         drop_flags,
         drop_individual_locals: f.drop_individual_locals.clone(),
+        drop_individual_exprs: f.drop_individual_exprs.clone(),
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
         alias_scope: 0,
@@ -1736,7 +1755,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
 /// [`null_moved_source`] clears the source, so a destination reached after an Arena/heap join
 /// inherits the exact path's provenance instead of the escape lattice's conservative joined region.
 fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
-    match &e.kind {
+    let runtime = match &e.kind {
         hir::ExprKind::Local(id) => {
             let flag = b.drop_flags.get(*id as usize).copied().flatten()?;
             let live = b.fresh_value(Ty::Bool);
@@ -1746,8 +1765,69 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
         hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
             blk.value.as_ref().and_then(|v| moved_drop_flag(b, v))
         }
+        hir::ExprKind::OptionSome(inner)
+        | hir::ExprKind::ResultOk(inner)
+        | hir::ExprKind::ResultErr(inner)
+        | hir::ExprKind::Try(inner)
+        | hir::ExprKind::TaskGet(inner) => moved_drop_flag(b, inner),
         _ => None,
+    };
+    runtime.or_else(|| {
+        b.drop_individual_exprs
+            .get(&e.span)
+            .copied()
+            .map(|live| Operand::Const(Const::Bool(live)))
+    })
+}
+
+/// Ownership bit for a just-lowered expression. A control-flow result may already carry a joined
+/// SSA bit; otherwise a direct move loads its source local's flag, falling back to sema's static
+/// allocation provenance for a fresh producer.
+fn lowered_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Option<Operand> {
+    b.value_drop_flag(operand).or_else(|| moved_drop_flag(b, e))
+}
+
+/// Result storage for a value-carrying CFG join. Owned values get a parallel boolean slot; scalar
+/// and borrowed Copy values need only the ordinary result slot.
+fn control_result_slots(b: &mut Builder, ty: Ty) -> (Option<Slot>, Option<Slot>) {
+    if ty == Ty::Unit {
+        return (None, None);
     }
+    let value = b.new_slot(ty);
+    let flag = needs_drop_flag(ty, &b.structs, &b.tuples).then(|| b.new_slot(Ty::Bool));
+    (Some(value), flag)
+}
+
+/// Store one continuing arm into a control-flow join, including its selected allocation provenance.
+/// Read the source bit before nulling a moved local; the destination now owns that value.
+fn store_control_result(
+    b: &mut Builder,
+    value_slot: Option<Slot>,
+    flag_slot: Option<Slot>,
+    expr: &hir::Expr,
+    operand: Operand,
+) {
+    if let Some(slot) = value_slot {
+        if let Some(flag_slot) = flag_slot {
+            let flag = lowered_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+            b.push(Stmt::Store(flag_slot, flag));
+        }
+        b.push(Stmt::Store(slot, operand));
+        null_moved_source(b, expr);
+    }
+}
+
+/// Load a joined value and attach the parallel ownership bit to the SSA result for its consumer.
+fn load_control_result(b: &mut Builder, ty: Ty, value_slot: Option<Slot>, flag_slot: Option<Slot>) -> Operand {
+    let Some(value_slot) = value_slot else { return Operand::Const(Const::Unit) };
+    let value = b.fresh_value(ty);
+    b.push(Stmt::Let(value, Rvalue::Load(value_slot)));
+    if let Some(flag_slot) = flag_slot {
+        let flag = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(flag, Rvalue::Load(flag_slot)));
+        b.attach_value_drop_flag(value, Operand::Value(flag));
+    }
+    Operand::Value(value)
 }
 
 /// The slot backing an `rng` method receiver. Sema requires the receiver to be a bound **mut**
@@ -1821,7 +1901,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     if b.is_terminated() {
                         return;
                     }
-                    inherited_flag = moved_drop_flag(b, init);
+                    inherited_flag = lowered_drop_flag(b, init, &op);
                     b.push(Stmt::Store(*local, op));
                     // If the initializer moved an owned local, clear its storage and runtime flag.
                     null_moved_source(b, init);
@@ -1842,7 +1922,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if b.is_terminated() {
                 return;
             }
-            let inherited_flag = moved_drop_flag(b, value);
+            let inherited_flag = lowered_drop_flag(b, value, &op);
             if drop_old.get() && b.drop_locals.contains(local) {
                 b.emit_drop_if_live(*local);
             }
@@ -2078,7 +2158,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         hir::Stmt::LetTuple { locals, init, .. } => {
             // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
             let tup = lower_expr(b, init);
-            let inherited_flag = moved_drop_flag(b, init);
+            let inherited_flag = lowered_drop_flag(b, init, &tup);
             // If the tuple was built from owned source locals (`(x, y) := (a, b)`), null them: the
             // destructure targets now own the buffers, so the source slots must not also free them.
             null_moved_source(b, init);
@@ -7377,6 +7457,10 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
         _ => Ty::Error,
     };
     let r = lower_expr(b, inner);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
+    let inner_flag = lowered_drop_flag(b, inner, &r);
 
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
@@ -7404,6 +7488,11 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
+    if needs_drop_flag(ok_ty, &b.structs, &b.tuples)
+        && let Some(flag) = inner_flag
+    {
+        b.attach_value_drop_flag(v, flag);
+    }
     null_moved_source(b, inner);
     Operand::Value(v)
 }
@@ -7416,8 +7505,12 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     // error to a Copy scalar, so there is nothing to drop on the fallback path (a bound-local
     // scrutinee with a Move *Ok* payload is nulled below, exactly like `Option<string>`).
     let is_result = matches!(opt.ty, Ty::Result(..));
-    let result_slot = b.new_slot(ty);
+    let (result_slot, result_flag) = control_result_slots(b, ty);
     let opt_op = lower_expr(b, opt);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
+    let opt_flag = lowered_drop_flag(b, opt, &opt_op);
 
     let is_pos = b.fresh_value(Ty::Bool);
     let test = if is_result { Rvalue::ResultIsOk(opt_op.clone()) } else { Rvalue::OptionIsSome(opt_op.clone()) };
@@ -7435,7 +7528,12 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     let val = b.fresh_value(ty);
     let unwrap = if is_result { Rvalue::ResultUnwrapOk(opt_op) } else { Rvalue::OptionUnwrap(opt_op) };
     b.push(Stmt::Let(val, unwrap));
-    b.push(Stmt::Store(result_slot, Operand::Value(val)));
+    if let Some(flag_slot) = result_flag {
+        b.push(Stmt::Store(flag_slot, opt_flag.unwrap_or(Operand::Const(Const::Bool(false)))));
+    }
+    if let Some(result_slot) = result_slot {
+        b.push(Stmt::Store(result_slot, Operand::Value(val)));
+    }
     null_moved_source(b, opt);
     b.terminate(Term::Goto(join_bb));
 
@@ -7444,14 +7542,12 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     b.cur = none_bb;
     let fb = lower_expr(b, fallback);
     if !b.is_terminated() {
-        b.push(Stmt::Store(result_slot, fb));
+        store_control_result(b, result_slot, result_flag, fallback, fb);
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = join_bb;
-    let r = b.fresh_value(ty);
-    b.push(Stmt::Let(r, Rvalue::Load(result_slot)));
-    Operand::Value(r)
+    load_control_result(b, ty, result_slot, result_flag)
 }
 
 /// `match scrutinee { … }`: lower per scrutinee kind — a user `enum` (a tag-compare chain over the
@@ -7463,34 +7559,31 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         lower_expr(b, scrutinee);
         return Operand::Const(Const::Unit);
     }
-    let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
+    let (result_slot, result_flag) = control_result_slots(b, ty);
     let scrut = lower_expr(b, scrutinee);
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
     }
-    let scrut_flag = moved_drop_flag(b, scrutinee);
+    let scrut_flag = lowered_drop_flag(b, scrutinee, &scrut);
     let join_bb = b.new_block();
     match scrutinee.ty {
-        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, (result_slot, join_bb), scrutinee, scrut_flag),
-        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, (result_slot, join_bb), scrutinee, scrut_flag),
+        Ty::Enum(enum_id) => {
+            lower_match_enum(b, enum_id, arms, &scrut, (result_slot, result_flag, join_bb), scrutinee, scrut_flag)
+        }
+        Ty::Option(_) | Ty::Result(..) => {
+            lower_match_binary(b, scrutinee.ty, arms, &scrut, (result_slot, result_flag, join_bb), scrutinee, scrut_flag)
+        }
         // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
     b.cur = join_bb;
-    match result_slot {
-        Some(slot) => {
-            let v = b.fresh_value(ty);
-            b.push(Stmt::Let(v, Rvalue::Load(slot)));
-            Operand::Value(v)
-        }
-        None => Operand::Const(Const::Unit),
-    }
+    load_control_result(b, ty, result_slot, result_flag)
 }
 
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
-fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
-    let (result_slot, join_bb) = target;
+fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
+    let (result_slot, result_flag, join_bb) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -7529,7 +7622,7 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
         if !arm.bindings.is_empty() {
             null_moved_source(b, scrutinee);
         }
-        finish_arm(b, &arm.body, result_slot, join_bb);
+        finish_arm(b, &arm.body, result_slot, result_flag, join_bb);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
@@ -7537,20 +7630,20 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
     if !d.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &d.body, result_slot, join_bb);
+    finish_arm(b, &d.body, result_slot, result_flag, join_bb);
 }
 
 /// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
 /// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
 /// (matching `match_variants`); either side may be the `_` wildcard.
-fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
-    let (result_slot, join_bb) = target;
+fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
+    let (result_slot, result_flag, join_bb) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
-        finish_arm(b, &pos.body, result_slot, join_bb);
+        finish_arm(b, &pos.body, result_slot, result_flag, join_bb);
         return;
     }
     let cond = b.fresh_value(Ty::Bool);
@@ -7569,13 +7662,13 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
     if !pos.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &pos.body, result_slot, join_bb);
+    finish_arm(b, &pos.body, result_slot, result_flag, join_bb);
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
     if !neg.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &neg.body, result_slot, join_bb);
+    finish_arm(b, &neg.body, result_slot, result_flag, join_bb);
 }
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
@@ -7607,17 +7700,10 @@ fn bind_local(b: &mut Builder, local: u32, rv: Rvalue, inherited_flag: Option<Op
 }
 
 /// Lower an arm body and, unless it diverged, store the value into the result slot and jump to join.
-fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, join_bb: BlockId) {
+fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, result_flag: Option<Slot>, join_bb: BlockId) {
     let av = lower_expr(b, body);
     if !b.is_terminated() {
-        if let Some(slot) = result_slot {
-            b.push(Stmt::Store(slot, av));
-            // If the arm yields an owned local (`Ok(xs) => xs`), it moved into the match result; null
-            // that source so its exit `Drop` doesn't double-free the buffer the result now owns. (A
-            // diverging arm already returned via `lower_fn`'s own null-on-move; a `result_slot`-less
-            // (Unit) match has a Unit body, so there is never an owned local to null in that case.)
-            null_moved_source(b, body);
-        }
+        store_control_result(b, result_slot, result_flag, body, av);
         b.terminate(Term::Goto(join_bb));
     }
 }
@@ -7777,9 +7863,12 @@ fn lower_if(
     els: &hir::Block,
     ty: Ty,
 ) -> Operand {
-    let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
+    let (result_slot, result_flag) = control_result_slots(b, ty);
 
     let c = lower_expr(b, cond);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
     let then_bb = b.new_block();
     let else_bb = b.new_block();
     let join_bb = b.new_block();
@@ -7787,28 +7876,28 @@ fn lower_if(
 
     b.cur = then_bb;
     let tv = lower_block(b, then);
-    if let (Some(slot), Some(op)) = (result_slot, tv) {
-        b.push(Stmt::Store(slot, op));
+    if !b.is_terminated() {
+        if let Some(op) = tv
+            && let Some(value) = &then.value
+        {
+            store_control_result(b, result_slot, result_flag, value, op);
+        }
+        b.terminate(Term::Goto(join_bb));
     }
-    b.terminate(Term::Goto(join_bb));
 
     b.cur = else_bb;
     let ev = lower_block(b, els);
-    if let (Some(slot), Some(op)) = (result_slot, ev) {
-        b.push(Stmt::Store(slot, op));
+    if !b.is_terminated() {
+        if let Some(op) = ev
+            && let Some(value) = &els.value
+        {
+            store_control_result(b, result_slot, result_flag, value, op);
+        }
+        b.terminate(Term::Goto(join_bb));
     }
-    b.terminate(Term::Goto(join_bb));
 
     b.cur = join_bb;
-    match result_slot {
-        Some(slot) => {
-            let v = b.fresh_value(ty);
-            b.push(Stmt::Let(v, Rvalue::Load(slot)));
-            Operand::Value(v)
-        }
-        // Unit if: value is unused by the caller (statement position).
-        None => Operand::Const(Const::Bool(false)),
-    }
+    load_control_result(b, ty, result_slot, result_flag)
 }
 
 /// A short type name used in MIR text / diagnostics.

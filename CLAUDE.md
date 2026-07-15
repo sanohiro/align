@@ -60,13 +60,13 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > loop fixpoints (#462), resource-owning locals use path-local MIR drop flags (#463), and the
 > exhaustive syntax walk now lowers into a compact checked-HIR escape CFG whose shared worklist owns
 > every branch join and loop fixpoint (#464), and concrete function-value types now carry the
-> inferred three-valued effect consumed by indirect calls (#465) (workspace 2127 tests: 2126 passed
+> inferred three-valued effect consumed by indirect calls (#465) (workspace 2137 tests: 2136 passed
 > + one ignored; clippy clean). Region-changing owned
 > reassignment is therefore legal when the lifetime target check passes, without leaking or
 > double-freeing either allocation path. Escape diagnostics and provenance remain at the
-> safety-verified HIR boundary. The next recommended structural item is the 1:1 table and regression
-> matrix for region composition plus owned move/drop behavior across every value-carrying control
-> form (`block`, `if`, `match`, `else`-unwrap, and `?`). The
+> safety-verified HIR boundary. The 1:1 table and regression matrix for region composition plus
+> owned move/drop behavior across every value-carrying control form (`block`, `if`, `match`,
+> `else`-unwrap, and `?`) is complete as #466; four result-join ownership-bit gaps were fixed. The
 > recorded fd-test flake hardening (#457), qualified cross-module function values (#458), and
 > wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
 > function values remain deliberately deferred until their heap-owned environment/drop model has a

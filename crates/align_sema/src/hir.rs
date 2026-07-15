@@ -212,6 +212,10 @@ pub struct Fn {
     /// sets these locals' runtime flags after their `let`; the remaining initial values are
     /// arena-owned and leave the flag clear.
     pub drop_individual_locals: Vec<LocalId>,
+    /// Static allocation provenance for owned expressions, keyed by their source span. Control-flow
+    /// lowering uses the per-branch facts to build a runtime ownership join; direct local moves
+    /// still forward their path-local flag instead of consulting this conservative table.
+    pub drop_individual_exprs: std::collections::HashMap<Span, bool>,
     /// M15 S2: this is a non-entry, non-generic `pub` **user** function — a candidate external
     /// symbol under separate compilation (its `module$name` mangling is globally collision-free).
     /// The *fact* is mode-independent; whether it actually gets `external` linkage is decided at

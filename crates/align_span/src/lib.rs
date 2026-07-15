@@ -6,7 +6,7 @@
 pub type FileId = u32;
 
 /// Byte-offset range `[lo, hi)` within a file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
     pub file: FileId,
     pub lo: u32,
