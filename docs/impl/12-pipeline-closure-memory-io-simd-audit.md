@@ -1065,8 +1065,10 @@ initialized-before-read arena proof/gate, exact-final-destination codec fill, he
 copy-path probes, HTTP request-copy removal, and sequential SIMD stream compaction.
 The measured total-order adaptive stable-sort path and tiny unused-scratch removal are also new here.
 
-The document-11 nested scheduler deadlock and lifted/higher-order effect holes are fixed. The
-function-type effect bit remains the precision path, not a second source mechanism.
+The document-11 nested scheduler deadlock and lifted/higher-order effect holes are fixed. #465
+completed the function-type representation: concrete callables carry the inferred fact, while an
+unresolved higher-order parameter stays fail-closed rather than introducing a second source
+mechanism.
 
 ---
 

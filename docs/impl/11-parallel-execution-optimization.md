@@ -1,8 +1,9 @@
 # Parallel execution and generated-IR optimization audit
 
-Status: **RECORDED 2026-07-12; correctness P0s implemented 2026-07-13.** The lifted-closure effect
-edge and higher-order unknown-target fail-closed gate (§4), plus caller-draining nested scheduler
-progress (§5), are fixed and regression-pinned. Performance work remains open. This is the durable parallel-runtime
+Status: **RECORDED 2026-07-12; correctness P0s implemented through #465 (2026-07-15).** Function
+values now carry inferred effects in `FnTy` (with unknown HOF targets fail-closed), and the
+caller-draining nested scheduler progress fix (§5) is regression-pinned. Performance work remains
+open. This is the durable parallel-runtime
 and generated-IR companion to [`10-cache-first-optimization.md`](10-cache-first-optimization.md).
 It separates already-recorded work from new findings, records two confirmed correctness blockers,
 and gives a cache-coherence-first implementation order. Audit baseline: commit
@@ -28,8 +29,8 @@ parallel-performance wave.** Align's Pure `par_map`, value capture, ordered resu
 
 Do the work in this order:
 
-1. ~~Close the capturing-closure effect hole.~~ **FIXED 2026-07-13**, including a conservative
-   higher-order unknown-target gate until `FnTy` carries effects.
+1. ~~Close the capturing-closure effect hole and put the inferred fact in `FnTy`.~~ **FIXED through
+   #465 (2026-07-15)**, including conservative unknown higher-order targets.
 2. ~~Make `par_map` work-first and caller-draining.~~ **FIXED 2026-07-13** with a shared range
    cursor, caller drain loop, total-range completion barrier, and watchdog gate.
 3. Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
@@ -202,15 +203,13 @@ though its lifted closure is Impure.
 
 ### Shipped correction and gate
 
-- [x] Add the lifted closure function as an `EffectScan` call edge while continuing to visit captures.
-  The conservative behavior matches the existing `FnValue` rule.
-- [x] Add the capturing counterpart beside
-  `impure_fn_via_fn_value_rejected_in_par_map` in `analysis_coverage.rs`.
-- [x] Treat an indirect target whose effect is absent from `FnTy` as unknown and propagate that fact
-  separately from observable I/O; reject it only at a later Pure/`par_map` boundary. Sequential HOF
-  calls remain legal. A future function-type effect bit recovers pure-HOF precision.
-- [x] Retain direct, transitive, inline-lambda, and non-capturing function-value purity tests.
-- [x] Mutation gates: removing either the closure edge or unknown-indirect mark fails its dedicated test.
+- [x] Store the inferred effect in independent concrete `FnTy` entries; named functions, lifted
+  closures, imported summaries, mutable target joins, and FFI pointers share the representation.
+- [x] Consume the type bit at `CallFnValue` and `map_err`; address-taking alone has no effect.
+- [x] Keep a function-typed parameter with no concrete target `Unknown`, rejected only at a later
+  Pure/`par_map` boundary. Sequential HOF calls remain legal.
+- [x] Pin direct/transitive/inline callables, known-Pure indirect calls and recursion, Impure joins,
+  unused Impure values, FFI, cross-unit parity, and stable signature equality under effect mutation.
 
 No scheduler or IR optimization should widen parallel execution until this soundness hole is
 closed. The language promise is stronger than “usually race-free”: accepted Pure parallel bodies

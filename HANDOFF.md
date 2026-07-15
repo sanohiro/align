@@ -8,8 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (twelfth update this day), **ESCAPE FLOW USES A COMPACT CHECKED-HIR CFG —
-MERGED as #464** (workspace **2118 green** = 2117 passed + one ignored manual probe; clippy
+_Last updated: 2026-07-15 (thirteenth update this day), **FUNCTION-VALUE PURITY IS TYPE-BORNE —
+MERGED as #465** (workspace **2127 green** = 2126 passed + one ignored manual probe; clippy
+`-D warnings` clean). Every concrete function value and fn-typed local now has an internal
+`Pure` / `Impure` / `Unknown` effect in `FnTy`; source syntax remains `fn(T) -> R`, and signature
+equality deliberately excludes the inferred mutable bit. A least-fixpoint pass refines named
+functions, lifted closures, imported interface summaries, and FFI pointers, while mutable locals
+join all assigned targets and unresolved higher-order parameters remain fail-closed. Actual
+function-value consumers (`CallFnValue` and `map_err`) read the type bit; merely taking an Impure
+function's address is no longer falsely treated as performing its effect. Regression gates cover
+known-Pure indirect calls and recursive cycles, Impure joins, closures, FFI, cross-unit summaries,
+unknown HOFs, unused Impure values, and stable equality of independent effect cells. Gemini's one
+high finding caught derived equality comparing mutable `Cell` contents; manual signature-only
+equality fixed it, the inline thread was answered and resolved, and the English validation comment
+was posted before squash merge. **Next recommended structural item:** write the 1:1
+value-carrying-control-flow matrix (block / `if` / `match` / `else`-unwrap / `?`) for region
+composition and owned move/drop behavior, and pin every matrix cell with a regression test.
+Fully-escaping function values remain deliberately deferred pending a consumer and settled
+heap-owned environment/drop semantics. Previous update: 2026-07-15 (twelfth update this day),
+**ESCAPE FLOW USES A COMPACT CHECKED-HIR CFG — MERGED as #464** (workspace **2118 green** =
+2117 passed + one ignored manual probe; clippy
 `-D warnings` clean). `EscapeCheck` now has a construction phase and a transfer phase: the
 exhaustive HIR expression match emits compact blocks, operations, and explicit edges for `if`,
 `match`, `else`-unwrap, loop backedges, and `break`; one finite may-state worklist is the sole owner
@@ -19,10 +37,7 @@ reorder errors. Cleanup provenance from diverging paths remains retained, and sy
 terminating `break` is still checked without mutating that break edge. Two regression gates pin the
 exact break snapshot and the join across multiple reachable loop exits. Gemini reported no
 actionable findings; thread-aware inspection found zero review threads, and the English validation
-comment was posted before squash merge. **Next recommended soundness structural item:** store
-inferred purity as an effect bit on function types so named functions, fn values, closures, and FFI
-pointers share one fail-closed representation. Fully-escaping function values remain deliberately
-deferred pending a consumer and settled heap-owned environment/drop semantics. Previous update:
+comment was posted before squash merge. Previous update:
 2026-07-15 (eleventh update this day), **OWNED CLEANUP IS PATH-LOCAL — MERGED as #463** (workspace
 **2116 green** = 2115 passed + one ignored manual probe; clippy `-D warnings`
 clean). Every resource-owning local now has an internal MIR boolean drop flag, while checked HIR
@@ -432,11 +447,11 @@ Also this date, **nested parallel scheduler P0 FIXED**: `par_map` now uses a sha
 atomic range cursor, caller/helper drain loop, and total-range completion barrier. Saturated
 `task_group -> par_map` therefore makes progress with zero idle pool workers; a forced-two-worker,
 `workers + 1` task child-process gate is watchdog-bounded, and stopping each runner after one range
-reproduces the old timeout. Also this date, **parallel lifted/higher-order effect P0 FIXED**: capturing closures now
-contribute their lifted call edge, and function-value calls whose effect is absent from `FnTy`
-propagate a separate unknown effect that is rejected at Pure/`par_map` boundaries. Sequential HOF
-calls remain legal; a future function-type effect bit recovers precision. Named/capturing/higher-order
-negative gates and a sequential positive control live in `analysis_coverage.rs`. Also this date,
+reproduces the old timeout. Also this date, **parallel lifted/higher-order effect P0 FIXED**:
+capturing closures first contributed a conservative lifted call edge and unknown function-value
+calls were rejected at Pure/`par_map` boundaries. #465 later replaced the name-edge workaround with
+inferred `FnTy` effects while preserving fail-closed unknown HOF parameters and legal sequential
+calls. Named/capturing/higher-order gates live in `analysis_coverage.rs`. Also this date,
 **post-`where` callable P0 FIXED + sequential effects SETTLED**:
 reducing MIR guards every general callable suffix/reducer on rejected elements, while safe field +
 builtin `sum`/`count`/`min`/`max` suffixes retain the vectorized mask/select path. Sequential
@@ -1347,7 +1362,7 @@ literals, both post-inference classification); **#314** was a clippy sweep, 50 w
 `allow`s, and unified the runtime's byte-copy loops on `copy_nonoverlapping`. **Held/deferred** (reasons
 recorded in `docs/open-questions.md`): hot/cold field-split lint (heuristics need design), buffered
 `print` (deliberate), the then-proposed escape dataflow refactor (later corrected to checked HIR and
-completed through #461–#464) + purity-as-effect-bit (still open), relative pointers
+completed through #461–#464) + purity-as-effect-bit (completed as #465), relative pointers
 (no recursive types yet), `f16`/`bf16` (arithmetic semantics decision needed). Tests grew ~1047 → ~1103;
 clippy is clean at `-D warnings`. **Next:** continue roadmap work (M6 is now formally closed, see
 above; M8 remainders) — the queue is derived from `docs/impl/07-roadmap.md`.
@@ -1403,8 +1418,8 @@ owned-array-context (#283–#285). A **dependency-free fuzz + property suite** n
 parse-preserving), `fuzz_differential.rs` (generate-program-with-oracle differential fuzzer over
 scalars / all widths + casts / call ABI / struct+array aggregates — **no miscompile found**). `cargo
 test` ≈ 990+ green. The audit's escape-dataflow structural refactor later shipped at the corrected
-checked-HIR boundary through #461–#464; purity-as-effect-bit remains tracked **open** in
-`docs/open-questions.md`. See memory
+checked-HIR boundary through #461–#464 and purity-as-effect-bit shipped as #465; the remaining
+structural record is the value-carrying-control-flow matrix in `docs/open-questions.md`. See memory
 `fuzzing-infrastructure.md`, `audit-2026-07-02-fixes.md`, `m8-unsafe-raw-started.md`.
 
 ## Setup on the new machine

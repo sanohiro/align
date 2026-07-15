@@ -19,7 +19,7 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2118 green (2117 passed + one ignored manual
+verification bundle) are complete. The workspace is 2127 green (2126 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
@@ -33,8 +33,12 @@ ownership state across assignments, moves, destructuring, branches, loops, and c
 region-changing owned reassignment legal when its lifetime target is valid, without leaks or double
 frees. Compact checked-HIR escape CFG extraction shipped as #464: exhaustive syntax lowering emits
 explicit branch/break/loop edges, and one worklist owns all region/local-slice joins and fixpoints
-while diagnostics replay once in source order. **Next recommended soundness structural item:** store
-inferred purity as an effect bit on function types rather than a name-based propagation result. No
+while diagnostics replay once in source order. Function-value effects shipped as #465: concrete
+`FnTy` entries carry inferred `Pure` / `Impure` / `Unknown`, mutable locals join assigned targets,
+imported summaries and FFI pointers use the same representation, and indirect consumers read the
+type bit instead of treating address-taking as a call edge. Unknown HOF parameters remain
+fail-closed. **Next recommended structural item:** record the 1:1 value-carrying-control-flow matrix
+for region composition and owned move/drop behavior, with one regression gate per cell. No
 receiver-specific borrow patch remains queued. Fully-escaping function values remain deliberately
 deferred pending a settled heap-owned environment/drop model and a consumer.
 
@@ -991,7 +995,8 @@ already lives in `docs/open-questions.md`.
   ranges on a process-lifetime `ParPool`; helpers and the caller drain one shared range cursor and
   join a total-range completion barrier. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
   2026-07-12 audit found a P0 lifted-capturing-closure effect edge; **fixed 2026-07-13**, together
-  with a fail-closed higher-order unknown-target gate. The saturated `task_group -> par_map`
+  with a fail-closed higher-order unknown-target gate; #465 later moved concrete callable effects
+  into `FnTy` and removed address-taking call edges. The saturated `task_group -> par_map`
   forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A *staged*
   `par_map` (`where(p).par_map(f)`) and a capturing `par_map` still use the sequential collect loop.
   Results are identical to the sequential lowering when the Pure premise holds.
@@ -3047,7 +3052,7 @@ heap→arena paths, bypasses, loops, joined-region moves, payload bindings, call
 borrow arguments, and region-free builders. Gemini's one medium finding identified two slot-growth
 paths that failed to grow parallel flag metadata; both were fixed, the thread was answered and
 resolved, and the English validation summary was posted before squash merge. The compact CFG item
-then shipped as #464 below; purity-as-effect-bit remains the independent audit follow-up.
+then shipped as #464 below; function-type effects subsequently shipped as #465.
 
 **COMPACT ESCAPE-FLOW CFG SHIPPED — MERGED as #464 (2026-07-15; workspace 2118 green = 2117
 passed + one ignored manual probe; clippy `-D warnings` clean).** `EscapeCheck` now lowers the
@@ -3060,8 +3065,21 @@ is split before unreachable syntax so later checked statements cannot contaminat
 Regression gates cover that false-positive direction and the fail-open direction where multiple
 reachable break predecessors must join at the loop exit. Gemini reported no findings, thread-aware
 inspection found zero review threads, and the English validation comment was posted before squash
-merge. The escape-analysis CFG structural follow-up is complete; purity-as-effect-bit is the next
-recommended soundness item.
+merge. The escape-analysis CFG structural follow-up is complete.
+
+**FUNCTION-VALUE EFFECT TYPES SHIPPED — MERGED as #465 (2026-07-15; workspace 2127 green =
+2126 passed + one ignored manual probe; clippy `-D warnings` clean).** `FnTy` now stores the inferred
+three-valued effect for each concrete function value/local while source annotations and signature
+identity remain effect-free. A least-fixpoint refinement covers named functions, lifted closures,
+mutable target joins, interface-only imports, and FFI pointers; unresolved HOF parameters stay
+`Unknown`. `CallFnValue` and `ResultMapErr` consume the type bit, so unused Impure values do not
+taint a function while every actual indirect invocation stays sound. Same-signature concrete values
+have independent effect cells, including after `Pure` / `Impure` refinement. Cross-unit parity and
+recursive Pure cycles are regression-pinned. Gemini's one high finding identified unstable derived
+equality over the mutable cell; manual parameter/return equality fixed it, the inline thread was
+answered and resolved, and the English validation summary was posted before squash merge. The next
+audit structural item is the explicit value-carrying-control-flow region/move/drop matrix and its
+1:1 tests.
 
 ## Design Issues to Settle in Parallel
 

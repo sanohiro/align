@@ -270,12 +270,13 @@ total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 
 The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
 
-> **Implementation audit note (2026-07-13):** the intended function-type effect bit is not yet
-> implemented end to end. Lifted closures now contribute their call edge, and an indirect target
-> whose effect is absent from `FnTy` fails closed at a Pure/`par_map` boundary while remaining legal
-> sequentially. Ordinary sequential effects are allowed with exact guarded source order. The
-> function-type effect representation remains the path to recover known-Pure HOF precision. See
-> [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
+> **Implementation note (2026-07-15, #465):** the effect bit is implemented end to end. Concrete
+> named functions and lifted closures receive independent `FnTy` effects, mutable fn locals join
+> assigned targets, imported summaries and FFI pointers feed the same least fixpoint, and indirect
+> consumers read the stored bit. A function-typed parameter with no concrete target remains
+> `Unknown` and fails closed only at a Pure/`par_map` boundary; ordinary sequential HOF calls remain
+> legal. Source annotations still omit effects, and signature equality ignores the inferred bit.
+> See [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
 
 ---
 

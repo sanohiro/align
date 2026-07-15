@@ -59,13 +59,14 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > across HIR expressions and types (#461), its region/local-slice state joins branches and reaches
 > loop fixpoints (#462), resource-owning locals use path-local MIR drop flags (#463), and the
 > exhaustive syntax walk now lowers into a compact checked-HIR escape CFG whose shared worklist owns
-> every branch join and loop fixpoint (#464) (workspace 2118 tests: 2117 passed + one ignored; clippy
-> clean). Region-changing owned
+> every branch join and loop fixpoint (#464), and concrete function-value types now carry the
+> inferred three-valued effect consumed by indirect calls (#465) (workspace 2127 tests: 2126 passed
+> + one ignored; clippy clean). Region-changing owned
 > reassignment is therefore legal when the lifetime target check passes, without leaking or
 > double-freeing either allocation path. Escape diagnostics and provenance remain at the
-> safety-verified HIR boundary. The next recommended soundness item is recording inferred purity as
-> an effect bit on function types so fn-value, closure, and FFI-pointer indirection consume the same
-> fail-closed fact instead of relying on name-based propagation. The
+> safety-verified HIR boundary. The next recommended structural item is the 1:1 table and regression
+> matrix for region composition plus owned move/drop behavior across every value-carrying control
+> form (`block`, `if`, `match`, `else`-unwrap, and `?`). The
 > recorded fd-test flake hardening (#457), qualified cross-module function values (#458), and
 > wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
 > function values remain deliberately deferred until their heap-owned environment/drop model has a
@@ -79,6 +80,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > callables may be Impure with exact guarded source order; explicit `par_map` remains Pure-required.
 > Lifted-closure effects now propagate, and unknown higher-order targets fail closed at Pure/parallel
 > boundaries while remaining legal sequentially.
+> **2026-07-15 update (#465):** concrete function values now store that inferred fact in `FnTy`;
+> name-edge propagation is gone, while unresolved HOF parameters retain the fail-closed behavior.
 > Saturated `task_group -> par_map` now shares caller-drained range claims; a forced-worker
 > child-process watchdog pins progress with zero idle pool workers.
 > Dynamic heap/arena/SoA byte sizes now use checked LLVM arithmetic and abort before allocation on
