@@ -102,10 +102,10 @@ fn region_free_move_resource_reassign_keeps_the_new_flag_live() {
 fn owned_call_result_stays_individual_with_an_arena_borrow_argument() {
     // Escape Region conservatively follows the arena-backed argument, but the callee cannot return
     // arena storage across its function boundary. The returned string is heap-owned on both writes.
-    let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    source := template \"{1}b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
+    let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    s := \"a\"\n    source := template \"{s}b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
     let main = main_fn(&text);
     assert!(
-        main.lines().filter(|line| line.contains("_2 <- true")).count() >= 2,
+        main.lines().filter(|line| line.contains("_3 <- true")).count() >= 2,
         "owned call results must not inherit an argument's arena allocation mode:\n{main}"
     );
 }
