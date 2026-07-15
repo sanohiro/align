@@ -764,12 +764,24 @@ pub fn codegen_units_parallel(
     // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
     // reads `units`/`obj_paths`/`keys` and appends any error under a short-held lock.
     if !misses.is_empty() {
+        use std::sync::atomic::AtomicBool;
         let worker_count = jobs.max(1).min(misses.len());
         let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
         let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| loop {
+                    // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
+                    // between units — an in-progress `emit_object_file` is never interrupted. Codegen
+                    // errors are rare (sema already validated in the walk), so this mainly bounds the
+                    // wasted work when a *systemic* failure (e.g. disk full) would otherwise compile
+                    // every remaining object before the build fails. `Relaxed` is correct: the flag is
+                    // a best-effort early-exit hint that publishes no data (errors ride the Mutex, and
+                    // the final read happens-after the scope join).
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let k = next.fetch_add(1, Ordering::Relaxed);
                     if k >= misses.len() {
                         break;
@@ -778,6 +790,7 @@ pub fn codegen_units_parallel(
                     let unit = &units[i];
                     if let Err(e) = emit_object_file(&unit.mir, &obj_paths[i], target.clone(), profile, &[], rt_lto) {
                         errors.lock().expect("codegen error lock").push((i, e));
+                        failed.store(true, Ordering::Relaxed);
                         continue;
                     }
                     if let Some(key) = &keys[i] {
@@ -786,6 +799,10 @@ pub fn codegen_units_parallel(
                 });
             }
         });
+        // Deterministic report: the lowest-DAG-index error among those collected. Fail-fast may leave
+        // a higher-index unit unattempted, so in the rare case of MULTIPLE independent codegen failures
+        // the set collected is timing-dependent; the *reported* error is still the lowest index present
+        // (and such failures — e.g. disk full — carry the same cause across units anyway).
         let mut errs = errors.into_inner().expect("codegen error lock");
         if !errs.is_empty() {
             errs.sort_by_key(|(i, _)| *i);
