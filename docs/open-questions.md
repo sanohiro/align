@@ -1942,7 +1942,23 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 
 Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
 
-**Borrow-liveness gap (recorded 2026-07-06, net Slice 2 review):** the region analysis tracks *where* a borrow may point, not *how long its source stays live* — intra-frame borrow invalidation is not modeled. A `Frame`-region borrow (`c.reader()`/`c.writer()` on a `tcp_conn`, `buffer.bytes()`, `cli.get_str`, a `str`-borrow of a `string` field) stays type-checked as usable for the rest of the frame even after its source is reassigned (`drop_old` closes/frees the underlying resource) or moved out — a use-after-close/use-after-free window the checker doesn't see. For sockets (std.net Slice 2) the consequence is sharper than for files/buffers: a reassigned `tcp_conn` frees its fd back to the kernel, so a stale reader/writer can silently read/write a **reused fd** (a different, unrelated connection) instead of merely crashing. The fix is the same borrow-liveness dataflow the escape-check → MIR-dataflow structural item above already calls for — recorded here so the socket-fd-reuse sharpening isn't lost. **Re-confirmed 2026-07-10** (std.http `get_many` gate review): `mut resp := http.parse(…)?; v := resp.body(); resp = http.parse(…)?; use(v)` passes `check` cleanly (`alignc check` → `ok`), and `array<response>` inherits the same hole one level up — `v := rs[0].body()` borrows the whole array (`rs[i]` views are region-bound to the array, not the element), so reassigning the `rs` binding itself (`rs = cl.get_many(…)?`) `drop_old`-frees every old element before the store, dangling `v`; this repro (`mut rs := cl.get_many(…)?; …; rs = cl.get_many(…)?`) also passes `check` cleanly.
+**Borrow-liveness gap — FIXED (2026-07-15).** Region analysis already tracked *where* a borrow
+may point, but did not invalidate a frame-local view when its owning source generation ended. The
+result was a use-after-free/use-after-close after moving or reassigning a `string`, `buffer`, CLI
+`parsed`, `tcp_conn`, HTTP `response`, or `array<response>` source; a stale socket reader/writer was
+especially dangerous because an fd could be reused for an unrelated connection. `MoveCheck` now
+has one shared, flow-sensitive borrow state alongside its move state: borrow-producing expressions
+flatten their provenance to owner locals, every consuming/replacing operation invalidates dependent
+views, borrower reassignment establishes a fresh generation, branches join only fallthrough states,
+and loop heads compute a finite may-state fixpoint. Buffer operations that may reallocate
+(`append`, scalar `put`, and `read_line`) invalidate existing byte/string views as well. Provenance
+distinguishes a view of an owned container's slots from copied view elements in a materialized
+array/SoA, avoiding both the `rs[0].body()` hole and false invalidation when a primitive SoA has
+already copied its source. Regression coverage spans direct/chained/call/pipeline-produced views,
+aggregate fields and response arrays, branch/loop joins, re-borrowing, diverging paths, reallocating
+mutation, diagnostics, and safe materialization cases in `tests/borrow_liveness.rs`. The broader
+escape-check → MIR-dataflow structural refactor above remains open; this fix shares HIR dataflow and
+does not claim to complete that separate migration.
 
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`

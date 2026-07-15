@@ -658,6 +658,36 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
     }
 }
 
+/// Whether a value may borrow storage owned by another local. This is intentionally narrower than
+/// Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`, a
+/// borrowed reader/writer, and aggregates containing those views carry borrow provenance.
+fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+    match ty {
+        Ty::Str
+        | Ty::Slice(_)
+        | Ty::Reader
+        | Ty::Writer
+        | Ty::Soa(_)
+        | Ty::DictEncoded(..)
+        | Ty::DynSliceArray(_)
+        | Ty::Fn(_) => true,
+        Ty::Array(s, _) | Ty::DynArray(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id) => structs
+            .get(id as usize)
+            .is_some_and(|s| s.fields.iter().any(|f| ty_may_borrow(f.ty, structs, tuples))),
+        Ty::Option(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+        Ty::Result(ok, err) => {
+            ty_may_borrow(scalar_to_ty(ok), structs, tuples)
+                || ty_may_borrow(scalar_to_ty(err), structs, tuples)
+        }
+        Ty::Tuple(id) => tuples
+            .get(id as usize)
+            .is_some_and(|t| t.elems.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples))),
+        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+        _ => false,
+    }
+}
+
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
 /// `None` mode = `wrapping_*` (the default wrapping arithmetic — lowered to a plain `Binary`);
 /// `Some(_)` = `saturating_*` / `checked_*`. Returns `None` for any other method name.
@@ -2910,7 +2940,16 @@ pub fn check_program_with_effects(
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
     for f in fns.iter_mut() {
-        MoveCheck { f, diags, tuples, structs, loop_breaks: Vec::new() }.check();
+        MoveCheck {
+            f,
+            diags,
+            tuples,
+            structs,
+            loop_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            loop_borrow_breaks: Vec::new(),
+        }
+        .check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
@@ -5914,6 +5953,11 @@ struct MoveCheck<'a> {
     /// every `break` bound to that loop; their union is the move state after the loop (code past a
     /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
     loop_breaks: Vec<Vec<MovedSet>>,
+    /// Intra-frame borrow provenance and invalidation state. This shares MoveCheck's evaluation
+    /// order and control-flow joins, so every consuming position has one source of truth.
+    borrows: BorrowState,
+    /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
+    loop_borrow_breaks: Vec<Vec<BorrowState>>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -5926,6 +5970,48 @@ enum MovedKey {
 }
 
 type MovedSet = std::collections::HashSet<MovedKey>;
+
+type BorrowRoots = std::collections::BTreeSet<LocalId>;
+
+/// Flow-sensitive provenance for locals that borrow storage owned by other locals. `sources`
+/// stores the flattened owner roots of each live borrower. `invalid` records which source
+/// generation was moved, replaced, or potentially reallocated on at least one path reaching the
+/// current point.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BorrowState {
+    sources: std::collections::HashMap<LocalId, BorrowRoots>,
+    invalid: std::collections::HashMap<LocalId, BorrowRoots>,
+}
+
+impl BorrowState {
+    fn assign(&mut self, local: LocalId, roots: BorrowRoots) {
+        self.invalid.remove(&local);
+        if roots.is_empty() {
+            self.sources.remove(&local);
+        } else {
+            self.sources.insert(local, roots);
+        }
+    }
+
+    fn invalidate_owner(&mut self, owner: LocalId) {
+        for (&borrower, roots) in &self.sources {
+            if roots.contains(&owner) {
+                self.invalid.entry(borrower).or_default().insert(owner);
+            }
+        }
+    }
+
+    fn join(a: &Self, b: &Self) -> Self {
+        let mut out = a.clone();
+        for (&local, roots) in &b.sources {
+            out.sources.entry(local).or_default().extend(roots);
+        }
+        for (&local, roots) in &b.invalid {
+            out.invalid.entry(local).or_default().extend(roots);
+        }
+        out
+    }
+}
 /// A matchable type's variants: `(variant name, positional payload scalars)`, see
 /// `Sema::match_variants`.
 type VariantList = Vec<(String, Vec<Scalar>)>;
@@ -5968,21 +6054,267 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Whether a local owns bytes reachable through a view even though the local itself is not a
+    /// whole-value Move slot. Fixed arrays of owned strings/Move structs are stored in-place, but
+    /// replacing one of their owned elements or fields still frees storage borrowed by a view.
+    fn local_owns_view_storage(&self, id: LocalId) -> bool {
+        match self.f.locals.get(id as usize).map(|l| l.ty) {
+            Some(ty) if self.is_move_ty(ty) => true,
+            Some(Ty::Array(Scalar::String, _)) => true,
+            Some(Ty::StructArray(sid, _)) => struct_is_move(sid, self.structs),
+            _ => false,
+        }
+    }
+
+    fn local_may_borrow(&self, id: LocalId) -> bool {
+        self.f
+            .locals
+            .get(id as usize)
+            .is_some_and(|l| ty_may_borrow(l.ty, self.structs, self.tuples))
+    }
+
+    fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
+        let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
+        if self.local_owns_view_storage(id) {
+            roots.insert(id);
+        }
+        roots
+    }
+
+    /// Storage roots owned by `e`. A view local forwards its already-flattened provenance; a local
+    /// that owns viewable storage also contributes itself. Caller-owned slice parameters
+    /// intentionally produce no intra-frame root — this pass only invalidates storage whose
+    /// lifetime this function controls.
+    fn storage_roots(&self, e: &Expr) -> BorrowRoots {
+        match &e.kind {
+            ExprKind::Local(id) => self.local_storage_roots(*id),
+            ExprKind::Field { root, .. }
+            | ExprKind::SoaColumn { base: root, .. }
+            | ExprKind::ArrayGroupAgg { base: root, .. }
+            | ExprKind::ArrayGroupAggMulti { base: root, .. }
+            | ExprKind::ArrayDictEncode { base: root, .. }
+            | ExprKind::IndexField { base: root, .. } => self.local_storage_roots(*root),
+            ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. }
+            | ExprKind::TupleIndex { recv, .. } => self.storage_roots(recv),
+            _ => self.borrow_sources(e),
+        }
+    }
+
+    /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
+    /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
+    fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
+        if !ty_may_borrow(e.ty, self.structs, self.tuples) {
+            return BorrowRoots::new();
+        }
+        let mut roots = BorrowRoots::new();
+        if let Some(stages) = pipeline_stages(&e.kind) {
+            for capture in stage_capture_exprs(stages) {
+                roots.extend(self.borrow_sources(capture));
+            }
+        }
+        for capture in node_captures(&e.kind) {
+            roots.extend(self.borrow_sources(capture));
+        }
+        roots.extend(self.borrow_sources_inner(e));
+        roots
+    }
+
+    fn borrow_sources_inner(&self, e: &Expr) -> BorrowRoots {
+        let union = |parts: Vec<&Expr>| {
+            let mut roots = BorrowRoots::new();
+            for p in parts {
+                roots.extend(self.borrow_sources(p));
+            }
+            roots
+        };
+        match &e.kind {
+            ExprKind::Local(id) => self.borrows.sources.get(id).cloned().unwrap_or_default(),
+            ExprKind::StrBorrow(inner)
+            | ExprKind::ArrayToSlice(inner)
+            | ExprKind::SliceRange { recv: inner, .. } => self.storage_roots(inner),
+            ExprKind::BufferBytes { buffer }
+            | ExprKind::CliGetStr { parsed: buffer, .. }
+            | ExprKind::HttpRespHeader { resp: buffer, .. }
+            | ExprKind::HttpRespBody { resp: buffer }
+            | ExprKind::HttpCtxMethod { ctx: buffer }
+            | ExprKind::HttpCtxPath { ctx: buffer }
+            | ExprKind::HttpCtxHeader { ctx: buffer, .. }
+            | ExprKind::HttpCtxBody { ctx: buffer }
+            | ExprKind::ConnReader { conn: buffer }
+            | ExprKind::ConnWriter { conn: buffer } => self.storage_roots(buffer),
+            // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
+            // (notably `c.reader().buffered()` still borrows `c`).
+            ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
+            ExprKind::BytesAsStr { bytes }
+            | ExprKind::StrTrim { recv: bytes, .. }
+            | ExprKind::PathComponent { path: bytes, .. } => self.storage_roots(bytes),
+            ExprKind::SoaColumn { base, .. }
+            | ExprKind::ArrayGroupAgg { base, .. }
+            | ExprKind::ArrayGroupAggMulti { base, .. }
+            | ExprKind::ArrayDictEncode { base, .. }
+            | ExprKind::IndexField { base, .. }
+            | ExprKind::Field { root: base, .. } => self.local_storage_roots(*base),
+            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
+            // Chunks are views into the source slots themselves. The materializing transforms below
+            // instead copy view values into fresh storage, so they inherit only the source value's
+            // already-flattened provenance, not ownership of its array header.
+            ExprKind::ArrayChunks { source, .. } => self.storage_roots(source),
+            ExprKind::ArrayToSoa { source, .. }
+            | ExprKind::ArrayToArray { source, .. }
+            | ExprKind::ArrayPartition { source, .. }
+            | ExprKind::ArrayParMap { source, .. }
+            | ExprKind::ArraySort { source, .. }
+            | ExprKind::ArraySortBy { source, .. } => self.borrow_sources(source),
+            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+                union(vec![source, init])
+            }
+            ExprKind::JsonDecode { input, .. }
+            | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::JsonDecodeStructArray { input, .. } => self.borrow_sources(input),
+            ExprKind::JsonDecodeSoa { input, struct_id } => {
+                let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
+                    s.fields
+                        .iter()
+                        .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples))
+                });
+                if borrows_input {
+                    self.borrow_sources(input)
+                } else {
+                    BorrowRoots::new()
+                }
+            }
+            ExprKind::Call { args, .. } => {
+                let mut roots = BorrowRoots::new();
+                for arg in args {
+                    roots.extend(self.borrow_sources(arg));
+                }
+                roots
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                let mut roots = self.borrow_sources(callee);
+                for arg in args {
+                    roots.extend(self.borrow_sources(arg));
+                }
+                roots
+            }
+            ExprKind::Spawn { closure, .. } => self.borrow_sources(closure),
+            ExprKind::Closure { captures, .. } => {
+                let mut roots = BorrowRoots::new();
+                for capture in captures {
+                    roots.extend(self.borrow_sources(capture));
+                }
+                roots
+            }
+            ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner)
+            | ExprKind::TaskGet(inner) => self.borrow_sources(inner),
+            ExprKind::ResultMapErr { result, .. } => self.borrow_sources(result),
+            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                let mut roots = BorrowRoots::new();
+                for elem in elems {
+                    roots.extend(self.borrow_sources(elem));
+                }
+                roots
+            }
+            ExprKind::StructLit { fields, .. } => {
+                let mut roots = BorrowRoots::new();
+                for field in fields {
+                    roots.extend(self.borrow_sources(field));
+                }
+                roots
+            }
+            ExprKind::TupleIndex { recv, .. } => self.borrow_sources(recv),
+            ExprKind::Block(b)
+            | ExprKind::Arena(b)
+            | ExprKind::TaskGroup(b)
+            | ExprKind::Unsafe(b) => b
+                .value
+                .as_ref()
+                .map_or_else(BorrowRoots::new, |v| self.borrow_sources(v)),
+            ExprKind::If { then, els, .. } => {
+                let mut roots = then
+                    .value
+                    .as_ref()
+                    .map_or_else(BorrowRoots::new, |v| self.borrow_sources(v));
+                if let Some(v) = &els.value {
+                    roots.extend(self.borrow_sources(v));
+                }
+                roots
+            }
+            ExprKind::Match { arms, .. } => {
+                let mut roots = BorrowRoots::new();
+                for arm in arms {
+                    roots.extend(self.borrow_sources(&arm.body));
+                }
+                roots
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => union(vec![opt, fallback]),
+            _ => BorrowRoots::new(),
+        }
+    }
+
+    fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
+        let roots = if self.local_may_borrow(local) {
+            self.borrow_sources(value)
+        } else {
+            BorrowRoots::new()
+        };
+        self.borrows.assign(local, roots);
+    }
+
+    fn invalidate_owner(&mut self, owner: LocalId) {
+        self.borrows.invalidate_owner(owner);
+    }
+
+    fn invalidate_storage(&mut self, storage: &Expr) {
+        for owner in self.storage_roots(storage) {
+            self.invalidate_owner(owner);
+        }
+    }
+
+    fn check_borrow_use(&mut self, local: LocalId, span: Span) {
+        let Some(owners) = self.borrows.invalid.get(&local) else { return };
+        let Some(owner) = owners.iter().next().copied() else { return };
+        let borrower = self
+            .f
+            .locals
+            .get(local as usize)
+            .map_or("<borrow>", |l| l.name.as_str());
+        let source = self
+            .f
+            .locals
+            .get(owner as usize)
+            .map_or("<source>", |l| l.name.as_str());
+        self.diags.error(
+            format!(
+                "use of invalidated borrow '{borrower}': its source '{source}' was moved or reassigned (or its storage was reallocated); create a new view from the current source"
+            ),
+            span,
+        );
+    }
+
     /// Loop-back use-after-move analysis for `loop { body }`. See the call site in `expr` for the
     /// full rationale. Kept `#[inline(never)]` so its large locals do not enlarge the recursive
     /// `expr` stack frame.
     #[inline(never)]
     fn loop_moves(&mut self, body: &Block, moved: &mut MovedSet) {
         let entry = moved.clone();
+        let entry_borrows = self.borrows.clone();
         // Probe pass: discover which locals a fall-through iteration moves, with diagnostics
         // suppressed by swapping in a throwaway sink (restored after).
         let mut probe = entry.clone();
         let mut sink = Diagnostics::new();
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
+        self.loop_borrow_breaks.push(Vec::new());
+        self.borrows = entry_borrows.clone();
         self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
-        std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probe's
+        self.loop_borrow_breaks.pop();
+        let probe_borrows = self.borrows.clone();
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
         // `return`s). Conditional `break`/`return` moves are already excluded from `probe` by the
         // `if`/`match` diverging-branch join; but if the body *always* diverges (an unconditional
@@ -5995,11 +6327,44 @@ impl<'a> MoveCheck<'a> {
         } else {
             probe.difference(&entry).copied().collect()
         };
+        // Borrow provenance is not a single monotonic moved bit: assignments can forward roots
+        // through multiple locals, so a chain may take several iterations to reach the loop head.
+        // Compute the finite may-state fixpoint with diagnostics still suppressed. Keeping the old
+        // head in the join represents every possible iteration count, including the first.
+        let fixed_borrows = if hir_block_diverges(body) {
+            entry_borrows.clone()
+        } else {
+            let mut head = BorrowState::join(&entry_borrows, &probe_borrows);
+            loop {
+                self.borrows = head.clone();
+                let mut probe_state = &entry | &back_edge;
+                self.loop_breaks.push(Vec::new());
+                self.loop_borrow_breaks.push(Vec::new());
+                self.block(body, &mut probe_state, false, false);
+                self.loop_breaks.pop();
+                self.loop_borrow_breaks.pop();
+                let next = BorrowState::join(
+                    &head,
+                    &BorrowState::join(&entry_borrows, &self.borrows),
+                );
+                if next == head {
+                    break head;
+                }
+                head = next;
+            }
+        };
+        std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probes'
         // Real pass from the back-edge fixpoint, collecting `break` snapshots.
         let mut body_state = &entry | &back_edge;
+        self.borrows = fixed_borrows;
         self.loop_breaks.push(Vec::new());
+        self.loop_borrow_breaks.push(Vec::new());
         self.block(body, &mut body_state, false, false);
         let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
+        let borrow_breaks = self
+            .loop_borrow_breaks
+            .pop()
+            .expect("loop borrow-break frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
         // leave `moved` unchanged.
@@ -6009,6 +6374,15 @@ impl<'a> MoveCheck<'a> {
                 post = &post | b;
             }
             *moved = post;
+        }
+        if let Some((first, rest)) = borrow_breaks.split_first() {
+            let mut post = first.clone();
+            for b in rest {
+                post = BorrowState::join(&post, b);
+            }
+            self.borrows = post;
+        } else {
+            self.borrows = entry_borrows;
         }
     }
 
@@ -6028,6 +6402,7 @@ impl<'a> MoveCheck<'a> {
             match s {
                 Stmt::Let { local, init } => {
                     self.expr(init, moved, true, true);
+                    self.assign_borrow(*local, init);
                     clear_moved(moved, *local);
                 }
                 Stmt::Assign { local, value, drop_old } => {
@@ -6041,6 +6416,10 @@ impl<'a> MoveCheck<'a> {
                     // locals never drop. (`s = make(s.len())` borrows, not moves → still drops.)
                     let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
                     drop_old.set(self.is_move(*local) && !consumed_by_rhs);
+                    if self.local_owns_view_storage(*local) {
+                        self.invalidate_owner(*local);
+                    }
+                    self.assign_borrow(*local, value);
                     clear_moved(moved, *local);
                 }
                 // `root.field = value` — writing a field is a use of `root` (an owned struct could
@@ -6048,11 +6427,15 @@ impl<'a> MoveCheck<'a> {
                 // check below (same diagnostic; the field write has no index expr to span, so it
                 // points at the RHS instead).
                 Stmt::AssignField { root, value, .. } => {
+                    self.check_borrow_use(*root, value.span);
                     if whole_moved(moved, *root) {
                         let name = &self.f.locals[*root as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), value.span);
                     }
                     self.expr(value, moved, true, true);
+                    if self.is_move_ty(value.ty) {
+                        self.invalidate_owner(*root);
+                    }
                 }
                 // `base[index] = value` / `base[index].field = value` — writing an element is a use
                 // of `base` (an owned array could have been moved away), so flag use-after-move on
@@ -6060,12 +6443,16 @@ impl<'a> MoveCheck<'a> {
                 Stmt::AssignIndex { base, index, value }
                 | Stmt::AssignElemField { base, index, value, .. }
                 | Stmt::AssignElem { base, index, value, .. } => {
+                    self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
                     self.expr(index, moved, false, false);
                     self.expr(value, moved, false, false);
+                    if self.is_move_ty(value.ty) {
+                        self.invalidate_owner(*base);
+                    }
                 }
                 Stmt::AssignVecLane { value, .. } => self.expr(value, moved, false, false),
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
@@ -6080,12 +6467,22 @@ impl<'a> MoveCheck<'a> {
                     if let Some(frame) = self.loop_breaks.last_mut() {
                         frame.push(moved.clone());
                     }
+                    if let Some(frame) = self.loop_borrow_breaks.last_mut() {
+                        frame.push(self.borrows.clone());
+                    }
                 }
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
                 // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
                     self.expr(init, moved, true, true);
+                    let roots = self.borrow_sources(init);
                     for l in locals.iter().flatten() {
+                        let local_roots = if self.local_may_borrow(*l) {
+                            roots.clone()
+                        } else {
+                            BorrowRoots::new()
+                        };
+                        self.borrows.assign(*l, local_roots);
                         clear_moved(moved, *l);
                     }
                 }
@@ -6161,21 +6558,26 @@ impl<'a> MoveCheck<'a> {
                 if whole_moved(moved, *id) {
                     let name = &self.f.locals[*id as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
-                } else if consuming && self.is_move(*id) {
-                    if !direct {
-                        let name = &self.f.locals[*id as usize].name;
-                        self.diags.error(
-                            format!(
-                                "cannot move owned value '{name}' out through a conditional \
-                                 expression yet; bind the `if`/`else` result to a local first"
-                            ),
-                            e.span,
-                        );
+                } else {
+                    self.check_borrow_use(*id, e.span);
+                    if consuming && self.is_move(*id) {
+                        if !direct {
+                            let name = &self.f.locals[*id as usize].name;
+                            self.diags.error(
+                                format!(
+                                    "cannot move owned value '{name}' out through a conditional \
+                                     expression yet; bind the `if`/`else` result to a local first"
+                                ),
+                                e.span,
+                            );
+                        }
+                        self.invalidate_owner(*id);
+                        moved.insert(MovedKey::Whole(*id));
                     }
-                    moved.insert(MovedKey::Whole(*id));
                 }
             }
             ExprKind::Field { root: base, path } => {
+                self.check_borrow_use(*base, e.span);
                 if path.len() == 1 {
                     let fld = path[0];
                     if field_moved(moved, *base, fld) {
@@ -6200,6 +6602,7 @@ impl<'a> MoveCheck<'a> {
                         // but its other fields stay readable. A *borrow* (`u.name.len()`, a `str`
                         // argument) reaches here non-consuming (wrapped in `StrBorrow`/`Len`), so it
                         // is allowed and moves nothing.
+                        self.invalidate_owner(*base);
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
                         // A whole nested Move-struct field (`a := u.addr`) moved out is still
@@ -6234,6 +6637,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. }
             | ExprKind::ArrayGroupAggMulti { base, .. }
             | ExprKind::ArrayDictEncode { base, .. } | ExprKind::IndexField { base, .. } => {
+                self.check_borrow_use(*base, e.span);
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -6304,6 +6708,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderReadLine { reader, buffer } => {
                 self.expr(reader, moved, false, false);
                 self.expr(buffer, moved, false, false);
+                self.invalidate_storage(buffer);
             }
             // `r.buffered()` **consumes** the reader (Move — one fd, one owner; the buffered handle
             // takes it over), exactly like `array_builder.build()`.
@@ -6331,10 +6736,12 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BufferPut { buffer, value, .. } => {
                 self.expr(buffer, moved, false, false);
                 self.expr(value, moved, false, false);
+                self.invalidate_storage(buffer);
             }
             ExprKind::BufferAppend { buffer, data } => {
                 self.expr(buffer, moved, false, false);
                 self.expr(data, moved, false, false);
+                self.invalidate_storage(buffer);
             }
             ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
@@ -6469,9 +6876,21 @@ impl<'a> MoveCheck<'a> {
                 // as already-moved in arm B (a false "use of moved value"). A diverging arm
                 // (`=> { return … }`) contributes nothing to the fall-through, so its moves must not
                 // poison the post-state; if every arm diverges the code after is unreachable.
+                let incoming_borrows = self.borrows.clone();
+                let scrutinee_roots = self.borrow_sources(scrutinee);
                 let mut joined: Option<MovedSet> = None;
+                let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
                     let mut m = moved.clone();
+                    self.borrows = incoming_borrows.clone();
+                    for binding in &a.bindings {
+                        let roots = if self.local_may_borrow(*binding) {
+                            scrutinee_roots.clone()
+                        } else {
+                            BorrowRoots::new()
+                        };
+                        self.borrows.assign(*binding, roots);
+                    }
                     self.expr(&a.body, &mut m, consuming, direct);
                     if hir_expr_diverges(&a.body) {
                         continue;
@@ -6480,10 +6899,15 @@ impl<'a> MoveCheck<'a> {
                         None => m,
                         Some(j) => &j | &m,
                     });
+                    joined_borrows = Some(match joined_borrows {
+                        None => self.borrows.clone(),
+                        Some(j) => BorrowState::join(&j, &self.borrows),
+                    });
                 }
                 if let Some(j) = joined {
                     *moved = j;
                 }
+                self.borrows = joined_borrows.unwrap_or(incoming_borrows);
             }
             ExprKind::ResultMapErr { result, f } => {
                 // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
@@ -6501,10 +6925,15 @@ impl<'a> MoveCheck<'a> {
                 self.expr(cond, moved, false, false);
                 // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
                 // bound owned local out through it is rejected (the `direct = false`).
+                let incoming_borrows = self.borrows.clone();
                 let mut m1 = moved.clone();
+                self.borrows = incoming_borrows.clone();
                 self.block(then, &mut m1, consuming, false);
+                let b1 = self.borrows.clone();
                 let mut m2 = moved.clone();
+                self.borrows = incoming_borrows.clone();
                 self.block(els, &mut m2, consuming, false);
+                let b2 = self.borrows.clone();
                 // Join the branch states — but a branch that always diverges (`return`) contributes
                 // nothing past the `if`, so its moves must not poison the fall-through. (Without this,
                 // `if c { return x }; use(x)` wrongly reports `x` moved.) When both diverge the code
@@ -6514,6 +6943,12 @@ impl<'a> MoveCheck<'a> {
                     (true, false) => m2,
                     (false, true) => m1,
                     (true, true) => moved.clone(),
+                };
+                self.borrows = match (hir_block_diverges(then), hir_block_diverges(els)) {
+                    (false, false) => BorrowState::join(&b1, &b2),
+                    (true, false) => b2,
+                    (false, true) => b1,
+                    (true, true) => incoming_borrows,
                 };
             }
             ExprKind::Template(parts) => {
@@ -6803,6 +7238,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::TupleIndex { recv, index } => {
                 match &recv.kind {
                     ExprKind::Local(t) => {
+                        self.check_borrow_use(*t, e.span);
                         if field_moved(moved, *t, *index) {
                             let name = &self.f.locals[*t as usize].name;
                             self.diags.error(format!("use of moved field '.{index}' of '{name}'"), e.span);
@@ -6810,6 +7246,7 @@ impl<'a> MoveCheck<'a> {
                             let owned = matches!(self.f.locals.get(*t as usize).map(|l| l.ty), Some(Ty::Tuple(tid))
                                 if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
                             if owned && consuming {
+                                self.invalidate_owner(*t);
                                 moved.insert(MovedKey::Field(*t, *index));
                             }
                         }
