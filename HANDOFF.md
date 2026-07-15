@@ -17,7 +17,7 @@ live and path-dependent allocations retain their conditional exactly-once destru
 gates pin zero drops after a definite move and one drop for an unmoved local; optimized-IR/runtime
 coverage includes a returned string, frozen `array_builder`, conditional move, early return, `?`,
 and real live frees. The complete workspace is green (**2158 total = 2157 passed + one ignored
-manual probe**) and workspace clippy passes with warnings denied. **Next recommended allocation-audit
+manual probe**) and workspace clippy passes with warnings denied. Ready PR: **#473**. **Next recommended allocation-audit
 item:** settle arena-free `template` / `json.encode` ownership, then fold static-only templates and
 direct obvious sinks where semantics permit. Previous update: 2026-07-15 (twentieth update this
 day), **LAZY MULTI-SOURCE `zip` IS SHIPPED.**
