@@ -104,7 +104,7 @@ pub struct ImportedFn {
     pub ret: Ty,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FnTy {
     /// Parameter types (scalar-only for now).
     pub params: Vec<crate::Scalar>,
@@ -116,6 +116,18 @@ pub struct FnTy {
     /// at Pure/parallel boundaries.
     pub effect: std::cell::Cell<crate::FnEffect>,
 }
+
+// Effects are inferred mutable facts, not part of source-level signature identity. Keeping them out
+// of equality makes annotation interning stable after a concrete value has been refined. Concrete
+// value types are deliberately allocated with `fresh_fn_type`, so equal signatures may still have
+// independent effect cells.
+impl PartialEq for FnTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.params == other.params && self.ret == other.ret
+    }
+}
+
+impl Eq for FnTy {}
 
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
 /// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's

@@ -19893,13 +19893,17 @@ mod tests {
         );
         assert!(!diagnostics.has_errors());
         let main = program.fns.iter().find(|f| f.name == "main").unwrap();
-        let effect = |name: &str| {
+        let fn_type = |name: &str| {
             let local = main.locals.iter().find(|l| l.name == name).unwrap();
             let Ty::Fn(fid) = local.ty else { panic!("{name} must be a function value") };
-            program.fn_types.get(fid as usize).unwrap().effect.get()
+            (fid, program.fn_types.get(fid as usize).unwrap())
         };
-        assert_eq!(effect("p"), FnEffect::Pure);
-        assert_eq!(effect("q"), FnEffect::Impure);
+        let (pure_id, pure) = fn_type("p");
+        let (impure_id, impure) = fn_type("q");
+        assert_ne!(pure_id, impure_id, "concrete values need independent effect cells");
+        assert_eq!(pure, impure, "effect mutations must not destabilize signature equality");
+        assert_eq!(pure.effect.get(), FnEffect::Pure);
+        assert_eq!(impure.effect.get(), FnEffect::Impure);
     }
 
     #[test]
