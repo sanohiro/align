@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (eighteenth update this day), **THE ZERO-COPY STRING BYTE VIEW IS
+_Last updated: 2026-07-15 (nineteenth update this day), **UNBOUND MOVE TEMPORARIES HAVE
+VIEW-AWARE OWNERSHIP.** Fresh owned expressions used through scalar consumers now move into
+path-local synthetic MIR owners and drop immediately after the scalar is produced; borrowed views
+propagate those owners through string/slice/path/chunk/index/call operations until function or loop
+cleanup. A separate runtime temporary bit distinguishes a fresh `if`/`match`/`else`/`?` arm from a
+borrowed bound local, preventing both leaks and double frees. Escape analysis caps views of anonymous
+owned storage at `Frame`, so returning a dangling `str`, subslice, or chunk element is rejected.
+Synthetic owners participate in per-iteration, `break`, return, and early-error cleanup, and entry
+initialization makes sibling paths safe. The original five optimized-IR leak shapes now contain
+exactly five frees; seven dedicated regressions cover producers, scalar/index/view/call consumers,
+mixed control flow, `?`, rejected escapes, and 20,000 loop iterations. Self-review caught and fixed
+a compiler stack regression by boxing the new bookkeeping in `BuilderCtx` and keeping call lowering
+out of the giant recursive frame; all five expression-depth gates pass. The complete workspace is
+green (**2149 total = 2148 passed + one ignored manual probe**) and workspace clippy passes with
+warnings denied. **Next recommended pipeline item:** consumer-gated lazy multi-source `zip`, starting
+with 2+ equal-length Copy-scalar arrays/slices and allocation-free fused terminals. Previous update:
+2026-07-15 (eighteenth update this day), **THE ZERO-COPY STRING BYTE VIEW IS
 SHIPPED.** `str.bytes()` and owned `string.bytes()` now produce the specified `slice<u8>` view by
 retyping the existing `{ptr,len}` descriptor: the HIR retains borrow provenance, while MIR emits no
 rvalue and LLVM emits no call. Owned receivers auto-borrow rather than move. Region and borrow

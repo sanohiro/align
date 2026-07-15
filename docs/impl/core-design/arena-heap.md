@@ -67,9 +67,9 @@ The reference implementation of the region model: `region_of(box) = Arena(depth)
 - P1 — the **unnecessary-heap lint** (#323) fires on a box that is only ever `.get()`-read and
   never escapes; the guide teaches that lint as the norm. If a change makes the lint fire on
   idiomatic code, the change is wrong, not the lint.
-- P2 — `heap.new(x).get()` as an unbound chain works only because the annotation flows through
-  (`v: i32 := heap.new(7).get()` is a pinned test); do not generalize unbound Move-temporary
-  patterns from it — box is region-tracked, not Move, which is *why* it composes.
+- P2 — `heap.new(x).get()` is arena-regioned, not a Move synthetic-owner case
+  (`v: i32 := heap.new(7).get()` is a pinned test). General unbound Move cleanup now also composes,
+  but through path-local ownership flags; do not merge the two lifetime mechanisms.
 - P3 — arena blocks nest; region depth comparisons, not block identity, drive escape checks.
   New constructs that open scopes (e.g. future `soa` builders) must integrate with depth, not
   add a parallel mechanism.

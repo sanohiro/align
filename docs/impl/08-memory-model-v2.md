@@ -331,11 +331,11 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    (`SrcSetup.temp_free`), both after a fold (`make().sum()`) and after a collect copy
    (`make().map(f).to_array()`). `temp_free` is set for sources that unambiguously own a fresh
    buffer — a `.to_array()` materialization or a call returning `array<T>` — but **not** for a
-   bound `Local`/`Field` (a borrow, freed by its owner) nor for `Block`/`If` sources (which may
-   borrow a bound local in a branch, e.g. `(if c { ys } else { zs }).sum()`; blanket-freeing
-   would double-free, so those stay a sound bounded leak). Moving a *bound* owned local out
-   through an `if`/`else` arm (or `else`-unwrap fallback) is rejected for now (sema deferral
-   diagnostic) — codegen only nulls at direct sites; bind the branch result to a local first.
+   bound `Local`/`Field` (a borrow, freed by its owner). Since 2026-07-15, general borrowed uses of
+   unbound Move expressions use path-local synthetic owners instead: a separate temporary bit joins
+   `Block`/`If`/`match`/`else`/`?` paths, so a fresh selected arm is dropped while a bound selected arm
+   remains borrowed. Value-carrying owned moves also carry their ordinary runtime ownership bit and
+   null the selected source, removing the older branch-move restriction without blanket frees.
 5. **More terminals (in progress).** `min`/`max` reductions **[done]** — fused-loop reducers
    (`Reducer::MinMax`) that keep an element only when it beats the running best (a conditional
    update branching to the loop `cont`), seeded with the element type's extreme so an empty

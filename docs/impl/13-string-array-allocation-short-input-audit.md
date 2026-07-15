@@ -50,7 +50,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `s.bytes()` | descriptor-only `str`/`string` → `slice<u8>` view | **SHIPPED 2026-07-15**; zero allocation/copy |
 | `str + str` | rejected in sema; no MIR concatenation path remains | **FIXED 2026-07-15**; `builder` is the one construction path |
 | arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
-| unbound owned temporaries | `.len()`, scalar index, direct call use can omit `Drop` | **CONFIRMED P0**; leaks strings and arrays in loops |
+| unbound owned temporaries | synthetic path-local owner; scalar early-drop, view retention | **FIXED 2026-07-15**; control flow and loops pinned |
 | moved slots | optimized IR still calls `free(null)` / handle-free(null) | **CONFIRMED P1** short-value fixed cost |
 | filesystem/path ABI views | common helper copies every short path into `String` | **CONFIRMED P1** avoidable allocation/copy |
 | UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
@@ -141,40 +141,39 @@ Implementation work can already remove common cases without settling the value t
 The stored-value case is a **CLAUDE QUESTION** in section 10: arena-required `str`, owned `string`, or
 contextual sink lowering. Do not paper over it with another process-global owner.
 
-### 3.4 CONFIRMED P0 — unbound owned string/array temporaries miss `Drop`
+### 3.4 FIXED 2026-07-15 — unbound owned temporaries have view-aware synthetic owners
 
-Bound Move locals receive null-on-move drop wiring, and a temporary owned array consumed as a later
-pipeline source may be returned through `SrcSetup.temp_free`. General expression temporaries do not.
-`Len` simply lowers its receiver and extracts the length
-([MIR](../../crates/align_mir/src/lib.rs#L2940)); scalar index and ordinary call-argument paths have
-the same ownership gap.
+MIR now gives a fresh unbound Move expression a zero-initialized hidden slot plus a path-local drop
+flag. The flag is separate from ordinary ownership: at `(if c { make() } else { bound }).len()`, the
+fresh arm sets the temporary bit and the bound arm leaves it clear, so the existing local is borrowed
+rather than transferred or double-freed. `if`, `match`, `else`-unwrap, and `?` carry that selected bit
+through the same value-result joins as ordinary ownership provenance.
 
-Confirmed optimized-IR examples:
+The five confirmed optimized-IR leaks now each retain exactly one `align_rt_free`:
 
 ```align
-"x".clone().len()          // calls align_rt_str_clone; no align_rt_free
-[n, n + 1].to_array().len() // calls align_rt_alloc; no free
-[n, n + 1].to_array()[0]    // same
-[1, 2, 3].chunks(2).len()   // chunks header allocation; no free
-b.build().len()              // frozen array payload; no free
+"x".clone().len()
+[n, n + 1].to_array().len()
+[n, n + 1].to_array()[0]
+[1, 2, 3].chunks(2).len()
+b.build().len()
 ```
 
-The existing collect comment acknowledges that some free-standing `.to_array()` temporaries leak
-([known limitation](../../crates/align_mir/src/lib.rs#L4252)), while the memory-model status text
-overstates drop coverage.
+Scalar consumers (`len`, scalar index, predicates, borrow-only sinks) end the hidden owner's liveness
+immediately after producing the scalar. Borrow-producing operations propagate the owner alongside the
+SSA value: subslices, `trim`, `str.bytes`, `path.base`/`dir`/`ext`, chunks, indexed views, and calls
+returning a borrow therefore retain it through later use. Escape analysis caps a view of fresh owned
+storage at `Frame`, rejecting a returned string/slice/chunk element before cleanup can dangle it.
+Synthetic owners discovered inside a loop join the loop's final per-iteration cleanup set, including
+`break`; entry-block initialization makes sibling and early-exit paths safe before a producer runs.
 
-Introduce a real owned-temporary/synthetic-owner representation and derive destruction from MIR
-liveness. Separate two cases:
-
-- scalar consumers such as `.len()` and `[i]` may drop the owner after the scalar is produced;
-- view consumers such as `[a..b]`, `.trim()`, `path.base`, or a function returning a borrowed view
-  require the hidden owner to live through the last use of that view.
-
-Test every producer (`clone`, builder freeze, path/encoding results, `to_array`, `sort`, `partition`,
-`chunks`, `par_map`) through `.len`, index, subslice, method, call argument, `if`/`match`, `?`, return,
-and loops. Use an allocation counter/ASan-equivalent and require allocation count to equal destruction
-count on every normal path. Existing leaks may currently mask UAFs, so sanitizer/view-lifetime tests
-are mandatory.
+`crates/align_driver/tests/owned_temporaries.rs` pins clone, builder freeze, path/encoding, `to_array`,
+sort, chunks, and `par_map`; scalar/index/view/call consumption; mixed `if` and `match`; `?`; rejected
+returns; and repeated loop cleanup. Its optimized-IR parity gate requires the five original allocation
+shapes to have exactly five frees, while runtime cases cover both sides of mixed control flow and
+view use (so neither a leak-masked UAF nor a double-free passes). Partition's two owned outputs remain
+covered through its settled destructuring consumer; temporary tuple field extraction is still a
+separate surface restriction, not an ownership exception.
 
 ### 3.5 CONFIRMED P1 — definite-null destructor calls survive O2
 
@@ -606,8 +605,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 1. ~~Enforce UTF-8 range boundaries~~ **DONE 2026-07-13**; ~~ship the specified zero-cost
    `s.bytes()` view~~ **DONE 2026-07-15**.
 2. ~~Enforce the settled `str + str` hard error and correct stale tests/docs.~~ **DONE 2026-07-15.**
-3. Add owned expression temporaries/synthetic owners with view-aware liveness; close string, array,
-   chunks, and builder direct-consumer leaks.
+3. ~~Add owned expression temporaries/synthetic owners with view-aware liveness; close string,
+   array, chunks, and builder direct-consumer leaks.~~ **DONE 2026-07-15.**
 4. Remove definite-null destructor calls after the ownership dataflow is trustworthy.
 5. Settle arena-free template/json.encode ownership; immediately fold static-only templates and
    direct obvious sinks where semantics already permit it.
@@ -678,7 +677,7 @@ short microbenchmark never justifies code-size or memory-traffic loss at scale.
   after a real decision, not because this audit asked the question.
 
 The new contribution of document 13 is the short-input evidence and the confirmed ownership/copy
-gaps: the now-fixed UTF-8 slicing defect, settled concat enforcement, arena-free template lifetime, unbound temporary
+gaps: the now-fixed UTF-8 slicing defect, settled concat enforcement, arena-free template lifetime, the now-fixed unbound temporary
 drop, known-null drops, borrowed ABI paths, builder/array-builder headers and freeze, virtual chunks,
 direct str-group outputs, direct path normalization, staged name/IP payloads, and large constant-local
 initialization.

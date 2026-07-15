@@ -2488,8 +2488,8 @@ stable compaction. Existing work from documents 10/11 remains attributed there.
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)
 is the durable implementation record. Its UTF-8 range-boundary gap is fixed and regression-pinned;
-its settled `str + str` enforcement drift is fixed 2026-07-15; it confirms the remaining
-owned-expression-temporary lifetime gaps, arena-free template lifetime leaks,
+its settled `str + str` enforcement drift is fixed 2026-07-15; unbound owned-expression
+temporaries gained view-aware synthetic owners the same day; it confirms the remaining arena-free template lifetime leaks,
 known-null destructor calls, and avoidable path/builder/chunks/group staging. It also records the
 good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
 later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,

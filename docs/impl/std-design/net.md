@@ -125,8 +125,9 @@ just supplies the `task_group` + blocking-pool substrate, already available.)
 - **P5 (DNS owned strings deep-drop)**: `array<string>` from `resolve` must deep-free each IP
   string (`read_dir` #339 template).
 - **P6 (bound-receiver, #337/#338)**: conn/listener/socket are owned Move — unbound temporaries
-  can't be receivers in v1 (bind first). `tcp.connect(...).reader()` is rejected until
-  Move-temp drops land.
+  can't be receivers in v1 (bind first). `tcp.connect(...).reader()` remains rejected after the
+  2026-07-15 general Move-temporary cleanup fix because receiver stable-address semantics are a
+  separate surface decision.
 
 ## Test checklist
 

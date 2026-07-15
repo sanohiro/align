@@ -103,11 +103,11 @@ storage-vs-element の区別である(str 配列の *要素* は配列の *stora
   表面は同じチェックを経由させること。
 - P4 — fixed-array のインデックスはレシーバがリテラルか変数であることを要求する(MIR がスロットを
   アドレス指定する)。失敗する式レシーバのケースを、配列を黙ってコピーして「直す」ことをしてはならない。
-- P5 — 一般の束縛されていない owned 一時値はまだ確実に drop されず、`chunks(n)` は直接 `.len()`、
-  index、pipeline へ渡す場合にも header 配列を常に materialize する。どちらも言語保証ではなく確認済みの
-  実装ギャップとして扱うこと。[audit 13](../../13-string-array-allocation-short-input-audit.md#34-confirmed-p0--unbound-owned-stringarray-temporaries-miss-drop)
-  と [§8.2](../../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers)
-  を参照。
+- P5 — 束縛されていない owned 一時値には 2026-07-15 から経路別の synthetic owner があり、
+  view の生存期間と loop 各反復の cleanup も追跡する。`chunks(n)` は直接 `.len()`、index、pipeline
+  へ渡す場合にも header 配列を常に materialize する。この残るコストは
+  [audit 13 §8.2](../../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers)
+  で追跡する。
 
 ## Test anchors
 

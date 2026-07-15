@@ -105,11 +105,10 @@ re-running that adversarial case.
   route through the same check.
 - P4 — fixed-array indexing requires literal-or-variable receiver (MIR addresses the slot);
   don't "fix" a failing expression-receiver case by copying the array silently.
-- P5 — general unbound owned temporaries are not yet dropped reliably, and `chunks(n)` always
-  materializes its header array even for direct `.len()`, index, or pipeline consumers. Treat both
-  as confirmed implementation gaps, not as language guarantees; see
-  [audit 13](../13-string-array-allocation-short-input-audit.md#34-confirmed-p0--unbound-owned-stringarray-temporaries-miss-drop)
-  and [§8.2](../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers).
+- P5 — unbound owned temporaries have path-local synthetic owners as of 2026-07-15, including
+  view-retention and per-iteration loop cleanup. `chunks(n)` still materializes its header array
+  even for direct `.len()`, index, or pipeline consumers; that remaining cost is tracked in
+  [audit 13 §8.2](../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers).
 
 ## Test anchors
 

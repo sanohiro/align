@@ -57,5 +57,6 @@ The permanent gates live in:
 - `crates/align_driver/tests/runway_a2_binary_codec.rs` (self-append);
 - `crates/align_lexer/src/lib.rs` and `crates/align_sema/src/lib.rs` (front-end diagnostics).
 
-The audit intentionally did not mark unrelated broader findings complete. Arena-free owned-temporary
-leaks and the remaining short-input work retain their recorded status.
+The audit intentionally did not mark unrelated broader findings complete. General unbound Move
+temporaries gained view-aware synthetic owners on 2026-07-15 (audit 13 §3.4); arena-free
+`template`/`json.encode` ownership and the remaining short-input work retain their recorded status.

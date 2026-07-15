@@ -98,7 +98,7 @@ pub fn main() -> Result<(), Error> {
 
 `io.stdin` / `io.stdout` / `io.stderr` are the borrowed standard streams. For chatty output, wrap: `w := io.stdout.buffered()` … `w.flush()?`.
 
-**The v1 rule you will trip on once:** an *owned* handle must be **bound to a local before use**. `fs.create(p)?.write(d)?` is rejected — the unnamed temporary would drop without running cleanup (today), so the compiler makes you name it. The borrowed std streams are exempt (`io.stdout.write("ok\n")?` is fine); a `.buffered()` writer is not (its final flush happens on drop — it must be named). This restriction lifts when Move temporaries get their drop (implementation in progress).
+**The v1 rule you will trip on once:** an *owned* handle must be **bound to a local before method use**. `fs.create(p)?.write(d)?` is rejected, so name the handle first. The borrowed std streams are exempt (`io.stdout.write("ok\n")?` is fine); a `.buffered()` writer must still be named. General unnamed Move values have cleanup as of 2026-07-15, but lifting this receiver surface also requires a stable address for mutating/consuming handle methods and remains separate.
 
 ## `std.path`, `std.env`, `std.time`
 
