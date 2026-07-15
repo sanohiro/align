@@ -8,17 +8,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (sixth update this day), **qualified cross-module function values are
+_Last updated: 2026-07-15 (seventh update this day), **wrapper-hidden local-slice returns are
+REJECTED — MERGED as #459** (workspace **2078 green** = 2077 passed + one ignored manual probe;
+clippy `-D warnings` clean). Return/break escape checks now see a frame-local slice through
+`Option`/`Result`, tuple, struct, calls, and value-carrying control flow. Wrapper locals,
+reassignment, tuple destructuring, and `match` payload bindings preserve that provenance, while a
+caller-provided slice remains returnable through the same wrappers. This closes the concrete
+`Ok(xs[..])` use-after-free without folding frame-local slices into `region_of` and reintroducing
+the known safe-arena false positive. Gemini had no findings, thread-aware inspection found no
+review threads, and the English validation comment is on the PR. **Next soundness priority:** the
+recorded intra-frame borrow-liveness gap (a source can be moved/reassigned while a view remains
+usable). Design and implement it as shared dataflow rather than per-receiver patches. Fully-
+escaping function values remain deliberately deferred pending a consumer and settled heap-owned
+environment/drop semantics. Previous update: 2026-07-15 (sixth update this day), **qualified
+cross-module function values are
 SHIPPED — MERGED as #458** (workspace **2074 green** = 2073 passed + one ignored manual probe;
 clippy `-D warnings` clean). A shared named-function reference preserves bare or dotted module
-prefixes and resolves through the same import / `pub` classifier as direct calls. Every named
-callable consumer (`map`/`where`/`reduce`/`scan`/`partition`/`any`/`all`/`par_map`/
-`sort_by_key`) and ordinary bound values (`f := util.dbl`) now support qualified functions,
-including nested modules, whole-program/per-unit parity, local leftmost-name shadowing, and
-imported effect bits. Gemini had no findings; the English validation comment is on the PR. The two
-recorded post-M15 follow-ups (#457 and #458) are complete. **Next:** no mandatory implementation
-slice is queued; select and settle the next backlog item. Fully-escaping function values remain
-deliberately deferred until their heap-owned environment/drop model has a consumer and is settled.
+prefixes and resolves through the same import / `pub` classifier as direct calls; all named
+callable consumers and ordinary bound values support qualified functions. Gemini had no findings
+and the English validation comment is on the PR.
 Previous update: 2026-07-15 (fifth update this day), **the HTTP-server fd-leak timing flake is
 HARDENED — MERGED as #457** (workspace **2068 green** = 2067 passed + one ignored manual probe;
 clippy `-D warnings` clean). `http_server_no_fd_leak_across_cycles` now participates in the

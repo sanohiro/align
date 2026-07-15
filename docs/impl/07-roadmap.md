@@ -19,12 +19,13 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2074 green (2073 passed + one ignored manual
+verification bundle) are complete. The workspace is 2078 green (2077 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
-#457 without weakening its persistent-leak threshold, and qualified cross-module function values
-are shipped as #458. Both recorded post-M15 items are complete. **Next:** select and settle the
-next backlog item; no mandatory implementation slice is queued. Fully-escaping function values
-remain deliberately deferred pending a settled heap-owned environment/drop model and a consumer.
+#457, qualified cross-module function values shipped as #458, and wrapper-hidden local-slice
+returns are rejected as #459. **Next soundness priority:** settle and implement the recorded
+intra-frame borrow-liveness gap as shared dataflow rather than receiver-specific patches.
+Fully-escaping function values remain deliberately deferred pending a settled heap-owned
+environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core
@@ -2989,6 +2990,20 @@ found no unresolved review comments, and an English validation summary was poste
 The two recorded post-M15 follow-ups are therefore complete. No mandatory implementation slice is
 queued; fully-escaping function values stay deferred until the heap-owned environment/drop model
 is settled and has a consumer.
+
+**WRAPPER-HIDDEN LOCAL-SLICE ESCAPES FIXED — MERGED as #459 (2026-07-15; workspace 2078 green =
+2077 passed + one ignored manual probe; clippy `-D warnings` clean).** The direct local-array slice
+return check only ran when the outer expression itself was `slice<T>`, so `Ok(xs[..])` or
+`Some(xs[..])` could hide a frame borrow and return a dangling pointer. The local-storage
+provenance check is now type-transparent through `Option`/`Result`, tuples, structs, calls, and
+value-carrying control flow. Locals and reassignments retain it, and tuple destructuring plus
+`match` payload bindings propagate it only to slice-bearing locals through checked HIR lookups.
+The fix deliberately remains separate from `region_of`, preserving the safe case where a slice of
+an arena-local array leaves the inner arena but not the function. Regression tests reject direct,
+wrapper-local, and `match`-payload escapes while accepting a wrapped caller-provided slice. Gemini
+reported no findings, thread-aware inspection found no review threads, and the English validation
+comment was posted before merge. The next correctness priority is the recorded intra-frame
+borrow-liveness gap; it requires a common dataflow design, not another receiver-specific arm.
 
 ## Design Issues to Settle in Parallel
 
