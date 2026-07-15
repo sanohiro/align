@@ -1480,6 +1480,7 @@ impl Builder {
         let s = self.slots.len() as Slot;
         self.slots.push(ty);
         self.slot_align.push(None);
+        self.drop_flags.push(None);
         s
     }
 
@@ -1556,6 +1557,7 @@ fn lower_fn(
         let flag = slots.len() as Slot;
         slots.push(Ty::Bool);
         slot_align.push(None);
+        drop_flags.push(None);
         drop_flags[local as usize] = Some(flag);
     }
     let mut b = Builder {
