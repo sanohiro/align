@@ -372,18 +372,34 @@ pub enum CacheLookup {
     Miss { reason: Option<FirstDiff> },
 }
 
-/// Clear the cache under `root` by removing only the cache-owned subdirectories (`cas`, `actions`,
-/// `index`) — never the root itself, so an explicit `ALIGNC_CACHE=<shared dir>` is not nuked wholesale.
-/// Safe on an absent root/subdir (each missing subdir is skipped). Returns whether anything was
-/// removed. A removal error is surfaced to the caller.
+/// Clear the cache under `root` by removing only the cache-owned entries (`cas`, `actions`, `index`)
+/// — never the root itself, so an explicit `ALIGNC_CACHE=<shared dir>` is not nuked wholesale. Safe on
+/// an absent root/entry (each missing one is skipped). Returns whether anything was removed.
+///
+/// A cache-owned entry that is a **symlink** is never followed: the link itself is unlinked, never its
+/// target — so `clear` can never recurse out of the resolved root even if an entry was replaced by a
+/// symlink. (The cache is a local, non-adversarial store, but this keeps the "delete only inside the
+/// resolved root" guarantee unconditional.)
 pub fn clear_cache(root: &Path) -> Result<bool, String> {
     let mut removed = false;
     for sub in ["cas", "actions", "index"] {
-        let dir = root.join(sub);
-        match std::fs::remove_dir_all(&dir) {
+        let path = root.join(sub);
+        // `symlink_metadata` does NOT follow a top-level symlink (unlike `metadata`), so we classify
+        // the entry itself before deciding how to remove it.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
+        };
+        let result = if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(&path) // a real dir: recurse (std's impl does not follow inner symlinks)
+        } else {
+            std::fs::remove_file(&path) // a symlink or a stray file: unlink the entry only, never a target
+        };
+        match result {
             Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", dir.display())),
+            Err(e) => return Err(format!("cannot remove {}: {e}", path.display())),
         }
     }
     Ok(removed)
@@ -909,5 +925,44 @@ mod tests {
         k.impl_hash = Hash128 { lo: 1, hi: 1 };
         k.exports = vec!["z".to_string()];
         assert_eq!(first_diff(&base, &k), FirstDiff::MirDigest);
+    }
+
+    #[test]
+    fn clear_cache_removes_owned_subtrees_and_is_absent_safe() {
+        let root = std::env::temp_dir().join(format!("align-clear-{}-{:p}", std::process::id(), &0u8 as *const _));
+        let _ = std::fs::remove_dir_all(&root);
+        // Absent root: safe, nothing removed.
+        assert_eq!(clear_cache(&root), Ok(false));
+        // Populate the three owned subtrees + an UNRELATED sibling that must survive.
+        for sub in ["cas", "actions", "index"] {
+            std::fs::create_dir_all(root.join(sub).join("x")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep").join("f"), b"x").unwrap();
+        assert_eq!(clear_cache(&root), Ok(true));
+        assert!(!root.join("cas").exists() && !root.join("actions").exists() && !root.join("index").exists());
+        assert!(root.join("keep").join("f").exists(), "clear must not touch anything but its own subtrees");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_cache_never_follows_a_symlinked_subtree() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("align-clearsym-{}-{:p}", std::process::id(), &0u8 as *const _));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("important");
+        std::fs::write(&victim, b"do not delete").unwrap();
+        // Replace the `cas` entry with a symlink pointing OUT of the cache root.
+        symlink(&outside, root.join("cas")).unwrap();
+        assert_eq!(clear_cache(&root), Ok(true));
+        // The symlink is gone, but its target's contents are untouched (never followed out of root).
+        assert!(!root.join("cas").exists(), "the symlink entry itself is removed");
+        assert!(victim.exists(), "clear must NEVER delete through a symlink out of the resolved root");
+        std::fs::remove_dir_all(&base).ok();
     }
 }
