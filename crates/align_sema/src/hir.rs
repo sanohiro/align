@@ -187,11 +187,14 @@ pub struct Fn {
     pub locals: Vec<Local>,
     pub body: Block,
     pub span: Span,
-    /// Free-standing **owned** locals (heap `array<T>`, region `Static`) that are *not*
-    /// moved out — MIR must drop (free) each at every function exit. Arena-allocated owned
-    /// values are excluded (the arena bulk-frees them). Populated after move/escape analysis
-    /// (MMv2 slice 4).
+    /// Locals whose type owns resources and therefore needs a path-local MIR drop flag. The flag
+    /// decides whether the value currently in the slot is individually owned or arena-owned;
+    /// moved/uninitialised slots also keep it clear. Populated after move/escape analysis.
     pub drop_locals: Vec<LocalId>,
+    /// Subset of [`Self::drop_locals`] whose declaration initializer is individually owned. MIR
+    /// sets these locals' runtime flags after their `let`; the remaining initial values are
+    /// arena-owned and leave the flag clear.
+    pub drop_individual_locals: Vec<LocalId>,
     /// M15 S2: this is a non-entry, non-generic `pub` **user** function — a candidate external
     /// symbol under separate compilation (its `module$name` mangling is globally collision-free).
     /// The *fact* is mode-independent; whether it actually gets `external` linkage is decided at
@@ -237,7 +240,14 @@ pub enum Stmt {
     /// local owns a heap buffer that the RHS does *not* move out, so the value being overwritten
     /// must be dropped (freed) before the store — else its buffer leaks. It is a [`Cell`] so the
     /// move analysis, which holds only `&Stmt`, can record the decision without a mutable walk.
-    Assign { local: LocalId, value: Expr, drop_old: std::cell::Cell<bool> },
+    /// `drop_new` (set by escape analysis) records whether the replacement is individually owned;
+    /// MIR writes it into the local's runtime drop flag after the store.
+    Assign {
+        local: LocalId,
+        value: Expr,
+        drop_old: std::cell::Cell<bool>,
+        drop_new: std::cell::Cell<bool>,
+    },
     /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
     /// Lowering emits a bounds check (abort on out-of-range), like an element read.
     AssignIndex { base: LocalId, index: Expr, value: Expr },

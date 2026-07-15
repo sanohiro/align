@@ -197,8 +197,8 @@ pub enum Stmt {
     TgWait(Operand),
     /// End a `task_group`, freeing its region (the operand is the task-group handle).
     TgEnd(Operand),
-    /// Null-initialise an owned-array slot (`{null, 0}`) so a later [`Stmt::Drop`] on a path
-    /// that never allocated is a no-op (MMv2 slice 4 drop-flag-via-null-slot).
+    /// Zero an owned slot after entry or a move so its storage is safe to inspect recursively.
+    /// Drop eligibility itself is tracked by a separate path-local boolean slot.
     DropFlagInit(Slot),
     /// Null one owned field (`{null, 0}`) of a tuple slot, after a partial field move (`a := t.0`)
     /// took its buffer — so the tuple's exit `Drop` frees null there, not the buffer now owned by
@@ -1363,10 +1363,14 @@ struct Builder {
     arenas: Vec<ValueId>,
     /// Handles of the `task_group`s currently open (innermost last); `spawn`/`wait` use the top.
     task_groups: Vec<ValueId>,
-    /// Free-standing owned locals (heap `array<T>`) that must be freed at every function
-    /// exit (MMv2 slice 4; `hir::Fn::drop_locals`). Their slots are null-initialised at
-    /// entry, so a drop on a path that never allocated frees null (a no-op).
+    /// Resource-owning locals that participate in path-local cleanup.
     drop_locals: Vec<Slot>,
+    /// Per-local runtime drop-flag slots. A set flag means the corresponding local currently holds
+    /// an individually owned value; a clear flag means arena-owned, moved, or uninitialised.
+    drop_flags: Vec<Option<Slot>>,
+    /// Locals whose declaration initializer is individually owned (the initial flag value after
+    /// their `let`; parameters in this set are live at entry).
+    drop_individual_locals: Vec<Slot>,
     /// Tuple defs — to tell whether a `Ty::Tuple` slot is a Move tuple (holds an owned element),
     /// which `null_moved_source` must null on move so its exit `Drop` doesn't double-free.
     tuples: Vec<hir::TupleDef>,
@@ -1401,9 +1405,8 @@ struct LineCtx {
 struct LoopFrame {
     exit: BlockId,
     result_slot: Option<Slot>,
-    /// Owned free-standing locals declared inside the loop body (a subset of `drop_locals`). They
-    /// are dropped and null-reset at the back-edge of each iteration and at each `break`, so a
-    /// per-iteration allocation is freed once per pass instead of leaking when the slot is reused.
+    /// Owned locals declared inside the loop body (a subset of `drop_locals`). Their live flags are
+    /// conditionally dropped at the back-edge and at each `break`.
     iter_drops: Vec<Slot>,
 }
 
@@ -1412,7 +1415,7 @@ impl Builder {
     /// every owned free-standing local — emitted before any exit that leaves these scopes.
     fn emit_exit_cleanup(&mut self) {
         for s in self.drop_locals.clone() {
-            self.push(Stmt::Drop(s));
+            self.emit_drop_if_live(s);
         }
         // An early exit out of a `task_group` still joins its tasks (structured concurrency) and
         // frees the region.
@@ -1480,6 +1483,33 @@ impl Builder {
         s
     }
 
+    fn set_drop_flag(&mut self, slot: Slot, live: bool) {
+        self.set_drop_flag_operand(slot, Operand::Const(Const::Bool(live)));
+    }
+
+    fn set_drop_flag_operand(&mut self, slot: Slot, live: Operand) {
+        if let Some(flag) = self.drop_flags.get(slot as usize).copied().flatten() {
+            self.push(Stmt::Store(flag, live));
+        }
+    }
+
+    /// Emit an explicit MIR branch around a slot drop. Keeping the condition in the MIR CFG makes
+    /// arena-vs-individual cleanup visible to optimisations and avoids hiding control flow in LLVM
+    /// lowering. The taken edge clears the flag after dropping; the false edge leaves the slot alone.
+    fn emit_drop_if_live(&mut self, slot: Slot) {
+        let flag = self.drop_flags[slot as usize].expect("owned local has a drop flag");
+        let live = self.fresh_value(Ty::Bool);
+        self.push(Stmt::Let(live, Rvalue::Load(flag)));
+        let drop_bb = self.new_block();
+        let next_bb = self.new_block();
+        self.terminate(Term::Branch(Operand::Value(live), drop_bb, next_bb));
+        self.cur = drop_bb;
+        self.push(Stmt::Drop(slot));
+        self.set_drop_flag(slot, false);
+        self.terminate(Term::Goto(next_bb));
+        self.cur = next_bb;
+    }
+
     fn push(&mut self, s: Stmt) {
         // Only track source lines when lowering located (explain-opt / debug info). Kept tiny and the
         // line work in a separate `#[inline(never)]` helper: `push` is inlined into `lower_expr`, a
@@ -1519,9 +1549,18 @@ fn lower_fn(
     structs: &[hir::StructDef],
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
+    let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
+    let mut slot_align: Vec<Option<u32>> = f.locals.iter().map(|l| l.align).collect();
+    let mut drop_flags = vec![None; slots.len()];
+    for &local in &f.drop_locals {
+        let flag = slots.len() as Slot;
+        slots.push(Ty::Bool);
+        slot_align.push(None);
+        drop_flags[local as usize] = Some(flag);
+    }
     let mut b = Builder {
-        slots: f.locals.iter().map(|l| l.ty).collect(),
-        slot_align: f.locals.iter().map(|l| l.align).collect(),
+        slots,
+        slot_align,
         value_tys: Vec::new(),
         blocks: Vec::new(),
         cur: 0,
@@ -1529,6 +1568,8 @@ fn lower_fn(
         arenas: Vec::new(),
         task_groups: Vec::new(),
         drop_locals: f.drop_locals.clone(),
+        drop_flags,
+        drop_individual_locals: f.drop_individual_locals.clone(),
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
         alias_scope: 0,
@@ -1542,22 +1583,24 @@ fn lower_fn(
     let params: Vec<Slot> = f.params.clone();
     for (i, &slot) in params.iter().enumerate() {
         b.push(Stmt::Store(slot, Operand::Arg(i as u32)));
+        if b.drop_locals.contains(&slot) {
+            b.set_drop_flag(slot, b.drop_individual_locals.contains(&slot));
+        }
     }
-    // Null-initialise each owned-drop slot so a drop on a path that never allocated frees
-    // null (a no-op) instead of an uninitialised pointer. Parameters are excluded: they arrive
-    // already initialised (owning a valid buffer), so zeroing them would clobber the argument
-    // and leak the caller-transferred buffer.
+    // Zero each owned slot so an uninitialised path has valid null storage. Parameters are excluded:
+    // they arrive already initialised, so zeroing them would clobber the caller-transferred value.
     for s in b.drop_locals.clone() {
         if !params.contains(&s) {
             b.push(Stmt::DropFlagInit(s));
+            b.set_drop_flag(s, false);
         }
     }
 
     let tail = lower_block(&mut b, &f.body);
     if !b.is_terminated() {
         // Fall-through end of the body: if the trailing value moves an owned local out (the
-        // function returns it), null that local's slot so the exit cleanup frees null — the
-        // caller now owns the buffer — then drop the remaining owned locals.
+        // function returns it), clear that local's slot and flag — the caller now owns the value —
+        // then conditionally drop the remaining owned locals.
         if f.ret != Ty::Unit
             && let Some(v) = &f.body.value {
                 null_moved_source(&mut b, v);
@@ -1640,6 +1683,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
             };
             if moved {
                 b.push(Stmt::DropFlagInit(*id));
+                b.set_drop_flag(*id, false);
             }
         }
         hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
@@ -1683,6 +1727,24 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
+    }
+}
+
+/// Capture the runtime ownership bit forwarded by a direct local move. This is read before
+/// [`null_moved_source`] clears the source, so a destination reached after an Arena/heap join
+/// inherits the exact path's provenance instead of the escape lattice's conservative joined region.
+fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
+    match &e.kind {
+        hir::ExprKind::Local(id) => {
+            let flag = b.drop_flags.get(*id as usize).copied().flatten()?;
+            let live = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(live, Rvalue::Load(flag)));
+            Some(Operand::Value(live))
+        }
+        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
+            blk.value.as_ref().and_then(|v| moved_drop_flag(b, v))
+        }
+        _ => None,
     }
 }
 
@@ -1743,32 +1805,55 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         b.set_span(sp);
     }
     match s {
-        hir::Stmt::Let { local, init } => match &init.kind {
-            // A struct literal initializes its slot field by field; there is no scalar value to
-            // bind. A nested struct-literal field is expanded in place (its leaves stored at the
-            // extended path), so no intermediate struct value is materialized.
-            hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
-            // An array literal stores its elements into the slot.
-            hir::ExprKind::ArrayLit { elems, elem } => store_array_elems(b, *local, elems, *elem),
-            _ => {
-                let op = lower_expr(b, init);
-                b.push(Stmt::Store(*local, op));
-                // If the initializer moved an owned local, null its slot (drop-flag).
-                null_moved_source(b, init);
+        hir::Stmt::Let { local, init } => {
+            let mut inherited_flag = None;
+            match &init.kind {
+                // A struct literal initializes its slot field by field; there is no scalar value to
+                // bind. A nested struct-literal field is expanded in place (its leaves stored at the
+                // extended path), so no intermediate struct value is materialized.
+                hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
+                // An array literal stores its elements into the slot.
+                hir::ExprKind::ArrayLit { elems, elem } => store_array_elems(b, *local, elems, *elem),
+                _ => {
+                    let op = lower_expr(b, init);
+                    if b.is_terminated() {
+                        return;
+                    }
+                    inherited_flag = moved_drop_flag(b, init);
+                    b.push(Stmt::Store(*local, op));
+                    // If the initializer moved an owned local, clear its storage and runtime flag.
+                    null_moved_source(b, init);
+                }
             }
-        },
-        hir::Stmt::Assign { local, value, drop_old } => {
+            match inherited_flag {
+                Some(flag) => b.set_drop_flag_operand(*local, flag),
+                None => b.set_drop_flag(*local, b.drop_individual_locals.contains(local)),
+            }
+        }
+        hir::Stmt::Assign { local, value, drop_old, drop_new } => {
             // Compute the new value first (the RHS may read the old). Then, if reassigning an owned
             // local whose old value the RHS did not move out (`drop_old`, set by sema's move
-            // analysis), free the buffer being overwritten — else it leaks. `drop_locals` excludes
-            // arena-owned locals (the arena bulk-frees those). The slot is a valid buffer or null
-            // (a prior move / the entry `DropFlagInit`), so the drop frees once or no-ops.
+            // analysis), conditionally free the buffer being overwritten — else it leaks. The
+            // runtime flag distinguishes an individually owned old value from arena-owned, moved,
+            // or uninitialised paths.
             let op = lower_expr(b, value);
-            if drop_old.get() && b.drop_locals.contains(local) {
-                b.push(Stmt::Drop(*local));
+            if b.is_terminated() {
+                return;
             }
-            b.push(Stmt::Store(*local, op));
+            let inherited_flag = moved_drop_flag(b, value);
+            if drop_old.get() && b.drop_locals.contains(local) {
+                b.emit_drop_if_live(*local);
+            }
+            // Clear a moved RHS source while its value is already captured in `op`, then install
+            // the replacement and its path-specific ownership bit. Doing this before the store
+            // also makes the degenerate `s = s` preserve the captured value rather than nulling the
+            // just-written destination.
             null_moved_source(b, value);
+            b.push(Stmt::Store(*local, op));
+            match inherited_flag {
+                Some(flag) => b.set_drop_flag_operand(*local, flag),
+                None => b.set_drop_flag(*local, drop_new.get()),
+            }
         }
         hir::Stmt::AssignField { root, path, value } => {
             // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
@@ -1978,13 +2063,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if let Some(e) = value {
                 null_moved_source(b, e);
             }
-            // Drop this iteration's per-iteration owned locals (null-resetting so the function-exit
-            // cleanup — these are still in `drop_locals` — frees null, not the freed buffer). The
-            // moved-out `break` value was already nulled, so its `Drop` is a no-op. Sema forbids a
+            // Conditionally drop this iteration's owned locals and clear their flags, so function
+            // cleanup cannot drop the same values again. A moved-out `break` value already has a
+            // clear flag. Sema forbids a
             // `break` inside an `arena`/`task_group` nested in the loop, so no region unwinding here.
             for s in &iter_drops {
-                b.push(Stmt::Drop(*s));
-                b.push(Stmt::DropFlagInit(*s));
+                b.emit_drop_if_live(*s);
             }
             let exit = b.loops.last().unwrap().exit;
             b.terminate(Term::Goto(exit));
@@ -1992,6 +2076,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         hir::Stmt::LetTuple { locals, init, .. } => {
             // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
             let tup = lower_expr(b, init);
+            let inherited_flag = moved_drop_flag(b, init);
             // If the tuple was built from owned source locals (`(x, y) := (a, b)`), null them: the
             // destructure targets now own the buffers, so the source slots must not also free them.
             null_moved_source(b, init);
@@ -2001,6 +2086,10 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     let v = b.fresh_value(ety);
                     b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: tup.clone(), index: i as u32 }));
                     b.push(Stmt::Store(*lid, Operand::Value(v)));
+                    match inherited_flag.clone() {
+                        Some(flag) => b.set_drop_flag_operand(*lid, flag),
+                        None => b.set_drop_flag(*lid, b.drop_individual_locals.contains(lid)),
+                    }
                 }
             }
         }
@@ -7374,10 +7463,14 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     }
     let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
     let scrut = lower_expr(b, scrutinee);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
+    let scrut_flag = moved_drop_flag(b, scrutinee);
     let join_bb = b.new_block();
     match scrutinee.ty {
-        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, result_slot, join_bb, scrutinee),
-        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, result_slot, join_bb, scrutinee),
+        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, (result_slot, join_bb), scrutinee, scrut_flag),
+        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, (result_slot, join_bb), scrutinee, scrut_flag),
         // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
@@ -7394,7 +7487,8 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
 
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
-fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId, scrutinee: &hir::Expr) {
+fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
+    let (result_slot, join_bb) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -7402,7 +7496,7 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
     let bind_payload = |b: &mut Builder, arm: &hir::MatchArm| {
         if let [v] = arm.variants[..] {
             for (slot, &local) in arm.bindings.iter().enumerate() {
-                bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
+                bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() }, scrut_flag.clone());
             }
         }
     };
@@ -7447,7 +7541,8 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
 /// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
 /// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
 /// (matching `match_variants`); either side may be the `_` wildcard.
-fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId, scrutinee: &hir::Expr) {
+fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
+    let (result_slot, join_bb) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
@@ -7466,7 +7561,7 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
     let neg_bb = b.new_block();
     b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
     b.cur = pos_bb;
-    bind_binary(b, ty, true, pos, scrut);
+    bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
     // Binding an owned payload (Ok/Some) moves it out of the scrutinee; null the scrutinee so its
     // exit `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
     if !pos.bindings.is_empty() {
@@ -7474,7 +7569,7 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
     }
     finish_arm(b, &pos.body, result_slot, join_bb);
     b.cur = neg_bb;
-    bind_binary(b, ty, false, neg, scrut);
+    bind_binary(b, ty, false, neg, scrut, scrut_flag);
     if !neg.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
@@ -7483,7 +7578,7 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
 /// None (and any `_` wildcard) binds nothing.
-fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand) {
+fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand, scrut_flag: Option<Operand>) {
     // A wildcard / or-pattern arm binds nothing (no bindings); only a single Some/Ok/Err arm does.
     if arm.bindings.is_empty() {
         return;
@@ -7494,15 +7589,19 @@ fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut
         (Ty::Result(..), false) => Rvalue::ResultUnwrapErr(scrut.clone()),
         _ => return,
     };
-    bind_local(b, arm.bindings[0], rv);
+    bind_local(b, arm.bindings[0], rv, scrut_flag);
 }
 
 /// Compute an rvalue into a fresh value and store it into a binding local's slot.
-fn bind_local(b: &mut Builder, local: u32, rv: Rvalue) {
+fn bind_local(b: &mut Builder, local: u32, rv: Rvalue, inherited_flag: Option<Operand>) {
     let pty = b.slots[local as usize];
     let pv = b.fresh_value(pty);
     b.push(Stmt::Let(pv, rv));
     b.push(Stmt::Store(local, Operand::Value(pv)));
+    match inherited_flag {
+        Some(flag) => b.set_drop_flag_operand(local, flag),
+        None => b.set_drop_flag(local, b.drop_individual_locals.contains(&local)),
+    }
 }
 
 /// Lower an arm body and, unless it diverged, store the value into the result slot and jump to join.
@@ -7610,7 +7709,7 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     Operand::Value(v)
 }
 
-/// The free-standing owned locals (a subset of `drop_locals`) declared inside a loop body — its
+/// The owned locals (a subset of `drop_locals`) declared inside a loop body — its
 /// per-iteration locals, dropped each pass. Taken from the loop's `body_locals` range (every local
 /// declared anywhere in the body, recorded by sema; see `hir::ExprKind::Loop`), intersected with
 /// `drop_locals` in declaration order — no fragile per-`ExprKind` walk that could miss a `let`
@@ -7621,8 +7720,8 @@ fn loop_iter_drops(b: &Builder, body_locals: &std::ops::Range<u32>) -> Vec<Slot>
 
 /// `loop { ... }` — a header block, the body, a back-edge to the header, and an exit block that
 /// `break` targets. The loop's value is stored into `result_slot` at each `break` and loaded at the
-/// exit. Per-iteration owned locals are dropped (and null-reset) at the back-edge and at each `break`
-/// so a per-iteration allocation is freed once per pass. A loop with no `break` (`diverges`) never
+/// exit. Live per-iteration owned locals are conditionally dropped at the back-edge and each `break`
+/// so an individually owned allocation is freed once per pass. A loop with no `break` (`diverges`) never
 /// reaches its exit — the header always loops back — so the exit is `Unreachable`.
 ///
 /// `#[inline(never)]` and reached through a bindings-free `lower_expr` arm (taking `e`, destructured
@@ -7642,12 +7741,11 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     b.cur = header;
     b.loops.push(LoopFrame { exit, result_slot, iter_drops: iter_drops.clone() });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
-    // Fall-through end of an iteration: drop this pass's per-iteration owned locals (null-resetting
-    // so the next pass — or a path that never re-allocated — frees null), then loop back.
+    // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
+    // and clear their flags, then loop back.
     if !b.is_terminated() {
         for s in &iter_drops {
-            b.push(Stmt::Drop(*s));
-            b.push(Stmt::DropFlagInit(*s));
+            b.emit_drop_if_live(*s);
         }
         b.terminate(Term::Goto(header));
     }
