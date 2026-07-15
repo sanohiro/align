@@ -2998,7 +2998,7 @@ pub fn check_program_with_effects(
             loop_borrow_breaks: Vec::new(),
         }
         .check();
-        let region = {
+        let (region, drop_individual) = {
             let mut ec = EscapeCheck {
                 f,
                 diags,
@@ -3006,37 +3006,38 @@ pub fn check_program_with_effects(
                 structs,
                 state: EscapeState::default(),
                 drop_region: std::collections::HashMap::new(),
+                drop_individual: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 task_group_regions: Vec::new(),
                 loop_break_states: Vec::new(),
             };
             ec.check();
-            ec.drop_region
+            (ec.drop_region, ec.drop_individual)
         };
-        // Every free-standing owned `array<T>` (region `Static`) is dropped at every function
-        // exit. Arena-allocated ones (region `Arena(k)`) are bulk-freed by the arena, so they
-        // are excluded. A moved-out local stays in this set, but MIR nulls its slot at the move
-        // site (null-on-move drop flag), so its exit `Drop` is a no-op `free(null)` — no
-        // double-free, and the path where it is *not* moved is still freed (no leak).
+        // Every resource-owning local gets a path-local MIR drop flag. The flag is set after a
+        // write iff that path installed an individually owned value, and cleared for arena values,
+        // moves, and uninitialised paths. This lets one slot safely hold Arena and Static values on
+        // different paths without either freeing arena memory or leaking heap memory.
         let drops: Vec<LocalId> = f
             .locals
             .iter()
             .filter(|l| is_owned_droppable(l.ty, structs) || ty_tuple_is_move(l.ty, tuples))
-            // Drop at function exit unless the value lives in an arena (region `Arena(k)`), which
-            // bulk-frees it. A `Static` (heap-owned) *or* `Frame`-region owned local (a Move-struct
-            // array, whose owned buffers die at this frame's exit — Slice 4b) is dropped here.
-            // Exception: a `chunks` result (`DynSliceArray`) is *always* heap-`malloc`'d (never
-            // arena memory — `align_rt_chunks` uses the general allocator), so it must be dropped
-            // even when its **region** is `Arena(k)`. Its region tracks the *borrowed source* array
-            // (so it can't escape that arena), not where its own header buffer lives — decoupled
-            // here so a chunks bound inside an arena is freed rather than leaked.
-            .filter(|l| {
-                matches!(l.ty, Ty::DynSliceArray(_))
-                    || !matches!(region.get(&l.id).copied().unwrap_or(Region::Static), Region::Arena(_))
-            })
             .map(|l| l.id)
             .collect();
+        let individual: Vec<LocalId> = drops
+            .iter()
+            .copied()
+            .filter(|id| {
+                let ty = f.locals[*id as usize].ty;
+                // A chunks header is always malloc-owned; its Region tracks the borrowed source.
+                matches!(ty, Ty::DynSliceArray(_))
+                    || drop_individual.get(id).copied().unwrap_or_else(|| {
+                        !matches!(region.get(id).copied().unwrap_or(Region::Static), Region::Arena(_))
+                    })
+            })
+            .collect();
         f.drop_locals = drops;
+        f.drop_individual_locals = individual;
     }
     // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11). Cross-unit
     // callees (interface-only dependencies' non-generic `pub` fns) take their effect from
@@ -4030,6 +4031,10 @@ struct EscapeCheck<'a> {
     /// declarations from diverging branches: their exit path still needs the right arena-vs-heap
     /// cleanup even though the branch contributes nothing to a later control-flow join.
     drop_region: std::collections::HashMap<LocalId, Region>,
+    /// Whether each owned declaration installs an individually dropped value. Kept separate from
+    /// escape Region because an owned call result is heap-owned even when its borrowed arguments
+    /// conservatively shorten `region_of(Call)`.
+    drop_individual: std::collections::HashMap<LocalId, bool>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
     /// Region of each active `task_group`, innermost last. A spawned closure may execute as late as
@@ -4216,6 +4221,36 @@ impl<'a> EscapeCheck<'a> {
     /// mirroring the region pass-through `tracks_region` already gives a `str` payload.
     fn region_bearing(&self, ty: Ty) -> bool {
         self.tracks_region(ty) || self.mentions_slice(ty)
+    }
+
+    /// Whether an owned expression's storage is individually released rather than arena-bulk
+    /// released. This is allocation provenance, deliberately separate from borrow/escape Region.
+    fn drop_is_individual(&self, e: &Expr, depth: u32) -> bool {
+        if matches!(e.ty, Ty::DynSliceArray(_)) {
+            return true;
+        }
+        match &e.kind {
+            // A callee cannot return arena-owned storage across its function boundary, even when
+            // `region_of(Call)` is shortened by an arena-borrowing argument.
+            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
+            ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner)
+            | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_ref()
+                .is_none_or(|value| self.drop_is_individual(value, depth)),
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
+                .value
+                .as_ref()
+                .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
+            // A Move struct's Drop releases its owned fields; borrowed fields may shorten the
+            // struct's escape Region but do not change those fields' allocation provenance.
+            ExprKind::StructLit { .. } if matches!(e.ty, Ty::Struct(_)) => true,
+            _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
+        }
     }
 
     /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
@@ -4986,6 +5021,12 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Let { local, init } => {
                 self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
+                if is_owned_droppable(init.ty, self.structs)
+                    || ty_tuple_is_move(init.ty, self.tuples)
+                {
+                    self.drop_individual
+                        .insert(*local, self.drop_is_individual(init, depth));
+                }
                 if self.region_bearing(init.ty) {
                     let mut r = self.region_of(init, depth);
                     // A Move-struct array is a *frame* slot whose elements' heap buffers are freed
@@ -5032,19 +5073,14 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::AssignVecLane { value, .. } => self.walk(value, depth),
-            Stmt::Assign { local, value, drop_old } => {
+            Stmt::Assign { local, value, drop_new, .. } => {
                 self.walk(value, depth);
-                // The value being *overwritten* is dropped here (the move pass set `drop_old`). But
-                // if it lived in an arena, its buffer is bump-allocated and bulk-freed by the arena
-                // — never individually. Freeing it here would corrupt the allocator (an interior
-                // arena pointer passed to `free`, then freed again by the arena's bulk reset — the
-                // observed double-free). The move pass has no region facts, so clear `drop_old` here
-                // (this pass owns them). The *new* value's own drop is still handled correctly by
-                // its region: a `Static` heap array keeps its exit drop; another arena value stays
-                // bulk-freed. Checked before the region map is updated below, so it reads the region
-                // of the value being replaced, not the replacement.
-                if matches!(self.state.region.get(local).copied(), Some(Region::Arena(_))) {
-                    drop_old.set(false);
+                // Record allocation provenance separately from escape Region: region-free Move
+                // resources and owned call results are individual, while arena allocations are not.
+                if is_owned_droppable(value.ty, self.structs)
+                    || ty_tuple_is_move(value.ty, self.tuples)
+                {
+                    drop_new.set(self.drop_is_individual(value, depth));
                 }
                 // Assignment is a strong update on this path. Branch/loop joins below restore the
                 // conservative may-property when another reaching path still holds a local borrow.
@@ -5065,38 +5101,16 @@ impl<'a> EscapeCheck<'a> {
                     // frame is still caught by the return / struct-field-store checks. A deeper
                     // arena value assigned to a shallower binding stays rejected.
                     let target = Region::Frame.shorter(Region::arena(*self.decl_depth.get(local).unwrap_or(&0)));
-                    let old_r = self.state.region.get(local).copied().unwrap_or(Region::Static);
                     if !r.outlives(target) {
                         self.diags.error(
                             "this value is bound to an arena block and cannot escape it".to_string(),
                             value.span,
                         );
-                    } else if is_owned_droppable(value.ty, self.structs) && old_r != r {
-                        // Rule 1 (fail-closed v1): an *owned* Move local (array / string / buffer /
-                        // Move struct …) is individually dropped at scope end, and whether that drop
-                        // runs is decided by its function-wide region (a `Static` heap value is freed by
-                        // `drop_locals`; an `Arena` value is bulk-freed with the arena, never
-                        // individually). Cleanup is not path-sensitive, so a reassignment that
-                        // *changes* it — e.g. `Arena → Static` on a conditional path — would put
-                        // the binding into `drop_locals` even when a bypassed branch leaves it holding
-                        // the original arena pointer: the arena bulk-free plus the exit drop then
-                        // double-free it. There is no per-path drop flag yet, so pin the region at
-                        // initialization and reject any region-changing reassign. Same-region
-                        // reassignment (heap → heap, same-arena → same-arena) stays legal and keeps its
-                        // `drop_old` behavior. (A flow-sensitive relaxation — per-path drop flags via
-                        // MIR dataflow — is the recorded future slice.)
-                        self.diags.error(
-                            "reassigning this binding changes the value's memory region (e.g. arena vs \
-                             heap); a `mut` binding's region is fixed at its initialization — use a \
-                             separate binding, or allocate the new value in the same region"
-                                .to_string(),
-                            value.span,
-                        );
                     } else {
                         // Assignment is a strong update on this path. A later control-flow join takes
                         // the shorter region from all reaching paths, while a straight-line overwrite
-                        // can precisely replace an obsolete shorter-lived view. Owned Move locals
-                        // never reach here on a region change: Rule 1 above rejects them.
+                        // can precisely replace an obsolete shorter-lived view. Owned Move locals may
+                        // now change region: their path-local MIR flag keeps cleanup provenance exact.
                         self.state.region.insert(*local, r);
                     }
                 }
@@ -5131,6 +5145,20 @@ impl<'a> EscapeCheck<'a> {
             // region, so the tuple's region is exact; per-element regions are a later refinement.)
             Stmt::LetTuple { locals, init, .. } => {
                 self.walk(init, depth);
+                let individual = self.drop_is_individual(init, depth);
+                for local in locals.iter().flatten() {
+                    if self
+                        .f
+                        .locals
+                        .get(*local as usize)
+                        .is_some_and(|l| {
+                            is_owned_droppable(l.ty, self.structs)
+                                || ty_tuple_is_move(l.ty, self.tuples)
+                        })
+                    {
+                        self.drop_individual.insert(*local, individual);
+                    }
+                }
                 if self.region_bearing(init.ty) {
                     let r = self.region_of(init, depth);
                     for l in locals.iter().flatten() {
@@ -5313,6 +5341,7 @@ impl<'a> EscapeCheck<'a> {
                 let scrutinee_region = self
                     .region_bearing(scrutinee.ty)
                     .then(|| self.region_of(scrutinee, depth));
+                let scrutinee_individual = self.drop_is_individual(scrutinee, depth);
                 let scrutinee_local_slice =
                     self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
                 let mut joined: Option<EscapeState> = None;
@@ -5320,6 +5349,17 @@ impl<'a> EscapeCheck<'a> {
                     self.state = incoming.clone();
                     for binding in &a.bindings {
                         self.decl_depth.insert(*binding, depth);
+                        if self
+                            .f
+                            .locals
+                            .get(*binding as usize)
+                            .is_some_and(|l| {
+                                is_owned_droppable(l.ty, self.structs)
+                                    || ty_tuple_is_move(l.ty, self.tuples)
+                            })
+                        {
+                            self.drop_individual.insert(*binding, scrutinee_individual);
+                        }
                         if let Some(region) = scrutinee_region {
                             self.state.region.insert(*binding, region);
                             self.drop_region.insert(*binding, region);
@@ -6905,7 +6945,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_borrow(*local, init);
                     clear_moved(moved, *local);
                 }
-                Stmt::Assign { local, value, drop_old } => {
+                Stmt::Assign { local, value, drop_old, .. } => {
                     let was_moved = whole_moved(moved, *local);
                     self.expr(value, moved, true, true);
                     // The RHS consumed the old value iff it just transitioned the local live→moved
@@ -8335,6 +8375,7 @@ impl<'a, 't> Checker<'a, 't> {
             body,
             span: f.span,
             drop_locals: Vec::new(),
+            drop_individual_locals: Vec::new(),
             exportable: false,
         }
     }
@@ -8494,7 +8535,12 @@ impl<'a, 't> Checker<'a, 't> {
                                 Ty::Str => self.check_str_init(value),
                                 _ => self.check_expr(value, Some(ty)),
                             };
-                            stmts.push(Stmt::Assign { local: id, value: v, drop_old: std::cell::Cell::new(false) });
+                            stmts.push(Stmt::Assign {
+                                local: id,
+                                value: v,
+                                drop_old: std::cell::Cell::new(false),
+                                drop_new: std::cell::Cell::new(false),
+                            });
                         }
                     }
                     Place::Field { root, path, ty } => {
@@ -11996,6 +12042,7 @@ impl<'a, 't> Checker<'a, 't> {
             body: body_fin,
             span,
             drop_locals: Vec::new(),
+            drop_individual_locals: Vec::new(),
             exportable: false,
         });
 

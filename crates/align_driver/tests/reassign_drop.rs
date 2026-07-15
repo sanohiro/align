@@ -3,12 +3,11 @@
 //! noted as deferred by Slice 3 of `docs/impl/08-nested-structs.md`.
 //!
 //! The decision is made by sema's move analysis (the authority on whether the RHS consumed the old
-//! value) and carried to MIR on `Stmt::Assign::drop_old`: the old value is dropped *iff* the RHS did
-//! not move it out. So `s = f(s)` / `s = s` (RHS consumes `s` — ownership transferred) emit no drop
-//! (no double-free), while `s = "b".clone()` / `s = other` / `s = make(s.len())` (RHS does not move
-//! `s`) do (no leak). A *leak* can't be observed from a return value, so the leak-fix direction is
-//! pinned by asserting on the emitted MIR; the no-double-free direction is pinned by running the
-//! program (a wrong/extra free corrupts the allocator and aborts the process).
+//! value) and carried to MIR on `Stmt::Assign::drop_old`. MIR conditionally drops the old value when
+//! its path-local flag says the slot is individually owned; arena-owned, moved, and uninitialised
+//! paths skip it. The replacement updates that flag, and direct moves transfer it to the destination.
+//! A *leak* can't be observed from a return value, so the leak-fix direction is pinned by asserting
+//! on the emitted MIR; the no-double-free direction is pinned by running the program.
 
 mod common;
 use common::*;
@@ -88,6 +87,30 @@ fn mir_no_drop_for_scalar_reassign() {
 }
 
 #[test]
+fn region_free_move_resource_reassign_keeps_the_new_flag_live() {
+    // A builder has no escape Region, but it is still an individually owned Move resource. Both
+    // its declaration and replacement must set the flag so the unfinished replacement is dropped.
+    let text = mir_text("fn main() -> i32 {\n  mut b := builder()\n  b.write(\"old\")\n  b = builder()\n  b.write(\"new\")\n  return 0\n}\n");
+    let main = main_fn(&text);
+    assert!(
+        main.lines().filter(|line| line.contains("_1 <- true")).count() >= 2,
+        "both builder writes must be individually owned:\n{main}"
+    );
+}
+
+#[test]
+fn owned_call_result_stays_individual_with_an_arena_borrow_argument() {
+    // Escape Region conservatively follows the arena-backed argument, but the callee cannot return
+    // arena storage across its function boundary. The returned string is heap-owned on both writes.
+    let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    source := \"a\" + \"b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
+    let main = main_fn(&text);
+    assert!(
+        main.lines().filter(|line| line.contains("_2 <- true")).count() >= 2,
+        "owned call results must not inherit an argument's arena allocation mode:\n{main}"
+    );
+}
+
+#[test]
 fn reassign_string_runtime_no_double_free() {
     if !backend_available() {
         return;
@@ -120,52 +143,74 @@ fn reassign_consuming_runtime_no_double_free() {
     assert_eq!(build_and_run("reassign-consume", src).status.code(), Some(4));
 }
 
-/// Whether `src` is rejected by sema with the region-change reassignment diagnostic (Rule 1).
-fn rejects_region_change(src: &str) -> bool {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, "reassign.align", src);
-    if !checked.diags.has_errors() {
-        return false;
+#[test]
+fn arena_to_heap_reassign_sets_a_path_local_drop_flag() {
+    // `xs` starts arena-owned (flag false). Only the conditional reassign installs a heap value
+    // (flag true), so the shared exit conditionally drops it without ever freeing the arena pointer.
+    let text = mir_text("fn make() -> array<i64> = [1, 2, 3].to_array()\nfn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    if xs[0] > 100 { xs = make() }\n  }\n  return 0\n}\n");
+    let main = main_fn(&text);
+    assert!(main.contains("_1 <- false"), "arena path must clear the flag:\n{main}");
+    assert!(main.contains("_1 <- true"), "heap replacement must set the flag:\n{main}");
+    assert!(main.contains("drop _0"), "the true flag edge must drop the slot:\n{main}");
+}
+
+#[test]
+fn arena_to_heap_reassign_runs_on_taken_and_bypassed_paths() {
+    if !backend_available() {
+        return;
     }
-    align_driver::format_diagnostics(&sm, &checked.diags).contains("changes the value's memory region")
+    let src = |cond| format!("fn make() -> array<i64> = [7, 8, 9].to_array()\nfn main() -> i32 {{\n  arena {{\n    mut xs := [3, 4].to_array()\n    if {cond} {{ xs = make() }}\n    return xs[0] as i32\n  }}\n}}\n");
+    assert_eq!(build_and_run("arena-heap-taken", &src("true")).status.code(), Some(7));
+    assert_eq!(build_and_run("arena-heap-bypassed", &src("false")).status.code(), Some(3));
 }
 
 #[test]
-fn arena_owned_array_reassign_region_change_rejected() {
-    // An arena-allocated owned array reassigned with a *heap* (`Static`) value is a region change
-    // (`Arena -> Static`). The old value is arena-bump memory (bulk-freed with the arena, never
-    // individually); flow-insensitively upgrading `xs` to `Static` would enter it into `drop_locals`
-    // and — on a bypassed branch that still holds the arena pointer — double-free it (the observed
-    // `double free or corruption`). Rule 1 pins a `mut` binding's region at init and rejects this.
-    // Both the conditional shape (the actual crash) and the unconditional shape are rejected.
-    let cond = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
-fn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    if xs[0] > 100 { xs = make() }\n  }\n  return 0\n}\n";
-    let uncond = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
-fn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    xs = make()\n  }\n  return 0\n}\n";
-    assert!(rejects_region_change(cond), "conditional Arena->Static reassign must be a sema error");
-    assert!(rejects_region_change(uncond), "unconditional Arena->Static reassign must be a sema error");
+fn joined_region_move_transfers_the_runtime_drop_flag() {
+    if !backend_available() {
+        return;
+    }
+    // After the `if`, escape analysis conservatively joins `xs` to Arena, but its runtime value may
+    // be heap-owned. Moving it into `ys` must copy the flag before clearing `xs`, not recompute the
+    // destination from that joined region.
+    let src = |cond| format!("fn make() -> array<i64> = [7, 8, 9].to_array()\nfn main() -> i32 {{\n  arena {{\n    mut xs := [3, 4].to_array()\n    if {cond} {{ xs = make() }}\n    ys := xs\n    return ys[0] as i32\n  }}\n}}\n");
+    assert_eq!(build_and_run("joined-move-heap", &src("true")).status.code(), Some(7));
+    assert_eq!(build_and_run("joined-move-arena", &src("false")).status.code(), Some(3));
 }
 
 #[test]
-fn arena_owned_array_reassign_region_change_rejected_in_loop() {
-    // Rule 1 fires the same inside a `loop` body: an arena binding reassigned with a heap value on
-    // any iteration would be a region change (and, in a loop, an unbounded leak/double-free). The
-    // two-pass loop-back MoveCheck (#402) does not exempt it.
+fn match_payload_binding_inherits_a_joined_scrutinee_flag() {
+    if !backend_available() {
+        return;
+    }
+    // Match payload bindings are another ownership-transfer site: the bound `xs` must inherit the
+    // mixed Result local's runtime bit before the scrutinee is cleared.
+    let src = |cond| format!("fn make() -> array<i64> = [7, 8, 9].to_array()\nfn main() -> i32 {{\n  arena {{\n    mut r: Result<array<i64>, i64> := Ok([3, 4].to_array())\n    if {cond} {{ r = Ok(make()) }}\n    return match r {{\n      Ok(xs) => xs[0] as i32\n      Err(_) => 0\n    }}\n  }}\n}}\n");
+    assert_eq!(build_and_run("joined-match-heap", &src("true")).status.code(), Some(7));
+    assert_eq!(build_and_run("joined-match-arena", &src("false")).status.code(), Some(3));
+}
+
+#[test]
+fn arena_to_heap_reassign_in_loop_drops_each_heap_replacement() {
+    if !backend_available() {
+        return;
+    }
+    // The first iteration replaces arena memory (skip old drop); later iterations replace heap
+    // memory (drop old), and the final heap value is dropped at function exit.
     let src = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
-fn main() -> i32 {\n  arena {\n    mut xs := [10, 20].to_array()\n    mut i := 0\n    loop {\n      if i >= 3 { break 0 }\n      xs = make()\n      i = i + 1\n    }\n  }\n  return 0\n}\n";
-    assert!(rejects_region_change(src), "a region-changing reassign in a loop body must be a sema error");
+fn main() -> i32 {\n  arena {\n    mut xs := [10, 20].to_array()\n    mut i := 0\n    loop {\n      if i >= 3 { break 0 }\n      xs = make()\n      i = i + 1\n    }\n    return xs[0] as i32\n  }\n}\n";
+    assert_eq!(build_and_run("arena-heap-loop", src).status.code(), Some(1));
 }
 
 #[test]
-fn same_arena_owned_array_reassign_no_drop_in_mir() {
-    // Same-region reassignment stays legal: an arena binding reassigned with another *same-arena*
-    // owned array is not a region change (`Arena -> Arena`), so it keeps its `drop_old` suppression
-    // (arena memory is bulk-freed) — no reassign-drop, and no exit drop either (the final value is
-    // still arena memory, freed by the arena, never by `drop_locals`).
+fn same_arena_owned_array_keeps_drop_flag_clear() {
+    // Both writes are arena-owned. Conditional drop edges exist for the slot, but no path sets its
+    // flag, so neither the overwrite nor exit executes an individual free.
     let text = mir_text(
         "fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].to_array()\n    xs = [3, 4, 5].to_array()\n    print(xs[0])\n  }\n  return 0\n}\n",
     );
-    assert_eq!(count_slot_drops(&text, "_0"), 0, "no reassign-drop and no exit drop for arena memory:\n{text}");
+    let main = main_fn(&text);
+    assert!(!main.contains("_1 <- true"), "arena writes must never set the flag:\n{main}");
+    assert!(main.contains("_1 <- false"), "arena writes must keep the flag clear:\n{main}");
 }
 
 #[test]
@@ -180,13 +225,35 @@ fn same_arena_owned_array_reassign_runtime_no_double_free() {
 }
 
 #[test]
+fn heap_to_arena_reassign_drops_old_heap_and_skips_final_arena_value() {
+    if !backend_available() {
+        return;
+    }
+    // A binding declared inside the arena may start with a callee-returned heap array and then hold
+    // arena memory. The old heap value is individually freed; the replacement is bulk-freed only.
+    let src = "fn make() -> array<i64> = [1, 2, 3].to_array()\nfn main() -> i32 {\n  arena {\n    mut xs := make()\n    xs = [9, 8].to_array()\n    return xs[0] as i32\n  }\n}\n";
+    assert_eq!(build_and_run("heap-arena-reassign", src).status.code(), Some(9));
+}
+
+#[test]
+fn owned_self_assign_preserves_the_value_and_drop_flag() {
+    if !backend_available() {
+        return;
+    }
+    // Lowering captures the RHS before clearing the moved source, then restores both the value and
+    // its ownership flag. Nulling after the store would replace the destination with `{null, 0}`.
+    let src = "fn main() -> i32 {\n  mut s := \"hello\".clone()\n  s = s\n  return s.len() as i32\n}\n";
+    assert_eq!(build_and_run("owned-self-assign", src).status.code(), Some(5));
+}
+
+#[test]
 fn heap_owned_array_reassign_in_loop_runtime_no_double_free() {
     if !backend_available() {
         return;
     }
     // Heap -> heap is same-region (`Static -> Static`): legal, and the overwritten buffer is freed
-    // once per reassign (a reassign-drop). Inside a `loop` body this exercises Rule 1's legal path
-    // against the loop-back MoveCheck. After 3 iterations `xs` holds `make(2)`, so `xs[0]` = 2.
+    // once per reassign (a conditional reassign-drop). Inside a `loop` body this exercises flag
+    // updates against the loop-back MoveCheck. After 3 iterations `xs` holds `make(2)`, so `xs[0]` = 2.
     let src = "fn make(n: i64) -> array<i64> = [n, n, n].to_array()\n\
 fn main() -> i32 {\n  mut xs := make(1)\n  mut i := 0\n  loop {\n    if i >= 3 { break 0 }\n    xs = make(i)\n    i = i + 1\n  }\n  return xs[0] as i32\n}\n";
     assert_eq!(build_and_run("heap-loop-reassign", src).status.code(), Some(2));
