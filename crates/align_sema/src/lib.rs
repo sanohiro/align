@@ -3041,10 +3041,10 @@ pub fn check_program_with_effects(
         f.drop_locals = drops;
         f.drop_individual_locals = individual;
     }
-    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11). Cross-unit
-    // callees (interface-only dependencies' non-generic `pub` fns) take their effect from
-    // `external_effects`; fail-closed for an absent target.
-    check_parallelism(&program, external_effects, diags);
+    // Pass 4: refine the inferred effect bit carried by each function-value type, then enforce the
+    // `par_map` Pure requirement (`draft.md` §11). Cross-unit callees take their effect from
+    // `external_effects`; FFI and absent targets fail closed.
+    check_parallelism(&mut program, external_effects, diags);
     program
 }
 
@@ -3056,10 +3056,11 @@ pub fn check_program_with_effects(
 /// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
 /// as it stands.)
 fn check_parallelism(
-    program: &Program,
+    program: &mut Program,
     external_effects: &std::collections::HashMap<String, FnEffect>,
     diags: &mut Diagnostics,
 ) {
+    infer_fn_type_effects(program, external_effects);
     let EffectSets { impure, unknown, parmaps } = compute_effect_sets(program, external_effects);
     // The `par_map` function must be Pure.
     for (func, span) in parmaps {
@@ -3077,17 +3078,120 @@ fn check_parallelism(
     }
 }
 
-/// The three-valued effect classification of a function (the M15 per-`pub`-fn interface bit). The
-/// analysis distinguishes all three today: [`FnEffect::Impure`] = transitively performs an
-/// observable side effect (I/O); [`FnEffect::Unknown`] = transitively calls a function *value* whose
-/// effect is not statically known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a
-/// `par_map`/parallel boundary both `Impure` and `Unknown` are rejected (fail-closed); the split is
-/// kept because the M15 interface summary records it verbatim and the diagnostics differ.
+/// The shared three-valued effect classification stored in function-value types and M15 per-`pub`-fn
+/// interface summaries. [`FnEffect::Impure`] = transitively performs an observable side effect
+/// (I/O); [`FnEffect::Unknown`] = transitively calls a function value whose target is not statically
+/// known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a `par_map`/parallel boundary
+/// both `Impure` and `Unknown` are rejected (fail-closed); the split is kept because the interface
+/// summary records it verbatim and the diagnostics differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FnEffect {
     Pure,
     Impure,
     Unknown,
+}
+
+impl FnEffect {
+    /// Conservative union for a function value that may hold either target. A known Impure target
+    /// wins for diagnostics; otherwise any unresolved target keeps the result fail-closed.
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Impure, _) | (_, Self::Impure) => Self::Impure,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Pure, Self::Pure) => Self::Pure,
+        }
+    }
+}
+
+fn effects_by_name(program: &Program, sets: &EffectSets) -> std::collections::HashMap<String, FnEffect> {
+    program
+        .fns
+        .iter()
+        .map(|f| {
+            let effect = if sets.impure.contains(&f.name) {
+                FnEffect::Impure
+            } else if sets.unknown.contains(&f.name) {
+                FnEffect::Unknown
+            } else {
+                FnEffect::Pure
+            };
+            (f.name.clone(), effect)
+        })
+        .collect()
+}
+
+/// Infer the effect stored in every concrete function-value type. Named targets begin at the Pure
+/// bottom of the effect lattice; value origins then refine their own `FnTy`, local bindings join all
+/// assigned targets, and the call graph is recomputed until stable. Unknown function parameters and
+/// fail-closed external targets seed the non-Pure cases. Starting at the bottom also solves a cycle
+/// of otherwise-Pure function values as Pure instead of permanently pinning it Unknown.
+fn infer_fn_type_effects(
+    program: &mut Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) {
+    // A local needs its own effect cell: two unrelated values with the same ABI must not poison one
+    // another merely because source-level `fn(T) -> R` annotations omit the inferred effect.
+    let Program { fns, fn_types, .. } = program;
+    for f in fns {
+        for local in &mut f.locals {
+            if local.is_param {
+                continue; // a function-typed parameter has no statically known target
+            }
+            let Ty::Fn(fid) = local.ty else { continue };
+            let Some(ft) = fn_types.get(fid as usize) else { continue };
+            let (params, ret) = (ft.params.clone(), ft.ret);
+            let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
+            local.ty = Ty::Fn(fresh);
+        }
+    }
+
+    let mut known: std::collections::HashMap<String, FnEffect> = program
+        .fns
+        .iter()
+        .map(|f| (f.name.clone(), FnEffect::Pure))
+        .collect();
+    for _ in 0..=program.fns.len() {
+        refine_fn_value_types(program, &known, external_effects);
+        let next = effects_by_name(program, &compute_effect_sets(program, external_effects));
+        if next == known {
+            return;
+        }
+        known = next;
+    }
+}
+
+fn refine_fn_value_types(
+    program: &Program,
+    known: &std::collections::HashMap<String, FnEffect>,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+) {
+    let externs: std::collections::HashSet<&str> = program.externs.iter().map(|e| e.name.as_str()).collect();
+    // Recompute local joins from their declarations on every iteration; this permits a target to
+    // improve from Unknown to Pure after its own indirect calls have been refined.
+    for f in &program.fns {
+        for local in &f.locals {
+            if !local.is_param
+                && let Ty::Fn(fid) = local.ty
+                && let Some(ft) = program.fn_types.get(fid as usize)
+            {
+                ft.effect.set(FnEffect::Unknown);
+            }
+        }
+    }
+    for f in &program.fns {
+        let mut scan = EffectScan {
+            impure_direct: false,
+            unknown_indirect: false,
+            calls: Vec::new(),
+            parmaps: Vec::new(),
+            locals: &f.locals,
+            fn_types: &program.fn_types,
+            known_effects: Some(known),
+            external_effects,
+            externs: &externs,
+        };
+        scan.block(&f.body);
+    }
 }
 
 /// The transitive effect sets over the whole program's call graph, keyed by canonical function name.
@@ -3120,8 +3224,20 @@ fn compute_effect_sets(
     let mut direct_unknown: HashMap<&str, bool> = HashMap::new();
     let mut calls: HashMap<&str, Vec<String>> = HashMap::new();
     let mut parmaps: Vec<(String, Span)> = Vec::new();
+    let no_known_effects = None;
+    let externs: std::collections::HashSet<&str> = program.externs.iter().map(|e| e.name.as_str()).collect();
     for f in &program.fns {
-        let mut scan = EffectScan { impure_direct: false, unknown_indirect: false, calls: Vec::new(), parmaps: Vec::new() };
+        let mut scan = EffectScan {
+            impure_direct: false,
+            unknown_indirect: false,
+            calls: Vec::new(),
+            parmaps: Vec::new(),
+            locals: &f.locals,
+            fn_types: &program.fn_types,
+            known_effects: no_known_effects,
+            external_effects,
+            externs: &externs,
+        };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
         direct_unknown.insert(f.name.as_str(), scan.unknown_indirect);
@@ -3215,37 +3331,29 @@ pub fn fn_effects(
     program: &Program,
     external_effects: &std::collections::HashMap<String, FnEffect>,
 ) -> std::collections::HashMap<String, FnEffect> {
-    let EffectSets { impure, unknown, .. } = compute_effect_sets(program, external_effects);
-    program
-        .fns
-        .iter()
-        .map(|f| {
-            let e = if impure.contains(&f.name) {
-                FnEffect::Impure
-            } else if unknown.contains(&f.name) {
-                FnEffect::Unknown
-            } else {
-                FnEffect::Pure
-            };
-            (f.name.clone(), e)
-        })
-        .collect()
+    effects_by_name(program, &compute_effect_sets(program, external_effects))
 }
 
 /// Walks a function body to collect its directly-observable effect, the functions it calls (incl.
 /// pipeline stage/reducer functions), and any `par_map` callees. The match is exhaustive, so no
 /// call edge or effect node can be silently missed.
-struct EffectScan {
+struct EffectScan<'a> {
     impure_direct: bool,
-    /// An indirect call whose function-value target/effect is not encoded in `FnTy`. Sequential
-    /// code may execute it, but a Pure/parallel boundary must reject it until function types carry
-    /// an inferred effect bit.
+    /// An indirect call whose function-value type remains unresolved. Sequential code may execute
+    /// it, but a Pure/parallel boundary rejects it fail-closed.
     unknown_indirect: bool,
     calls: Vec<String>,
     parmaps: Vec<(String, Span)>,
+    locals: &'a [Local],
+    fn_types: &'a [hir::FnTy],
+    /// Present only during the type-refinement walk. The ordinary effect scan consumes the settled
+    /// `FnTy` bits and never propagates effects merely from taking a function's address.
+    known_effects: Option<&'a std::collections::HashMap<String, FnEffect>>,
+    external_effects: &'a std::collections::HashMap<String, FnEffect>,
+    externs: &'a std::collections::HashSet<&'a str>,
 }
 
-impl EffectScan {
+impl EffectScan<'_> {
     fn stage_funcs(&mut self, stages: &[Stage]) {
         for s in stages {
             match &s.kind {
@@ -3265,7 +3373,19 @@ impl EffectScan {
     fn block(&mut self, b: &Block) {
         for s in &b.stmts {
             match s {
-                Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } | Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
+                Stmt::Let { local, init } => {
+                    self.expr(init);
+                    if self.known_effects.is_some() {
+                        self.set_local_effect(*local, self.fn_value_effect(init), false);
+                    }
+                }
+                Stmt::Assign { local, value, .. } => {
+                    self.expr(value);
+                    if self.known_effects.is_some() {
+                        self.set_local_effect(*local, self.fn_value_effect(value), true);
+                    }
+                }
+                Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
                 Stmt::AssignIndex { index, value, .. }
                 | Stmt::AssignElemField { index, value, .. }
                 | Stmt::AssignElem { index, value, .. } => {
@@ -3279,6 +3399,69 @@ impl EffectScan {
         }
         if let Some(v) = &b.value {
             self.expr(v);
+        }
+    }
+
+    fn named_effect(&self, name: &str) -> FnEffect {
+        if self.externs.contains(name) {
+            return FnEffect::Impure; // all FFI is outside the safe Pure core
+        }
+        self.known_effects
+            .and_then(|effects| effects.get(name).copied())
+            .or_else(|| self.external_effects.get(name).copied())
+            .unwrap_or(FnEffect::Impure) // absent imported summary: fail closed
+    }
+
+    fn type_effect(&self, ty: Ty) -> FnEffect {
+        let Ty::Fn(fid) = ty else { return FnEffect::Unknown };
+        self.fn_types
+            .get(fid as usize)
+            .map(|ft| ft.effect.get())
+            .unwrap_or(FnEffect::Unknown)
+    }
+
+    fn block_value_effect(&self, block: &Block) -> FnEffect {
+        block
+            .value
+            .as_deref()
+            .map(|value| self.fn_value_effect(value))
+            .unwrap_or(FnEffect::Unknown)
+    }
+
+    /// Effect of invoking the function value produced by `expr`. Origins are resolved only in the
+    /// refinement walk and stored in `FnTy`; indirect-call consumers otherwise read the type bit.
+    fn fn_value_effect(&self, expr: &Expr) -> FnEffect {
+        match &expr.kind {
+            ExprKind::Local(id) => self
+                .locals
+                .get(*id as usize)
+                .map(|local| self.type_effect(local.ty))
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::If { then, els, .. } => self.block_value_effect(then).join(self.block_value_effect(els)),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .map(|arm| self.fn_value_effect(&arm.body))
+                .reduce(FnEffect::join)
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::Block(block) | ExprKind::Arena(block) | ExprKind::Unsafe(block) | ExprKind::TaskGroup(block) => {
+                self.block_value_effect(block)
+            }
+            _ => self.type_effect(expr.ty),
+        }
+    }
+
+    fn set_local_effect(&self, local: LocalId, incoming: FnEffect, join: bool) {
+        let Some(local) = self.locals.get(local as usize) else { return };
+        let Ty::Fn(fid) = local.ty else { return };
+        let Some(ft) = self.fn_types.get(fid as usize) else { return };
+        ft.effect.set(if join { ft.effect.get().join(incoming) } else { incoming });
+    }
+
+    fn consume_fn_value(&mut self, expr: &Expr) {
+        match self.fn_value_effect(expr) {
+            FnEffect::Pure => {}
+            FnEffect::Impure => self.impure_direct = true,
+            FnEffect::Unknown => self.unknown_indirect = true,
         }
     }
 
@@ -3341,26 +3524,31 @@ impl EffectScan {
                     self.expr(a);
                 }
             }
-            // Taking a function's address (`g := loud`) is not itself a call, but it exposes that
-            // function's effects to any later indirect call (`g(x)`) — which reaches `CallFnValue`
-            // with a `callee` whose target is not statically known. So record a call edge to the
-            // referenced function here: its impurity then propagates through the call graph, closing
-            // the `par_map`-purity bypass where an impure function is laundered through a fn value.
-            ExprKind::FnValue(name) => self.calls.push(name.clone()),
+            // Taking a function's address has no observable effect. During refinement, record the
+            // target's inferred effect in this concrete value's `FnTy`; invocation sites below
+            // consume that bit instead of manufacturing a name-based call edge here.
+            ExprKind::FnValue(name) => {
+                if self.known_effects.is_some()
+                    && let Ty::Fn(fid) = e.ty
+                    && let Some(ft) = self.fn_types.get(fid as usize)
+                {
+                    ft.effect.set(self.named_effect(name));
+                }
+            }
             ExprKind::Closure { lifted, captures } => {
-                // A capturing closure exposes its lifted body just like `FnValue(name)` exposes a
-                // named body. Dropping this edge launders an Impure lifted function through a local.
-                self.calls.push(lifted.clone());
+                if self.known_effects.is_some()
+                    && let Ty::Fn(fid) = e.ty
+                    && let Some(ft) = self.fn_types.get(fid as usize)
+                {
+                    ft.effect.set(self.named_effect(lifted));
+                }
                 for c in captures {
                     self.expr(c);
                 }
             }
             ExprKind::CallFnValue { callee, args } => {
-                // `FnTy` does not carry an effect yet, so a call through a local/parameter cannot
-                // prove Pure even when construction sites contribute known call edges. Fail closed
-                // only at a later `par_map` boundary; ordinary sequential HOF calls remain legal.
-                self.unknown_indirect = true;
                 self.expr(callee);
+                self.consume_fn_value(callee);
                 for a in args {
                     self.expr(a);
                 }
@@ -3886,6 +4074,7 @@ impl EffectScan {
             ExprKind::ResultMapErr { result, f } => {
                 self.expr(result);
                 self.expr(f);
+                self.consume_fn_value(f);
             }
             ExprKind::TupleIndex { recv, .. } => self.expr(recv),
             ExprKind::Index { recv, index } => {
@@ -8290,6 +8479,18 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Ty::FloatVar(v1)
             }
+            // The effect bit is inferred internal information, not source-level type syntax. Two
+            // function values are compatible when their callable signatures match; the value-flow
+            // pass later joins their effects in the destination local's function type.
+            (Ty::Fn(aid), Ty::Fn(bid))
+                if self
+                    .fn_types
+                    .get(aid as usize)
+                    .zip(self.fn_types.get(bid as usize))
+                    .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret) =>
+            {
+                Ty::Fn(aid)
+            }
             _ if a == b => a,
             _ => {
                 self.diags.error(
@@ -9421,7 +9622,7 @@ impl<'a, 't> Checker<'a, 't> {
         let ret = fn_sig_scalar(sig.ret);
         match (params, ret) {
             (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
-                let fid = intern_fn_type(self.fn_types, ps, r);
+                let fid = fresh_fn_type(self.fn_types, ps, r, FnEffect::Unknown);
                 let ty = Ty::Fn(fid);
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::FnValue(mangled), ty, span }
@@ -10232,7 +10433,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("a lambda value supports only scalar parameters and return type".to_string(), span);
             return err;
         };
-        let fid = intern_fn_type(self.fn_types, ps, r);
+        let fid = fresh_fn_type(self.fn_types, ps, r, FnEffect::Unknown);
         let ty = Ty::Fn(fid);
         self.constrain(ty, expected, span);
         // No captures → a plain function pointer (slice ②a). Captures → a closure carrying its
@@ -10294,7 +10495,7 @@ impl<'a, 't> Checker<'a, 't> {
         // The closure value (the `{thunk, env}` machinery is reused as-is; the lifted function may
         // return `Result` — the thunk just forwards it). Its `Ty::Fn` tag uses the `ok` scalar as
         // the return (a repr-only tag — a closure value is a pointer pair regardless).
-        let fid = intern_fn_type(self.fn_types, Vec::new(), ok);
+        let fid = fresh_fn_type(self.fn_types, Vec::new(), ok, FnEffect::Unknown);
         let cty = Ty::Fn(fid);
         let closure = if captures.is_empty() {
             Expr { kind: ExprKind::FnValue(name), ty: cty, span: arg.span }
@@ -19029,11 +19230,19 @@ fn intern_tuple(tuples: &mut Vec<hir::TupleDef>, elems: Vec<Scalar>) -> u32 {
 }
 
 fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scalar) -> u32 {
-    let ft = hir::FnTy { params, ret };
+    let ft = hir::FnTy { params, ret, effect: std::cell::Cell::new(FnEffect::Unknown) };
     if let Some(i) = fn_types.iter().position(|t| *t == ft) {
         return i as u32;
     }
     fn_types.push(ft);
+    (fn_types.len() - 1) as u32
+}
+
+/// Allocate a distinct function-value type for one concrete origin. Its signature remains
+/// structurally compatible with a source `fn(T) -> R` annotation, while its effect cell can be
+/// refined independently from unrelated functions with the same ABI.
+fn fresh_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scalar, effect: FnEffect) -> u32 {
+    fn_types.push(hir::FnTy { params, ret, effect: std::cell::Cell::new(effect) });
     (fn_types.len() - 1) as u32
 }
 
@@ -19675,6 +19884,22 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn concrete_function_values_record_distinct_inferred_effects_in_their_types() {
+        let (program, diagnostics) = check(
+            "fn quiet(x: i64) -> i64 = x + 1\nfn loud(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> i32 {\n  p := quiet\n  q := loud\n  return 0\n}\n",
+        );
+        assert!(!diagnostics.has_errors());
+        let main = program.fns.iter().find(|f| f.name == "main").unwrap();
+        let effect = |name: &str| {
+            let local = main.locals.iter().find(|l| l.name == name).unwrap();
+            let Ty::Fn(fid) = local.ty else { panic!("{name} must be a function value") };
+            program.fn_types.get(fid as usize).unwrap().effect.get()
+        };
+        assert_eq!(effect("p"), FnEffect::Pure);
+        assert_eq!(effect("q"), FnEffect::Impure);
     }
 
     #[test]

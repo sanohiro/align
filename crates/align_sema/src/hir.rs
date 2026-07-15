@@ -77,9 +77,9 @@ pub struct Program {
     /// Anonymous tuple types, indexed by the id carried in [`crate::Ty::Tuple`]. Interned
     /// (deduplicated by element list) during checking, so `(i64, i64)` is one entry.
     pub tuples: Vec<TupleDef>,
-    /// Function-value types, indexed by the id carried in [`crate::Ty::Fn`]. Interned during
-    /// checking. A `Ty::Fn` value is a function pointer (Copy / `Static`, no environment yet —
-    /// non-capturing first-class functions, slice ①).
+    /// Function-value types, indexed by the id carried in [`crate::Ty::Fn`]. Source annotations are
+    /// interned by scalar signature; concrete values/locals receive distinct entries so their
+    /// inferred effects do not contaminate unrelated functions with the same ABI.
     pub fn_types: Vec<FnTy>,
     /// M15 S2 (per-unit compilation): imported `pub` functions this unit *calls* but whose bodies
     /// live in another unit's object. Each is a bodyless declaration (its already-mangled
@@ -110,6 +110,11 @@ pub struct FnTy {
     pub params: Vec<crate::Scalar>,
     /// Return type (a scalar).
     pub ret: crate::Scalar,
+    /// Inferred observable effect of invoking a value of this type. This is internal type
+    /// information: source annotations remain `fn(T) -> R`, while the checker refines the bit from
+    /// each value's origin and conservatively joins mutable assignments. `Unknown` is fail-closed
+    /// at Pure/parallel boundaries.
+    pub effect: std::cell::Cell<crate::FnEffect>,
 }
 
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
