@@ -2878,6 +2878,47 @@ Remainders → S3b (all per the settled record): parallel codegen over misses, `
 `-j` / `ALIGNC_JOBS` / `cache clear`, runtime-archive mtime → content digest, default-ON flip
 gated on the cold-vs-hit gate; then SV.
 
+**M15 S3b SHIPPED — MERGED as #455 (2026-07-15; workspace 2061 green + clippy `-D warnings`
+clean). S3 is COMPLETE.** All five S3b items per the settled record: **(1) parallel unit codegen
+over cache misses** — serial lookups first (they produce the DAG ordering), then
+`std::thread::scope` workers claim misses via a shared atomic index (claim-once RMW; fresh LLVM
+`Context` per unit; native target initialized exactly once on the main thread pre-scope via a
+`Once`); results, capability union, and link order iterate DAG index order, never completion
+order; `-j/--jobs` + `ALIGNC_JOBS` (flag wins; garbage/zero/empty/overflow diagnosed, never a
+panic), default `available_parallelism()`; `explain-opt` stays serial + uncached; the cache
+entry split into `lookup` + `publish_after_miss` so serial and parallel callers share one
+implementation of each primitive. **(2) `--cache-stats`** on build/run/size (silent on the
+default path; per-unit hit/miss(reason) lines + summary counts; corruption notes always-on).
+**(3) `alignc cache clear`** — removes only the cache-owned `cas`/`actions`/`index` subtrees
+(an explicit shared `ALIGNC_CACHE` dir is never nuked wholesale); symlink entries are unlinked,
+never followed — the self-review hardening that makes `clear` unable to recurse outside the
+resolved root. **(4) runtime-archive freshness mtime → content digest** — `build.rs` bakes a
+sorted-walk digest of `align_runtime/src` (via the in-tree `align_hash`, now a driver
+build-dependency; no external dep) and `ensure_archive_fresh` compares source digests: the
+recorded post-merge `cargo test` false-stale papercut is gone, a genuinely stale archive still
+fails loud, and the `build.rs` ↔ `lib.rs` algorithm identity is pinned by test;
+`runtime_archive_digest()` is prepared for the future doc-10 §6.3 link key. **(5) default-ON
+flip, last, gated on the cold-vs-hit byte-identity gate**: unset `ALIGNC_CACHE` → enabled at
+the XDG root, `off` disables, path relocates; all 7 non-cache alignc-spawning test files pinned
+to `ALIGNC_CACHE=off` (uniform isolation), and a default-ON smoke gate (temp XDG root) proves
+second-build all-hit + byte-identity. gemini's one finding (fail-fast on parallel codegen
+error) APPLIED deliberately minimal: an `AtomicBool` checked at the top of the claim loop —
+workers stop claiming after the first error, an in-progress emit is never interrupted (no torn
+objects), `Relaxed` suffices (best-effort hint; errors ride the `Mutex`; final read
+happens-after the scope join), zero success-path change; single-error reporting stays
+deterministic (lowest DAG index), the multi-independent-failure collected set is documented as
+timing-dependent; left untested-but-simple (a deterministic multi-unit codegen failure needs a
+fault-injection seam the CLI lacks). 7 new `cache_parallel.rs` gates (parallel == `-j 1` bytes,
+≥3-unit parallel-twice byte-identity, jobs override, cache-stats shape, clear → all-miss →
+all-hit, digest freshness both directions, default-ON smoke). **Next M15 step = SV** (the
+verification bundle: doc-10 §7 invalidation matrix per-unit, N=1 byte-identity vs today,
+cold-vs-hit byte-identity, fail-closed effect-bit gates incl. a stale/absent-interface
+mutation, plus the S3-review additions: cross-process `impl_hash` stability pin, transitive
+A→B→C invalidation, absent/stale-interface fail-closed mutation). Still queued behind the M15
+slices: the `http_server_no_fd_leak_across_cycles` flake-hardening slice (it recurred during
+the S3b full-suite runs — same signature, passes in isolation) and the qualified cross-module
+fn-value remainder (`map(util.dbl)`, open-questions).
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).

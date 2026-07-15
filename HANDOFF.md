@@ -8,7 +8,28 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (second update this day), **M15 S3a SHIPPED — the incremental
+_Last updated: 2026-07-15 (third update this day), **M15 S3b SHIPPED — parallel unit codegen +
+cache CLI + default-ON flip, MERGED as #455. S3 (incremental cache + parallel compilation +
+hit/miss observability) is COMPLETE** (workspace **2061 green** + clippy clean; full record in
+the roadmap M15 S3b paragraph). The incremental codegen cache is now **ON by default**
+(`ALIGNC_CACHE=off` disables, path relocates; flip gated on the cold-vs-hit byte-identity
+gate). Parallel codegen claims cache misses via `std::thread::scope` + an atomic claim index
+(fresh LLVM `Context` per unit; target-init once pre-scope; DAG-index-ordered results/union/
+link, never completion order; `-j`/`ALIGNC_JOBS`; explain-opt stays serial + uncached; gemini's
+fail-fast finding applied — claim-loop `AtomicBool`, in-progress emits never interrupted).
+`--cache-stats` (build/run/size) + `alignc cache clear` (symlink-safe, cache-owned subtrees
+only). Runtime-archive freshness is now a **content digest** baked by `build.rs` (in-tree
+`align_hash` as a build-dep, no external dep) — the post-merge `cargo test` false-stale
+papercut is GONE (a genuinely stale archive still fails loud). Non-cache alignc-spawning test
+files are pinned `ALIGNC_CACHE=off`; a default-ON smoke gate (temp XDG root) proves
+second-build all-hit + byte-identity. **Next M15 step = SV (verification bundle): the doc-10
+§7 invalidation matrix per-unit, N=1 byte-identity vs today, cold-vs-hit byte-identity,
+fail-closed effect-bit gates incl. a stale/absent-interface mutation, + the S3-review
+additions (cross-process impl_hash stability pin, transitive A→B→C invalidation).** Still
+queued behind the M15 slices: the `http_server_no_fd_leak_across_cycles` flake-hardening slice
+(recurred again during S3b full-suite runs, same signature) and the qualified cross-module
+fn-value remainder (`map(util.dbl)`, open-questions). Previous update: 2026-07-15 (second
+update this day), **M15 S3a SHIPPED — the incremental
 codegen-stage cache (opt-in), MERGED as #454** (workspace **2051 green** + clippy clean; the S3
 design was SETTLED the same day by a two-lens review — soundness/key-correctness +
 driver/layout/scheduling/observability — recorded as the roadmap M15 "S3 design SETTLED"
