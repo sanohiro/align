@@ -197,3 +197,66 @@ fn main() -> i32 {
 
     assert_eq!(build_and_run("diverging-arena-drop-region", src).status.code(), Some(7));
 }
+
+#[test]
+fn break_edge_captures_state_at_the_terminator() {
+    // The CFG keeps lowering unreachable syntax for diagnostics, but the break edge must leave
+    // before that syntax mutates provenance. Otherwise the dead assignment would falsely taint the
+    // only state that reaches the return after the loop.
+    let src = r#"
+fn f(input: slice<i64>) -> slice<i64> {
+  xs := [1, 2, 3]
+  mut out: slice<i64> := input
+  loop {
+    break 0
+    out = xs
+  }
+  return out
+}
+
+fn main() -> i32 {
+  xs := [4, 5, 6]
+  print(f(xs).len())
+  return 0
+}
+"#;
+
+    let diagnostics = check_diagnostics("region-break-edge.align", src);
+    assert!(
+        diagnostics.is_empty(),
+        "unreachable syntax after break must not change the break edge:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn loop_exit_joins_all_reachable_break_predecessors() {
+    // One break path carries a frame-local slice and the other retains the caller slice. The
+    // compact CFG's loop exit must join both explicit predecessors before checking the return.
+    let src = r#"
+fn f(input: slice<i64>, local: bool) -> slice<i64> {
+  xs := [1, 2, 3]
+  mut out: slice<i64> := input
+  loop {
+    if local {
+      out = xs
+      break 0
+    } else {
+      break 0
+    }
+  }
+  return out
+}
+
+fn main() -> i32 {
+  xs := [4, 5, 6]
+  print(f(xs, false).len())
+  return 0
+}
+"#;
+
+    let diagnostics = check_diagnostics("region-break-join.align", src);
+    assert!(
+        diagnostics.contains("cannot return a slice that views a local array"),
+        "every reachable break predecessor must contribute to the loop exit:\n{diagnostics}"
+    );
+}

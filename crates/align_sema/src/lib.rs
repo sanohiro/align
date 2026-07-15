@@ -3009,7 +3009,9 @@ pub fn check_program_with_effects(
                 drop_individual: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 task_group_regions: Vec::new(),
-                loop_break_states: Vec::new(),
+                flow: EscapeFlowCfg::new(),
+                flow_current: 0,
+                loop_exit_blocks: Vec::new(),
             };
             ec.check();
             (ec.drop_region, ec.drop_individual)
@@ -4013,6 +4015,83 @@ impl EscapeState {
     }
 }
 
+type EscapeFlowBlockId = usize;
+
+/// One compact checked-HIR control-flow graph for escape provenance. Syntax traversal only builds
+/// these blocks and edges; the worklist below is the single place that joins paths and computes
+/// loop fixpoints. Keeping transfers as references to already-checked HIR avoids a second IR while
+/// making new control-flow syntax choose its edges explicitly in the exhaustive expression match.
+struct EscapeFlowCfg<'a> {
+    blocks: Vec<EscapeFlowBlock<'a>>,
+    /// Syntax order for the one-shot diagnostic replay. Block ids reflect graph construction
+    /// (a loop exit can be allocated before its body), so they are not a source-order traversal.
+    replay_order: Vec<(EscapeFlowBlockId, usize)>,
+}
+
+struct EscapeFlowBlock<'a> {
+    ops: Vec<EscapeFlowOp<'a>>,
+    successors: Vec<EscapeFlowBlockId>,
+}
+
+#[derive(Clone, Copy)]
+enum EscapeFlowOp<'a> {
+    Stmt(&'a Stmt, u32),
+    MatchBindings {
+        scrutinee: &'a Expr,
+        bindings: &'a [LocalId],
+        depth: u32,
+    },
+    ArenaExit {
+        value: &'a Expr,
+        value_depth: u32,
+        target: Region,
+    },
+    TaskGroupExit {
+        value: &'a Expr,
+        value_depth: u32,
+        target: Region,
+    },
+    SpawnCapture {
+        closure: &'a Expr,
+        group: Region,
+        depth: u32,
+    },
+    ReturnEscape(&'a Expr, u32),
+}
+
+impl<'a> EscapeFlowCfg<'a> {
+    fn new() -> Self {
+        Self {
+            blocks: vec![EscapeFlowBlock {
+                ops: Vec::new(),
+                successors: Vec::new(),
+            }],
+            replay_order: Vec::new(),
+        }
+    }
+
+    fn new_block(&mut self) -> EscapeFlowBlockId {
+        let id = self.blocks.len();
+        self.blocks.push(EscapeFlowBlock {
+            ops: Vec::new(),
+            successors: Vec::new(),
+        });
+        id
+    }
+
+    fn add_edge(&mut self, from: EscapeFlowBlockId, to: EscapeFlowBlockId) {
+        if !self.blocks[from].successors.contains(&to) {
+            self.blocks[from].successors.push(to);
+        }
+    }
+
+    fn has_predecessor(&self, block: EscapeFlowBlockId) -> bool {
+        self.blocks
+            .iter()
+            .any(|candidate| candidate.successors.contains(&block))
+    }
+}
+
 /// Arena escape checking (`03-types.md` §7, generalized per `impl/08-memory-model-v2.md`):
 /// every view / arena-allocated value carries an inferred [`Region`], and the one escape rule
 /// ([`Region::outlives`]) forbids it being returned to / stored into a longer-lived location.
@@ -4041,18 +4120,123 @@ struct EscapeCheck<'a> {
     /// the group's `wait`, so every capture must outlive the innermost group even when `spawn`
     /// appears inside a shorter-lived nested arena.
     task_group_regions: Vec<Region>,
-    /// Escape-state snapshots at `break` exits, one frame per active loop (innermost last).
-    loop_break_states: Vec<Vec<EscapeState>>,
+    /// Compact checked-HIR CFG built before solving escape state.
+    flow: EscapeFlowCfg<'a>,
+    /// Block currently receiving lowered escape operations.
+    flow_current: EscapeFlowBlockId,
+    /// CFG exit block for each active loop, innermost last.
+    loop_exit_blocks: Vec<EscapeFlowBlockId>,
 }
 
 impl<'a> EscapeCheck<'a> {
     fn check(&mut self) {
-        self.block(&self.f.body, 0);
+        self.lower_block(&self.f.body, 0);
         // The body's trailing value is the function's return value (single-expression
         // bodies and fall-through blocks), so apply the same escape check there.
         if let Some(v) = &self.f.body.value {
-            self.check_return_escape(v, 0);
+            self.push_flow_op(EscapeFlowOp::ReturnEscape(v, 0));
         }
+        self.solve_flow();
+    }
+
+    fn push_flow_op(&mut self, op: EscapeFlowOp<'a>) {
+        let block = &mut self.flow.blocks[self.flow_current];
+        let index = block.ops.len();
+        block.ops.push(op);
+        self.flow.replay_order.push((self.flow_current, index));
+    }
+
+    /// Run the finite may-state worklist, then replay each reachable block once with its fixed input
+    /// to emit diagnostics. The probe pass also derives idempotent cleanup metadata, but sends its
+    /// diagnostics to a sink so loop iterations cannot duplicate user-facing errors.
+    fn solve_flow(&mut self) {
+        let mut inputs = vec![None; self.flow.blocks.len()];
+        inputs[0] = Some(EscapeState::default());
+        let mut worklist = std::collections::VecDeque::from([0usize]);
+        let mut sink = Diagnostics::new();
+        std::mem::swap(self.diags, &mut sink);
+
+        while let Some(block) = worklist.pop_front() {
+            let Some(mut state) = inputs[block].clone() else {
+                continue;
+            };
+            let ops = self.flow.blocks[block].ops.clone();
+            let successors = self.flow.blocks[block].successors.clone();
+            for op in ops {
+                self.apply_flow_op(op, &mut state);
+            }
+            for successor in successors {
+                let next = match &inputs[successor] {
+                    Some(current) => current.join(&state),
+                    None => state.clone(),
+                };
+                if inputs[successor].as_ref() != Some(&next) {
+                    inputs[successor] = Some(next);
+                    worklist.push_back(successor);
+                }
+            }
+        }
+
+        std::mem::swap(self.diags, &mut sink);
+        let mut emit_states = inputs;
+        for (block, index) in self.flow.replay_order.clone() {
+            let Some(state) = &mut emit_states[block] else {
+                continue;
+            };
+            let op = self.flow.blocks[block].ops[index];
+            self.apply_flow_op(op, state);
+        }
+    }
+
+    fn apply_flow_op(&mut self, op: EscapeFlowOp<'a>, state: &mut EscapeState) {
+        self.state = state.clone();
+        match op {
+            EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
+            EscapeFlowOp::MatchBindings {
+                scrutinee,
+                bindings,
+                depth,
+            } => self.apply_match_bindings(scrutinee, bindings, depth),
+            EscapeFlowOp::ArenaExit {
+                value,
+                value_depth,
+                target,
+            } => {
+                if self.region_bearing(value.ty)
+                    && !self.region_of(value, value_depth).outlives(target)
+                {
+                    self.diags.error(
+                        "a value allocated in this arena cannot escape as the block's value"
+                            .to_string(),
+                        value.span,
+                    );
+                }
+            }
+            EscapeFlowOp::TaskGroupExit {
+                value,
+                value_depth,
+                target,
+            } => {
+                if self.region_bearing(value.ty)
+                    && !self.region_of(value, value_depth).outlives(target)
+                {
+                    self.diags.error(
+                        "a value from this task_group cannot escape as the block's value"
+                            .to_string(),
+                        value.span,
+                    );
+                }
+            }
+            EscapeFlowOp::SpawnCapture {
+                closure,
+                group,
+                depth,
+            } => self.check_spawn_capture(closure, group, depth),
+            EscapeFlowOp::ReturnEscape(value, depth) => {
+                self.check_return_escape(value, depth)
+            }
+        }
+        *state = self.state.clone();
     }
 
     /// Escape check for a returned value `e` (an explicit `return` or a body's trailing value):
@@ -4167,10 +4351,10 @@ impl<'a> EscapeCheck<'a> {
             // region argument taints the whole result — even when the callee's own reader is an
             // unrelated direct `fs.open`. Returning that call's result past the tainted region is
             // then rejected, even though nothing is actually borrowed. This is sound (never
-            // miscompiles) but imprecise; the precise fix belongs to the escape-check → MIR-dataflow
-            // structural follow-up (`docs/open-questions.md` "External soundness audit"). This arm
-            // only makes the escape check *consult* the region either way. (A `tcp_conn` itself is
-            // always owned, never a borrow, so it is deliberately NOT here.)
+            // miscompiles) but imprecise; the precise fix needs interprocedural return-borrow
+            // summaries, independently of the intraprocedural region-flow CFG. This arm only makes
+            // the escape check *consult* the region either way. (A `tcp_conn` itself is always
+            // owned, never a borrow, so it is deliberately NOT here.)
             Ty::Reader | Ty::Writer | Ty::Fn(_) => true,
             // Scalar/register values and owned handles carry no inferred borrow region. This list
             // is exhaustive so every future type must make an explicit escape-analysis choice.
@@ -4959,67 +5143,54 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Compute the escape-state loop-head fixpoint, then run one diagnostic pass from that state.
-    /// The body's fallthrough state is the back-edge; `break` snapshots are the only predecessors of
-    /// code after the loop. Kept out of [`Self::walk`] so the probe sink and state clones do not
-    /// enlarge its recursive stack frame.
-    #[inline(never)]
-    fn loop_flow(&mut self, body: &Block, depth: u32) {
-        let entry = self.state.clone();
-        let mut head = entry.clone();
-
-        // Probe to a finite may-state fixpoint without emitting the same diagnostics on every
-        // iteration of the analysis. A body that always diverges has no back-edge.
-        let mut sink = Diagnostics::new();
-        std::mem::swap(self.diags, &mut sink);
-        if !hir_block_diverges(body) {
-            loop {
-                self.state = head.clone();
-                self.loop_break_states.push(Vec::new());
-                self.block(body, depth);
-                self.loop_break_states.pop();
-                let next = entry.join(&self.state);
-                if next == head {
-                    break;
-                }
-                head = next;
-            }
-        }
-        std::mem::swap(self.diags, &mut sink);
-
-        // Emit diagnostics once from the fixed loop head and collect every reachable break exit.
-        self.state = head;
-        self.loop_break_states.push(Vec::new());
-        self.block(body, depth);
-        let breaks = self
-            .loop_break_states
-            .pop()
-            .expect("loop escape-state frame balanced");
-        if let Some((first, rest)) = breaks.split_first() {
-            let mut post = first.clone();
-            for state in rest {
-                post = post.join(state);
-            }
-            self.state = post;
-        } else {
-            // A break-less loop never reaches its continuation, so its state there is immaterial.
-            self.state = entry;
-        }
-    }
-
-    fn block(&mut self, b: &Block, depth: u32) {
+    fn lower_block(&mut self, b: &'a Block, depth: u32) {
         for s in &b.stmts {
-            self.stmt(s, depth);
+            self.lower_stmt(s, depth);
         }
         if let Some(v) = &b.value {
             self.walk(v, depth);
         }
     }
 
-    fn stmt(&mut self, s: &Stmt, depth: u32) {
+    fn lower_stmt(&mut self, stmt: &'a Stmt, depth: u32) {
+        match stmt {
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                self.walk(init, depth)
+            }
+            Stmt::AssignIndex { index, value, .. }
+            | Stmt::AssignElemField { index, value, .. }
+            | Stmt::AssignElem { index, value, .. } => {
+                self.walk(index, depth);
+                self.walk(value, depth);
+            }
+            Stmt::AssignVecLane { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::AssignField { value, .. } => self.walk(value, depth),
+            Stmt::Return(Some(value)) | Stmt::Expr(value) => self.walk(value, depth),
+            Stmt::Return(None) => {}
+            Stmt::Break(value) => {
+                if let Some(value) = value {
+                    self.walk(value, depth);
+                }
+            }
+        }
+        self.push_flow_op(EscapeFlowOp::Stmt(stmt, depth));
+        if matches!(stmt, Stmt::Break(_)) {
+            let break_block = self.flow_current;
+            if let Some(exit) = self.loop_exit_blocks.last().copied() {
+                self.flow.add_edge(break_block, exit);
+            }
+            // Keep lowering unreachable syntax for diagnostics, but isolate it from the break edge:
+            // successors observe the state exactly at `break`, never mutations written afterward.
+            let unreachable = self.flow.new_block();
+            self.flow.add_edge(break_block, unreachable);
+            self.flow_current = unreachable;
+        }
+    }
+
+    fn apply_stmt(&mut self, s: &Stmt, depth: u32) {
         match s {
             Stmt::Let { local, init } => {
-                self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
                 if is_owned_droppable(init.ty, self.structs)
                     || ty_tuple_is_move(init.ty, self.tuples)
@@ -5057,11 +5228,9 @@ impl<'a> EscapeCheck<'a> {
             // element slot; recurse into the index/value for nested escapes, and — when the element
             // is region-tracked (a `str` element) — reject storing a shorter-lived value into the
             // longer-lived array (the `Assign`/`AssignField` region rule, extended to elements).
-            Stmt::AssignIndex { base, index, value }
-            | Stmt::AssignElemField { base, index, value, .. }
-            | Stmt::AssignElem { base, index, value, .. } => {
-                self.walk(index, depth);
-                self.walk(value, depth);
+            Stmt::AssignIndex { base, index: _, value }
+            | Stmt::AssignElemField { base, index: _, value, .. }
+            | Stmt::AssignElem { base, index: _, value, .. } => {
                 if self.region_bearing(value.ty) {
                     let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
@@ -5072,9 +5241,8 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            Stmt::AssignVecLane { value, .. } => self.walk(value, depth),
+            Stmt::AssignVecLane { .. } => {}
             Stmt::Assign { local, value, drop_new, .. } => {
-                self.walk(value, depth);
                 // Record allocation provenance separately from escape Region: region-free Move
                 // resources and owned call results are individual, while arena allocations are not.
                 if is_owned_droppable(value.ty, self.structs)
@@ -5116,7 +5284,6 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::AssignField { root, value, .. } => {
-                self.walk(value, depth);
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
                 if self.region_bearing(value.ty) {
@@ -5130,13 +5297,12 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::Return(Some(e)) => {
-                self.walk(e, depth);
                 // A returned value escapes to the caller (`Static`): only a `Static`-region
                 // value may be returned (an arena/frame view cannot).
                 self.check_return_escape(e, depth);
             }
             Stmt::Return(None) => {}
-            Stmt::Expr(e) => self.walk(e, depth),
+            Stmt::Expr(_) => {}
             // A tuple destructure binds each element to a local. If the tuple is region-tracked
             // (holds a `str` view, or owned arrays allocated in an arena), each bound local inherits
             // the tuple's region — else an arena-allocated destructured array would default to
@@ -5144,7 +5310,6 @@ impl<'a> EscapeCheck<'a> {
             // (The current producers — `partition`, owned-tuple returns — give all elements the same
             // region, so the tuple's region is exact; per-element regions are a later refinement.)
             Stmt::LetTuple { locals, init, .. } => {
-                self.walk(init, depth);
                 let individual = self.drop_is_individual(init, depth);
                 for local in locals.iter().flatten() {
                     if self
@@ -5182,20 +5347,74 @@ impl<'a> EscapeCheck<'a> {
             // enclosing-arena / outer-frame view escape the loop is a future refinement.)
             Stmt::Break(value) => {
                 if let Some(e) = value {
-                    self.walk(e, depth);
                     self.check_break_escape(e, depth);
                 }
-                if let Some(frame) = self.loop_break_states.last_mut() {
-                    frame.push(self.state.clone());
-                }
             }
+        }
+    }
+
+    fn apply_match_bindings(
+        &mut self,
+        scrutinee: &Expr,
+        bindings: &[LocalId],
+        depth: u32,
+    ) {
+        let region = self
+            .region_bearing(scrutinee.ty)
+            .then(|| self.region_of(scrutinee, depth));
+        let individual = self.drop_is_individual(scrutinee, depth);
+        let local_slice =
+            self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
+        for binding in bindings {
+            self.decl_depth.insert(*binding, depth);
+            if self
+                .f
+                .locals
+                .get(*binding as usize)
+                .is_some_and(|local| {
+                    is_owned_droppable(local.ty, self.structs)
+                        || ty_tuple_is_move(local.ty, self.tuples)
+                })
+            {
+                self.drop_individual.insert(*binding, individual);
+            }
+            if let Some(region) = region {
+                self.state.region.insert(*binding, region);
+                self.drop_region.insert(*binding, region);
+            }
+            if local_slice && self.local_mentions_slice(*binding) {
+                self.state.local_backed_slice.insert(*binding);
+            }
+        }
+    }
+
+    fn check_spawn_capture(&mut self, closure: &Expr, group: Region, depth: u32) {
+        let check = |this: &mut Self, capture: &Expr| {
+            if this.region_bearing(capture.ty)
+                && !this.region_of(capture, depth).outlives(group)
+            {
+                this.diags.error(
+                    "a spawned task cannot capture a value that is freed before its task_group is joined"
+                        .to_string(),
+                    capture.span,
+                );
+            }
+        };
+        if let ExprKind::Closure { captures, .. } = &closure.kind {
+            for capture in captures {
+                check(self, capture);
+            }
+        } else {
+            // `check_spawn` currently constructs only `FnValue` or `Closure`, but keep the escape
+            // pass fail-closed if the surface later accepts a local/block function expression.
+            check(self, closure);
         }
     }
 
     /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
     /// recursive [`Self::walk`] frame (#296).
     #[inline(never)]
-    fn walk_file_op(&mut self, kind: &ExprKind, depth: u32) {
+    fn walk_file_op(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
             ExprKind::FilePread { file, buffer, offset } => {
                 self.walk(file, depth);
@@ -5215,7 +5434,7 @@ impl<'a> EscapeCheck<'a> {
     /// Walk an `array_builder` op's sub-exprs for the escape walk. `#[inline(never)]` so its arm
     /// locals stay out of the recursive [`Self::walk`] frame (#296).
     #[inline(never)]
-    fn walk_array_builder(&mut self, kind: &ExprKind, depth: u32) {
+    fn walk_array_builder(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
             ExprKind::ArrayBuilderNew { .. } => {}
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
@@ -5231,8 +5450,9 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Recurse to find nested arenas and value positions that let a box escape.
-    fn walk(&mut self, e: &Expr, depth: u32) {
+    /// Lower every checked-HIR value position into the compact escape CFG. This match is exhaustive:
+    /// adding syntax requires either explicit control-flow edges or explicit operand recursion.
+    fn walk(&mut self, e: &'a Expr, depth: u32) {
         // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
         // enclosing locals); walk them so a captured value escaping its region is caught.
         if let Some(stages) = pipeline_stages(&e.kind) {
@@ -5257,64 +5477,59 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
             ExprKind::Arena(b) => {
                 let inner = depth + 1;
-                self.block(b, inner);
+                self.lower_block(b, inner);
                 if let Some(v) = &b.value {
-                    // The block's value escapes to the enclosing region (`Region::arena(depth)`);
-                    // a value bound to this inner arena cannot outlive it.
-                    if self.region_bearing(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
-                        self.diags.error(
-                            "a value allocated in this arena cannot escape as the block's value".to_string(),
-                            v.span,
-                        );
-                    }
+                    self.push_flow_op(EscapeFlowOp::ArenaExit {
+                        value: v,
+                        value_depth: inner,
+                        target: Region::arena(depth),
+                    });
                 }
             }
-            ExprKind::Block(b) => self.block(b, depth),
-            // A `loop` opens no region, but its escape provenance must flow around the back-edge to
-            // a fixpoint before later uses are checked. `break` exits supply the post-loop state.
-            ExprKind::Loop { body, .. } => self.loop_flow(body, depth),
+            ExprKind::Block(b) => self.lower_block(b, depth),
+            ExprKind::Loop { body, .. } => {
+                let before = self.flow_current;
+                let head = self.flow.new_block();
+                let exit = self.flow.new_block();
+                self.flow.add_edge(before, head);
+                self.flow_current = head;
+                self.loop_exit_blocks.push(exit);
+                self.lower_block(body, depth);
+                self.loop_exit_blocks.pop();
+                if !hir_block_diverges(body) {
+                    self.flow.add_edge(self.flow_current, head);
+                }
+                // Preserve the old analysis's benign input state after a syntactically break-less
+                // loop, even though runtime continuation is unreachable.
+                if !self.flow.has_predecessor(exit) {
+                    self.flow.add_edge(before, exit);
+                }
+                self.flow_current = exit;
+            }
             // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
-            ExprKind::Unsafe(b) => self.block(b, depth),
+            ExprKind::Unsafe(b) => self.lower_block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
             // region value (e.g. a `Task` handle) cannot escape as the block's value.
             ExprKind::TaskGroup(b) => {
                 let inner = depth + 1;
                 self.task_group_regions.push(Region::arena(inner));
-                self.block(b, inner);
+                self.lower_block(b, inner);
                 self.task_group_regions.pop();
-                if let Some(v) = &b.value
-                    && self.region_bearing(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
-                        self.diags.error(
-                            "a value from this task_group cannot escape as the block's value".to_string(),
-                            v.span,
-                        );
-                    }
+                if let Some(v) = &b.value {
+                    self.push_flow_op(EscapeFlowOp::TaskGroupExit {
+                        value: v,
+                        value_depth: inner,
+                        target: Region::arena(depth),
+                    });
+                }
             }
             ExprKind::Spawn { closure, .. } => {
                 if let Some(group) = self.task_group_regions.last().copied() {
-                    if let ExprKind::Closure { captures, .. } = &closure.kind {
-                        for capture in captures {
-                            if self.region_bearing(capture.ty)
-                                && !self.region_of(capture, depth).outlives(group)
-                            {
-                                self.diags.error(
-                                    "a spawned task cannot capture a value that is freed before its task_group is joined"
-                                        .to_string(),
-                                    capture.span,
-                                );
-                            }
-                        }
-                    } else if self.region_bearing(closure.ty)
-                        && !self.region_of(closure, depth).outlives(group)
-                    {
-                        // `check_spawn` currently constructs only `FnValue` or `Closure`, but keep
-                        // the escape pass fail-closed if the surface later accepts a local/block fn.
-                        self.diags.error(
-                            "a spawned task cannot capture a value that is freed before its task_group is joined"
-                                .to_string(),
-                            closure.span,
-                        );
-                    }
+                    self.push_flow_op(EscapeFlowOp::SpawnCapture {
+                        closure,
+                        group,
+                        depth,
+                    });
                 }
                 self.walk(closure, depth);
             }
@@ -5325,58 +5540,28 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk(scrutinee, depth);
-                // A payload bound by an arm pattern (`Some(v)` / `Ok(v)` / `Variant(v)`) is extracted
-                // *out of* the scrutinee — for a region-tracked scrutinee it is a view into / part of
-                // the same storage, so the binding inherits the scrutinee's region. This mirrors
-                // `LetTuple` destructuring and the `OptionSome`/`Try` region pass-through in reverse.
-                // Without it, unwrapping an `Option<view>` / `Result<view>` through a `match` arm loses
-                // the region (`region_of(Local)` defaults to `Static`) and the view escapes — the
-                // general #297-class use-after-free that first bit `resp.header()`'s `Option<str>` view
-                // (env.get's `Option<string>` is owned/`Static`, so it never exposed this gap). A
-                // non-tracked (scalar) payload binding needs no region — the guard skips it, and a
-                // Copy binding's region is never consulted anyway. `region_bearing` (not just
-                // `tracks_region`) also carries the region into an arm that unwraps a
-                // `Result<slice<u8>, Error>` / `Option<slice<u8>>` — the `bytes`-view match path.
-                let incoming = self.state.clone();
-                let scrutinee_region = self
-                    .region_bearing(scrutinee.ty)
-                    .then(|| self.region_of(scrutinee, depth));
-                let scrutinee_individual = self.drop_is_individual(scrutinee, depth);
-                let scrutinee_local_slice =
-                    self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
-                let mut joined: Option<EscapeState> = None;
+                let branch = self.flow_current;
+                let join = self.flow.new_block();
+                let mut continuing = false;
                 for a in arms {
-                    self.state = incoming.clone();
-                    for binding in &a.bindings {
-                        self.decl_depth.insert(*binding, depth);
-                        if self
-                            .f
-                            .locals
-                            .get(*binding as usize)
-                            .is_some_and(|l| {
-                                is_owned_droppable(l.ty, self.structs)
-                                    || ty_tuple_is_move(l.ty, self.tuples)
-                            })
-                        {
-                            self.drop_individual.insert(*binding, scrutinee_individual);
-                        }
-                        if let Some(region) = scrutinee_region {
-                            self.state.region.insert(*binding, region);
-                            self.drop_region.insert(*binding, region);
-                        }
-                        if scrutinee_local_slice && self.local_mentions_slice(*binding) {
-                            self.state.local_backed_slice.insert(*binding);
-                        }
-                    }
+                    let arm = self.flow.new_block();
+                    self.flow.add_edge(branch, arm);
+                    self.flow_current = arm;
+                    self.push_flow_op(EscapeFlowOp::MatchBindings {
+                        scrutinee,
+                        bindings: &a.bindings,
+                        depth,
+                    });
                     self.walk(&a.body, depth);
                     if !hir_expr_diverges(&a.body) {
-                        joined = Some(match joined {
-                            None => self.state.clone(),
-                            Some(state) => state.join(&self.state),
-                        });
+                        self.flow.add_edge(self.flow_current, join);
+                        continuing = true;
                     }
                 }
-                self.state = joined.unwrap_or(incoming);
+                if !continuing {
+                    self.flow.add_edge(branch, join);
+                }
+                self.flow_current = join;
             }
             ExprKind::ResultMapErr { result, f } => {
                 self.walk(result, depth);
@@ -5386,19 +5571,26 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.walk(cond, depth);
-                let incoming = self.state.clone();
-                self.state = incoming.clone();
-                self.block(then, depth);
-                let then_state = self.state.clone();
-                self.state = incoming.clone();
-                self.block(els, depth);
-                let else_state = self.state.clone();
-                self.state = match (hir_block_diverges(then), hir_block_diverges(els)) {
-                    (false, false) => then_state.join(&else_state),
-                    (true, false) => else_state,
-                    (false, true) => then_state,
-                    (true, true) => incoming,
-                };
+                let branch = self.flow_current;
+                let then_entry = self.flow.new_block();
+                let else_entry = self.flow.new_block();
+                let join = self.flow.new_block();
+                self.flow.add_edge(branch, then_entry);
+                self.flow.add_edge(branch, else_entry);
+                self.flow_current = then_entry;
+                self.lower_block(then, depth);
+                if !hir_block_diverges(then) {
+                    self.flow.add_edge(self.flow_current, join);
+                }
+                self.flow_current = else_entry;
+                self.lower_block(els, depth);
+                if !hir_block_diverges(els) {
+                    self.flow.add_edge(self.flow_current, join);
+                }
+                if hir_block_diverges(then) && hir_block_diverges(els) {
+                    self.flow.add_edge(branch, join);
+                }
+                self.flow_current = join;
             }
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.walk(expr, depth),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -5514,17 +5706,17 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
-                // The success path skips the fallback. Analyze the fallback from the same incoming
-                // state and join it only when it can continue; a diverging fallback (`return`) has
-                // no edge to the expression's continuation.
-                let incoming = self.state.clone();
-                self.state = incoming.clone();
+                let branch = self.flow_current;
+                let fallback_entry = self.flow.new_block();
+                let join = self.flow.new_block();
+                self.flow.add_edge(branch, join);
+                self.flow.add_edge(branch, fallback_entry);
+                self.flow_current = fallback_entry;
                 self.walk(fallback, depth);
-                if hir_expr_diverges(fallback) {
-                    self.state = incoming;
-                } else {
-                    self.state = incoming.join(&self.state);
+                if !hir_expr_diverges(fallback) {
+                    self.flow.add_edge(self.flow_current, join);
                 }
+                self.flow_current = join;
             }
             ExprKind::Template(parts) => {
                 for p in parts {
