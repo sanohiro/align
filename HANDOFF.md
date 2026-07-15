@@ -8,7 +8,35 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15, **M15 S2b SHIPPED — the default build is per-unit, MERGED as #453**
+_Last updated: 2026-07-15 (second update this day), **M15 S3a SHIPPED — the incremental
+codegen-stage cache (opt-in), MERGED as #454** (workspace **2051 green** + clippy clean; the S3
+design was SETTLED the same day by a two-lens review — soundness/key-correctness +
+driver/layout/scheduling/observability — recorded as the roadmap M15 "S3 design SETTLED"
+paragraph = the S3 implementation source of truth; that review also CORRECTED settlement Q6's
+frontend-key wording "direct-dep" → **TRANSITIVE** dep interface hashes — a stale-check hole as
+written, since interface hashes do NOT chain (foreign type refs are by-name); the shipped
+`PerUnitCheck` was already transitive). v1 caches per-unit OBJECT bytes only (frontend always
+runs — it produces the keys; link always re-runs), keyed by the full doc-10 §6.2 codegen key:
+compiler build id = memoized runtime hash of the `alignc` binary, exact LLVM version via
+`LLVMGetVersion`, RESOLVED cpu/features shared with `create_target_machine`, `impl_hash` one
+component never the whole key. CAS + versioned fail-closed manifests under
+`${XDG_CACHE_HOME:-~/.cache}/alignc/<schema-ver>/` (`ALIGNC_CACHE=on|<path>|off`, DISABLED by
+default until S3b's gated flip; a disabled build does zero cache-key work). Headline win pinned:
+a dep private-body edit → that unit misses, every dependent HITS, exe correct.
+`CacheOutcome`/`FirstDiff` observability model from slice 1 (tests assert the enum, never
+elapsed time; full-key actions + a stable-slot index — the recorded deviation that makes
+first-diff reasons computable). 10 integration gates + 5 unit tests incl. transitive A→B→C
+invalidation, edit-revert hit, corruption evict+rebuild, cold-vs-hit byte-identity, N=1 gates
+untouched. gemini reflected pre-merge: staging-leak fix APPLIED; Windows cache root REJECTED
+(documented — fail-closed unsupported target); its build-id suggestion surfaced a REAL defect
+(unconditional key construction with cache off — fixed via `is_enabled()` gate) while the
+compile-time-constant swap was rejected (dev-rebuild false-hits). Hash decision owner-visible in
+the roadmap record: keys/CAS stay in-tree 128-bit wyhash; FIRM trigger — any shared/cross-host
+cache must FIRST swap to a cryptographic 256-bit digest. **Next M15 step = S3b: parallel unit
+codegen over cache misses (`std::thread::scope`; LLVM target-init once pre-scope; explain-opt
+stays serial), `--cache-stats`/`-j`/`ALIGNC_JOBS`/`cache clear`, runtime-archive mtime →
+content digest, then the default-ON flip gated on the cold-vs-hit byte-identity gate; then SV.**
+Previous update: 2026-07-15, **M15 S2b SHIPPED — the default build is per-unit, MERGED as #453**
 (workspace **2035 green** (2022 + 13) + clippy clean; gemini review ZERO findings; design settled
 by a two-lens review — driver/UX + soundness/byte-identity — integrated before implementation;
 full record in the roadmap M15 S2b paragraph). Hard cutover: `build`/`run`/`emit-obj`/`size` all

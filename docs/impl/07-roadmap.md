@@ -2846,6 +2846,38 @@ source of truth).**
   an absent/stale-interface fail-closed mutation. Also recorded: doc-10 §3's code pointers
   (`build_to`, `main.rs#L307–346`) are stale post-S2b — update them when S3a touches the driver.
 
+**M15 S3a SHIPPED — MERGED as #454 (2026-07-15; workspace 2051 green + clippy `-D warnings`
+clean).** New `crates/align_driver/src/cache.rs` (CAS blobs via private staging + atomic rename;
+versioned length-prefixed fail-closed manifest codec in the `align_interface::codec` style —
+allocation-bomb-safe: lengths bounds-checked against the real buffer before any allocation) wired
+serially into `build_per_unit_to` (build/run/size) + `run_emit_obj` (`--export` in the key);
+`emit-llvm`/`emit-mir`/`explain-opt`/`check*` uncached by design. Key sourcing: compiler build id
+= memoized runtime hash of the running `alignc` binary (a compile-time version constant would
+false-hit across dev rebuilds); exact LLVM version via `LLVMGetVersion`, never the hand-typed
+tool constant; cpu/features/triple/reloc/code-model from a `resolve_cpu_features` now SHARED with
+`create_target_machine`, so the key hashes exactly what codegen uses. Opt-in
+(`ALIGNC_CACHE=on|<path>|off`, disabled by default until the S3b gated flip); a disabled build
+does ZERO cache-key work (gated on `CacheContext::is_enabled()`, pinned by a
+disabled-cache-verbatim-zero-disk gate). **One recorded implementation deviation:** the settled
+record's single `actions/codegen/<key-digest>` manifest became full-key actions PLUS a
+stable-slot index — full-key addressing gives edit-then-revert hits (old entries never
+overwritten), the slot index is what makes first-differing-component miss reasons computable (a
+changed key otherwise lands at a fresh path with nothing to diff); the slot index is
+observability-only, a hit still requires the full-key action + a digest-verified blob. 10
+integration gates (`cache_codegen.rs`) + 5 unit tests: no-op all-hit, dep private-body edit →
+one miss + dependents HIT + correct exe (the headline), transitive A→B→C invalidation,
+comment-only hit, edit-revert hit, corrupted blob → evict + stderr note + rebuild + correct
+binary, cold-vs-hit byte-identity (objects AND final exe), profile/`--export` `FirstDiff`
+reasons, rt-lto key split, cross-process second-build hit. gemini review reflected pre-merge:
+staging-leak-on-error-return APPLIED (orphaned `.cache-stage-*` on failed write/rename — every
+error path now cleans up); Windows `%LOCALAPPDATA%` cache root REJECTED with a documented
+platform story (Windows is a fail-closed unsupported target — dead code); its
+compile-time-build-id suggestion surfaced a REAL defect (unconditional key construction with the
+cache off — fixed) while the constant swap itself was rejected (dev-rebuild false-hits).
+Remainders → S3b (all per the settled record): parallel codegen over misses, `--cache-stats` /
+`-j` / `ALIGNC_JOBS` / `cache clear`, runtime-archive mtime → content digest, default-ON flip
+gated on the cold-vs-hit gate; then SV.
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).
