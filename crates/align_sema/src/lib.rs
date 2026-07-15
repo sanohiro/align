@@ -1030,8 +1030,31 @@ struct FnSig {
 /// A pipeline stage as collected from the AST (before type checking).
 /// A stage's function argument: either a reference to a named top-level function, or an inline
 /// lambda (which sema lifts to a synthetic top-level function — see [`Checker::lift_lambda`]).
+#[derive(Clone)]
+struct NamedFnRef {
+    module: Option<String>,
+    name: ast::Ident,
+    span: Span,
+}
+
+impl NamedFnRef {
+    fn display_name(&self) -> String {
+        match &self.module {
+            Some(module) => format!("{module}.{}", self.name.name),
+            None => self.name.name.clone(),
+        }
+    }
+}
+
+enum QualifiedFnResolution {
+    Resolved(String),
+    NotImported,
+    Private,
+    Missing,
+}
+
 enum StageFn {
-    Named(ast::Ident),
+    Named(NamedFnRef),
     Lambda { params: Vec<ast::LambdaParam>, body: ast::Block, span: Span },
 }
 
@@ -8155,6 +8178,39 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind, ty, span }
     }
 
+    /// Build a first-class value for an already-resolved top-level function. Bare and qualified
+    /// references share this path so their scalar-signature and `out` restrictions cannot drift.
+    fn check_named_fn_value(
+        &mut self,
+        display: &str,
+        mangled: String,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        let Some(sig) = self.sigs.get(&mangled) else {
+            self.diags.error(format!("undefined function: '{display}'"), span);
+            return err();
+        };
+        let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
+        let ret = fn_sig_scalar(sig.ret);
+        match (params, ret) {
+            (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
+                let fid = intern_fn_type(self.fn_types, ps, r);
+                let ty = Ty::Fn(fid);
+                self.constrain(ty, expected, span);
+                Expr { kind: ExprKind::FnValue(mangled), ty, span }
+            }
+            _ => {
+                self.diags.error(
+                    format!("'{display}' cannot be used as a function value yet (only scalar parameters/return, no `out`)"),
+                    span,
+                );
+                err()
+            }
+        }
+    }
+
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
         let err = |s: Span| Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span: s };
         // `None` builtin: its Option type comes from context.
@@ -8176,26 +8232,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // A top-level function used as a value (`f := double`) is a first-class function
             // pointer (`Ty::Fn`). Slice ①: scalar params/ret, no `out` params. The name resolves
-            // in the current module to its mangled codegen name (cross-module fn values are later).
+            // in the current module to its mangled codegen name.
             if let Some(mangled) = self.resolve_local_fn(base) {
-                let sig = &self.sigs[&mangled];
-                let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
-                let ret = fn_sig_scalar(sig.ret);
-                match (params, ret) {
-                    (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
-                        let fid = intern_fn_type(self.fn_types, ps, r);
-                        let ty = Ty::Fn(fid);
-                        self.constrain(ty, expected, span);
-                        return Expr { kind: ExprKind::FnValue(mangled), ty, span };
-                    }
-                    _ => {
-                        self.diags.error(
-                            format!("'{base}' cannot be used as a function value yet (only scalar parameters/return, no `out`)"),
-                            span,
-                        );
-                        return err(span);
-                    }
-                }
+                return self.check_named_fn_value(base, mangled, expected, span);
             }
             self.diags.error(format!("undefined name: '{base}'"), span);
             return err(span);
@@ -8243,7 +8282,8 @@ impl<'a, 't> Checker<'a, 't> {
             Ok(None) => {}
             Err(()) => return err,
         }
-        // `mod.NAME` / `a.b.NAME` — a qualified reference to an imported module's `pub` constant.
+        // `mod.NAME` / `a.b.NAME` — a qualified reference to an imported module's `pub` constant
+        // or function value.
         // The receiver is a pure dotted module name; a local shadowing the leftmost segment makes
         // this ordinary value field access instead.
         // A local *or captured* variable shadowing the leftmost segment makes this value field
@@ -8261,8 +8301,18 @@ impl<'a, 't> Checker<'a, 't> {
             match self.consts.resolve(&modpath, &field.name, &self.cur_module) {
                 Ok(Some((ty, val))) => return self.const_literal(ty, &val, expected, span),
                 Ok(None) => {
-                    self.diags.error(format!("module `{modpath}` has no constant `{}`", field.name), span);
-                    return err;
+                    // A qualified exported function is also a value (`f := util.dbl`). Constants
+                    // and functions cannot share a module-local name, so trying the function only
+                    // after the constant miss is unambiguous.
+                    let named = NamedFnRef {
+                        module: Some(modpath.clone()),
+                        name: field.clone(),
+                        span,
+                    };
+                    let Some(mangled) = self.resolve_named_fn(&named) else {
+                        return err;
+                    };
+                    return self.check_named_fn_value(&named.display_name(), mangled, expected, span);
                 }
                 Err(msg) => {
                     self.diags.error(msg, span);
@@ -9577,31 +9627,82 @@ impl<'a, 't> Checker<'a, 't> {
         self.mods.get(&self.cur_module)?.fns.get(name).map(|(m, _)| m.clone())
     }
 
+    /// Resolve a named callable without diagnostics. Signature peeks use this before the source
+    /// element or accumulator is checked; the later checked resolution reports any visibility,
+    /// import, or missing-name error exactly once.
+    fn resolve_named_fn_quiet(&self, named: &NamedFnRef) -> Option<String> {
+        let Some(module) = &named.module else {
+            return self.resolve_local_fn(&named.name.name);
+        };
+        match self.classify_qualified_fn(module, &named.name.name) {
+            QualifiedFnResolution::Resolved(mangled) => Some(mangled),
+            QualifiedFnResolution::NotImported
+            | QualifiedFnResolution::Private
+            | QualifiedFnResolution::Missing => None,
+        }
+    }
+
+    /// Resolve a bare or qualified named callable to its mangled codegen target. Qualified names
+    /// use the exact import/visibility contract of a direct `mod.fn(...)` call.
+    fn resolve_named_fn(&mut self, named: &NamedFnRef) -> Option<String> {
+        let Some(module) = &named.module else {
+            return self.resolve_local_fn(&named.name.name).or_else(|| {
+                self.diags
+                    .error(format!("undefined function: '{}'", named.name.name), named.span);
+                None
+            });
+        };
+        match self.resolve_qualified_fn(module, &named.name.name, named.span) {
+            Ok(Some(mangled)) => Some(mangled),
+            Ok(None) => {
+                self.diags.error(
+                    format!("module '{module}' is not imported here (add `import {module}`)"),
+                    named.span,
+                );
+                None
+            }
+            Err(()) => None,
+        }
+    }
+
     /// Resolve a cross-module call `mod.fn` to its mangled target, checking that `mod` is imported
     /// here and that `fn` exists and is `pub`. `Ok(None)` means `mod` is not an imported user module
     /// (so the `mod.fn` shape is something else — a builtin namespace or a method); `Err` is a
     /// reported resolution error.
     fn resolve_qualified_fn(&mut self, module: &str, name: &str, span: Span) -> Result<Option<String>, ()> {
+        match self.classify_qualified_fn(module, name) {
+            QualifiedFnResolution::Resolved(mangled) => Ok(Some(mangled)),
+            QualifiedFnResolution::NotImported => Ok(None),
+            QualifiedFnResolution::Private => {
+                self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
+                Err(())
+            }
+            QualifiedFnResolution::Missing => {
+                self.diags.error(format!("module '{module}' has no function '{name}'"), span);
+                Err(())
+            }
+        }
+    }
+
+    /// Classify a qualified function name once so direct calls, named callable arguments, and quiet
+    /// signature peeks cannot drift on import or `pub` visibility rules.
+    fn classify_qualified_fn(&self, module: &str, name: &str) -> QualifiedFnResolution {
         let is_self = module == self.cur_module;
         if !is_self {
             let here = self.mods.get(&self.cur_module);
             if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
-                return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+                return QualifiedFnResolution::NotImported;
             }
         }
         match self.mods.get(module).and_then(|mi| mi.fns.get(name)) {
             Some((mangled, pub_exported)) => {
                 if *pub_exported || is_self {
-                    Ok(Some(mangled.clone()))
+                    QualifiedFnResolution::Resolved(mangled.clone())
                 } else {
-                    self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
-                    Err(())
+                    QualifiedFnResolution::Private
                 }
             }
-            None => {
-                self.diags.error(format!("module '{module}' has no function '{name}'"), span);
-                Err(())
-            }
+            None => QualifiedFnResolution::Missing,
         }
     }
 
@@ -10737,40 +10838,32 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// Collect a pipeline `src.map(f).where(p)…` from the AST: the innermost receiver is
     /// the source array; `.map`/`.where` calls become ordered stages (source-first).
-    /// Check a `map`/`where` stage function against the current element type, returning
-    /// its return type. `is_pred` requires a `bool` result.
-    fn check_stage_fn(&mut self, fname: &ast::Ident, elem: Ty, is_pred: bool) -> Ty {
-        // Resolve the bare name to its mangled codegen name in the caller's own module (exactly as a
-        // direct call does via `resolve_local_fn`) before the signature lookup: outside the entry
-        // module functions are keyed `module$name`, so a bare `sigs` lookup would miss them.
-        let Some(sig) = self.resolve_local_fn(&fname.name).and_then(|m| self.sigs.get(&m)) else {
-            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-            return Ty::Error;
-        };
-        let (params, ret) = (sig.params.clone(), sig.ret);
-        if params.len() != 1 || params[0] != elem {
-            self.diags.error(
-                format!("'{}' must take one {} argument here", fname.name, ty_name(elem)),
-                fname.span,
-            );
-        }
-        if is_pred && ret != Ty::Bool {
-            self.diags
-                .error(format!("'where' predicate '{}' must return bool", fname.name), fname.span);
-        }
-        ret
-    }
-
     /// Resolve a stage's function argument (named or lambda) over element type `elem`, returning
     /// the (possibly synthetic) function name to lower to and its return type. A lambda is lifted
     /// to a synthetic top-level function (`lift_lambda`); a named function is checked in place.
     fn resolve_stage_fn(&mut self, sf: &StageFn, elem: Ty, is_pred: bool) -> Option<(String, Ty, Vec<Expr>)> {
         match sf {
-            StageFn::Named(fname) => {
-                // Lower to the mangled codegen name (module-qualified outside the entry module), the
-                // same target a direct call would use; `check_stage_fn` reports an undefined name.
-                let func = self.resolve_local_fn(&fname.name).unwrap_or_else(|| fname.name.clone());
-                Some((func, self.check_stage_fn(fname, elem, is_pred), Vec::new()))
+            StageFn::Named(named) => {
+                let func = self.resolve_named_fn(named)?;
+                let Some(sig) = self.sigs.get(&func) else {
+                    self.diags
+                        .error(format!("undefined function: '{}'", named.display_name()), named.span);
+                    return None;
+                };
+                let (params, ret) = (sig.params.clone(), sig.ret);
+                if params.len() != 1 || params[0] != elem {
+                    self.diags.error(
+                        format!("'{}' must take one {} argument here", named.display_name(), ty_name(elem)),
+                        named.span,
+                    );
+                }
+                if is_pred && ret != Ty::Bool {
+                    self.diags.error(
+                        format!("'where' predicate '{}' must return bool", named.display_name()),
+                        named.span,
+                    );
+                }
+                Some((func, ret, Vec::new()))
             }
             StageFn::Lambda { params, body, span } => {
                 let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
@@ -10958,19 +11051,14 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Lambda { params, body } = &arg.kind {
             return self.lift_lambda(params, body, expected_params, expected_ret, arg.span);
         }
-        let Some(fname) = self.pipeline_fn_name(arg) else {
+        let Some(named) = self.pipeline_fn_name(arg) else {
             self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
             return None;
         };
-        // Resolve the bare callable to its mangled codegen name in the caller's own module (as a
-        // direct call does), then look up the signature and lower to that same mangled name — so a
-        // same-module fn-value works identically inside and outside the entry module.
-        let Some(mangled) = self.resolve_local_fn(&fname.name) else {
-            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-            return None;
-        };
+        let mangled = self.resolve_named_fn(&named)?;
         let Some(sig) = self.sigs.get(&mangled) else {
-            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+            self.diags
+                .error(format!("undefined function: '{}'", named.display_name()), named.span);
             return None;
         };
         let (params, ret) = (sig.params.clone(), sig.ret);
@@ -10982,11 +11070,11 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(
                 format!(
                     "'{}' must have type ({}) -> {} here",
-                    fname.name,
+                    named.display_name(),
                     expected_resolved.iter().map(|t| ty_name(*t)).collect::<Vec<_>>().join(", "),
                     ty_name(want_ret),
                 ),
-                fname.span,
+                named.span,
             );
             return None;
         }
@@ -11001,7 +11089,7 @@ impl<'a, 't> Checker<'a, 't> {
             return None;
         }
         self.pipeline_fn_name(arg)
-            .and_then(|f| self.resolve_local_fn(&f.name))
+            .and_then(|named| self.resolve_named_fn_quiet(&named))
             .and_then(|m| self.sigs.get(&m).cloned())
             .and_then(|s| s.params.get(idx).copied())
     }
@@ -11013,7 +11101,7 @@ impl<'a, 't> Checker<'a, 't> {
             return None;
         }
         self.pipeline_fn_name(arg)
-            .and_then(|f| self.resolve_local_fn(&f.name))
+            .and_then(|named| self.resolve_named_fn_quiet(&named))
             .and_then(|m| self.sigs.get(&m).cloned())
     }
 
@@ -11068,11 +11156,23 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<ast::Ident> {
+    fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<NamedFnRef> {
         if let ast::ExprKind::Path(p) = &a.kind
             && p.segments.len() == 1 {
-                return Some(p.segments[0].clone());
+                return Some(NamedFnRef {
+                    module: None,
+                    name: p.segments[0].clone(),
+                    span: a.span,
+                });
             }
+        if let ast::ExprKind::FieldAccess { recv, field } = &a.kind {
+            let module = flatten_module_path(recv)?;
+            let leftmost = leftmost_segment(recv)?;
+            if self.name_in_scope(leftmost) {
+                return None;
+            }
+            return Some(NamedFnRef { module: Some(module), name: field.clone(), span: a.span });
+        }
         None
     }
 
@@ -11089,8 +11189,8 @@ impl<'a, 't> Checker<'a, 't> {
         let elem_expected = match raw_stages.first() {
             // A named first `map` fixes the element type from its parameter; a lambda's parameter
             // type is inferred (the literal defaults), so there is no hint to pull.
-            Some(RawStage::Map(StageFn::Named(fname))) => self
-                .resolve_local_fn(&fname.name)
+            Some(RawStage::Map(StageFn::Named(named))) => self
+                .resolve_named_fn_quiet(named)
                 .and_then(|m| self.sigs.get(&m))
                 .and_then(|s| s.params.first().copied()),
             None => elem_expected_no_stages,

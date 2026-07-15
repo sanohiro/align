@@ -2386,12 +2386,18 @@ non-entry `par_map` callee and rejects an Impure one. Whole-program and per-unit
 (differential test added). Tests: `crates/align_driver/tests/modules.rs` (6 new) +
 `per_unit.rs` (1 new).
 
-**Remaining (separate, still open):** a QUALIFIED cross-module fn-value —
-`xs.map(util.dbl)` / `reduce(util.add)` — is still rejected (`'.map()' needs a function …`).
-`pipeline_fn_name` only accepts a single-segment path, so a `mod.fn` callable never reaches
-resolution; this is the same pre-existing limitation the S1b gate observed for `par_map`
-qualified callees. Out of scope for the same-module fix above; add qualified-callable support
-(map/reduce/par_map/sort_by_key) as a follow-up.
+**Qualified remainder — FIXED 2026-07-15.** A shared named-function reference now preserves either
+a bare name or the complete dotted module prefix, then resolves through the same import / `pub`
+visibility contract as a direct `mod.fn(...)` call. Qualified functions work in every named
+callable consumer (`map`/`where`/`reduce`/`scan`/`partition`/`any`/`all`/`par_map`/
+`sort_by_key`) and as ordinary bound function values (`f := util.dbl; f(x)`). Signature peeks for
+untyped literal sources and fold accumulators use the same resolver without emitting premature
+diagnostics; checked resolution reports import, visibility, and missing-function errors once.
+The leftmost-name shadowing rule is shared with direct calls, so a local `util` keeps value-field
+semantics instead of being misread as a module. Dotted modules (`util.math.dbl`) retain the full
+prefix. Whole-program and per-unit checking agree, including imported Pure/Impure effect bits at a
+direct qualified `par_map` boundary. Tests: `crates/align_driver/tests/modules.rs` and
+`per_unit.rs`.
 
 Note: the recorded repro snippet `pub fn doubled(xs) -> array<i64> = xs.map(dbl)` does not
 type-check in *either* module — a `map` must end in a reduction (`.sum()`) or an out-param sink

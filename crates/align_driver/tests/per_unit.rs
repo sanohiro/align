@@ -183,6 +183,27 @@ fn same_module_fn_value_in_non_entry_unit_accepts() {
     assert!(!r.diags.has_errors());
 }
 
+#[test]
+fn qualified_cross_unit_function_value_accepts() {
+    // Qualified named callables and bound function values must resolve identically from source ASTs
+    // (whole-program) and dependency interfaces (per-unit).
+    let util = "module util\npub fn dbl(x: i64) -> i64 = x * 2\n";
+    let main = concat!(
+        "module main\n",
+        "import util\n",
+        "fn main() -> i32 {\n",
+        "  f := util.dbl\n",
+        "  return ([1, 2, 3].map(util.dbl).sum() + f(2)) as i32\n",
+        "}\n",
+    );
+    let r = assert_same_verdict(
+        "qualified-cross-unit-fnval",
+        &[("util.align", util), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!r.diags.has_errors());
+}
+
 // ---- Gate 1: negative cases (both must reject) ----------------------------------------------------
 
 #[test]
@@ -269,9 +290,8 @@ fn generic_pub_fn_body_over_pub_items_and_qualified_import_accepts() {
 
 // ---- Gate 3: effect bits fail-closed across units -------------------------------------------------
 
-// `par_map` requires a named local function (a qualified `mod.fn` is rejected by both checkers), so a
-// cross-unit effect reaches the parallel boundary through a thin local wrapper — which is exactly how
-// the imported fn's effect bit must propagate.
+// A qualified imported function can sit directly at the `par_map` boundary. Its serialized effect
+// bit must therefore drive the same Pure/Impure verdict in the whole-program and per-unit checkers.
 
 #[test]
 fn par_map_over_pure_imported_fn_accepts() {
@@ -279,9 +299,8 @@ fn par_map_over_pure_imported_fn_accepts() {
     let main = concat!(
         "module main\n",
         "import geom\n",
-        "fn w(x: i64) -> i64 = geom.dbl(x)\n",
         "fn main() -> Result<(), Error> {\n",
-        "  out := [1, 2, 3].par_map(w)\n",
+        "  out := [1, 2, 3].par_map(geom.dbl)\n",
         "  print(out.sum())\n",
         "  return Ok(())\n",
         "}\n",
@@ -292,15 +311,14 @@ fn par_map_over_pure_imported_fn_accepts() {
 
 #[test]
 fn par_map_over_impure_imported_fn_rejects() {
-    // An imported fn that performs I/O is Impure in its summary; a `par_map` over a wrapper that
-    // calls it must fail closed (the impurity crosses the unit boundary via the effect bit).
+    // An imported fn that performs I/O is Impure in its summary; a direct qualified `par_map`
+    // callable must fail closed (the impurity crosses the unit boundary via the effect bit).
     let geom = "module geom\npub fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\n";
     let main = concat!(
         "module main\n",
         "import geom\n",
-        "fn w(x: i64) -> i64 = geom.noisy(x)\n",
         "fn main() -> Result<(), Error> {\n",
-        "  out := [1, 2, 3].par_map(w)\n",
+        "  out := [1, 2, 3].par_map(geom.noisy)\n",
         "  print(out.sum())\n",
         "  return Ok(())\n",
         "}\n",

@@ -96,15 +96,16 @@ fn nested_module_path_resolves_to_subdirectory() {
     if !backend_available() {
         return;
     }
-    // `import util.math` → `util/math.align` (declaring `module util.math`); called `util.math.fn`.
+    // `import util.math` → `util/math.align` (declaring `module util.math`); both a direct call and
+    // a qualified function-value reference retain the complete dotted module path.
     let math = "module util.math\npub fn cube(x: i64) -> i64 = x * x * x\n";
-    let main = "module main\nimport util.math\nfn main() -> i32 = util.math.cube(3) as i32\n";
+    let main = "module main\nimport util.math\nfn main() -> i32 = (util.math.cube(3) + [1, 2].map(util.math.cube).sum()) as i32\n";
     let out = build_and_run_multi(
         "mod-nested",
         &[("util/math.align", math), ("main.align", main)],
         "main.align",
     );
-    assert_eq!(out.status.code(), Some(27));
+    assert_eq!(out.status.code(), Some(36));
 }
 
 #[test]
@@ -479,4 +480,133 @@ fn non_entry_undefined_callable_still_errors() {
     let main = "module main\nimport util\nfn main() -> i32 = 0\n";
     let diags = check_multi_diagnostics("mod-fnval-undef", &[("util.align", util), ("main.align", main)], "main.align");
     assert!(diags.contains("undefined function: 'nope'"), "expected undefined-function error, got:\n{diags}");
+}
+
+// ---- Qualified cross-module function values ----------------------------------------------------
+
+#[test]
+fn qualified_cross_module_callable_forms_run() {
+    if !backend_available() {
+        return;
+    }
+    // Exercise every named callable consumer through the same qualified resolver. The i32 map and
+    // reduce functions also prove that signature peeks constrain otherwise-untyped literals.
+    let util = concat!(
+        "module util\n",
+        "pub fn dbl32(x: i32) -> i32 = x * 2\n",
+        "pub fn add32(a: i32, b: i32) -> i32 = a + b\n",
+        "pub fn dbl(x: i64) -> i64 = x * 2\n",
+        "pub fn add(a: i64, b: i64) -> i64 = a + b\n",
+        "pub fn positive(x: i64) -> bool = x > 0\n",
+        "pub fn neg(x: i64) -> i64 = -x\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import util\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  print([1, 2, 3].map(util.dbl32).sum())\n",
+        "  print([4, 5, 6].reduce(0, util.add32))\n",
+        "  print([1, 2, 3].par_map(util.dbl).sum())\n",
+        "  print([3, 1, 2].sort_by_key(util.neg)[0])\n",
+        "  print([0, 1, 2].where(util.positive).sum())\n",
+        "  print([1, 2, 3].scan(0, util.add).sum())\n",
+        "  parts := [0, 1, 2].partition(util.positive)\n",
+        "  print(parts.0.len())\n",
+        "  print(parts.1.len())\n",
+        "  print([0, 0, 1].any(util.positive))\n",
+        "  print([1, 2, 3].all(util.positive))\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run_multi(
+        "mod-qualified-callables",
+        &[("util.align", util), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n15\n12\n3\n3\n10\n2\n1\ntrue\ntrue\n");
+}
+
+#[test]
+fn qualified_cross_module_function_value_can_be_bound_and_called() {
+    if !backend_available() {
+        return;
+    }
+    let util = "module util\npub fn dbl(x: i64) -> i64 = x * 2\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  f := util.dbl\n  return f(21) as i32\n}\n";
+    let out = build_and_run_multi(
+        "mod-qualified-bound-fnval",
+        &[("util.align", util), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn qualified_callable_enforces_visibility_and_imports() {
+    let private_util = "module util\nfn dbl(x: i64) -> i64 = x * 2\n";
+    let imported_main = "module main\nimport util\nfn main() -> i32 = [1, 2].map(util.dbl).sum() as i32\n";
+    let private_diags = check_multi_diagnostics(
+        "mod-qualified-private-callable",
+        &[("util.align", private_util), ("main.align", imported_main)],
+        "main.align",
+    );
+    assert!(
+        private_diags.contains("'dbl' is private to module 'util'"),
+        "expected a visibility diagnostic, got:\n{private_diags}"
+    );
+
+    let public_util = "module util\npub fn dbl(x: i64) -> i64 = x * 2\n";
+    let unimported_main = "module main\nfn main() -> i32 = [1, 2].map(util.dbl).sum() as i32\n";
+    let import_diags = check_multi_diagnostics(
+        "mod-qualified-unimported-callable",
+        &[("util.align", public_util), ("main.align", unimported_main)],
+        "main.align",
+    );
+    assert!(
+        import_diags.contains("module 'util' is not imported here"),
+        "expected an import diagnostic, got:\n{import_diags}"
+    );
+}
+
+#[test]
+fn qualified_function_value_keeps_signature_restrictions() {
+    let util = "module util\npub fn total(xs: slice<i64>) -> i64 = xs.sum()\n";
+    let main = "module main\nimport util\nfn main() -> i32 {\n  f := util.total\n  return 0\n}\n";
+    let diags = check_multi_diagnostics(
+        "mod-qualified-fnval-signature",
+        &[("util.align", util), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        diags.contains("'util.total' cannot be used as a function value yet"),
+        "qualified values must retain the scalar-signature restriction, got:\n{diags}"
+    );
+}
+
+#[test]
+fn local_shadowing_module_is_not_a_qualified_callable() {
+    let util = "module util\npub fn dbl(x: i64) -> i64 = x * 2\n";
+    let main = concat!(
+        "module main\n",
+        "import util\n",
+        "Holder { dbl: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  util := Holder { dbl: 2 }\n",
+        "  return [1, 2].map(util.dbl).sum() as i32\n",
+        "}\n",
+    );
+    let diags = check_multi_diagnostics(
+        "mod-qualified-callable-shadow",
+        &[("util.align", util), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        diags.contains("'.map()' needs a function"),
+        "a shadowing local must keep value-field semantics, got:\n{diags}"
+    );
+    assert!(
+        !diags.contains("private to module") && !diags.contains("module 'util' has no function"),
+        "the shadowing local must not enter module resolution:\n{diags}"
+    );
 }
