@@ -19,8 +19,8 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete in the current working tree. The workspace is 2068 green (2067
-passed + one ignored manual probe) and clippy-clean. **Next:** harden the
+verification bundle) are complete. The workspace is 2068 green (2067 passed + one ignored manual
+probe) and clippy-clean. **Next:** harden the
 `http_server_no_fd_leak_across_cycles` timing flake without weakening its leak detection, then close
 the qualified cross-module fn-value remainder (`map(util.dbl)`).
 
@@ -2928,8 +2928,8 @@ slices: the `http_server_no_fd_leak_across_cycles` flake-hardening slice (it rec
 the S3b full-suite runs — same signature, passes in isolation) and the qualified cross-module
 fn-value remainder (`map(util.dbl)`, open-questions).
 
-**M15 SV COMPLETE (2026-07-15; workspace 2068 green + clippy `-D warnings` clean). M15 is
-COMPLETE.** The verification bundle closes the doc-10 §7 matrix at the implemented v1 boundary:
+**M15 SV SHIPPED — MERGED as #456 (2026-07-15; workspace 2068 green + clippy `-D warnings`
+clean). M15 is COMPLETE.** The verification bundle closes the doc-10 §7 matrix at the implemented v1 boundary:
 the frontend always re-runs and link always re-runs by design, while every codegen/object-cache
 identity and publication expectation is automated. Existing gates already pinned N=1 object/exe
 identity across profiles + `--rt-lto`, cold-vs-hit object/exe identity, private-body vs public
@@ -2954,6 +2954,11 @@ only, as settled in S3, so frontend and link rows are verified as safe reruns ra
 stages. Deferred cache layers retain their doc-10 gates. Next after M15: the recorded
 `http_server_no_fd_leak_across_cycles` flake hardening, then qualified cross-module function values
 (`map(util.dbl)`).
+
+Gemini's one high performance finding was valid and applied before merge: interface decode records
+the canonical surface boundary and hashes that input slice directly, avoiding a second O(N)
+serialization/allocation while preserving the same fail-closed check. The inline thread was
+answered and resolved, and the PR carries the English review-response/validation summary.
 
 ## Design Issues to Settle in Parallel
 
