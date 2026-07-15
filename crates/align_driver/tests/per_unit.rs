@@ -328,6 +328,46 @@ fn par_map_over_impure_imported_fn_rejects() {
 }
 
 #[test]
+fn imported_pure_fn_value_effect_survives_indirect_call() {
+    let geom = "module geom\npub fn dbl(x: i64) -> i64 = x * 2\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "fn worker(x: i64) -> i64 {\n",
+        "  f := geom.dbl\n",
+        "  return f(x)\n",
+        "}\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  out := [1, 2, 3].par_map(worker)\n",
+        "  print(out.sum())\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let r = assert_same_verdict("s1b-fnvalue-pure", &[("geom.align", geom), ("main.align", main)], "main.align");
+    assert!(!r.diags.has_errors());
+}
+
+#[test]
+fn imported_impure_fn_value_effect_survives_indirect_call() {
+    let geom = "module geom\npub fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "fn worker(x: i64) -> i64 {\n",
+        "  f := geom.noisy\n",
+        "  return f(x)\n",
+        "}\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  out := [1, 2, 3].par_map(worker)\n",
+        "  print(out.sum())\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let r = assert_same_verdict("s1b-fnvalue-impure", &[("geom.align", geom), ("main.align", main)], "main.align");
+    assert!(r.diags.has_errors());
+}
+
+#[test]
 fn sequential_impure_imported_call_stays_legal() {
     // Calling an impure imported fn sequentially (not under par_map) is fine in both checkers.
     let geom = "module geom\npub fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\n";

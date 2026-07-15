@@ -203,7 +203,7 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
-fn impure_capturing_closure_edge_rejected_in_par_map() {
+fn unused_impure_capturing_closure_does_not_taint_purity() {
     let src = "\
 fn worker(x: i64) -> i64 {
   k := 100
@@ -220,8 +220,137 @@ fn main() -> Result<(), Error> {
 }
 ";
     assert!(
-        check_errs("parmap-capturing-closure-purity", src),
-        "an Impure lifted closure must contribute an effect edge even before an indirect call"
+        !check_errs("parmap-unused-capturing-closure-purity", src),
+        "constructing an Impure closure without invoking it has no observable effect"
+    );
+}
+
+#[test]
+fn pure_fn_type_effect_allows_indirect_par_map_worker() {
+    let src = "\
+fn inc(x: i64) -> i64 = x + 1
+fn worker(x: i64) -> i64 {
+  f := inc
+  return f(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-fn-type-effect", src),
+        "a known-Pure function value must remain Pure through an indirect local call"
+    );
+}
+
+#[test]
+fn pure_capturing_closure_type_effect_allows_indirect_par_map_worker() {
+    let src = "\
+fn worker(x: i64) -> i64 {
+  k := 10
+  f := fn y: i64 { y + k }
+  return f(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-closure-type-effect", src),
+        "a known-Pure lifted closure must carry Pure through its function type"
+    );
+}
+
+#[test]
+fn pure_recursive_fn_value_cycle_reaches_least_effect_fixpoint() {
+    let src = "\
+fn countdown(x: i64) -> i64 {
+  f := countdown
+  if x == 0 { return 0 }
+  return f(x - 1)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(countdown)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-recursive-fn-type-effect", src),
+        "a recursive concrete function value must converge to the least Pure effect"
+    );
+}
+
+#[test]
+fn mutable_fn_type_effect_joins_impure_assignment() {
+    let src = "\
+fn inc(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut f := inc
+  if x > 0 { f = loud }
+  return f(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-joined-fn-type-effect", src),
+        "a mutable function value must conservatively join every assigned target's effect"
+    );
+}
+
+#[test]
+fn extern_fn_type_effect_is_impure_through_indirection() {
+    let src = "\
+extern \"C\" fn abs(x: i32) -> i32
+fn worker(x: i32) -> i32 {
+  f := abs
+  return f(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-extern-fn-type-effect", src),
+        "an FFI pointer must carry Impure through its function type"
+    );
+}
+
+#[test]
+fn map_err_consumes_function_type_effect() {
+    let src = "\
+fn noisy(e: Error) -> Error {
+  print(1)
+  return e
+}
+fn worker(x: i64) -> i64 {
+  r: Result<i64, Error> := Ok(x)
+  mapped := r.map_err(noisy)
+  return x
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-map-err-fn-type-effect", src),
+        "a function-valued consumer other than CallFnValue must also read the FnTy effect"
     );
 }
 
@@ -243,7 +372,7 @@ fn main() -> Result<(), Error> {
     let diagnostics = check_diagnostics("parmap-hof-unknown-effect", src);
     assert!(
         diagnostics.contains("calls a function value whose effect is not statically known"),
-        "a higher-order target with no function-type effect must fail closed at par_map:\n{diagnostics}"
+        "a higher-order parameter with no concrete target must remain fail-closed at par_map:\n{diagnostics}"
     );
 }
 
