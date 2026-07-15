@@ -8,7 +8,18 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (fifteenth update this day), **DEEP PIPELINE SCALING IS NOW A RECORDED
+_Last updated: 2026-07-15 (sixteenth update this day), **DEEP PIPELINE SCALING IS MEASURED AND
+REGRESSION-PINNED.** The shared 4-family × 6-depth fixture now runs through check, MIR, optimized
+LLVM, and release object emission on an explicit 2 MiB stack. It asserts one fused MIR loop, no
+intermediate/closure allocation, no residual simple-stage calls, and legal vector reductions
+through depth 32. The same-target O2 throughput harness compares runtime input with equal-LLVM
+clang-22 controls. On Ryzen 9 5950X / LLVM 22.1.8, all 24 native and x86-64-v2 points stayed within
+7.1% of control; depth-32 ratios were 0.981-1.011 native and 1.000-1.005 baseline. There is no
+Align-specific depth cliff. Native named/capture stage cost stayed nearly flat; v2's increase for
+long dependency chains matched C and is real useful-work/code-shape cost, not abstraction overhead.
+Cache-off compile time + sampled peak RSS are recorded in `bench/deep_pipeline/README.md`; the full
+gate and interpretation live in audit §4.5 and `docs/open-questions.md`. Previous update: 2026-07-15
+(fifteenth update this day), **DEEP PIPELINE SCALING IS NOW A RECORDED
 PERFORMANCE-CONTRACT GATE.** The pipeline remains structurally strong — one fused loop, no
 intermediate collections, allocation-free non-escaping captures — but the current equal-LLVM C
 evidence covers shallow kernels only. `docs/impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5

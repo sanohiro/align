@@ -3320,19 +3320,21 @@ length/effect/trap/alias behavior on x86-64 and arm64. Runtime-length `dot` may 
 but ordered floating-point reduction must not be silently reassociated. Full measurement and design
 gate: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.3.
 
-### Deep pipeline stage scaling — P1 performance-contract gate
+### Deep pipeline stage scaling — DONE / MEASURED 2026-07-15
 
-**Recorded 2026-07-15.** Fusion guarantees one data loop and removes intermediate collections, but
-the existing C-parity evidence covers only shallow pipelines. Before claiming depth-independent
-abstraction cost, sweep 1/2/4/8/16/32 stages across arithmetic maps, branchless reducing `where`,
-capturing lambdas, and the deliberately branchy general-callable-after-`where` case. Compare with
-semantically identical manually fused Align and equal-LLVM C controls using runtime-provided input.
-The acceptance evidence is optimized IR/assembly plus throughput per performed stage operation:
-one loop, no intermediate/closure allocation, no residual simple-stage calls, SIMD parity when
-legal, and no unexplained inlining/register-pressure/code-size cliff. Record compile time and peak
-memory separately. Compiler survival on a controlled 2 MiB stack is a distinct companion gate tied
-to "Expression-depth cap" above; a larger compiler stack is not a runtime optimization. Full gate:
-`impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5.
+**Recorded 2026-07-15; implemented and measured the same day.** The shared 1/2/4/8/16/32-stage
+fixture covers arithmetic maps, branchless reducing `where`, capturing lambdas, and the deliberately
+branchy general-callable-after-`where` case. A mandatory 2 MiB-stack integration test proves one
+fused MIR loop, no intermediate/closure allocation, no residual simple-stage calls, legal SIMD
+through depth 32, and successful object emission. The same-target O2 harness uses runtime input and
+equal-LLVM C controls. On Ryzen 9 5950X / LLVM 22.1.8 all 24 native and x86-64-v2 points stayed
+within 7.1% of control; depth-32 ratios were 0.981-1.011 native and 1.000-1.005 baseline. No
+Align-specific depth cliff was found. The portable baseline's higher per-stage cost for long serial
+dependency chains matched C and is therefore useful-work/code-shape cost, not pipeline abstraction
+overhead. Compile time and sampled peak RSS are recorded separately. The broader accepted-expression
+depth versus compiler-stack gap remains open above; a larger compiler stack is not a runtime
+optimization. Full result: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5 and
+`bench/deep_pipeline/`.
 
 ### Tuples / multi-value returns — design SETTLED (see Settled); implementation in progress
 The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
