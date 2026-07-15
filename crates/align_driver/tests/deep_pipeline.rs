@@ -27,7 +27,8 @@ fn target() -> BuildTarget {
 }
 
 fn clang22_available() -> bool {
-    Command::new("clang-22")
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang-22".to_string());
+    Command::new(clang)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -92,10 +93,26 @@ fn cyclic_components(f: &align_mir::Function) -> usize {
 }
 
 fn llvm_function<'a>(ir: &'a str, name: &str) -> &'a str {
-    let marker = format!("define i64 @{name}(");
-    let start = ir
-        .find(&marker)
-        .unwrap_or_else(|| panic!("missing LLVM definition for `{name}`"));
+    let symbol = format!("@{name}(");
+    let mut search_from = 0;
+    let start = loop {
+        let symbol_pos = ir[search_from..]
+            .find(&symbol)
+            .map(|position| search_from + position)
+            .unwrap_or_else(|| panic!("missing LLVM definition for `{name}`"));
+        let line_start = ir[..symbol_pos]
+            .rfind('\n')
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        let line_end = ir[symbol_pos..]
+            .find('\n')
+            .map(|position| symbol_pos + position)
+            .unwrap_or(ir.len());
+        if ir[line_start..line_end].trim_start().starts_with("define ") {
+            break line_start;
+        }
+        search_from = symbol_pos + symbol.len();
+    };
     let tail = &ir[start..];
     let end = tail
         .find("\n}\n")
