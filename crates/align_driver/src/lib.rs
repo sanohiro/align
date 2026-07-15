@@ -19,7 +19,7 @@ pub use align_interface::{Hash128, InterfaceSummary};
 pub mod cache;
 pub mod explain;
 
-pub use cache::{CacheContext, CacheOutcome, CacheStage, CodegenKey, FirstDiff};
+pub use cache::{clear_cache, CacheContext, CacheLookup, CacheOutcome, CacheStage, CodegenKey, FirstDiff};
 
 /// Result of running the pipeline through sema.
 pub struct Checked {
@@ -705,6 +705,115 @@ pub fn emit_object_cached(
     cache.codegen(&key, obj, |out| emit_object_file(mir, out, target.clone(), profile, exports, rt_lto))
 }
 
+/// M15 S3b: codegen every unit of a per-unit build into `obj_paths` (parallel over cache MISSES), the
+/// `build`/`run`/`size` path. Two phases, per the settled S3 design:
+///
+/// 1. **Serial** cache lookups (they mutate no shared LLVM state and produce the ordering): for each
+///    unit build its key and look it up; a HIT writes the object from the CAS immediately, a MISS is
+///    queued for codegen. When the cache is disabled every unit is a miss and NO key work runs.
+/// 2. **Parallel** codegen of the misses via `std::thread::scope` — `jobs` worker threads pull the
+///    next miss through a shared atomic index; each runs [`emit_object_file`] (a fresh LLVM `Context`
+///    per call) into its own `obj_paths[i]`, then publishes to the CAS. LLVM's native target is
+///    initialized ONCE on this (main) thread before the scope, never racily inside a worker.
+///
+/// Determinism: results return in DAG (unit) index order regardless of which worker finished first;
+/// the caller iterates the returned outcomes / the units' capability libs in that same order. `-j 1`
+/// is byte-identical to any `-j N` (each object is produced by an independent single-threaded codegen;
+/// only *which thread* runs it differs). A codegen error is reported for the lowest failing DAG index.
+///
+/// `obj_paths.len()` must equal `units.len()`. `build`/`run`/`size` pass no export roots (a unit's
+/// `pub` fns are already external; the entry's `main` is the only linker root).
+pub fn codegen_units_parallel(
+    units: &[PerUnitArtifact],
+    obj_paths: &[std::path::PathBuf],
+    cache: &CacheContext,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+) -> Result<Vec<CacheOutcome>, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
+    let n = units.len();
+    // LLVM native-target init once, on the main thread, before any worker touches codegen.
+    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
+
+    let enabled = cache.is_enabled();
+    // Phase 1 (serial): keys + lookups. `outcomes[i]` is set for every unit (hit or miss placeholder);
+    // `misses` lists the DAG indices still needing codegen; `keys[i]` is retained for the miss publish.
+    let mut keys: Vec<Option<CodegenKey>> = (0..n).map(|_| None).collect();
+    let mut outcomes: Vec<Option<CacheOutcome>> = (0..n).map(|_| None).collect();
+    let mut misses: Vec<usize> = Vec::new();
+    for (i, unit) in units.iter().enumerate() {
+        if enabled {
+            let key = build_codegen_key(&unit.unit, unit.summary.impl_hash, &unit.dep_interface_hashes, target, profile, &[], rt_lto)?;
+            match cache.lookup(&key, &obj_paths[i]) {
+                cache::CacheLookup::Hit(o) => outcomes[i] = Some(o),
+                cache::CacheLookup::Miss { reason } => {
+                    outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: reason });
+                    misses.push(i);
+                }
+            }
+            keys[i] = Some(key);
+        } else {
+            outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: None });
+            misses.push(i);
+        }
+    }
+
+    // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
+    // reads `units`/`obj_paths`/`keys` and appends any error under a short-held lock.
+    if !misses.is_empty() {
+        use std::sync::atomic::AtomicBool;
+        let worker_count = jobs.max(1).min(misses.len());
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| loop {
+                    // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
+                    // between units — an in-progress `emit_object_file` is never interrupted. Codegen
+                    // errors are rare (sema already validated in the walk), so this mainly bounds the
+                    // wasted work when a *systemic* failure (e.g. disk full) would otherwise compile
+                    // every remaining object before the build fails. `Relaxed` is correct: the flag is
+                    // a best-effort early-exit hint that publishes no data (errors ride the Mutex, and
+                    // the final read happens-after the scope join).
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= misses.len() {
+                        break;
+                    }
+                    let i = misses[k];
+                    let unit = &units[i];
+                    if let Err(e) = emit_object_file(&unit.mir, &obj_paths[i], target.clone(), profile, &[], rt_lto) {
+                        errors.lock().expect("codegen error lock").push((i, e));
+                        failed.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    if let Some(key) = &keys[i] {
+                        cache.publish_after_miss(key, &obj_paths[i]);
+                    }
+                });
+            }
+        });
+        // Deterministic report: the lowest-DAG-index error among those collected. Fail-fast may leave
+        // a higher-index unit unattempted, so in the rare case of MULTIPLE independent codegen failures
+        // the set collected is timing-dependent; the *reported* error is still the lowest index present
+        // (and such failures — e.g. disk full — carry the same cause across units anyway).
+        let mut errs = errors.into_inner().expect("codegen error lock");
+        if !errs.is_empty() {
+            errs.sort_by_key(|(i, _)| *i);
+            let (i, e) = &errs[0];
+            return Err(format!("codegen failed for unit `{}`: {e}", units[*i].unit));
+        }
+    }
+
+    Ok(outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect())
+}
+
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
 /// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
@@ -914,62 +1023,92 @@ fn runtime_archive() -> Result<std::path::PathBuf, String> {
     ))
 }
 
-/// Fail loudly if `libalign_runtime.a` is older than the `align_runtime` source.
-///
-/// `align_driver` has no cargo dependency edge to the runtime *staticlib*, and a unit-test
-/// build (`cargo test -p align_runtime`) recompiles only the test harness — neither refreshes
-/// the `.a`. So editing the runtime and re-running the driver/tests without a full `cargo build`
-/// would silently link a *stale* archive: wrong behavior and baffling test failures (this has
-/// bitten development; see `open-questions.md`). Converting that into an actionable error is the
-/// stable-toolchain fix (an artifact dependency, the clean edge, is still nightly-only).
-///
-/// No-ops when the source tree is absent (an installed `alignc`) or unreadable — it only ever
-/// turns a definitely-stale link into an error, never blocks a legitimate one.
-fn ensure_archive_fresh(archive: &std::path::Path) -> Result<(), String> {
-    let src = std::path::Path::new(RUNTIME_SRC_DIR);
-    if !src.is_dir() {
-        return Ok(()); // installed binary: no source tree to compare against
-    }
-    let Ok(archive_mtime) = archive.metadata().and_then(|m| m.modified()) else {
-        return Ok(()); // cannot stat the archive: do not block the build
-    };
-    if let Some(newest) = newest_rs_mtime(src)
-        && newest > archive_mtime {
-            return Err(format!(
-                "libalign_runtime.a is stale: a source file under {} is newer than the archive \
-                 {}.\nThe driver has no cargo edge to the runtime staticlib, so run `cargo build` \
-                 to refresh it before linking.",
-                src.display(),
-                archive.display(),
-            ));
-        }
-    Ok(())
-}
+/// The shared seed for the runtime-source content digest (M15 S3b). MUST equal
+/// `RUNTIME_SRC_DIGEST_SEED` in `build.rs` — the digest baked there is compared here, so the two
+/// algorithms + seed must agree (pinned by [`tests::runtime_src_digest_matches_baked`]).
+const RUNTIME_SRC_DIGEST_SEED: u64 = 0x616C_6967_6E5F_7274; // "align_rt"
 
-/// Newest modification time among `*.rs` files under `dir` (recursive); `None` if there are
-/// none or the tree is unreadable. Unreadable subdirectories are skipped, not fatal — the check
-/// must never disable itself silently on a single bad entry.
-fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
-    let mut newest: Option<std::time::SystemTime> = None;
+/// The runtime-source content digest baked at build time (`build.rs` → `cargo:rustc-env`), the
+/// staleness reference. Empty only if the source tree was absent when `alignc` was built.
+const BAKED_RUNTIME_SRC_DIGEST: &str = env!("ALIGN_RUNTIME_SRC_DIGEST");
+
+/// A deterministic, **mtime-independent** content digest of every `*.rs` file under `dir` (recursive):
+/// relative paths sorted, then each `(rel_path, len, bytes)` folded into one buffer and wyhashed.
+/// `None` if the tree is absent/unreadable. Mirrors the identical routine in `build.rs` (same seed +
+/// canonical form), so a digest computed here at link time is comparable to the one baked at build.
+pub fn runtime_src_digest(dir: &std::path::Path) -> Option<String> {
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
+        let entries = std::fs::read_dir(&d).ok()?;
         for entry in entries.flatten() {
-            // `file_type()` comes from the `read_dir` iterator with no extra `stat`, and (unlike
-            // `path.is_dir()`) does not follow symlinks — so a symlinked dir is not traversed,
-            // avoiding cycles / escaping the source tree. We `stat` only actual `.rs` files.
+            // `file_type()` (from the iterator, no extra `stat`) does not follow symlinks, so a
+            // symlinked dir is not traversed (no cycles / no escaping the tree).
             let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
             if ft.is_dir() {
-                stack.push(entry.path());
-            } else if ft.is_file() && entry.path().extension().is_some_and(|x| x == "rs")
-                && let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
-                    newest = Some(newest.map_or(t, |n| n.max(t)));
-                }
+                stack.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs") {
+                let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                files.push((rel, path));
+            }
         }
     }
-    newest
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut buf: Vec<u8> = Vec::new();
+    for (rel, path) in &files {
+        let bytes = std::fs::read(path).ok()?;
+        buf.extend_from_slice(rel.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&bytes);
+    }
+    Some(format!("{:016x}", align_hash::wyhash(&buf, RUNTIME_SRC_DIGEST_SEED)))
+}
+
+/// The content digest of the runtime archive bytes (`docs/impl/10-cache-first-optimization.md` §6.3):
+/// a future link-cache-key input, and the identity a shared/cross-host cache would key link actions on.
+/// Not yet folded into any key (link caching is a later slice); exposed + tested now so the identity
+/// exists. A `touch` of the archive leaves this unchanged (content-addressed); rebuilt bytes change it.
+pub fn runtime_archive_digest() -> Result<Hash128, String> {
+    let archive = runtime_archive()?;
+    let bytes = std::fs::read(&archive).map_err(|e| format!("cannot read {}: {e}", archive.display()))?;
+    Ok(Hash128::of(&bytes))
+}
+
+/// Fail loudly if `libalign_runtime.a` does not correspond to the current `align_runtime` source.
+///
+/// `align_driver` has no cargo dependency edge to the runtime *staticlib*, and a unit-test build
+/// (`cargo test -p align_runtime`) recompiles only the test harness — neither refreshes the `.a`. So
+/// editing the runtime and re-running the driver/tests without a full `cargo build` would silently
+/// link a *stale* archive: wrong behavior and baffling test failures.
+///
+/// M15 S3b switched the check from **mtime** to a **content digest**: the current runtime-source digest
+/// is compared to the one baked into this `alignc` at build time (`build.rs`). Since `alignc` and the
+/// `.a` are produced by the same `cargo build`, a match means the `.a` is current — regardless of file
+/// mtimes. This kills the false-stale papercut (a `git checkout`/`touch` bumps source mtimes without
+/// changing content, which the old mtime check flagged as stale) while keeping the teeth: a real
+/// source edit changes the digest and fails loud until `cargo build` refreshes both.
+///
+/// No-ops when the source tree is absent (an installed `alignc`), unreadable, or when no digest was
+/// baked — it only ever turns a definitely-stale link into an error, never blocks a legitimate one.
+fn ensure_archive_fresh(_archive: &std::path::Path) -> Result<(), String> {
+    let src = std::path::Path::new(RUNTIME_SRC_DIR);
+    if !src.is_dir() || BAKED_RUNTIME_SRC_DIGEST.is_empty() {
+        return Ok(()); // installed binary / no baked reference: nothing to compare against
+    }
+    let Some(current) = runtime_src_digest(src) else {
+        return Ok(()); // cannot read the source tree: do not block the build
+    };
+    if current != BAKED_RUNTIME_SRC_DIGEST {
+        return Err(format!(
+            "libalign_runtime.a is stale: the content of {} differs from what this `alignc` was \
+             built against.\nThe driver has no cargo edge to the runtime staticlib, so run \
+             `cargo build` to refresh the archive before linking.",
+            src.display(),
+        ));
+    }
+    Ok(())
 }
 
 /// Format diagnostics for humans (one per line, `file:line:col: severity: message`).
@@ -997,42 +1136,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn newest_rs_mtime_scans_recursively_and_filters_extension() {
-        // Unique temp dir (no Date/rand in-crate; pid + a stack address suffice here).
-        let root = std::env::temp_dir().join(format!(
-            "align-driver-mtime-{}-{:p}",
-            std::process::id(),
-            &0u8 as *const _
-        ));
+    fn runtime_src_digest_is_content_based_and_mtime_independent() {
+        let root = std::env::temp_dir().join(format!("align-driver-srcdigest-{}-{:p}", std::process::id(), &0u8 as *const _));
         let sub = root.join("nested");
         std::fs::create_dir_all(&sub).expect("create temp tree");
 
-        // Empty (no `.rs`) → None.
-        assert_eq!(newest_rs_mtime(&root), None, "no .rs files yet");
-
-        // A non-`.rs` file is ignored.
+        // Empty (no `.rs`) → a digest of the empty buffer (Some, deterministic). A non-`.rs` is ignored.
         std::fs::write(root.join("notes.txt"), b"x").unwrap();
-        assert_eq!(newest_rs_mtime(&root), None, ".txt is not counted");
+        let empty = runtime_src_digest(&root);
+        assert!(empty.is_some(), ".txt is not counted; the empty-`.rs` tree still digests");
 
-        // `.rs` files at the top level and in a subdir are both found; the result is their max
-        // mtime. Compare against an independent scan so the test does not depend on write timing.
+        // Add `.rs` at two levels → a specific content digest.
         std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
         std::fs::write(sub.join("b.rs"), b"fn b() {}").unwrap();
-        let expect = [root.join("a.rs"), sub.join("b.rs")]
-            .iter()
-            .map(|p| p.metadata().unwrap().modified().unwrap())
-            .max()
-            .unwrap();
-        assert_eq!(
-            newest_rs_mtime(&root),
-            Some(expect),
-            "finds the newest .rs across the top level and the nested dir"
-        );
+        let d1 = runtime_src_digest(&root).expect("digest");
+        assert_ne!(Some(&d1), empty.as_ref(), "adding source changes the digest");
 
-        // A missing directory yields None (read_dir fails, skipped, not a panic).
-        assert_eq!(newest_rs_mtime(&root.join("does-not-exist")), None);
+        // A pure `touch` (rewrite identical bytes, new mtime) leaves the digest UNCHANGED — the
+        // papercut fix: content, not mtime, drives staleness.
+        std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+        assert_eq!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "identical content → identical digest (mtime-independent)");
 
+        // A content CHANGE flips the digest (keeps the teeth).
+        std::fs::write(root.join("a.rs"), b"fn a() { let _ = 1; }").unwrap();
+        assert_ne!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "changed content → changed digest");
+
+        // A missing directory yields None (read_dir fails; not a panic).
+        assert_eq!(runtime_src_digest(&root.join("does-not-exist")), None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn runtime_src_digest_matches_baked() {
+        // Pins that `build.rs`'s baked digest and lib's recompute agree (same algorithm + seed). In a
+        // dev tree the source is unchanged since the last build, so the two MUST be equal. Skips only
+        // if `alignc` was built without a source tree (installed binary): baked digest empty.
+        if BAKED_RUNTIME_SRC_DIGEST.is_empty() {
+            return;
+        }
+        let src = std::path::Path::new(RUNTIME_SRC_DIR);
+        if let Some(current) = runtime_src_digest(src) {
+            assert_eq!(current, BAKED_RUNTIME_SRC_DIGEST, "lib recompute must equal build.rs's baked digest (algorithm/seed drift)");
+        }
     }
 
     #[test]

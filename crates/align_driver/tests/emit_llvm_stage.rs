@@ -42,7 +42,11 @@ fn write_src(test_name: &str) -> TempFile {
 }
 
 fn alignc() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_alignc"))
+    // Isolate from the (now default-ON) user cache so this test is deterministic and never
+    // pollutes ~/.cache; these verbs assert exact codegen/IR, not caching behavior.
+    let mut c = Command::new(env!("CARGO_BIN_EXE_alignc"));
+    c.env("ALIGNC_CACHE", "off");
+    c
 }
 
 #[test]

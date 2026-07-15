@@ -629,13 +629,25 @@ mutation in the validation matrix causes the intended miss; cache-hit and cold o
   cache): the per-unit codegen key folds the unit's own `impl_hash` + its transitive dependency
   interface hashes, so a private-body edit misses only the edited unit and every dependent hits
   (`crates/align_driver/src/cache.rs`; gates in `crates/align_driver/tests/cache_codegen.rs`).
-- [ ] Compile independent misses in parallel using the C0 publication mechanism — deferred to S3b.
+- [x] Compile independent misses in parallel using the C0 publication mechanism — **M15 S3b**
+  (`align_driver::codegen_units_parallel`): serial lookups, then `std::thread::scope` workers produce
+  only the misses (fresh LLVM `Context` per unit; native target initialized once on the main thread
+  before the scope); results stay DAG-ordered.
 
 **S3a landed (2026-07-15):** the codegen-stage action cache + CAS substrate (`align_driver::cache`),
 serial cache wiring for `build`/`run`/`size`/`emit-obj`, the `CacheOutcome`/`FirstDiff` observability
-model, and the doc-10 §7 invalidation gates — **opt-in** via `ALIGNC_CACHE`. Still open (S3b): parallel
-codegen, `--cache-stats`/`-j`/`cache clear`, the runtime-archive mtime→content-digest upgrade, and the
-default-ON flip.
+model, and the doc-10 §7 invalidation gates — **opt-in** via `ALIGNC_CACHE`.
+
+**S3b landed (2026-07-15):** parallel codegen over cache MISSES (`-j`/`--jobs` + `ALIGNC_JOBS`, default
+`available_parallelism`; `-j 1` byte-identical to `-j N`); `--cache-stats` (per-unit hit/miss + summary
+on build/run/size); `alignc cache clear` (removes the `cas`/`actions`/`index` subtrees under the
+resolved root); the runtime-archive freshness check moved **mtime → content digest** (§6.3) — a
+source-content digest baked at build time (`build.rs`) is compared at link time, killing the false-stale
+`touch`/checkout papercut while keeping the teeth, plus `runtime_archive_digest()` as the future
+link-key input; and the **default-ON flip** — unset `ALIGNC_CACHE` now enables the cache at the XDG
+root (`off` still disables). Test infrastructure isolates every `alignc`-binary-spawning test with an
+explicit `ALIGNC_CACHE=off` so the default-ON cache never makes an assertion nondeterministic or
+pollutes the user cache.
 
 **Completion:** a private-body edit recompiles one unit plus relink; public soundness-summary changes
 invalidate the right reverse dependencies; no missing summary is treated optimistically.

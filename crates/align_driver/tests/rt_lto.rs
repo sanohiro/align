@@ -327,6 +327,7 @@ fn write_cli_src(tag: &str) -> std::path::PathBuf {
 fn cli_rt_lto_rejects_dev_profile() {
     let src = write_cli_src("dev");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .env("ALIGNC_CACHE", "off")
         .arg("build")
         .arg(&src)
         .args(["--rt-lto", "--profile", "dev"])
@@ -345,6 +346,7 @@ fn cli_rt_lto_rejects_dev_profile() {
 fn cli_rt_lto_rejects_non_build_verb() {
     let src = write_cli_src("check");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .env("ALIGNC_CACHE", "off")
         .arg("check")
         .arg(&src)
         .arg("--rt-lto")

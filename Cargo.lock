@@ -39,6 +39,7 @@ dependencies = [
  "align_codegen_llvm",
  "align_diag",
  "align_fmt",
+ "align_hash",
  "align_interface",
  "align_lexer",
  "align_mir",

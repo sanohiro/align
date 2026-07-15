@@ -28,7 +28,11 @@ fn write_src(name: &str, body: &str) -> TempFile {
 }
 
 fn alignc() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_alignc"))
+    // Isolate from the (now default-ON) user cache so this test is deterministic and never
+    // pollutes ~/.cache; these verbs assert exact codegen/IR, not caching behavior.
+    let mut c = Command::new(env!("CARGO_BIN_EXE_alignc"));
+    c.env("ALIGNC_CACHE", "off");
+    c
 }
 
 const MAP_SUM: &str = "fn dbl(x: i64) -> i64 = x * 2\n\

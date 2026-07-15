@@ -258,12 +258,27 @@ pub struct ResolvedTarget {
     pub code_model: &'static str,
 }
 
+/// Initialize the native LLVM target exactly once per process. LLVM's `initialize_native` mutates
+/// process-global target registries, so it must not race; a `Once` serializes the first call and makes
+/// every later call a cheap no-op. **The parallel build driver calls this on the main thread BEFORE
+/// spawning codegen workers** (`docs/impl/07-roadmap.md` M15 S3 "LLVM target-init once on the main
+/// thread before the scope"); per-thread `create_target_machine` calls it too, so a direct caller is
+/// still safe. A failed init is remembered so every caller sees the same error.
+pub fn ensure_target_initialized() -> Result<(), CodegenError> {
+    use std::sync::OnceLock;
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        Target::initialize_native(&InitializationConfig::default()).map_err(|e| format!("native target init: {e}"))
+    })
+    .clone()
+    .map_err(CodegenError::Target)
+}
+
 /// Resolve the concrete codegen identity for `target` (triple + resolved cpu/features + reloc/code
 /// model) without building a `TargetMachine`. Used by the driver to build the codegen cache key from
 /// the SAME resolution [`create_target_machine`] uses, so a cache hit implies byte-identical codegen.
 pub fn resolve_target_identity(target: &BuildTarget) -> Result<ResolvedTarget, CodegenError> {
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
+    ensure_target_initialized()?;
     let triple = TargetMachine::get_default_triple();
     let triple_str = triple.as_str().to_string_lossy().to_string();
     let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase());
@@ -290,8 +305,7 @@ pub fn llvm_version() -> String {
 /// the diagnostic lenses (`emit_llvm_ir` / `collect_opt_remarks`) pin `Default` so their IR shape
 /// stays profile-independent.
 fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result<TargetMachine, CodegenError> {
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
+    ensure_target_initialized()?;
     let triple = TargetMachine::get_default_triple();
     let t = Target::from_triple(&triple)
         .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
