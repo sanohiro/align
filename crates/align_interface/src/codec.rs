@@ -375,6 +375,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     let structs = r.seq(read_struct)?;
     let enums = r.seq(read_enum)?;
     let consts = r.seq(read_const)?;
+    let surface_len = r.pos;
     let capabilities = r.seq(|r| r.str())?;
     let interface_hash = Hash128 { lo: r.u64()?, hi: r.u64()? };
     let impl_hash = Hash128 { lo: r.u64()?, hi: r.u64()? };
@@ -389,7 +390,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
         interface_hash,
         impl_hash,
     };
-    if Hash128::of(&encode_interface_surface(&summary)) != summary.interface_hash {
+    if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }
     Ok(summary)
