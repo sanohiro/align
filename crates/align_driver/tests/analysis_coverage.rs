@@ -96,6 +96,72 @@ fn main() -> i32 { return 0 }
     assert!(check_errs("slicerange-return", src), "returning a range slice of a local array must be rejected");
 }
 
+// A wrapper must not hide the same frame-local borrow from the return escape check.
+#[test]
+fn returning_local_array_slice_inside_result_is_rejected() {
+    let src = "\
+fn f() -> Result<slice<i64>, Error> {
+  xs := [1, 2, 3]
+  return Ok(xs[..])
+}
+fn main() -> i32 { return 0 }
+";
+    assert!(
+        check_errs("wrapped-slicerange-return", src),
+        "Result must not hide a returned slice of a local array"
+    );
+}
+
+#[test]
+fn returning_local_array_slice_through_wrapped_local_is_rejected() {
+    let src = "\
+fn f() -> Option<slice<i64>> {
+  xs := [1, 2, 3]
+  wrapped := Some(xs[..])
+  return wrapped
+}
+fn main() -> i32 { return 0 }
+";
+    assert!(
+        check_errs("wrapped-slice-local-return", src),
+        "a wrapper local must retain local-slice provenance"
+    );
+}
+
+#[test]
+fn returning_local_array_slice_through_match_payload_is_rejected() {
+    let src = "\
+fn f() -> Result<slice<i64>, Error> {
+  xs := [1, 2, 3]
+  wrapped: Result<slice<i64>, Error> := Ok(xs[..])
+  return match wrapped {
+    Ok(s) => Ok(s),
+    Err(e) => Err(e),
+  }
+}
+fn main() -> i32 { return 0 }
+";
+    assert!(
+        check_errs("wrapped-slice-match-return", src),
+        "a match payload must retain local-slice provenance"
+    );
+}
+
+#[test]
+fn returning_caller_slice_inside_result_is_allowed() {
+    let src = "\
+fn pass(xs: slice<i64>) -> Result<slice<i64>, Error> {
+  wrapped: Result<slice<i64>, Error> := Ok(xs)
+  return wrapped
+}
+fn main() -> i32 { return 0 }
+";
+    assert!(
+        !check_errs("wrapped-slice-param-return", src),
+        "a wrapped caller-provided slice remains returnable"
+    );
+}
+
 // --- 1-6: an arena str stored into an outer array element (AssignIndex lacked a region check) ---
 #[test]
 fn storing_arena_str_into_outer_array_element_is_rejected() {
