@@ -3320,6 +3320,20 @@ length/effect/trap/alias behavior on x86-64 and arm64. Runtime-length `dot` may 
 but ordered floating-point reduction must not be silently reassociated. Full measurement and design
 gate: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.3.
 
+### Deep pipeline stage scaling — P1 performance-contract gate
+
+**Recorded 2026-07-15.** Fusion guarantees one data loop and removes intermediate collections, but
+the existing C-parity evidence covers only shallow pipelines. Before claiming depth-independent
+abstraction cost, sweep 1/2/4/8/16/32 stages across arithmetic maps, branchless reducing `where`,
+capturing lambdas, and the deliberately branchy general-callable-after-`where` case. Compare with
+semantically identical manually fused Align and equal-LLVM C controls using runtime-provided input.
+The acceptance evidence is optimized IR/assembly plus throughput per performed stage operation:
+one loop, no intermediate/closure allocation, no residual simple-stage calls, SIMD parity when
+legal, and no unexplained inlining/register-pressure/code-size cliff. Record compile time and peak
+memory separately. Compiler survival on a controlled 2 MiB stack is a distinct companion gate tied
+to "Expression-depth cap" above; a larger compiler stack is not a runtime optimization. Full gate:
+`impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5.
+
 ### Tuples / multi-value returns — design SETTLED (see Settled); implementation in progress
 The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
