@@ -165,6 +165,18 @@ impl Profile {
         }
     }
 
+    /// The codegen opt level as a stable string for the S3 cache key (`none`/`less`/`default`/
+    /// `aggressive`). Mirrors [`Profile::codegen_opt_level`] without leaking the inkwell enum type to
+    /// the driver.
+    pub fn codegen_opt_name(self) -> &'static str {
+        match self.codegen_opt_level() {
+            OptimizationLevel::None => "none",
+            OptimizationLevel::Less => "less",
+            OptimizationLevel::Default => "default",
+            OptimizationLevel::Aggressive => "aggressive",
+        }
+    }
+
     /// Whether all symbols should be stripped from the final image (spelled per object format by
     /// the driver: ELF links with `-Wl,--strip-all`, Mach-O runs `strip` post-link). The
     /// size profiles (`small`/`tiny`) strip — the symbol table is pure size a size build does not
@@ -202,6 +214,74 @@ impl Profile {
     pub const NAMES: &'static str = "dev, release, fast, small, tiny";
 }
 
+/// Resolve the `(cpu, features)` pair codegen targets — the single place the CPU/feature string is
+/// picked, shared by [`create_target_machine`] (which builds the machine) and
+/// [`resolve_target_identity`] (which reports the resolved identity for the cache key). `triple_lower`
+/// is the default triple lowercased. Keeping this one function guarantees the cache key hashes the
+/// EXACT cpu/features codegen will use — `native` is never keyed as the literal string `"native"`, it
+/// is resolved here to the host's concrete cpu + feature set (doc-10 §6.2).
+fn resolve_cpu_features(target: &BuildTarget, triple_lower: &str) -> (String, String) {
+    match target {
+        BuildTarget::Native => (
+            TargetMachine::get_host_cpu_name().to_string(),
+            TargetMachine::get_host_cpu_features().to_string(),
+        ),
+        BuildTarget::Cpu(name) => (name.clone(), String::new()),
+        BuildTarget::Baseline => {
+            // Conservative per-arch floor: bump amd64 to x86-64-v2 (still pre-AVX, so cloud-safe);
+            // arm64 / anything else uses `generic` (= the architecture baseline, e.g. armv8-a).
+            let cpu = if triple_lower.starts_with("x86_64") || triple_lower.starts_with("amd64") {
+                "x86-64-v2"
+            } else {
+                "generic"
+            };
+            (cpu.to_string(), String::new())
+        }
+    }
+}
+
+/// The relocation model codegen uses (kept in sync with [`create_target_machine`]'s `RelocMode::PIC`),
+/// as a stable string for the cache key.
+const RELOC_MODEL: &str = "PIC";
+/// The code model codegen uses (kept in sync with [`create_target_machine`]'s `CodeModel::Default`),
+/// as a stable string for the cache key.
+const CODE_MODEL: &str = "Default";
+
+/// The resolved, concrete codegen target identity — the target-dependent part of the S3 codegen cache
+/// key. `cpu`/`features` are already resolved (never the literal `"native"`), so two hosts that
+/// resolve `native` differently get distinct keys (doc-10 §6.2).
+pub struct ResolvedTarget {
+    pub triple: String,
+    pub cpu: String,
+    pub features: String,
+    pub reloc_model: &'static str,
+    pub code_model: &'static str,
+}
+
+/// Resolve the concrete codegen identity for `target` (triple + resolved cpu/features + reloc/code
+/// model) without building a `TargetMachine`. Used by the driver to build the codegen cache key from
+/// the SAME resolution [`create_target_machine`] uses, so a cache hit implies byte-identical codegen.
+pub fn resolve_target_identity(target: &BuildTarget) -> Result<ResolvedTarget, CodegenError> {
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
+    let triple = TargetMachine::get_default_triple();
+    let triple_str = triple.as_str().to_string_lossy().to_string();
+    let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase());
+    Ok(ResolvedTarget { triple: triple_str, cpu, features, reloc_model: RELOC_MODEL, code_model: CODE_MODEL })
+}
+
+/// The exact LLVM version this compiler is dynamically linked against, `"major.minor.patch"`, read at
+/// runtime from `LLVMGetVersion` (never a hand-typed constant — doc-10 §6.2: a minor/patch change can
+/// alter pass pipelines or object bytes, so the codegen cache key must pin the exact version).
+pub fn llvm_version() -> String {
+    let (mut major, mut minor, mut patch) = (0u32, 0u32, 0u32);
+    // SAFETY: `LLVMGetVersion` writes three `unsigned` out-params; the pointers are to live u32 locals.
+    unsafe {
+        llvm_sys::core::LLVMGetVersion(&mut major, &mut minor, &mut patch);
+    }
+    format!("{major}.{minor}.{patch}")
+}
+
 /// Build the `TargetMachine` for `target` — the one place that picks the CPU / feature string, so
 /// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
 ///
@@ -215,29 +295,13 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
     let triple = TargetMachine::get_default_triple();
     let t = Target::from_triple(&triple)
         .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
-    let (cpu, features) = match target {
-        BuildTarget::Native => (
-            TargetMachine::get_host_cpu_name().to_string(),
-            TargetMachine::get_host_cpu_features().to_string(),
-        ),
-        BuildTarget::Cpu(name) => (name.clone(), String::new()),
-        BuildTarget::Baseline => {
-            let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();
-            // Conservative per-arch floor: bump amd64 to x86-64-v2 (still pre-AVX, so cloud-safe);
-            // arm64 / anything else uses `generic` (= the architecture baseline, e.g. armv8-a).
-            let cpu = if ts.starts_with("x86_64") || ts.starts_with("amd64") {
-                "x86-64-v2"
-            } else {
-                "generic"
-            };
-            (cpu.to_string(), String::new())
-        }
-    };
+    let (cpu, features) = resolve_cpu_features(target, &triple.as_str().to_string_lossy().to_ascii_lowercase());
     t.create_target_machine(
         &triple,
         &cpu,
         &features,
         opt,
+        // Kept in sync with RELOC_MODEL / CODE_MODEL (the strings the cache key hashes).
         RelocMode::PIC,
         CodeModel::Default,
     )
