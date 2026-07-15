@@ -19,10 +19,12 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2068 green (2067 passed + one ignored manual
-probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened and
-merged as #457 without weakening its persistent-leak threshold. **Next:** close the qualified
-cross-module fn-value remainder (`map(util.dbl)`).
+verification bundle) are complete. The workspace is 2074 green (2073 passed + one ignored manual
+probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
+#457 without weakening its persistent-leak threshold, and qualified cross-module function values
+are shipped as #458. Both recorded post-M15 items are complete. **Next:** select and settle the
+next backlog item; no mandatory implementation slice is queued. Fully-escaping function values
+remain deliberately deferred pending a settled heap-owned environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core
@@ -2952,8 +2954,8 @@ rejection. SV added the missing teeth:
 The matrix intentionally does not claim frontend/link cache hits: v1 caches per-unit object bytes
 only, as settled in S3, so frontend and link rows are verified as safe reruns rather than cached
 stages. Deferred cache layers retain their doc-10 gates. The first recorded post-M15 item, the
-`http_server_no_fd_leak_across_cycles` flake hardening, shipped as #457; next is qualified
-cross-module function values (`map(util.dbl)`).
+`http_server_no_fd_leak_across_cycles` flake hardening, shipped as #457; qualified cross-module
+function values then shipped as #458. Both recorded follow-ups are complete.
 
 Gemini's one high performance finding was valid and applied before merge: interface decode records
 the canonical surface boundary and hashes that input slice directly, avoiding a second O(N)
@@ -2972,6 +2974,21 @@ parallel `align_runtime` library suite passed 20 consecutive runs. Gemini's one 
 valid and applied: transient `/proc/self/fd` read failures are handled without `unwrap` panics in
 both the initial post-cycle count and retries. The inline thread was answered and resolved, and an
 English review-response/validation summary was posted before merge.
+
+**QUALIFIED CROSS-MODULE FUNCTION VALUES SHIPPED — MERGED as #458 (2026-07-15; workspace 2074
+green = 2073 passed + one ignored manual probe; clippy `-D warnings` clean).** Named callable
+positions previously discarded a qualified module prefix even though direct calls already
+understood it. A shared named-function reference now preserves bare or complete dotted module
+paths and uses the same import / `pub` classifier as direct calls. The common checked resolver
+drives `map`, `where`, `reduce`, `scan`, `partition`, `any`, `all`, `par_map`, and `sort_by_key`,
+plus ordinary bound values such as `f := util.dbl; f(21)`. Quiet signature peeks share resolution
+without premature diagnostics; local leftmost-name shadowing remains value-field semantics.
+Whole-program and per-unit checking agree for nested modules, visibility/import failures, and
+qualified Pure/Impure `par_map` effect bits. Gemini reported no findings, thread-aware inspection
+found no unresolved review comments, and an English validation summary was posted before merge.
+The two recorded post-M15 follow-ups are therefore complete. No mandatory implementation slice is
+queued; fully-escaping function values stay deferred until the heap-owned environment/drop model
+is settled and has a consumer.
 
 ## Design Issues to Settle in Parallel
 

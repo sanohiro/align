@@ -2386,7 +2386,7 @@ non-entry `par_map` callee and rejects an Impure one. Whole-program and per-unit
 (differential test added). Tests: `crates/align_driver/tests/modules.rs` (6 new) +
 `per_unit.rs` (1 new).
 
-**Qualified remainder — FIXED 2026-07-15.** A shared named-function reference now preserves either
+**Qualified remainder — FIXED as #458, 2026-07-15.** A shared named-function reference now preserves either
 a bare name or the complete dotted module prefix, then resolves through the same import / `pub`
 visibility contract as a direct `mod.fn(...)` call. Qualified functions work in every named
 callable consumer (`map`/`where`/`reduce`/`scan`/`partition`/`any`/`all`/`par_map`/
