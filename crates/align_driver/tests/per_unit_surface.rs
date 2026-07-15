@@ -75,9 +75,10 @@ impl Proj {
         Proj { dir }
     }
 
-    /// Run `alignc <args>` with this project as the working directory.
+    /// Run `alignc <args>` with this project as the working directory. `ALIGNC_CACHE=off` isolates
+    /// these byte-identity/visibility assertions from the (now default-ON) user cache.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(alignc()).args(args).current_dir(&self.dir).output().expect("spawn alignc")
+        Command::new(alignc()).args(args).env("ALIGNC_CACHE", "off").current_dir(&self.dir).output().expect("spawn alignc")
     }
 }
 

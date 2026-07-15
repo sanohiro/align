@@ -159,6 +159,29 @@ pub enum FirstDiff {
     CorruptEntry,
 }
 
+impl FirstDiff {
+    /// A short human-readable miss reason for the `--cache-stats` surface.
+    pub fn reason(self) -> &'static str {
+        match self {
+            FirstDiff::NoPriorEntry => "no prior entry",
+            FirstDiff::CacheFormatVersion => "cache-format version",
+            FirstDiff::CompilerBuildId => "compiler build id",
+            FirstDiff::FrontendSchema => "frontend schema",
+            FirstDiff::Target => "target",
+            FirstDiff::Cpu => "cpu/features",
+            FirstDiff::LlvmVersion => "llvm version",
+            FirstDiff::RelocCodeModel => "reloc/code model",
+            FirstDiff::MirDigest => "implementation changed",
+            FirstDiff::DepInterfaceHashes => "dependency interface changed",
+            FirstDiff::Exports => "export set",
+            FirstDiff::Profile => "profile",
+            FirstDiff::RtLto => "rt-lto mode",
+            FirstDiff::CrossUnitOpt => "cross-unit-opt",
+            FirstDiff::CorruptEntry => "corrupt entry rebuilt",
+        }
+    }
+}
+
 /// The first differing component of `current` vs a decoded prior `stored` key, in a fixed priority
 /// order. The stable-core components (cache-format version / compiler build id / unit) are guaranteed
 /// equal when the slot pointer was found by [`CodegenKey::slot_digest`], but they are still checked
@@ -240,18 +263,22 @@ pub enum CacheContext {
 }
 
 impl CacheContext {
-    /// Resolve the cache from `ALIGNC_CACHE` (doc-10 §6.1). Unset or `off` ⇒ disabled. `on` ⇒
-    /// `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema>`. Any other value ⇒ that path used as the root
-    /// verbatim (schema skew inside a shared root is handled by the fail-closed key/manifest versions).
+    /// Resolve the cache from `ALIGNC_CACHE` (doc-10 §6.1). **Default-ON (M15 S3b): unset ⇒ ENABLED**
+    /// at `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema>` (same as `on`). `off` (or an empty value) ⇒
+    /// disabled — the operability hatch, not a compat shim. Any other value ⇒ that path used as the
+    /// root verbatim (schema skew inside a shared root is handled by the fail-closed key/manifest
+    /// versions). If the default root cannot be resolved (no `HOME`/`XDG_CACHE_HOME`), the on/unset
+    /// case degrades to disabled rather than guessing a root.
     pub fn from_env() -> CacheContext {
+        let default_on = || match default_cache_root() {
+            Some(root) => CacheContext::Enabled { root },
+            None => CacheContext::Disabled,
+        };
         match std::env::var("ALIGNC_CACHE") {
-            Ok(v) if v.is_empty() || v == "off" => CacheContext::Disabled,
-            Ok(v) if v == "on" => match default_cache_root() {
-                Some(root) => CacheContext::Enabled { root },
-                None => CacheContext::Disabled,
-            },
+            Err(_) => default_on(),                                       // unset ⇒ default-ON
+            Ok(v) if v.is_empty() || v == "off" => CacheContext::Disabled, // explicit off
+            Ok(v) if v == "on" => default_on(),
             Ok(path) => CacheContext::Enabled { root: PathBuf::from(path) },
-            Err(_) => CacheContext::Disabled,
         }
     }
 
@@ -267,58 +294,99 @@ impl CacheContext {
         matches!(self, CacheContext::Enabled { .. })
     }
 
-    /// Run the codegen stage for one unit through the cache. On an enabled hit, the CAS blob is written
-    /// verbatim to `obj_out` and no producer runs. On a miss (or when disabled), `produce(obj_out)`
-    /// runs today's codegen verbatim, then (when enabled) the object bytes are published to the CAS and
-    /// both index paths. Returns the structured [`CacheOutcome`]; a producer error propagates as `Err`.
+    /// The root `alignc cache clear` operates on, honoring `ALIGNC_CACHE` path resolution even when the
+    /// cache is currently disabled (`off` clears the DEFAULT root — the one a later `on` would use).
+    /// An explicit path resolves to that path; anything else resolves to the default XDG root; `None`
+    /// only when the default cannot be resolved (no `HOME`/`XDG_CACHE_HOME`).
+    pub fn clear_root() -> Option<PathBuf> {
+        match std::env::var("ALIGNC_CACHE") {
+            Ok(v) if !v.is_empty() && v != "off" && v != "on" => Some(PathBuf::from(v)),
+            _ => default_cache_root(),
+        }
+    }
+
+    /// The serial cache lookup for one unit — the first half of [`codegen`], exposed so the parallel
+    /// build driver can do all lookups serially and then produce only the MISSES in parallel (the
+    /// settled S3 design). On an enabled HIT the CAS blob is written verbatim to `obj_out` and
+    /// [`CacheLookup::Hit`] carries the outcome. A [`CacheLookup::Miss`] carries the first-differing
+    /// reason (its object is NOT produced — the caller must `produce` it then [`publish_after_miss`]).
+    /// A disabled cache is [`CacheLookup::Miss`] with `None` reason (never consulted, no key work).
+    pub fn lookup(&self, key: &CodegenKey, obj_out: &Path) -> CacheLookup {
+        let root = match self {
+            CacheContext::Disabled => return CacheLookup::Miss { reason: None },
+            CacheContext::Enabled { root } => root,
+        };
+        let action_path = action_manifest_path(root, key.full_digest());
+        match try_hit(root, &action_path, key, obj_out) {
+            HitResult::Hit => CacheLookup::Hit(CacheOutcome {
+                stage: CacheStage::Codegen,
+                unit: key.unit.clone(),
+                hit: true,
+                miss_reason: None,
+            }),
+            HitResult::Corrupt => CacheLookup::Miss { reason: Some(FirstDiff::CorruptEntry) },
+            // Reason computed BEFORE any publish overwrites the slot pointer (the prior key is diffed).
+            HitResult::Miss => CacheLookup::Miss { reason: Some(diff_against_slot(root, key)) },
+        }
+    }
+
+    /// Publish an already-produced object to the cache after a [`CacheLookup::Miss`] — best-effort (a
+    /// cache WRITE failure never fails an otherwise-correct build; the object at `obj_out` is already
+    /// valid and link reads it directly). A no-op when the cache is disabled. Safe to call from a
+    /// worker thread (only writes into the content-addressed store + index).
+    pub fn publish_after_miss(&self, key: &CodegenKey, obj_out: &Path) {
+        if let CacheContext::Enabled { root } = self {
+            publish(root, key, obj_out);
+        }
+    }
+
+    /// Run the codegen stage for one unit through the cache (the serial composition of [`lookup`] +
+    /// `produce` + [`publish_after_miss`]). On an enabled hit, the CAS blob is written verbatim to
+    /// `obj_out` and no producer runs. On a miss (or when disabled), `produce(obj_out)` runs today's
+    /// codegen verbatim, then (when enabled) the object bytes are published. Returns the structured
+    /// [`CacheOutcome`]; a producer error propagates as `Err`.
     pub fn codegen<F>(&self, key: &CodegenKey, obj_out: &Path, produce: F) -> Result<CacheOutcome, String>
     where
         F: FnOnce(&Path) -> Result<(), String>,
     {
-        let root = match self {
-            CacheContext::Disabled => {
+        match self.lookup(key, obj_out) {
+            CacheLookup::Hit(outcome) => Ok(outcome),
+            CacheLookup::Miss { reason } => {
                 produce(obj_out)?;
-                return Ok(CacheOutcome {
+                self.publish_after_miss(key, obj_out);
+                Ok(CacheOutcome {
                     stage: CacheStage::Codegen,
                     unit: key.unit.clone(),
                     hit: false,
-                    miss_reason: None,
-                });
+                    miss_reason: reason,
+                })
             }
-            CacheContext::Enabled { root } => root,
-        };
-
-        let full = key.full_digest();
-        let action_path = action_manifest_path(root, full);
-
-        let miss_reason = match try_hit(root, &action_path, key, obj_out) {
-            HitResult::Hit => {
-                return Ok(CacheOutcome {
-                    stage: CacheStage::Codegen,
-                    unit: key.unit.clone(),
-                    hit: true,
-                    miss_reason: None,
-                });
-            }
-            HitResult::Corrupt => FirstDiff::CorruptEntry,
-            HitResult::Miss => diff_against_slot(root, key),
-        };
-
-        // Miss: produce the object verbatim, then publish it (blob + both index paths) best-effort.
-        // Reason was computed BEFORE publishing so the slot pointer still held the prior key. A cache
-        // WRITE failure (read-only / full cache dir) must NOT fail an otherwise-correct build — the
-        // object at `obj_out` is already valid and link reads it directly; a failed publish just means
-        // the next build misses again. Only the producer error is fatal.
-        produce(obj_out)?;
-        publish(root, key, obj_out);
-
-        Ok(CacheOutcome {
-            stage: CacheStage::Codegen,
-            unit: key.unit.clone(),
-            hit: false,
-            miss_reason: Some(miss_reason),
-        })
+        }
     }
+}
+
+/// The result of a serial [`CacheContext::lookup`]. A `Hit` has already written `obj_out`; a `Miss`
+/// requires the caller to produce the object and then [`CacheContext::publish_after_miss`].
+pub enum CacheLookup {
+    Hit(CacheOutcome),
+    Miss { reason: Option<FirstDiff> },
+}
+
+/// Clear the cache under `root` by removing only the cache-owned subdirectories (`cas`, `actions`,
+/// `index`) — never the root itself, so an explicit `ALIGNC_CACHE=<shared dir>` is not nuked wholesale.
+/// Safe on an absent root/subdir (each missing subdir is skipped). Returns whether anything was
+/// removed. A removal error is surfaced to the caller.
+pub fn clear_cache(root: &Path) -> Result<bool, String> {
+    let mut removed = false;
+    for sub in ["cas", "actions", "index"] {
+        let dir = root.join(sub);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot remove {}: {e}", dir.display())),
+        }
+    }
+    Ok(removed)
 }
 
 /// Publish a produced object to the cache, best-effort: the CAS blob + the full-key action manifest +

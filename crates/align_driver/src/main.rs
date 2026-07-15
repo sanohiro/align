@@ -62,8 +62,28 @@ fn main() -> ExitCode {
     // primitives' bitcode into the program module before the one opt run. Orthogonal to `--profile`
     // (Nothing-hidden: the mechanism is named, not folded into `fast`).
     let (rt_lto, args) = parse_rt_lto(&args);
+    // Pull `--cache-stats` (S3b, build/run/size only) and the `-j`/`--jobs` codegen-parallelism flag.
+    let (cache_stats, args) = parse_cache_stats(&args);
+    let (jobs_flag, args) = match parse_jobs(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("alignc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    // `--cache-stats` / `-j` only mean something on the build-producing per-unit path.
+    let build_verb = matches!(cmd, Some("build") | Some("run") | Some("size"));
+    if cache_stats && !build_verb {
+        eprintln!("alignc: --cache-stats is only valid for `build`/`run`/`size` (got `{}`)", cmd.unwrap_or("<none>"));
+        return ExitCode::FAILURE;
+    }
+    if jobs_flag.is_some() && !build_verb {
+        eprintln!("alignc: -j/--jobs is only valid for `build`/`run`/`size` (got `{}`)", cmd.unwrap_or("<none>"));
+        return ExitCode::FAILURE;
+    }
 
     // `--rt-lto` only means something where codegen runs the optimizer over a real build/lens.
     if rt_lto {
@@ -101,6 +121,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Resolve the codegen worker count once (build verbs only); a bad `ALIGNC_JOBS` fails here.
+    let jobs = if build_verb {
+        match resolve_jobs(jobs_flag) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("alignc: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        1
+    };
+
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
         (Some("check-per-unit"), Some(p)) => run_check_per_unit(p),
@@ -111,7 +144,13 @@ fn main() -> ExitCode {
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
-        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto),
+        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, jobs, cache_stats),
+        // `cache clear` — remove the cache-owned subtrees under the resolved cache root (S3b).
+        (Some("cache"), Some(sub)) if sub == "clear" => run_cache_clear(),
+        (Some("cache"), other) => {
+            eprintln!("alignc: unknown `cache` subcommand `{}` (expected: clear)", other.map(|s| s.as_str()).unwrap_or("<none>"));
+            ExitCode::FAILURE
+        }
         // `explain-opt <file> [--verbose]` — report what the `-O2` middle-end did to the data path
         // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
         (Some("explain-opt"), Some(p)) => {
@@ -120,9 +159,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto),
+        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, jobs, cache_stats),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, jobs, cache_stats),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -171,6 +210,72 @@ fn parse_rt_lto(args: &[String]) -> (bool, Vec<String>) {
         }
     }
     (rt_lto, rest)
+}
+
+/// Pull the boolean `--cache-stats` flag (M15 S3b) out of `args`. Valueless, idempotent; with it, the
+/// build/run/size verbs print a per-unit cache hit/miss report + a summary line (silent otherwise).
+fn parse_cache_stats(args: &[String]) -> (bool, Vec<String>) {
+    let mut stats = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "--cache-stats" {
+            stats = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (stats, rest)
+}
+
+/// Pull the `-j <N>` / `-j<N>` / `--jobs <N>` codegen-parallelism flag (M15 S3b). Returns the explicit
+/// job count (if any) and the remaining args. A missing value or a non-`usize`/zero value is a hard
+/// error (never a silent fallback). The flag wins over `ALIGNC_JOBS`; the default (neither set) is
+/// [`std::thread::available_parallelism`].
+fn parse_jobs(args: &[String]) -> Result<(Option<usize>, Vec<String>), String> {
+    let mut jobs: Option<usize> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    let parse_n = |s: &str| -> Result<usize, String> {
+        match s.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("invalid job count '{s}' (expected a positive integer)")),
+        }
+    };
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--jobs=").or_else(|| a.strip_prefix("-j")).filter(|v| !v.is_empty()) {
+            jobs = Some(parse_n(v)?);
+        } else if a == "-j" || a == "--jobs" {
+            match args.get(i + 1) {
+                Some(v) => {
+                    jobs = Some(parse_n(v)?);
+                    i += 1;
+                }
+                None => return Err("-j/--jobs requires a value (e.g. `-j 4`)".to_string()),
+            }
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    Ok((jobs, rest))
+}
+
+/// Resolve the codegen worker count: the `-j`/`--jobs` flag wins, else `ALIGNC_JOBS`, else
+/// [`std::thread::available_parallelism`] (1 if that is unavailable). A malformed `ALIGNC_JOBS` is a
+/// hard error (surfaced by the caller) — never a silent fallback.
+fn resolve_jobs(flag: Option<usize>) -> Result<usize, String> {
+    if let Some(n) = flag {
+        return Ok(n);
+    }
+    if let Some(v) = std::env::var_os("ALIGNC_JOBS") {
+        let s = v.to_string_lossy();
+        return match s.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("invalid ALIGNC_JOBS '{s}' (expected a positive integer)")),
+        };
+    }
+    Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
 /// Validate the `--export` roots against the **entry unit** (M15 S2b): `--export` is entry-unit-only
@@ -303,6 +408,7 @@ fn usage() {
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
            size       build then report the executable's size breakdown\n  \
+           cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
@@ -311,7 +417,13 @@ fn usage() {
                        name's linkage external instead of the default internal, so a no-`main`\n  \
                        library/benchmark object exposes it to the linker\n  \
          --rt-lto      (build/run/emit-obj/size/emit-llvm; release/fast only) link the fast-path\n  \
-                       string primitives' bitcode into the program and inline it before the opt run"
+                       string primitives' bitcode into the program and inline it before the opt run\n  \
+         --cache-stats (build/run/size) print a per-unit codegen-cache hit/miss report\n  \
+         -j, --jobs N  (build/run/size) codegen worker threads (default: available parallelism;\n  \
+                       overrides ALIGNC_JOBS)\n  \
+         \n\
+         ALIGNC_CACHE  on | <path> | off — the codegen cache (default: on, at the XDG cache root)\n  \
+         ALIGNC_JOBS   default codegen worker-thread count (the -j flag overrides it)"
     );
 }
 
@@ -679,38 +791,31 @@ impl Drop for ArtifactStage {
 /// by a per-unit index, not the `.`-containing module path); capability libraries are unioned
 /// deterministically first-seen across units; the executable is published to `exe` by same-directory
 /// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
-fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool) -> Result<(), ExitCode> {
+fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
     let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
     })?;
-    let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(walk.units.len());
-    // Deterministic capability union across units, first-seen order (units are bottom-up).
-    let mut link_libs: Vec<String> = Vec::new();
-    // Opt-in codegen cache (ALIGNC_CACHE); disabled ⇒ each unit emits verbatim (byte-identical to the
-    // pre-S3a path). S3a is serial + silent; S3b renders the outcomes via `--cache-stats`.
+    // One object path per unit (DAG-index-named, not the `.`-containing module path).
+    let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
+    // Opt-in codegen cache (ALIGNC_CACHE); disabled ⇒ each unit emits verbatim. Codegen runs in
+    // parallel over cache MISSES (`jobs` workers); lookups are serial and results stay DAG-ordered.
     let cache = CacheContext::from_env();
-    for (i, unit) in walk.units.iter().enumerate() {
-        let obj = object_stage.path().join(format!("unit{i}.o"));
-        // `build`/`run`/`size` never take `--export` (the only linker-visible definition is the
-        // entry's `main`; a unit's `pub` fns are external so cross-unit calls resolve).
-        if let Err(e) = emit_object_cached(
-            &cache,
-            &unit.unit,
-            unit.summary.impl_hash,
-            &unit.dep_interface_hashes,
-            &unit.mir,
-            &obj,
-            target.clone(),
-            profile,
-            &[],
-            rt_lto,
-        ) {
-            eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
+    let outcomes = match align_driver::codegen_units_parallel(&walk.units, &obj_paths, &cache, &target, profile, rt_lto, jobs) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("alignc: {e}");
             return Err(ExitCode::FAILURE);
         }
-        obj_paths.push(obj);
+    };
+    if cache_stats {
+        render_cache_stats(&outcomes, cache.is_enabled());
+    }
+    // Deterministic capability union across units, first-seen in DAG (unit) order — never completion
+    // order (the parallel codegen above may finish units out of order, but this iterates `walk.units`).
+    let mut link_libs: Vec<String> = Vec::new();
+    for unit in &walk.units {
         for lib in &unit.mir.link_libs {
             if !link_libs.contains(lib) {
                 link_libs.push(lib.clone());
@@ -736,9 +841,9 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     Ok(())
 }
 
-fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
+fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
     let exe = PathBuf::from(stem(path));
-    match build_per_unit_to(path, &exe, target, profile, rt_lto) {
+    match build_per_unit_to(path, &exe, target, profile, rt_lto, jobs, cache_stats) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -747,7 +852,53 @@ fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool) ->
     }
 }
 
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool) -> ExitCode {
+/// Render the `--cache-stats` report: one `hit` / `miss (<reason>)` line per unit + a summary count.
+/// Silent on all-hit is the *default* (no flag); with the flag we always print. A disabled cache
+/// prints a single note (there are no per-unit lookups to report).
+fn render_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
+    if !enabled {
+        eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");
+        return;
+    }
+    let (mut hits, mut misses) = (0usize, 0usize);
+    for o in outcomes {
+        if o.hit {
+            hits += 1;
+            eprintln!("alignc: cache: {} hit", o.unit);
+        } else {
+            misses += 1;
+            let reason = o.miss_reason.map(|r| r.reason()).unwrap_or("miss");
+            eprintln!("alignc: cache: {} miss ({reason})", o.unit);
+        }
+    }
+    eprintln!("alignc: cache: {} unit(s): {hits} hit, {misses} miss", outcomes.len());
+}
+
+/// `alignc cache clear` — remove the cache-owned subtrees (`cas`/`actions`/`index`) under the resolved
+/// cache root. Honors `ALIGNC_CACHE` path resolution (an explicit path, else the default XDG root),
+/// even when the cache is currently disabled. Safe on an absent root.
+fn run_cache_clear() -> ExitCode {
+    let Some(root) = CacheContext::clear_root() else {
+        eprintln!("alignc: cannot resolve the cache root (set ALIGNC_CACHE or HOME/XDG_CACHE_HOME)");
+        return ExitCode::FAILURE;
+    };
+    match align_driver::clear_cache(&root) {
+        Ok(true) => {
+            println!("alignc: cleared cache under {}", root.display());
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("alignc: cache already empty under {}", root.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("alignc: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
     let stage = match ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
@@ -756,7 +907,7 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto) {
+    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, jobs, cache_stats) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the

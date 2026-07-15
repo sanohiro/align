@@ -44,6 +44,7 @@ fn harness_runs_and_emits_the_comparison_table() {
     let out = Command::new("bash")
         .arg(dir.join("run.sh"))
         .env("ALIGNC", env!("CARGO_BIN_EXE_alignc"))
+        .env("ALIGNC_CACHE", "off")
         .output()
         .expect("launch run.sh");
     let stdout = String::from_utf8_lossy(&out.stdout);

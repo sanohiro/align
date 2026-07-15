@@ -23,3 +23,7 @@ align_sema = { path = "../align_sema" }
 align_mir = { path = "../align_mir" }
 align_interface = { path = "../align_interface" }
 align_codegen_llvm = { path = "../align_codegen_llvm" }
+align_hash = { path = "../align_hash" }
+
+[build-dependencies]
+align_hash = { path = "../align_hash" }

@@ -53,8 +53,8 @@ fn same_basename_concurrent_run_and_build_stay_isolated() {
     let alignc = env!("CARGO_BIN_EXE_alignc");
 
     for round in 0..12 {
-        let a = Command::new(alignc).args(["run", a_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let b = Command::new(alignc).args(["run", b_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let a = Command::new(alignc).env("ALIGNC_CACHE", "off").args(["run", a_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let b = Command::new(alignc).env("ALIGNC_CACHE", "off").args(["run", b_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
         let (a, b) = wait_pair(a, b);
         assert!(a.status.success(), "round {round}: first run failed: {a:?}");
         assert!(b.status.success(), "round {round}: second run failed: {b:?}");
@@ -67,8 +67,8 @@ fn same_basename_concurrent_run_and_build_stay_isolated() {
     std::fs::create_dir(&a_out).unwrap();
     std::fs::create_dir(&b_out).unwrap();
     for round in 0..12 {
-        let a = Command::new(alignc).arg("build").arg(&a_src).current_dir(&a_out).stdout(std::process::Stdio::null()).spawn().unwrap();
-        let b = Command::new(alignc).arg("build").arg(&b_src).current_dir(&b_out).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let a = Command::new(alignc).env("ALIGNC_CACHE", "off").arg("build").arg(&a_src).current_dir(&a_out).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let b = Command::new(alignc).env("ALIGNC_CACHE", "off").arg("build").arg(&b_src).current_dir(&b_out).stdout(std::process::Stdio::null()).spawn().unwrap();
         let (a, b) = wait_pair(a, b);
         assert!(a.status.success(), "round {round}: first build failed: {a:?}");
         assert!(b.status.success(), "round {round}: second build failed: {b:?}");
@@ -79,8 +79,8 @@ fn same_basename_concurrent_run_and_build_stay_isolated() {
     }
 
     for round in 0..8 {
-        let a = Command::new(alignc).args(["size", a_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let b = Command::new(alignc).args(["size", b_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let a = Command::new(alignc).env("ALIGNC_CACHE", "off").args(["size", a_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let b = Command::new(alignc).env("ALIGNC_CACHE", "off").args(["size", b_src.to_str().unwrap()]).stdout(std::process::Stdio::piped()).spawn().unwrap();
         let (a, b) = wait_pair(a, b);
         assert!(a.status.success(), "round {round}: first size report failed: {a:?}");
         assert!(b.status.success(), "round {round}: second size report failed: {b:?}");
