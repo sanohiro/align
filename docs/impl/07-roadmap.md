@@ -19,7 +19,7 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2116 green (2115 passed + one ignored manual
+verification bundle) are complete. The workspace is 2118 green (2117 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
@@ -31,9 +31,11 @@ loop-head fixpoints, and keeps early-return arena cleanup classification intact.
 flags shipped as #463: every resource-owning slot now transfers explicit individual-vs-arena
 ownership state across assignments, moves, destructuring, branches, loops, and cleanup. This makes
 region-changing owned reassignment legal when its lifetime target is valid, without leaks or double
-frees. **Next recommended soundness structural item:** extract the exhaustive recursive escape
-transfer walk into a compact region-flow CFG at the checked-HIR boundary. No receiver-specific
-borrow patch remains queued. Fully-escaping function values remain deliberately
+frees. Compact checked-HIR escape CFG extraction shipped as #464: exhaustive syntax lowering emits
+explicit branch/break/loop edges, and one worklist owns all region/local-slice joins and fixpoints
+while diagnostics replay once in source order. **Next recommended soundness structural item:** store
+inferred purity as an effect bit on function types rather than a name-based propagation result. No
+receiver-specific borrow patch remains queued. Fully-escaping function values remain deliberately
 deferred pending a settled heap-owned environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
@@ -1451,7 +1453,8 @@ and http last (needs net + TLS).
     Frame ∩ region_of(conn)` so a borrowed stream can't escape its conn; direct owned
     constructors stay `Static`; the one conservatism (an owned reader threaded through a user
     call with a non-Static arg is rejected on return) is test-pinned and honest in the
-    `tracks_region` comment — the precise fix rides the escape→MIR-dataflow follow-up.
+    `tracks_region` comment — the precise fix needs interprocedural return-borrow summaries, not
+    another intraprocedural CFG change.
   - Slice 3 `tcp_listener` (#373): twin Move type; `tcp.listen` (AI_PASSIVE, empty host = null
     node = wildcard bind, SO_REUSEADDR, backlog 128), `l.accept() -> Result<tcp_conn, Error>` —
     accept **borrows** the listener (accept loops move-check-pinned); EINTR asymmetry documented
@@ -3043,9 +3046,22 @@ views, and also fixes owned self-assignment ordering. Regression coverage spans 
 heap→arena paths, bypasses, loops, joined-region moves, payload bindings, calls with shorter-lived
 borrow arguments, and region-free builders. Gemini's one medium finding identified two slot-growth
 paths that failed to grow parallel flag metadata; both were fixed, the thread was answered and
-resolved, and the English validation summary was posted before squash merge. The remaining
-recommended escape-analysis structural item is compact region-flow CFG extraction at the
-checked-HIR boundary; purity-as-effect-bit remains the independent audit follow-up.
+resolved, and the English validation summary was posted before squash merge. The compact CFG item
+then shipped as #464 below; purity-as-effect-bit remains the independent audit follow-up.
+
+**COMPACT ESCAPE-FLOW CFG SHIPPED — MERGED as #464 (2026-07-15; workspace 2118 green = 2117
+passed + one ignored manual probe; clippy `-D warnings` clean).** `EscapeCheck` now lowers the
+already-checked HIR into compact basic blocks containing references to transfer operations.
+`if`, `match`, `else`-unwrap, loop backedges, and `break` produce explicit edges; a single finite
+may-state worklist computes every branch join and loop fixpoint. The probe pass suppresses repeated
+loop diagnostics, then reachable operations replay once in original syntax order from their fixed
+block inputs, preserving stable diagnostics and cleanup metadata on diverging paths. A `break` edge
+is split before unreachable syntax so later checked statements cannot contaminate its snapshot.
+Regression gates cover that false-positive direction and the fail-open direction where multiple
+reachable break predecessors must join at the loop exit. Gemini reported no findings, thread-aware
+inspection found zero review threads, and the English validation comment was posted before squash
+merge. The escape-analysis CFG structural follow-up is complete; purity-as-effect-bit is the next
+recommended soundness item.
 
 ## Design Issues to Settle in Parallel
 

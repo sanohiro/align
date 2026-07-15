@@ -57,12 +57,15 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > the doc-10 §7 verification bundle are green. Intra-frame borrow liveness is enforced as shared flow
 > state in `MoveCheck` (#460); escape provenance classification is compile-enforced exhaustive
 > across HIR expressions and types (#461), its region/local-slice state joins branches and reaches
-> loop fixpoints (#462), and resource-owning locals now use path-local MIR drop flags (#463)
-> (workspace 2116 tests: 2115 passed + one ignored; clippy clean). Region-changing owned
+> loop fixpoints (#462), resource-owning locals use path-local MIR drop flags (#463), and the
+> exhaustive syntax walk now lowers into a compact checked-HIR escape CFG whose shared worklist owns
+> every branch join and loop fixpoint (#464) (workspace 2118 tests: 2117 passed + one ignored; clippy
+> clean). Region-changing owned
 > reassignment is therefore legal when the lifetime target check passes, without leaking or
 > double-freeing either allocation path. Escape diagnostics and provenance remain at the
-> safety-verified HIR boundary; the next recommended structural item is extracting their exhaustive
-> recursive transfer walk into the compact region-flow CFG recorded by the soundness audit. The
+> safety-verified HIR boundary. The next recommended soundness item is recording inferred purity as
+> an effect bit on function types so fn-value, closure, and FFI-pointer indirection consume the same
+> fail-closed fact instead of relying on name-based propagation. The
 > recorded fd-test flake hardening (#457), qualified cross-module function values (#458), and
 > wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
 > function values remain deliberately deferred until their heap-owned environment/drop model has a
