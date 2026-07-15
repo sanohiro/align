@@ -1597,17 +1597,18 @@ pub unsafe extern "C" fn align_rt_par_map(
 }
 
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
-/// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
-/// arena-tied builders come later).
+/// desugaring. The grow buffer is heap-backed; finishing either copies bytes into an arena or
+/// transfers them to a separately owned `string` allocation.
 pub struct Builder {
     buf: Vec<u8>,
-    /// Where the finished bytes live: an arena (bulk-freed) or null (leaked).
+    /// Where an arena finish places the bytes; null selects an individually owned finish.
     arena: *mut Arena,
 }
 
 /// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
-/// bulk at the block's end); otherwise it is leaked (no owner yet). `capacity` (bytes) pre-sizes the
-/// backing buffer so appends don't reallocate as it grows; 0 = default (empty).
+/// bulk at the block's end); otherwise the caller must use [`align_rt_builder_into_string`] and
+/// retain/drop the returned owner. `capacity` (bytes) pre-sizes the backing buffer so appends don't
+/// reallocate as it grows; 0 = default (empty).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut Builder {
     // `try_reserve` (not `with_capacity`) so a bogus/huge user capacity can't abort the process on
@@ -4468,8 +4469,9 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-/// Finish the builder, returning a `str` view over the (leaked) contents and freeing
-/// the builder object.
+/// Finish an arena-backed builder, returning a `str` view and freeing the builder object.
+/// Compiler-generated arena-free templates use [`align_rt_builder_into_string`] instead. The null
+/// arena arm remains a legacy FFI fallback and leaks its bytes to keep the returned view valid.
 ///
 /// # Safety
 /// `b` must be a non-null pointer returned by [`align_rt_builder_new`] and not yet finished/freed;

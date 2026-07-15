@@ -7833,7 +7833,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
-        // Pass the enclosing arena handle (or a null pointer = leak) to builder_new.
+        // Pass the enclosing arena handle, or null for an individually owned finish retained by a
+        // synthetic MIR string owner.
         let arena_ptr = match arena {
             Some(op) => self.operand(op),
             None => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
@@ -7913,13 +7914,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
         }
+        let finish = if arena.is_some() { "builder_finish" } else { "builder_into_string" };
         Ok(self
             .builder
-            .build_call(self.funcs["builder_finish"], &[bptr.into()], "s")
+            .build_call(self.funcs[finish], &[bptr.into()], "s")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
-            .expect("builder_finish returns a str"))
+            .expect("builder finish returns a string descriptor"))
     }
 
     /// All `array_builder<T>` (M12 A6) rvalues (new/push/push_str/append/build). `#[inline(never)]`

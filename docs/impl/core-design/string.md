@@ -45,16 +45,17 @@ not consumed). `hash64`/`hash128` also accept these views ([hash.md](hash.md)).
 - `builder` — an owned accumulator; `to_string` finishes it. Adjacent writes are fused by the
   MIR peephole (`fuse_builder_writes`, `"lit" + int + "lit"` → one runtime call) — new write
   shapes should extend the batcher, not bypass it.
-- `template` results are arena-regioned `str` inside an arena. The current arena-free lowering leaks
-  its payload for process lifetime; this is a confirmed ownership gap, not a performance contract
-  ([audit 13](../13-string-array-allocation-short-input-audit.md#33-confirmed-p0p1--arena-free-template-and-jsonencode-leak-forever)).
+- `template` results are arena-regioned `str` inside an arena. Outside one, dynamic results are
+  frame-bounded views over hidden scoped `string` owners; static-only templates are pooled literals
+  ([audit 13](../13-string-array-allocation-short-input-audit.md#33-fixed-2026-07-15--arena-free-template-and-jsonencode-have-scoped-owners)).
 
 ## Effects
 
 Pure (no I/O). The *allocation-visibility* rules are enforced structurally, not via effects:
-`str + str` is a settled hard error everywhere; `template` inside a pipeline lambda without its own
-arena is a hard error ("would silently leak" — `lambda.rs`). The checker enforces the uniform rule
-and the obsolete MIR concatenation path is removed (audit 13 §3.2, fixed 2026-07-15).
+`str + str` is a settled hard error everywhere. An arena-free `template` may be consumed locally in
+a pipeline lambda, but its frame-bounded view cannot be returned from that lambda (`lambda.rs`). The
+checker enforces the uniform concatenation rule and the obsolete MIR path is removed (audit 13 §3.2,
+fixed 2026-07-15).
 
 ## Errors & aborts
 

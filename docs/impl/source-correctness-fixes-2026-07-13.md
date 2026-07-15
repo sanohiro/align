@@ -59,4 +59,5 @@ The permanent gates live in:
 
 The audit intentionally did not mark unrelated broader findings complete. General unbound Move
 temporaries gained view-aware synthetic owners on 2026-07-15 (audit 13 §3.4); arena-free
-`template`/`json.encode` ownership and the remaining short-input work retain their recorded status.
+`template`/`json.encode` gained scoped hidden owners and static-only folding later that day (audit 13
+§3.3). The remaining short-input work retains its recorded status.

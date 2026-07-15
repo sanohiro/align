@@ -510,8 +510,8 @@ pub enum Rvalue {
     /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
     /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
     BuilderToString(Operand),
-    /// `template "..."` — build a `str` from pieces. The optional operand
-    /// is the enclosing arena handle (the result lives there; `None` = leaked).
+    /// `template "..."` — build a `str` from pieces. The optional operand is the enclosing arena
+    /// handle; absent means individually owned storage held by a synthetic `string` owner.
     Template(Vec<TemplatePiece>, Option<Operand>),
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
@@ -2587,6 +2587,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Template(parts) => {
+            // Outside an explicit arena, retain the produced bytes in a hidden owned string. Its
+            // view inherits this owner through scalar/view consumers and loop/function cleanup.
+            // Register before holes: a `?` inside one may emit an early cleanup edge.
+            let owner = b.arenas.is_empty().then(|| b.new_synthetic_owner(Ty::String));
             let mut pieces = Vec::new();
             for p in parts {
                 match p {
@@ -2607,10 +2611,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         pieces.push(TemplatePiece::JsonStrHole(op));
                     }
                 }
+                if b.is_terminated() {
+                    return Operand::Value(b.fresh_value(e.ty));
+                }
             }
             let arena = b.arenas.last().map(|h| Operand::Value(*h));
             let r = b.fresh_value(e.ty);
             b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
+            if let Some(owner) = owner {
+                b.push(Stmt::Store(owner, Operand::Value(r)));
+                b.set_drop_flag(owner, true);
+                b.attach_borrow_owners(r, [owner]);
+            }
             Operand::Value(r)
         }
         hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
