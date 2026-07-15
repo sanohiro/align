@@ -83,8 +83,9 @@ basename:
 `run` similarly uses `<temp>/align-<stem>` for the executable, while `size` uses
 `<temp>/align-size-<stem>`. The relevant code is:
 
-- [`build_to` and `run`](../../crates/align_driver/src/main.rs#L307-L346)
-- [`size`](../../crates/align_driver/src/size.rs#L27-L39)
+- [`build_per_unit_to` and `run`](../../crates/align_driver/src/main.rs) (the single per-unit build
+  path since the M15 S2b flip — the old whole-program `build_to`/`main.rs#L307–346` helper is gone)
+- [`size`](../../crates/align_driver/src/size.rs) (`run_size` → `build_per_unit_to`)
 
 Two unrelated `/a/main.align` and `/b/main.align` therefore write the same object even when their
 contents, target CPUs, profiles, or capability sets differ. One invocation can overwrite the object
@@ -621,10 +622,20 @@ mutation in the validation matrix causes the intended miss; cache-hit and cold o
 
 ### Slice C2 — M15 unit summaries and incremental invalidation
 
-- Settle the unit boundary/artifact format and generic strategy.
-- Canonicalize interface, implementation, and link summaries.
-- Rebuild only reverse dependencies whose interface inputs changed.
-- Compile independent misses in parallel using the C0 publication mechanism.
+- [x] Settle the unit boundary/artifact format and generic strategy (M15 S2/S2b + the S3 design
+  record in `07-roadmap.md`).
+- [x] Canonicalize interface, implementation, and link summaries (`align_interface::codec`, M15 S2).
+- [x] Rebuild only reverse dependencies whose interface inputs changed — **M15 S3a** (opt-in codegen
+  cache): the per-unit codegen key folds the unit's own `impl_hash` + its transitive dependency
+  interface hashes, so a private-body edit misses only the edited unit and every dependent hits
+  (`crates/align_driver/src/cache.rs`; gates in `crates/align_driver/tests/cache_codegen.rs`).
+- [ ] Compile independent misses in parallel using the C0 publication mechanism — deferred to S3b.
+
+**S3a landed (2026-07-15):** the codegen-stage action cache + CAS substrate (`align_driver::cache`),
+serial cache wiring for `build`/`run`/`size`/`emit-obj`, the `CacheOutcome`/`FirstDiff` observability
+model, and the doc-10 §7 invalidation gates — **opt-in** via `ALIGNC_CACHE`. Still open (S3b): parallel
+codegen, `--cache-stats`/`-j`/`cache clear`, the runtime-archive mtime→content-digest upgrade, and the
+default-ON flip.
 
 **Completion:** a private-body edit recompiles one unit plus relink; public soundness-summary changes
 invalidate the right reverse dependencies; no missing summary is treated optimistically.

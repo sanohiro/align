@@ -16,7 +16,10 @@ pub use align_mir::Program as MirProgram;
 /// depending on `align_interface` directly).
 pub use align_interface::{Hash128, InterfaceSummary};
 
+pub mod cache;
 pub mod explain;
+
+pub use cache::{CacheContext, CacheOutcome, CacheStage, CodegenKey, FirstDiff};
 
 /// Result of running the pipeline through sema.
 pub struct Checked {
@@ -613,6 +616,93 @@ pub fn rt_lto_bitcode() -> &'static [u8] {
 
 pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
     align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
+}
+
+/// Build the S3 codegen cache key (`docs/impl/10-cache-first-optimization.md` §6.2) for one unit. The
+/// target-dependent components come from [`align_codegen_llvm::resolve_target_identity`] and the exact
+/// LLVM version from [`align_codegen_llvm::llvm_version`] — the SAME resolution codegen uses, so a
+/// cache hit implies byte-identical object bytes. `impl_hash` + `dep_interface_hashes` are the unit's
+/// `PerUnitArtifact` fields; `exports` is sorted+deduped and `dep_interface_hashes` sorted by unit
+/// name so semantically equivalent inputs share a key.
+pub fn build_codegen_key(
+    unit: &str,
+    impl_hash: Hash128,
+    dep_interface_hashes: &[(String, Hash128)],
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+) -> Result<CodegenKey, String> {
+    let rt = align_codegen_llvm::resolve_target_identity(target).map_err(|e| e.to_string())?;
+    let object_format = match target_object_format()? {
+        ObjectFormat::Elf => 0u8,
+        ObjectFormat::MachO => 1u8,
+    };
+    let mut dep_hashes = dep_interface_hashes.to_vec();
+    dep_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut exp = exports.to_vec();
+    exp.sort();
+    exp.dedup();
+    let rt_lto_digest = rt_lto.then(|| Hash128::of(rt_lto_bitcode()));
+    Ok(CodegenKey {
+        cache_format_version: cache::CACHE_KEY_FORMAT_VERSION,
+        compiler_build_id: cache::compiler_build_id(),
+        frontend_schema: align_interface::FORMAT_VERSION,
+        located: false,
+        impl_hash,
+        dep_interface_hashes: dep_hashes,
+        exports: exp,
+        target_triple: rt.triple,
+        object_format,
+        resolved_cpu: rt.cpu,
+        resolved_features: rt.features,
+        profile_name: profile.name().to_string(),
+        pipeline: profile.pipeline().to_string(),
+        codegen_opt: profile.codegen_opt_name().to_string(),
+        reloc_model: rt.reloc_model.to_string(),
+        code_model: rt.code_model.to_string(),
+        llvm_version: align_codegen_llvm::llvm_version(),
+        rt_lto,
+        rt_lto_digest,
+        cross_unit_opt_digest: Vec::new(),
+        unit: unit.to_string(),
+    })
+}
+
+/// Emit one unit's object **through the codegen cache** (`docs/impl/10-cache-first-optimization.md`).
+/// On an enabled hit, the CAS blob is written verbatim to `obj` and no codegen runs; on a miss (or when
+/// the cache is disabled) [`emit_object_file`] runs today's codegen verbatim into `obj` and — when
+/// enabled — the object bytes are published to the CAS + index. Returns the structured
+/// [`CacheOutcome`] (its `hit`/`miss_reason` the observability model the tests assert). When
+/// `cache` is [`CacheContext::Disabled`] this is byte-for-byte the pre-S3a behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_object_cached(
+    cache: &CacheContext,
+    unit: &str,
+    impl_hash: Hash128,
+    dep_interface_hashes: &[(String, Hash128)],
+    mir: &align_mir::Program,
+    obj: &std::path::Path,
+    target: BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+) -> Result<CacheOutcome, String> {
+    // When the cache is disabled (the default), skip building the key entirely — the codegen-key
+    // inputs (`compiler_build_id`'s one-time `alignc`-binary hash, `resolve_target_identity`,
+    // `llvm_version`, `target_object_format`) are pure cache overhead a cache-off build must not pay.
+    // This is the byte-identical, no-extra-I/O pre-S3a path (the same disabled miss `codegen` returns).
+    if !cache.is_enabled() {
+        emit_object_file(mir, obj, target, profile, exports, rt_lto)?;
+        return Ok(cache::CacheOutcome {
+            stage: cache::CacheStage::Codegen,
+            unit: unit.to_string(),
+            hit: false,
+            miss_reason: None,
+        });
+    }
+    let key = build_codegen_key(unit, impl_hash, dep_interface_hashes, &target, profile, exports, rt_lto)?;
+    cache.codegen(&key, obj, |out| emit_object_file(mir, out, target.clone(), profile, exports, rt_lto))
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)

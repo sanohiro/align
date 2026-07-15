@@ -26,8 +26,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
-    build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_file,
-    format_diagnostics, link_objects, unknown_exports, BuildTarget, PerUnitWalk, Profile,
+    build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
+    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PerUnitWalk,
+    Profile,
 };
 use align_span::SourceMap;
 
@@ -556,12 +557,25 @@ fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Pro
     if let Some(code) = check_exports_entry(&walk, exports, path) {
         return code;
     }
+    // Opt-in codegen cache (ALIGNC_CACHE); `--export` folds into the key. Disabled ⇒ verbatim emit.
+    let cache = CacheContext::from_env();
     if let [unit] = walk.units.as_slice() {
         // N=1: byte-identical to the pre-flip whole-program object — `<stem>.o` (or the given output
         // path), with any `--export` applied to the single (entry) unit.
         let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
-        return match emit_object_file(&unit.mir, &obj, target, profile, exports, rt_lto) {
-            Ok(()) => {
+        return match emit_object_cached(
+            &cache,
+            &unit.unit,
+            unit.summary.impl_hash,
+            &unit.dep_interface_hashes,
+            &unit.mir,
+            &obj,
+            target,
+            profile,
+            exports,
+            rt_lto,
+        ) {
+            Ok(_) => {
                 println!("alignc: wrote object: {}", obj.display());
                 ExitCode::SUCCESS
             }
@@ -586,7 +600,18 @@ fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Pro
         // Exports apply only to the entry unit (a non-entry `pub` fn is already external via per-unit
         // lowering); every other unit emits with no export roots.
         let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
-        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, unit_exports, rt_lto) {
+        if let Err(e) = emit_object_cached(
+            &cache,
+            &unit.unit,
+            unit.summary.impl_hash,
+            &unit.dep_interface_hashes,
+            &unit.mir,
+            &obj,
+            target.clone(),
+            profile,
+            unit_exports,
+            rt_lto,
+        ) {
             eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
             return ExitCode::FAILURE;
         }
@@ -663,11 +688,25 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(walk.units.len());
     // Deterministic capability union across units, first-seen order (units are bottom-up).
     let mut link_libs: Vec<String> = Vec::new();
+    // Opt-in codegen cache (ALIGNC_CACHE); disabled ⇒ each unit emits verbatim (byte-identical to the
+    // pre-S3a path). S3a is serial + silent; S3b renders the outcomes via `--cache-stats`.
+    let cache = CacheContext::from_env();
     for (i, unit) in walk.units.iter().enumerate() {
         let obj = object_stage.path().join(format!("unit{i}.o"));
         // `build`/`run`/`size` never take `--export` (the only linker-visible definition is the
         // entry's `main`; a unit's `pub` fns are external so cross-unit calls resolve).
-        if let Err(e) = emit_object_file(&unit.mir, &obj, target.clone(), profile, &[], rt_lto) {
+        if let Err(e) = emit_object_cached(
+            &cache,
+            &unit.unit,
+            unit.summary.impl_hash,
+            &unit.dep_interface_hashes,
+            &unit.mir,
+            &obj,
+            target.clone(),
+            profile,
+            &[],
+            rt_lto,
+        ) {
             eprintln!("alignc: codegen failed for unit `{}`: {e}", unit.unit);
             return Err(ExitCode::FAILURE);
         }
