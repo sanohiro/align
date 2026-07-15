@@ -270,3 +270,108 @@ fn default_on_second_build_all_hit_and_byte_identical() {
     assert!(String::from_utf8_lossy(&hot.stderr).contains("3 hit, 0 miss"), "default-ON second build is all-hit");
     assert_eq!(cold_exe, p.exe_bytes(), "cache-hit executable is byte-identical to the cold build");
 }
+
+// ---- SV: identical cross-process producers publish one complete immutable result ----------------
+
+fn tree_contains_stage(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else { return false };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with(".cache-stage-") {
+            return true;
+        }
+        if path.is_dir() && tree_contains_stage(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn concurrent_identical_builds_share_complete_actions() {
+    if !backend() || !cc_available() {
+        return;
+    }
+    const N: usize = 4;
+    let projects: Vec<Proj> = (0..N).map(|i| Proj::new(&format!("same-key-{i}"))).collect();
+    let shared = projects[0].dir.join("shared-cache");
+
+    let children: Vec<std::process::Child> = projects
+        .iter()
+        .map(|p| {
+            Command::new(env!("CARGO_BIN_EXE_alignc"))
+                .args(["build", "main.align", "-j", "2"])
+                .current_dir(&p.dir)
+                .env("ALIGNC_CACHE", &shared)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn concurrent alignc")
+        })
+        .collect();
+
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().expect("wait concurrent alignc");
+        assert!(out.status.success(), "producer {i} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let run = Command::new(projects[i].dir.join("main")).output().expect("run concurrent output");
+        assert!(run.status.success());
+        assert_eq!(run.stdout, b"11\n", "producer {i} published/linked the wrong bytes");
+    }
+
+    let action_dir = shared.join("actions").join("codegen");
+    let actions = std::fs::read_dir(&action_dir)
+        .expect("action dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file())
+        .count();
+    assert_eq!(actions, 3, "four identical 3-unit builds converge on exactly three immutable actions");
+    assert!(!tree_contains_stage(&shared), "successful racing producers leave no private staging files");
+
+    // Every action produced under the race is readable: a fresh process must see an all-hit build.
+    let hot = projects[0].alignc(shared.to_str().unwrap(), &["build", "main.align", "--cache-stats"]);
+    assert!(hot.status.success(), "post-race hit failed: {}", String::from_utf8_lossy(&hot.stderr));
+    assert!(String::from_utf8_lossy(&hot.stderr).contains("3 hit, 0 miss"));
+}
+
+#[test]
+fn concurrent_different_same_basename_builds_keep_distinct_actions() {
+    if !backend() || !cc_available() {
+        return;
+    }
+    let a = Proj::new("different-key-a");
+    let b = Proj::new("different-key-b");
+    std::fs::write(b.dir.join("c.align"), "module c\npub fn cval() -> i64 = 2\n").unwrap();
+    let shared = a.dir.join("shared-cache");
+
+    let spawn = |p: &Proj| {
+        Command::new(env!("CARGO_BIN_EXE_alignc"))
+            .args(["build", "main.align", "-j", "2"])
+            .current_dir(&p.dir)
+            .env("ALIGNC_CACHE", &shared)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn concurrent alignc")
+    };
+    let achild = spawn(&a);
+    let bchild = spawn(&b);
+    let (ao, bo) = (achild.wait_with_output().unwrap(), bchild.wait_with_output().unwrap());
+    assert!(ao.status.success(), "first build failed: {}", String::from_utf8_lossy(&ao.stderr));
+    assert!(bo.status.success(), "second build failed: {}", String::from_utf8_lossy(&bo.stderr));
+    assert_eq!(Command::new(a.dir.join("main")).output().unwrap().stdout, b"11\n");
+    assert_eq!(Command::new(b.dir.join("main")).output().unwrap().stdout, b"12\n");
+
+    // b/main are byte-identical shared actions; c has two implementation keys. A racing slot-pointer
+    // update may name either c key, but both full actions remain immutable and directly hittable.
+    let actions = std::fs::read_dir(shared.join("actions").join("codegen"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file())
+        .count();
+    assert_eq!(actions, 4, "two same-basename DAGs retain both distinct c actions plus shared b/main");
+    for p in [&a, &b] {
+        let hot = p.alignc(shared.to_str().unwrap(), &["build", "main.align", "--cache-stats"]);
+        assert!(hot.status.success());
+        assert!(String::from_utf8_lossy(&hot.stderr).contains("3 hit, 0 miss"));
+    }
+}

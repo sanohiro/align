@@ -208,6 +208,9 @@ pub enum DecodeError {
     BadUtf8,
     /// Bytes remained after the summary was fully read (a length/format mismatch).
     TrailingBytes,
+    /// The decoded public surface does not match the fingerprint stored in the artifact.
+    /// This catches a stale or modified effect bit/signature/layout before a consumer can trust it.
+    InterfaceHashMismatch,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -220,6 +223,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::BadTag { what, tag } => write!(f, "invalid {what} tag byte {tag}"),
             DecodeError::BadUtf8 => write!(f, "interface artifact contains invalid UTF-8"),
             DecodeError::TrailingBytes => write!(f, "interface artifact has trailing bytes"),
+            DecodeError::InterfaceHashMismatch => write!(f, "interface artifact surface does not match its stored hash"),
         }
     }
 }
@@ -358,7 +362,8 @@ fn read_const(r: &mut Reader<'_>) -> Result<IConst, DecodeError> {
 }
 
 /// Deserialize a complete summary from its artifact byte form. Fail-closed: an unknown format
-/// version, a truncated buffer, a bad tag, invalid UTF-8, or trailing bytes all return an error.
+/// version, a truncated buffer, a bad tag, invalid UTF-8, trailing bytes, or a stale/mismatched
+/// surface hash all return an error.
 pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     let mut r = Reader::new(bytes);
     let version = r.u32()?;
@@ -370,11 +375,12 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     let structs = r.seq(read_struct)?;
     let enums = r.seq(read_enum)?;
     let consts = r.seq(read_const)?;
+    let surface_len = r.pos;
     let capabilities = r.seq(|r| r.str())?;
     let interface_hash = Hash128 { lo: r.u64()?, hi: r.u64()? };
     let impl_hash = Hash128 { lo: r.u64()?, hi: r.u64()? };
     r.finish()?;
-    Ok(InterfaceSummary {
+    let summary = InterfaceSummary {
         unit,
         fns,
         structs,
@@ -383,5 +389,9 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
         capabilities,
         interface_hash,
         impl_hash,
-    })
+    };
+    if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
+        return Err(DecodeError::InterfaceHashMismatch);
+    }
+    Ok(summary)
 }

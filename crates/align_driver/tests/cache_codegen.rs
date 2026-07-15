@@ -9,7 +9,9 @@
 //! (5) edit-then-exact-revert hit (old CAS entry); (6) corrupted blob → corruption event + rebuild +
 //! correct binary; (7) cold vs hit byte-identity (object + executable); (8) profile / `--export`
 //! change miss with the right `FirstDiff`; (9) rt-lto on/off distinct keys; (10) cross-process
-//! `impl_hash` stability (hit on the second subprocess).
+//! `impl_hash` stability (hit on the second subprocess); (11) an unimported file is outside the
+//! build graph; (12) a killed producer's private staging remnant is never a hit; (13) resolved CPU
+//! identity separates baseline/native artifacts.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -465,4 +467,75 @@ fn gate10_cross_process_impl_hash_stability() {
     assert_eq!(count2, count1, "a stable cross-process impl_hash re-hits the same key (no new manifest)");
     let exe2 = std::fs::read(proj.dir.join("main")).expect("read exe after run 2");
     assert_eq!(exe1, exe2, "the cross-process cache-hit executable is byte-identical");
+}
+
+// ---- Gate 11: an unused, unimported file is outside every existing action -----------------------
+
+#[test]
+fn gate11_unimported_file_edit_keeps_all_units_hot() {
+    if !backend() {
+        return;
+    }
+    let files = &[
+        ("lib.align", "module lib\npub fn f(x: i64) -> i64 = x + 1\n"),
+        ("main.align", "import lib\nfn main() {\n  print(lib.f(41))\n}\n"),
+    ];
+    let proj = Project::new("unimported", files, "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+
+    proj.write("unused.align", "module unused\npub fn value() -> i64 = 1\n");
+    let added = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(added.all_hit(), "adding an unimported file must not enter the unit graph or invalidate existing actions");
+
+    proj.write("unused.align", "module unused\npub fn value() -> i64 = 999\n");
+    let edited = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(edited.all_hit(), "editing an unimported file must leave every existing unit hot");
+}
+
+// ---- Gate 12: producer killed before publish leaves no readable entry ---------------------------
+
+#[test]
+fn gate12_orphaned_private_stage_is_never_a_hit() {
+    if !backend() {
+        return;
+    }
+    let proj = Project::new("killed-publish", &[("main.align", "fn main() {\n  print(42)\n}\n")], "main.align");
+    let cache = proj.cache();
+
+    // This is the only filesystem state a process killed between staged write and atomic rename can
+    // leave. It has no final action-manifest name and therefore must be invisible to lookup.
+    let action_dir = proj.cache_root().join("actions").join("codegen");
+    std::fs::create_dir_all(&action_dir).expect("mkdir action dir");
+    let orphan = action_dir.join(format!(".cache-stage-dead-{}", nonce()));
+    std::fs::write(&orphan, b"partial manifest bytes").expect("write orphan stage");
+
+    let rebuilt = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!rebuilt.outcome("main").hit, "an orphaned stage is not a published cache entry");
+    assert_eq!(rebuilt.outcome("main").miss_reason, Some(FirstDiff::NoPriorEntry));
+    assert!(orphan.exists(), "ordinary lookup/publish must not mistake or rename an unrelated orphan stage");
+
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(hot.all_hit(), "the safe rebuild publishes a complete entry for the next build");
+}
+
+// ---- Gate 13: resolved baseline/native CPU identity separates object namespaces -----------------
+
+#[test]
+fn gate13_cpu_change_misses_only_the_cpu_namespace() {
+    if !backend() {
+        return;
+    }
+    let proj = Project::new("cpu-key", &[("main.align", "fn main() {\n  print(42)\n}\n")], "main.align");
+    let cache = proj.cache();
+    let baseline = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!baseline.outcome("main").hit);
+
+    let native = emit_all(&proj, &cache, Profile::Release, BuildTarget::Native, &no_exports(), false);
+    assert!(!native.outcome("main").hit, "native codegen must not reuse the baseline object");
+    assert_eq!(native.outcome("main").miss_reason, Some(FirstDiff::Cpu));
+
+    let native_hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Native, &no_exports(), false);
+    assert!(native_hot.all_hit(), "the native namespace is independently cacheable");
 }

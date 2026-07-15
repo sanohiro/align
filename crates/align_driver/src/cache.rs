@@ -901,10 +901,29 @@ mod tests {
     #[test]
     fn first_diff_priority() {
         let base = sample_key();
+        // Every namespace-bearing component reports its own stable reason.
+        let mut k = base.clone();
+        k.frontend_schema += 1;
+        assert_eq!(first_diff(&base, &k), FirstDiff::FrontendSchema);
+        let mut k = base.clone();
+        k.target_triple = "aarch64-unknown-linux-gnu".to_string();
+        assert_eq!(first_diff(&base, &k), FirstDiff::Target);
+        let mut k = base.clone();
+        k.resolved_cpu = "native-cpu".to_string();
+        assert_eq!(first_diff(&base, &k), FirstDiff::Cpu);
+        let mut k = base.clone();
+        k.llvm_version = "23.0.0".to_string();
+        assert_eq!(first_diff(&base, &k), FirstDiff::LlvmVersion);
+        let mut k = base.clone();
+        k.reloc_model = "Static".to_string();
+        assert_eq!(first_diff(&base, &k), FirstDiff::RelocCodeModel);
         // Only impl_hash differs → MirDigest.
         let mut k = base.clone();
         k.impl_hash = Hash128 { lo: 42, hi: 42 };
         assert_eq!(first_diff(&base, &k), FirstDiff::MirDigest);
+        let mut k = base.clone();
+        k.dep_interface_hashes[0].1 = Hash128 { lo: 55, hi: 66 };
+        assert_eq!(first_diff(&base, &k), FirstDiff::DepInterfaceHashes);
         // Only profile differs → Profile.
         let mut k = base.clone();
         k.profile_name = "dev".to_string();
@@ -920,6 +939,15 @@ mod tests {
         k.rt_lto = true;
         k.rt_lto_digest = Some(Hash128 { lo: 7, hi: 7 });
         assert_eq!(first_diff(&base, &k), FirstDiff::RtLto);
+        let mut k = base.clone();
+        k.cross_unit_opt_digest = vec![1];
+        assert_eq!(first_diff(&base, &k), FirstDiff::CrossUnitOpt);
+        let mut k = base.clone();
+        k.cache_format_version += 1;
+        assert_eq!(first_diff(&base, &k), FirstDiff::CacheFormatVersion);
+        let mut k = base.clone();
+        k.compiler_build_id = Hash128 { lo: 77, hi: 88 };
+        assert_eq!(first_diff(&base, &k), FirstDiff::CompilerBuildId);
         // impl_hash takes priority over a simultaneous exports change.
         let mut k = base.clone();
         k.impl_hash = Hash128 { lo: 1, hi: 1 };
