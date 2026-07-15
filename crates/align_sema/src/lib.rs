@@ -3004,13 +3004,14 @@ pub fn check_program_with_effects(
                 diags,
                 tuples,
                 structs,
-                region: std::collections::HashMap::new(),
+                state: EscapeState::default(),
+                drop_region: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
-                local_backed_slice: std::collections::HashSet::new(),
                 task_group_regions: Vec::new(),
+                loop_break_states: Vec::new(),
             };
             ec.check();
-            ec.region
+            ec.drop_region
         };
         // Every free-standing owned `array<T>` (region `Static`) is dropped at every function
         // exit. Arena-allocated ones (region `Arena(k)`) are bulk-freed by the arena, so they
@@ -3940,9 +3941,9 @@ enum Region {
     Static,
     /// The current function's frame: a view created in-frame over frame-local storage. Cannot
     /// be returned. (A view *parameter* borrows the caller and is `Static` here — returnable.)
-    /// Not yet produced — frame-local slices still use the `local_backed_slice` set; folding
-    /// them onto this variant is a later MMv2 slice.
-    #[allow(dead_code)]
+    /// Frame-local slices additionally use `EscapeState::local_backed_slice` for their dedicated
+    /// diagnostic; other frame borrows (for example a `str` view of an owned `string`) use this
+    /// region directly.
     Frame,
     /// The k-th enclosing `arena {}` (1 = outermost). Freed at that block's end.
     Arena(u32),
@@ -3985,6 +3986,32 @@ impl Region {
     }
 }
 
+/// Path-sensitive escape provenance at one control-flow point. Both components form finite
+/// may-lattices: a local's joined region is the shortest region it may carry, and slice provenance
+/// is present when any reaching path may still borrow function-local storage.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct EscapeState {
+    region: std::collections::HashMap<LocalId, Region>,
+    local_backed_slice: std::collections::HashSet<LocalId>,
+}
+
+impl EscapeState {
+    fn join(&self, other: &Self) -> Self {
+        let mut joined = self.clone();
+        for (&local, &region) in &other.region {
+            joined
+                .region
+                .entry(local)
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        joined
+            .local_backed_slice
+            .extend(other.local_backed_slice.iter().copied());
+        joined
+    }
+}
+
 /// Arena escape checking (`03-types.md` §7, generalized per `impl/08-memory-model-v2.md`):
 /// every view / arena-allocated value carries an inferred [`Region`], and the one escape rule
 /// ([`Region::outlives`]) forbids it being returned to / stored into a longer-lived location.
@@ -3997,19 +4024,20 @@ struct EscapeCheck<'a> {
     tuples: &'a [hir::TupleDef],
     /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
     structs: &'a [StructDef],
-    /// For each box/str local, the region at which its current value was allocated.
-    region: std::collections::HashMap<LocalId, Region>,
+    /// Region and local-backed-slice provenance at the current control-flow point.
+    state: EscapeState,
+    /// Region used to classify each owned local's function-wide cleanup. Unlike `state`, this keeps
+    /// declarations from diverging branches: their exit path still needs the right arena-vs-heap
+    /// cleanup even though the branch contributes nothing to a later control-flow join.
+    drop_region: std::collections::HashMap<LocalId, Region>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
-    /// Locals whose value is, or transitively contains, a slice of *function-local* storage (an
-    /// array literal or local array materialized in this frame). Such a slice borrows the stack
-    /// frame and so must not be returned, even through an `Option` / `Result` wrapper. A slice
-    /// *parameter* borrows the caller and is never in this set.
-    local_backed_slice: std::collections::HashSet<LocalId>,
     /// Region of each active `task_group`, innermost last. A spawned closure may execute as late as
     /// the group's `wait`, so every capture must outlive the innermost group even when `spawn`
     /// appears inside a shorter-lived nested arena.
     task_group_regions: Vec<Region>,
+    /// Escape-state snapshots at `break` exits, one frame per active loop (innermost last).
+    loop_break_states: Vec<Vec<EscapeState>>,
 }
 
 impl<'a> EscapeCheck<'a> {
@@ -4417,14 +4445,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => {
                 Region::Frame.shorter(self.region_of(conn, depth))
             }
-            ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
+            ExprKind::Local(p) => self.state.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
             ExprKind::StructLit { fields, .. } => fields
                 .iter()
                 .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { root, .. } => self.region.get(root).copied().unwrap_or(Region::Static),
+            ExprKind::Field { root, .. } => self.state.region.get(root).copied().unwrap_or(Region::Static),
             // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
             // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
@@ -4437,7 +4465,7 @@ impl<'a> EscapeCheck<'a> {
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
             // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
             // so inheriting is harmless — never checked.)
-            | ExprKind::SoaColumn { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            | ExprKind::SoaColumn { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // `unsafe {}` is a plain marker block — its value's region is the tail value's region (no
             // new region opened, unlike `arena {}`). Explicit so an arena value returned from an
@@ -4469,7 +4497,7 @@ impl<'a> EscapeCheck<'a> {
             ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
-            ExprKind::IndexField { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            ExprKind::IndexField { base, .. } => self.state.region.get(base).copied().unwrap_or(Region::Static),
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
             ExprKind::TaskGet(inner) => self.region_of(inner, depth),
@@ -4659,7 +4687,7 @@ impl<'a> EscapeCheck<'a> {
                 .decl_depth
                 .get(p)
                 .map_or(Region::Static, |d| Region::Frame.shorter(Region::arena(*d))),
-            ExprKind::Local(p) if self.local_backed_slice.contains(p) => Region::Frame,
+            ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => Region::Frame,
             ExprKind::ArrayLit { .. } => Region::Frame.shorter(Region::arena(depth)),
             _ => self.region_of(source, depth),
         }
@@ -4678,7 +4706,7 @@ impl<'a> EscapeCheck<'a> {
             // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
             // local-backed check is the one that catches its escape).
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
-            ExprKind::Local(p) => self.local_backed_slice.contains(p),
+            ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
             ExprKind::CallFnValue { callee, args } => {
                 self.slice_is_local(callee) || args.iter().any(|a| self.slice_is_local(a))
@@ -4691,7 +4719,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
             ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
             ExprKind::StructLit { fields, .. } => fields.iter().any(|f| self.slice_is_local(f)),
-            ExprKind::Field { root, .. } => self.local_backed_slice.contains(root),
+            ExprKind::Field { root, .. } => self.state.local_backed_slice.contains(root),
             ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
             ExprKind::If { then, els, .. } => {
                 then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
@@ -4896,6 +4924,54 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Compute the escape-state loop-head fixpoint, then run one diagnostic pass from that state.
+    /// The body's fallthrough state is the back-edge; `break` snapshots are the only predecessors of
+    /// code after the loop. Kept out of [`Self::walk`] so the probe sink and state clones do not
+    /// enlarge its recursive stack frame.
+    #[inline(never)]
+    fn loop_flow(&mut self, body: &Block, depth: u32) {
+        let entry = self.state.clone();
+        let mut head = entry.clone();
+
+        // Probe to a finite may-state fixpoint without emitting the same diagnostics on every
+        // iteration of the analysis. A body that always diverges has no back-edge.
+        let mut sink = Diagnostics::new();
+        std::mem::swap(self.diags, &mut sink);
+        if !hir_block_diverges(body) {
+            loop {
+                self.state = head.clone();
+                self.loop_break_states.push(Vec::new());
+                self.block(body, depth);
+                self.loop_break_states.pop();
+                let next = entry.join(&self.state);
+                if next == head {
+                    break;
+                }
+                head = next;
+            }
+        }
+        std::mem::swap(self.diags, &mut sink);
+
+        // Emit diagnostics once from the fixed loop head and collect every reachable break exit.
+        self.state = head;
+        self.loop_break_states.push(Vec::new());
+        self.block(body, depth);
+        let breaks = self
+            .loop_break_states
+            .pop()
+            .expect("loop escape-state frame balanced");
+        if let Some((first, rest)) = breaks.split_first() {
+            let mut post = first.clone();
+            for state in rest {
+                post = post.join(state);
+            }
+            self.state = post;
+        } else {
+            // A break-less loop never reaches its continuation, so its state there is immaterial.
+            self.state = entry;
+        }
+    }
+
     fn block(&mut self, b: &Block, depth: u32) {
         for s in &b.stmts {
             self.stmt(s, depth);
@@ -4922,17 +4998,18 @@ impl<'a> EscapeCheck<'a> {
                     if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs)) {
                         r = r.shorter(Region::Frame);
                     }
-                    self.region.insert(*local, r);
+                    self.state.region.insert(*local, r);
+                    self.drop_region.insert(*local, r);
                 }
                 if self.mentions_slice(init.ty) && self.slice_is_local(init) {
-                    self.local_backed_slice.insert(*local);
+                    self.state.local_backed_slice.insert(*local);
                 }
                 // A local bound to a *fixed* array (`xs := [1, 2, 3]`) owns frame storage, so any
                 // slice viewing it (`xs[0..2]`, `xs` coerced) is frame-local and must not escape.
                 // Array *parameters* borrow the caller and are never `Let`-bound, so they stay out
                 // of this set (returnable), matching the slice-parameter convention above.
                 if matches!(init.ty, Ty::Array(..) | Ty::StructArray(..)) {
-                    self.local_backed_slice.insert(*local);
+                    self.state.local_backed_slice.insert(*local);
                 }
             }
             // `base[index] = value` / `base[index].field = value`. The store itself targets the
@@ -4945,7 +5022,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
                 self.walk(value, depth);
                 if self.region_bearing(value.ty) {
-                    let target = self.region.get(base).copied().unwrap_or(Region::Static);
+                    let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
@@ -4966,14 +5043,18 @@ impl<'a> EscapeCheck<'a> {
                 // its region: a `Static` heap array keeps its exit drop; another arena value stays
                 // bulk-freed. Checked before the region map is updated below, so it reads the region
                 // of the value being replaced, not the replacement.
-                if matches!(self.region.get(local).copied(), Some(Region::Arena(_))) {
+                if matches!(self.state.region.get(local).copied(), Some(Region::Arena(_))) {
                     drop_old.set(false);
                 }
-                // Conservative without a dataflow join: a binding that is *ever* assigned a value
-                // containing a local-backed slice stays local-backed (a later branch could reach
-                // `return` while it still holds the local array). We never clear the flag.
-                if self.mentions_slice(value.ty) && self.slice_is_local(value) {
-                    self.local_backed_slice.insert(*local);
+                // Assignment is a strong update on this path. Branch/loop joins below restore the
+                // conservative may-property when another reaching path still holds a local borrow.
+                // Fixed-array owner markers are not slice-bearing locals and therefore remain set.
+                if self.local_mentions_slice(*local) {
+                    if self.mentions_slice(value.ty) && self.slice_is_local(value) {
+                        self.state.local_backed_slice.insert(*local);
+                    } else {
+                        self.state.local_backed_slice.remove(local);
+                    }
                 }
                 if self.region_bearing(value.ty) {
                     let r = self.region_of(value, depth);
@@ -4984,7 +5065,7 @@ impl<'a> EscapeCheck<'a> {
                     // frame is still caught by the return / struct-field-store checks. A deeper
                     // arena value assigned to a shallower binding stays rejected.
                     let target = Region::Frame.shorter(Region::arena(*self.decl_depth.get(local).unwrap_or(&0)));
-                    let old_r = self.region.get(local).copied().unwrap_or(Region::Static);
+                    let old_r = self.state.region.get(local).copied().unwrap_or(Region::Static);
                     if !r.outlives(target) {
                         self.diags.error(
                             "this value is bound to an arena block and cannot escape it".to_string(),
@@ -4993,10 +5074,10 @@ impl<'a> EscapeCheck<'a> {
                     } else if is_owned_droppable(value.ty, self.structs) && old_r != r {
                         // Rule 1 (fail-closed v1): an *owned* Move local (array / string / buffer /
                         // Move struct …) is individually dropped at scope end, and whether that drop
-                        // runs is decided by its region (a `Static` heap value is freed by
+                        // runs is decided by its function-wide region (a `Static` heap value is freed by
                         // `drop_locals`; an `Arena` value is bulk-freed with the arena, never
-                        // individually). This region is tracked flow-insensitively, so a reassignment
-                        // that *changes* it — e.g. `Arena → Static` on a conditional path — would put
+                        // individually). Cleanup is not path-sensitive, so a reassignment that
+                        // *changes* it — e.g. `Arena → Static` on a conditional path — would put
                         // the binding into `drop_locals` even when a bypassed branch leaves it holding
                         // the original arena pointer: the arena bulk-free plus the exit drop then
                         // double-free it. There is no per-path drop flag yet, so pin the region at
@@ -5012,16 +5093,11 @@ impl<'a> EscapeCheck<'a> {
                             value.span,
                         );
                     } else {
-                        // Track the reassigned binding's region for later uses. Intersect (take the
-                        // shorter-lived of the old and new regions) rather than overwrite: a Copy
-                        // region-bearing view (`str`/`slice`/`bytes`) has no drop, so the concern is
-                        // escape, and a flow-insensitive upgrade (`Arena → Static` on one path) would
-                        // let the binding be returned / stored while a bypassed branch still holds the
-                        // shorter-lived arena view (a use-after-free). The intersection keeps the
-                        // binding pinned to the shortest region it can hold on any path — exactly the
-                        // sound escape bound. (Owned Move locals never reach here on a region change:
-                        // Rule 1 above rejects them.)
-                        self.region.insert(*local, old_r.shorter(r));
+                        // Assignment is a strong update on this path. A later control-flow join takes
+                        // the shorter region from all reaching paths, while a straight-line overwrite
+                        // can precisely replace an obsolete shorter-lived view. Owned Move locals
+                        // never reach here on a region change: Rule 1 above rejects them.
+                        self.state.region.insert(*local, r);
                     }
                 }
             }
@@ -5030,7 +5106,7 @@ impl<'a> EscapeCheck<'a> {
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
                 if self.region_bearing(value.ty) {
-                    let target = self.region.get(root).copied().unwrap_or(Region::Static);
+                    let target = self.state.region.get(root).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived struct field (it would escape its region)".to_string(),
@@ -5059,13 +5135,14 @@ impl<'a> EscapeCheck<'a> {
                     let r = self.region_of(init, depth);
                     for l in locals.iter().flatten() {
                         self.decl_depth.insert(*l, depth);
-                        self.region.insert(*l, r);
+                        self.state.region.insert(*l, r);
+                        self.drop_region.insert(*l, r);
                     }
                 }
                 if self.mentions_slice(init.ty) && self.slice_is_local(init) {
                     for l in locals.iter().flatten() {
                         if self.local_mentions_slice(*l) {
-                            self.local_backed_slice.insert(*l);
+                            self.state.local_backed_slice.insert(*l);
                         }
                     }
                 }
@@ -5079,6 +5156,9 @@ impl<'a> EscapeCheck<'a> {
                 if let Some(e) = value {
                     self.walk(e, depth);
                     self.check_break_escape(e, depth);
+                }
+                if let Some(frame) = self.loop_break_states.last_mut() {
+                    frame.push(self.state.clone());
                 }
             }
         }
@@ -5162,9 +5242,9 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Block(b) => self.block(b, depth),
-            // A `loop` opens no region (it is not an arena), so walk its body at the same depth. Its
-            // per-iteration `break`-escape rule is enforced per `Stmt::Break` in `stmt` above.
-            ExprKind::Loop { body, .. } => self.block(body, depth),
+            // A `loop` opens no region, but its escape provenance must flow around the back-edge to
+            // a fixpoint before later uses are checked. `break` exits supply the post-loop state.
+            ExprKind::Loop { body, .. } => self.loop_flow(body, depth),
             // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
             ExprKind::Unsafe(b) => self.block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
@@ -5229,27 +5309,34 @@ impl<'a> EscapeCheck<'a> {
                 // Copy binding's region is never consulted anyway. `region_bearing` (not just
                 // `tracks_region`) also carries the region into an arm that unwraps a
                 // `Result<slice<u8>, Error>` / `Option<slice<u8>>` — the `bytes`-view match path.
-                if self.region_bearing(scrutinee.ty) {
-                    let sr = self.region_of(scrutinee, depth);
-                    for a in arms {
-                        for b in &a.bindings {
-                            self.decl_depth.insert(*b, depth);
-                            self.region.insert(*b, sr);
-                        }
-                    }
-                }
-                if self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee) {
-                    for a in arms {
-                        for b in &a.bindings {
-                            if self.local_mentions_slice(*b) {
-                                self.local_backed_slice.insert(*b);
-                            }
-                        }
-                    }
-                }
+                let incoming = self.state.clone();
+                let scrutinee_region = self
+                    .region_bearing(scrutinee.ty)
+                    .then(|| self.region_of(scrutinee, depth));
+                let scrutinee_local_slice =
+                    self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
+                let mut joined: Option<EscapeState> = None;
                 for a in arms {
+                    self.state = incoming.clone();
+                    for binding in &a.bindings {
+                        self.decl_depth.insert(*binding, depth);
+                        if let Some(region) = scrutinee_region {
+                            self.state.region.insert(*binding, region);
+                            self.drop_region.insert(*binding, region);
+                        }
+                        if scrutinee_local_slice && self.local_mentions_slice(*binding) {
+                            self.state.local_backed_slice.insert(*binding);
+                        }
+                    }
                     self.walk(&a.body, depth);
+                    if !hir_expr_diverges(&a.body) {
+                        joined = Some(match joined {
+                            None => self.state.clone(),
+                            Some(state) => state.join(&self.state),
+                        });
+                    }
                 }
+                self.state = joined.unwrap_or(incoming);
             }
             ExprKind::ResultMapErr { result, f } => {
                 self.walk(result, depth);
@@ -5259,8 +5346,19 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.walk(cond, depth);
+                let incoming = self.state.clone();
+                self.state = incoming.clone();
                 self.block(then, depth);
+                let then_state = self.state.clone();
+                self.state = incoming.clone();
                 self.block(els, depth);
+                let else_state = self.state.clone();
+                self.state = match (hir_block_diverges(then), hir_block_diverges(els)) {
+                    (false, false) => then_state.join(&else_state),
+                    (true, false) => else_state,
+                    (false, true) => then_state,
+                    (true, true) => incoming,
+                };
             }
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.walk(expr, depth),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -5376,7 +5474,17 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
+                // The success path skips the fallback. Analyze the fallback from the same incoming
+                // state and join it only when it can continue; a diverging fallback (`return`) has
+                // no edge to the expression's continuation.
+                let incoming = self.state.clone();
+                self.state = incoming.clone();
                 self.walk(fallback, depth);
+                if hir_expr_diverges(fallback) {
+                    self.state = incoming;
+                } else {
+                    self.state = incoming.join(&self.state);
+                }
             }
             ExprKind::Template(parts) => {
                 for p in parts {
