@@ -26,6 +26,20 @@ xs.scan(0, add)    // running accumulation — a stage, not a terminal
 
 ステージに渡すのは名前付き関数か、インラインのラムダです。ラムダは `fn x { x * 2 }` のように、パラメータを波括弧の前に書きます。(ラムダは周囲の値もキャプチャできます。詳しくは [10](10-closures-and-parallelism.md) 章で扱います。)
 
+## `zip` で複数 source を読む
+
+同じ index の複数配列/スライスから一つの結果を作る場合は `zip` を使います。
+
+```align
+fn combine(a: slice<f32>, b: slice<f32>, c: slice<f32>, out dst: slice<f32>) {
+    zip(a, b, c).map(fn v { v.0 + v.1 * v.2 }).map_into(dst)
+}
+```
+
+`zip` は tuple 配列ではなく遅延 pipeline head です。全 source の長さを反復前に検査し、`v` は
+各 index だけに存在する SSA tuple です。v1 は2個以上の Copy primitive-scalar source を受けます。
+source 同士は alias してもよい一方、`map_into` の destination は全 source と非重複でなければなりません。
+
 ## リダクション終端
 
 ```align

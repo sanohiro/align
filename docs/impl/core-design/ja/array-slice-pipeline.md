@@ -41,6 +41,7 @@ xs.where(p) / .where(.flag)        xs.any(p) / .all(p)
 xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
 xs.chunks(n)                       xs.map_into(dst)        // write into caller slice
+zip(a, b, ...)                     // Copy scalar の遅延 multi-source head
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
 ```
@@ -57,6 +58,9 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 - Slice は Copy のビュー。`mut slice<T>` の束縛(または `out` 引数)が唯一の書き込み可能ビュー形である。
 - `.count()` は *パイプライン* の長さ(`where` と合成される)。`.len()` は直接読み取りである。両方が
   意図的に存在する — 統合してはならない。
+- `zip(a, b, ...)` はパイプライン専用の遅延 source である。各 index に SSA tuple を一つだけ作り、
+  ループ前に全 runtime 長を検査し、tuple 配列は確保しない。v1 は2個以上の名前付き配列/スライス、
+  fixed literal、sub-slice の Copy primitive scalar を受ける。
 
 ## Effects
 
@@ -68,7 +72,8 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 
 この領域に `Result` は無い。形の間違いはコンパイルエラーである(未終端のパイプライン、ステージのラムダの
 arity 不一致、Move 要素のスライス/インデックス、`out` 引数の aliasing、`map_into` の source/dst の重複)。
-ランタイム abort: インデックス/範囲の out of bounds、`map_into` の長さ不一致。空入力はエラーではなく答え
+ランタイム abort: インデックス/範囲の out of bounds、`map_into` または runtime `zip` の長さ不一致。
+固定長 `zip` の不一致はコンパイルエラーである。空入力はエラーではなく答え
 である — `sum` は 0、`count` は 0、`any` は false、`all` は true。証明可能に空なフィルタに対する `min`/
 `max` は sentinel の identity を返す(branchless な `where` reducer、#303)。
 
@@ -79,6 +84,8 @@ storage-vs-element の区別である(str 配列の *要素* は配列の *stora
 `sort`/`partition` の結果は owned である(region 無し)。`map_into` は呼び出し側の region を通して書き込み、
 **no-alias を証明する** — 呼び出し側の out-disjointness チェックは #328 の call-laundered-aliasing 修正
 以降あえて保守的にしてある。あの敵対的ケースを再実行せずに緩めてはならない。
+`zip(...).map_into(dst)` は全 source と `dst` の非重複を証明する。source 同士の alias は許可され、
+source-source の `noalias` は決して出さない。
 
 ## 仕様先行(未実装)
 

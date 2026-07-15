@@ -3304,7 +3304,7 @@ orthogonal lever there.
 ### SoA conversion trigger
 Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
 
-### Lazy multi-source pipeline (`zip`) — P1 measured design candidate, consumer-gated
+### Lazy multi-source pipeline (`zip`) — SHIPPED 2026-07-15
 
 **Recorded 2026-07-14.** The shipped pipeline fuses work derived from one input element but has no
 canonical runtime-array/slice shape for `out[i] = f(a[i], b[i], c[i])`. Retain one lazy `zip`
@@ -3319,6 +3319,13 @@ equal-LLVM IR/assembly: one allocation-free vector loop, no tuple storage, and e
 length/effect/trap/alias behavior on x86-64 and arm64. Runtime-length `dot` may reuse the machinery,
 but ordered floating-point reduction must not be silently reassociated. Full measurement and design
 gate: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.3.
+
+**Implemented 2026-07-15.** `zip(a, b, ...)` is a pipeline-only lazy source for two or more Copy
+primitive-scalar arrays/slices. It emits one equal-length-guarded loop, per-index SSA tuples, no
+tuple storage, and existing stage/reducer trap semantics. `map_into` proves the destination
+disjoint from every source using one input-vs-output scope and makes no source-source no-alias
+claim. The dedicated regression gate covers runtime/static mismatch, fusion/allocation/SIMD,
+guarded traps, and both alias directions. Strided/Move/parallel forms remain consumer-deferred.
 
 ### Deep pipeline stage scaling — DONE / MEASURED 2026-07-15
 

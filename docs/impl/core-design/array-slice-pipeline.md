@@ -41,6 +41,7 @@ xs.where(p) / .where(.flag)        xs.any(p) / .all(p)
 xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
 xs.chunks(n)                       xs.map_into(dst)        // write into caller slice
+zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
 ```
@@ -58,6 +59,9 @@ removed outright (no alias survives, per the no-backward-compat rule).
 - Slices are Copy views; a `mut slice<T>` binding (or `out` param) is the one writable-view form.
 - `.count()` is the *pipeline* length (composes with `where`); `.len()` is the direct read. Both
   exist on purpose — do not merge them.
+- `zip(a, b, ...)` is pipeline-only and lazy: it assembles one SSA tuple per index, checks every
+  runtime length before the loop, and never allocates tuple storage. v1 takes two or more named
+  arrays/slices, fixed literals, or sub-slices with Copy primitive-scalar elements.
 
 ## Effects
 
@@ -69,7 +73,8 @@ and demanded where it matters (`par_map`; and pipeline lambdas reject allocation
 
 No `Result` in this area. Shape mistakes are compile errors (unterminated pipeline, arity
 mismatch in a stage lambda, Move-element slicing/indexing, aliasing `out` args, `map_into`
-source/dst overlap). Runtime aborts: index/range out of bounds, `map_into` length mismatch.
+source/dst overlap, unequal fixed `zip` lengths). Runtime aborts: index/range out of bounds,
+`map_into` length mismatch, or unequal runtime `zip` lengths.
 Empty input is an answer, never an error: `sum` 0, `count` 0, `any` false, `all` true; `min`/
 `max` on a provably-empty filter yield the sentinel identity (branchless `where` reducers, #303).
 
@@ -81,6 +86,8 @@ the storage-vs-element distinction from #297 (a str-array's *elements* may outli
 through the caller's region and **proves no-alias**: the caller-side out-disjointness check is
 deliberately conservative after the #328 call-laundered-aliasing fix — do not loosen it without
 re-running that adversarial case.
+For `zip(...).map_into(dst)`, the proof covers **every** source. Runtime source loads share one
+input-vs-output scope; sources are allowed to alias one another and are never declared disjoint.
 
 ## Spec'd but not implemented
 
@@ -115,5 +122,6 @@ re-running that adversarial case.
 `m4.rs` (count/min/max/any/all), `mmv2.rs` (scan/sort), `lambda.rs` (stage lambdas, arity,
 purity rejections), `map_into.rs` (+#328 aliasing cases), `out_params.rs` (no-alias, bounds),
 `struct_index.rs` (element/field writes, nested paths), `tuples.rs` (partition destructure),
+`zip_pipeline.rs` (fusion, SIMD, length/effect/trap/alias contract),
 examples `pipeline.align`, `chunks.align`, `partition.align`, `sort_by_key.align`,
 `owned_array.align`. Differential fuzzer covers reducer terminals (#326).

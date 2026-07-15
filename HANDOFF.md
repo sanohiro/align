@@ -8,7 +8,22 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (nineteenth update this day), **UNBOUND MOVE TEMPORARIES HAVE
+_Last updated: 2026-07-15 (twentieth update this day), **LAZY MULTI-SOURCE `zip` IS SHIPPED.**
+`zip(a, b, ...)` is a pipeline-only head for two or more equal-length Copy primitive-scalar
+arrays/slices. Checked HIR carries the sources and an interned per-index tuple; MIR checks every
+runtime length before the terminal loop, loads all sources at one increasing index, and constructs
+only an SSA tuple — no tuple array or allocation. Existing `map`/`where`/reducers retain their
+effect and trap ordering, including the guarded callable suffix after `where`. `map_into` proves its
+destination disjoint from every source, while all runtime source loads share one input-vs-output
+scope and never claim source-source disjointness. Five dedicated regressions pin the three-source
+result, one counted loop, no allocation, optimized LLVM vectorization, guarded division, runtime and
+static length mismatch, repeated-source aliasing, destination alias rejection, and invalid surfaces.
+The complete workspace is green (**2155 total = 2154 passed + one ignored manual probe**) and
+workspace clippy passes with warnings denied. The preceding synthetic-owner work was squash-merged
+as PR #471 (`a2db332`) after all three Gemini findings were applied, answered in English, resolved,
+and summarized in the required top-level PR comment. **Next recommended allocation-audit item:**
+remove definite-null destructor calls now that ownership dataflow is path-aware. Previous update:
+2026-07-15 (nineteenth update this day), **UNBOUND MOVE TEMPORARIES HAVE
 VIEW-AWARE OWNERSHIP.** Fresh owned expressions used through scalar consumers now move into
 path-local synthetic MIR owners and drop immediately after the scalar is produced; borrowed views
 propagate those owners through string/slice/path/chunk/index/call operations until function or loop

@@ -522,6 +522,10 @@ pub enum ExprKind {
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
+    /// `zip(a, b, …)` — a lazy multi-source pipeline head. Each source is an array/slice of a
+    /// Copy scalar; `tuple_id` describes the per-index SSA tuple. There is no tuple array and this
+    /// node is valid only as the `source` of a pipeline terminal.
+    ArrayZip { sources: Vec<Expr>, tuple_id: u32 },
     /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2): lane `i`
     /// is `a[i]` where `mask[i]`, else `b[i]`. Lowers to `Rvalue::Select` (an LLVM vector `select`).
     Select { mask: Box<Expr>, a: Box<Expr>, b: Box<Expr> },

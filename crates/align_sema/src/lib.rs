@@ -4011,6 +4011,11 @@ impl EffectScan<'_> {
                     self.expr(el);
                 }
             }
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    self.expr(source);
+                }
+            }
             ExprKind::Select { mask, a, b } => {
                 self.expr(mask);
                 self.expr(a);
@@ -4833,6 +4838,7 @@ impl<'a> EscapeCheck<'a> {
                     r
                 }
             }
+            ExprKind::ArrayZip { .. } => Region::Static,
             // A tuple lives as long as its shortest-lived element (same rule as an array literal):
             // a tuple holding an arena `str` view is arena-regioned and cannot escape.
             ExprKind::Tuple { elems, .. } => elems
@@ -5200,6 +5206,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
             ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::ArrayZip { sources, .. } => sources.iter().any(|a| self.slice_is_local(a)),
             ExprKind::CallFnValue { callee, args } => {
                 self.slice_is_local(callee) || args.iter().any(|a| self.slice_is_local(a))
             }
@@ -5954,6 +5961,11 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(e, depth);
                 }
             }
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    self.walk(source, depth);
+                }
+            }
             ExprKind::Select { mask, a, b } => {
                 self.walk(mask, depth);
                 self.walk(a, depth);
@@ -6567,6 +6579,11 @@ impl UnnecessaryHeapScan {
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for el in elems {
                     self.visit(el);
+                }
+            }
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    self.visit(source);
                 }
             }
             ExprKind::Select { mask, a, b } => {
@@ -7229,6 +7246,13 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
+            ExprKind::ArrayZip { sources, .. } => {
+                let mut roots = BorrowRoots::new();
+                for source in sources {
+                    roots.extend(self.borrow_sources(source));
+                }
+                roots
+            }
             ExprKind::StructLit { fields, .. } => {
                 let mut roots = BorrowRoots::new();
                 for field in fields {
@@ -7809,6 +7833,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     self.expr(e, moved, true, true);
+                }
+            }
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    self.expr(source, moved, false, false);
                 }
             }
             ExprKind::Select { mask, a, b } => {
@@ -10718,6 +10747,13 @@ impl<'a, 't> Checker<'a, 't> {
         if name == "array_builder" {
             return self.check_array_builder_new(args, expected, span);
         }
+        if name == "zip" {
+            self.diags.error(
+                "'zip' is a lazy pipeline source and must be consumed by a pipeline terminal (for example `zip(a, b).map(f).map_into(out)`)".to_string(),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         if name == "buffer" {
             return self.check_buffer_new(args, span);
         }
@@ -12728,10 +12764,16 @@ impl<'a, 't> Checker<'a, 't> {
             _ => None,
         };
         let source = match &source_ast.kind {
+            ast::ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ast::ExprKind::Path(path) if single_name(path) == Some("zip")) =>
+            {
+                self.check_zip_source(args, source_ast.span)?
+            }
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
             _ => self.check_expr(source_ast, None),
         };
         let mut elem = match source.ty {
+            Ty::Tuple(_) if matches!(source.kind, ExprKind::ArrayZip { .. }) => source.ty,
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
             // A `soa<Struct>` source is a struct source whose field access is column-addressed
@@ -12876,6 +12918,59 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         Some((source, stages, elem))
+    }
+
+    /// Check the pipeline-only `zip(a, b, …)` head. Sources are deliberately narrow in v1:
+    /// named arrays/slices, fixed literals, or their sub-slices, each with a Copy scalar element.
+    /// The tuple is a per-index SSA value, never a materialized array.
+    fn check_zip_source(&mut self, args: &[ast::Expr], span: Span) -> Option<Expr> {
+        if args.len() < 2 {
+            self.diags.error(format!("'zip' needs at least 2 array/slice sources, got {}", args.len()), span);
+            return None;
+        }
+        let mut sources = Vec::with_capacity(args.len());
+        let mut elems = Vec::with_capacity(args.len());
+        let mut fixed_len = None;
+        for arg in args {
+            let source = match &arg.kind {
+                ast::ExprKind::ArrayLit(values) => self.check_array_lit(values, None, arg.span),
+                _ => self.check_expr(arg, None),
+            };
+            let (scalar, len) = match self.resolve(source.ty) {
+                Ty::Array(s, n) => (s, Some(n)),
+                Ty::Slice(s) | Ty::DynArray(s) => (s, None),
+                Ty::Error => return None,
+                other => {
+                    self.diags.error(format!("'zip' sources must be arrays/slices of Copy scalars, got {}", ty_name(other)), arg.span);
+                    return None;
+                }
+            };
+            if !matches!(scalar, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char) {
+                self.diags.error(format!("'zip' v1 supports only Copy scalar elements, got {}", scalar_name(scalar)), arg.span);
+                return None;
+            }
+            if !matches!(source.kind, ExprKind::Local(_) | ExprKind::ArrayLit { .. } | ExprKind::SliceRange { .. }) {
+                self.diags.error(
+                    "'zip' v1 sources must be named arrays/slices, fixed literals, or sub-slices (bind other expressions first)".to_string(),
+                    arg.span,
+                );
+                return None;
+            }
+            if let Some(n) = len {
+                match fixed_len {
+                    Some(want) if want != n => {
+                        self.diags.error(format!("'zip' fixed-array lengths differ: expected {want}, got {n}"), arg.span);
+                        return None;
+                    }
+                    None => fixed_len = Some(n),
+                    _ => {}
+                }
+            }
+            elems.push(scalar);
+            sources.push(source);
+        }
+        let tuple_id = intern_tuple(self.tuples, elems);
+        Some(Expr { kind: ExprKind::ArrayZip { sources, tuple_id }, ty: Ty::Tuple(tuple_id), span })
     }
 
     /// `src.…​.sum()` — fold the (numeric) post-stage elements with `+`.
@@ -13349,34 +13444,32 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        match self.expr_root_local(&source) {
-            Some(sr) if sr == dst_root => {
-                let name = self.locals[dst_root as usize].name.clone();
-                self.diags.error(
-                    format!("'map_into' destination aliases the pipeline source '{name}' — the output slice must be a distinct buffer"),
-                    dst_arg.span,
-                );
-                return err;
-            }
-            Some(sr) if !self.slice_root_is_known(sr) => {
-                // The source root is a slice local of unknown origin (bound to a fn return / soa
-                // column / struct field) — it could alias `dst`, so it cannot back a `noalias` claim.
-                self.diags.error(
-                    "'map_into' source is a view of unknown origin (a fn-returned slice, a soa column, a struct field); its buffer cannot be proven distinct from the `out` buffer, so it is rejected (deferred)".to_string(),
-                    span,
-                );
-                return err;
-            }
-            // Two distinct *known* backing buffers → provably disjoint. Two slice parameters are
-            // guaranteed distinct by the caller's `out` no-alias check; a param vs. an array local,
-            // or two distinct array locals, never share storage.
-            Some(_) => {}
-            None => {
-                // No name root. Sound only if the source is provably fresh/stack storage (a fixed
-                // array literal) — never a view of unknown origin that could alias `dst`.
-                if !matches!(source.ty, Ty::Array(..) | Ty::StructArray(..)) {
+        let alias_sources: &[Expr] = match &source.kind {
+            ExprKind::ArrayZip { sources, .. } => sources,
+            _ => std::slice::from_ref(&source),
+        };
+        for alias_source in alias_sources {
+            match self.expr_root_local(alias_source) {
+                Some(sr) if sr == dst_root => {
+                    let name = self.locals[dst_root as usize].name.clone();
                     self.diags.error(
-                        "'map_into' needs a source whose buffer is known — a named array/slice (or a sub-slice of one) or an array literal. A slice of unknown origin (returned from a function, a soa column, a struct field) could alias the `out` buffer, so it is rejected (deferred)".to_string(),
+                        format!("'map_into' destination aliases a pipeline source '{name}' — the output slice must be a distinct buffer"),
+                        dst_arg.span,
+                    );
+                    return err;
+                }
+                Some(sr) if !self.slice_root_is_known(sr) => {
+                    self.diags.error(
+                        "'map_into' source is a view of unknown origin (a fn-returned slice, a soa column, a struct field); its buffer cannot be proven distinct from the `out` buffer, so it is rejected (deferred)".to_string(),
+                        span,
+                    );
+                    return err;
+                }
+                Some(_) => {}
+                None if matches!(alias_source.ty, Ty::Array(..) | Ty::StructArray(..)) => {}
+                None => {
+                    self.diags.error(
+                        "'map_into' needs sources whose buffers are known — named arrays/slices (or sub-slices) or array literals. A view of unknown origin could alias the `out` buffer".to_string(),
                         span,
                     );
                     return err;
@@ -18379,6 +18472,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     self.finalize_expr(e);
+                }
+            }
+            ExprKind::ArrayZip { sources, .. } => {
+                for source in sources {
+                    self.finalize_expr(source);
                 }
             }
             ExprKind::Select { mask, a, b } => {
