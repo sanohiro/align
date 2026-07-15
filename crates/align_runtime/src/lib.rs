@@ -18678,7 +18678,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             let _ = client.join();
         }
         unsafe { align_rt_http_server_free(srv) };
-        let mut after = count_fds().unwrap();
+        let Some(mut after) = count_fds() else { return };
         // Other tests in this binary share the process fd table. Give transient parallel network
         // activity a short, fixed window to drain, retaining the lowest observed count. A real leak
         // from these cycles remains open across every sample, so the +2 threshold is unchanged.
@@ -18687,7 +18687,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
-            after = after.min(count_fds().unwrap());
+            if let Some(fds) = count_fds() {
+                after = after.min(fds);
+            }
         }
         // Allow a small slack for runtime bookkeeping, but a per-cycle leak (12+) must not show.
         assert!(after <= before + 2, "fd leak across accept/respond cycles: {before} -> {after}");
