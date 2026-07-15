@@ -2990,7 +2990,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `str.bytes()` is the same zero-cost descriptor retype in the other direction: `str` and
         // `slice<u8>` both lower as `{ptr,len}`. The HIR node retains borrow provenance; MIR needs
         // no instruction or runtime call.
-        hir::ExprKind::StrBytes { string } => lower_expr(b, string),
+        hir::ExprKind::StrBytes { inner } => lower_expr(b, inner),
         hir::ExprKind::BuilderNew { capacity } => {
             let cap = match capacity {
                 Some(c) => lower_expr(b, c),

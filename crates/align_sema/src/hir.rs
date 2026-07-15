@@ -775,7 +775,7 @@ pub enum ExprKind {
     /// `s.bytes()` — a zero-cost `slice<u8>` view of a `str`'s UTF-8 bytes. An owned `string`
     /// receiver is first wrapped in `StrBorrow`, so this node always borrows a `str` and inherits
     /// its storage region. Pure; the `{ptr,len}` representation is unchanged in MIR.
-    StrBytes { string: Box<Expr> },
+    StrBytes { inner: Box<Expr> },
     /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
     BufferLen { buffer: Box<Expr> },
     /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`
