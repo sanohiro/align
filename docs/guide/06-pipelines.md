@@ -26,6 +26,23 @@ xs.scan(0, add)    // running accumulation — a stage, not a terminal
 
 Functions passed to stages are named functions or inline lambdas — `fn x { x * 2 }`, with the parameter before the brace. (Lambdas capture surrounding values too; the full story is chapter [10](10-closures-and-parallelism.md).)
 
+## Multiple sources with `zip`
+
+Use `zip` when one output element depends on the same index of two or more arrays/slices:
+
+```align
+fn combine(a: slice<f32>, b: slice<f32>, c: slice<f32>, out dst: slice<f32>) {
+    zip(a, b, c)
+        .map(fn v { v.0 + v.1 * v.2 })
+        .map_into(dst)
+}
+```
+
+`zip` is a lazy pipeline head, not an array of tuples. All sources must have equal length (checked
+before iteration), and each `v` is an ephemeral SSA tuple for one increasing index. The first
+version accepts two or more Copy primitive-scalar arrays/slices. Sources may alias one another;
+`map_into` still requires its destination to be disjoint from every source.
+
 ## Reduction terminals
 
 ```align

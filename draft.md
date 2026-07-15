@@ -809,6 +809,18 @@ at runtime, like an out-of-bounds index), and yields `()`. A filtering `where` b
 no-alias rule as an `out` argument) and emits the disjoint-buffer `noalias`, so the fused loop
 vectorizes with no runtime overlap guard.
 
+For a same-index transform over multiple inputs, `zip` is the lazy pipeline source:
+
+```align
+zip(a, b, c).map(fn v { v.0 + v.1 * v.2 }).map_into(dst)
+```
+
+It accepts two or more arrays/slices of Copy primitive scalars. Every runtime length is checked
+equal before the loop; fixed unequal lengths are a compile error. The per-index tuple exists only
+as an SSA value, never as an allocated tuple array. `map`/`where`/reducers retain their ordinary
+increasing-index effect and trap rules. For `map_into`, `dst` must be disjoint from every source,
+while the sources may alias each other (the compiler does not emit source-vs-source `noalias`).
+
 ---
 
 ## 8. Data Processing Core

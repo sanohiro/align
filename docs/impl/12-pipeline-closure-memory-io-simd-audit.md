@@ -522,7 +522,7 @@ interchange first and backend-chosen tiling only when per-output state or anothe
 it. Keep ROI/border policy and separability explicit in the library operation. Do not add
 image-specific syntax or a general polyhedral loop system from this result.
 
-### 4.3 P1 MEASURED DESIGN CANDIDATE — lazy multi-source `zip`
+### 4.3 SHIPPED 2026-07-15 — lazy multi-source `zip`
 
 The current pipeline is fundamentally single-source. It can fuse arbitrary work derived from one
 element, and `map_into` can write one disjoint destination, but it cannot directly express the
@@ -572,6 +572,21 @@ manually fused equal-LLVM C control. Compare against both staged materialization
 control so the feature is adopted for canonical expression/fusion, not because the control was
 artificially weak. Do not add `map2`/`map_with`, `zip2`/`zip3`, or an automatic multi-array fusion
 heuristic as parallel mechanisms; settle one `zip` source spelling with the first real consumer.
+
+**Implementation result (2026-07-15):** the preferred spelling above is shipped. Checked HIR keeps
+`zip` as a pipeline-only source carrying two or more Copy primitive-scalar arrays/slices and an
+interned tuple type. MIR evaluates sources left-to-right, checks every length against the first
+before constructing the terminal loop, loads one element from each source at the shared index, and
+assembles only an SSA tuple. Existing stage/reducer control flow therefore preserves increasing
+index, effects, and the post-`where` trap guard without a second pipeline engine. `map_into` checks
+the destination against every source root. All runtime source loads use the same input-vs-output
+alias scope, which permits source-source aliasing and never claims mutual disjointness.
+
+`zip_pipeline.rs` pins a three-source runtime result, one counted MIR loop, no allocation, optimized
+LLVM vectorization, a guarded division after `where`, runtime mismatch abort, static mismatch and
+surface diagnostics, repeated-source legality, and destination-vs-any-source rejection. The tuple
+never becomes array storage. v1 deliberately requires named arrays/slices, fixed literals, or
+sub-slices; Move/borrowed text elements, nested zip, strided inputs, and parallel zip remain deferred.
 
 ### 4.4 Correct way to recover SIMD after the `where` fix
 
@@ -1170,8 +1185,8 @@ of integer wrap.
 ### Slice P1 — cache traffic and visible loops
 
 - implement and benchmark arena initialized-before-read/uninitialized vs conservative-zeroed separation;
-- build lazy multi-source `zip` only with its first real consumer; gate it on one allocation-free,
-  tuple-storage-free vector loop and exact length/alias/effect semantics;
+- [x] build lazy multi-source `zip` with its first real consumer; one allocation-free,
+  tuple-storage-free vector loop and exact length/alias/effect semantics (2026-07-15);
 - direct-fill exact codec destinations, then evaluate already-planned Base64 SIMD and the separate
   measure-first hex SIMD probe;
 - add the total-order ordered-input/run-boundary stable-sort path and delay merge-only scratch until

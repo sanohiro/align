@@ -3363,6 +3363,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
+        hir::ExprKind::ArrayZip { .. } => {
+            unreachable!("zip is a lazy source lowered only by its pipeline terminal")
+        }
         // `select(mask, a, b)` → a vector `select` (`Rvalue::Select` with a vector mask cond).
         hir::ExprKind::Select { mask, a, b: bexpr } => {
             let cond = lower_expr(b, mask);
@@ -4353,6 +4356,20 @@ struct SrcSetup {
     /// consuming loop once done. `None` for slots, slices, bound locals, and arena temporaries
     /// (the latter are bulk-freed by the arena).
     temp_free: Option<Operand>,
+    /// Per-input scalar source setup for a lazy `zip`; empty for an ordinary single source.
+    /// All runtime lengths have already been checked equal to `bound` before loop construction.
+    zip: Option<ZipSetup>,
+}
+
+struct ZipSetup {
+    tuple_id: u32,
+    inputs: Vec<ZipInputSetup>,
+}
+
+struct ZipInputSetup {
+    slot: Slot,
+    slice_val: Option<Operand>,
+    elem: Ty,
 }
 
 /// The arguments for a stage function call: the element, then any captured values (a lifted
@@ -4387,6 +4404,34 @@ fn pipeline_source_needs_drop(source: &hir::Expr, outside_arena: bool) -> bool {
 }
 
 fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
+    if let hir::ExprKind::ArrayZip { sources, tuple_id } = &source.kind {
+        let mut inputs = Vec::with_capacity(sources.len());
+        let mut bound: Option<Operand> = None;
+        for source in sources {
+            let setup = setup_source(b, source);
+            debug_assert!(setup.zip.is_none(), "nested zip is rejected in sema");
+            debug_assert!(setup.temp_free.is_none(), "zip v1 sources are borrowed places/literals");
+            if let Some(want) = &bound {
+                emit_len_eq_check(b, setup.bound.clone(), want.clone());
+            } else {
+                bound = Some(setup.bound.clone());
+            }
+            let elem = match source.ty {
+                Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                _ => unreachable!("zip source type is sema-restricted to scalar arrays/slices"),
+            };
+            inputs.push(ZipInputSetup { slot: setup.slot, slice_val: setup.slice_val, elem });
+        }
+        return SrcSetup {
+            slot: 0,
+            slice_val: None,
+            bound: bound.expect("zip has at least two sources"),
+            scalar_slot: false,
+            struct_view: None,
+            temp_free: None,
+            zip: Some(ZipSetup { tuple_id: *tuple_id, inputs }),
+        };
+    }
     match source.ty {
         // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
         // `slice<T>`) all share the `{ptr,len}` layout and runtime length.
@@ -4408,7 +4453,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // freed here. Materializing terminals instead arena-allocate inside an arena, so the loop
             // frees those only outside one.
             let temp_free = pipeline_source_needs_drop(source, b.arenas.is_empty()).then(|| sv.clone());
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free }
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free, zip: None }
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
         // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
@@ -4417,7 +4462,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None }
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None, zip: None }
         }
         // A `soa<Struct>` view: a `{ptr,len}` column-major buffer. Same `{ptr,len}` handling as an
         // owned struct array, but the `Layout::Soa` struct-view makes field access column-addressed.
@@ -4425,7 +4470,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None }
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None, zip: None }
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
@@ -4436,9 +4481,32 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
                 scalar_slot: matches!(source.ty, Ty::Array(..)),
                 struct_view: None,
                 temp_free: None,
+                zip: None,
             }
         }
     }
+}
+
+/// Load one index from every lazy-zip input and assemble the ephemeral tuple in SSA. Runtime slice
+/// loads may share the pipeline's single input alias scope against `map_into`'s destination; no
+/// metadata ever claims that the inputs are mutually disjoint.
+fn lower_zip_element(b: &mut Builder, zip: &ZipSetup, index: &Operand, alias_scope: Option<u32>) -> Operand {
+    let mut elems = Vec::with_capacity(zip.inputs.len());
+    for input in &zip.inputs {
+        let value = b.fresh_value(input.elem);
+        let load = match (&input.slice_val, alias_scope) {
+            (Some(slice), Some(scope)) => {
+                Rvalue::SliceIndexNoalias { slice: slice.clone(), index: index.clone(), scope }
+            }
+            (Some(slice), None) => Rvalue::SliceIndex(slice.clone(), index.clone()),
+            (None, _) => Rvalue::Index(input.slot, index.clone()),
+        };
+        b.push(Stmt::Let(value, load));
+        elems.push(Operand::Value(value));
+    }
+    let tuple = b.fresh_value(Ty::Tuple(zip.tuple_id));
+    b.push(Stmt::Let(tuple, Rvalue::MakeTuple { tuple_id: zip.tuple_id, elems }));
+    Operand::Value(tuple)
 }
 
 /// The **single layout seam** for struct-array element-field addressing — the one place that
@@ -4530,7 +4598,7 @@ fn lower_array_reduce(
     reducer: Reducer,
 ) -> Operand {
     let elem_ty = acc_ty;
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -4578,7 +4646,9 @@ fn lower_array_reduce(
 
     // A scalar array or a slice loads the element up front; a struct array (stack slot or a
     // `{ptr,len}` `array<Struct>` view) stays addressed by index until a `.field` projection.
-    let mut cur: Option<Operand> = if struct_view.is_some() {
+    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+        Some(lower_zip_element(b, zip, &index, None))
+    } else if struct_view.is_some() {
         None
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
@@ -4803,18 +4873,16 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // — `make()` returns an owned array nothing else holds). The copy loop consumes it into the
     // new output buffer, so free that source temporary at the exit (the result is a separate
     // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
 
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
     let out_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
     let alloc = match arena {
         Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
-        // KNOWN LIMITATION (deferred): a free-standing `.to_array()` that is consumed as an
-        // unbound temporary (`[..].to_array().sum()`) is never bound to a `drop_local`, so its
-        // buffer is leaked. Sound (no UAF) and bounded; the "complete drop coverage" slice will
-        // either bind such temporaries to synthetic drop slots or fuse the terminal so no
-        // materialization happens. Arena mode is unaffected (bulk-freed).
+        // Outside an arena the returned buffer is individually owned. A binding gets its ordinary
+        // drop slot; an unbound consumer gets the path-local synthetic owner installed by
+        // `lower_borrowed_owned`. Arena mode remains bulk-freed.
         None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
     };
     b.push(Stmt::Let(out_ptr, alloc));
@@ -4854,7 +4922,9 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    let mut cur: Option<Operand> = if struct_view.is_some() {
+    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+        Some(lower_zip_element(b, zip, &index, None))
+    } else if struct_view.is_some() {
         None
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
@@ -5004,7 +5074,7 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
 /// ([`Rvalue::SliceIndexNoalias`]/[`Stmt::PtrStoreNoalias`]) — sema proved `dst` is disjoint from the
 /// source — so the vectorizer drops its runtime overlap guard. Yields `()`.
 fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], dst: &hir::Expr, elem: Ty) -> Operand {
-    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free, zip } = setup_source(b, source);
     // `map_into` reads its source (never consumes it), so there is never a fresh owned source
     // buffer to free here. Sema's alias gate restricts the source to a named array/slice, a
     // sub-slice of one, or a fixed array literal — never a fn-returned owned `array<T>` or a nested
@@ -5013,7 +5083,8 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     debug_assert!(temp_free.is_none(), "map_into source must not own a fresh buffer (sema alias gate)");
     // The source load is scope-tagged only when it reads a runtime slice buffer (`SliceIndex`); a
     // fixed stack-array source (`Index`) can't alias a caller slice, so it needs no metadata.
-    let emit_noalias = slice_val.is_some();
+    let emit_noalias = slice_val.is_some()
+        || zip.as_ref().is_some_and(|zip| zip.inputs.iter().any(|input| input.slice_val.is_some()));
     let scope = b.fresh_alias_scope();
 
     // Destination `{ptr,len}`: its buffer pointer (store target) and length (for the guard).
@@ -5047,7 +5118,9 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     let index = Operand::Value(idx);
 
     // Load the source element (scalar sources); struct sources defer to the first Project stage.
-    let mut cur: Option<Operand> = if struct_view.is_some() {
+    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+        Some(lower_zip_element(b, zip, &index, Some(scope)))
+    } else if struct_view.is_some() {
         None
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
@@ -5555,7 +5628,7 @@ fn lower_array_partition(
     tuple_id: u32,
 ) -> Operand {
     let arena = b.arenas.last().copied();
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
 
     // Two output buffers, each an upper-bound `bound` elements (a split never grows the count).
     let alloc_buf = |b: &mut Builder| {
@@ -5598,7 +5671,9 @@ fn lower_array_partition(
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    let mut cur: Option<Operand> = if struct_view.is_some() {
+    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+        Some(lower_zip_element(b, zip, &index, None))
+    } else if struct_view.is_some() {
         None
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
