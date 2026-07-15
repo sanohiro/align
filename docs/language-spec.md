@@ -418,7 +418,9 @@ A program also spans **user modules**: a non-entry file declares `module geom` a
 functions and types with `pub`; `import geom` resolves by filename to `geom.align` in the entry's
 directory (nested `import util.math` → `util/math.align`). A cross-module reference is qualified —
 `geom.area(...)` for a function, `geom.Point` for a type — reaching only `pub` members; a bare name
-resolves within the calling module (an imported type must be qualified). Each module has its own
+resolves within the calling module (an imported type must be qualified). A qualified `pub` function
+may also be passed to a pipeline/reducer (`xs.map(geom.area)`) or bound as a function value
+(`f := geom.area`) under the same import and visibility rules. Each module has its own
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,
