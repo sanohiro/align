@@ -654,7 +654,55 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         }
         Ty::Tuple(id) => tuples[id as usize].elems.iter().any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples)),
         Ty::Struct(id) => structs[id as usize].fields.iter().any(|f| ty_mentions_slice(f.ty, structs, tuples)),
-        _ => false,
+        // The remaining types do not contain a `slice` payload in the current type model. Keep the
+        // list exhaustive so a future aggregate cannot bypass escape checking by default.
+        Ty::Int(_)
+        | Ty::Param(_)
+        | Ty::IntVar(_)
+        | Ty::Float(_)
+        | Ty::FloatVar(_)
+        | Ty::Bool
+        | Ty::Char
+        | Ty::Box(_)
+        | Ty::Array(..)
+        | Ty::Vec(..)
+        | Ty::Mask(..)
+        | Ty::StructArray(..)
+        | Ty::DynStructArray(..)
+        | Ty::Soa(_)
+        | Ty::DynSliceArray(_)
+        | Ty::DynArray(_)
+        | Ty::DynResponseArray
+        | Ty::Str
+        | Ty::String
+        | Ty::ArenaHandle
+        | Ty::Raw
+        | Ty::Builder
+        | Ty::Writer
+        | Ty::Reader
+        | Ty::Buffer
+        | Ty::ArrayBuilder(_)
+        | Ty::File
+        | Ty::Rng
+        | Ty::CliCommand
+        | Ty::CliParsed
+        | Ty::TcpConn
+        | Ty::TcpListener
+        | Ty::UdpSocket
+        | Ty::Child
+        | Ty::HttpRequest
+        | Ty::HttpResponse
+        | Ty::HttpClient
+        | Ty::HttpServer
+        | Ty::HttpRequestCtx
+        | Ty::ResponseBuilder
+        | Ty::HttpStream
+        | Ty::DictEncoded(..)
+        | Ty::Enum(_)
+        | Ty::Task(_)
+        | Ty::Fn(_)
+        | Ty::Error
+        | Ty::Unit => false,
     }
 }
 
@@ -4044,7 +4092,7 @@ impl<'a> EscapeCheck<'a> {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
             // An owned `array<response>` is escape-checked in the same lane as every owned collection.
-            // It borrows nothing, so its `region_of` is `Static` (the wildcard) — the check passes and
+            // It borrows nothing, so its `region_of` is explicitly `Static` — the check passes and
             // the array is freely returnable (like `array<string>` from `fs.read_dir`); tracking keeps
             // it from silently skipping the escape pass if a future producer gives it a region.
             Ty::DynResponseArray => true,
@@ -4079,7 +4127,7 @@ impl<'a> EscapeCheck<'a> {
             // so a stream used past the conn's `close(fd)` is a use-after-close (net.md P2, #297).
             // An *owned* reader/writer constructed **directly** by a builtin (`io.stdin`/`fs.open`/
             // `io.stdout`/`fs.create`) has region `Static` (its `region_of` producer — `ReaderOpen` /
-            // `WriterCreate` — falls through to the `Static` wildcard), so it stays freely returnable.
+            // `WriterCreate` — is classified `Static`), so it stays freely returnable.
             // But a reader/writer threaded through a **user** function call is not so lucky:
             // `region_of(Call)` conservatively folds in *every* argument's region (it has no per-fn
             // "does this actually borrow arg i" fact), so calling that user fn with a Frame/Arena-
@@ -4091,7 +4139,40 @@ impl<'a> EscapeCheck<'a> {
             // only makes the escape check *consult* the region either way. (A `tcp_conn` itself is
             // always owned, never a borrow, so it is deliberately NOT here.)
             Ty::Reader | Ty::Writer | Ty::Fn(_) => true,
-            _ => false,
+            // Scalar/register values and owned handles carry no inferred borrow region. This list
+            // is exhaustive so every future type must make an explicit escape-analysis choice.
+            Ty::Int(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Vec(..)
+            | Ty::Mask(..)
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Builder
+            | Ty::Buffer
+            | Ty::ArrayBuilder(_)
+            | Ty::File
+            | Ty::Rng
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::Enum(_)
+            | Ty::Error
+            | Ty::Unit => false,
         }
     }
 
@@ -4145,7 +4226,7 @@ impl<'a> EscapeCheck<'a> {
             // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
             // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
-            // / `fs.remove` return owned / non-region values and stay `Static` (the wildcard below).
+            // / `fs.remove` return owned / non-region values and stay explicitly `Static` below.
             ExprKind::FsReadFileView { .. } => Region::arena(depth),
             // `fs.read_bytes_view(p)` returns a `bytes` (`slice<u8>`) view of the same mmap, so it is
             // arena-bound exactly like `read_file_view`'s `str` view. Unlike a `str`, a `slice<u8>` is
@@ -4288,9 +4369,9 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
             // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
             // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
-            // explicit arm the wildcard below would mis-infer `Static`, letting a view of an arena/frame
-            // `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned strings and stay
-            // `Static` (the wildcard).
+            // explicit arm the default classification used to mis-infer `Static`, letting a view of
+            // an arena/frame `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned
+            // strings and are explicitly `Static`.
             ExprKind::PathComponent { path, .. } => self.region_of(path, depth),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
@@ -4299,23 +4380,23 @@ impl<'a> EscapeCheck<'a> {
             // lives exactly as long as its receiver — inherit its region directly (like `StrTrim` /
             // `PathComponent`). A view of `buf.bytes()` (Frame) stays Frame; a view of an arena
             // `read_bytes_view` (Arena) stays Arena. `?` preserves it (the `Try` arm above). Without
-            // this arm the wildcard mis-infers `Static`, letting a view of a dropped buffer escape (#297).
+            // this arm a `Static` classification would let a view of a dropped buffer escape (#297).
             ExprKind::BytesAsStr { bytes } => self.region_of(bytes, depth),
             // `r.buffered()` yields an owned `reader` over the source reader's fd, so it inherits the
             // source's region (a `c.reader().buffered()` stays conn-bound; a `fs.open(...)` reader is
             // owned/`Static`). A plain `read_line` result is a Copy `i64` (not region-tracked → the
-            // wildcard `Static`), so no arm is needed for it.
+            // explicitly `Static`), so no provenance arm is needed for it.
             ExprKind::ReaderBuffered { reader } => self.region_of(reader, depth),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
-            // frame. Without this explicit arm the wildcard below mis-infers `Static`, letting the view
+            // frame. Without this explicit arm a `Static` classification would let the view
             // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
             ExprKind::CliGetStr { parsed, .. } => Region::Frame.shorter(self.region_of(parsed, depth)),
             // `resp.header(name)` returns `Option<str>` and `resp.body()` a `slice<u8>`, both **views**
             // into the `http response` handle's owned buffer (freed at frame exit). Like `CliGetStr` /
             // `BufferBytes`, they are `Frame`-regioned and bound to `resp` (or shorter if `resp` is
             // arena-scoped) — an escape past `resp`'s `Drop` reads freed memory (#297). Without these
-            // arms the wildcard mis-infers `Static`; `.clone()` (header) / a copy-out copies past `resp`.
+            // arms a `Static` classification is unsound; `.clone()` (header) / a copy-out copies past `resp`.
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
                 Region::Frame.shorter(self.region_of(resp, depth))
             }
@@ -4331,7 +4412,7 @@ impl<'a> EscapeCheck<'a> {
             // `Drop` closes it), so — like `BufferBytes` / `CliGetStr` — the returned stream is
             // region-bound to `c`: `Frame` (or shorter if `c` lives in an arena). It must not escape
             // `c`'s scope, else it would read/write a `close`d fd (net.md P2, #297). Without this
-            // explicit arm the wildcard below would mis-infer `Static`, letting the stream outlive
+            // explicit arm a `Static` classification would let the stream outlive
             // the connection. (`c` is a bound local — the receiver gate in `check_conn_stream`.)
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => {
                 Region::Frame.shorter(self.region_of(conn, depth))
@@ -4360,7 +4441,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // `unsafe {}` is a plain marker block — its value's region is the tail value's region (no
             // new region opened, unlike `arena {}`). Explicit so an arena value returned from an
-            // unsafe block isn't silently inferred `Static` via the wildcard below and allowed to escape.
+            // unsafe block isn't incorrectly classified `Static` and allowed to escape.
             ExprKind::Unsafe(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
@@ -4374,7 +4455,7 @@ impl<'a> EscapeCheck<'a> {
             // A `match` yields one of its arms' values, so it lives only as long as the
             // shortest-lived arm (the same rule as `if`/`else`). Without this, an arena value
             // returned through a match arm is inferred `Static` and escapes undetected (a
-            // use-after-free — `region_of` otherwise falls to the `Static` wildcard below).
+            // use-after-free — `region_of` must not classify this value as `Static`).
             ExprKind::Match { arms, .. } => arms
                 .iter()
                 .fold(Region::Static, |acc, a| acc.shorter(self.region_of(&a.body, depth))),
@@ -4415,7 +4496,145 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Closure { captures, .. } => captures
                 .iter()
                 .fold(Region::Static, |acc, c| acc.shorter(self.region_of(c, depth))),
-            _ => Region::Static,
+            // Producers that own their result, return a scalar, or otherwise carry no borrow
+            // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
+            // expression must force its escape semantics to be classified here instead of falling
+            // through an optimistic wildcard.
+            ExprKind::Unit
+            | ExprKind::Int(..)
+            | ExprKind::Float(..)
+            | ExprKind::Char(..)
+            | ExprKind::Str(..)
+            | ExprKind::Bool(..)
+            | ExprKind::Unary { .. }
+            | ExprKind::Cast(..)
+            | ExprKind::Binary { .. }
+            | ExprKind::IntArith { .. }
+            | ExprKind::MathOp { .. }
+            | ExprKind::FnValue(..)
+            | ExprKind::EnumValue { .. }
+            | ExprKind::Wait
+            | ExprKind::OptionNone
+            | ExprKind::RawAlloc(..)
+            | ExprKind::RawFree(..)
+            | ExprKind::RawLoad { .. }
+            | ExprKind::RawStore { .. }
+            | ExprKind::RawOffset { .. }
+            | ExprKind::BoxGet(..)
+            | ExprKind::StrClone(..)
+            | ExprKind::StrPredicate { .. }
+            | ExprKind::BuilderNew { .. }
+            | ExprKind::BuilderWrite { .. }
+            | ExprKind::BuilderToString(..)
+            | ExprKind::Select { .. }
+            | ExprKind::VecSumWhere { .. }
+            | ExprKind::VecDot { .. }
+            | ExprKind::VecMinMax { .. }
+            | ExprKind::VecSum { .. }
+            | ExprKind::VecLoad { .. }
+            | ExprKind::VecStore { .. }
+            | ExprKind::VecLit { .. }
+            | ExprKind::ArraySum { .. }
+            | ExprKind::ArrayCount { .. }
+            | ExprKind::ArrayAnyAll { .. }
+            | ExprKind::ArrayMinMax { .. }
+            | ExprKind::ArrayDot { .. }
+            | ExprKind::ArrayMapInto { .. }
+            | ExprKind::Len(..)
+            | ExprKind::JsonDecodeArray { .. }
+            | ExprKind::FsReadFile { .. }
+            | ExprKind::ReaderStdin
+            | ExprKind::ReaderOpen { .. }
+            | ExprKind::WriterStd { .. }
+            | ExprKind::WriterCreate { .. }
+            | ExprKind::ReaderRead { .. }
+            | ExprKind::ReaderReadLine { .. }
+            | ExprKind::WriterWrite { .. }
+            | ExprKind::WriterFlush { .. }
+            | ExprKind::IoCopy { .. }
+            | ExprKind::FileCreateRw { .. }
+            | ExprKind::FileOpenRw { .. }
+            | ExprKind::FilePread { .. }
+            | ExprKind::FilePwrite { .. }
+            | ExprKind::FileLen { .. }
+            | ExprKind::BufferNew { .. }
+            | ExprKind::BufferLen { .. }
+            | ExprKind::BytesRead { .. }
+            | ExprKind::BufferPut { .. }
+            | ExprKind::BufferAppend { .. }
+            | ExprKind::ArrayBuilderNew { .. }
+            | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. }
+            | ExprKind::ArrayBuilderBuild(..)
+            | ExprKind::FsWriteFile { .. }
+            | ExprKind::FsExists { .. }
+            | ExprKind::FsRemove { .. }
+            | ExprKind::FsReadDir { .. }
+            | ExprKind::DnsResolve { .. }
+            | ExprKind::TcpConnect { .. }
+            | ExprKind::TcpListen { .. }
+            | ExprKind::TcpAccept { .. }
+            | ExprKind::UdpBind { .. }
+            | ExprKind::UdpSendTo { .. }
+            | ExprKind::UdpRecvFrom { .. }
+            | ExprKind::PathJoin { .. }
+            | ExprKind::PathNormalize { .. }
+            | ExprKind::EnvGet { .. }
+            | ExprKind::EnvSet { .. }
+            | ExprKind::TimeNow
+            | ExprKind::TimeInstant
+            | ExprKind::TimeSleep { .. }
+            | ExprKind::ProcessExit { .. }
+            | ExprKind::ProcessAbort
+            | ExprKind::ProcessSpawn { .. }
+            | ExprKind::ChildWait { .. }
+            | ExprKind::ChildKill { .. }
+            | ExprKind::ProcessExec { .. }
+            | ExprKind::EncodingEncode { .. }
+            | ExprKind::EncodingDecode { .. }
+            | ExprKind::Utf8Valid { .. }
+            | ExprKind::Compress { .. }
+            | ExprKind::Decompress { .. }
+            | ExprKind::RandSeed
+            | ExprKind::RandSeedWith { .. }
+            | ExprKind::RandNext { .. }
+            | ExprKind::RandRange { .. }
+            | ExprKind::RandShuffle { .. }
+            | ExprKind::RandSample { .. }
+            | ExprKind::CliCommand { .. }
+            | ExprKind::CliFlag { .. }
+            | ExprKind::CliParse { .. }
+            | ExprKind::CliGetBool { .. }
+            | ExprKind::CliGetI64 { .. }
+            | ExprKind::CliUsage { .. }
+            | ExprKind::HttpRequest { .. }
+            | ExprKind::HttpHeader { .. }
+            | ExprKind::HttpBody { .. }
+            | ExprKind::HttpParse { .. }
+            | ExprKind::HttpRespStatus { .. }
+            | ExprKind::HttpClient
+            | ExprKind::HttpClientGet { .. }
+            | ExprKind::HttpClientPost { .. }
+            | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpGetMany { .. }
+            | ExprKind::HttpServe { .. }
+            | ExprKind::HttpAccept { .. }
+            | ExprKind::HttpResponseBuilder { .. }
+            | ExprKind::HttpRbHeader { .. }
+            | ExprKind::HttpRbBody { .. }
+            | ExprKind::HttpRespond { .. }
+            | ExprKind::HttpRespondStream { .. }
+            | ExprKind::HttpStreamSend { .. }
+            | ExprKind::HttpStreamFinish { .. }
+            | ExprKind::CryptoCtEqual { .. }
+            | ExprKind::CryptoRandom { .. }
+            | ExprKind::CryptoHash { .. }
+            | ExprKind::CryptoHmac { .. }
+            | ExprKind::CryptoHkdf { .. }
+            | ExprKind::CryptoAead { .. }
+            | ExprKind::CryptoArgon2 { .. }
+            | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. } => Region::Static,
         }
     }
 
@@ -4500,7 +4719,180 @@ impl<'a> EscapeCheck<'a> {
             // value is provably never local-backed, and `false` here is sound. (If the `break`-escape
             // rule is ever loosened to let a frame-local view escape the loop, revisit this arm.)
             ExprKind::Loop { .. } => false,
-            _ => false,
+            // These forms do not introduce or forward a function-local slice. Keep the list
+            // exhaustive so a new HIR expression cannot silently default to non-local provenance.
+            ExprKind::Unit
+            | ExprKind::Int(..)
+            | ExprKind::Float(..)
+            | ExprKind::Char(..)
+            | ExprKind::Str(..)
+            | ExprKind::Bool(..)
+            | ExprKind::Unary { .. }
+            | ExprKind::Cast(..)
+            | ExprKind::Binary { .. }
+            | ExprKind::IntArith { .. }
+            | ExprKind::MathOp { .. }
+            | ExprKind::FnValue(..)
+            | ExprKind::Closure { .. }
+            | ExprKind::EnumValue { .. }
+            | ExprKind::Spawn { .. }
+            | ExprKind::TaskGet(..)
+            | ExprKind::Wait
+            | ExprKind::SoaColumn { .. }
+            | ExprKind::IndexField { .. }
+            | ExprKind::OptionNone
+            | ExprKind::RawAlloc(..)
+            | ExprKind::RawFree(..)
+            | ExprKind::RawLoad { .. }
+            | ExprKind::RawStore { .. }
+            | ExprKind::RawOffset { .. }
+            | ExprKind::HeapNew(..)
+            | ExprKind::BoxGet(..)
+            | ExprKind::BoxClone(..)
+            | ExprKind::StrClone(..)
+            | ExprKind::StrPredicate { .. }
+            | ExprKind::StrTrim { .. }
+            | ExprKind::StrBorrow(..)
+            | ExprKind::BuilderNew { .. }
+            | ExprKind::BuilderWrite { .. }
+            | ExprKind::BuilderToString(..)
+            | ExprKind::Select { .. }
+            | ExprKind::VecSumWhere { .. }
+            | ExprKind::VecDot { .. }
+            | ExprKind::VecMinMax { .. }
+            | ExprKind::VecSum { .. }
+            | ExprKind::VecLoad { .. }
+            | ExprKind::VecStore { .. }
+            | ExprKind::VecLit { .. }
+            | ExprKind::ArraySum { .. }
+            | ExprKind::ArrayCount { .. }
+            | ExprKind::ArrayAnyAll { .. }
+            | ExprKind::ArrayMinMax { .. }
+            | ExprKind::ArrayReduce { .. }
+            | ExprKind::ArrayScan { .. }
+            | ExprKind::ArrayDot { .. }
+            | ExprKind::ArraySort { .. }
+            | ExprKind::ArraySortBy { .. }
+            | ExprKind::ArrayToArray { .. }
+            | ExprKind::ArrayToSoa { .. }
+            | ExprKind::ArrayMapInto { .. }
+            | ExprKind::ArrayPartition { .. }
+            | ExprKind::ArrayParMap { .. }
+            | ExprKind::ArrayChunks { .. }
+            | ExprKind::Len(..)
+            | ExprKind::Index { .. }
+            | ExprKind::ElemField { .. }
+            | ExprKind::Template(..)
+            | ExprKind::JsonDecode { .. }
+            | ExprKind::JsonDecodeArray { .. }
+            | ExprKind::JsonDecodeStructArray { .. }
+            | ExprKind::JsonDecodeSoa { .. }
+            | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. }
+            | ExprKind::ArrayDictEncode { .. }
+            | ExprKind::FsReadFile { .. }
+            | ExprKind::ReaderStdin
+            | ExprKind::ReaderOpen { .. }
+            | ExprKind::WriterStd { .. }
+            | ExprKind::WriterCreate { .. }
+            | ExprKind::ReaderRead { .. }
+            | ExprKind::ReaderBuffered { .. }
+            | ExprKind::ReaderReadLine { .. }
+            | ExprKind::BytesAsStr { .. }
+            | ExprKind::WriterWrite { .. }
+            | ExprKind::WriterFlush { .. }
+            | ExprKind::IoCopy { .. }
+            | ExprKind::FileCreateRw { .. }
+            | ExprKind::FileOpenRw { .. }
+            | ExprKind::FilePread { .. }
+            | ExprKind::FilePwrite { .. }
+            | ExprKind::FileLen { .. }
+            | ExprKind::BufferNew { .. }
+            | ExprKind::BufferLen { .. }
+            | ExprKind::BytesRead { .. }
+            | ExprKind::BufferPut { .. }
+            | ExprKind::BufferAppend { .. }
+            | ExprKind::ArrayBuilderNew { .. }
+            | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. }
+            | ExprKind::ArrayBuilderBuild(..)
+            | ExprKind::FsWriteFile { .. }
+            | ExprKind::FsExists { .. }
+            | ExprKind::FsRemove { .. }
+            | ExprKind::FsReadDir { .. }
+            | ExprKind::DnsResolve { .. }
+            | ExprKind::TcpConnect { .. }
+            | ExprKind::ConnReader { .. }
+            | ExprKind::ConnWriter { .. }
+            | ExprKind::TcpListen { .. }
+            | ExprKind::TcpAccept { .. }
+            | ExprKind::UdpBind { .. }
+            | ExprKind::UdpSendTo { .. }
+            | ExprKind::UdpRecvFrom { .. }
+            | ExprKind::FsReadFileView { .. }
+            | ExprKind::FsReadBytesView { .. }
+            | ExprKind::PathJoin { .. }
+            | ExprKind::PathComponent { .. }
+            | ExprKind::PathNormalize { .. }
+            | ExprKind::EnvGet { .. }
+            | ExprKind::EnvSet { .. }
+            | ExprKind::TimeNow
+            | ExprKind::TimeInstant
+            | ExprKind::TimeSleep { .. }
+            | ExprKind::ProcessExit { .. }
+            | ExprKind::ProcessAbort
+            | ExprKind::ProcessSpawn { .. }
+            | ExprKind::ChildWait { .. }
+            | ExprKind::ChildKill { .. }
+            | ExprKind::ProcessExec { .. }
+            | ExprKind::EncodingEncode { .. }
+            | ExprKind::EncodingDecode { .. }
+            | ExprKind::Utf8Valid { .. }
+            | ExprKind::Compress { .. }
+            | ExprKind::Decompress { .. }
+            | ExprKind::RandSeed
+            | ExprKind::RandSeedWith { .. }
+            | ExprKind::RandNext { .. }
+            | ExprKind::RandRange { .. }
+            | ExprKind::RandShuffle { .. }
+            | ExprKind::RandSample { .. }
+            | ExprKind::CliCommand { .. }
+            | ExprKind::CliFlag { .. }
+            | ExprKind::CliParse { .. }
+            | ExprKind::CliGetBool { .. }
+            | ExprKind::CliGetI64 { .. }
+            | ExprKind::CliGetStr { .. }
+            | ExprKind::CliUsage { .. }
+            | ExprKind::HttpRequest { .. }
+            | ExprKind::HttpHeader { .. }
+            | ExprKind::HttpBody { .. }
+            | ExprKind::HttpParse { .. }
+            | ExprKind::HttpRespStatus { .. }
+            | ExprKind::HttpRespHeader { .. }
+            | ExprKind::HttpClient
+            | ExprKind::HttpClientGet { .. }
+            | ExprKind::HttpClientPost { .. }
+            | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpGetMany { .. }
+            | ExprKind::HttpServe { .. }
+            | ExprKind::HttpAccept { .. }
+            | ExprKind::HttpCtxMethod { .. }
+            | ExprKind::HttpCtxPath { .. }
+            | ExprKind::HttpCtxHeader { .. }
+            | ExprKind::HttpResponseBuilder { .. }
+            | ExprKind::HttpRbHeader { .. }
+            | ExprKind::HttpRbBody { .. }
+            | ExprKind::HttpRespond { .. }
+            | ExprKind::HttpRespondStream { .. }
+            | ExprKind::HttpStreamSend { .. }
+            | ExprKind::HttpStreamFinish { .. }
+            | ExprKind::CryptoCtEqual { .. }
+            | ExprKind::CryptoRandom { .. }
+            | ExprKind::CryptoHash { .. }
+            | ExprKind::CryptoHmac { .. }
+            | ExprKind::CryptoHkdf { .. }
+            | ExprKind::CryptoAead { .. }
+            | ExprKind::CryptoArgon2 { .. } => false,
         }
     }
 
