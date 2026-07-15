@@ -24,6 +24,7 @@ s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
 s.find(n) / s.rfind(n)     -> Option<i64>   // byte index of first/last occurrence
 s.trim() / s.trim_start() / s.trim_end()    -> str   // ASCII-whitespace; zero-copy sub-view
 s[a..b]                    -> str        // range view; region-tied; NO s[i] byte indexing
+s.bytes()                  -> slice<u8>  // zero-copy byte view; no UTF-8 obligation
 s.clone()                  -> string     // deep copy; the arena-escape hatch
 a + b                      -> compile error; builder is the one concatenation path
 
@@ -64,7 +65,8 @@ endpoints (audit 13 §3.1; fixed 2026-07-13).
 
 ## Regions
 
-`region_of(trim*/s[a..b]) = region_of(s)` — sub-views inherit. `clone` → owned, region-free. A
+`region_of(trim*/s[a..b]/s.bytes()) = region_of(s)` — sub-views inherit. `clone` → owned,
+region-free. A
 `string` struct field read borrows as a
 Frame-regioned `str` (owned-structs work).
 
@@ -74,8 +76,8 @@ Frame-regioned `str` (owned-structs work).
   its return shape (`array<str>` of views — a Move array of regioned views) needs the
   Move-element collection work; do not ship it as an owned-copies compromise ("ideal form, or
   defer"). Today: `find`/`rfind` + `s[a..b]` compose the manual split.
-- No `s[i]` byte access — deliberate so far (byte access invites indexing bugs on UTF-8); if a
-  use case demands it, decide `u8`-returning semantics in `open-questions.md` first.
+- No direct `s[i]` byte access — use the explicit byte view `s.bytes()[i]` so dropping the UTF-8
+  obligation is visible at the call site.
 - The §13/§18.1 template variants (`html`, `raw`, json-template) — only plain `template "…"`
   exists. The escaping-variant design (context-aware autoescape) is unsettled.
 
@@ -91,7 +93,7 @@ Frame-regioned `str` (owned-structs work).
 
 ## Test anchors
 
-`m5.rs` (methods incl. find/rfind pairs, trim family, builder incl. fuse,
+`m5.rs` (methods incl. find/rfind pairs, trim family, zero-copy bytes views, builder incl. fuse,
 template, escapes, UTF-8 byte lengths, print type coverage); `lambda.rs:271/280/287/294`
 (template allocation rejection + arena-in-lambda allowance); `hash.rs` (view acceptance);
 `fuzz_fmt.rs` (formatter round-trips string-heavy sources); examples `strings.align`,

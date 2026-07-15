@@ -2,8 +2,8 @@
 
 > Status: audit record, 2026-07-13. **Partial corrective implementation shipped in the working
 > tree on 2026-07-13:** the UTF-8 range-boundary part of §3.1 is fixed and regression-pinned;
-> §3.2's `str + str` contract drift was fixed 2026-07-15. `s.bytes()` and the other findings remain
-> open. No other implementation in this document is
+> its zero-cost `s.bytes()` companion and §3.2's `str + str` contract correction shipped
+> 2026-07-15. The other findings remain open. No other implementation in this document is
 > shipped merely because it is described here. Performance changes remain gated unless an existing
 > roadmap item already says otherwise. The complete corrective wave is summarized in
 > [`source-correctness-fixes-2026-07-13.md`](source-correctness-fixes-2026-07-13.md).
@@ -47,6 +47,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | Area | Current shape | Disposition |
 |---|---|---|
 | `s[a..b]` | O(1) range + UTF-8 scalar-boundary checks | **FIXED 2026-07-13**; `str` validity is preserved |
+| `s.bytes()` | descriptor-only `str`/`string` → `slice<u8>` view | **SHIPPED 2026-07-15**; zero allocation/copy |
 | `str + str` | rejected in sema; no MIR concatenation path remains | **FIXED 2026-07-15**; `builder` is the one construction path |
 | arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
 | unbound owned temporaries | `.len()`, scalar index, direct call use can omit `Drop` | **CONFIRMED P0**; leaks strings and arrays in loops |
@@ -89,10 +90,12 @@ The fix is O(1): `0` and `len` are valid; otherwise the byte at the boundary mus
 1/2/3/4-byte boundaries, omitted endpoints, and both a split start and split end. This preserves the
 two loads/masks shape instead of rescanning the sub-string.
 
-The documented arbitrary-byte escape hatch `s.bytes() -> slice<u8>` is also absent: sema dispatches
-`buffer.bytes()` but not `str.bytes()`
-([method dispatch](../../crates/align_sema/src/lib.rs#L9261)). Implement the existing contract as a
-zero-cost `{ptr,len}` retype so callers never need to violate `str` to process arbitrary bytes.
+The documented arbitrary-byte escape hatch `s.bytes() -> slice<u8>` shipped 2026-07-15 as the
+existing contract requires. Sema records a borrow-producing `StrBytes` HIR node (auto-borrowing an
+owned `string` first), region and owner provenance follow the source, and MIR returns the same
+`{ptr,len}` operand without an rvalue or runtime call. Regression tests cover UTF-8 continuation-byte
+access, static/caller-safe returns, owned/arena escape rejection, owner invalidation, and the
+descriptor-only MIR shape.
 
 ### 3.2 FIXED 2026-07-15 — the settled `str + str` hard error is enforced
 
@@ -600,8 +603,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### C0 — invariants and resource ownership
 
-1. ~~Enforce UTF-8 range boundaries~~ **DONE 2026-07-13**; separately ship the specified zero-cost
-   `s.bytes()` view.
+1. ~~Enforce UTF-8 range boundaries~~ **DONE 2026-07-13**; ~~ship the specified zero-cost
+   `s.bytes()` view~~ **DONE 2026-07-15**.
 2. ~~Enforce the settled `str + str` hard error and correct stale tests/docs.~~ **DONE 2026-07-15.**
 3. Add owned expression temporaries/synthetic owners with view-aware liveness; close string, array,
    chunks, and builder direct-consumer leaks.
@@ -638,7 +641,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 Correctness/resource mutations must fail when any of the following is removed:
 
-- UTF-8 start/end continuation-byte check (**shipped and regression-pinned 2026-07-13**);
+- UTF-8 start/end continuation-byte check (**shipped and regression-pinned 2026-07-13**) and
+  descriptor-only `s.bytes()` (**shipped and regression-pinned 2026-07-15**);
 - hard error for `str + str` (**shipped and regression-pinned 2026-07-15**);
 - synthetic owner/drop for an unbound Move temporary;
 - owner lifetime extension for a borrowed result view;
@@ -646,7 +650,8 @@ Correctness/resource mutations must fail when any of the following is removed:
 
 IR gates:
 
-- no allocation for static-only template, string subview, slice, trim, or direct chunk `.len()`;
+- no allocation for static-only template, `str.bytes()`, string subview, slice, trim, or direct
+  chunk `.len()`;
 - no `*_free(null)` for definitely moved slots;
 - direct-consumer chunks contain no header allocation or `N*16` header-store loop;
 - bulk/direct array builder contains no per-element push call;
