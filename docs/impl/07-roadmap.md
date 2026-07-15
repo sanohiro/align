@@ -19,7 +19,7 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2109 green (2108 passed + one ignored manual
+verification bundle) are complete. The workspace is 2116 green (2115 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
@@ -27,11 +27,13 @@ broader escape-analysis structural gate shipped as #461: expression provenance, 
 provenance, and their type classifiers are exhaustive, so a new HIR/type variant cannot silently
 fall through a permissive wildcard. The first flow-sensitive gate shipped as #462: a unified
 region/local-slice state joins `if`/`match`/`else` continuations, excludes diverging paths, reaches
-loop-head fixpoints, and keeps early-return arena cleanup classification intact. **Next recommended
-soundness structural item:** add path-local MIR drop flags for owned slots so region-changing owned
-reassignment can be relaxed safely; the dependency audit keeps escape diagnostics and provenance at
-the checked-HIR boundary. No receiver-specific borrow patch remains queued. Fully-escaping function
-values remain deliberately
+loop-head fixpoints, and keeps early-return arena cleanup classification intact. Path-local MIR drop
+flags shipped as #463: every resource-owning slot now transfers explicit individual-vs-arena
+ownership state across assignments, moves, destructuring, branches, loops, and cleanup. This makes
+region-changing owned reassignment legal when its lifetime target is valid, without leaks or double
+frees. **Next recommended soundness structural item:** extract the exhaustive recursive escape
+transfer walk into a compact region-flow CFG at the checked-HIR boundary. No receiver-specific
+borrow patch remains queued. Fully-escaping function values remain deliberately
 deferred pending a settled heap-owned environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
@@ -3025,8 +3027,25 @@ distinct from copied view-element roots, closing `rs[0].body()` after response-a
 without rejecting primitive SoA materialization after its source moves. Twenty-four new tests pin
 the rejection matrix, re-borrows and diverging branches, loop back edges, diagnostics, and safe
 materialization. Gemini reported no findings; thread-aware inspection found no review threads; an
-English validation comment was posted before squash merge. The broader escape/region → MIR
-dataflow refactor remains the recommended structural follow-up.
+English validation comment was posted before squash merge. The broader escape/region structural
+work continues through #461–#463 below.
+
+**PATH-LOCAL OWNED DROP FLAGS SHIPPED — MERGED as #463 (2026-07-15; workspace 2116 green =
+2115 passed + one ignored manual probe; clippy `-D warnings` clean).** Checked HIR now records every
+resource-owning local separately from the subset of values that require individual cleanup, and
+each owned assignment carries its new-value cleanup provenance. MIR allocates a private boolean
+flag beside every resource-owning slot; initialization, reassignment, direct moves, tuple and
+`match` destructuring, loop edges, `break`, return, and early cleanup explicitly update or transfer
+it. Cleanup branches around `Drop` unless the live path holds an individually owned value, then
+clears the flag after the taken edge. This removes the temporary fail-closed rejection of
+region-changing owned reassignment while preserving conservative escape-region joins for Copy
+views, and also fixes owned self-assignment ordering. Regression coverage spans arena→heap and
+heap→arena paths, bypasses, loops, joined-region moves, payload bindings, calls with shorter-lived
+borrow arguments, and region-free builders. Gemini's one medium finding identified two slot-growth
+paths that failed to grow parallel flag metadata; both were fixed, the thread was answered and
+resolved, and the English validation summary was posted before squash merge. The remaining
+recommended escape-analysis structural item is compact region-flow CFG extraction at the
+checked-HIR boundary; purity-as-effect-bit remains the independent audit follow-up.
 
 ## Design Issues to Settle in Parallel
 

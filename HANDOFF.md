@@ -8,23 +8,35 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (tenth update this day), **ESCAPE PROVENANCE IS FLOW-SENSITIVE —
-MERGED as #462** (workspace **2109 green** = 2108 passed + one ignored manual probe; clippy
-`-D warnings` clean). `EscapeCheck` now carries one finite `EscapeState` for region and
-local-backed-slice provenance. `if`, `match`, and `else`-unwrap analyze mutually exclusive paths
-from the same input, join only continuing paths, and exclude branches that always return or break;
-straight-line assignments are precise strong updates. Loop heads iterate that state to a fixpoint,
-and post-loop state is joined from the reachable `break` exits, closing the two-iteration
-Frame/local-slice propagation hole. Function-wide owned cleanup classification remains separate,
-so an arena-owned local on an early-return branch is still bulk-freed rather than individually
-freed even though that branch does not reach the continuation. Seven regression gates cover the
-fail-open, false-positive, strong-update, sibling-control-flow, and double-free directions. Gemini
-had no findings; thread-aware inspection found zero review threads, the English validation comment
-is on the PR, and the PR was squash-merged. **Next recommended soundness structural item:** add
-path-local MIR drop flags for owned slots, then use them to safely relax the current fail-closed
-rejection of region-changing owned reassignment; escape diagnostics and provenance remain at the
-checked-HIR boundary. Fully-escaping function values remain deliberately deferred pending a
-consumer and settled heap-owned environment/drop semantics. Previous update: 2026-07-15 (ninth
+_Last updated: 2026-07-15 (eleventh update this day), **OWNED CLEANUP IS PATH-LOCAL — MERGED as
+#463** (workspace **2116 green** = 2115 passed + one ignored manual probe; clippy `-D warnings`
+clean). Every resource-owning local now has an internal MIR boolean drop flag, while checked HIR
+separately classifies each produced value as individually owned or arena-managed. Initialization,
+reassignment, direct moves, tuple destructuring, `match` payload binding, loop backedges, `break`,
+return, and early cleanup transfer or clear the flag explicitly; each cleanup edge branches around
+`Drop` unless that path actually contains an individually owned resource. This safely removes the
+fail-closed region-changing owned-reassignment error when the lifetime target check passes, covers
+arena→heap, heap→arena, joined-region moves, and the pre-existing owned self-assignment corner, and
+keeps Copy-view region joins conservative. Gemini's one medium finding caught two slot-growth paths
+that did not grow the parallel flag metadata; the fix was applied, the inline thread was answered
+and resolved, and an English review-response/validation summary was posted before squash merge.
+**Next recommended soundness structural item:** extract `EscapeCheck`'s exhaustive recursive
+transfer walk into the compact region-flow CFG recorded by the external audit; escape diagnostics
+and provenance stay at the checked-HIR boundary. Fully-escaping function values remain deliberately
+deferred pending a consumer and settled heap-owned environment/drop semantics. Previous update:
+2026-07-15 (tenth update this day), **ESCAPE PROVENANCE IS FLOW-SENSITIVE — MERGED as #462**
+(workspace **2109 green** = 2108 passed + one ignored manual probe; clippy `-D warnings` clean).
+`EscapeCheck` now carries one finite `EscapeState` for region and local-backed-slice provenance.
+`if`, `match`, and `else`-unwrap analyze mutually exclusive paths from the same input, join only
+continuing paths, and exclude branches that always return or break; straight-line assignments are
+precise strong updates. Loop heads iterate that state to a fixpoint, and post-loop state is joined
+from the reachable `break` exits, closing the two-iteration Frame/local-slice propagation hole.
+Function-wide owned cleanup classification remains separate, so an arena-owned local on an
+early-return branch is still bulk-freed rather than individually freed even though that branch does
+not reach the continuation. Seven regression gates cover the fail-open, false-positive,
+strong-update, sibling-control-flow, and double-free directions. Gemini had no findings;
+thread-aware inspection found zero review threads, the English validation comment is on the PR,
+and the PR was squash-merged. Previous update: 2026-07-15 (ninth
 update this day), **ESCAPE PROVENANCE CLASSIFICATION IS
 FAIL-CLOSED — MERGED as #461** (workspace **2102 green** = 2101 passed + one ignored manual
 probe; clippy `-D warnings` clean). `EscapeCheck::region_of`, local-slice provenance,
@@ -834,12 +846,13 @@ wave — **soundness-triage wave DONE**: another session's three
 open PRs triaged — **#405** MERGED (bare array literal as generic arg: ICE → sema diagnostic),
 **#406** MERGED (closure capturing an arena view escapes → rejected; `Ty::Fn` now `tracks_region`
 + capture-region fold; retires the #399-gate UAF record), **#404** CLOSED-superseded by **#407**
-MERGED (a `mut` binding's region is now **fixed at initialization** — region-changing reassign of
-an owned Move local = sema error, view regions intersect; kills a confirmed double-free AND a
-confirmed view-UAF on main; #404's intersect-everything fix traded the UB for an unbounded leak and
-was rejected). `cargo test --workspace` **1687 green**, clippy clean. New Open items recorded:
-wrapper-hidden local-slice escape through a fn return (`return Ok(xs[..])`, pre-existing UAF), and
-the if-expression mixed-region leak (pre-existing, flow-sensitive-slice class). Root stray files
+MERGED (the temporary gate fixed a `mut` binding's region at initialization — region-changing
+owned reassignment was a sema error and view regions intersected; #463 later replaced the owned
+restriction with path-local drop flags; #404's intersect-everything fix traded the UB for an
+unbounded leak and was rejected). `cargo test --workspace` **1687 green**, clippy clean. New Open
+items recorded at that point: wrapper-hidden local-slice escape through a fn return (`return
+Ok(xs[..])`, later fixed by #459), and the if-expression mixed-region leak (later fixed by #463).
+Root stray files
 triaged + deleted. Earlier same day: **#402** the `loop` expression MERGED (full slice, lexer→MIR);
 **#401** runway A2 binary decode/encode; **#400** lexer escape set (other session); **#399** runway
 A1 `fs.read_bytes_view`; **#398** std.http Slice 3 keepalive pool + R6 bench; **#396**/**#397**

@@ -56,14 +56,15 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > interfaces/sema/codegen/link, the default-on incremental object cache, parallel unit codegen, and
 > the doc-10 §7 verification bundle are green. Intra-frame borrow liveness is enforced as shared flow
 > state in `MoveCheck` (#460); escape provenance classification is compile-enforced exhaustive
-> across HIR expressions and types (#461), and its region/local-slice state now joins branches and
-> reaches loop fixpoints (#462) (workspace 2109 tests: 2108 passed + one ignored; clippy clean). The
-> dependency audit corrected the older literal-MIR placement: escape diagnostics and `drop_locals`
-> derivation remain at the safety-verified HIR boundary. The next recommended soundness structural
-> item is path-local MIR drop flags for owned slots, which can safely relax the current fail-closed
-> rejection of region-changing owned reassignment. The recorded fd-test flake hardening (#457),
-> qualified cross-module function values (#458), and wrapper-hidden local-slice escape fix (#459)
-> are also merged. Fully-escaping
+> across HIR expressions and types (#461), its region/local-slice state joins branches and reaches
+> loop fixpoints (#462), and resource-owning locals now use path-local MIR drop flags (#463)
+> (workspace 2116 tests: 2115 passed + one ignored; clippy clean). Region-changing owned
+> reassignment is therefore legal when the lifetime target check passes, without leaking or
+> double-freeing either allocation path. Escape diagnostics and provenance remain at the
+> safety-verified HIR boundary; the next recommended structural item is extracting their exhaustive
+> recursive transfer walk into the compact region-flow CFG recorded by the soundness audit. The
+> recorded fd-test flake hardening (#457), qualified cross-module function values (#458), and
+> wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
 > function values remain deliberately deferred until their heap-owned environment/drop model has a
 > consumer and is settled.
 > `HANDOFF.md` remains the living source of truth.
