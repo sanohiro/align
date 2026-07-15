@@ -19,13 +19,14 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2078 green (2077 passed + one ignored manual
+verification bundle) are complete. The workspace is 2102 green (2101 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
-#457, qualified cross-module function values shipped as #458, and wrapper-hidden local-slice
-returns are rejected as #459. **Next soundness priority:** settle and implement the recorded
-intra-frame borrow-liveness gap as shared dataflow rather than receiver-specific patches.
-Fully-escaping function values remain deliberately deferred pending a settled heap-owned
-environment/drop model and a consumer.
+#457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
+are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. **Next
+recommended soundness structural item:** move the broader escape/region analysis onto MIR dataflow
+so future HIR variants cannot fall through a permissive wildcard. No receiver-specific borrow patch
+remains queued. Fully-escaping function values remain deliberately deferred pending a settled
+heap-owned environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core
@@ -3002,8 +3003,24 @@ The fix deliberately remains separate from `region_of`, preserving the safe case
 an arena-local array leaves the inner arena but not the function. Regression tests reject direct,
 wrapper-local, and `match`-payload escapes while accepting a wrapped caller-provided slice. Gemini
 reported no findings, thread-aware inspection found no review threads, and the English validation
-comment was posted before merge. The next correctness priority is the recorded intra-frame
-borrow-liveness gap; it requires a common dataflow design, not another receiver-specific arm.
+comment was posted before merge. The common borrow-liveness design then shipped as #460 below.
+
+**INTRA-FRAME BORROW LIVENESS ENFORCED — MERGED as #460 (2026-07-15; workspace 2102 green =
+2101 passed + one ignored manual probe; clippy `-D warnings` clean).** Region analysis already
+bounded where a view could escape, but a source could still be moved, replaced, or reallocated
+inside that frame while the old view remained usable. `MoveCheck` now carries a shared
+`BorrowState`: borrow-producing expressions flatten to owner-local roots, invalidation records a
+dead source generation, borrower reassignment clears it with fresh provenance, branches join only
+fallthrough states, and loop heads compute a finite may-state fixpoint. The producer sweep covers
+string/slice views, buffer/CLI/TCP/HTTP handles, response-array elements, aggregate and wrapper
+forms, calls/tasks/control flow, and pipeline captures. Buffer `append`, scalar `put`, and
+`read_line` invalidate views because they may reallocate. Owner-slot roots are kept alongside but
+distinct from copied view-element roots, closing `rs[0].body()` after response-array replacement
+without rejecting primitive SoA materialization after its source moves. Twenty-four new tests pin
+the rejection matrix, re-borrows and diverging branches, loop back edges, diagnostics, and safe
+materialization. Gemini reported no findings; thread-aware inspection found no review threads; an
+English validation comment was posted before squash merge. The broader escape/region → MIR
+dataflow refactor remains the recommended structural follow-up.
 
 ## Design Issues to Settle in Parallel
 

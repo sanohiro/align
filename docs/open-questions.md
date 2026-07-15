@@ -1942,7 +1942,7 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 
 Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
 
-**Borrow-liveness gap — FIXED (2026-07-15).** Region analysis already tracked *where* a borrow
+**Borrow-liveness gap — FIXED as #460 (2026-07-15).** Region analysis already tracked *where* a borrow
 may point, but did not invalidate a frame-local view when its owning source generation ended. The
 result was a use-after-free/use-after-close after moving or reassigning a `string`, `buffer`, CLI
 `parsed`, `tcp_conn`, HTTP `response`, or `array<response>` source; a stale socket reader/writer was

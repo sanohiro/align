@@ -8,20 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (seventh update this day), **wrapper-hidden local-slice returns are
-REJECTED — MERGED as #459** (workspace **2078 green** = 2077 passed + one ignored manual probe;
-clippy `-D warnings` clean). Return/break escape checks now see a frame-local slice through
-`Option`/`Result`, tuple, struct, calls, and value-carrying control flow. Wrapper locals,
-reassignment, tuple destructuring, and `match` payload bindings preserve that provenance, while a
-caller-provided slice remains returnable through the same wrappers. This closes the concrete
-`Ok(xs[..])` use-after-free without folding frame-local slices into `region_of` and reintroducing
-the known safe-arena false positive. Gemini had no findings, thread-aware inspection found no
-review threads, and the English validation comment is on the PR. **Next soundness priority:** the
-recorded intra-frame borrow-liveness gap (a source can be moved/reassigned while a view remains
-usable). Design and implement it as shared dataflow rather than per-receiver patches. Fully-
-escaping function values remain deliberately deferred pending a consumer and settled heap-owned
-environment/drop semantics. Previous update: 2026-07-15 (sixth update this day), **qualified
-cross-module function values are
+_Last updated: 2026-07-15 (eighth update this day), **INTRA-FRAME BORROW LIVENESS IS ENFORCED —
+MERGED as #460** (workspace **2102 green** = 2101 passed + one ignored manual probe; clippy
+`-D warnings` clean). `MoveCheck` now carries shared borrow provenance/invalidation flow state next
+to its move state: source moves/replacements and reallocating buffer operations invalidate
+dependent views, borrower reassignment establishes a fresh generation, fallthrough branches join,
+and loop heads reach a finite may-state fixpoint. The common producer classification covers string,
+slice, buffer/CLI/TCP/HTTP views, response arrays, aggregate fields, direct/indirect calls,
+value-carrying control flow, tasks, and pipeline captures. Owner-slot roots remain distinct from
+copied view-element provenance, so response-array bodies are sound without falsely invalidating a
+materialized primitive SoA. Twenty-four adversarial/safe tests pin diagnostics, re-borrows,
+diverging paths, chained/captured views, and safe materialization. Gemini had no findings,
+thread-aware inspection found no review threads, and the English validation comment is on the PR.
+**Next recommended soundness structural item:** move the broader escape/region analysis onto MIR
+dataflow so future HIR variants cannot fall through a permissive wildcard; no receiver-specific
+borrow patch remains queued. Fully-escaping function values remain deliberately deferred pending a
+consumer and settled heap-owned environment/drop semantics. Previous update: 2026-07-15 (seventh
+update this day), **wrapper-hidden local-slice returns are REJECTED — MERGED as #459** (workspace
+**2078 green** = 2077 passed + one ignored manual probe; clippy `-D warnings` clean). Return/break
+escape checks now see a frame-local slice through `Option`/`Result`, tuple, struct, calls, and
+value-carrying control flow. Wrapper locals, reassignment, tuple destructuring, and `match` payload
+bindings preserve that provenance, while a caller-provided slice remains returnable through the
+same wrappers. Gemini had no findings, thread-aware inspection found no review threads, and the
+English validation comment is on the PR. Previous update: 2026-07-15 (sixth update this day),
+**qualified cross-module function values are
 SHIPPED — MERGED as #458** (workspace **2074 green** = 2073 passed + one ignored manual probe;
 clippy `-D warnings` clean). A shared named-function reference preserves bare or dotted module
 prefixes and resolves through the same import / `pub` classifier as direct calls; all named
