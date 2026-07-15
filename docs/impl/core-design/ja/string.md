@@ -53,8 +53,8 @@ template "…{expr}…"        -> str        // holes: int, float, str, bool, ch
 
 Pure(I/O 無し)。*確保の可視性* のルールはエフェクトではなく構造的に強制される — `str + str` はすべての
 場所で settled hard error である。自身の arena を持たないパイプラインラムダ内の `template` もハードエラー
-になる(「黙って漏らすことになる」 — `lambda.rs`)。現在の checker がなお `str + str` を受理する点は、
-audit 13 が P0 の実装/settlement drift として記録している。
+になる(「黙って漏らすことになる」 — `lambda.rs`)。checker はこの一律の規則を強制し、古い MIR の
+連結経路も削除された(audit 13 §3.2、2026-07-15 修正済み)。
 
 ## Errors & aborts
 
@@ -95,5 +95,5 @@ audit 13 が P0 の実装/settlement drift として記録している。
 `m5.rs`(find/rfind ペア、trim ファミリ、fuse を含む builder、template、escape、
 UTF-8 のバイト長、print 型の網羅を含むメソッド); `lambda.rs:271/280/287/294`(ラムダの確保拒否 +
 ラムダ内 arena の許容); `hash.rs`(ビュー受け入れ); `fuzz_fmt.rs`(文字列を多用するソースの formatter
-往復); 例 `strings.align`、`template.align`。残る concat 受理テストは audit-13 P0 修正まで stale である。
-SIMD スキャンの固定: #310 differential oracle。
+往復); 例 `strings.align`、`template.align`。文字列 concat の拒否は reducer、名前付き関数、
+ラムダの各コンテキストで一様にカバーされる。SIMD スキャンの固定: #310 differential oracle。

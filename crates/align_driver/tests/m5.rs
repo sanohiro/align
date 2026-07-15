@@ -58,8 +58,8 @@ fn template_expression_holes() {
     if !backend_available() {
         return;
     }
-    // `{expr}` holes: arithmetic and an inline str concat, not just bare names.
-    let src = "fn main() -> i32 {\n  a := 20\n  b := 22\n  name := \"world\"\n  print(template \"sum={a + b} dbl={a * 2} hi={name + \\\"!\\\"}\")\n  return 0\n}\n";
+    // `{expr}` holes accept arithmetic; literal text can surround a string-valued hole.
+    let src = "fn main() -> i32 {\n  a := 20\n  b := 22\n  name := \"world\"\n  print(template \"sum={a + b} dbl={a * 2} hi={name}!\")\n  return 0\n}\n";
     let out = build_and_run("template-expr", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "sum=42 dbl=40 hi=world!\n");
@@ -168,10 +168,10 @@ fn str_clone_escapes_arena_as_owned_string() {
         return;
     }
     // `str.clone()` deep-copies into a heap-owned `string` that outlives the arena its source
-    // was built in (MMv2 slice 7): the concat `c` lives in the arena (freed at `}`), but the
+    // was built in (MMv2 slice 7): the template `c` lives in the arena (freed at `}`), but the
     // returned clone owns its own buffer. `print` borrows (so `s` is still usable for `.len()`),
     // and the owned string is freed once at function exit.
-    let src = "fn longer(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := longer(\"foo\", \"bar\")\n  print(s)\n  print(s.len())\n  return 0\n}\n";
+    let src = "fn longer(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := longer(\"foo\", \"bar\")\n  print(s)\n  print(s.len())\n  return 0\n}\n";
     let out = build_and_run("str-clone-escape", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar\n6\n");
@@ -212,7 +212,7 @@ fn owned_string_borrowed_as_str_arg() {
     // view shares the `{ptr,len}` layout (zero-cost), and the `string` is NOT consumed — `s` is
     // still usable after the call (`s.len()` below) and freed exactly once at function exit.
     // `show` borrows the string twice across the call boundary; output: "foobar\n6\n6\n".
-    let src = "fn show(label: str) -> i64 {\n  print(label)\n  return label.len()\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  n := show(s)\n  print(n)\n  print(s.len())\n  return 0\n}\n";
+    let src = "fn show(label: str) -> i64 {\n  print(label)\n  return label.len()\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  n := show(s)\n  print(n)\n  print(s.len())\n  return 0\n}\n";
     let out = build_and_run("string-borrow-arg", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar\n6\n6\n");
@@ -742,7 +742,7 @@ fn io_stdout_buffered_writes_owned_string_without_consuming_it() {
     // `out.write(owned_string)` auto-borrows the `string` as a `str` (zero-cost, non-consuming), so
     // the owned string stays usable afterwards (`s.len()` = 10). The buffered "owned-text\n" is
     // flushed at `out.flush()`; `print` flushes immediately, so the length (10) prints first.
-    let src = "import std.io\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  s := mk(\"owned-\", \"text\")\n  out.write(s)?\n  out.write(\"\\n\")?\n  print(s.len())\n  out.flush()?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  s := mk(\"owned-\", \"text\")\n  out.write(s)?\n  out.write(\"\\n\")?\n  print(s.len())\n  out.flush()?\n  return Ok(())\n}\n";
     let out = build_and_run("io-buffered-owned", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10\nowned-text\n");
@@ -1101,15 +1101,9 @@ fn print_and_template_bool_char() {
 }
 
 #[test]
-fn string_concatenation() {
-    if !backend_available() {
-        return;
-    }
-    // a + b + "!" inside an arena (arena-backed, no leak); also outside (leaked).
-    let src = "fn main() -> i32 {\n  a := \"foo\"\n  b := \"bar\"\n  arena {\n    print(a + b + \"!\")\n  }\n  print(a + b)\n  return 0\n}\n";
-    let out = build_and_run("concat", src);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar!\nfoobar\n");
+fn string_concatenation_is_rejected() {
+    let src = "fn main() -> i32 {\n  a := \"foo\"\n  b := \"bar\"\n  print(a + b)\n  return 0\n}\n";
+    assert!(check_errs("concat-error", src));
 }
 
 #[test]
@@ -1117,11 +1111,11 @@ fn empty_string_build() {
     if !backend_available() {
         return;
     }
-    // Empty concat/template (exercises the zero-length dangling-pointer path).
-    let src = "fn main() -> i32 {\n  e := \"\"\n  arena {\n    print(e + e)\n    print(template \"{e}\")\n  }\n  return 0\n}\n";
+    // Empty template exercises the zero-length dangling-pointer path.
+    let src = "fn main() -> i32 {\n  e := \"\"\n  arena {\n    print(template \"{e}\")\n  }\n  return 0\n}\n";
     let out = build_and_run("empty-build", src);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n");
 }
 
 #[test]
@@ -1165,7 +1159,7 @@ fn str_predicates_on_owned_string_dont_consume() {
     }
     // The receiver is an owned `string` (auto-borrowed): the predicate reads bytes, never moves it,
     // so `s` is still usable afterwards (s.len() == 6). Bits 1+2+4+8 → 15.
-    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  r := b2i(s.contains(\"oba\")) + b2i(s.starts_with(\"foo\")) * 2 + b2i(s.ends_with(\"bar\")) * 4\n  return r + b2i(s.len() == 6) * 8\n}\n";
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  r := b2i(s.contains(\"oba\")) + b2i(s.starts_with(\"foo\")) * 2 + b2i(s.ends_with(\"bar\")) * 4\n  return r + b2i(s.len() == 6) * 8\n}\n";
     let out = build_and_run("str-pred-owned", src);
     assert_eq!(out.status.code(), Some(15));
 }
@@ -1216,7 +1210,7 @@ fn str_trim_on_owned_string_view_is_borrowed() {
     }
     // The receiver is an owned `string`; trim borrows it (no move), so it stays usable after.
     // The trimmed view ("foobar", len 6) feeds an equality, then s.len() (8, incl. the padding).
-    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\" foobar \", \"\")\n  trimmed := b2i(s.trim() == \"foobar\")\n  return trimmed + b2i(s.len() == 8) * 2\n}\n";
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\" foobar \", \"\")\n  trimmed := b2i(s.trim() == \"foobar\")\n  return trimmed + b2i(s.len() == 8) * 2\n}\n";
     let out = build_and_run("str-trim-owned", src);
     assert_eq!(out.status.code(), Some(3));
 }
@@ -1280,7 +1274,7 @@ fn str_range_slice_of_owned_string() {
     }
     // An owned `string` receiver auto-borrows to a `str`; the sub-slice views it without moving it,
     // so the string stays usable (its full len is 8). The slice "ooba" feeds an equality.
-    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foob\", \"arxx\")\n  hit := b2i(s[2..6] == \"obar\")\n  return hit + b2i(s.len() == 8) * 2\n}\n";
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foob\", \"arxx\")\n  hit := b2i(s[2..6] == \"obar\")\n  return hit + b2i(s.len() == 8) * 2\n}\n";
     let out = build_and_run("str-range-owned", src);
     assert_eq!(out.status.code(), Some(3));
 }
@@ -1400,7 +1394,7 @@ fn str_find_on_owned_string() {
         return;
     }
     // An owned `string` receiver auto-borrows; `find` reads it without moving it (still usable).
-    let src = "fn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"abc\", \"def\")\n  i := s.find(\"cd\") else { return 9 }\n  return (i + s.len()) as i32\n}\n";
+    let src = "fn mk(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"abc\", \"def\")\n  i := s.find(\"cd\") else { return 9 }\n  return (i + s.len()) as i32\n}\n";
     let out = build_and_run("str-find-owned", src);
     assert_eq!(out.status.code(), Some(8)); // index 2 + len 6
 }

@@ -265,13 +265,11 @@ fn lambda_wrong_arity_rejected() {
     assert!(check_errs("lam-arity", src));
 }
 
-// ---- Gap A: a lifted lambda loses the enclosing arena, so an allocating string op would leak ----
+// ---- String concatenation is a settled hard error; builder is the one construction path -------
 
 #[test]
 fn str_concat_in_reduce_lambda_is_rejected() {
-    // `acc + x` inside a reduce lambda allocates per call; the enclosing arena isn't threaded into
-    // the lifted function, so it would leak (OOM in the loop — Gemini's M2 report, Gap A). It must
-    // be a hard error (use a `builder`), not a silent leak.
+    // The rejection is uniform inside a reducer; this used to be only a lifted-lambda leak guard.
     let src = "pub fn run(s: slice<str>) -> i64 {\n  arena {\n    res := s.reduce(\"\", fn acc, x { acc + x })\n    return res.len()\n  }\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("lam-strcat-leak", src));
 }
@@ -284,17 +282,17 @@ fn template_in_map_lambda_is_rejected() {
 }
 
 #[test]
-fn str_concat_at_top_level_still_ok() {
-    // The guard is scoped to lifted lambdas — a plain top-level / named-function concat is unaffected.
+fn str_concat_at_top_level_is_rejected() {
+    // The settled rule is uniform; a named function cannot hide the allocation either.
     let src = "fn cat(a: str, b: str) -> str = a + b\nfn main() -> i32 = 0\n";
-    assert!(!check_errs("strcat-toplevel-ok", src));
+    assert!(check_errs("strcat-toplevel-error", src));
 }
 
 #[test]
-fn str_concat_in_lambda_own_arena_ok() {
-    // If the lambda opens its own `arena {}`, the concat has somewhere to live — allowed.
+fn str_concat_in_lambda_own_arena_is_still_rejected() {
+    // An arena makes lifetime safe but does not make the hidden allocation visible in source.
     let src = "pub fn run(s: slice<str>) -> i64 {\n  return s.reduce(0, fn acc, x { arena { y := x + x; acc + y.len() } })\n}\nfn main() -> i32 = 0\n";
-    assert!(!check_errs("strcat-lambda-arena-ok", src));
+    assert!(check_errs("strcat-lambda-arena-error", src));
 }
 
 #[test]

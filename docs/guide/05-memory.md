@@ -63,7 +63,7 @@ The compiler tracks the **region** of every value. A value allocated in an arena
 ```align
 fn leak(a: str, b: str) -> str {
     arena {
-        s := a + b
+        s := template "{a}{b}"
         return s        // error: cannot return a value allocated in an arena
     }                   //        (it is freed at block end)
 }

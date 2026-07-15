@@ -21,6 +21,7 @@ below.
 | `buffer.append` self-alias | `b.append(b.bytes())` could reallocate `b.data` before copying from its old pointer, causing a UAF | The runtime detects overlap with the current allocation and snapshots the source before truncate/growth. A forced-growth doubling test pins byte identity. **New finding.** |
 | Line-head `!=` | The lexer inserted `END` before a next-line `!=`, although line-head binary operators continue the expression | `!` suppresses `END` only when followed by `=`; a bare unary `!` still starts a new statement. Lexer tests pin both sides. **New finding.** |
 | Duplicate struct fields | `P { x: i32, x: i32 }` entered HIR with ambiguous lookup and became impossible to construct coherently | Type collection diagnoses the second occurrence for concrete and generic structs before building their field tables. Sema tests require both diagnostics. **New finding.** |
+| String concatenation contract | `str + str` remained accepted and lowered to an allocating template after the specification settled on a hard error | Sema rejects `+` on `str` and owned `string` with the canonical `builder` guidance, the obsolete MIR lowering is removed, and region/Drop tests use explicit templates so their original invariants remain exercised. **Fixed 2026-07-15.** |
 
 ## Ownership rule clarified by the audit
 

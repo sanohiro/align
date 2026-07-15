@@ -509,7 +509,7 @@ pub enum Rvalue {
     /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
     /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
     BuilderToString(Operand),
-    /// `template "..."` / `str + str` — build a `str` from pieces. The optional operand
+    /// `template "..."` — build a `str` from pieces. The optional operand
     /// is the enclosing arena handle (the result lives there; `None` = leaked).
     Template(Vec<TemplatePiece>, Option<Operand>),
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
@@ -2704,16 +2704,6 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
-            // `str + str` is concatenation, built like a two-piece template.
-            if *op == BinOp::Add && lhs.ty == Ty::Str {
-                let arena = b.arenas.last().map(|h| Operand::Value(*h));
-                let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(
-                    v,
-                    Rvalue::Template(vec![TemplatePiece::StrHole(l), TemplatePiece::StrHole(r)], arena),
-                ));
-                return Operand::Value(v);
-            }
             // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
             // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
             // division is IEEE (no guard).
