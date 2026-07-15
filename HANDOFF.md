@@ -8,7 +8,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (twenty-first update this day), **DEFINITE-NULL DESTRUCTOR CALLS ARE
+_Last updated: 2026-07-15 (twenty-second update this day), **ARENA-FREE DYNAMIC TEMPLATES HAVE SCOPED
+OWNERS.** The surface result remains `str`: an explicit arena keeps the existing arena-backed path,
+while an arena-free `template` or `json.encode` now finishes into a hidden synthetic `string` owner.
+Borrow-owner propagation retains that allocation across local/view consumers and loop/function
+cleanup drops it; scalar consumers can release it immediately. Escape analysis marks the dynamic
+view `Frame`, so local use (including lifted pipeline lambdas) is accepted but returning it beyond
+the hidden owner is rejected. Static-only templates fold in HIR to pooled literals with no builder
+or allocation. Six dedicated tests cover the fold, 20,000 loop iterations, JSON encode, lambda
+consumption, early `?`, and rejected escape. The complete workspace is green (**2164 total = 2163 passed + one
+ignored manual probe**). PR #473 was squash-merged as `9242c60` after Gemini feedback was applied,
+answered, resolved, and summarized. **Next recommended allocation-audit item:** borrow filesystem/
+path ABI strings and construct C strings directly. Previous update: 2026-07-15 (twenty-first update
+this day), **DEFINITE-NULL DESTRUCTOR CALLS ARE
 ELIMINATED IN MIR.** A forward drop-flag pass propagates constant ownership bits through CFG joins,
 folds only conditional-drop branches whose flag has one value on every reachable incoming path,
 and removes the newly unreachable destructor blocks. Moved returned strings/arrays and consumed
@@ -17,9 +29,8 @@ live and path-dependent allocations retain their conditional exactly-once destru
 gates pin zero drops after a definite move and one drop for an unmoved local; optimized-IR/runtime
 coverage includes a returned string, frozen `array_builder`, conditional move, early return, `?`,
 and real live frees. The complete workspace is green (**2158 total = 2157 passed + one ignored
-manual probe**) and workspace clippy passes with warnings denied. Ready PR: **#473**. **Next recommended allocation-audit
-item:** settle arena-free `template` / `json.encode` ownership, then fold static-only templates and
-direct obvious sinks where semantics permit. Previous update: 2026-07-15 (twentieth update this
+manual probe**) and workspace clippy passes with warnings denied. Squash-merged as PR **#473**
+(`9242c60`). Previous update: 2026-07-15 (twentieth update this
 day), **LAZY MULTI-SOURCE `zip` IS SHIPPED.**
 `zip(a, b, ...)` is a pipeline-only head for two or more equal-length Copy primitive-scalar
 arrays/slices. Checked HIR carries the sources and an interned per-index tuple; MIR checks every

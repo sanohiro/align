@@ -276,7 +276,8 @@ fn str_concat_in_reduce_lambda_is_rejected() {
 
 #[test]
 fn template_in_map_lambda_is_rejected() {
-    // A `template` string in a lifted lambda leaks the same way.
+    // Returning a lambda-local template view would outlive its hidden owner. Local scalar
+    // consumption is allowed and covered by template_ownership.rs.
     let src = "fn main() -> i32 {\n  arena {\n    xs := [1, 2, 3].map(fn x { template \"n={x}\" }).to_array()\n    return 0\n  }\n}\n";
     assert!(check_errs("lam-template-leak", src));
 }
@@ -305,8 +306,8 @@ fn builder_reduce_still_ok() {
 
 #[test]
 fn json_encode_in_lambda_is_rejected() {
-    // `json.encode` desugars to a Template `str` — the same arena-allocating leak path, so it is
-    // also rejected inside a lifted lambda (reviewer's catch on the Gap A fix).
+    // `json.encode` desugars to a Template `str`; returning that lambda-local view would outlive its
+    // hidden owner, just like a direct template.
     let src = "import core.json\nU { id: i64 }\nfn main() -> i32 {\n  arena {\n    xs := [U{id:1}, U{id:2}].map(fn u { json.encode(u) }).to_array()\n    return 0\n  }\n}\n";
     assert!(check_errs("lam-jsonencode-leak", src));
 }

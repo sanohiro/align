@@ -46,16 +46,16 @@ template "…{expr}…"        -> str        // holes: int, float, str, bool, ch
 - `builder` — 所有権付きのアキュムレータ。`to_string` がそれを終える。隣接する write は MIR の peephole
   で fuse される(`fuse_builder_writes`、`"lit" + int + "lit"` → 1 回のランタイム呼び出し) — 新しい
   write の形は batcher を迂回するのではなく拡張すること。
-- `template` の結果は arena 内では arena に region 付けされた `str` である。現在の arena 外 lowering は
-  payload をプロセス寿命で leak する。これは性能契約ではなく、確認済みの ownership gap である
-  ([audit 13](../../13-string-array-allocation-short-input-audit.md#33-confirmed-p0p1--arena-free-template-and-jsonencode-leak-forever))。
+- `template` の結果は arena 内では arena に region 付けされた `str` である。arena 外の動的な結果は、
+  hidden scoped `string` owner を参照する frame-bounded view になる。静的部分だけなら pooled literal へ畳み込む
+  ([audit 13](../../13-string-array-allocation-short-input-audit.md#33-fixed-2026-07-15--arena-free-template-and-jsonencode-have-scoped-owners))。
 
 ## Effects
 
 Pure(I/O 無し)。*確保の可視性* のルールはエフェクトではなく構造的に強制される — `str + str` はすべての
-場所で settled hard error である。自身の arena を持たないパイプラインラムダ内の `template` もハードエラー
-になる(「黙って漏らすことになる」 — `lambda.rs`)。checker はこの一律の規則を強制し、古い MIR の
-連結経路も削除された(audit 13 §3.2、2026-07-15 修正済み)。
+場所で settled hard error である。arena 外の `template` はパイプラインラムダ内でローカル消費できるが、
+frame-bounded view をラムダから返すことはできない(`lambda.rs`)。checker は連結の一律の規則を強制し、
+古い MIR の連結経路も削除された(audit 13 §3.2、2026-07-15 修正済み)。
 
 ## Errors & aborts
 

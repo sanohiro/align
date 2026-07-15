@@ -953,11 +953,13 @@ test migration completed on 2026-07-15.
   UNIFORM CONTRACT FIX 2026-07-15.** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose `lower_fn`
   starts with `b.arenas` empty, so `str+str` (MIR ~757) got `arena = None` → `builder_finish`
   `Box::leak`d the buffer (runtime ~1196) → one leak per reduce step → OOM at N=10k. **Fix:**
-  `guard_lambda_alloc_leak` (align_sema) errors on a string allocation (`str + str` / `template` /
+  `guard_lambda_alloc_leak` (align_sema) historically errored on a string allocation (`str + str` / `template` /
   `json.encode` — all desugar to an arena `Template` str) inside a lifted lambda with no arena of its
   own (`capture.is_some() && arena_depth == 0`), pointing at the `builder` pattern — so the silent
   leak became a clear compile error. That first guard deliberately left named/top-level and
-  inner-arena concatenation untouched. The settled One-way rule later chose `builder` instead of an
+  inner-arena concatenation untouched. Arena-free dynamic templates gained hidden scoped owners on
+  2026-07-15, so locally consumed templates in lifted lambdas are now safe; returning their
+  frame-bounded views remains rejected. The settled One-way rule later chose `builder` instead of an
   owned-concat surface; on 2026-07-15 sema made the rejection uniform and the obsolete MIR
   concatenation lowering was removed. The named-reducer sub-gap is therefore closed by the same
   hard error, while builder-reduce remains valid. `tests/lambda.rs` pins all three former contexts.
@@ -2489,8 +2491,9 @@ stable compaction. Existing work from documents 10/11 remains attributed there.
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)
 is the durable implementation record. Its UTF-8 range-boundary gap is fixed and regression-pinned;
 its settled `str + str` enforcement drift is fixed 2026-07-15; unbound owned-expression
-temporaries gained view-aware synthetic owners the same day; it confirms the remaining arena-free template lifetime leaks,
-known-null destructor calls, and avoidable path/builder/chunks/group staging. It also records the
+temporaries gained view-aware synthetic owners the same day; arena-free templates then gained scoped
+owners and static-only folding, and known-null destructor calls were eliminated. It confirms the
+remaining avoidable path/builder/chunks/group staging. It also records the
 good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
 later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,
 JSON escape SIMD, and large constant-local pooling are measurement-gated. The document's language-

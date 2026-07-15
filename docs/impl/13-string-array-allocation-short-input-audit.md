@@ -49,7 +49,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `s[a..b]` | O(1) range + UTF-8 scalar-boundary checks | **FIXED 2026-07-13**; `str` validity is preserved |
 | `s.bytes()` | descriptor-only `str`/`string` → `slice<u8>` view | **SHIPPED 2026-07-15**; zero allocation/copy |
 | `str + str` | rejected in sema; no MIR concatenation path remains | **FIXED 2026-07-15**; `builder` is the one construction path |
-| arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
+| arena-free `template` / `json.encode` | hidden owned `string` backs the surface `str` view | **FIXED 2026-07-15**; frame-bounded and dropped |
 | unbound owned temporaries | synthetic path-local owner; scalar early-drop, view retention | **FIXED 2026-07-15**; control flow and loops pinned |
 | moved slots | MIR prunes cleanup edges whose drop flag is definitely false | **FIXED 2026-07-15**; no known-null destructor call |
 | filesystem/path ABI views | common helper copies every short path into `String` | **CONFIRMED P1** avoidable allocation/copy |
@@ -115,31 +115,23 @@ such as `a + b + c + d` from building and recopying a growing intermediate at ev
 Inside an arena that is O(k²) copied bytes plus retained intermediates; outside an arena it joins the
 process-lifetime leak below.
 
-### 3.3 CONFIRMED P0/P1 — arena-free `template` and `json.encode` leak forever
+### 3.3 FIXED 2026-07-15 — arena-free `template` and `json.encode` have scoped owners
 
-Sema assigns an allocating `Template` to `Region::arena(depth)`; at depth zero that becomes Static,
-described as safe because the result is leaked
-([region inference](../../crates/align_sema/src/lib.rs#L3341)). Codegen passes a null arena handle
-([template codegen](../../crates/align_codegen_llvm/src/lib.rs#L7228)), and
-`align_rt_builder_finish` turns the Vec into a leaked boxed slice
-([runtime](../../crates/align_runtime/src/lib.rs#L4398)). `json.encode` uses the same path and says
-“else leaked” in its implementation comment
-([sema](../../crates/align_sema/src/lib.rs#L12005)).
+The surface result remains `str`. Inside an explicit arena, templates keep the existing arena-backed
+finish. Outside an arena, MIR now creates a hidden synthetic `string` owner, codegen finishes through
+`align_rt_builder_into_string`, and the returned view carries that owner through existing borrow-owner
+propagation. Function/loop cleanup drops stored values, while scalar consumers such as `print`, hash,
+or `.len()` can release the owner immediately after the view is consumed. The owner is registered
+before lowering holes, so an early `?` also cleans it safely.
 
-The guard covers only a lifted lambda with no inner arena. An ordinary function or `loop` can execute
-`template`/`json.encode` repeatedly and grow RSS until OOM. The guides show arena-free encode as the
-normal spelling, so this is not an exotic unsafe path.
-
-Implementation work can already remove common cases without settling the value type:
-
-- fold a template with no holes to a pooled `StrLit` — no builder or allocation;
-- when the immediate consumer is a writer/file/response/print sink, keep the builder as the sink and
-  consume/free it without `builder_finish`;
-- retain the already-shipped `writer.write(builder)` / `fs.write_file(path, builder)` route as the
-  oracle for no-final-string I/O.
-
-The stored-value case is a **CLAUDE QUESTION** in section 10: arena-required `str`, owned `string`, or
-contextual sink lowering. Do not paper over it with another process-global owner.
+Escape analysis classifies the arena-free dynamic view as `Frame`: it can be stored and consumed
+locally, including inside a lifted pipeline lambda, but cannot be returned beyond its hidden owner.
+Static-only templates fold in HIR to pooled string literals and emit no builder or allocation.
+Dedicated regressions pin the static fold, a 20,000-iteration cleanup loop, `json.encode`, local
+pipeline-lambda consumption, cleanup for `?` in a hole, and the rejected escape. Direct
+builder-to-sink fusion remains a
+separate P2 optimization; correctness no longer depends on it, and the existing synthetic-owner
+early-drop path avoids retaining completed strings longer than their scalar consumer.
 
 ### 3.4 FIXED 2026-07-15 — unbound owned temporaries have view-aware synthetic owners
 
@@ -555,7 +547,7 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | nonempty `str.clone()` | 1 | 1 input→final | keep; ownership requires it |
 | `builder.to_string()` | header + Vec + final | 1 Vec→final | compatible grow buffer, zero-copy freeze |
 | template in arena | header + Vec + arena | 1 Vec→arena | direct arena/sink fill after ownership settlement |
-| template outside arena | header + Vec leaked | 0 after freeze, but never freed | remove process-lifetime leak |
+| template outside arena | header + Vec + owned final | 1 Vec→final, then scoped free | zero-copy owned freeze (P1) |
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
 | `path.normalize` | components + output Vec + final | output Vec→final | one final allocation/direct fill |
 | `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
@@ -570,14 +562,14 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 
 ## 10. Questions for Claude Code — not decisions
 
-The user explicitly asked that language-spec changes remain optional. No syntax or semantic change is
-adopted by this audit. Ask Claude Code to compare the following against One way, Nothing hidden,
-predictable performance, and inferred regions:
+The user explicitly asked that language-spec changes remain optional. No new syntax was adopted by
+this audit. The first question below was settled on 2026-07-15; the others remain open for comparison
+against One way, Nothing hidden, predictable performance, and inferred regions:
 
-1. **Where does a template result live?** Should `template`/`json.encode` require an arena when their
-   result is `str`, produce an owned `string`, or become contextual Sink producers when immediately
-   consumed? Which option removes arena-free lifetime leaks without creating a second text-building
-   mechanism?
+1. **SETTLED 2026-07-15 — where does a template result live?** The surface remains `str`; outside an
+   arena a hidden scoped `string` owner backs dynamic results, while static-only templates are pooled
+   literals. Returning the dynamic view is rejected. Contextual sink fusion remains optional and
+   does not define correctness.
 2. **What does `.to_array()` promise?** Is it a guaranteed fresh physical allocation, or a visible
    owned result whose backing may be donated from a provably unique, unobservable temporary? The
    latter would legitimize document 10's planned donation without new syntax.
@@ -612,8 +604,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
    array, chunks, and builder direct-consumer leaks.~~ **DONE 2026-07-15.**
 4. ~~Remove definite-null destructor calls after the ownership dataflow is trustworthy.~~ **DONE
    2026-07-15.**
-5. Settle arena-free template/json.encode ownership; immediately fold static-only templates and
-   direct obvious sinks where semantics already permit it.
+5. ~~Settle arena-free template/json.encode ownership and fold static-only templates.~~ **DONE
+   2026-07-15.** Direct sink fusion remains a separate P2 copy/call optimization.
 6. ~~Complete document 12's checked dynamic allocation-size arithmetic.~~ **DONE 2026-07-13.**
 
 ### P1 — short fixed costs
@@ -649,12 +641,13 @@ Correctness/resource mutations must fail when any of the following is removed:
 - hard error for `str + str` (**shipped and regression-pinned 2026-07-15**);
 - synthetic owner/drop for an unbound Move temporary;
 - owner lifetime extension for a borrowed result view;
-- arena-free template ownership/diagnostic rule once settled.
+- arena-free template ownership, local lambda consumption, and rejected frame-view escape
+  (**shipped and regression-pinned 2026-07-15**).
 
 IR gates:
 
-- no allocation for static-only template, `str.bytes()`, string subview, slice, trim, or direct
-  chunk `.len()`;
+- no allocation for static-only template (**shipped and regression-pinned 2026-07-15**),
+  `str.bytes()`, string subview, slice, trim, or direct chunk `.len()`;
 - no `*_free(null)` for definitely moved slots (**shipped and regression-pinned 2026-07-15**);
 - direct-consumer chunks contain no header allocation or `N*16` header-store loop;
 - bulk/direct array builder contains no per-element push call;
@@ -681,7 +674,8 @@ short microbenchmark never justifies code-size or memory-traffic loss at scale.
   after a real decision, not because this audit asked the question.
 
 The new contribution of document 13 is the short-input evidence and the confirmed ownership/copy
-gaps: the now-fixed UTF-8 slicing defect, settled concat enforcement, arena-free template lifetime, the now-fixed unbound temporary
-drop, known-null drops, borrowed ABI paths, builder/array-builder headers and freeze, virtual chunks,
+gaps: the now-fixed UTF-8 slicing defect, settled concat enforcement, the now-fixed arena-free
+template lifetime and unbound temporary drop, known-null drops, borrowed ABI paths,
+builder/array-builder headers and freeze, virtual chunks,
 direct str-group outputs, direct path normalization, staged name/IP payloads, and large constant-local
 initialization.

@@ -4743,9 +4743,11 @@ impl<'a> EscapeCheck<'a> {
     /// it can't slip out via an `if`/block value.
     fn region_of(&self, e: &Expr, depth: u32) -> Region {
         match &e.kind {
-            // Allocating producers are bound to the enclosing arena (Static outside any arena,
-            // where the result is leaked / process-lifetime and safe to return).
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
+            // Arena allocations are bound to the enclosing arena. An arena-free template is backed
+            // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
+            // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => Region::arena(depth),
+            ExprKind::Template(_) => if depth == 0 { Region::Frame } else { Region::arena(depth) },
             // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
             // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
@@ -12033,7 +12035,16 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.constrain(Ty::Str, expected, span);
-        self.guard_lambda_alloc_leak("a `template` string", span);
+        let static_text = hparts.iter().try_fold(String::new(), |mut text, part| match part {
+            TemplatePart::Text(part) => {
+                text.push_str(part);
+                Some(text)
+            }
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) => None,
+        });
+        if let Some(text) = static_text {
+            return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
+        }
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
     }
 
@@ -12448,26 +12459,6 @@ impl<'a, 't> Checker<'a, 't> {
     /// Slice ① cut: **non-capturing** only — the lambda body sees its parameters and top-level
     /// functions, but not enclosing locals (capturing those is a follow-up; such a reference
     /// surfaces as an undefined-variable error here).
-    /// Reject an allocating string op inside a lifted lambda that has no arena to hold the result.
-    /// A pipeline lambda (`reduce`/`map`/`par_map`/…) is lifted to a synthetic top-level function;
-    /// the enclosing `arena {}` is **not** threaded into it, so an allocation there lowers with no
-    /// arena and is leaked to process-lifetime (`align_rt_builder_finish`). Per call, in a reduce
-    /// loop, that OOMs (Gemini's M2 report, Gap A). A silent leak violates "nothing hidden", so this
-    /// is a hard error pointing at the right tool. `capture.is_some()` ⇒ we are inside a lambda body;
-    /// `arena_depth == 0` ⇒ the lambda opened no arena of its own to catch the allocation.
-    fn guard_lambda_alloc_leak(&mut self, what: &str, span: Span) {
-        if self.capture.is_some() && self.arena_depth == 0 {
-            self.diags.error(
-                format!(
-                    "{what} inside a pipeline lambda leaks — the enclosing `arena {{}}` is not available in a \
-                     lifted lambda. Accumulate with a `builder` instead, e.g. \
-                     `reduce(builder(), fn b, x {{ b.write(x); b }})`, or open an `arena {{}}` inside the lambda."
-                ),
-                span,
-            );
-        }
-    }
-
     fn lift_lambda(
         &mut self,
         params: &[ast::LambdaParam],
@@ -14498,7 +14489,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// string-builder `template` machinery: static JSON syntax interleaved with per-field
     /// value holes (`str` fields are emitted as JSON-escaped string literals). M5: fields
     /// must be int/float/bool/str; nested structs/arrays/options are not supported yet. The
-    /// result is arena-backed when inside an `arena {}` (else leaked), like any built string.
+    /// result is arena-backed inside an `arena {}`; otherwise MIR retains it in a hidden owned
+    /// string for the lifetime of the returned `str` view.
     fn check_json_encode(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 1 {
@@ -14540,9 +14532,6 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return err;
         }
-        // `json.encode` desugars to a `Template` `str` — the same arena-allocating path, so it leaks
-        // the same way inside a lifted lambda with no arena.
-        self.guard_lambda_alloc_leak("json.encode", span);
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 

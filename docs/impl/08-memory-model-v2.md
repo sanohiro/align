@@ -93,9 +93,10 @@ A value's region is computed bottom-up (generalizing today's `region_of`). The r
 its sources** — a borrow can never outlive what it borrows.
 
 ```text
-literal / leaked / owned-from-scalars     → Static
+literal / owned-from-scalars              → Static
 view parameter (slice/str/… param)        → Static within this fn  (borrows the caller; returnable)
-heap.new / template                        → region of the enclosing arena (Static if none*)
+heap.new                                   → region of the enclosing arena (Static if none)
+dynamic template                           → enclosing arena, or Frame with a hidden owner if none*
 clone                                      → owned `string` in the current implementation**
 slice of a frame-local array literal      → Frame
 slice/view into a by-value param interior → Frame
@@ -110,9 +111,10 @@ struct literal { … }                      → max region over its fields  (Sta
 decoded str/array field                   → region of the decode input  (§9)
 ```
 
-\* An arena-free `template` is leaked/process-lifetime today, so `Static`; audit 13 records this as
-a confirmed ownership gap, not a performance contract. String `+` is a settled hard error, although
-the stale checker/MIR path still needs removal. The owned-collection case is different — see §6: a
+\* Since 2026-07-15 an arena-free dynamic `template`/`json.encode` view is backed by a hidden scoped
+`string` owner and cannot escape its frame; a static-only template folds to a `Static` literal.
+String `+` is a settled hard error and has no checker/MIR concatenation path. The owned-collection
+case is different — see §6: a
 free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until its `Drop`*
 (not `Frame`). `Frame` is only for **borrows** of frame-local storage (a slice of a
 frame-local array literal, or a view into a by-value parameter's interior), never for a
