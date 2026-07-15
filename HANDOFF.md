@@ -8,7 +8,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (fourteenth update this day), **VALUE-CARRYING CONTROL FLOW PRESERVES
+_Last updated: 2026-07-15 (fifteenth update this day), **DEEP PIPELINE SCALING IS NOW A RECORDED
+PERFORMANCE-CONTRACT GATE.** The pipeline remains structurally strong — one fused loop, no
+intermediate collections, allocation-free non-escaping captures — but the current equal-LLVM C
+evidence covers shallow kernels only. `docs/impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5
+now requires a 1/2/4/8/16/32-stage sweep over arithmetic maps, branchless reducing `where`, scalar
+captures, and the correctness-required branchy post-`where` callable case. The gate compares
+runtime-provided workloads with manually fused Align and equal-LLVM C controls, inspects optimized
+IR/assembly for one loop / no intermediates / no residual simple-stage calls / legal SIMD parity,
+and reports throughput per performed operation so useful added work is not mistaken for abstraction
+overhead. Compile time, peak memory, and small-stack compiler survival are measured separately; the
+known accepted-expression-depth versus 2 MiB-stack gap remains a compiler robustness issue, not a
+generated-runtime result. `docs/open-questions.md` carries the tracking summary. **Next recommended
+performance evidence item:** implement this depth sweep before widening pipeline optimization claims
+or changing lowering/inlining policy. Previous update: 2026-07-15 (fourteenth update this day),
+**VALUE-CARRYING CONTROL FLOW PRESERVES
 CLEANUP PROVENANCE — MERGED as #466** (workspace **2137 green** = 2136 passed + one ignored manual
 probe; clippy `-D warnings` clean). The exhaustive 5×2 spec/test matrix now covers region composition
 and owned move/drop behavior for block / `if` / `match` / `else`-unwrap / `?`. All five region cells

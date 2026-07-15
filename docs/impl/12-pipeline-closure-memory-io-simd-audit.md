@@ -592,6 +592,46 @@ MIR should continue carrying width-independent facts: contiguous access, indepen
 reduction identity, effect, and the new `CanExecuteOnInactiveLane` legality summary. Fixed `vecN<T>` remains the
 explicit kernel escape hatch; the ordinary pipeline should not bake in AVX2/NEON widths.
 
+### 4.5 P1 MEASURE-FIRST — deep-stage scaling is part of the pipeline contract
+
+Pipeline fusion removes intermediate arrays and extra memory passes, but it does not make added
+work free. For `N` input elements and `S` stages, the intended runtime shape is one counted loop
+doing `O(N*S)` useful stage work, with no additional abstraction cost that grows non-linearly with
+`S`. The shallow C-parity kernels in §4.2 establish the current baseline, but they do not prove that
+inlining, vectorization, register allocation, or code size remain healthy for a deeply chained
+pipeline. Do not describe arbitrary pipeline depth as performance-neutral until this is measured.
+
+Add a depth sweep at `S = 1, 2, 4, 8, 16, 32` for four representative families:
+
+1. pure arithmetic `map` stages ending in `sum` or `map_into`;
+2. inactive-lane-safe `where` plus builtin reduction, which should retain the branchless mask path;
+3. scalar-capturing inline lambdas, proving captures stay as hoisted direct arguments; and
+4. a general callable after `where`, whose required skip branch is a correctness control rather
+   than a vectorization expectation.
+
+Use runtime-provided input so LLVM cannot constant-fold the pipeline. Compare every depth with a
+semantically identical manually fused Align loop body and an equal-LLVM C control. Publish both
+absolute throughput and cost per performed stage operation; a longer pipeline necessarily performs
+more arithmetic, so raw latency alone is not evidence of abstraction overhead.
+
+The gate must inspect optimized IR/assembly as well as time:
+
+- exactly one data loop and no intermediate collection or closure-environment allocation;
+- no residual stage calls for the simple arithmetic and scalar-capture cases;
+- the same vectorization decision, width, and reduction shape as the equal-LLVM control whenever
+  the semantics permit vectorization;
+- no unexplained depth knee from spills, failed inlining, excessive code growth, or lost loop
+  interleaving; if one appears, retain the simplest failing depth as a regression fixture before
+  changing lowering or optimization policy; and
+- compile time and peak memory recorded separately from runtime throughput.
+
+Compiler robustness is a related but distinct gate. Method chains build nested AST receivers and
+the compiler still has the accepted-depth versus 2 MiB-stack gap recorded in `open-questions.md`
+under "Expression-depth cap". Run the depth sweep through `check`, MIR, optimized LLVM, and object
+emission on a controlled small-stack worker. A compiler stack overflow is a build robustness defect,
+not evidence that the generated pipeline is slow, and increasing the compiler stack must not be
+reported as a runtime performance fix.
+
 ---
 
 ## 5. Closure representation and inlining
@@ -1159,6 +1199,10 @@ Correctness precedes the speed gate:
 - buffered lookahead then copy, short read/write, EINTR, partial transfer, EOF, invalid UTF-8/codec
   input, and allocation overflow;
 - scalar/SIMD differential fuzzing, tail lengths, misalignment, and page boundaries.
+
+For the flagship pipeline path, also retain the deep-stage sweep from §4.5. Shallow shape parity
+does not close a regression that appears only after LLVM's inlining, vectorization, or register
+allocation budget crosses a stage-count threshold.
 
 No below-gate mechanism remains shipped in parallel with the reference implementation. Record the
 result here and close it, as was done for arena pooling with mandatory re-zero.
