@@ -336,7 +336,7 @@ pub enum Ty {
     /// Lowers to an LLVM `ptr`, like the other opaque-pointer types.
     Raw,
     /// `builder` — an append-oriented string writer (draft.md §12), the canonical way to
-    /// construct a `string` (over `a + b` concat). An opaque owned handle to a heap builder
+    /// construct a `string`. An opaque owned handle to a heap builder
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
     /// it into an owned `string`. An unfinished builder is `Drop`-freed at scope exit (MMv2 7c).
     Builder,
@@ -4504,7 +4504,7 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// Types whose values carry an inferred region and so must be escape-checked: `box<T>`
-    /// (M3), arena-backed `str` (M5 — `template`/concat allocate in the arena), and a struct
+    /// (M3), arena-backed `str` (M5 — `template` allocates in the arena), and a struct
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(&self, ty: Ty) -> bool {
@@ -4713,8 +4713,8 @@ impl<'a> EscapeCheck<'a> {
             // A spawned task's handle is a box in the enclosing `task_group` region.
             ExprKind::Spawn { .. } => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
-            // its accumulator there too — when that accumulator is region-tracked (a `str` built by
-            // concatenation, a struct), the result lives in the enclosing arena and must not escape
+            // its accumulator there too — when that accumulator is region-tracked (a template-built
+            // `str`, a struct), the result lives in the enclosing arena and must not escape
             // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
             // at this depth can have, so it conservatively covers an accumulator that instead just
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
@@ -4729,8 +4729,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArraySort { .. }
             | ExprKind::ArraySortBy { .. }
             | ExprKind::ArrayReduce { .. } => Region::arena(depth),
-            // `str + str` concatenation is also built in the enclosing arena.
-            ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
@@ -10200,19 +10198,26 @@ impl<'a, 't> Checker<'a, 't> {
                     ty = Ty::Vec(s, n);
                 } else {
                     let t = self.unify(l.ty, r.ty, span);
-                    // `str + str` is concatenation; other ops on str are errors.
+                    // String construction is deliberately not an arithmetic operation: `builder`
+                    // is the one visible-allocation path. Reject `+` here instead of letting the
+                    // old MIR `Template` lowering preserve the pre-settlement hidden allocation.
                     if let Ty::Param(i) = t {
                         // A generic value: arithmetic needs the `Num` bound.
                         if !self.param_bound(i).grants_arith() {
                             self.diags.error(self.bound_needed_msg(i, "arithmetic", Bound::Num), span);
                         }
-                    } else if t == Ty::Str && op != BinOp::Add {
-                        self.diags.error("str supports only `+` (concatenation)", span);
-                    } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
+                    } else if matches!(t, Ty::Str | Ty::String) {
+                        if op == BinOp::Add {
+                            self.diags.error(
+                                "`+` does not concatenate strings — use `builder` with `.write()` and `.to_string()`",
+                                span,
+                            );
+                        } else {
+                            self.diags.error("arithmetic operators do not accept strings", span);
+                        }
+                        return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                    } else if !t.is_numeric() && t != Ty::Error {
                         self.diags.error("arithmetic expects numbers (int or float)", span);
-                    }
-                    if t == Ty::Str && op == BinOp::Add {
-                        self.guard_lambda_alloc_leak("string concatenation (`str + str`)", span);
                     }
                     ty = t;
                 }
@@ -20218,7 +20223,7 @@ mod tests {
     fn json_decoded_str_view_cannot_escape_arena() {
         // A `str` field decoded from an arena-allocated input is a view into that input; the
         // decoded struct is region-tied to it, so the view cannot escape the arena.
-        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := template \"{key}{key}\"\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a decoded str view from arena input must not escape the arena");
     }
 
@@ -20230,10 +20235,10 @@ mod tests {
         assert!(!ok.has_errors(), "json.decode into array<Struct> should check");
         // The decoded array's `str` fields are views into the input, so an array decoded from an
         // arena-allocated input must not escape the arena (use-after-free of the freed buffer).
-        let (_q, esc) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<i64, Error> {\n  mut total := 0\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    total = users.len()\n  }\n  return Ok(total)\n}\nfn main() -> i32 = 0\n");
+        let (_q, esc) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<i64, Error> {\n  mut total := 0\n  arena {\n    d := template \"{key}{key}\"\n    users: array<User> := json.decode(d)?\n    total = users.len()\n  }\n  return Ok(total)\n}\nfn main() -> i32 = 0\n");
         assert!(!esc.has_errors(), "reading .len() inside the arena is fine (no escape)");
         // Returning the arena-decoded array (region-tied to the arena input) must be rejected.
-        let (_r, ret) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_r, ret) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := template \"{key}{key}\"\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(ret.has_errors(), "an arena-tied decoded struct array must not escape via return");
     }
 
@@ -20273,7 +20278,7 @@ mod tests {
         assert!(!ok.has_errors(), "Option<str> / Result<str,Error> with literal payloads should check");
         // Region: an arena-built `str` in an `Option<str>` must not escape the arena (the view
         // would dangle) — this falls out of the existing region model, no new logic.
-        let (_q, esc) = check("fn bad(a: str, b: str) -> Option<str> {\n  arena {\n    return Some(a + b)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_q, esc) = check("fn bad(a: str, b: str) -> Option<str> {\n  arena {\n    return Some(template \"{a}{b}\")\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(esc.has_errors(), "an arena str inside Option<str> must not escape the arena");
         // `box<str>` is rejected (a view is not boxable) — both the annotation and `heap.new`.
         let (_r, bann) = check("fn f(b: box<str>) -> i32 = 0\nfn main() -> i32 = 0\n");
@@ -20300,7 +20305,7 @@ mod tests {
         assert!(esc.has_errors(), "a slice<str> into a local array must not escape");
         // Region: an `array<str>` of arena strs must not let an element escape via index+return
         // (the fixed array is region-tracked because its `str` element is).
-        let (_s, idxesc) = check("fn bad(a: str, b: str) -> str {\n  arena {\n    xs := [a + b, a]\n    return xs[0]\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_s, idxesc) = check("fn bad(a: str, b: str) -> str {\n  arena {\n    xs := [template \"{a}{b}\", a]\n    return xs[0]\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(idxesc.has_errors(), "a str element of an arena str-array must not escape via index");
         // A literal-str array element is Static → returnable (no false reject); a scalar array
         // stays returnable too (no regression from the new array region-tracking).
@@ -20309,7 +20314,7 @@ mod tests {
         // A `slice<str>` coerced from an arena str-array must not escape via return — the slice
         // inherits the array's region (`region_of(ArrayToSlice)`), and `slice<str>` is now
         // region-tracked.
-        let (_u, slesc) = check("fn bad(a: str, b: str) -> slice<str> {\n  arena {\n    s: slice<str> := [a + b, a]\n    return s\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_u, slesc) = check("fn bad(a: str, b: str) -> slice<str> {\n  arena {\n    s: slice<str> := [template \"{a}{b}\", a]\n    return s\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(slesc.has_errors(), "a slice<str> over an arena str-array must not escape");
         // A scalar `slice<i32>` parameter stays returnable (it borrows the caller) — no regression
         // from adding `Slice` to `tracks_region`.
@@ -20359,7 +20364,7 @@ mod tests {
         let (_r, badf) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  return ps[0].nope\n}\n");
         assert!(badf.has_errors(), "an unknown element field must be rejected");
         // A `str` field read from an arena-decoded element must not escape the arena.
-        let (_s, esc) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<str, Error> {\n  mut out := \"\"\n  arena {\n    d := key + key\n    users: array<U> := json.decode(d)?\n    out = users[0].name\n  }\n  return Ok(out)\n}\nfn main() -> i32 = 0\n");
+        let (_s, esc) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<str, Error> {\n  mut out := \"\"\n  arena {\n    d := template \"{key}{key}\"\n    users: array<U> := json.decode(d)?\n    out = users[0].name\n  }\n  return Ok(out)\n}\nfn main() -> i32 = 0\n");
         assert!(esc.has_errors(), "a str field of an arena-decoded element must not escape the arena");
     }
 
@@ -20380,7 +20385,7 @@ mod tests {
         // The decoded struct's region must survive while wrapped in a `Result`: binding the raw
         // `json.decode(...)` to a `Result`-typed local, unwrapping it with `?`, then returning
         // `Ok(u)` must still be rejected (otherwise the arena-tied str views escape → UAF).
-        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<U, Error> {\n  arena {\n    d := key + key\n    res: Result<U, Error> := json.decode(d)\n    u: U := res?\n    return Ok(u)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<U, Error> {\n  arena {\n    d := template \"{key}{key}\"\n    res: Result<U, Error> := json.decode(d)\n    u: U := res?\n    return Ok(u)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a region-tied decoded struct must not escape through a Result-typed local");
     }
 
@@ -20404,7 +20409,7 @@ mod tests {
     fn struct_arena_str_field_ok_when_not_escaping() {
         // MMv2 slice 2: a struct may now hold an arena-backed str. As long as the struct does
         // not escape the arena (here it is only used inside it), this is safe and allowed.
-        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  arena {\n    p := P{tag: a + b}\n    print(p.tag)\n  }\n  return 0\n}\n");
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  arena {\n    p := P{tag: template \"{a}{b}\"}\n    print(p.tag)\n  }\n  return 0\n}\n");
         assert!(!d.has_errors(), "a struct holding an arena str is fine if it does not escape");
     }
 
@@ -20412,7 +20417,7 @@ mod tests {
     fn struct_with_arena_str_field_cannot_escape() {
         // The struct carries its field's arena region, so returning it out of the arena (as the
         // arena block's value, which becomes the function result) must be rejected.
-        let (_p, d) = check("P { tag: str }\nfn mk(a: str, b: str) -> P {\n  arena {\n    P{tag: a + b}\n  }\n}\nfn main() -> i32 { return 0 }\n");
+        let (_p, d) = check("P { tag: str }\nfn mk(a: str, b: str) -> P {\n  arena {\n    P{tag: template \"{a}{b}\"}\n  }\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "a struct holding an arena str must not escape its arena");
     }
 
@@ -20420,7 +20425,7 @@ mod tests {
     fn struct_nested_arena_escape_rejected() {
         // A binding that captures an inner arena's value must keep that arena's region, so it
         // cannot be assigned to an outer-arena binding (which would outlive it → use-after-free).
-        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  arena {\n    mut out := P{tag: \"init\"}\n    arena {\n      x := \"a\" + \"b\"\n      p := arena {\n        P{tag: x}\n      }\n      out = p\n    }\n  }\n  return 0\n}\n");
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  arena {\n    mut out := P{tag: \"init\"}\n    arena {\n      a := \"a\"\n      x := template \"{a}b\"\n      p := arena {\n        P{tag: x}\n      }\n      out = p\n    }\n  }\n  return 0\n}\n");
         assert!(d.has_errors(), "a value captured from an inner arena must not escape to an outer one");
     }
 
@@ -20435,7 +20440,7 @@ mod tests {
     fn arena_str_into_outer_struct_field_rejected() {
         // Assigning an arena str into a field of a struct declared in an outer (longer-lived)
         // scope would let it outlive the arena via that struct.
-        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  mut p := P{tag: \"init\"}\n  arena {\n    p.tag = a + b\n  }\n  print(p.tag)\n  return 0\n}\n");
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  mut p := P{tag: \"init\"}\n  arena {\n    p.tag = template \"{a}{b}\"\n  }\n  print(p.tag)\n  return 0\n}\n");
         assert!(d.has_errors(), "storing an arena str into an outer struct's field must be rejected");
     }
 
@@ -20467,7 +20472,7 @@ mod tests {
 
     #[test]
     fn arena_backed_str_cannot_escape() {
-        let (_p, d) = check("fn f() -> str {\n  arena {\n    \"x\" + \"y\"\n  }\n}\nfn main() -> i32 { return 0 }\n");
+        let (_p, d) = check("fn f(x: str) -> str {\n  arena {\n    template \"{x}y\"\n  }\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "an arena-backed str must not escape its arena");
     }
 
@@ -20507,7 +20512,7 @@ mod tests {
         // arena-backed str and returning the result out of the arena must be rejected (the
         // borrowed buffer is freed at arena end → use-after-free). Conservative: the call
         // result lives no longer than its shortest-lived argument.
-        let (_p, d) = check("fn dup(s: str) -> str = s\nfn leak() -> str {\n  arena {\n    x := \"a\" + \"b\"\n    return dup(x)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("fn dup(s: str) -> str = s\nfn leak(a: str) -> str {\n  arena {\n    x := template \"{a}b\"\n    return dup(x)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a view returned from a call on an arena arg must not escape the arena");
     }
 
@@ -20522,9 +20527,9 @@ mod tests {
     #[test]
     fn reduce_str_accumulator_cannot_escape_arena() {
         // `reduce`'s accumulator is folded in the enclosing arena; when it is region-tracked (a
-        // `str` built by concatenation), returning it out of the arena must be rejected (the
+        // `str` built by a template), returning it out of the arena must be rejected (the
         // accumulator buffer is freed at arena end → use-after-free).
-        let (_p, d) = check("fn build(a: str, e: i64) -> str = a + \"?\"\nfn leak() -> str {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(build, \"\")\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("fn build(a: str, e: i64) -> str = template \"{a}?\"\nfn leak() -> str {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(\"\", build)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a str reduce accumulator built in an arena must not escape it");
     }
 
@@ -20540,7 +20545,7 @@ mod tests {
     fn str_clone_produces_returnable_owned_string() {
         // `str.clone()` yields a heap-owned `string` (region `Static`), so it can be returned out
         // of the arena its source was built in — the explicit escape hatch (MMv2 slice 7).
-        let (_p, d) = check("fn longer(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("fn longer(a: str, b: str) -> string {\n  arena {\n    c := template \"{a}{b}\"\n    return c.clone()\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(!d.has_errors(), "a cloned (owned) string should be returnable from an arena");
     }
 
@@ -20548,7 +20553,7 @@ mod tests {
     fn arena_str_without_clone_still_cannot_escape() {
         // Without the `.clone()`, the arena-backed `str` view must not escape (regression guard
         // that adding `string` did not loosen the borrow's region check).
-        let (_p, d) = check("fn longer(a: str, b: str) -> str {\n  arena {\n    c := a + b\n    return c\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("fn longer(a: str, b: str) -> str {\n  arena {\n    c := template \"{a}{b}\"\n    return c\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "an arena-backed str view must not escape without an explicit clone");
     }
 
@@ -20729,17 +20734,29 @@ mod tests {
     }
 
     #[test]
-    fn non_arena_str_returns_ok() {
-        let (_p, d) = check("fn g(a: str, b: str) -> str = a + b\nfn h() -> str = \"lit\"\n");
-        assert!(!d.has_errors(), "a non-arena str is returnable (leaked / process-lifetime)");
+    fn literal_str_returns_ok() {
+        let (_p, d) = check("fn h() -> str = \"lit\"\n");
+        assert!(!d.has_errors(), "a literal str is returnable");
     }
 
     #[test]
-    fn str_concat_checks_but_other_ops_error() {
-        let (_p, ok) = check("fn f(a: str, b: str) -> str = a + b\n");
-        assert!(!ok.has_errors(), "str + str should check");
+    fn string_arithmetic_is_rejected() {
+        let (_p, concat) = check("fn f(a: str, b: str) -> str = a + b\n");
+        assert!(concat.has_errors(), "str + str must be rejected");
+        assert_eq!(concat.error_count(), 1, "string concatenation must emit one root diagnostic");
+        assert!(
+            concat.iter().any(|d| d.message.contains("use `builder`")),
+            "the concatenation diagnostic must name the one construction path"
+        );
+        let (_owned, owned_concat) = check("fn f(a: string, b: string) -> string = a + b\n");
+        assert!(owned_concat.has_errors(), "owned string + string must be rejected");
+        assert_eq!(owned_concat.error_count(), 1, "owned-string concatenation must emit one root diagnostic");
+        assert!(
+            owned_concat.iter().any(|d| d.message.contains("use `builder`")),
+            "owned-string concatenation must use the same canonical diagnostic"
+        );
         let (_q, bad) = check("fn f(a: str, b: str) -> str = a - b\n");
-        assert!(bad.has_errors(), "str only supports +");
+        assert!(bad.has_errors(), "str does not support arithmetic");
     }
 
     #[test]
@@ -20756,9 +20773,9 @@ mod tests {
 
     #[test]
     fn template_expression_holes_check() {
-        // `{expr}` holes: arithmetic and str concatenation are both valid.
-        let (_p, d) = check("fn main() -> i32 {\n  a := 20\n  b := 22\n  n := \"x\"\n  m := template \"{a + b} {a * 2} {n + \\\"!\\\"}\"\n  print(m)\n  return 0\n}\n");
-        assert!(!d.has_errors(), "arithmetic and str-concat holes should check");
+        // `{expr}` holes allow arithmetic; literal text surrounds string-valued holes directly.
+        let (_p, d) = check("fn main() -> i32 {\n  a := 20\n  b := 22\n  n := \"x\"\n  m := template \"{a + b} {a * 2} {n}!\"\n  print(m)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "arithmetic and string holes should check");
     }
 
     #[test]

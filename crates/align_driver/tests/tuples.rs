@@ -100,7 +100,7 @@ fn str_element_allowed() {
 #[test]
 fn arena_str_element_cannot_escape() {
     // A tuple holding an arena-backed `str` is region-tied to that arena and cannot be returned.
-    let src = "fn bad() -> (str, i32) {\n  arena {\n    s := \"x\" + \"y\"\n    return (s, 1)\n  }\n}\nfn main() -> i32 = 0\n";
+    let src = "fn bad(x: str) -> (str, i32) {\n  arena {\n    s := template \"{x}y\"\n    return (s, 1)\n  }\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("tup-arena-str", src));
 }
 

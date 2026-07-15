@@ -3,7 +3,7 @@
 fn main() -> i32 {
   name := "align"
   score := 40
-  // Holes are full expressions: a bare name, arithmetic, or an inline str concat.
-  print(template "Hello {name}, score={score + 2}, tag={name + \"!\"}")
+  // Holes are full expressions; literal text can directly surround a string-valued hole.
+  print(template "Hello {name}, score={score + 2}, tag={name}!")
   return 0
 }

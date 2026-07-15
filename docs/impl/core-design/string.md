@@ -52,8 +52,8 @@ not consumed). `hash64`/`hash128` also accept these views ([hash.md](hash.md)).
 
 Pure (no I/O). The *allocation-visibility* rules are enforced structurally, not via effects:
 `str + str` is a settled hard error everywhere; `template` inside a pipeline lambda without its own
-arena is a hard error ("would silently leak" — `lambda.rs`). The current checker still accepts
-`str + str`; audit 13 records that implementation/settlement drift as P0.
+arena is a hard error ("would silently leak" — `lambda.rs`). The checker enforces the uniform rule
+and the obsolete MIR concatenation path is removed (audit 13 §3.2, fixed 2026-07-15).
 
 ## Errors & aborts
 
@@ -95,5 +95,5 @@ Frame-regioned `str` (owned-structs work).
 template, escapes, UTF-8 byte lengths, print type coverage); `lambda.rs:271/280/287/294`
 (template allocation rejection + arena-in-lambda allowance); `hash.rs` (view acceptance);
 `fuzz_fmt.rs` (formatter round-trips string-heavy sources); examples `strings.align`,
-`template.align`. The remaining concat-acceptance tests are stale until audit-13 P0 is fixed. SIMD
-scan pin: #310 differential oracle.
+`template.align`. String-concat rejection is covered uniformly across reducer, named-function,
+and lambda contexts. SIMD scan pin: #310 differential oracle.

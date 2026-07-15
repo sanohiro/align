@@ -578,7 +578,7 @@ later slices (struct arrays, M5 strings/JSON).
   (`align_rt_builder_*`); `template "...{ident}..."` desugaring (static parts +
   int/str holes → builder writes → `str`). **Historical milestone note:** `str + str`
   concatenation shipped here, but the 2026-07-02 settlement removed that surface; the checker/MIR
-  drift is audit-13 C0 work.
+  hard cutover was completed 2026-07-15, including removal of the obsolete MIR lowering.
 - [done] arena-backed builder: when a `template` runs inside an `arena {}`,
   the result is allocated in the arena (bulk-freed, no leak); outside, it is leaked
   (process-lifetime).

@@ -102,7 +102,7 @@ fn region_free_move_resource_reassign_keeps_the_new_flag_live() {
 fn owned_call_result_stays_individual_with_an_arena_borrow_argument() {
     // Escape Region conservatively follows the arena-backed argument, but the callee cannot return
     // arena storage across its function boundary. The returned string is heap-owned on both writes.
-    let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    source := \"a\" + \"b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
+    let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    source := template \"{1}b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
     let main = main_fn(&text);
     assert!(
         main.lines().filter(|line| line.contains("_2 <- true")).count() >= 2,
@@ -267,7 +267,7 @@ fn view_reassign_region_upgrade_escape_rejected() {
     // still borrows the arena buffer (a use-after-free). Rule 2 intersects the regions (keeps `v`
     // pinned to the shortest it can hold on any path), so the return-escape check fires.
     let mut sm = SourceMap::new();
-    let src = "fn f(cond: bool) -> str {\n  arena {\n    mut v := \"a\" + \"b\"\n    if cond { v = \"static\" }\n    return v\n  }\n}\nfn main() -> i32 {\n  print(f(false).len())\n  return 0\n}\n";
+    let src = "fn f(cond: bool, a: str) -> str {\n  arena {\n    mut v := template \"{a}b\"\n    if cond { v = \"static\" }\n    return v\n  }\n}\nfn main() -> i32 {\n  print(f(false, \"a\").len())\n  return 0\n}\n";
     let checked = check(&mut sm, "view-reassign.align", src);
     assert!(checked.diags.has_errors(), "an arena view escaping via a region-upgraded reassign must be rejected");
     let msg = align_driver::format_diagnostics(&sm, &checked.diags);

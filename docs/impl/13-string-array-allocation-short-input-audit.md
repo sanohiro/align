@@ -2,7 +2,8 @@
 
 > Status: audit record, 2026-07-13. **Partial corrective implementation shipped in the working
 > tree on 2026-07-13:** the UTF-8 range-boundary part of §3.1 is fixed and regression-pinned;
-> `s.bytes()` and the other findings remain open. No other implementation in this document is
+> §3.2's `str + str` contract drift was fixed 2026-07-15. `s.bytes()` and the other findings remain
+> open. No other implementation in this document is
 > shipped merely because it is described here. Performance changes remain gated unless an existing
 > roadmap item already says otherwise. The complete corrective wave is summarized in
 > [`source-correctness-fixes-2026-07-13.md`](source-correctness-fixes-2026-07-13.md).
@@ -46,7 +47,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | Area | Current shape | Disposition |
 |---|---|---|
 | `s[a..b]` | O(1) range + UTF-8 scalar-boundary checks | **FIXED 2026-07-13**; `str` validity is preserved |
-| `str + str` | settled hard error, but sema still accepts and MIR allocates | **CONFIRMED P0** contract drift |
+| `str + str` | rejected in sema; no MIR concatenation path remains | **FIXED 2026-07-15**; `builder` is the one construction path |
 | arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
 | unbound owned temporaries | `.len()`, scalar index, direct call use can omit `Drop` | **CONFIRMED P0**; leaks strings and arrays in loops |
 | moved slots | optimized IR still calls `free(null)` / handle-free(null) | **CONFIRMED P1** short-value fixed cost |
@@ -93,15 +94,17 @@ The documented arbitrary-byte escape hatch `s.bytes() -> slice<u8>` is also abse
 ([method dispatch](../../crates/align_sema/src/lib.rs#L9261)). Implement the existing contract as a
 zero-cost `{ptr,len}` retype so callers never need to violate `str` to process arbitrary bytes.
 
-### 3.2 CONFIRMED P0 — the settled `str + str` hard error is not enforced
+### 3.2 FIXED 2026-07-15 — the settled `str + str` hard error is enforced
 
 `draft.md`, `language-spec.md`, and the settled ledger all say concatenation through `+` is a hard
 error and `builder` is the one construction path
 ([settlement ledger](../open-questions.md)).
-The checker still explicitly accepts it
-([sema](../../crates/align_sema/src/lib.rs#L7941)), and MIR lowers every binary node to a fresh
-two-piece `Template` ([MIR](../../crates/align_mir/src/lib.rs#L2481)). Repository guides and
-implementation records had the same drift and are corrected alongside this audit.
+The audit baseline checker explicitly accepted it, and MIR lowered it to a fresh two-piece
+`Template`. The checker now rejects both `str` and owned `string` arithmetic, with `+` naming
+`builder`, `.write()`, and `.to_string()` as the single construction path. The obsolete MIR
+two-piece-template branch is removed, and stale region/Drop tests use `template` when they need an
+arena-backed `str`, so they continue to exercise their original invariant instead of passing on the
+new diagnostic.
 
 This is not a new language proposal. Enforce the settled error, change the stale tests, and use the
 same diagnostic the spec gives. Besides restoring One way / Nothing hidden, this prevents a chain
@@ -599,7 +602,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 1. ~~Enforce UTF-8 range boundaries~~ **DONE 2026-07-13**; separately ship the specified zero-cost
    `s.bytes()` view.
-2. Enforce the settled `str + str` hard error and correct stale tests/docs.
+2. ~~Enforce the settled `str + str` hard error and correct stale tests/docs.~~ **DONE 2026-07-15.**
 3. Add owned expression temporaries/synthetic owners with view-aware liveness; close string, array,
    chunks, and builder direct-consumer leaks.
 4. Remove definite-null destructor calls after the ownership dataflow is trustworthy.
@@ -636,7 +639,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 Correctness/resource mutations must fail when any of the following is removed:
 
 - UTF-8 start/end continuation-byte check (**shipped and regression-pinned 2026-07-13**);
-- hard error for `str + str`;
+- hard error for `str + str` (**shipped and regression-pinned 2026-07-15**);
 - synthetic owner/drop for an unbound Move temporary;
 - owner lifetime extension for a borrowed result view;
 - arena-free template ownership/diagnostic rule once settled.

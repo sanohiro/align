@@ -8,7 +8,17 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (sixteenth update this day), **DEEP PIPELINE SCALING IS MEASURED AND
+_Last updated: 2026-07-15 (seventeenth update this day), **THE SETTLED STRING-CONCATENATION
+CONTRACT IS ENFORCED.** `str + str` and owned `string + string` now fail in sema with the canonical
+`builder` / `.write()` / `.to_string()` guidance. The obsolete MIR path that silently converted
+string addition into a two-piece allocating template is removed. Stale tests and the template
+example are migrated deliberately: rejection tests pin the uniform rule, while region, escape, and
+Drop tests use explicit `template` values so they still exercise their original ownership
+invariants rather than passing because of an unrelated diagnostic. The complete workspace remains
+green (**2139 total = 2138 passed + one ignored manual probe**). Audit 13 §3.2, the source-fix
+ledger, roadmap history, core string design in both languages, and the guides now agree with the
+implementation. **Next recommended C0 item:** ship the already-specified zero-cost `str.bytes() ->
+slice<u8>` view. Previous update: 2026-07-15 (sixteenth update this day), **DEEP PIPELINE SCALING IS MEASURED AND
 REGRESSION-PINNED.** The shared 4-family × 6-depth fixture now runs through check, MIR, optimized
 LLVM, and release object emission on an explicit 2 MiB stack. It asserts one fused MIR loop, no
 intermediate/closure allocation, no residual simple-stage calls, and legal vector reductions

@@ -941,31 +941,29 @@ arm64 *numbers* here (linux x86), but every *code* claim was verified against th
 
 **Historical scope note (superseded 2026-07-02):** Gap A below records the earlier lambda-only guard,
 not the current language contract. The later settled rule rejects string `+` everywhere and uses
-`builder.to_string()` as the one construction path. Audit 13 confirms that sema/MIR and stale tests
-still need to enforce that settlement.
+`builder.to_string()` as the one construction path. Audit 13 records the sema/MIR hard cutover and
+test migration completed on 2026-07-15.
 
 - **Math pipeline (`map→where→sum`): Align 1.15–1.27× FASTER than Rust on M2 — a positive confirm.**
   The branchless-`select` fusion wins on arm64 (on x86 it was parity — Rust's slice `filter` evidently
   doesn't vectorize as cleanly on arm here). Nothing to do; good signal that the flagship lowering
   holds cross-arch.
-- **★ Gap A — `str + str` inside a lifted lambda silently LEAKED → OOM. FIXED 2026-06-27 (now a hard
-  error).** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose `lower_fn`
+- **★ Gap A — `str + str` inside a lifted lambda silently LEAKED → OOM. FIRST GUARD 2026-06-27;
+  UNIFORM CONTRACT FIX 2026-07-15.** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose `lower_fn`
   starts with `b.arenas` empty, so `str+str` (MIR ~757) got `arena = None` → `builder_finish`
   `Box::leak`d the buffer (runtime ~1196) → one leak per reduce step → OOM at N=10k. **Fix:**
   `guard_lambda_alloc_leak` (align_sema) errors on a string allocation (`str + str` / `template` /
   `json.encode` — all desugar to an arena `Template` str) inside a lifted lambda with no arena of its
   own (`capture.is_some() && arena_depth == 0`), pointing at the `builder` pattern — so the silent
-  leak is now a clear compile error (Nothing-hidden restored). Legitimate cases unaffected: top-level
-  / named-fn concat, the builder-reduce pattern, and a concat inside the lambda's own `arena {}`.
-  `tests/lambda.rs` (+6). **Remaining sub-gap (recorded, NOT the
-  reported case):** a *named* reducer fn that concats (`fn cat(a,b)=a+b` used as `reduce("", cat)`)
-  leaks the same way but isn't caught (the guard is scoped to inline lambdas via `capture`); the real
-  fix is **owned `string` from concat** (str+str → a heap `string` with `Drop`, freeing each
-  intermediate → no leak, O(1) like Rust — also dissolves Gap B), the deferred M5 feature.
-- **Gap B — `acc + x` string reduce is O(N²) arena space even if A were fixed.** Arena has no
+  leak became a clear compile error. That first guard deliberately left named/top-level and
+  inner-arena concatenation untouched. The settled One-way rule later chose `builder` instead of an
+  owned-concat surface; on 2026-07-15 sema made the rejection uniform and the obsolete MIR
+  concatenation lowering was removed. The named-reducer sub-gap is therefore closed by the same
+  hard error, while builder-reduce remains valid. `tests/lambda.rs` pins all three former contexts.
+- **Gap B — `acc + x` string reduce would use O(N²) arena space; MOOT under the hard error.** Arena has no
   per-object free, so all N intermediate strings live until block exit (Rust frees each `acc`
-  immediately → O(1)). Inherent; the answer is **guidance/lint: use `builder` for string
-  accumulation, not `reduce(+)`** (a perf-rail lint candidate — Codex's idea). Not a core fix.
+  immediately → O(1)). The uniform compile-time rejection makes this shape unrepresentable;
+  `builder` accumulation is the single supported path, so no separate lint remains.
 - **Gap C — `builder(capacity)` — DONE 2026-06-27 as a feature, but MEASURED *not* to be the lever.**
   Added the surface (`builder()` / `builder(capacity)`, an `i64`) + `align_rt_builder_new(arena, cap)`
   → `Vec::with_capacity`. **But `bench/string_builder/` shows `+cap` ≈ `build` (2.77 vs 2.77 ms) — the
@@ -2489,7 +2487,8 @@ stable compaction. Existing work from documents 10/11 remains attributed there.
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)
 is the durable implementation record. Its UTF-8 range-boundary gap is fixed and regression-pinned;
-it confirms the remaining owned-expression-temporary lifetime gaps, settled `str + str` enforcement drift, arena-free template lifetime leaks,
+its settled `str + str` enforcement drift is fixed 2026-07-15; it confirms the remaining
+owned-expression-temporary lifetime gaps, arena-free template lifetime leaks,
 known-null destructor calls, and avoidable path/builder/chunks/group staging. It also records the
 good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
 later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,
