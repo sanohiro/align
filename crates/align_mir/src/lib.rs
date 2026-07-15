@@ -1216,10 +1216,10 @@ fn simplify_known_drop_flags(f: &mut Function) {
         changed
     }
 
-    fn operand_state(op: &Operand, values: &std::collections::HashMap<ValueId, BoolState>) -> BoolState {
+    fn operand_state(op: &Operand, values: &[BoolState]) -> BoolState {
         match op {
             Operand::Const(Const::Bool(value)) => BoolState::Const(*value),
-            Operand::Value(value) => values.get(value).copied().unwrap_or(BoolState::Unknown),
+            Operand::Value(value) => values.get(*value as usize).copied().unwrap_or(BoolState::Unknown),
             _ => BoolState::Unknown,
         }
     }
@@ -1228,7 +1228,10 @@ fn simplify_known_drop_flags(f: &mut Function) {
         matches!(
             term,
             Term::Branch(_, then_bb, _)
-                if matches!(f.blocks[*then_bb as usize].stmts.first(), Some(Stmt::Drop(_)))
+                if f.blocks
+                    .get(*then_bb as usize)
+                    .and_then(|block| block.stmts.first())
+                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_)))
         )
     }
 
@@ -1242,18 +1245,27 @@ fn simplify_known_drop_flags(f: &mut Function) {
     incoming[f.entry as usize] = Some(vec![BoolState::Unknown; f.slots.len()]);
     let mut work = VecDeque::from([f.entry]);
     let mut known_terms = vec![None; f.blocks.len()];
+    // Reuse indexed scratch storage rather than allocating a HashMap on every block visit. Values
+    // not defined in the current block stay Unknown: the drop guard's Load is deliberately local,
+    // and keeping cross-block values conservative avoids needing a separate SSA dependency queue.
+    let mut values = vec![BoolState::Unknown; f.value_tys.len()];
+    let mut touched_values = Vec::new();
 
     while let Some(block_id) = work.pop_front() {
+        for value in touched_values.drain(..) {
+            values[value] = BoolState::Unknown;
+        }
         let mut slots = incoming[block_id as usize].clone().expect("queued MIR block is reachable");
         let block = &f.blocks[block_id as usize];
-        let mut values = std::collections::HashMap::new();
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let(value, Rvalue::Load(slot)) if f.slots[*slot as usize] == Ty::Bool => {
-                    values.insert(*value, slots[*slot as usize]);
+                    values[*value as usize] = slots[*slot as usize];
+                    touched_values.push(*value as usize);
                 }
                 Stmt::Let(value, Rvalue::Use(op)) if f.value_tys[*value as usize] == Ty::Bool => {
-                    values.insert(*value, operand_state(op, &values));
+                    values[*value as usize] = operand_state(op, &values);
+                    touched_values.push(*value as usize);
                 }
                 Stmt::Store(slot, op) if f.slots[*slot as usize] == Ty::Bool => {
                     slots[*slot as usize] = operand_state(op, &values);
