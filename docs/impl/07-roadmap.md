@@ -16,7 +16,16 @@ but read the order from here.
 - **No backward compatibility** (pre-release) — change APIs outright; no aliases / shims / dual paths.
 - **Finish all of `core` + the language before `std`** — the OS-boundary layer (`std`/`pkg`) waits.
 
-**Done (as of 2026-07-10):** **M0–M10 are complete and formally closed** — the language core
+**Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
+M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
+per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
+verification bundle) are complete in the current working tree. The workspace is 2068 green (2067
+passed + one ignored manual probe) and clippy-clean. **Next:** harden the
+`http_server_no_fd_leak_across_cycles` timing flake without weakening its leak detection, then close
+the qualified cross-module fn-value remainder (`map(util.dbl)`).
+
+**Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
+and formally closed** — the language core
 (M0–M5 + Memory Model v2, tuples, lambdas/closures, sum types + `Error`, minimal generics), M6
 SIMD (`vecN`/`maskN`/`soa`/columnar `group_by`/`align(N)`), M7 concurrency (`par_map`/`chunks`/
 purity + `task_group` on real threads), M8 tooling (`align_fmt`, `unsafe`/`raw.*`, `extern "C"`
@@ -36,9 +45,9 @@ Denied/Code/Invalid taxonomy. With std.http done, **all M11 std-module work is c
 formal M11 close is the orchestrator's call (verify against `open-questions.md` before flipping the
 milestone header).
 
-**Next (in order):** finish M12 (only the A5-SSE slice remains in flight) → **M13 codegen
-quality & link hygiene** (the pre-LLVM-upgrade wave — see its section) → the **LLVM/inkwell
-upgrade checkpoint** → the post-upgrade wave (ThinLTO → runtime bitcode → PGO → BOLT). The
+**Historical next sequence (superseded):** finish M12 (only the A5-SSE slice remains in flight) →
+**M13 codegen quality & link hygiene** (the pre-LLVM-upgrade wave — see its section) → the
+**LLVM/inkwell upgrade checkpoint** → the post-upgrade wave (ThinLTO → runtime bitcode → PGO → BOLT). The
 consumer-gated execution-plan items (decode fusion, pushdown, algorithm portfolio, Sink/Source
 MIR) stay recorded in the consultation digest + runway records until their align-LLM consumers
 arrive.
@@ -2451,7 +2460,7 @@ chunk, attribute-kind fail-loud + modern `captures(none)` emission **[DONE 2026-
 round-trip follow-up above is RESOLVED — tool-gated gate added]**); **wave 3, measure-first** (JSON
 decode double-allocation, I/O buffer zero-fill). Doc-debt items ride along with their slices.
 
-## M15 — Separate compilation (multi-module compilation units) — OWNER-MANDATED 2026-07-12
+## M15 — Separate compilation (multi-module compilation units) — COMPLETE 2026-07-15
 
 **Directive.** On reading the M14 re-scope note "Align has no separate compilation — one
 `Program` → one whole-program module", the owner ruled this must not remain true: multi-module
@@ -2918,6 +2927,33 @@ A→B→C invalidation, absent/stale-interface fail-closed mutation). Still queu
 slices: the `http_server_no_fd_leak_across_cycles` flake-hardening slice (it recurred during
 the S3b full-suite runs — same signature, passes in isolation) and the qualified cross-module
 fn-value remainder (`map(util.dbl)`, open-questions).
+
+**M15 SV COMPLETE (2026-07-15; workspace 2068 green + clippy `-D warnings` clean). M15 is
+COMPLETE.** The verification bundle closes the doc-10 §7 matrix at the implemented v1 boundary:
+the frontend always re-runs and link always re-runs by design, while every codegen/object-cache
+identity and publication expectation is automated. Existing gates already pinned N=1 object/exe
+identity across profiles + `--rt-lto`, cold-vs-hit object/exe identity, private-body vs public
+surface invalidation, transitive A→B→C invalidation, exact-revert reuse, corruption recovery,
+cross-process `impl_hash` stability, runtime content freshness, and absent/Unknown/Impure effect-bit
+rejection. SV added the missing teeth:
+
+- the interface reader now recomputes the canonical public-surface hash and rejects a stale or
+  modified signature/layout/effect surface before it can seed sema; a mutated Impure→Pure effect
+  artifact is the permanent negative gate, alongside the pre-existing absent-effect gate;
+- unimported-file edits leave every reachable unit hot; baseline/native resolved CPU identities
+  occupy distinct namespaces; and the unit key's complete `FirstDiff` component matrix is pinned;
+- a killed producer's orphan private staging file is invisible, so the next build safely rebuilds
+  and publishes a complete hit; four identical cross-process producers converge on one immutable
+  action per unit with no staging residue;
+- concurrent different programs with the same basenames retain both distinct implementation
+  actions while sharing byte-identical dependency actions; both executables are correct and both
+  builds subsequently hit in full.
+
+The matrix intentionally does not claim frontend/link cache hits: v1 caches per-unit object bytes
+only, as settled in S3, so frontend and link rows are verified as safe reruns rather than cached
+stages. Deferred cache layers retain their doc-10 gates. Next after M15: the recorded
+`http_server_no_fd_leak_across_cycles` flake hardening, then qualified cross-module function values
+(`map(util.dbl)`).
 
 ## Design Issues to Settle in Parallel
 

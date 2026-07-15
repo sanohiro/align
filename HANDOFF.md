@@ -8,7 +8,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (third update this day), **M15 S3b SHIPPED — parallel unit codegen +
+_Last updated: 2026-07-15 (fourth update this day), **M15 SV COMPLETE in the working tree — the
+verification bundle is green; M15 is COMPLETE** (workspace **2068 green** = 2067 passed + one
+ignored manual probe; clippy `-D warnings` clean; full record in the roadmap M15 SV paragraph).
+The doc-10 §7 matrix is now automated at the settled v1 object-cache boundary: existing gates cover
+N=1 and cold-vs-hit byte identity, private/public/transitive invalidation, exact revert, corruption,
+runtime freshness, and cross-process `impl_hash`; SV adds unimported-file stability, resolved CPU +
+the full key-component namespace matrix, killed-producer orphan staging, identical and different
+same-basename cross-process races, and a confirmed fail-closed hardening — interface deserialization
+now recomputes the public-surface hash, so a stale/tampered Impure→Pure effect bit is rejected before
+sema consumes it (the absent/Unknown/Impure effect gates remain green). Frontend and link still
+re-run by design; the record does not claim caches that v1 does not have. **Next:** harden
+`http_server_no_fd_leak_across_cycles` without weakening its leak-detection teeth, then close the
+qualified cross-module fn-value remainder (`map(util.dbl)`). Previous update: 2026-07-15 (third
+update this day), **M15 S3b SHIPPED — parallel unit codegen +
 cache CLI + default-ON flip, MERGED as #455. S3 (incremental cache + parallel compilation +
 hit/miss observability) is COMPLETE** (workspace **2061 green** + clippy clean; full record in
 the roadmap M15 S3b paragraph). The incremental codegen cache is now **ON by default**

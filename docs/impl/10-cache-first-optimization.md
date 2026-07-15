@@ -366,6 +366,16 @@ The cache implementation is incomplete until this matrix is automated:
 Add bounded cache eviction only after correctness and hit telemetry exist. Eviction policy is not an
 artifact-identity concern and must not complicate the first slice.
 
+**M15 SV status (2026-07-15): automated for the v1 object-cache boundary.** The frontend and link
+always re-run by settled design, so their rows are safe-rerun requirements rather than cache-hit
+claims. `cache_codegen.rs`, `cache_parallel.rs`, `artifact_staging.rs`, `per_unit*.rs`, and the
+interface effect/codec tests jointly pin every applicable row: unimported edits, full key namespace
+separation, transitive interface invalidation, runtime content freshness, exact revert, identical
+and different same-basename concurrent producers, orphan staging after a killed producer,
+corruption recovery, and cold-vs-hit byte identity. The interface reader also verifies its stored
+public-surface hash before exposing effect bits. Future frontend/link cache layers must rerun this
+matrix at their new stage boundary; this status does not pre-approve those deferred caches.
+
 ---
 
 ## 8. CPU-cache candidates not already scheduled

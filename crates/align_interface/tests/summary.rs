@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    build_summaries, deserialize, serialize, DecodeError, IType, InterfaceSummary, FORMAT_VERSION,
+    build_summaries, deserialize, serialize, DecodeError, Effect, IType, InterfaceSummary, FORMAT_VERSION,
 };
 
 /// One in-memory source module for a test program.
@@ -217,6 +217,20 @@ fn deserialize_truncated_and_trailing_fail_closed() {
     let mut extra = bytes.clone();
     extra.push(0);
     assert_eq!(deserialize(&extra), Err(DecodeError::TrailingBytes));
+}
+
+#[test]
+fn deserialize_stale_effect_bit_fails_closed() {
+    let sums = one("pub fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> i32 = 0\n");
+    let mut stale = sums[0].clone();
+    let noisy = stale.fns.iter_mut().find(|f| f.name == "noisy").expect("pub fn present");
+    assert_eq!(noisy.effect, Effect::Impure);
+
+    // Simulate a stale/tampered artifact whose effect byte says Pure while its stored surface hash
+    // still describes the original Impure interface. A consumer must reject it before effect seeding.
+    noisy.effect = Effect::Pure;
+    let bytes = serialize(&stale);
+    assert_eq!(deserialize(&bytes), Err(DecodeError::InterfaceHashMismatch));
 }
 
 // ---- 4. out[i] markers --------------------------------------------------------------------------
