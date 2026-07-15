@@ -99,8 +99,9 @@ Single slice, but ordered:
   or use-after-move. Highest risk.
 - **P2 (bound-receiver, #337/#338 lesson)**: `command`/`parsed` are owned Move; an unbound
   temporary cannot be a method receiver in v1 (bind first). So `cli.command("x").flag_bool("v")`
-  chaining and `c.parse(args)?.get_bool("v")` are rejected until Move-temporary drops land —
-  require `c := cli.command("x"); c.flag_bool("v"); ...` and `p := c.parse(args)?;
+  chaining and `c.parse(args)?.get_bool("v")` remain rejected by the v1 receiver surface even
+  though general Move-temporary cleanup landed 2026-07-15 — require
+  `c := cli.command("x"); c.flag_bool("v"); ...` and `p := c.parse(args)?;
   p.get_bool("v")`. Design the bound-receiver gate into `check_cli_*` from the start (the
   `check_reader_method`/`check_writer_method` precedent).
 - **P3 (get_str view region, #297 trap)**: `get_str` returns a str view into parsed; its region

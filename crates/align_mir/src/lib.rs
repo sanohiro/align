@@ -1392,14 +1392,29 @@ struct Builder {
     /// block, `result_slot` (where a `break` value is stored, `None` for a unit loop), and
     /// `iter_drops` (owned locals declared in the body, dropped each iteration / at each `break`).
     loops: Vec<LoopFrame>,
-    /// All source-line-tracking state (explain-opt / debug info), or `None` in a normal build.
-    /// Boxed into a single optional pointer so the `Builder` — which sits at the base of
-    /// `lower_expr`'s deep recursion — grows by only one word vs. a no-debug-info build, preserving
-    /// its stack margin (`expr_depth`). `None` also makes every span update a trivial skipped check.
+    /// Bulky temporary-ownership and optional source-line state, boxed behind one pointer so the
+    /// `Builder` at the base of `lower_expr` recursion retains its established stack margin.
+    ctx: Box<BuilderCtx>,
+}
+
+/// Bulky, non-recursive lowering metadata kept behind the same single pointer that previously held
+/// `Builder::dbg`. `lower_expr` is deeply recursive, so growing `Builder` itself by even a few words
+/// multiplies across the accepted expression-depth limit and can overflow the test thread stack.
+struct BuilderCtx {
+    /// Runtime bit saying an SSA value is backed by an unbound owned temporary, rather than a
+    /// borrowed bound place. Control-flow joins preserve the selected path's bit.
+    value_temp_drop_flags: Vec<Option<Operand>>,
+    /// Synthetic owners discovered while lowering; initialised together in the entry block.
+    synthetic_drop_slots: Vec<Slot>,
+    /// Hidden owners keeping each SSA borrowed view alive.
+    value_borrow_owners: Vec<Vec<Slot>>,
+    /// Borrow-owner unions accumulated for value-carrying control-flow result slots.
+    slot_borrow_owners: std::collections::HashMap<Slot, Vec<Slot>>,
+    /// Optional source-line tracking state.
     dbg: Option<Box<LineCtx>>,
 }
 
-/// Located-lowering state carried through one function's `Builder` (see [`Builder::dbg`]).
+/// Located-lowering state carried through one function's [`BuilderCtx`].
 struct LineCtx {
     /// Byte-offset → (line, col) table over every source file (shared read-only).
     lines: Rc<SourceLines>,
@@ -1452,7 +1467,7 @@ impl Builder {
     /// The (line, col) of the node currently being lowered, or `(0, 0)` when lowering without a
     /// source table (a normal build) or before any span is set.
     fn cur_line(&self) -> (u32, u32) {
-        match &self.dbg {
+        match &self.ctx.dbg {
             Some(d) => match d.cur_span {
                 Some(sp) => d.lines.locate(sp),
                 None => (0, 0),
@@ -1463,7 +1478,7 @@ impl Builder {
 
     /// Set the current source span (a no-op in a normal build, where `dbg` is `None`).
     fn set_span(&mut self, sp: Span) {
-        if let Some(d) = &mut self.dbg {
+        if let Some(d) = &mut self.ctx.dbg {
             d.cur_span = Some(sp);
         }
     }
@@ -1472,6 +1487,8 @@ impl Builder {
         let v = self.value_tys.len() as ValueId;
         self.value_tys.push(ty);
         self.value_drop_flags.push(None);
+        self.ctx.value_temp_drop_flags.push(None);
+        self.ctx.value_borrow_owners.push(Vec::new());
         v
     }
 
@@ -1482,6 +1499,29 @@ impl Builder {
     fn value_drop_flag(&self, operand: &Operand) -> Option<Operand> {
         let Operand::Value(value) = operand else { return None };
         self.value_drop_flags.get(*value as usize).and_then(Clone::clone)
+    }
+
+    fn attach_value_temp_drop_flag(&mut self, value: ValueId, flag: Operand) {
+        self.ctx.value_temp_drop_flags[value as usize] = Some(flag);
+    }
+
+    fn value_temp_drop_flag(&self, operand: &Operand) -> Option<Operand> {
+        let Operand::Value(value) = operand else { return None };
+        self.ctx.value_temp_drop_flags.get(*value as usize).and_then(Clone::clone)
+    }
+
+    fn attach_borrow_owners(&mut self, value: ValueId, owners: impl IntoIterator<Item = Slot>) {
+        let dst = &mut self.ctx.value_borrow_owners[value as usize];
+        for owner in owners {
+            if !dst.contains(&owner) {
+                dst.push(owner);
+            }
+        }
+    }
+
+    fn borrow_owners(&self, operand: &Operand) -> Vec<Slot> {
+        let Operand::Value(value) = operand else { return Vec::new() };
+        self.ctx.value_borrow_owners.get(*value as usize).cloned().unwrap_or_default()
     }
 
     /// A fresh alias-scope id for a `map_into` loop — its `in`/`out` scopes are declared disjoint
@@ -1499,6 +1539,21 @@ impl Builder {
         self.slot_align.push(None);
         self.drop_flags.push(None);
         s
+    }
+
+    /// Allocate a path-local hidden owner for an unbound Move temporary. Its initialisation is
+    /// prepended to entry after lowering, while its cleanup participates in the innermost active
+    /// loop so a temporary created per iteration cannot accumulate until function exit.
+    fn new_synthetic_owner(&mut self, ty: Ty) -> Slot {
+        let owner = self.new_slot(ty);
+        let flag = self.new_slot(Ty::Bool);
+        self.drop_flags[owner as usize] = Some(flag);
+        self.drop_locals.push(owner);
+        self.ctx.synthetic_drop_slots.push(owner);
+        if let Some(frame) = self.loops.last_mut() {
+            frame.iter_drops.push(owner);
+        }
+        owner
     }
 
     fn set_drop_flag(&mut self, slot: Slot, live: bool) {
@@ -1535,7 +1590,7 @@ impl Builder {
         // ×depth and overflow the test thread on machine-generated deep expressions (`expr_depth`).
         // A normal build leaves `stmt_lines` empty — codegen reads it defensively (`.get(i)`) and the
         // fusion pass guards on its length.
-        if self.dbg.is_some() {
+        if self.ctx.dbg.is_some() {
             self.record_line();
         }
         self.blocks[self.cur as usize].stmts.push(s);
@@ -1595,7 +1650,13 @@ fn lower_fn(
         structs: structs.to_vec(),
         alias_scope: 0,
         loops: Vec::new(),
-        dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
+        ctx: Box::new(BuilderCtx {
+            value_temp_drop_flags: Vec::new(),
+            synthetic_drop_slots: Vec::new(),
+            value_borrow_owners: Vec::new(),
+            slot_borrow_owners: std::collections::HashMap::new(),
+            dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
+        }),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -1631,6 +1692,29 @@ fn lower_fn(
         match tail {
             Some(op) => b.terminate(Term::Return(Some(op))),
             None => b.terminate(Term::Return(None)),
+        }
+    }
+
+    // Synthetic owners are discovered while recursively lowering expressions, but every cleanup
+    // edge — including one in a sibling branch that never evaluated the producer — may inspect
+    // their flags. Prepend zero-storage + clear-flag initialisation to entry once the complete set
+    // is known. Located builds keep the statement/source arrays parallel with synthetic `(0, 0)`
+    // locations; ordinary builds leave `stmt_lines` empty as usual.
+    if !b.ctx.synthetic_drop_slots.is_empty() {
+        let mut init = Vec::with_capacity(b.ctx.synthetic_drop_slots.len() * 2);
+        for &owner in &b.ctx.synthetic_drop_slots {
+            let flag = b.drop_flags[owner as usize].expect("synthetic owner has a drop flag");
+            init.push(Stmt::DropFlagInit(owner));
+            init.push(Stmt::Store(flag, Operand::Const(Const::Bool(false))));
+        }
+        let entry_block = &mut b.blocks[entry as usize];
+        let init_len = init.len();
+        init.append(&mut entry_block.stmts);
+        entry_block.stmts = init;
+        if !entry_block.stmt_lines.is_empty() {
+            let mut lines = vec![(0, 0); init_len];
+            lines.append(&mut entry_block.stmt_lines);
+            entry_block.stmt_lines = lines;
         }
     }
 
@@ -1787,15 +1871,108 @@ fn lowered_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Optio
     b.value_drop_flag(operand).or_else(|| moved_drop_flag(b, e))
 }
 
+/// Ownership bit for the subset of owned values that are anonymous temporaries in a borrowing
+/// context. A bound place is borrowed in place and must never be transferred to a hidden owner;
+/// fresh producers (and consuming unwraps such as `?`) forward their ordinary ownership bit.
+/// Value-carrying control flow carries an already-joined bit on its SSA result.
+fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Option<Operand> {
+    if let Some(flag) = b.value_temp_drop_flag(operand) {
+        return Some(flag);
+    }
+    match &e.kind {
+        hir::ExprKind::Local(_)
+        | hir::ExprKind::Field { .. }
+        | hir::ExprKind::TupleIndex { .. }
+        | hir::ExprKind::Index { .. }
+        | hir::ExprKind::ElemField { .. } => Some(Operand::Const(Const::Bool(false))),
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) | hir::ExprKind::TaskGroup(block) => {
+            block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
+        }
+        _ => lowered_drop_flag(b, e, operand),
+    }
+}
+
+/// Whether a borrowing use can select a fresh owned value. Direct bound places are borrowed; a
+/// block is transparent. Control-flow nodes are conservatively eligible and their per-path runtime
+/// temporary bit prevents a bound arm from being dropped.
+fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::Local(_)
+        | hir::ExprKind::Field { .. }
+        | hir::ExprKind::TupleIndex { .. }
+        | hir::ExprKind::Index { .. }
+        | hir::ExprKind::ElemField { .. } => false,
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block.value.as_ref().is_some_and(|value| may_need_synthetic_owner(value)),
+        _ => true,
+    }
+}
+
+/// Lower the root of an owned value in a borrowing context. Value-carrying control flow must not
+/// null a bound-local arm merely because it stores that borrowed value through a join slot.
+fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
+        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, true),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, true),
+        _ => lower_expr(b, e),
+    }
+}
+
+/// Lower an owned expression used only through a borrow. Fresh unbound values move into a hidden
+/// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
+/// producers can extend it and scalar consumers can end it immediately.
+fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
+    if !needs_drop_flag(e.ty, &b.structs, &b.tuples) || !may_need_synthetic_owner(e) {
+        return lower_expr(b, e);
+    }
+    // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
+    let owner = b.new_synthetic_owner(e.ty);
+    let operand = lower_expr_for_borrow(b, e);
+    if b.is_terminated() {
+        return operand;
+    }
+    let live = temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+    b.push(Stmt::Store(owner, operand.clone()));
+    b.set_drop_flag_operand(owner, live);
+    if let Operand::Value(value) = operand {
+        b.attach_borrow_owners(value, [owner]);
+        Operand::Value(value)
+    } else {
+        operand
+    }
+}
+
+/// End every hidden owner's liveness after a scalar-only consumer. Flags make this safe for the
+/// non-selected arms of value-carrying control flow and deduplication avoids repeated drops when a
+/// view has flowed through more than one transparent operation.
+fn drop_borrow_owners(b: &mut Builder, operand: &Operand) {
+    for owner in b.borrow_owners(operand) {
+        b.emit_drop_if_live(owner);
+    }
+}
+
+fn inherit_borrow_owners<'a>(b: &mut Builder, value: ValueId, operands: impl IntoIterator<Item = &'a Operand>) {
+    let mut owners = Vec::new();
+    for operand in operands {
+        for owner in b.borrow_owners(operand) {
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+    }
+    b.attach_borrow_owners(value, owners);
+}
+
 /// Result storage for a value-carrying CFG join. Owned values get a parallel boolean slot; scalar
 /// and borrowed Copy values need only the ordinary result slot.
-fn control_result_slots(b: &mut Builder, ty: Ty) -> (Option<Slot>, Option<Slot>) {
+fn control_result_slots(b: &mut Builder, ty: Ty) -> (Option<Slot>, Option<Slot>, Option<Slot>) {
     if ty == Ty::Unit {
-        return (None, None);
+        return (None, None, None);
     }
     let value = b.new_slot(ty);
     let flag = needs_drop_flag(ty, &b.structs, &b.tuples).then(|| b.new_slot(Ty::Bool));
-    (Some(value), flag)
+    let temp_flag = flag.map(|_| b.new_slot(Ty::Bool));
+    (Some(value), flag, temp_flag)
 }
 
 /// Store one continuing arm into a control-flow join, including its selected allocation provenance.
@@ -1804,21 +1981,42 @@ fn store_control_result(
     b: &mut Builder,
     value_slot: Option<Slot>,
     flag_slot: Option<Slot>,
+    temp_flag_slot: Option<Slot>,
     expr: &hir::Expr,
     operand: Operand,
+    borrow_result: bool,
 ) {
     if let Some(slot) = value_slot {
         if let Some(flag_slot) = flag_slot {
             let flag = lowered_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
             b.push(Stmt::Store(flag_slot, flag));
         }
+        if let Some(temp_flag_slot) = temp_flag_slot {
+            let flag = temporary_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+            b.push(Stmt::Store(temp_flag_slot, flag));
+        }
+        let owners = b.borrow_owners(&operand);
+        let result_owners = b.ctx.slot_borrow_owners.entry(slot).or_default();
+        for owner in owners {
+            if !result_owners.contains(&owner) {
+                result_owners.push(owner);
+            }
+        }
         b.push(Stmt::Store(slot, operand));
-        null_moved_source(b, expr);
+        if !borrow_result || may_need_synthetic_owner(expr) {
+            null_moved_source(b, expr);
+        }
     }
 }
 
 /// Load a joined value and attach the parallel ownership bit to the SSA result for its consumer.
-fn load_control_result(b: &mut Builder, ty: Ty, value_slot: Option<Slot>, flag_slot: Option<Slot>) -> Operand {
+fn load_control_result(
+    b: &mut Builder,
+    ty: Ty,
+    value_slot: Option<Slot>,
+    flag_slot: Option<Slot>,
+    temp_flag_slot: Option<Slot>,
+) -> Operand {
     let Some(value_slot) = value_slot else { return Operand::Const(Const::Unit) };
     let value = b.fresh_value(ty);
     b.push(Stmt::Let(value, Rvalue::Load(value_slot)));
@@ -1826,6 +2024,14 @@ fn load_control_result(b: &mut Builder, ty: Ty, value_slot: Option<Slot>, flag_s
         let flag = b.fresh_value(Ty::Bool);
         b.push(Stmt::Let(flag, Rvalue::Load(flag_slot)));
         b.attach_value_drop_flag(value, Operand::Value(flag));
+    }
+    if let Some(temp_flag_slot) = temp_flag_slot {
+        let flag = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(flag, Rvalue::Load(temp_flag_slot)));
+        b.attach_value_temp_drop_flag(value, Operand::Value(flag));
+    }
+    if let Some(owners) = b.ctx.slot_borrow_owners.get(&value_slot).cloned() {
+        b.attach_borrow_owners(value, owners);
     }
     Operand::Value(value)
 }
@@ -2176,7 +2382,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             }
         }
         hir::Stmt::Expr(e) => {
-            let _ = lower_expr(b, e);
+            // An otherwise-unused fresh Move value still owns resources. Route it through the same
+            // synthetic-owner path as a borrowing consumer, then end that ownership immediately.
+            // A bare bound local is classified as a borrowed place and remains untouched.
+            let op = lower_borrowed_owned(b, e);
+            if !b.is_terminated() {
+                drop_borrow_owners(b, &op);
+            }
         }
     }
 }
@@ -2396,6 +2608,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::PathComponent { kind, path } => {
             let po = lower_expr(b, path);
             let v = b.fresh_value(e.ty);
+            inherit_borrow_owners(b, v, [&po]);
             b.push(Stmt::Let(v, Rvalue::PathComponent { kind: *kind, path: po }));
             Operand::Value(v)
         }
@@ -2746,31 +2959,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::Closure { lifted: lifted.clone(), captures: ops, capture_tys }));
             Operand::Value(v)
         }
-        hir::ExprKind::CallFnValue { callee, args } => {
-            let c = lower_expr(b, callee);
-            // The function type for the indirect call comes from the (sema-checked) arg types and
-            // the call's result type — no signature table is threaded into MIR.
-            let (param_tys, ops): (Vec<Ty>, Vec<Operand>) =
-                args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
-            Operand::Value(v)
-        }
-        hir::ExprKind::Call { func, args, .. } => {
-            let ops = args.iter().map(|a| lower_expr(b, a)).collect();
-            // A by-value owned-array argument is moved into the callee: null the caller's slot.
-            // `print` / `hash64` / `hash128` only read their argument (they borrow the byte view),
-            // so they must not null the source — it keeps living (matching the borrow in sema).
-            if !matches!(func.as_str(), "print" | "hash64" | "hash128") {
-                for a in args {
-                    null_moved_source(b, a);
-                }
-            }
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops)));
-            Operand::Value(v)
-        }
-        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty),
+        hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
+        hir::ExprKind::Call { .. } => lower_direct_call(b, e),
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
         // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
         // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
         // headroom lesson: rustc reserves every arm's locals per level at opt-0).
@@ -2782,7 +2973,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::MakeEnum { enum_id: *enum_id, variant: *variant, payload: ops }));
             Operand::Value(v)
         }
-        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty),
+        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, false),
         hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
         hir::ExprKind::Field { root, path } => {
             let v = b.fresh_value(e.ty);
@@ -2913,7 +3104,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::OptionNone));
             Operand::Value(v)
         }
-        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, false),
         hir::ExprKind::ResultOk(inner) => {
             let op = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
@@ -2974,19 +3165,22 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let h = lower_expr(b, haystack);
             let n = lower_expr(b, needle);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::StrPredicate { kind: *kind, haystack: h, needle: n }));
+            b.push(Stmt::Let(v, Rvalue::StrPredicate { kind: *kind, haystack: h.clone(), needle: n.clone() }));
+            drop_borrow_owners(b, &h);
+            drop_borrow_owners(b, &n);
             Operand::Value(v)
         }
         hir::ExprKind::StrTrim { kind, recv } => {
             let r = lower_expr(b, recv);
             let v = b.fresh_value(e.ty);
+            inherit_borrow_owners(b, v, [&r]);
             b.push(Stmt::Let(v, Rvalue::StrTrim { kind: *kind, recv: r }));
             Operand::Value(v)
         }
         // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
         // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
         // `null_moved_source`), so its owner still `Drop`-frees it.
-        hir::ExprKind::StrBorrow(inner) => lower_expr(b, inner),
+        hir::ExprKind::StrBorrow(inner) => lower_borrowed_owned(b, inner),
         // `str.bytes()` is the same zero-cost descriptor retype in the other direction: `str` and
         // `slice<u8>` both lower as `{ptr,len}`. The HIR node retains borrow provenance; MIR needs
         // no instruction or runtime call.
@@ -3132,7 +3326,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayChunks { source, n, elem } => {
             // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
             let src = match source.ty {
-                Ty::Slice(_) | Ty::DynArray(_) => lower_expr(b, source),
+                Ty::Slice(_) => lower_expr(b, source),
+                Ty::DynArray(_) => lower_borrowed_owned(b, source),
                 _ => {
                     let (slot, len) = array_source_slot(b, source);
                     let sv = b.fresh_value(Ty::Slice(scalar_of(*elem)));
@@ -3142,6 +3337,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             let n_op = lower_expr(b, n);
             let v = b.fresh_value(e.ty);
+            inherit_borrow_owners(b, v, [&src]);
             b.push(Stmt::Let(v, Rvalue::Chunks { src, n: n_op, elem: *elem }));
             Operand::Value(v)
         }
@@ -3153,9 +3349,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::Len(inner) => {
             // `str`/`slice` carry the length in their `{ ptr, len }` view.
-            let sv = lower_expr(b, inner);
+            let sv = lower_borrowed_owned(b, inner);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::SliceLen(sv)));
+            b.push(Stmt::Let(v, Rvalue::SliceLen(sv.clone())));
+            drop_borrow_owners(b, &sv);
             Operand::Value(v)
         }
         hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
@@ -3264,6 +3461,54 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
     }
+}
+
+/// Lower an indirect call out-of-line so temporary-owner propagation does not enlarge the deeply
+/// recursive `lower_expr` stack frame (the `expr_depth` contract).
+#[inline(never)]
+fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::CallFnValue { callee, args } = &e.kind else {
+        unreachable!("lower_call_fn_value on a non-call expression");
+    };
+    let c = lower_expr(b, callee);
+    // The function type for the indirect call comes from the (sema-checked) arg types and the
+    // call's result type — no signature table is threaded into MIR.
+    let (param_tys, ops): (Vec<Ty>, Vec<Operand>) = args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
+    let v = b.fresh_value(e.ty);
+    inherit_borrow_owners(b, v, std::iter::once(&c).chain(ops.iter()));
+    b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
+    Operand::Value(v)
+}
+
+/// Lower a named call out-of-line for the same recursive-stack reason as
+/// [`lower_call_fn_value`]. Borrow-only intrinsics create synthetic owners for fresh arguments;
+/// ordinary owned arguments continue to transfer ownership to the callee.
+#[inline(never)]
+fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::Call { func, args, .. } = &e.kind else {
+        unreachable!("lower_direct_call on a non-call expression");
+    };
+    let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
+    let ops: Vec<_> = args
+        .iter()
+        .map(|a| if borrows_args { lower_borrowed_owned(b, a) } else { lower_expr(b, a) })
+        .collect();
+    // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
+    // source, matching their sema contract.
+    if !borrows_args {
+        for a in args {
+            null_moved_source(b, a);
+        }
+    }
+    let v = b.fresh_value(e.ty);
+    inherit_borrow_owners(b, v, &ops);
+    b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops.clone())));
+    if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples) {
+        for op in &ops {
+            drop_borrow_owners(b, op);
+        }
+    }
+    Operand::Value(v)
 }
 
 /// The i64 type used for array indices / loop counters.
@@ -3646,7 +3891,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         // pointer (the receiver-borrow of `rs[i].status()` etc. — `elem_ty` = `HttpResponse`). All by
         // `elem_ty` via `SliceIndex`.
         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
-            let sv = lower_expr(b, recv);
+            let sv = lower_borrowed_owned(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Src::Slice(sv), Operand::Value(len))
@@ -3659,9 +3904,20 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     };
     emit_bounds_check(b, &idx, len);
     let v = b.fresh_value(elem_ty);
+    let borrowed_src = match &src {
+        Src::Slice(sv) => Some(sv.clone()),
+        Src::Slot(_) => None,
+    };
     match src {
         Src::Slice(sv) => b.push(Stmt::Let(v, Rvalue::SliceIndex(sv, idx))),
         Src::Slot(slot) => b.push(Stmt::Let(v, Rvalue::Index(slot, idx))),
+    }
+    if let Some(src) = borrowed_src {
+        if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples) {
+            inherit_borrow_owners(b, v, [&src]);
+        } else {
+            drop_borrow_owners(b, &src);
+        }
     }
     Operand::Value(v)
 }
@@ -3779,7 +4035,7 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
             b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
             Operand::Value(v)
         }
-        _ => lower_expr(b, recv),
+        _ => lower_borrowed_owned(b, recv),
     };
     let base_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(base_len, Rvalue::SliceLen(base.clone())));
@@ -3800,6 +4056,7 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
     let new_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(new_len, Rvalue::Bin(BinOp::Sub, end_op, start_op.clone())));
     let v = b.fresh_value(result_ty);
+    inherit_borrow_owners(b, v, [&base]);
     b.push(Stmt::Let(v, Rvalue::SubSlice { base, start: start_op, len: Operand::Value(new_len), elem }));
     Operand::Value(v)
 }
@@ -3816,7 +4073,7 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
     // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
     let (struct_view, slice_val, slot, len) = match recv.ty {
         Ty::DynStructArray(_, layout) => {
-            let sv = lower_expr(b, recv);
+            let sv = lower_borrowed_owned(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Some((struct_id, layout)), Some(sv), 0, Operand::Value(len))
@@ -3842,14 +4099,23 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
     // pipeline's single-field seam stays untouched.
     let first_ty = if path.len() == 1 { leaf_ty } else { b.structs[struct_id as usize].fields[path[0] as usize].ty };
     let first = lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], first_ty);
-    if path.len() == 1 {
-        return Operand::Value(first);
+    let result = if path.len() == 1 {
+        first
+    } else {
+        let tmp = b.new_slot(first_ty);
+        b.push(Stmt::Store(tmp, Operand::Value(first)));
+        let leaf = b.fresh_value(leaf_ty);
+        b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
+        leaf
+    };
+    if let Some(source) = &slice_val {
+        if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples) {
+            inherit_borrow_owners(b, result, [source]);
+        } else {
+            drop_borrow_owners(b, source);
+        }
     }
-    let tmp = b.new_slot(first_ty);
-    b.push(Stmt::Store(tmp, Operand::Value(first)));
-    let leaf = b.fresh_value(leaf_ty);
-    b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
-    Operand::Value(leaf)
+    Operand::Value(result)
 }
 
 fn index_const(i: usize) -> Operand {
@@ -7455,6 +7721,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
         return Operand::Const(Const::Unit);
     }
     let inner_flag = lowered_drop_flag(b, inner, &r);
+    let inner_owners = b.borrow_owners(&r);
 
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
@@ -7485,26 +7752,31 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     if needs_drop_flag(ok_ty, &b.structs, &b.tuples)
         && let Some(flag) = inner_flag
     {
-        b.attach_value_drop_flag(v, flag);
+        b.attach_value_drop_flag(v, flag.clone());
+        // `?` consumes the Result payload even when the Result was a bound local, so a later
+        // borrowing consumer must treat the unwrapped owned value as its temporary responsibility.
+        b.attach_value_temp_drop_flag(v, flag);
     }
+    b.attach_borrow_owners(v, inner_owners);
     null_moved_source(b, inner);
     Operand::Value(v)
 }
 
 /// `opt else fallback` → branch on the Option tag; `Some` unwraps the payload into the
 /// result slot, `None` evaluates the fallback (which writes the slot or diverges).
-fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty) -> Operand {
+fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty, borrow_result: bool) -> Operand {
     // `else` unwraps an `Option` (Some/None) or a `Result` (Ok/Err) — the same two-way shape, just
     // a different discriminant/unwrap rvalue. The `Err` case discards the error; sema restricts the
     // error to a Copy scalar, so there is nothing to drop on the fallback path (a bound-local
     // scrutinee with a Move *Ok* payload is nulled below, exactly like `Option<string>`).
     let is_result = matches!(opt.ty, Ty::Result(..));
-    let (result_slot, result_flag) = control_result_slots(b, ty);
+    let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
     let opt_op = lower_expr(b, opt);
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
     }
     let opt_flag = lowered_drop_flag(b, opt, &opt_op);
+    let opt_owners = b.borrow_owners(&opt_op);
 
     let is_pos = b.fresh_value(Ty::Bool);
     let test = if is_result { Rvalue::ResultIsOk(opt_op.clone()) } else { Rvalue::OptionIsSome(opt_op.clone()) };
@@ -7522,10 +7794,23 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     let val = b.fresh_value(ty);
     let unwrap = if is_result { Rvalue::ResultUnwrapOk(opt_op) } else { Rvalue::OptionUnwrap(opt_op) };
     b.push(Stmt::Let(val, unwrap));
+    b.attach_borrow_owners(val, opt_owners);
     if let Some(flag_slot) = result_flag {
+        b.push(Stmt::Store(flag_slot, opt_flag.clone().unwrap_or(Operand::Const(Const::Bool(false)))));
+    }
+    if let Some(flag_slot) = result_temp_flag {
+        // Unwrapping consumes the positive payload; unlike a direct local borrow, the result now
+        // needs a temporary owner if the payload is individually owned.
         b.push(Stmt::Store(flag_slot, opt_flag.unwrap_or(Operand::Const(Const::Bool(false)))));
     }
     if let Some(result_slot) = result_slot {
+        let owners = b.borrow_owners(&Operand::Value(val));
+        let result_owners = b.ctx.slot_borrow_owners.entry(result_slot).or_default();
+        for owner in owners {
+            if !result_owners.contains(&owner) {
+                result_owners.push(owner);
+            }
+        }
         b.push(Stmt::Store(result_slot, Operand::Value(val)));
     }
     null_moved_source(b, opt);
@@ -7536,24 +7821,24 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     b.cur = none_bb;
     let fb = lower_expr(b, fallback);
     if !b.is_terminated() {
-        store_control_result(b, result_slot, result_flag, fallback, fb);
+        store_control_result(b, result_slot, result_flag, result_temp_flag, fallback, fb, borrow_result);
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = join_bb;
-    load_control_result(b, ty, result_slot, result_flag)
+    load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
 /// `match scrutinee { … }`: lower per scrutinee kind — a user `enum` (a tag-compare chain over the
 /// non-union struct) or builtin `Option`/`Result` (a single 2-way branch on `IsSome`/`IsOk`).
-fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty) -> Operand {
+fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty, borrow_result: bool) -> Operand {
     // A zero-arm `match` is already a (non-exhaustive) sema error; lower the scrutinee for its
     // effects and yield unit so we never panic on the indexing below.
     if arms.is_empty() {
         lower_expr(b, scrutinee);
         return Operand::Const(Const::Unit);
     }
-    let (result_slot, result_flag) = control_result_slots(b, ty);
+    let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
     let scrut = lower_expr(b, scrutinee);
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
@@ -7562,22 +7847,46 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     let join_bb = b.new_block();
     match scrutinee.ty {
         Ty::Enum(enum_id) => {
-            lower_match_enum(b, enum_id, arms, &scrut, (result_slot, result_flag, join_bb), scrutinee, scrut_flag)
+            lower_match_enum(
+                b,
+                enum_id,
+                arms,
+                &scrut,
+                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                scrutinee,
+                scrut_flag,
+            )
         }
         Ty::Option(_) | Ty::Result(..) => {
-            lower_match_binary(b, scrutinee.ty, arms, &scrut, (result_slot, result_flag, join_bb), scrutinee, scrut_flag)
+            lower_match_binary(
+                b,
+                scrutinee.ty,
+                arms,
+                &scrut,
+                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                scrutinee,
+                scrut_flag,
+            )
         }
         // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
     b.cur = join_bb;
-    load_control_result(b, ty, result_slot, result_flag)
+    load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
-fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
-    let (result_slot, result_flag, join_bb) = target;
+fn lower_match_enum(
+    b: &mut Builder,
+    enum_id: u32,
+    arms: &[hir::MatchArm],
+    scrut: &Operand,
+    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    scrutinee: &hir::Expr,
+    scrut_flag: Option<Operand>,
+) {
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -7616,7 +7925,7 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
         if !arm.bindings.is_empty() {
             null_moved_source(b, scrutinee);
         }
-        finish_arm(b, &arm.body, result_slot, result_flag, join_bb);
+        finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
@@ -7624,20 +7933,28 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
     if !d.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &d.body, result_slot, result_flag, join_bb);
+    finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
 }
 
 /// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
 /// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
 /// (matching `match_variants`); either side may be the `_` wildcard.
-fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, target: (Option<Slot>, Option<Slot>, BlockId), scrutinee: &hir::Expr, scrut_flag: Option<Operand>) {
-    let (result_slot, result_flag, join_bb) = target;
+fn lower_match_binary(
+    b: &mut Builder,
+    ty: Ty,
+    arms: &[hir::MatchArm],
+    scrut: &Operand,
+    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    scrutinee: &hir::Expr,
+    scrut_flag: Option<Operand>,
+) {
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
-        finish_arm(b, &pos.body, result_slot, result_flag, join_bb);
+        finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         return;
     }
     let cond = b.fresh_value(Ty::Bool);
@@ -7656,13 +7973,13 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
     if !pos.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &pos.body, result_slot, result_flag, join_bb);
+    finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
     if !neg.bindings.is_empty() {
         null_moved_source(b, scrutinee);
     }
-    finish_arm(b, &neg.body, result_slot, result_flag, join_bb);
+    finish_arm(b, &neg.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
 }
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
@@ -7694,10 +8011,18 @@ fn bind_local(b: &mut Builder, local: u32, rv: Rvalue, inherited_flag: Option<Op
 }
 
 /// Lower an arm body and, unless it diverged, store the value into the result slot and jump to join.
-fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, result_flag: Option<Slot>, join_bb: BlockId) {
+fn finish_arm(
+    b: &mut Builder,
+    body: &hir::Expr,
+    result_slot: Option<Slot>,
+    result_flag: Option<Slot>,
+    result_temp_flag: Option<Slot>,
+    join_bb: BlockId,
+    borrow_result: bool,
+) {
     let av = lower_expr(b, body);
     if !b.is_terminated() {
-        store_control_result(b, result_slot, result_flag, body, av);
+        store_control_result(b, result_slot, result_flag, result_temp_flag, body, av, borrow_result);
         b.terminate(Term::Goto(join_bb));
     }
 }
@@ -7821,11 +8146,14 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
     b.cur = header;
-    b.loops.push(LoopFrame { exit, result_slot, iter_drops: iter_drops.clone() });
+    b.loops.push(LoopFrame { exit, result_slot, iter_drops });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
     // and clear their flags, then loop back.
     if !b.is_terminated() {
+        // Lowering may have discovered synthetic owners inside the body. Read the final frame
+        // rather than the pre-body snapshot so those owners are also released on the back-edge.
+        let iter_drops = b.loops.last().expect("loop frame remains active").iter_drops.clone();
         for s in &iter_drops {
             b.emit_drop_if_live(*s);
         }
@@ -7856,8 +8184,9 @@ fn lower_if(
     then: &hir::Block,
     els: &hir::Block,
     ty: Ty,
+    borrow_result: bool,
 ) -> Operand {
-    let (result_slot, result_flag) = control_result_slots(b, ty);
+    let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
 
     let c = lower_expr(b, cond);
     if b.is_terminated() {
@@ -7874,7 +8203,7 @@ fn lower_if(
         if let Some(op) = tv
             && let Some(value) = &then.value
         {
-            store_control_result(b, result_slot, result_flag, value, op);
+            store_control_result(b, result_slot, result_flag, result_temp_flag, value, op, borrow_result);
         }
         b.terminate(Term::Goto(join_bb));
     }
@@ -7885,13 +8214,13 @@ fn lower_if(
         if let Some(op) = ev
             && let Some(value) = &els.value
         {
-            store_control_result(b, result_slot, result_flag, value, op);
+            store_control_result(b, result_slot, result_flag, result_temp_flag, value, op, borrow_result);
         }
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = join_bb;
-    load_control_result(b, ty, result_slot, result_flag)
+    load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
 }
 
 /// A short type name used in MIR text / diagnostics.

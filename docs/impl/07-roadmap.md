@@ -1045,7 +1045,8 @@ Its P0 slices precede any SIMD or parallel widening; it adds no source syntax.
 `13-string-array-allocation-short-input-audit.md` is the durable follow-up for text and array
 ownership, allocation count, copy count, and `0..64` behavior. C0 first restores UTF-8 slice
 boundaries and settled concat rejection, then gives unbound owned expression temporaries
-view-aware lifetime/drop handling and removes the arena-free template lifetime leak. Confirmed
+view-aware lifetime/drop handling (**shipped 2026-07-15**) and removes the arena-free template
+lifetime leak. Confirmed
 implementation work then removes borrowed-path copies, builder freeze copies, staged directory/DNS/
 path/group outputs, and direct-consumer chunk headers. UTF-8 crossovers, repeated-needle plans, JSON
 escape SIMD, and large constant arrays remain measure-first. Its language-surface section contains
@@ -1219,8 +1220,8 @@ untrustworthy-size files). **`std.path`/`std.env`/`std.time`** round-trip (`join
 §18.2) backs every fallible call across the fallible modules (std.io, std.fs, and std.env). **v1 restrictions, not blockers:** each
 owned handle passed to `io.copy` must be a bound local (the `io.std*` streams are exempt — the
 bound-receiver restriction, which also covers a bound `.buffered()` writer); and an unbound Move
-*temporary* isn't dropped yet, so a one-shot `io.stdout.write(x)?` leaks its small handle (any bound
-handle drops correctly) — a general MIR gap, not std.io-specific. **Not blockers, tracked as post-M9
+*temporary* was not dropped at the M9 milestone; the general synthetic-owner fix shipped
+2026-07-15 (the bound-receiver surface restriction remains separate). **Not blockers, tracked as post-M9
 backlog** (own subsection below): `io.copy` syscall fast paths (`sendfile`/`splice`/`io_uring`), no
 `SIGBUS` handler on post-`mmap` truncation, non-UTF-8 filenames from `read_dir` (a caveat for
 downstream `string` ops that assume UTF-8), Move-temporary dropping, streaming×pipeline integration,
@@ -1249,9 +1250,9 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   expression once it is implemented, per the 2026-07-09 sequential-control decision), plus
   per-method tests (EOF, `NotFound`/`Denied`
   mapping, `io.stdin`, moved-reader rejection, buffer-view escape rejection) — `tests/m9_io.rs`.
-  Known minor gap (a general MIR limitation, not std.io-specific): an **unbound Move temporary**
-  isn't dropped, so a one-shot `io.stdout.write(x)?` leaks its ~40-byte writer handle (bound writers
-  / readers / buffers drop correctly); the fix is dropping Move temporaries, a separate improvement.
+  Historical minor gap (fixed 2026-07-15): an **unbound Move temporary** lacked a synthetic Drop.
+  General expression temporaries now clean up path-locally; the v1 bound-receiver rule for owned
+  handles remains a separate source-surface restriction.
 - **Slice 2 — `io.copy` — DONE.** `io.copy(r: reader, w: writer) -> Result<i64, Error>`, the
   portable fixed-buffer loop (`align_rt_io_copy`: a 64 KiB transfer buffer matching `BUF_WRITER_CAP`,
   read→write with `EINTR` retry + partial-write handling shared with `writer.write`, errno
@@ -1334,8 +1335,8 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
 - **Non-UTF-8 path/file names** — `fs.read_dir` stores each entry's raw OS bytes losslessly into an
   Align `string` (Unix filenames are not guaranteed valid UTF-8); this is a caveat for any later
   `string` operation that assumes valid UTF-8, not yet resolved.
-- **Move-temporary drop** — an unbound Move temporary (e.g. a one-shot `io.stdout.write(x)?`) isn't
-  dropped and leaks its handle; a general MIR improvement, not std.io-specific (Slice 1 known gap).
+- **Move-temporary drop — DONE 2026-07-15.** Unbound Move expressions have path-local synthetic
+  owners with view retention and per-iteration cleanup. The bound-receiver rule remains separate.
 - **Streaming × pipeline integration** — a `reader`/`writer` as a `map`/`where`/`reduce` pipeline
   source/sink is not wired up.
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
@@ -1406,8 +1407,8 @@ handles (each swept through every pass, the reader/writer discipline). Full API 
   index). `get_str` returns a `str` **view** into `parsed` (region-bound — a `Frame` view, so an
   escape is a compile error; `.clone()` copies out — the #297 arm). v1 bound-receiver gate: an owned
   handle temporary cannot be a method receiver (the `check_reader_method` precedent), so
-  `cli.command("x").flag_bool("v")` and `c.parse(args)?.get_bool("v")` are rejected until Move-
-  temporary drops land; `flag_*` do **not** require `mut` (mutate in place through the handle, like a
+  `cli.command("x").flag_bool("v")` and `c.parse(args)?.get_bool("v")` remain rejected by the v1
+  receiver surface even though general Move-temporary drops landed 2026-07-15; `flag_*` do **not** require `mut` (mutate in place through the handle, like a
   `buffer`). v1 argv grammar: `--name` (bool), `--name value`, `--name=value` (str/i64); `args[0]` is
   the program name, skipped. All cli ops are **Pure** (no syscalls — argv is already captured).
   Implementation: sema builtin dispatch (`import std.cli`) + HIR `CliCommand`/`CliFlag`/`CliParse`/
@@ -1763,7 +1764,8 @@ and http last (needs net + TLS).
 The M12 set = the align-LLM runway A-list remainder (`open-questions.md` Open → "align-LLM
 runway"; A1–A3 + A5's server half shipped pre-M12 as #399/#401/#402/#409). Items marked
 *(general)* are ordinary fast-systems needs, not engine-specific. Both new Move types inherit
-the standing v1 bind-to-local rule (unbound Move temporaries have no Drop). **All slices resolved:**
+the standing v1 bind-to-local receiver rule (general unbound Move Drop landed later, on 2026-07-15).
+**All slices resolved:**
 A4 offset file I/O (#413), A6 `array_builder<T>` (#414), A7 streaming line reads (#415), A8
 per-request arena reuse (#416, measured-below-gate record-and-close — the drop-the-re-zero
 follow-up carries the 13.5× upper bound), A5-SSE `respond_stream`/`http_stream` (#417). With this,

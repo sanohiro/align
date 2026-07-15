@@ -709,7 +709,10 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
 /// Whether a value may borrow storage owned by another local. This is intentionally narrower than
 /// Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`, a
 /// borrowed reader/writer, and aggregates containing those views carry borrow provenance.
-fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+/// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
+/// same recursive classification when deciding whether an indexed result retains a synthetic
+/// temporary owner or can release it immediately after a scalar load.
+pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     match ty {
         Ty::Str
         | Ty::Slice(_)
@@ -4236,6 +4239,9 @@ struct EscapeFlowBlock<'a> {
 #[derive(Clone, Copy)]
 enum EscapeFlowOp<'a> {
     Stmt(&'a Stmt, u32),
+    /// Record heap-vs-arena provenance even when an owned expression is not assigned to a local.
+    /// MIR needs this for synthetic owners of directly consumed temporaries.
+    DropProvenance(&'a Expr, u32),
     MatchBindings {
         scrutinee: &'a Expr,
         bindings: &'a [LocalId],
@@ -4396,6 +4402,9 @@ impl<'a> EscapeCheck<'a> {
         self.state = state.clone();
         match op {
             EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
+            EscapeFlowOp::DropProvenance(expr, depth) => {
+                self.drop_is_individual(expr, depth);
+            }
             EscapeFlowOp::MatchBindings {
                 scrutinee,
                 bindings,
@@ -4686,6 +4695,36 @@ impl<'a> EscapeCheck<'a> {
             .is_some_and(|l| self.mentions_slice(l.ty))
     }
 
+    /// Whether a value used through a borrow owns anonymous storage that a MIR synthetic owner will
+    /// release in this frame. Bound places borrow their existing owner; fresh producers and any
+    /// control-flow expression that may select one are frame-capped so a derived view cannot escape
+    /// and dangle when the hidden owner is dropped.
+    fn unbound_owned_temporary(&self, e: &Expr) -> bool {
+        if !needs_drop_flag(e.ty, self.structs, self.tuples) {
+            return false;
+        }
+        match &e.kind {
+            ExprKind::Local(_)
+            | ExprKind::Field { .. }
+            | ExprKind::TupleIndex { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::ElemField { .. } => false,
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                block.value.as_ref().is_some_and(|value| self.unbound_owned_temporary(value))
+            }
+            _ => true,
+        }
+    }
+
+    fn borrowed_storage_region(&self, owner: &Expr, depth: u32) -> Region {
+        let region = self.region_of(owner, depth);
+        if self.unbound_owned_temporary(owner) {
+            region.shorter(Region::Frame)
+        } else {
+            region
+        }
+    }
+
     /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
     /// self-contained, arena-only value into one whose columns hold zero-copy `str` views borrowing
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
@@ -4761,7 +4800,7 @@ impl<'a> EscapeCheck<'a> {
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
-            ExprKind::ElemField { recv, .. } => self.region_of(recv, depth),
+            ExprKind::ElemField { recv, .. } => self.borrowed_storage_region(recv, depth),
             // `s[i]` on a `soa` *gathers* a whole struct. A primitive-only struct is copied
             // column-by-column into a fresh POD value that borrows nothing → `Static` (returnable).
             // A struct with a `str` column gathers `str` views that borrow the soa's buffer/input,
@@ -4773,11 +4812,11 @@ impl<'a> EscapeCheck<'a> {
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
-            ExprKind::Index { recv, .. } => self.region_of(recv, depth),
+            ExprKind::Index { recv, .. } => self.borrowed_storage_region(recv, depth),
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
-            ExprKind::SliceRange { recv, .. } => self.region_of(recv, depth),
+            ExprKind::SliceRange { recv, .. } => self.borrowed_storage_region(recv, depth),
             // An array literal lives as long as its shortest-lived element — a `[str]` of arena
             // `str` views is arena-regioned (the same rule as a struct literal over its fields). A
             // Move-struct array literal, however, *owns* its elements' heap buffers (its `.clone()`
@@ -4816,7 +4855,7 @@ impl<'a> EscapeCheck<'a> {
                 .shorter(self.region_of(source, depth)),
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
-            ExprKind::ArrayToSlice(inner) => self.region_of(inner, depth),
+            ExprKind::ArrayToSlice(inner) => self.borrowed_storage_region(inner, depth),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -5142,7 +5181,7 @@ impl<'a> EscapeCheck<'a> {
                 .map_or(Region::Static, |d| Region::Frame.shorter(Region::arena(*d))),
             ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => Region::Frame,
             ExprKind::ArrayLit { .. } => Region::Frame.shorter(Region::arena(depth)),
-            _ => self.region_of(source, depth),
+            _ => self.borrowed_storage_region(source, depth),
         }
     }
 
@@ -6256,6 +6295,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
+        }
+        if needs_drop_flag(e.ty, self.structs, self.tuples) {
+            self.push_flow_op(EscapeFlowOp::DropProvenance(e, depth));
         }
     }
 }
