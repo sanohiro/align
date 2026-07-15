@@ -2565,8 +2565,12 @@ implementation NOT started).** Per-question decisions:
    relinks, all dependents hit (THE headline win). The interface hash INCLUDES effect bits and
    generic template bodies — the two places an "implementation-only" edit is actually an
    interface change; both lenses independently flagged this as the most likely place to get
-   the invalidation boundary wrong. Action keys: frontend = unit source hash · direct-dep
-   interface hashes · builtin schema · frontend schema id; codegen = doc-10 §6.2 per unit
+   the invalidation boundary wrong. Action keys: frontend = unit source hash · **transitive**-dep
+   interface hashes (corrected 2026-07-15 by the S3 design review — this line originally said
+   "direct-dep", a stale-check hole as written: interface hashes do NOT chain, foreign type refs
+   are rendered by name, so a transitive-only dep's `pub` change must invalidate the top consumer;
+   the shipped `PerUnitCheck` already records the transitive set, per the S1b gate (2))
+   · builtin schema · frontend schema id; codegen = doc-10 §6.2 per unit
    (+ rt-lto bitcode digest + the empty-in-v1 cross-unit-opt digest); link = doc-10 §6.3
    (ordered object digests · runtime CONTENT digest replacing the mtime check · format/flags/
    linker identity · deterministic capability union). Atomic publication extends the shipped
@@ -2763,6 +2767,84 @@ whole-build `pub` internalization, cross-host executable caching, manifest/packa
 units, caching failed frontend results (blocked on the doc-10 §5 diagnostic-determinism fix),
 escape precision bits (borrows-arg-i/returns-fresh), the generic-over-generic fix, and
 `extern "C"` body export.
+
+**M15 S3 design SETTLED (2026-07-15, two-lens review — soundness/key-correctness +
+driver/cache-layout/scheduling/observability — integrated; this record is the S3 implementation
+source of truth).**
+
+- **v1 caches the CODEGEN stage only: per-unit object bytes.** `walk_per_unit` (sema + lowering)
+  always runs — it is cheap relative to LLVM optimize+emit and it *produces* the key inputs
+  (`impl_hash`, interface hashes); frontend caching would also collide with the doc-10 §5
+  failed-diagnostics nondeterminism blocker, so it is deferred whole. Link always re-runs
+  (executable caching is host-local/non-hermetic, low value; object CAS is the portable
+  high-value layer — its key is not weakened chasing a link hit). The headline win falls out:
+  a private-body edit flips only that unit's `impl_hash` → only its object misses; dependents'
+  keys (own MIR digest + transitive dep INTERFACE hashes, which a private edit leaves
+  byte-identical) are unchanged → hit; relink.
+- **Cache location/layout:** user-level cache `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema-ver>/`
+  with `ALIGNC_CACHE=<path>` relocate and `ALIGNC_CACHE=off` disable (per-project `.align-cache`
+  rejected: source-tree litter, no cross-checkout sharing). `cas/<digest[0..2]>/<digest>` =
+  immutable blobs; `actions/codegen/<key-digest>` = a tiny versioned manifest holding the result
+  digest PLUS the decomposed key components (what makes first-differing-component miss reasons
+  possible). Manifest = the repo's hand-rolled versioned length-prefixed fail-closed codec
+  (`align_interface::codec` style), never JSON. Eviction: none in v1 (doc-10: bounded eviction
+  only after correctness + telemetry).
+- **Codegen action key, v1 components (doc-10 §6.2):** cache-format version · compiler build id ·
+  frontend schema id (which also namespaces located vs normal MIR, so an `explain-opt`-shaped
+  entry can never be shared) · the unit's `impl_hash` (stable location-free MIR print; its
+  Vec-index type ids are cross-process-deterministic — doc-10 §4's byte-identity evidence — and
+  SV pins this with an explicit cross-process `impl_hash` stability gate) · explicit export/root
+  set · target triple + object format · RESOLVED cpu + feature set (never the string `native`;
+  codegen already resolves via `get_host_cpu_name`/`get_host_cpu_features`) · profile + pass
+  pipeline + TargetMachine opt level · reloc/code model · exact LLVM version · rt-lto mode +
+  merged-bitcode digest · the empty-in-v1 cross-unit-opt digest. `impl_hash` is one component,
+  never the whole key; any lowering change that could renumber type ids also flips the compiler
+  build id, so no stale reuse.
+- **Fail-closed matrix:** digest-verify every CAS read → mismatch = unlink + miss + rebuild +
+  an always-on stderr corruption note (not hidden behind `--cache-stats`); publish = private
+  `ArtifactStage` staging + same-directory atomic rename (a partial entry is never visible; an
+  interrupted publish never creates a hit — the C0 pattern per entry); version/schema skew =
+  key components (old entries simply unreferenced) + fail-closed versioned manifest decode;
+  concurrent same-key producers = both stage privately, atomic-rename last-writer-wins over
+  byte-identical content (determinism), no lock needed for correctness.
+- **Hash decision (recorded deviation from the `hash.rs` header intent, owner-visible):** v1
+  keys AND CAS addressing stay on the in-tree 128-bit wyhash `Hash128` — the cache is local and
+  non-adversarial (birthday bound ≈ 2^64 keys; ~10^6 lifetime artifacts ⇒ P(collision) ≈ 10^-27),
+  and a real BLAKE3/SHA-256 would be a new dependency the repo forbids without need. FIRM
+  recorded trigger: any shared / cross-host / networked cache MUST first swap to a cryptographic
+  256-bit digest (one-type swap behind `Hash128` + a cache schema-ver bump). Digest-verify does
+  NOT protect against key collision (a collision is a "valid" entry) — width is the protection;
+  that is why the trigger is firm.
+- **Parallel compilation:** sema stays serial (bottom-up DAG order, mutates shared walk state);
+  unit CODEGEN parallelizes over cache MISSES only via `std::thread::scope` (no rayon — first
+  compiler-side threading; fresh LLVM `Context` per entry verified). Required serializations:
+  LLVM target-init once on the main thread before the scope; `explain-opt` stays serial
+  (process-global remark cl::opts). Determinism: results collect into a Vec indexed by DAG
+  position; capability union + link order iterate DAG index order, never completion order.
+  `-j N` flag + `ALIGNC_JOBS`, default `available_parallelism()`.
+- **Observability from slice 1:** the build API returns structured
+  `CacheOutcome { stage, unit, hit, miss_reason: Option<FirstDiff> }` where `FirstDiff` names the
+  first differing key component (diffed against the manifest's decomposed components) — tests
+  assert the enum, never elapsed time. Human surface: silent on all-hit; `--cache-stats`
+  (build/run/size) prints per-unit hit/miss(reason) lines + summary counts.
+- **CLI surface:** cache applies to `build`/`run`/`size`/`emit-obj` (`--export` folds into the
+  key); `emit-llvm`/`emit-mir` (diagnostic truth lenses), `explain-opt` (serial, located
+  namespace), and `check`/`check-per-unit`/`emit-interface` (frontend-only) stay uncached by
+  design. `alignc cache clear` ships in S3b.
+- **Rollout: S3a** = cache substrate (`align_driver::cache`) + serial codegen-stage cache +
+  `CacheOutcome`/`FirstDiff` model + the gate net, **opt-in** (`ALIGNC_CACHE=on`); **S3b** =
+  parallel codegen + `--cache-stats`/`-j`/`cache clear` + the runtime-archive freshness check
+  upgraded mtime → content digest (also kills the recorded post-merge `cargo test` staleness
+  papercut) + **default-ON flip gated on the cold-vs-hit byte-identity gate**. The `off` hatch is
+  doc-10-mandated operability, not a compat shim — a disabled cache is an always-miss lookup on
+  the one code path. N=1 byte-identity and `multi_unit_dag_builds_byte_identically_twice` stay
+  green throughout: the miss path is today's codegen verbatim; the hit path is digest-verified
+  identical bytes.
+- **SV additions demanded by this review:** the cross-process `impl_hash` stability pin (the one
+  place a future lowering change could silently introduce a stale hit); transitive A→B→C
+  invalidation (C `pub`-signature change forces A's miss; C private-body edit does not);
+  an absent/stale-interface fail-closed mutation. Also recorded: doc-10 §3's code pointers
+  (`build_to`, `main.rs#L307–346`) are stale post-S2b — update them when S3a touches the driver.
 
 ## Design Issues to Settle in Parallel
 
