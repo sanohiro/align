@@ -18662,6 +18662,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// Linux-only (uses `/proc/self/fd`); a no-op elsewhere.
     #[test]
     fn http_server_no_fd_leak_across_cycles() {
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let count_fds = || -> Option<usize> { std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count()) };
         let Some(before) = count_fds() else { return }; // not Linux — skip
         let port = free_loopback_port();
@@ -18677,7 +18678,19 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             let _ = client.join();
         }
         unsafe { align_rt_http_server_free(srv) };
-        let after = count_fds().unwrap();
+        let Some(mut after) = count_fds() else { return };
+        // Other tests in this binary share the process fd table. Give transient parallel network
+        // activity a short, fixed window to drain, retaining the lowest observed count. A real leak
+        // from these cycles remains open across every sample, so the +2 threshold is unchanged.
+        for _ in 0..20 {
+            if after <= before + 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(fds) = count_fds() {
+                after = after.min(fds);
+            }
+        }
         // Allow a small slack for runtime bookkeeping, but a per-cycle leak (12+) must not show.
         assert!(after <= before + 2, "fd leak across accept/respond cycles: {before} -> {after}");
     }
