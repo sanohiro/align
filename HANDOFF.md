@@ -9,7 +9,7 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-15 (fourteenth update this day), **VALUE-CARRYING CONTROL FLOW PRESERVES
-CLEANUP PROVENANCE — READY FOR PR** (workspace **2137 green** = 2136 passed + one ignored manual
+CLEANUP PROVENANCE — MERGED as #466** (workspace **2137 green** = 2136 passed + one ignored manual
 probe; clippy `-D warnings` clean). The exhaustive 5×2 spec/test matrix now covers region composition
 and owned move/drop behavior for block / `if` / `match` / `else`-unwrap / `?`. All five region cells
 and block cleanup were already sound; the audit found four real heap-leak gaps where `if`, `match`,
@@ -19,8 +19,13 @@ parallel ownership bit beside each owned control result and forwards it to the c
 local moves still transfer their path-local flag, and moved sources are cleared on the selected
 edge. The mandatory self-review also added missing terminated-block guards after a diverging `if`
 condition, `else` operand, or `?` operand. Ten dedicated regression cells, the complete workspace,
-and clippy are green. No mandatory implementation slice remains queued; fully-escaping function
-values stay deferred pending a consumer and settled heap-owned environment/drop semantics. Previous
+and clippy are green. Gemini's one high finding covered the same `lower_if` guard on both arms. The
+claimed terminator overwrite was already prevented by `Builder::terminate`, but the structural
+hardening was valid and applied so a diverged arm performs neither a result store nor a join
+termination attempt. Both inline threads were answered and resolved, and an English review-response
+and validation comment was posted before squash merge. No mandatory implementation slice remains
+queued; fully-escaping function values stay deferred pending a consumer and settled heap-owned
+environment/drop semantics. Previous
 update: 2026-07-15 (thirteenth update this day), **FUNCTION-VALUE PURITY IS TYPE-BORNE — MERGED as
 #465** (workspace **2127 green** = 2126 passed + one ignored manual probe; clippy
 `-D warnings` clean). Every concrete function value and fn-typed local now has an internal

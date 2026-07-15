@@ -7876,23 +7876,25 @@ fn lower_if(
 
     b.cur = then_bb;
     let tv = lower_block(b, then);
-    if !b.is_terminated()
-        && let Some(op) = tv
-        && let Some(value) = &then.value
-    {
-        store_control_result(b, result_slot, result_flag, value, op);
+    if !b.is_terminated() {
+        if let Some(op) = tv
+            && let Some(value) = &then.value
+        {
+            store_control_result(b, result_slot, result_flag, value, op);
+        }
+        b.terminate(Term::Goto(join_bb));
     }
-    b.terminate(Term::Goto(join_bb));
 
     b.cur = else_bb;
     let ev = lower_block(b, els);
-    if !b.is_terminated()
-        && let Some(op) = ev
-        && let Some(value) = &els.value
-    {
-        store_control_result(b, result_slot, result_flag, value, op);
+    if !b.is_terminated() {
+        if let Some(op) = ev
+            && let Some(value) = &els.value
+        {
+            store_control_result(b, result_slot, result_flag, value, op);
+        }
+        b.terminate(Term::Goto(join_bb));
     }
-    b.terminate(Term::Goto(join_bb));
 
     b.cur = join_bb;
     load_control_result(b, ty, result_slot, result_flag)

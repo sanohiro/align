@@ -37,7 +37,7 @@ while diagnostics replay once in source order. Function-value effects shipped as
 `FnTy` entries carry inferred `Pure` / `Impure` / `Unknown`, mutable locals join assigned targets,
 imported summaries and FFI pointers use the same representation, and indirect consumers read the
 type bit instead of treating address-taking as a call edge. Unknown HOF parameters remain
-fail-closed. The value-carrying-control-flow matrix is now complete: `draft.md` records region
+fail-closed. The value-carrying-control-flow matrix shipped as #466: `draft.md` records region
 composition and owned move/drop behavior for block / `if` / `match` / `else`-unwrap / `?`, and the
 10-cell regression file pins both facts for every form. The audit closed four heap-leak gaps by
 carrying the selected arm's individual-vs-arena bit through the same MIR join as its value. No
