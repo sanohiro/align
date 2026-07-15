@@ -17,11 +17,11 @@ borrowed bound local, preventing both leaks and double frees. Escape analysis ca
 owned storage at `Frame`, so returning a dangling `str`, subslice, or chunk element is rejected.
 Synthetic owners participate in per-iteration, `break`, return, and early-error cleanup, and entry
 initialization makes sibling paths safe. The original five optimized-IR leak shapes now contain
-exactly five frees; seven dedicated regressions cover producers, scalar/index/view/call consumers,
+exactly five frees; eight dedicated regressions cover producers, scalar/index/view/call consumers,
 mixed control flow, `?`, rejected escapes, and 20,000 loop iterations. Self-review caught and fixed
 a compiler stack regression by boxing the new bookkeeping in `BuilderCtx` and keeping call lowering
 out of the giant recursive frame; all five expression-depth gates pass. The complete workspace is
-green (**2149 total = 2148 passed + one ignored manual probe**) and workspace clippy passes with
+green (**2150 total = 2149 passed + one ignored manual probe**) and workspace clippy passes with
 warnings denied. **Next recommended pipeline item:** consumer-gated lazy multi-source `zip`, starting
 with 2+ equal-length Copy-scalar arrays/slices and allocation-free fused terminals. Previous update:
 2026-07-15 (eighteenth update this day), **THE ZERO-COPY STRING BYTE VIEW IS

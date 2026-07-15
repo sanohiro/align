@@ -1542,15 +1542,15 @@ impl Builder {
     }
 
     /// Allocate a path-local hidden owner for an unbound Move temporary. Its initialisation is
-    /// prepended to entry after lowering, while its cleanup participates in every active loop so a
-    /// temporary created per iteration cannot accumulate until function exit.
+    /// prepended to entry after lowering, while its cleanup participates in the innermost active
+    /// loop so a temporary created per iteration cannot accumulate until function exit.
     fn new_synthetic_owner(&mut self, ty: Ty) -> Slot {
         let owner = self.new_slot(ty);
         let flag = self.new_slot(Ty::Bool);
         self.drop_flags[owner as usize] = Some(flag);
         self.drop_locals.push(owner);
         self.ctx.synthetic_drop_slots.push(owner);
-        for frame in &mut self.loops {
+        if let Some(frame) = self.loops.last_mut() {
             frame.iter_drops.push(owner);
         }
         owner
@@ -1951,10 +1951,10 @@ fn drop_borrow_owners(b: &mut Builder, operand: &Operand) {
     }
 }
 
-fn inherit_borrow_owners(b: &mut Builder, value: ValueId, operands: impl IntoIterator<Item = Operand>) {
+fn inherit_borrow_owners<'a>(b: &mut Builder, value: ValueId, operands: impl IntoIterator<Item = &'a Operand>) {
     let mut owners = Vec::new();
     for operand in operands {
-        for owner in b.borrow_owners(&operand) {
+        for owner in b.borrow_owners(operand) {
             if !owners.contains(&owner) {
                 owners.push(owner);
             }
@@ -2608,8 +2608,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::PathComponent { kind, path } => {
             let po = lower_expr(b, path);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::PathComponent { kind: *kind, path: po.clone() }));
-            inherit_borrow_owners(b, v, [po]);
+            inherit_borrow_owners(b, v, [&po]);
+            b.push(Stmt::Let(v, Rvalue::PathComponent { kind: *kind, path: po }));
             Operand::Value(v)
         }
         // `path.normalize(p)` → an owned `string` `{ptr,len}` returned by value.
@@ -3173,8 +3173,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::StrTrim { kind, recv } => {
             let r = lower_expr(b, recv);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::StrTrim { kind: *kind, recv: r.clone() }));
-            inherit_borrow_owners(b, v, [r]);
+            inherit_borrow_owners(b, v, [&r]);
+            b.push(Stmt::Let(v, Rvalue::StrTrim { kind: *kind, recv: r }));
             Operand::Value(v)
         }
         // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
@@ -3337,8 +3337,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             let n_op = lower_expr(b, n);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Chunks { src: src.clone(), n: n_op, elem: *elem }));
-            inherit_borrow_owners(b, v, [src]);
+            inherit_borrow_owners(b, v, [&src]);
+            b.push(Stmt::Let(v, Rvalue::Chunks { src, n: n_op, elem: *elem }));
             Operand::Value(v)
         }
         hir::ExprKind::ArrayToSlice(inner) => {
@@ -3475,10 +3475,8 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     // call's result type — no signature table is threaded into MIR.
     let (param_tys, ops): (Vec<Ty>, Vec<Operand>) = args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
     let v = b.fresh_value(e.ty);
-    let mut borrowed = vec![c.clone()];
-    borrowed.extend(ops.iter().cloned());
+    inherit_borrow_owners(b, v, std::iter::once(&c).chain(ops.iter()));
     b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
-    inherit_borrow_owners(b, v, borrowed);
     Operand::Value(v)
 }
 
@@ -3503,8 +3501,8 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
     }
     let v = b.fresh_value(e.ty);
+    inherit_borrow_owners(b, v, &ops);
     b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops.clone())));
-    inherit_borrow_owners(b, v, ops.iter().cloned());
     if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples) {
         for op in &ops {
             drop_borrow_owners(b, op);
@@ -3916,7 +3914,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     }
     if let Some(src) = borrowed_src {
         if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples) {
-            inherit_borrow_owners(b, v, [src]);
+            inherit_borrow_owners(b, v, [&src]);
         } else {
             drop_borrow_owners(b, &src);
         }
@@ -4058,8 +4056,8 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
     let new_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(new_len, Rvalue::Bin(BinOp::Sub, end_op, start_op.clone())));
     let v = b.fresh_value(result_ty);
-    b.push(Stmt::Let(v, Rvalue::SubSlice { base: base.clone(), start: start_op, len: Operand::Value(new_len), elem }));
-    inherit_borrow_owners(b, v, [base]);
+    inherit_borrow_owners(b, v, [&base]);
+    b.push(Stmt::Let(v, Rvalue::SubSlice { base, start: start_op, len: Operand::Value(new_len), elem }));
     Operand::Value(v)
 }
 
@@ -4101,28 +4099,23 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
     // pipeline's single-field seam stays untouched.
     let first_ty = if path.len() == 1 { leaf_ty } else { b.structs[struct_id as usize].fields[path[0] as usize].ty };
     let first = lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], first_ty);
-    if path.len() == 1 {
-        if let Some(source) = slice_val {
-            if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples) {
-                inherit_borrow_owners(b, first, [source]);
-            } else {
-                drop_borrow_owners(b, &source);
-            }
-        }
-        return Operand::Value(first);
-    }
-    let tmp = b.new_slot(first_ty);
-    b.push(Stmt::Store(tmp, Operand::Value(first)));
-    let leaf = b.fresh_value(leaf_ty);
-    b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
-    if let Some(source) = slice_val {
+    let result = if path.len() == 1 {
+        first
+    } else {
+        let tmp = b.new_slot(first_ty);
+        b.push(Stmt::Store(tmp, Operand::Value(first)));
+        let leaf = b.fresh_value(leaf_ty);
+        b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
+        leaf
+    };
+    if let Some(source) = &slice_val {
         if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples) {
-            inherit_borrow_owners(b, leaf, [source]);
+            inherit_borrow_owners(b, result, [source]);
         } else {
-            drop_borrow_owners(b, &source);
+            drop_borrow_owners(b, source);
         }
     }
-    Operand::Value(leaf)
+    Operand::Value(result)
 }
 
 fn index_const(i: usize) -> Operand {

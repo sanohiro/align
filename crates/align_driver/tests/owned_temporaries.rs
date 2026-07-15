@@ -196,6 +196,37 @@ fn main() -> i32 {
 }
 
 #[test]
+fn nested_loop_temporary_cleanup_stays_in_the_innermost_loop() {
+    let src = r#"
+fn main() -> i32 {
+  mut outer := 0
+  mut total := 0
+  loop {
+    mut inner := 0
+    loop {
+      total = total + "x".clone().len() as i32
+      inner = inner + 1
+      if inner >= 2 { break }
+    }
+    outer = outer + 1
+    if outer >= 3 { break }
+  }
+  return total
+}
+"#;
+    let mir = mir_text(src);
+    let main = function(&mir, "main");
+    assert_eq!(
+        real_drop_count(main),
+        4,
+        "the temporary needs its scalar release, inner edges, and function cleanup, but no outer-loop checks:\n{main}"
+    );
+    if backend_available() {
+        assert_eq!(build_and_run("owned-temp-nested-loop", src).status.code(), Some(6));
+    }
+}
+
+#[test]
 fn borrowed_views_of_fresh_owners_cannot_escape() {
     let cases = [
         ("string", "fn bad() -> str = \"abc\".clone().trim()\nfn main() -> i32 = 0\n"),
