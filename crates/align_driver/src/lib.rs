@@ -688,6 +688,19 @@ pub fn emit_object_cached(
     exports: &[String],
     rt_lto: bool,
 ) -> Result<CacheOutcome, String> {
+    // When the cache is disabled (the default), skip building the key entirely — the codegen-key
+    // inputs (`compiler_build_id`'s one-time `alignc`-binary hash, `resolve_target_identity`,
+    // `llvm_version`, `target_object_format`) are pure cache overhead a cache-off build must not pay.
+    // This is the byte-identical, no-extra-I/O pre-S3a path (the same disabled miss `codegen` returns).
+    if !cache.is_enabled() {
+        emit_object_file(mir, obj, target, profile, exports, rt_lto)?;
+        return Ok(cache::CacheOutcome {
+            stage: cache::CacheStage::Codegen,
+            unit: unit.to_string(),
+            hit: false,
+            miss_reason: None,
+        });
+    }
     let key = build_codegen_key(unit, impl_hash, dep_interface_hashes, &target, profile, exports, rt_lto)?;
     cache.codegen(&key, obj, |out| emit_object_file(mir, out, target.clone(), profile, exports, rt_lto))
 }

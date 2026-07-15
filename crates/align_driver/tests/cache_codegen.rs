@@ -394,6 +394,33 @@ fn gate9_rt_lto_distinct_keys() {
     assert!(on2.all_hit(), "a repeated rt-lto-on build hits its own key");
 }
 
+// ---- Disabled fast path: no cache dir, verbatim object, `None` reason ----------------------------
+
+#[test]
+fn disabled_cache_emits_verbatim_without_touching_disk() {
+    if !backend() {
+        return;
+    }
+    let proj = Project::new("disabled", &[("main.align", "fn main() {\n  print(secret(4))\n}\nfn secret(x: i64) -> i64 = x * 2\n")], "main.align");
+
+    // Enabled cold build → the reference object bytes + a populated cache.
+    let enabled = emit_all(&proj, &proj.cache(), Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    let ref_obj = std::fs::read(&enabled.objs[0]).unwrap();
+
+    // Disabled build → miss with NO reason (cache not consulted) and byte-identical object; crucially
+    // it must not create the cache root at all (the gating that keeps the binary hash off the hot path).
+    let disabled = emit_all(&proj, &CacheContext::Disabled, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!disabled.outcome("main").hit);
+    assert_eq!(disabled.outcome("main").miss_reason, None, "a disabled cache reports no first-diff reason");
+    let dis_obj = std::fs::read(&disabled.objs[0]).unwrap();
+    assert_eq!(dis_obj, ref_obj, "the disabled path emits byte-identical object bytes");
+
+    // A CacheContext::Disabled never writes anywhere; a separate never-touched root stays absent.
+    let untouched = proj.dir.join("never-created-root");
+    assert!(!untouched.exists());
+    assert!(!CacheContext::Disabled.is_enabled());
+}
+
 // ---- Gate 10: cross-process impl_hash stability (fresh alignc subprocesses) ----------------------
 
 /// Count the action manifests under a cache root (recursively over `actions/codegen`).

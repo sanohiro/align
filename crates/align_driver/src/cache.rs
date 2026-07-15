@@ -260,6 +260,13 @@ impl CacheContext {
         CacheContext::Enabled { root }
     }
 
+    /// Whether the cache is on. The caller gates key construction on this so a disabled build (the
+    /// default) never pays for the codegen-key inputs — notably the one-time `alignc`-binary hash in
+    /// [`compiler_build_id`] and the target/LLVM identity resolution.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, CacheContext::Enabled { .. })
+    }
+
     /// Run the codegen stage for one unit through the cache. On an enabled hit, the CAS blob is written
     /// verbatim to `obj_out` and no producer runs. On a miss (or when disabled), `produce(obj_out)`
     /// runs today's codegen verbatim, then (when enabled) the object bytes are published to the CAS and
@@ -356,6 +363,14 @@ pub fn compiler_build_id() -> Hash128 {
 
 /// `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema>`, or `None` if neither `XDG_CACHE_HOME` nor `HOME` is
 /// set (then `ALIGNC_CACHE=on` degrades to disabled rather than guessing a root).
+///
+/// Platform story: the supported targets are Linux and macOS, and both use the XDG `~/.cache`
+/// convention here deliberately (a settled S3 choice — one root layout, not macOS's
+/// `~/Library/Caches`). There is intentionally **no** Windows `%LOCALAPPDATA%` branch: Windows is a
+/// fail-closed unsupported target (`align_codegen_llvm::target_object_format` errors on it and linking
+/// is unsupported), so a Windows build never reaches a successful link — a cache-root branch for it
+/// would be dead code. If Windows ever becomes a real target, add the `%LOCALAPPDATA%` fallback here
+/// together with the linker support, not before.
 fn default_cache_root() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -462,7 +477,13 @@ fn publish_file(final_path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create cache dir {}: {e}", parent.display()))?;
     }
     let tmp = staging_sibling(final_path);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot stage cache file {}: {e}", tmp.display()))?;
+    // On ANY error after the staging file is created — a failed (possibly partial) write or a failed
+    // rename — remove `tmp` before returning, so an ordinary error never orphans a staging file in the
+    // cache root. (doc-10 tolerates staging orphaned by a KILLED process; an error return must not.)
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot stage cache file {}: {e}", tmp.display()));
+    }
     if let Err(e) = std::fs::rename(&tmp, final_path) {
         let _ = std::fs::remove_file(&tmp);
         // A racing producer may already have published identical content; accept that, else fail.
