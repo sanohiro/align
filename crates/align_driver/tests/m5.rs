@@ -78,6 +78,65 @@ fn len_of_str_slice_array() {
 }
 
 #[test]
+fn str_bytes_is_a_zero_copy_view_for_str_and_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // The continuation byte of `é` is not a valid standalone `str`, but it is directly readable
+    // through `bytes`. Passing an owned string to `view` borrows it; the owner remains usable.
+    let src = "fn view(s: str) -> slice<u8> = s.bytes()\nfn main() -> i32 {\n  owned := \"é!\".clone()\n  bytes := view(owned)\n  print(owned)\n  return bytes[1] as i32\n}\n";
+    let out = build_and_run("str-bytes", src);
+    assert_eq!(out.status.code(), Some(0xa9));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "é!\n");
+}
+
+#[test]
+fn str_bytes_preserves_borrow_regions() {
+    let ok = "fn view(s: str) -> slice<u8> = s.bytes()\nfn literal() -> slice<u8> = \"abc\".bytes()\nfn main() -> i32 = 0\n";
+    assert!(!check_errs("str-bytes-static", ok), "caller and static storage may be re-viewed");
+
+    let owned_escape = "fn bad() -> slice<u8> {\n  s := \"abc\".clone()\n  return s.bytes()\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("str-bytes-owned-escape", owned_escape));
+
+    let arena_escape = "fn bad(s: str) -> slice<u8> {\n  arena {\n    built := template \"{s}!\"\n    return built.bytes()\n  }\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("str-bytes-arena-escape", arena_escape));
+
+    let invalidated_owner = "fn bad() -> i32 {\n  mut s := \"abc\".clone()\n  bytes := s.bytes()\n  s = \"def\".clone()\n  return bytes[0] as i32\n}\nfn main() -> i32 = bad()\n";
+    assert!(
+        check_errs("str-bytes-invalidated-owner", invalidated_owner),
+        "a bytes view must keep its owned string source borrowed"
+    );
+
+    assert!(check_errs(
+        "str-bytes-args",
+        "fn main() -> i32 {\n  bytes := \"abc\".bytes(1)\n  return bytes.len() as i32\n}\n"
+    ));
+}
+
+#[test]
+fn str_bytes_lowers_without_a_mir_operation() {
+    let src = "fn view(s: str) -> slice<u8> = s.bytes()\nfn main() -> i32 = 0\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "str-bytes-mir.align", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    assert!(!mir.contains("buffer_bytes"), "str.bytes() must not use the buffer runtime path:\n{mir}");
+    assert!(!mir.contains("str_bytes"), "the descriptor retype must not add a MIR operation:\n{mir}");
+
+    let ir = emit_llvm_with_exports(src, &["view"]);
+    let view = ir
+        .split("define ")
+        .find(|body| body.contains("@view("))
+        .expect("exported view function in LLVM IR");
+    let view = view.split("\n}").next().expect("view function body");
+    assert!(!view.contains(" call "), "str.bytes() must not introduce a codegen call:\n{view}");
+}
+
+#[test]
 fn json_decode_str_field_zero_copy() {
     if !backend_available() {
         return;

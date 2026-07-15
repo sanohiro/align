@@ -8,7 +8,17 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (seventeenth update this day), **THE SETTLED STRING-CONCATENATION
+_Last updated: 2026-07-15 (eighteenth update this day), **THE ZERO-COPY STRING BYTE VIEW IS
+SHIPPED.** `str.bytes()` and owned `string.bytes()` now produce the specified `slice<u8>` view by
+retyping the existing `{ptr,len}` descriptor: the HIR retains borrow provenance, while MIR emits no
+rvalue and LLVM emits no call. Owned receivers auto-borrow rather than move. Region and borrow
+liveness tests pin caller/static returns, reject owned/arena escapes, and reject use after backing
+owner replacement; the runtime test reads a UTF-8 continuation byte and keeps the owned string
+usable. The complete workspace remains green (**2142 total = 2141 passed + one ignored manual
+probe**) and workspace clippy passes with warnings denied. Audit 13 §3.1, the source-fix ledger,
+settlement record, and core string design in both languages now mark the view built. **Next
+recommended C0 item:** add synthetic owners for unbound Move temporaries with view-aware liveness.
+Previous update: 2026-07-15 (seventeenth update this day), **THE SETTLED STRING-CONCATENATION
 CONTRACT IS ENFORCED.** `str + str` and owned `string + string` now fail in sema with the canonical
 `builder` / `.write()` / `.to_string()` guidance. The obsolete MIR path that silently converted
 string addition into a two-piece allocating template is removed. Stale tests and the template

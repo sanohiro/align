@@ -3598,7 +3598,9 @@ impl EffectScan<'_> {
             // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
             // (the #296 expr-depth lesson).
             ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.effect_file_op(&e.kind),
-            // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
+            // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
+            // a field read.
+            ExprKind::StrBytes { inner } => self.expr(inner),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
@@ -4838,6 +4840,10 @@ impl<'a> EscapeCheck<'a> {
             // arena-allocates a `string` (`Arena(k)`, shorter than `Frame`), the borrow must not
             // outlive that arena — taking the shorter keeps it sound for free.
             ExprKind::StrBorrow(inner) => Region::Frame.shorter(self.region_of(inner, depth)),
+            // `str.bytes()` is a zero-copy re-view of exactly the same `{ptr,len}` storage, so it
+            // inherits the receiver's region. An owned `string` receiver was first `StrBorrow`ed,
+            // which supplies the required Frame bound.
+            ExprKind::StrBytes { inner } => self.region_of(inner, depth),
             // A trim yields a sub-`str` of its receiver (same bytes), so the view lives exactly as
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
@@ -5228,6 +5234,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::StrPredicate { .. }
             | ExprKind::StrTrim { .. }
             | ExprKind::StrBorrow(..)
+            | ExprKind::StrBytes { .. }
             | ExprKind::BuilderNew { .. }
             | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..)
@@ -5856,7 +5863,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
@@ -6470,7 +6477,7 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.visit(i),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.visit(recv);
@@ -7093,6 +7100,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::StrBorrow(inner)
             | ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. } => self.storage_roots(inner),
+            ExprKind::StrBytes { inner } => self.storage_roots(inner),
             ExprKind::BufferBytes { buffer }
             | ExprKind::CliGetStr { parsed: buffer, .. }
             | ExprKind::HttpRespHeader { resp: buffer, .. }
@@ -7686,6 +7694,7 @@ impl<'a> MoveCheck<'a> {
             // consumed — no move-out); the buffer is filled in place and the data/offset are read.
             // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
             ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.move_file_op(&e.kind, moved),
+            ExprKind::StrBytes { inner } => self.expr(inner, moved, false, false),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
@@ -11587,8 +11596,13 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty == Ty::Reader {
                 return self.check_reader_method(recv_expr, method, args, span);
             }
-            if recv_expr.ty == Ty::Buffer && method == "bytes" {
-                return self.check_buffer_bytes(recv_expr, args, span);
+            if method == "bytes" {
+                if recv_expr.ty == Ty::Buffer {
+                    return self.check_buffer_bytes(recv_expr, args, span);
+                }
+                if matches!(recv_expr.ty, Ty::Str | Ty::String) {
+                    return self.check_str_bytes(recv_expr, args, span);
+                }
             }
             if method != "read" && method != "bytes"
                 && let Some(kind) = builder_write_kind(method) {
@@ -17190,6 +17204,27 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `s.bytes()` on a `str` or owned `string`: a zero-cost `slice<u8>` view over the same
+    /// `{ptr,len}` descriptor. An owned receiver is auto-borrowed first so the result is tied to
+    /// the owner's Frame region and does not consume it.
+    fn check_str_bytes(&mut self, mut recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error(format!("'.bytes()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        if recv_expr.ty == Ty::String {
+            let recv_span = recv_expr.span;
+            recv_expr = Expr { kind: ExprKind::StrBorrow(Box::new(recv_expr)), ty: Ty::Str, span: recv_span };
+        }
+        debug_assert_eq!(recv_expr.ty, Ty::Str);
+        Expr {
+            kind: ExprKind::StrBytes { inner: Box::new(recv_expr) },
+            ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+            span,
+        }
+    }
+
     /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`
     /// (`slice<u8>`) view (align-LLM runway A2). `recv_expr` is the already-checked `bytes` value;
     /// `scalar`/`be` come from the method-name suffix. The result is the read scalar (Copy — no
@@ -18266,7 +18301,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
