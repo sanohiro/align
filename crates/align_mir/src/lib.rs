@@ -2612,7 +2612,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                 }
                 if b.is_terminated() {
-                    return Operand::Const(Const::Unit);
+                    return Operand::Value(b.fresh_value(e.ty));
                 }
             }
             let arena = b.arenas.last().map(|h| Operand::Value(*h));
