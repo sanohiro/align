@@ -19,16 +19,19 @@ but read the order from here.
 **Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2102 green (2101 passed + one ignored manual
+verification bundle) are complete. The workspace is 2109 green (2108 passed + one ignored manual
 probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
 broader escape-analysis structural gate shipped as #461: expression provenance, local-slice
 provenance, and their type classifiers are exhaustive, so a new HIR/type variant cannot silently
-fall through a permissive wildcard. **Next recommended soundness structural item:** build the
-flow-sensitive region/drop-state pass; the dependency audit keeps safety validation and drop
-derivation at the checked-HIR boundary rather than moving diagnostics behind MIR lowering. No
-receiver-specific borrow patch remains queued. Fully-escaping function values remain deliberately
+fall through a permissive wildcard. The first flow-sensitive gate shipped as #462: a unified
+region/local-slice state joins `if`/`match`/`else` continuations, excludes diverging paths, reaches
+loop-head fixpoints, and keeps early-return arena cleanup classification intact. **Next recommended
+soundness structural item:** add path-local MIR drop flags for owned slots so region-changing owned
+reassignment can be relaxed safely; the dependency audit keeps escape diagnostics and provenance at
+the checked-HIR boundary. No receiver-specific borrow patch remains queued. Fully-escaping function
+values remain deliberately
 deferred pending a settled heap-owned environment/drop model and a consumer.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete

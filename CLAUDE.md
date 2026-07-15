@@ -55,13 +55,15 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > **2026-07-15 current correction:** M15 separate compilation is COMPLETE through SV: per-unit
 > interfaces/sema/codegen/link, the default-on incremental object cache, parallel unit codegen, and
 > the doc-10 §7 verification bundle are green. Intra-frame borrow liveness is enforced as shared flow
-> state in `MoveCheck` (#460), and escape provenance classification is now compile-enforced
-> exhaustive across HIR expressions and types (#461) (workspace 2102 tests: 2101 passed + one
-> ignored; clippy clean). The dependency audit corrected the older literal-MIR placement: escape
-> diagnostics and `drop_locals` derivation remain at the safety-verified HIR boundary. The next
-> recommended soundness structural item is a sema-owned region CFG/dataflow pass with per-path
-> region/drop state. The recorded fd-test flake hardening (#457), qualified cross-module function
-> values (#458), and wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
+> state in `MoveCheck` (#460); escape provenance classification is compile-enforced exhaustive
+> across HIR expressions and types (#461), and its region/local-slice state now joins branches and
+> reaches loop fixpoints (#462) (workspace 2109 tests: 2108 passed + one ignored; clippy clean). The
+> dependency audit corrected the older literal-MIR placement: escape diagnostics and `drop_locals`
+> derivation remain at the safety-verified HIR boundary. The next recommended soundness structural
+> item is path-local MIR drop flags for owned slots, which can safely relax the current fail-closed
+> rejection of region-changing owned reassignment. The recorded fd-test flake hardening (#457),
+> qualified cross-module function values (#458), and wrapper-hidden local-slice escape fix (#459)
+> are also merged. Fully-escaping
 > function values remain deliberately deferred until their heap-owned environment/drop model has a
 > consumer and is settled.
 > `HANDOFF.md` remains the living source of truth.

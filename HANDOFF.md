@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (ninth update this day), **ESCAPE PROVENANCE CLASSIFICATION IS
+_Last updated: 2026-07-15 (tenth update this day), **ESCAPE PROVENANCE IS FLOW-SENSITIVE —
+MERGED as #462** (workspace **2109 green** = 2108 passed + one ignored manual probe; clippy
+`-D warnings` clean). `EscapeCheck` now carries one finite `EscapeState` for region and
+local-backed-slice provenance. `if`, `match`, and `else`-unwrap analyze mutually exclusive paths
+from the same input, join only continuing paths, and exclude branches that always return or break;
+straight-line assignments are precise strong updates. Loop heads iterate that state to a fixpoint,
+and post-loop state is joined from the reachable `break` exits, closing the two-iteration
+Frame/local-slice propagation hole. Function-wide owned cleanup classification remains separate,
+so an arena-owned local on an early-return branch is still bulk-freed rather than individually
+freed even though that branch does not reach the continuation. Seven regression gates cover the
+fail-open, false-positive, strong-update, sibling-control-flow, and double-free directions. Gemini
+had no findings; thread-aware inspection found zero review threads, the English validation comment
+is on the PR, and the PR was squash-merged. **Next recommended soundness structural item:** add
+path-local MIR drop flags for owned slots, then use them to safely relax the current fail-closed
+rejection of region-changing owned reassignment; escape diagnostics and provenance remain at the
+checked-HIR boundary. Fully-escaping function values remain deliberately deferred pending a
+consumer and settled heap-owned environment/drop semantics. Previous update: 2026-07-15 (ninth
+update this day), **ESCAPE PROVENANCE CLASSIFICATION IS
 FAIL-CLOSED — MERGED as #461** (workspace **2102 green** = 2101 passed + one ignored manual
 probe; clippy `-D warnings` clean). `EscapeCheck::region_of`, local-slice provenance,
 region-bearing type classification, and recursive slice-type classification now use exhaustive
