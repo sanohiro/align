@@ -8,7 +8,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (fourth update this day), **M15 SV SHIPPED — MERGED as #456; the
+_Last updated: 2026-07-15 (fifth update this day), **the HTTP-server fd-leak timing flake is
+HARDENED — MERGED as #457** (workspace **2068 green** = 2067 passed + one ignored manual probe;
+clippy `-D warnings` clean). `http_server_no_fd_leak_across_cycles` now participates in the
+existing fd-sensitive network-test lock and, only when the first post-cycle process-wide
+`/proc/self/fd` sample exceeds the unchanged `+2` threshold, retains the lowest successful count
+from a fixed 20 × 10 ms drain window. Persistent leaks remain visible across every sample: a
+deliberate +12-fd mutation failed `4 -> 16`; the real test passed 50 consecutive targeted runs and
+20 consecutive parallel `align_runtime` suite runs. Gemini's one medium finding was valid and
+applied before merge: both the initial post-cycle sample and retry samples now handle a transient
+`/proc` read failure without panicking. The inline response, resolved thread, and English
+review-response/validation comment are on the PR. **Next:** close the qualified cross-module
+fn-value remainder (`map(util.dbl)`). Previous update: 2026-07-15 (fourth update this day), **M15
+SV SHIPPED — MERGED as #456; the
 verification bundle is green and M15 is COMPLETE** (workspace **2068 green** = 2067 passed + one
 ignored manual probe; clippy `-D warnings` clean; full record in the roadmap M15 SV paragraph).
 The doc-10 §7 matrix is now automated at the settled v1 object-cache boundary: existing gates cover
@@ -18,9 +30,7 @@ the full key-component namespace matrix, killed-producer orphan staging, identic
 same-basename cross-process races, and a confirmed fail-closed hardening — interface deserialization
 now recomputes the public-surface hash, so a stale/tampered Impure→Pure effect bit is rejected before
 sema consumes it (the absent/Unknown/Impure effect gates remain green). Frontend and link still
-re-run by design; the record does not claim caches that v1 does not have. **Next:** harden
-`http_server_no_fd_leak_across_cycles` without weakening its leak-detection teeth, then close the
-qualified cross-module fn-value remainder (`map(util.dbl)`). Gemini's one high performance finding
+re-run by design; the record does not claim caches that v1 does not have. Gemini's one high performance finding
 was valid and applied before merge: hash the already-present canonical input surface directly
 instead of re-encoding the decoded summary; the response and validation record are on the PR.
 Previous update: 2026-07-15 (third

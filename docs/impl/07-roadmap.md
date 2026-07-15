@@ -20,9 +20,9 @@ but read the order from here.
 M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
 verification bundle) are complete. The workspace is 2068 green (2067 passed + one ignored manual
-probe) and clippy-clean. **Next:** harden the
-`http_server_no_fd_leak_across_cycles` timing flake without weakening its leak detection, then close
-the qualified cross-module fn-value remainder (`map(util.dbl)`).
+probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened and
+merged as #457 without weakening its persistent-leak threshold. **Next:** close the qualified
+cross-module fn-value remainder (`map(util.dbl)`).
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core
@@ -2951,14 +2951,27 @@ rejection. SV added the missing teeth:
 
 The matrix intentionally does not claim frontend/link cache hits: v1 caches per-unit object bytes
 only, as settled in S3, so frontend and link rows are verified as safe reruns rather than cached
-stages. Deferred cache layers retain their doc-10 gates. Next after M15: the recorded
-`http_server_no_fd_leak_across_cycles` flake hardening, then qualified cross-module function values
-(`map(util.dbl)`).
+stages. Deferred cache layers retain their doc-10 gates. The first recorded post-M15 item, the
+`http_server_no_fd_leak_across_cycles` flake hardening, shipped as #457; next is qualified
+cross-module function values (`map(util.dbl)`).
 
 Gemini's one high performance finding was valid and applied before merge: interface decode records
 the canonical surface boundary and hashes that input slice directly, avoiding a second O(N)
 serialization/allocation while preserving the same fail-closed check. The inline thread was
 answered and resolved, and the PR carries the English review-response/validation summary.
+
+**HTTP server fd-leak timing flake HARDENED — MERGED as #457 (2026-07-15; workspace 2068 green +
+clippy `-D warnings` clean).** The test samples a process-wide Linux fd table while Rust runs the
+same test binary concurrently, so unrelated transient sockets could inflate a single post-cycle
+snapshot. It now participates in the existing fd-sensitive network-test lock and, only after an
+over-threshold first sample, retains the lowest successful fd count from a fixed 20 × 10 ms drain
+window. The acceptance threshold remains `after <= before + 2`; a real cycle leak persists across
+every sample. That property was mutation-checked by deliberately retaining 12 fds (`4 -> 16`, the
+expected failure), while the unmodified test passed 50 consecutive targeted runs and the complete
+parallel `align_runtime` library suite passed 20 consecutive runs. Gemini's one medium finding was
+valid and applied: transient `/proc/self/fd` read failures are handled without `unwrap` panics in
+both the initial post-cycle count and retries. The inline thread was answered and resolved, and an
+English review-response/validation summary was posted before merge.
 
 ## Design Issues to Settle in Parallel
 
