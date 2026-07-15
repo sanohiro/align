@@ -13,6 +13,7 @@
 use align_ast::{BinOp, UnOp};
 use align_sema::{hir, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 use align_span::{SourceMap, Span};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub mod print;
@@ -1162,6 +1163,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
             // every function `internal` for byte-identity.
             mf.exportable = per_unit && f.exportable;
+            simplify_known_drop_flags(&mut mf);
             fuse_builder_writes(&mut mf);
             mf
         })
@@ -1185,6 +1187,167 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),
     }
+}
+
+/// Remove conditional-drop edges whose path-local flag has one compile-time value on every
+/// incoming path. Lowering deliberately materialises ownership as boolean slots so joins remain
+/// correct; this small forward pass recovers the straight-line cases after that conservative CFG
+/// construction. In particular, moving an owned local clears its flag immediately before exit, so
+/// the now-unreachable destructor block must not survive as a `*_free(null)` call in optimized IR.
+fn simplify_known_drop_flags(f: &mut Function) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BoolState {
+        Const(bool),
+        Unknown,
+    }
+
+    fn merge(dst: &mut Option<Vec<BoolState>>, incoming: &[BoolState]) -> bool {
+        let Some(current) = dst else {
+            *dst = Some(incoming.to_vec());
+            return true;
+        };
+        let mut changed = false;
+        for (old, new) in current.iter_mut().zip(incoming) {
+            if *old != *new && *old != BoolState::Unknown {
+                *old = BoolState::Unknown;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn operand_state(op: &Operand, values: &std::collections::HashMap<ValueId, BoolState>) -> BoolState {
+        match op {
+            Operand::Const(Const::Bool(value)) => BoolState::Const(*value),
+            Operand::Value(value) => values.get(value).copied().unwrap_or(BoolState::Unknown),
+            _ => BoolState::Unknown,
+        }
+    }
+
+    fn is_drop_guard(f: &Function, term: &Term) -> bool {
+        matches!(
+            term,
+            Term::Branch(_, then_bb, _)
+                if matches!(f.blocks[*then_bb as usize].stmts.first(), Some(Stmt::Drop(_)))
+        )
+    }
+
+    // Numeric-only fused pipelines have no conditional drops. Keep this pass completely off their
+    // compile path rather than allocating per-block dataflow state that cannot produce a rewrite.
+    if !f.blocks.iter().any(|block| is_drop_guard(f, &block.term)) {
+        return;
+    }
+
+    let mut incoming = vec![None; f.blocks.len()];
+    incoming[f.entry as usize] = Some(vec![BoolState::Unknown; f.slots.len()]);
+    let mut work = VecDeque::from([f.entry]);
+    let mut known_terms = vec![None; f.blocks.len()];
+
+    while let Some(block_id) = work.pop_front() {
+        let mut slots = incoming[block_id as usize].clone().expect("queued MIR block is reachable");
+        let block = &f.blocks[block_id as usize];
+        let mut values = std::collections::HashMap::new();
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let(value, Rvalue::Load(slot)) if f.slots[*slot as usize] == Ty::Bool => {
+                    values.insert(*value, slots[*slot as usize]);
+                }
+                Stmt::Let(value, Rvalue::Use(op)) if f.value_tys[*value as usize] == Ty::Bool => {
+                    values.insert(*value, operand_state(op, &values));
+                }
+                Stmt::Store(slot, op) if f.slots[*slot as usize] == Ty::Bool => {
+                    slots[*slot as usize] = operand_state(op, &values);
+                }
+                _ => {}
+            }
+        }
+
+        let branch_state = match &block.term {
+            Term::Branch(cond, ..) if is_drop_guard(f, &block.term) => Some(operand_state(cond, &values)),
+            _ => None,
+        };
+        known_terms[block_id as usize] = branch_state.and_then(|state| match state {
+            BoolState::Const(value) => Some(value),
+            BoolState::Unknown => None,
+        });
+
+        let mut propagate = |successor: BlockId| {
+            if merge(&mut incoming[successor as usize], &slots) {
+                work.push_back(successor);
+            }
+        };
+        match (&block.term, known_terms[block_id as usize]) {
+            (Term::Goto(target), _) => propagate(*target),
+            (Term::Branch(_, then_bb, _), Some(true)) => propagate(*then_bb),
+            (Term::Branch(_, _, else_bb), Some(false)) => propagate(*else_bb),
+            (Term::Branch(_, then_bb, else_bb), None) => {
+                propagate(*then_bb);
+                propagate(*else_bb);
+            }
+            (Term::Return(_) | Term::Unreachable, _) => {}
+        }
+    }
+
+    if known_terms.iter().all(Option::is_none) {
+        return;
+    }
+
+    for (block, known) in f.blocks.iter_mut().zip(known_terms) {
+        let Term::Branch(_, then_bb, else_bb) = block.term else {
+            continue;
+        };
+        block.term = match known {
+            Some(true) => Term::Goto(then_bb),
+            Some(false) => Term::Goto(else_bb),
+            None => continue,
+        };
+    }
+
+    // Do not leave the discarded destructor blocks in MIR: codegen intentionally lowers every
+    // block, and relying on a later LLVM unreachable-block cleanup is exactly what allowed
+    // handle-specific `free(null)` calls to remain.
+    let mut reachable = vec![false; f.blocks.len()];
+    let mut pending = vec![f.entry];
+    while let Some(block_id) = pending.pop() {
+        if std::mem::replace(&mut reachable[block_id as usize], true) {
+            continue;
+        }
+        match f.blocks[block_id as usize].term {
+            Term::Goto(target) => pending.push(target),
+            Term::Branch(_, then_bb, else_bb) => {
+                pending.push(then_bb);
+                pending.push(else_bb);
+            }
+            Term::Return(_) | Term::Unreachable => {}
+        }
+    }
+    if reachable.iter().all(|value| *value) {
+        return;
+    }
+
+    let mut remap = vec![u32::MAX; f.blocks.len()];
+    let mut blocks = Vec::with_capacity(reachable.iter().filter(|value| **value).count());
+    for (old_id, mut block) in std::mem::take(&mut f.blocks).into_iter().enumerate() {
+        if !reachable[old_id] {
+            continue;
+        }
+        let new_id = blocks.len() as BlockId;
+        remap[old_id] = new_id;
+        block.id = new_id;
+        blocks.push(block);
+    }
+    for block in &mut blocks {
+        match &mut block.term {
+            Term::Goto(target) => *target = remap[*target as usize],
+            Term::Branch(_, then_bb, else_bb) => {
+                *then_bb = remap[*then_bb as usize];
+                *else_bb = remap[*else_bb as usize];
+            }
+            Term::Return(_) | Term::Unreachable => {}
+        }
+    }
+    f.entry = remap[f.entry as usize];
+    f.blocks = blocks;
 }
 
 /// Identifies which builder a write targets, so a `write_str`/`write_int`/`write_str` triple can be
@@ -8386,6 +8549,37 @@ mod tests {
         let p = lower("fn f(n: i64) -> i64 {\n  if n < 2 { return n }\n  return n\n}\n");
         let f = &p.fns[0];
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Branch(..))));
+    }
+
+    #[test]
+    fn moved_owned_local_has_no_reachable_drop() {
+        let p = lower(
+            "fn take() -> string {\n  s := \"x\".clone()\n  return s\n}\nfn main() -> i32 = take().len() as i32\n",
+        );
+        let take = p.fns.iter().find(|f| f.name == "take").expect("take MIR");
+        assert!(
+            take.blocks.iter().flat_map(|b| &b.stmts).all(|stmt| !matches!(stmt, Stmt::Drop(_))),
+            "a definitely moved local must not retain a destructor edge:\n{}",
+            print::function_to_string(take)
+        );
+    }
+
+    #[test]
+    fn live_owned_local_retains_exactly_one_drop() {
+        let p = lower(
+            "fn keep() -> i64 {\n  s := \"x\".clone()\n  return s.len()\n}\nfn main() -> i32 = keep() as i32\n",
+        );
+        let keep = p.fns.iter().find(|f| f.name == "keep").expect("keep MIR");
+        assert_eq!(
+            keep.blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .filter(|stmt| matches!(stmt, Stmt::Drop(_)))
+                .count(),
+            1,
+            "a live local must still be destroyed exactly once:\n{}",
+            print::function_to_string(keep)
+        );
     }
 
     #[test]

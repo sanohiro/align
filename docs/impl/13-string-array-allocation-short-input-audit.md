@@ -51,7 +51,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `str + str` | rejected in sema; no MIR concatenation path remains | **FIXED 2026-07-15**; `builder` is the one construction path |
 | arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
 | unbound owned temporaries | synthetic path-local owner; scalar early-drop, view retention | **FIXED 2026-07-15**; control flow and loops pinned |
-| moved slots | optimized IR still calls `free(null)` / handle-free(null) | **CONFIRMED P1** short-value fixed cost |
+| moved slots | MIR prunes cleanup edges whose drop flag is definitely false | **FIXED 2026-07-15**; no known-null destructor call |
 | filesystem/path ABI views | common helper copies every short path into `String` | **CONFIRMED P1** avoidable allocation/copy |
 | UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
 | `builder.to_string()` | header allocation + grow buffer + final allocation/copy | **CONFIRMED P1** copy count; M14 only solves call overhead |
@@ -175,24 +175,27 @@ view use (so neither a leak-masked UAF nor a double-free passes). Partition's tw
 covered through its settled destructuring consumer; temporary tuple field extraction is still a
 separate surface restriction, not an ownership exception.
 
-### 3.5 CONFIRMED P1 — definite-null destructor calls survive O2
+### 3.5 FIXED 2026-07-15 — definite-null destructor calls eliminated in MIR
 
-Move lowering nulls the source slot, but exit cleanup still loads it and calls a null-safe runtime
-destructor. Optimized IR retains calls such as:
+Move lowering still nulls source storage for recursively safe inspection, but a forward MIR
+drop-flag pass now propagates constant ownership bits through CFG joins, replaces constant cleanup
+branches with their live edge, and removes the newly unreachable destructor blocks. Consequently,
+optimized IR no longer retains calls such as:
 
 ```llvm
 tail call void @align_rt_free(ptr null)
 call void @align_rt_array_builder_free(ptr null)
 ```
 
-See source nulling ([MIR](../../crates/align_mir/src/lib.rs#L1563)) and generated drop dispatch
-([codegen](../../crates/align_codegen_llvm/src/lib.rs#L3658)). This is small in absolute time, but it
-is pure fixed overhead for a short returned string/array or a just-frozen builder.
+Storage nulling remains the safety fallback for runtime-selected ownership; the optimization is
+limited to flags with one compile-time value on every reachable incoming path. A live or
+path-dependent flag therefore retains its conditional destructor and exactly-once behavior.
 
-Prefer MIR definite-null/drop-state elimination after control-flow joins are correct. A separately
-audited LLVM free-family contract may help the ordinary `align_rt_free(null)` case, but it cannot
-model every handle-specific destructor. Gate on zero known-null destructor calls in optimized IR,
-with conditional moves, early returns, `?`, and exactly-once destruction as negative tests.
+The regression gate covers returned strings, a frozen `array_builder`, conditional moves, early
+returns, `?`, and live allocations. It requires zero literal `align_rt_free(null)` and
+`align_rt_array_builder_free(null)` calls in optimized IR while retaining real destructor calls and
+checking the runtime result. MIR unit tests separately pin a moved local at zero reachable drops and
+an unmoved local at exactly one.
 
 ## 4. Short-input measurements
 
@@ -607,7 +610,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 2. ~~Enforce the settled `str + str` hard error and correct stale tests/docs.~~ **DONE 2026-07-15.**
 3. ~~Add owned expression temporaries/synthetic owners with view-aware liveness; close string,
    array, chunks, and builder direct-consumer leaks.~~ **DONE 2026-07-15.**
-4. Remove definite-null destructor calls after the ownership dataflow is trustworthy.
+4. ~~Remove definite-null destructor calls after the ownership dataflow is trustworthy.~~ **DONE
+   2026-07-15.**
 5. Settle arena-free template/json.encode ownership; immediately fold static-only templates and
    direct obvious sinks where semantics already permit it.
 6. ~~Complete document 12's checked dynamic allocation-size arithmetic.~~ **DONE 2026-07-13.**
@@ -651,7 +655,7 @@ IR gates:
 
 - no allocation for static-only template, `str.bytes()`, string subview, slice, trim, or direct
   chunk `.len()`;
-- no `*_free(null)` for definitely moved slots;
+- no `*_free(null)` for definitely moved slots (**shipped and regression-pinned 2026-07-15**);
 - direct-consumer chunks contain no header allocation or `N*16` header-store loop;
 - bulk/direct array builder contains no per-element push call;
 - str-group single aggregate contains no accumulator/representative staging copies;

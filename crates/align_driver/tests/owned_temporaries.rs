@@ -75,6 +75,55 @@ fn main() -> i32 = probe(2) as i32
 }
 
 #[test]
+fn moved_slots_emit_no_known_null_destructor_calls() {
+    let src = r#"
+fn take_string() -> string {
+  s := "x".clone()
+  return s
+}
+fn choose(flag: bool) -> string {
+  s := "kept".clone()
+  if flag { return s }
+  return "other".clone()
+}
+fn check(flag: bool) -> Result<(), i64> {
+  if flag { return Ok(()) }
+  return Err(9)
+}
+fn via_try(flag: bool) -> Result<string, i64> {
+  s := "try".clone()
+  check(flag)?
+  return Ok(s)
+}
+fn main() -> i32 {
+  mut b: array_builder<i64> := array_builder()
+  b.push(7)
+  xs := b.build()
+  tried := match via_try(true) { Ok(s) => s.len() Err(_) => 100 }
+  failed := match via_try(false) { Ok(s) => s.len() Err(e) => e }
+  return (take_string().len() + choose(true).len() + choose(false).len()
+    + xs[0] + tried + failed) as i32
+}
+"#;
+    if backend_available() {
+        let ir = optimized_llvm(src);
+        assert!(
+            !ir.contains("@align_rt_free(ptr null)"),
+            "definitely moved string/array slots must not call free(null):\n{ir}"
+        );
+        assert!(
+            !ir.contains("@align_rt_array_builder_free(ptr null)"),
+            "a frozen builder must not retain a null handle destructor:\n{ir}"
+        );
+        assert!(
+            ir.contains("call void @align_rt_free("),
+            "live allocations still need real destructor calls:\n{ir}"
+        );
+        assert_eq!(build_and_run("known-null-drops", src).status.code(), Some(29));
+    }
+}
+
+#[test]
 fn major_string_and_array_producers_feed_scalar_consumers_without_leaks() {
     let src = r#"
 import std.path
@@ -218,8 +267,8 @@ fn main() -> i32 {
     let main = function(&mir, "main");
     assert_eq!(
         real_drop_count(main),
-        4,
-        "the temporary needs its scalar release, inner edges, and function cleanup, but no outer-loop checks:\n{main}"
+        1,
+        "the scalar release is live, while known-dead inner edges and function cleanup must be removed:\n{main}"
     );
     if backend_available() {
         assert_eq!(build_and_run("owned-temp-nested-loop", src).status.code(), Some(6));

@@ -8,7 +8,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (twentieth update this day), **LAZY MULTI-SOURCE `zip` IS SHIPPED.**
+_Last updated: 2026-07-15 (twenty-first update this day), **DEFINITE-NULL DESTRUCTOR CALLS ARE
+ELIMINATED IN MIR.** A forward drop-flag pass propagates constant ownership bits through CFG joins,
+folds only conditional-drop branches whose flag has one value on every reachable incoming path,
+and removes the newly unreachable destructor blocks. Moved returned strings/arrays and consumed
+builders therefore no longer pay `free(null)` or handle-specific `*_free(null)` overhead, while
+live and path-dependent allocations retain their conditional exactly-once destruction. MIR unit
+gates pin zero drops after a definite move and one drop for an unmoved local; optimized-IR/runtime
+coverage includes a returned string, frozen `array_builder`, conditional move, early return, `?`,
+and real live frees. The complete workspace is green (**2158 total = 2157 passed + one ignored
+manual probe**) and workspace clippy passes with warnings denied. **Next recommended allocation-audit
+item:** settle arena-free `template` / `json.encode` ownership, then fold static-only templates and
+direct obvious sinks where semantics permit. Previous update: 2026-07-15 (twentieth update this
+day), **LAZY MULTI-SOURCE `zip` IS SHIPPED.**
 `zip(a, b, ...)` is a pipeline-only head for two or more equal-length Copy primitive-scalar
 arrays/slices. Checked HIR carries the sources and an interned per-index tuple; MIR checks every
 runtime length before the terminal loop, loads all sources at one increasing index, and constructs
