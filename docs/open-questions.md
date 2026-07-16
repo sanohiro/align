@@ -2488,13 +2488,13 @@ Base64/hex fill; both shipped 2026-07-16 after their gates. Arena chunks now dis
 conservative; only file-copy, arena-builder-finish, and strict SoA decode use raw storage. The HTTP
 batch request-copy removal also shipped 2026-07-16: immutable requests are prebuilt once and the
 workers borrow uniquely claimed entries, removing one URL allocation/copy per request while retaining
-the bounded claim loop and ordered all-or-Err cleanup. The x86-64 Base64 encoder now runtime-dispatches
-to AVX2 at the measured 32-byte crossover; its scalar oracle and exact destination are retained. A
-baseline-NEON backend cross-compiles, but native aarch64 correctness/performance measurement and
-production activation remain deliberately deferred rather than guessing a threshold. Remaining work
-is that ARM Base64 gate plus a new hex SIMD probe and scalar vs SIMD stable compaction. Existing work
-from documents 10/11 remains attributed there. The separate native aarch64 UTF-8 portability run also
-remains deferred.
+the bounded claim loop and ordered all-or-Err cleanup. The x86-64 Base64 and hex encoders now
+runtime-dispatch to AVX2 at their independently measured 32-byte crossovers; their scalar oracles and
+exact destinations are retained. Baseline-NEON backends cross-compile, but native aarch64
+correctness/performance measurement and production activation remain deliberately deferred rather
+than guessing thresholds. Remaining work is those two ARM codec gates plus scalar vs SIMD stable
+compaction. Existing work from documents 10/11 remains attributed there. The separate native aarch64
+UTF-8 portability run also remains deferred.
 
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)

@@ -8,16 +8,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (fifteenth update this day), **X86-64 BASE64 ENCODE DISPATCHES TO AVX2 AT
-THE MEASURED 32-BYTE CROSSOVER.** The two-lane byte-shuffle backend writes the existing exact final
+_Last updated: 2026-07-16 (sixteenth update this day), **X86-64 HEX ENCODE DISPATCHES TO AVX2 AT ITS
+INDEPENDENTLY MEASURED 32-BYTE CROSSOVER.** The nibble-lookup/unpack backend writes the existing exact
+final destination; shorter/non-AVX2 inputs retain the scalar oracle. Differential coverage compares
+every length through 4096, every alignment modulo 32, and a page-aligned input. On this Ryzen 9 5950X
+the allocation-inclusive 1..=64 selected-point geometric mean improved 1.21x; 32 B improved 1.98x,
+1 KiB 10.84x, 1 MiB 12.04x, and 64 MiB 1.36x, with 27.58 GB/s core input throughput at 1 MiB. A
+baseline-NEON candidate is implemented and cross-compiles, but production aarch64 dispatch remains
+scalar pending the native probe. This work is on branch **`agent/hex-simd-probe`**, based on
+squash-merged PR #487 (`2843e95`). The complete workspace is green (**2198 total = 2187 passed +
+eleven ignored manual probes**) and workspace clippy passes with warnings denied. **Next recommended
+after this PR:** run document 12's scalar-vs-SIMD stable-compaction experiment across selectivity and
+element widths; adopt only if the materialization consumer wins. The aarch64 Base64/hex activation
+gates and older aarch64 UTF-8 portability measurement remain deferred. Previous update: 2026-07-16
+(fifteenth update this day), **X86-64 BASE64 ENCODE DISPATCHES TO AVX2 AT THE MEASURED 32-BYTE
+CROSSOVER.** The two-lane byte-shuffle backend writes the existing exact final
 destination and leaves shorter/non-AVX2 inputs on the scalar oracle. Direct differential coverage
 compares every length through 4096, both alphabets/padding forms, every alignment modulo 32, and a
 page-aligned input. On this Ryzen 9 5950X the allocation-inclusive 1..=64 selected-point geometric
 mean improved 1.05x for both Base64 and Base64url; 32 B improved 1.22x/1.21x, 1 KiB 4.12x/4.09x,
 1 MiB 5.22x/5.27x, and 64 MiB 1.52x/1.55x. A baseline-NEON backend is implemented and cross-compiles
 for `aarch64-unknown-linux-gnu`, but production aarch64 dispatch remains scalar until the checked-in
-probe runs on native hardware; do not guess its threshold. This work is on branch
-**`agent/base64-simd-runtime`**, based on squash-merged PR #486 (`3270e2b`). The complete workspace is
+probe runs on native hardware; do not guess its threshold. This work was squash-merged as PR **#487**
+(`2843e95`), based on squash-merged PR #486 (`3270e2b`). The complete workspace is
 green (**2196 total = 2186 passed + ten ignored manual probes**) and workspace clippy passes with
 warnings denied. **Next recommended after this PR:** run the separate measure-first hex SIMD probe;
 do not fold it into Base64 merely because the destination machinery is shared. Both the aarch64
