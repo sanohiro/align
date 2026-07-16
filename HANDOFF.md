@@ -8,7 +8,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (third update this day), **THE X86-64 UTF-8 CROSSOVER IS MEASURED AND
+_Last updated: 2026-07-16 (fourth update this day), **PROVEN NONESCAPING BUILDER HEADERS NOW USE
+ENTRY STACK STORAGE.** A checked-in ignored release probe isolated header placement while retaining
+the exact payload representation and write/push calls: at 0/1/4 elements, `builder` improved by
+2.69x/1.42x/1.31x and `array_builder` by 3.37x/1.59x/1.33x; 1K/1M controls stayed within 0.3%.
+Codegen now applies a conservative whole-MIR proof only to directly-bound locals; aliases, user
+calls, returns, captures, and unknown uses retain the boxed ABI. Dynamic template/json.encode
+builders also use entry storage because their internal header is never exposed. One 64-byte,
+16-aligned buffer is reused per eligible local/expression, guarded by runtime layout assertions;
+payload growth, pointer stability, direct I/O, and zero-copy array freeze are unchanged. Runtime and
+raw-IR gates cover consuming finishes/builds, safe reassignment, scalar and deep-string unfinished
+Drop, and boxed call/return escape controls. Gemini's three findings were applied: unaudited MIR
+rvalues now reject every stack-header candidate fail-closed, a future aggregate-wrapper MIR gate
+pins that rule, and both stack initializers debug-check the concrete header alignment. After
+refreshing the ordinary CLI/staticlib pair, the complete workspace is green (**2176 total = 2174
+passed + two ignored manual probes**) and workspace clippy passes with warnings denied. This work is
+in PR **#476**, based on merged PR #475. **Next recommended
+P2:** make owned builder freeze allocator-compatible and zero-copy, measured independently from the
+now-shipped header placement. Portability follow-up remains: run the UTF-8 probe on native aarch64;
+do not infer its threshold from x86. Previous update: 2026-07-16 (third update this day), **THE X86-64 UTF-8 CROSSOVER IS MEASURED AND
 SHIPPED.** The existing ignored runtime probe now reports balanced median-of-seven scalar, direct
 SIMD, and shipped-dispatch latency for ASCII, valid multibyte, early-invalid, and late-invalid
 inputs from 0 through 4096 bytes, plus its 64-MiB throughput control. On this Ryzen 9 5950X / Zen 3

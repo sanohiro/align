@@ -438,10 +438,12 @@ benchmark on x86 baseline/v3 and arm64 plus differential tails and every control
 
 ### 8.1 CONFIRMED P1 — make `array_builder` cheap when it is tiny
 
-`array_builder_new` always boxes the header; the first push separately reallocates backing storage
-([runtime](../../crates/align_runtime/src/lib.rs#L7652)). A dynamic push loop also retains one opaque
-`align_rt_array_builder_push` call per element, so LLVM cannot turn it into bulk/vector stores. Empty
-builders therefore allocate once, 1–4 elements allocate twice, and larger loops remain ABI-bound.
+The boxed `array_builder_new` ABI still allocates a header for escaping values; proven local values
+now use aligned caller storage instead ([runtime](../../crates/align_runtime/src/lib.rs#L7652)). The
+first push separately reallocates backing storage in either case. A dynamic push loop also retains
+one opaque `align_rt_array_builder_push` call per element, so LLVM cannot turn it into bulk/vector
+stores. Eligible empty locals now allocate zero times and 1–4 elements once; escaping values retain
+the old one/two-allocation shape, while larger loops remain ABI-bound.
 
 Separate refinements:
 
@@ -449,8 +451,16 @@ Separate refinements:
    `builder_new`.~~ **DONE 2026-07-16.** Its declaration now goes through `mark_alloc_like`; the IR
    gate pins `noalias`, `nofree`, and `nounwind` while forbidding the unsound `willreturn`. This is
    hygiene, not the main speedup.
-2. Probe an entry-alloca/by-value header for a proven nonescaping local, retaining boxed headers for
-   escaping values. Payload allocation and pointer stability remain unchanged.
+2. ~~Probe an entry-alloca/by-value header for a proven nonescaping local, retaining boxed headers
+   for escaping values.~~ **DONE 2026-07-16.** A conservative whole-MIR proof selects only directly
+   bound locals whose loads feed audited non-retaining operations; aliases, user calls, returns,
+   closure captures, and unknown uses retain the boxed ABI. Compiler-internal dynamic template /
+   `json.encode` builders use the same entry storage because their header is never exposed as an
+   operand. Each selected expression/local gets one 64-byte, 16-aligned entry buffer (reused across
+   loop iterations or safe reassignment), with compile-time runtime layout-envelope assertions.
+   Payload representation, growth, pointer stability, push/write calls, and zero-copy array freeze
+   are unchanged. Element-aware unfinished Drop and both consuming paths have runtime + raw-IR
+   gates; call/return escape controls pin the boxed fallback.
 3. Prefer existing bulk `append(slice)` whenever a source slice exists.
 4. Feed future internal `Exact/AtMost` cardinality into one reserve/direct-fill plan. Do not add a
    user capacity parameter merely because the compiler lacks that summary today.
@@ -468,15 +478,33 @@ zero-copy.
 | 1,024 | 4.90 us | 87.8 ns | 72.1 ns | 55.8x |
 | 100,000 | 471.4 us | 14.0 us | 14.4 us | 33.7x |
 
+**Nonescaping-header adoption gate (2026-07-16, same host, release, allocation-inclusive median of
+nine):** the checked-in ignored probe compared only header placement, retaining the exact payload
+and write/push paths. The 0/1/4-element decision cases all exceeded the required 15% improvement;
+the 1K/1M controls stayed within 0.3%.
+
+| kind | elements | boxed header | stack header | boxed/stack |
+|---|---:|---:|---:|---:|
+| builder | 0 | 10.21 ns | 3.79 ns | 2.69x |
+| builder | 1 | 27.66 ns | 19.50 ns | 1.42x |
+| builder | 4 | 31.08 ns | 23.78 ns | 1.31x |
+| builder | 1,024 | 1.127 us | 1.130 us | 1.00x |
+| builder | 1,000,000 | 945.5 us | 947.8 us | 1.00x |
+| array_builder | 0 | 9.95 ns | 2.95 ns | 3.37x |
+| array_builder | 1 | 18.64 ns | 11.74 ns | 1.59x |
+| array_builder | 4 | 28.11 ns | 21.21 ns | 1.33x |
+| array_builder | 1,024 | 3.604 us | 3.600 us | 1.00x |
+| array_builder | 1,000,000 | 3.435 ms | 3.438 ms | 1.00x |
+
 At 100K, bulk append and exact direct fill are at parity: payload copying is already the right
 shape, while the opaque call per pushed element is the large gap. Removing the header helps tiny
 builders (append/direct was 2.3-2.6x at 1-16 elements) but saves only about 13 ns in absolute terms.
-Prioritize compiler-selected bulk/direct fill from cardinality over a header-only rewrite; retain
-the latter as the tiny-builder allocation cleanup.
+The shipped header cleanup addresses that fixed tiny-builder cost; next prioritize compiler-selected
+bulk/direct fill from cardinality for the much larger loop gap.
 
-Gate 0–4 elements on one fewer allocation and at least 15% allocator-inclusive improvement; 1K/1M
-append and push controls may not regress over 3%. Pin optimized IR for no per-element call only in
-the direct-fill/bulk case — header attributes alone cannot remove it.
+The shipped gate required 0–4 elements to lose one allocation and improve by at least 15%, with no
+more than 3% regression in the 1K/1M append and push controls. Pin optimized IR for no per-element
+call only in the future direct-fill/bulk case — header placement alone cannot remove it.
 
 ### 8.2 CONFIRMED P1 — virtualize `chunks` for direct consumers
 
@@ -563,9 +591,9 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 |---|---:|---:|---|
 | empty `str.clone()` | 0 | 0 | keep |
 | nonempty `str.clone()` | 1 | 1 input→final | keep; ownership requires it |
-| `builder.to_string()` | header + Vec + final | 1 Vec→final | compatible grow buffer, zero-copy freeze |
-| template in arena | header + Vec + arena | 1 Vec→arena | direct arena/sink fill after ownership settlement |
-| template outside arena | header + Vec + owned final | 1 Vec→final, then scoped free | zero-copy owned freeze (P1) |
+| `builder.to_string()` | Vec + final (Box only on conservative fallback) | 1 Vec→final | compatible grow buffer, zero-copy freeze |
+| template in arena | Vec + arena | 1 Vec→arena | direct arena/sink fill after ownership settlement |
+| template outside arena | Vec + owned final | 1 Vec→final, then scoped free | zero-copy owned freeze (P1) |
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
 | `path.normalize` | components + output Vec + final | output Vec→final | one final allocation/direct fill |
 | `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
@@ -574,7 +602,7 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | JSON decoded array | parser Vec + final | Vec→final | already-planned measure-first |
 | `to_array` | 1 output | source→output fill | keep; donation only for proven unique temporary |
 | `partition` | 2 outputs | one store per source element | keep baseline |
-| `array_builder.build()` | header + grow payload | 0 | remove nonescaping header allocation; keep freeze |
+| `array_builder.build()` | grow payload (Box only when escaping) | 0 | keep nonescaping header elision + freeze |
 | `chunks` | 1 header array | header fill then consumer read | virtualize when not stored |
 | str-key single group | 2 result + HashMap + 2 staging Vecs | 2 staging→result | direct result accumulation |
 
@@ -636,7 +664,9 @@ AoS/SoA conversion, or a second substring-search algorithm.
    memcmp-class set behind `--rt-lto`.
 4. Establish the UTF-8 scalar/SIMD crossover per target. **x86-64 DONE 2026-07-16 (scalar below
    32); aarch64 native measurement remains open.**
-5. Prototype nonescaping builder/array-builder headers separately from payload changes.
+5. ~~Prototype nonescaping builder/array-builder headers separately from payload changes.~~ **DONE
+   2026-07-16.** Proven local and compiler-internal template headers use aligned entry storage;
+   escaping/call-crossing values remain boxed. Payload changes remain a separate P2 item.
 
 ### P2 — remove proven staging
 
