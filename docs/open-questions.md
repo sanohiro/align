@@ -2814,6 +2814,10 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   the count-gates piggyback on the M13 IR-shape suite).
 - **Post-LLVM-upgrade (order matters — bitcode compat):** ThinLTO → runtime-as-bitcode (LLVM
   version alignment is the known wall) → instrument PGO → sample PGO / BOLT.
+  **Instrument-PGO SETTLED + S0 GO 2026-07-17** (design/S0-evidence/slice-plan = roadmap
+  "Instrument-PGO design SETTLED"): ONE new `align_pgo_run_pipeline` shim entry (llvm-sys 221 has
+  no PGO surface), opt-in `--pgo-instrument` / `--pgo-use`, a `PgoMode` cache-key component; ELF
+  needs `-Wl,--undefined=__llvm_profile_runtime` + the `clang_rt.profile` archive on instrument links.
   **Amended 2026-07-12 (post-#425 two-lens review; full record = roadmap "Post-upgrade wave"):**
   ThinLTO-across-Align-modules is MOOT (one `Program` → one module; the only boundary is the
   runtime FFI), the version wall DISSOLVED (rustc 1.96 = LLVM 22.1.2, same major as the 22.1.8

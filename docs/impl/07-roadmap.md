@@ -2487,6 +2487,70 @@ rate for simpler invalidation was considered and rejected for v1); (iii) ThinLTO
 a cross-unit remark story is designed); (iv) fully-escaping function values across units and
 `extern "C"` export-of-body remain out of scope (their own settled deferrals, unchanged by ThinLTO).
 
+**Instrument-PGO design SETTLED (2026-07-17, two-lens review: soundness/cache-identity + mechanics/driver;
+S0 spike GO the same day). This paragraph is the instrument-PGO S1/S2/SV implementation source of truth**
+(it supersedes the "PGOOptions likely via raw llvm-sys" guess in the sequencing note below — llvm-sys 221
+exposes no PGO surface at all). Settled decisions: **(a) mechanism = ONE new shim entry**
+`align_pgo_run_pipeline` in the existing `thinlto_shim.cpp` (`PassBuilder(TM, PipelineTuningOptions(),
+std::optional<PGOOptions>{...}, nullptr, vfs::getRealFileSystem())` + `buildPerModuleDefaultPipeline`,
+driving BOTH `IRInstr` and `IRUse`). A shim is the ideal form, not a workaround: llvm-sys 221 has no PGO
+surface (the complete `LLVMPassBuilderOptions` setter list has no `PGOOptions`), and the textual pipeline
+can express instr-GEN as a bare pass name but CANNOT express instr-USE (no pass-parameter form; only a
+process-global test `cl::opt`, structurally incompatible with parallel per-unit codegen). **(b) Flags =
+opt-in `--pgo-instrument` / `--pgo-use <file.profdata>`**, mutually exclusive, legal only on
+`release`/`fast`, on the `build`/`run`/`size` verbs, loud rejection everywhere else (the
+`--rt-lto`/`--thin-lto` discipline). **(c) PGO × `--thin-lto` REJECTED loudly in v1** (correct
+ThinLTO+PGO needs `PGOOptions` threaded through all three ThinLTO phases + profile-aware import — its own
+later slice); `--rt-lto` × `--pgo-use` composes. **(d) No merge wrapper** — the user runs
+`llvm-profdata-22 merge` directly (a documented toolchain prerequisite, like `llvm-config-22`).
+**(e) profraw contract = LLVM default + `LLVM_PROFILE_FILE`**, and an instrument build PRINTS the profraw
+destination; no compile-time path baking in v1. **(f) Stale-profile policy**:
+missing/unreadable/version-skewed/0%-match profdata = hard error; partially-stale = ONE aggregated
+match-ratio report then proceed; no `--pgo-strict` knob. **(g) Cache identity = a `PgoMode { Off |
+Instrument | Use(Hash128 of the profdata bytes) }` KEY COMPONENT on `CodegenKey`** (the `rt_lto_digest`
+precedent — same artifact kind, same key shape → a component, NOT a separate CAS namespace; the
+ThinLTO-S2 lesson applied in reverse). Instrumented builds are cacheable and structurally isolated from
+ordinary and use builds; `CACHE_KEY_FORMAT_VERSION` bumps at S2. **(h) Non-goals**: sample PGO / BOLT
+(later in the wave, driver-managed external pipeline), CSPGO, a value-profiling surface, coverage
+reporting, hotness-gated multiversioning (a separate unimplemented feature), and folding PGO into a
+`--profile`.
+
+**Instrument-PGO S0 spike GO record (2026-07-17, `pgo-spike` feature, 5 ignored tests,
+`crates/align_codegen_llvm/src/pgo_spike.rs`).** END-TO-END on a REAL Align binary: a branch-heavy program
+compiled through the actual frontend + `build_module` emit path with the opt run replaced by the shim GEN
+entry, emitted as an object, linked under Align's real link hygiene (`--gc-sections`/`--as-needed`) with
+the clang profile runtime archive appended, run with `LLVM_PROFILE_FILE` set → a 288-byte `.profraw`
+written at normal exit — so M13 whole-program internalization + gc-sections do NOT strip the counters
+(`__profc_`/`__profd_`/`__llvm_prf_nm` are pinned by `llvm.used`/`llvm.compiler.used` → `SHF_GNU_RETAIN`).
+Round trip proven: `llvm-profdata-22 merge` → shim USE entry → `!prof branch_weights` in the optimized IR,
+with an in-process LLVM diagnostic handler capturing NO hash-mismatch/unprofiled degradation on the
+matching module AND capturing a mismatch on a structurally-different control (so the handler is live and
+the clean result is meaningful); a no-PGO control has neither counters nor `branch_weights`. **LLVM-22
+frictions recorded**: (i) `PGOOptions` lost its VFS argument — the filesystem moved to `PassBuilder`'s last
+param (default `vfs::getRealFileSystem()`); the ctor is the 11-arg `PGOOptions(ProfileFile, "", "", "",
+Action, NoCSAction, ColdFuncOpt::Default, false, false, false)`. (ii) **On ELF the instrumented object
+carries NO `__llvm_profile_runtime` reference** (LLVM relies on the `__start/__stop___llvm_prf_*` section
+brackets), so the **S1 driver MUST add `-Wl,--undefined=__llvm_profile_runtime` plus the `clang_rt.profile`
+archive to instrumented links** (archive located via `clang-22
+-print-file-name=libclang_rt.profile-x86_64.a`), or the link succeeds silently and no `.profraw` is
+written — exactly the flag clang's own driver injects. Timing at spike scale (one module): plain-`O2` and
+GEN-`O2` both sub-10 ms, GEN within run-to-run noise of plain (a real overhead measurement belongs at S1
+module sizes). **S1 shim final form**: the single entry runs the pipeline in place and emission stays on
+the existing Rust `write_object` seam (swap `run_opt_pipeline` for the shim call, the `emit_prelink_bc`
+shape); S1 driver work = the two-pass build (gen build → run/collect → `llvm-profdata` merge → use build),
+the force-undefined-symbol + profile archive on the gen link line, and the `PgoMode` cache component.
+
+**Instrument-PGO slice plan: S1** = serial whole-program correctness behind the two flags, cache BYPASSED
+(gates: an instrument build links/runs/writes a profraw; a use build shows `!prof` on a branch-heavy
+kernel, mutation-checked; run-parity across off/instrument/use; rejections incl. the `--thin-lto` combo
+and non-`release`/`fast` profiles; fail-loud profdata errors; flag-off byte-identity). **S2** = cache
+composition (the `PgoMode` key component, `FirstDiff::PgoProfile`, `CACHE_KEY_FORMAT_VERSION` bump,
+instrumented-vs-ordinary isolation + profdata-digest + revert gates). **SV** = build-twice determinism in
+both modes, cold-vs-hit byte-identity, stale/wrong-profile mutation gates, an explicit compile-time bound,
+and the PAYOFF GATE: a measured PGO win on a branch-heavy/dispatch kernel (bench-style, interleaved) —
+PGO's whole justification, since the numeric core is already branchless-vectorized and M13 already made
+fail edges cold.
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,
@@ -2638,7 +2702,8 @@ cache key** (the `hash64` native-tuning lever, deferred with the doc-10 §2 key 
 block-layout/hot-cold-split win is already MOOT per M13 Slice V (`noreturn` attrs make fail
 edges cold; a real `!prof` prototype was byte-identical and reverted); instrument PGO is
 mid-size infrastructure (InstrProfiling pass + profile runtime hook + an `llvm-profdata` merge
-stage + `PGOOptions` likely via raw llvm-sys — inkwell 0.9 does not expose it); its unique
+stage + `PGOOptions` via a shim entry — neither inkwell 0.9 nor llvm-sys 221 exposes it; SETTLED,
+see "Instrument-PGO design SETTLED" above); its unique
 lever, hotness-gated multiversioning, is a separate unimplemented feature. Sample PGO / BOLT
 unchanged (evaluate later, driver-managed external pipeline).
 
