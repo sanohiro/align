@@ -314,14 +314,63 @@ pub unsafe extern "C" fn align_rt_fs_remove(path: *const u8, path_len: i64) -> i
     }
 }
 
+/// RAII staging for an `array<string>` whose payloads are already in their final allocations.
+/// Until publication, `Drop` owns every payload; publication transfers them to the header array.
+#[derive(Default)]
+struct OwnedStringList(Vec<AlignStr>);
+
+impl OwnedStringList {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        let len = i64::try_from(bytes.len()).map_err(|_| ())?;
+        let dst = align_rt_alloc(len);
+        if !bytes.is_empty() {
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+        }
+        self.0.push(AlignStr { ptr: dst, len });
+        Ok(())
+    }
+
+    fn contains(&self, bytes: &[u8]) -> bool {
+        self.0.iter().any(|s| unsafe { safe_slice(s.ptr, s.len) } == bytes)
+    }
+
+    /// Publish the header array and transfer every payload to its generic deep-drop owner.
+    /// On any size error, `Drop` frees all payloads accumulated so far.
+    unsafe fn publish(mut self, out: *mut AlignStr) -> Result<(), ()> {
+        let n = self.0.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let hdr_bytes = n
+            .checked_mul(core::mem::size_of::<AlignStr>())
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .ok_or(())?;
+        let len = i64::try_from(n).map_err(|_| ())?;
+        let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
+        unsafe { core::ptr::copy_nonoverlapping(self.0.as_ptr(), hdr, n) };
+        unsafe { out.write(AlignStr { ptr: hdr as *const u8, len }) };
+        // Payload ownership is now represented by the published header array.
+        self.0.clear();
+        Ok(())
+    }
+}
+
+impl Drop for OwnedStringList {
+    fn drop(&mut self) {
+        for item in &self.0 {
+            unsafe { align_rt_free(item.ptr as *mut u8) };
+        }
+    }
+}
+
 /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>` written to
 /// `out` (`{ptr,len}`: a heap buffer of `len` `AlignStr` headers, each owning its own name buffer).
 /// Entries are bare names (no path prefix), in OS order (`.`/`..` excluded — Rust's `read_dir`
 /// omits them; the caller sorts if a deterministic order is wanted, per `draft.md` §18.2). An entry
 /// whose name is **not valid UTF-8 is excluded** (a `string` is always UTF-8, draft §7/§12; such a
 /// file is unreachable through a `str` path regardless), so the result may be shorter than the
-/// on-disk entry count. Returns `0` on success, else the mapped errno (leaving `out` = `{null,0}`). The whole array is `Drop`-freed
-/// by [`align_rt_free_string_array`] (each name buffer, then the header).
+/// on-disk entry count. Returns `0` on success, else the mapped errno (leaving `out` = `{null,0}`).
+/// The whole array is `Drop`-freed by [`align_rt_free_string_array`] (each payload, then the header).
 ///
 /// # Safety
 /// `path` must describe a valid byte range; `out` must point to a writable `{ptr,len}` slot.
@@ -338,8 +387,9 @@ pub unsafe extern "C" fn align_rt_fs_read_dir(path: *const u8, path_len: i64, ou
         Ok(rd) => rd,
         Err(e) => return io_error_to_status(&e),
     };
-    // Collect every entry name first (a mid-iteration error maps like any other, leaving `out` empty).
-    let mut names: Vec<Vec<u8>> = Vec::new();
+    // Allocate each final payload while enumerating. A mid-iteration error drops the list and frees
+    // every payload created so far, while `out` remains canonical empty.
+    let mut names = OwnedStringList::default();
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
@@ -354,28 +404,11 @@ pub unsafe extern "C" fn align_rt_fs_read_dir(path: *const u8, path_len: i64, ou
         if !validate_utf8(bytes) {
             continue;
         }
-        names.push(bytes.to_vec());
-    }
-    let n = names.len();
-    if n == 0 {
-        return 0; // empty directory → {null,0}
-    }
-    // The header buffer: `n` `AlignStr` entries. `checked_mul` guards a 32-bit size overflow (which
-    // would otherwise under-allocate and heap-overflow the store loop below).
-    let Some(hdr_bytes) = n.checked_mul(core::mem::size_of::<AlignStr>()).and_then(|b| i64::try_from(b).ok()) else {
-        return AL_INVALID;
-    };
-    let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
-    for (i, name) in names.into_iter().enumerate() {
-        let len = name.len() as i64;
-        let dst = align_rt_alloc(len); // null for an empty name (len 0) — a harmless free at Drop
-        if len > 0 {
-            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len()) };
+        if names.push(bytes).is_err() {
+            return AL_INVALID;
         }
-        unsafe { *hdr.add(i) = AlignStr { ptr: dst, len } };
     }
-    unsafe { *out = AlignStr { ptr: hdr as *const u8, len: n as i64 } };
-    0
+    unsafe { names.publish(out) }.map_or(AL_INVALID, |()| 0)
 }
 
 /// Free an owned `array<string>` (`fs.read_dir`): free each element's name buffer, then the header
@@ -512,7 +545,7 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
 
     // Walk the result list, formatting each address. `freeaddrinfo(res)` is called before any
     // return below (success or an alloc-guard bail-out) — the list is always freed.
-    let mut ips: Vec<Vec<u8>> = Vec::new();
+    let mut ips = OwnedStringList::default();
     let mut cur = res;
     while !cur.is_null() {
         let ai = unsafe { &*cur };
@@ -536,8 +569,9 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
                 // `inet_ntop` writes a NUL-terminated string — take the bytes up to the NUL.
                 let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                 let s = &buf[..n];
-                if !ips.iter().any(|e| e.as_slice() == s) {
-                    ips.push(s.to_vec());
+                if !ips.contains(s) && ips.push(s).is_err() {
+                    unsafe { freeaddrinfo(res) };
+                    return AL_INVALID;
                 }
             }
         }
@@ -545,26 +579,11 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
     }
     unsafe { freeaddrinfo(res) };
 
-    let n = ips.len();
-    if n == 0 {
+    if ips.0.is_empty() {
         // The name resolved but yielded no usable A/AAAA address — a definitive no-address.
         return AL_INVALID;
     }
-    // Header buffer: `n` `AlignStr` entries. `checked_mul` guards a 32-bit size overflow.
-    let Some(hdr_bytes) = n.checked_mul(core::mem::size_of::<AlignStr>()).and_then(|b| i64::try_from(b).ok()) else {
-        return AL_INVALID;
-    };
-    let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
-    for (i, ip) in ips.into_iter().enumerate() {
-        let len = ip.len() as i64;
-        let dst = align_rt_alloc(len); // null for a 0-length string — harmless free at Drop
-        if len > 0 {
-            unsafe { core::ptr::copy_nonoverlapping(ip.as_ptr(), dst, ip.len()) };
-        }
-        unsafe { *hdr.add(i) = AlignStr { ptr: dst, len } };
-    }
-    unsafe { *out = AlignStr { ptr: hdr as *const u8, len: n as i64 } };
-    0
+    unsafe { ips.publish(out) }.map_or(AL_INVALID, |()| 0)
 }
 
 // --- tcp.connect (std.net Slice 2) ------------------------------------------------------------

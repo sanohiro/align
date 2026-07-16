@@ -8,7 +8,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (eighth update this day), **`path.normalize` FILLS ONE FINAL BUFFER.** The
+_Last updated: 2026-07-16 (ninth update this day), **`read_dir` AND DNS CREATE FINAL STRING PAYLOADS
+ONCE.** Both runtimes now allocate each UTF-8 filename or numeric-IP payload while enumerating and
+stage only `AlignStr` headers in a shared RAII owner. Any later iteration or checked-size error drops
+that owner and frees every payload accumulated so far while the ABI output stays `{null,0}`. Success
+publishes one final header buffer, clears the temporary owner, and transfers each payload exactly
+once to the existing generic `array<string>` deep-drop representation. UTF-8 filename exclusion,
+DNS first-occurrence order/deduplication, and `freeaddrinfo` coverage are unchanged. This removes one
+staging allocation and full payload copy per returned entry without introducing a slab or a second
+ownership representation. The complete workspace remains green (**2185 total = 2181 passed + four
+ignored manual probes**) and workspace clippy passes with warnings denied. This work is in PR
+**#481**, based on squash-merged PR #480 (`bdca925`). **Next recommended P2:** execute document 12's
+codec exact-destination slice and the roadmap JSON-copy probe. The aarch64 UTF-8 portability
+measurement remains deferred. Previous update: 2026-07-16 (eighth update this day), **`path.normalize` FILLS ONE FINAL BUFFER.** The
 runtime allocates the owned result once at the proven `max(input_len, 1)` bound and uses its
 initialized prefix as the component stack; ordinary components append directly and `..` rewinds to
 the preceding separator. The component Vec, output Vec, and final full-output copy are gone while
@@ -20,7 +32,7 @@ explicit negative shape (256 appends then 192 pops) is recorded at 0.77x because
 components that a staging stack later discards; the required already-normal short gate still clears
 decisively. Gemini's `rposition` cleanup suggestion was measured and rejected: it regressed all four
 probe shapes by roughly 5-7% versus the explicit initialized-prefix loop. The complete workspace is green (**2185 total = 2181 passed + four ignored manual
-probes**) and workspace clippy passes with warnings denied. This work is in PR **#480**, based on
+probes**) and workspace clippy passes with warnings denied. This work was squash-merged as PR **#480** (`bdca925`), based on
 squash-merged PR #479 (`b8b9173`). **Next recommended P2:** remove per-entry payload staging from
 `fs.read_dir` and DNS results with explicit unwind cleanup, while retaining generic deep-drop
 ownership. The aarch64 UTF-8 portability measurement remains deferred. Previous update: 2026-07-16
