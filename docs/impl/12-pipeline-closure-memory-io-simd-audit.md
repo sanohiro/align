@@ -67,8 +67,9 @@ After those are closed, the highest-value performance refinements from this audi
 1. Split arena allocation into **proven-initialized-before-read / uninitialized** and conservative
    **zeroed** paths. A fresh chunk logically initializes at least 64 KiB even for a tiny request;
    existing reuse measurements show that mandatory full re-zeroing dominates that microbenchmark.
-2. Fill exact-size Base64 and hex output directly into its final allocation, then add the already
-   planned runtime-dispatched Base64 SIMD backend; hex SIMD is a separate new measure-first probe.
+2. ~~Fill exact-size Base64 and hex output directly into its final allocation.~~ **SHIPPED
+   2026-07-16.** Next add the already planned runtime-dispatched Base64 SIMD backend; hex SIMD is a
+   separate new measure-first probe.
 3. Evaluate SIMD block compaction for materializing `where`/`partition`, separately from reducing
    `where`; do not preserve the current unsafe speculative-execution trick merely to get vector code.
 4. Remove a redundant URL/request copy in `http.get_many`, and complete the already-planned I/O
@@ -845,11 +846,10 @@ Arena adoption gate:
 
 The already-planned zero-size arena fast path is independent and should land first.
 
-### 6.3 PROPOSED — exact-size codecs should allocate once
+### 6.3 SHIPPED 2026-07-16 — exact-size codecs allocate once
 
-Base64 and hex encode into a Rust `Vec`, then `owned_str_from_vec` performs a second allocation and
-copies into Align-owned storage
-([encoding implementation](../../crates/align_runtime/src/lib.rs#L5375)). Their output sizes are known:
+At the audit baseline, Base64 and hex encoded into a Rust `Vec`, then copied that complete output
+into a second Align-owned allocation. Their output sizes are known:
 
 ```text
 base64 padded   4 * ((input_len + 2) / 3)
@@ -857,9 +857,17 @@ base64url       (4 * input_len + 2) / 3
 hex             2 * input_len
 ```
 
-All additions and multiplications in these integer formulas must use checked arithmetic. Then
-allocate the final Align string once and fill it directly. This removes one allocation and one
-full-output copy before any SIMD work. Then implement the
+The shipped scalar encoders compute the equivalent formulas with checked group/tail arithmetic,
+allocate one exact `align_rt_alloc` payload, and initialize it through `MaybeUninit<u8>` without
+constructing a reference that falsely claims fresh `malloc` bytes are initialized. Empty output is
+the canonical `{null,0}`. Differential gates cover every length through 65 bytes, 256, 4096, all byte
+values, both alphabets and padding forms, and overflow. This removes one allocation and one
+full-output copy before any SIMD work.
+
+The allocation-inclusive median-of-nine probe covered 0-65 bytes, 1 KiB, 1 MiB, and 64 MiB. Every
+short case improved: Base64 1.19-1.65x, Base64url 1.18-1.71x, and hex 1.16-2.01x. At 64 MiB the gains
+were 1.71x, 1.70x, and 1.86x respectively after the final chunked hot loop removed per-byte bounds
+checks. The scalar direct destination is therefore the retained oracle. Next implement the
 **ALREADY PLANNED** Lemire-class Base64 runtime dispatch behind the same ABI. Hex SIMD is a separate
 new **MEASURE-FIRST** extension and must beat the simple scalar exact-destination loop:
 
@@ -880,7 +888,7 @@ Do not use unstable `std::simd` in the stable runtime.
 | packed spawn env/result/error record | **ALREADY PLANNED** in document 11; measure false sharing after block claiming |
 | one `Arc<TgWaitState>` instead of separate task/cursor/barrier Arcs | New small follow-up; measure after scheduler P2 because the work-first descriptor may subsume it |
 | I/O `Vec::resize(..., 0)` removal | Reader/`io.copy` **ALREADY PLANNED**; UDP/pread are a new audited extension; use spare-capacity/raw-write discipline |
-| JSON Vec->malloc final copy | **ALREADY PLANNED** measure-first |
+| JSON Vec->malloc final copy | Exact-count `array<i64>` direct fill **REJECTED 2026-07-16**: an extra lexical count pass fell to 0.71-0.73x at 1K-1M elements; retain one-pass staging unless a different ownership mechanism avoids the second parse |
 | C-realloc-backed template Builder with zero-copy string freeze | Plausible P3; current evidence says per-write FFI, not final copy, dominates |
 | upper-bound filter allocation right-sizing | Do not retry alone; untouched pages are lazy and prior right-sizing measured no win |
 | SSO / hidden default arena / automatic global custom allocator | Rejected or unsupported by evidence; do not reopen here |
@@ -993,11 +1001,11 @@ hand-vectorized without a profile. The structural index and UTF-8 passes already
 conversion, schema lookup, and output writes can dominate. Likewise, short HTTP headers and CLI flags
 usually lose to SIMD setup. Preserve the scalar prefix/crossover discipline.
 
-### 8.2 P1 — exact-destination SIMD Base64 and hex
+### 8.2 P1 — exact destinations shipped; SIMD Base64 and hex remain
 
-This is the strongest unimplemented byte-kernel candidate. Lemire-class Base64 SIMD was already on
-the encoding backlog; exact-final-allocation fill for Base64/hex and hex SIMD are new here. Combine
-the Base64 work, and any hex backend that passes its own gate, with section 6.3 so SIMD does not merely
+Exact-final-allocation fill for Base64/hex is shipped in section 6.3. Lemire-class Base64 SIMD remains
+the strongest unimplemented byte-kernel candidate; hex SIMD remains a separate measure-first item.
+Any backend that passes its gate now writes the retained direct destination, so SIMD cannot merely
 accelerate a buffer that is then copied in full.
 
 Use architecture intrinsics plus a scalar oracle on stable Rust. Cache CPU feature selection outside

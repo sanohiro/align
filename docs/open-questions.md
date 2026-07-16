@@ -2641,9 +2641,12 @@ every valid finding addressed. Disposition:
      keep the chunk count at zero, interleaved with a real allocation to confirm the fast path
      doesn't corrupt subsequent bump-allocator state).
 - **Measure-first adoptions (direction yes, gated on numbers):**
-  7. **JSON decode double allocation** (Rust `Vec` → `align_rt_alloc` → memcpy, runtime
-     ~2317/~2624). Direction adopted (C-owned growable buffer / exact-count direct decode) but
-     the recorded fact stands that decode wins are parse-bound/modest — measure first; the
+  7. **JSON decode double allocation — exact-count scalar path measured and rejected 2026-07-16**
+     (Rust `Vec` → `align_rt_alloc` → memcpy, runtime ~2317/~2624). A checked-in balanced
+     `array<i64>` probe priced the required lexical count pass before exact allocation and direct
+     parse. It won only at 1-8 elements; from 64 it lost, reaching 0.71-0.73x of the existing
+     one-pass staged decoder at 1K-1M elements. Retain staging for this path. A C-owned growable
+     buffer remains a different ownership experiment, not authorized by this negative result; the
      bigger lever stays decode-fusion (consumer-gated, GPT-5.6 record).
   8. **I/O buffer zero-fill** (`Vec::resize(64KiB, 0)` before `read` overwrite, runtime ~4558/
      ~4995). Adopt `spare_capacity_mut`+`set_len` — but correctness tests (short read/EINTR/

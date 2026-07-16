@@ -2483,7 +2483,9 @@ decorate-sort-undecorate `sort_by_key` (keys computed once), all in MIR — reco
 chunk, attribute-kind fail-loud + modern `captures(none)` emission **[DONE 2026-07-13: fail-loud
 `enum_kind_id` panic + `captures(none)` via the `captures` kind; the `llvm-as-22` textual
 round-trip follow-up above is RESOLVED — tool-gated gate added]**); **wave 3, measure-first** (JSON
-decode double-allocation, I/O buffer zero-fill). Doc-debt items ride along with their slices.
+decode double-allocation **[EXACT-COUNT SCALAR PATH REJECTED 2026-07-16: count+direct was
+0.71-0.73x at 1K-1M elements; retain one-pass staging]**, I/O buffer zero-fill). Doc-debt items ride
+along with their slices.
 
 ## M15 — Separate compilation (multi-module compilation units) — COMPLETE 2026-07-15
 

@@ -5714,17 +5714,39 @@ const fn base64_decode_table(alphabet: &[u8; 64]) -> [u8; 256] {
 static BASE64_STD_TABLE: [u8; 256] = base64_decode_table(&BASE64_STD);
 static BASE64_URL_TABLE: [u8; 256] = base64_decode_table(&BASE64_URL);
 
-/// Copy an owned byte vector into a freshly `align_rt_alloc`'d `string` `{ptr,len}` (the generated
-/// `Drop` frees the buffer via `align_rt_free`). An empty result owns no buffer (null ptr, len 0),
-/// so its `free(null)` drop is a harmless no-op — same convention as `align_rt_str_clone`.
-fn owned_str_from_vec(v: &[u8]) -> AlignStr {
+/// Copy bytes into a freshly `align_rt_alloc`'d `string` `{ptr,len}` (the generated `Drop` frees the
+/// buffer via `align_rt_free`). Use only when the producer cannot write its final allocation
+/// directly. An empty result owns no buffer (null ptr, len 0).
+fn owned_str_copy(v: &[u8]) -> AlignStr {
     let n = v.len();
     if n == 0 {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
-    let dst = align_rt_alloc(n as i64);
+    let Ok(len) = i64::try_from(n) else {
+        align_rt_alloc_size_fail();
+    };
+    let dst = align_rt_alloc(len);
     unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), dst, n) };
-    AlignStr { ptr: dst, len: n as i64 }
+    AlignStr { ptr: dst, len }
+}
+
+/// Allocate an exact final owned-string payload and let `fill` initialize every byte in place.
+/// The callback receives `MaybeUninit<u8>` so constructing a Rust slice never claims that fresh
+/// `malloc` storage was initialized before the codec writes it.
+///
+/// # Safety
+/// `fill` must initialize every element of the supplied slice before returning.
+unsafe fn owned_str_exact(fill_len: usize, fill: impl FnOnce(&mut [core::mem::MaybeUninit<u8>])) -> AlignStr {
+    if fill_len == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let Ok(len) = i64::try_from(fill_len) else {
+        align_rt_alloc_size_fail();
+    };
+    let dst = align_rt_alloc(len);
+    let out = unsafe { std::slice::from_raw_parts_mut(dst.cast::<core::mem::MaybeUninit<u8>>(), fill_len) };
+    fill(out);
+    AlignStr { ptr: dst, len }
 }
 
 /// Wrap a decoded byte vector into an owned `buffer` handle (`cap == len == v.len()`, so `.bytes()`
@@ -5734,39 +5756,72 @@ fn buffer_from_vec(v: Vec<u8>) -> *mut Buffer {
     Box::into_raw(Box::new(Buffer { data: v, cap: n, len: n }))
 }
 
-/// Encode `data` into `out` using `alphabet`; append `=` padding to a whole 4-char group iff `pad`
-/// (standard Base64 pads; URL-safe does not — `draft.md` §18.2). Pure, allocation-only.
-fn base64_encode_into(data: &[u8], alphabet: &[u8; 64], pad: bool, out: &mut Vec<u8>) {
-    out.reserve(data.len().div_ceil(3) * 4);
+/// Exact Base64 output length. Every size operation is checked before allocation so a hostile ABI
+/// length cannot wrap into a smaller destination.
+fn base64_encoded_len(input_len: usize, pad: bool) -> Option<usize> {
+    let groups = input_len / 3;
+    let tail = input_len % 3;
+    groups.checked_mul(4)?.checked_add(match (tail, pad) {
+        (0, _) => 0,
+        (_, true) => 4,
+        (1, false) => 2,
+        (2, false) => 3,
+        _ => unreachable!(),
+    })
+}
+
+/// Encode `data` into an exact uninitialized destination using `alphabet`; append `=` padding to a
+/// whole 4-char group iff `pad` (standard Base64 pads; URL-safe does not — `draft.md` §18.2).
+fn base64_encode_into(
+    data: &[u8],
+    alphabet: &[u8; 64],
+    pad: bool,
+    out: &mut [core::mem::MaybeUninit<u8>],
+) {
+    assert_eq!(base64_encoded_len(data.len(), pad), Some(out.len()), "Base64 destination length mismatch");
+    let groups = data.len() / 3;
+    let Some(group_bytes) = groups.checked_mul(4) else {
+        align_rt_alloc_size_fail();
+    };
+    let (out_groups, out_tail) = out.split_at_mut(group_bytes);
     let mut chunks = data.chunks_exact(3);
-    for c in &mut chunks {
+    for (c, out_c) in chunks.by_ref().zip(out_groups.chunks_exact_mut(4)) {
         let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
-        out.push(alphabet[(n >> 18 & 63) as usize]);
-        out.push(alphabet[(n >> 12 & 63) as usize]);
-        out.push(alphabet[(n >> 6 & 63) as usize]);
-        out.push(alphabet[(n & 63) as usize]);
+        out_c[0].write(alphabet[(n >> 18 & 63) as usize]);
+        out_c[1].write(alphabet[(n >> 12 & 63) as usize]);
+        out_c[2].write(alphabet[(n >> 6 & 63) as usize]);
+        out_c[3].write(alphabet[(n & 63) as usize]);
     }
     let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = (rem[0] as u32) << 16;
-            out.push(alphabet[(n >> 18 & 63) as usize]);
-            out.push(alphabet[(n >> 12 & 63) as usize]);
+            out_tail[0].write(alphabet[(n >> 18 & 63) as usize]);
+            out_tail[1].write(alphabet[(n >> 12 & 63) as usize]);
             if pad {
-                out.push(b'=');
-                out.push(b'=');
+                out_tail[2].write(b'=');
+                out_tail[3].write(b'=');
             }
         }
         2 => {
             let n = (rem[0] as u32) << 16 | (rem[1] as u32) << 8;
-            out.push(alphabet[(n >> 18 & 63) as usize]);
-            out.push(alphabet[(n >> 12 & 63) as usize]);
-            out.push(alphabet[(n >> 6 & 63) as usize]);
+            out_tail[0].write(alphabet[(n >> 18 & 63) as usize]);
+            out_tail[1].write(alphabet[(n >> 12 & 63) as usize]);
+            out_tail[2].write(alphabet[(n >> 6 & 63) as usize]);
             if pad {
-                out.push(b'=');
+                out_tail[3].write(b'=');
             }
         }
         _ => {}
+    }
+}
+
+fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    assert_eq!(data.len().checked_mul(2), Some(out.len()), "hex destination length mismatch");
+    for (pair, &byte) in out.chunks_exact_mut(2).zip(data) {
+        pair[0].write(HEX[(byte >> 4) as usize]);
+        pair[1].write(HEX[(byte & 15) as usize]);
     }
 }
 
@@ -5839,9 +5894,10 @@ fn hex_val(c: u8) -> Option<u8> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_base64_encode(ptr: *const u8, len: i64) -> AlignStr {
     let data = unsafe { bytes_view(ptr, len) };
-    let mut out = Vec::new();
-    base64_encode_into(data, &BASE64_STD, true, &mut out);
-    owned_str_from_vec(&out)
+    let Some(out_len) = base64_encoded_len(data.len(), true) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| base64_encode_into(data, &BASE64_STD, true, out)) }
 }
 
 /// `encoding.base64url_encode(data)` — URL-safe alphabet, no padding. Returns an owned `string`.
@@ -5851,9 +5907,10 @@ pub unsafe extern "C" fn align_rt_base64_encode(ptr: *const u8, len: i64) -> Ali
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_base64url_encode(ptr: *const u8, len: i64) -> AlignStr {
     let data = unsafe { bytes_view(ptr, len) };
-    let mut out = Vec::new();
-    base64_encode_into(data, &BASE64_URL, false, &mut out);
-    owned_str_from_vec(&out)
+    let Some(out_len) = base64_encoded_len(data.len(), false) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| base64_encode_into(data, &BASE64_URL, false, out)) }
 }
 
 /// `encoding.hex_encode(data)` — lower-case hex. Returns an owned `string`.
@@ -5862,14 +5919,11 @@ pub unsafe extern "C" fn align_rt_base64url_encode(ptr: *const u8, len: i64) -> 
 /// `ptr`/`len` must describe a valid byte range for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_hex_encode(ptr: *const u8, len: i64) -> AlignStr {
-    const HEX: [u8; 16] = *b"0123456789abcdef";
     let data = unsafe { bytes_view(ptr, len) };
-    let mut out = Vec::with_capacity(data.len() * 2);
-    for &b in data {
-        out.push(HEX[(b >> 4) as usize]);
-        out.push(HEX[(b & 15) as usize]);
-    }
-    owned_str_from_vec(&out)
+    let Some(out_len) = data.len().checked_mul(2) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| hex_encode_into(data, out)) }
 }
 
 /// `encoding.base64_decode(s)` — standard alphabet. Writes an owned `buffer` handle to `*out` and
@@ -9786,7 +9840,7 @@ pub unsafe extern "C" fn align_rt_cli_usage(cmd: *const CliCommand) -> AlignStr 
             }
         }
     }
-    owned_str_from_vec(s.as_bytes())
+    owned_str_copy(s.as_bytes())
 }
 
 /// Free a `cli command` (its flag table). Null-safe.
@@ -13022,21 +13076,19 @@ mod tests {
 
     // --- std.encoding (M10 Slice 1) ----------------------------------------------------------
 
-    /// Encode via the internal encoder (the FFI shape is a thin `owned_str_from_vec` wrapper).
+    /// Encode via the same exact-destination core as the FFI path.
     fn b64_enc(data: &[u8], url: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        base64_encode_into(data, if url { &BASE64_URL } else { &BASE64_STD }, !url, &mut out);
-        out
+        let pad = !url;
+        let len = base64_encoded_len(data.len(), pad).unwrap();
+        let mut out = vec![core::mem::MaybeUninit::uninit(); len];
+        base64_encode_into(data, if url { &BASE64_URL } else { &BASE64_STD }, pad, &mut out);
+        out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
     }
 
     fn hex_enc(data: &[u8]) -> Vec<u8> {
-        const HEX: [u8; 16] = *b"0123456789abcdef";
-        let mut out = Vec::new();
-        for &b in data {
-            out.push(HEX[(b >> 4) as usize]);
-            out.push(HEX[(b & 15) as usize]);
-        }
-        out
+        let mut out = vec![core::mem::MaybeUninit::uninit(); data.len() * 2];
+        hex_encode_into(data, &mut out);
+        out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
     }
 
     /// A hex decode mirroring the FFI path (odd length / non-hex byte -> `None`).
@@ -13099,6 +13151,275 @@ mod tests {
             }
             let hx = hex_enc(data);
             assert_eq!(hex_dec(&hx).as_ref(), Some(data), "hex round trip {data:?}");
+        }
+    }
+
+    #[test]
+    fn encoding_ffi_exact_destinations_match_reference() {
+        let mut lengths: Vec<usize> = (0..=65).collect();
+        lengths.extend([256, 4096]);
+        for n in lengths {
+            let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+            for (url, encode) in [
+                (false, align_rt_base64_encode as unsafe extern "C" fn(*const u8, i64) -> AlignStr),
+                (true, align_rt_base64url_encode as unsafe extern "C" fn(*const u8, i64) -> AlignStr),
+            ] {
+                let out = unsafe { encode(data.as_ptr(), data.len() as i64) };
+                assert_eq!(out.len as usize, base64_encoded_len(n, !url).unwrap());
+                assert_eq!(unsafe { safe_slice(out.ptr, out.len) }, b64_enc(&data, url));
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+            }
+            let out = unsafe { align_rt_hex_encode(data.as_ptr(), data.len() as i64) };
+            assert_eq!(out.len as usize, n * 2);
+            assert_eq!(unsafe { safe_slice(out.ptr, out.len) }, hex_enc(&data));
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+        }
+        assert_eq!(base64_encoded_len(usize::MAX, true), None);
+        assert_eq!(base64_encoded_len(usize::MAX, false), None);
+    }
+
+    /// Manual allocation-inclusive gate for removing the codec staging allocation and full-output
+    /// copy. The staged controls use the former Vec encoder followed by `owned_str_copy`; direct
+    /// paths call the shipped exact-destination ABI. Run with:
+    ///
+    /// `cargo test -p align_runtime --release encoding_exact_destination_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn encoding_exact_destination_probe() {
+        use std::hint::black_box;
+
+        #[derive(Clone, Copy)]
+        enum Codec {
+            Base64,
+            Base64Url,
+            Hex,
+        }
+
+        #[inline(never)]
+        fn run(data: &[u8], codec: Codec, direct: bool) -> u64 {
+            let out = if direct {
+                match codec {
+                    Codec::Base64 => unsafe { align_rt_base64_encode(data.as_ptr(), data.len() as i64) },
+                    Codec::Base64Url => unsafe { align_rt_base64url_encode(data.as_ptr(), data.len() as i64) },
+                    Codec::Hex => unsafe { align_rt_hex_encode(data.as_ptr(), data.len() as i64) },
+                }
+            } else {
+                let staged = match codec {
+                    Codec::Base64 => b64_enc(data, false),
+                    Codec::Base64Url => b64_enc(data, true),
+                    Codec::Hex => hex_enc(data),
+                };
+                owned_str_copy(&staged)
+            };
+            let checksum = if out.len == 0 {
+                0
+            } else {
+                out.len as u64
+                    ^ unsafe { *out.ptr as u64 }
+                    ^ unsafe { *out.ptr.add(out.len as usize - 1) as u64 }
+            };
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            checksum
+        }
+
+        fn time(data: &[u8], codec: Codec, direct: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(run)(black_box(data), codec, black_box(direct));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        println!("codec exact destinations (median of 9, allocation-inclusive ns/op):");
+        println!(" codec     | input    | staged       | direct       | staged/direct");
+        for (name, codec) in [
+            ("base64", Codec::Base64),
+            ("base64url", Codec::Base64Url),
+            ("hex", Codec::Hex),
+        ] {
+            for n in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 65, 1024, 1 << 20, 64 << 20] {
+                let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+                let iters = match n {
+                    0..=65 => 100_000,
+                    66..=1024 => 20_000,
+                    1025..=1_048_576 => 30,
+                    _ => 3,
+                };
+                let mut staged = Vec::with_capacity(9);
+                let mut direct = Vec::with_capacity(9);
+                for trial in 0..9 {
+                    if trial % 2 == 0 {
+                        staged.push(time(&data, codec, false, iters));
+                        direct.push(time(&data, codec, true, iters));
+                    } else {
+                        direct.push(time(&data, codec, true, iters));
+                        staged.push(time(&data, codec, false, iters));
+                    }
+                }
+                assert_eq!(run(&data, codec, false), run(&data, codec, true));
+                let staged = median(staged);
+                let direct = median(direct);
+                println!("{name:9} | {n:8} | {staged:12.2} | {direct:12.2} | {:13.2}x", staged / direct);
+            }
+        }
+    }
+
+    /// End-to-end measure-first probe for the roadmap's JSON scalar-array double allocation. The
+    /// candidate performs a lexical count pass, allocates the exact final `array<i64>` payload, then
+    /// parses directly into it; the shipped control parses once into a growing Vec and publishes by
+    /// malloc+copy. This prices the extra pass instead of measuring the final copy in isolation.
+    /// Run with:
+    ///
+    /// `cargo test -p align_runtime --release json_decode_exact_destination_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn json_decode_exact_destination_probe() {
+        use std::hint::black_box;
+
+        fn count_values(src: &[u8]) -> Option<usize> {
+            let mut p = JsonParser { src, pos: 0 };
+            p.ws();
+            p.expect(b'[')?;
+            p.ws();
+            let mut count = 0usize;
+            if p.peek() == Some(b']') {
+                p.pos += 1;
+            } else {
+                loop {
+                    p.skip_value()?;
+                    count = count.checked_add(1)?;
+                    p.ws();
+                    match p.peek() {
+                        Some(b',') => p.pos += 1,
+                        Some(b']') => {
+                            p.pos += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                    p.ws();
+                }
+            }
+            p.ws();
+            (p.pos == src.len()).then_some(count)
+        }
+
+        #[inline(never)]
+        fn direct_decode(src: &[u8]) -> Option<AlignStr> {
+            if !validate_utf8(src) {
+                return None;
+            }
+            let count = count_values(src)?;
+            let total = count.checked_mul(core::mem::size_of::<i64>())?;
+            let total_i64 = i64::try_from(total).ok()?;
+            let count_i64 = i64::try_from(count).ok()?;
+            let dst = align_rt_alloc(total_i64);
+            let parsed = (|| -> Option<()> {
+                let mut p = JsonParser { src, pos: 0 };
+                p.ws();
+                p.expect(b'[')?;
+                p.ws();
+                if count == 0 {
+                    p.expect(b']')?;
+                } else {
+                    for i in 0..count {
+                        p.ws();
+                        let value = p.integer_field(8, true)?;
+                        unsafe { dst.cast::<u64>().add(i).write(value) };
+                        p.ws();
+                        p.expect(if i + 1 == count { b']' } else { b',' })?;
+                    }
+                }
+                p.ws();
+                (p.pos == src.len()).then_some(())
+            })();
+            if parsed.is_none() {
+                unsafe { align_rt_free(dst) };
+                return None;
+            }
+            Some(AlignStr { ptr: dst, len: count_i64 })
+        }
+
+        #[inline(never)]
+        fn run(src: &[u8], direct: bool) -> u64 {
+            let out = if direct {
+                direct_decode(src).unwrap()
+            } else {
+                let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+                let tag = (1 << 16) | 8;
+                assert_eq!(unsafe { align_rt_json_decode_array(src.as_ptr(), src.len() as i64, tag, &mut out) }, 0);
+                out
+            };
+            let checksum = if out.len == 0 {
+                0
+            } else {
+                out.len as u64
+                    ^ unsafe { *(out.ptr as *const u64) }
+                    ^ unsafe { *(out.ptr as *const u64).add(out.len as usize - 1) }
+            };
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            checksum
+        }
+
+        fn time(src: &[u8], direct: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(run)(black_box(src), black_box(direct));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        println!("JSON array<i64> exact destination (median of 9, allocation-inclusive ns/op):");
+        println!(" elements | input bytes | staged       | count+direct | staged/direct");
+        for n in [0usize, 1, 8, 64, 1024, 65_536, 1_000_000] {
+            let mut src = String::from("[");
+            for i in 0..n {
+                if i > 0 {
+                    src.push(',');
+                }
+                use std::fmt::Write;
+                write!(&mut src, "{}", (i * 7919) % 1_000_003).unwrap();
+            }
+            src.push(']');
+            let src = src.into_bytes();
+            let iters = match n {
+                0..=8 => 100_000,
+                9..=64 => 20_000,
+                65..=1024 => 2_000,
+                1025..=65_536 => 30,
+                _ => 3,
+            };
+            let mut staged = Vec::with_capacity(9);
+            let mut direct = Vec::with_capacity(9);
+            for trial in 0..9 {
+                if trial % 2 == 0 {
+                    staged.push(time(&src, false, iters));
+                    direct.push(time(&src, true, iters));
+                } else {
+                    direct.push(time(&src, true, iters));
+                    staged.push(time(&src, false, iters));
+                }
+            }
+            assert_eq!(run(&src, false), run(&src, true));
+            let staged = median(staged);
+            let direct = median(direct);
+            println!("{n:9} | {:11} | {staged:12.2} | {direct:12.2} | {:13.2}x", src.len(), staged / direct);
         }
     }
 
