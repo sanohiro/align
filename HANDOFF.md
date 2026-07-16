@@ -18,7 +18,8 @@ normal/`..` stress. The checked-in allocation-inclusive median-of-nine probe mea
 already-normal 16-byte path, 1.86x on a mixed 10-byte path, and 1.43x on 256 normal components. The
 explicit negative shape (256 appends then 192 pops) is recorded at 0.77x because direct fill writes
 components that a staging stack later discards; the required already-normal short gate still clears
-decisively. The complete workspace is green (**2185 total = 2181 passed + four ignored manual
+decisively. Gemini's `rposition` cleanup suggestion was measured and rejected: it regressed all four
+probe shapes by roughly 5-7% versus the explicit initialized-prefix loop. The complete workspace is green (**2185 total = 2181 passed + four ignored manual
 probes**) and workspace clippy passes with warnings denied. This work is in PR **#480**, based on
 squash-merged PR #479 (`b8b9173`). **Next recommended P2:** remove per-entry payload staging from
 `fs.read_dir` and DNS results with explicit unwind cleanup, while retaining generic deep-drop
