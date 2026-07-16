@@ -646,9 +646,9 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
 | `path.normalize` | 1 exact-upper-bound final | 0 | shipped direct fill |
 | `fs.read_dir` / DNS, N names | N final + header + header Vec | 0 | shipped direct payloads + RAII unwind |
-| Base64/hex encode | Vec + final | Vec→final | document 12 exact destination |
+| Base64/hex encode | 1 exact final | 0 | shipped document-12 direct destination |
 | JSON decoded string field | 0 per field | 0 | keep zero-copy view |
-| JSON decoded array | parser Vec + final | Vec→final | already-planned measure-first |
+| JSON decoded array | parser Vec + final | Vec→final | retain one-pass staging; exact-count scalar probe regressed large inputs |
 | `to_array` | 1 output | source→output fill | keep; donation only for proven unique temporary |
 | `partition` | 2 outputs | one store per source element | keep baseline |
 | `array_builder.build()` | grow payload (Box only when escaping) | 0 | keep nonescaping header elision + freeze |
@@ -726,7 +726,10 @@ AoS/SoA conversion, or a second substring-search algorithm.
    stored/escaping and pipeline/`par_map` values retain the owned materialized representation.
 3. ~~Write single str-group and dictionary outputs directly.~~ **DONE 2026-07-16.**
 4. ~~Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.~~ **DONE 2026-07-16.**
-5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
+5. ~~Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.~~ **DONE
+   2026-07-16.** Base64/Base64url/hex now fill one checked exact final allocation; the balanced probe
+   improved every short case and 64 MiB by 1.70-1.86x. An `array<i64>` count-then-direct JSON probe
+   regressed 1K-1M elements to 0.71-0.73x, so the one-pass parser Vec remains.
 
 ### P3 — larger portfolios after measurement
 

@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (ninth update this day), **`read_dir` AND DNS CREATE FINAL STRING PAYLOADS
+_Last updated: 2026-07-16 (tenth update this day), **BASE64/BASE64URL/HEX FILL ONE EXACT FINAL
+PAYLOAD.** All three scalar encoders now compute checked group/tail output lengths, allocate only the
+final Align-owned string, and initialize it through `MaybeUninit<u8>`; the staging Vec, second
+allocation, and full-output copy are gone. Empty output remains `{null,0}`, positive OOM remains the
+runtime's fail-fast contract, and differential gates cover every length through 65 bytes plus
+256/4096 and every byte value. The allocation-inclusive balanced probe improved every short case;
+at 64 MiB Base64/Base64url/hex improved 1.71x/1.70x/1.86x after the review-requested chunked hot
+loop removed per-byte bounds checks. The roadmap JSON-copy probe was also
+executed end to end for `array<i64>` with the required lexical count pass: it won only at 1-8
+elements, reversed by 64, and reached 0.71-0.73x at 1K-1M, so the existing one-pass staged decoder is
+retained and the negative result is recorded. The complete workspace is green (**2188 total = 2182
+passed + six ignored manual probes**) and workspace clippy passes with warnings denied. This work is on branch
+**`agent/exact-codec-destinations`**, based on squash-merged PR #481 (`be74904`). **Next recommended
+after this PR:** take document 12's highest remaining measured item, the
+initialized-before-read/uninitialized arena split, beginning with its safety classification and
+gateway adoption probe. The aarch64 UTF-8 portability measurement remains deferred. Previous
+update: 2026-07-16 (ninth update this day), **`read_dir` AND DNS CREATE FINAL STRING PAYLOADS
 ONCE.** Both runtimes now allocate each UTF-8 filename or numeric-IP payload while enumerating and
 stage only `AlignStr` headers in a shared RAII owner. Any later iteration or checked-size error drops
 that owner and frees every payload accumulated so far while the ABI output stays `{null,0}`. Success
@@ -17,8 +33,9 @@ once to the existing generic `array<string>` deep-drop representation. UTF-8 fil
 DNS first-occurrence order/deduplication, and `freeaddrinfo` coverage are unchanged. This removes one
 staging allocation and full payload copy per returned entry without introducing a slab or a second
 ownership representation. The complete workspace remains green (**2185 total = 2181 passed + four
-ignored manual probes**) and workspace clippy passes with warnings denied. This work is in PR
-**#481**, based on squash-merged PR #480 (`bdca925`). **Next recommended P2:** execute document 12's
+ignored manual probes**) and workspace clippy passes with warnings denied. This work was
+squash-merged as PR **#481** (`be74904`), based on squash-merged PR #480 (`bdca925`). **Next
+recommended P2:** execute document 12's
 codec exact-destination slice and the roadmap JSON-copy probe. The aarch64 UTF-8 portability
 measurement remains deferred. Previous update: 2026-07-16 (eighth update this day), **`path.normalize` FILLS ONE FINAL BUFFER.** The
 runtime allocates the owned result once at the proven `max(input_len, 1)` bound and uses its
