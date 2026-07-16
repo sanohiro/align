@@ -8,7 +8,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twenty-fourth update this day), **THINLTO S1 IS SHIPPED — SERIAL
+_Last updated: 2026-07-17, **THINLTO S2 IS SHIPPED — CACHE COMPOSITION + PARALLELISM, MERGED as
+#497** (`c5a0244`). `--thin-lto` builds are now incremental and parallel: PHASE 1 prelink
+(parallel, cacheable per unit; artifact = summary-bearing `.bc` in a new CAS `prelink` namespace)
+→ PHASE 2 thin-link (serial, uncached, fresh import/export lists every build) → PHASE 3 backend
+(parallel, cacheable; key = own prelink digest ⊕ inbound import list ⊕ import-source prelink
+digests ⊕ outbound export/promotion set ⊕ backend/target bits; `thinbackend` namespace). Both
+phases run in the existing `thread::scope` atomic-claim loop in DAG index order; `FirstDiff` names
+the missing phase (`PrelinkInput`/`CrossUnitImports`); explain-opt stays serial/uncached/
+non-ThinLTO. Headline win pinned: editing a dep's private body misses only that unit's prelink and
+exactly the importing units' backends — a unit importing nothing from it hits both phases. Key
+hygiene: `CACHE_KEY_FORMAT_VERSION` and `MANIFEST_FORMAT_VERSION` both 1→2 (fail-closed
+`UnknownVersion` decode), and the reserved `CodegenKey::cross_unit_opt_digest` was REMOVED
+outright — the separate phase keys/namespaces supersede the empty/non-empty-digest scheme with
+structurally stronger toggle isolation; doc-10 §6.2, the roadmap settled paragraph, and
+open-questions carry appended supersession corrections. Two recorded soundness deviations: the
+outbound export set is keyed (entry 3 promotes own locals per export flags) and `target_triple`
+stays in the prelink key (datalayout). Gates: the 8-gate `thin_lto_cache.rs` suite (incremental
+win, pub-signature transitive miss, import-sensitive precision, toggle isolation, cold-vs-hit
+byte-identity through both phases, parallel == `-j 1`, cross-process all-hit, corruption
+evict+rebuild) plus all prior suites. gemini reviewed with zero findings (still active on its
+sunset day); validation comment posted before squash-merge. The complete workspace is green
+(**2219 total = 2206 passed + 13 ignored**) and clippy passes with warnings denied in both
+feature states. **Next: ThinLTO SV — the verification bundle** per the settled slice plan:
+build-twice determinism as a pinned gate, cold-vs-hit byte-identity re-verified at SV scope, a
+summary-index-level stale-summary fail-closed mutation (S2's gate covers CAS-blob corruption; SV
+deepens it), and an explicit compile-time regression bound (the rt-lto bound discipline). After
+SV closes the ThinLTO arc: next M14 remainder = instrument PGO (sequenced after LTO in the
+recorded wave order). From now on gemini-code-assist is sunset — use `/code-review` on each
+branch before merging. Previous update: 2026-07-16 (twenty-fourth update this day), **THINLTO S1
+IS SHIPPED — SERIAL
 CROSS-UNIT OPTIMIZATION BEHIND `--thin-lto`, MERGED as #496** (`a3ae142`). The 3-entry shim is now
 a production component of every `alignc` (libLTO stays spike-only); the driver runs
 prelink → thin-link → backend serially over private staging; `--thin-lto` is legal only on
