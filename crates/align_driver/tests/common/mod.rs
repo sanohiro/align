@@ -6,9 +6,11 @@
 #![allow(dead_code, unused_imports)]
 
 pub use align_driver::{
-    backend_available, build_per_unit, check, check_per_unit, emit_llvm_ir, emit_object_file,
-    link_executable, link_objects, lower_to_mir, lower_to_mir_per_unit, BuildTarget, Hash128,
-    InterfaceSummary, ObjectFormat, PerUnitArtifact, PerUnitCheck, PerUnitWalk, Profile,
+    backend_available, build_per_unit, build_thin_lto, cas_blob_path, check, check_per_unit,
+    emit_llvm_ir, emit_object_file, link_executable, link_objects, lower_to_mir,
+    lower_to_mir_per_unit, BackendKey, BuildTarget, CacheContext, CacheOutcome, CacheStage,
+    FirstDiff, Hash128, InboundImport, InterfaceSummary, ObjectFormat, PerUnitArtifact,
+    PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, CACHE_KEY_FORMAT_VERSION,
 };
 pub use align_span::SourceMap;
 
@@ -465,4 +467,175 @@ pub fn check_multi_diagnostics(name: &str, files: &[(&str, &str)], entry: &str) 
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, &entry_path.display().to_string(), &entry_src);
     align_driver::format_diagnostics(&sm, &checked.diags)
+}
+
+// ================================================================================================
+// ThinLTO shared fixtures (consumed by `thin_lto.rs`, `thin_lto_cache.rs`, `thin_lto_sv.rs`).
+// Hoisted here so the 4-unit DAG corpus, the `Proj` RAII guard, and the two-phase `ThinBuilt` result
+// live in one place instead of being copied per test file.
+// ================================================================================================
+
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static THIN_NONCE: AtomicU64 = AtomicU64::new(0);
+/// A per-process-unique counter for temp dir / staging / artifact names.
+pub fn thin_nonce() -> u64 {
+    THIN_NONCE.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+// The 4-unit DAG: main → {b → c, d}. `c` has a PRIVATE helper (editable body, stable interface);
+// `d` imports nothing from `c`. main prints `b.bval() + d.dval()`.
+//   C_V1:   helper = x*2 → cval = 20 → bval = 120 → prints 125
+//   C_BODY: helper = x*3 → cval = 30 → bval = 130 → prints 135   (a private-body edit)
+//   C_PUB:  adds a new `pub fn extra()` → flips c's interface hash (a public-surface edit)
+pub const C_V1: &str = "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\n";
+pub const C_BODY: &str = "module c\nfn helper(x: i64) -> i64 = x * 3\npub fn cval() -> i64 = helper(10)\n";
+pub const C_PUB: &str = "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\npub fn extra() -> i64 = 7\n";
+pub const B_SRC: &str = "module b\nimport c\npub fn bval() -> i64 = c.cval() + 100\n";
+pub const D_SRC: &str = "module d\npub fn dval() -> i64 = 5\n";
+pub const MAIN_SRC: &str = "import b\nimport d\nfn main() {\n  print(b.bval() + d.dval())\n}\n";
+/// Expected stdout for the DAG with `C_V1` (the default body).
+pub const DAG_OUT_V1: &str = "125\n";
+/// Expected stdout for the DAG with `C_BODY` (the edited private body).
+pub const DAG_OUT_BODY: &str = "135\n";
+
+/// The DAG's four `(filename, source)` pairs for a given `c` body.
+pub fn dag_files(cver: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("c.align", cver.to_string()),
+        ("b.align", B_SRC.to_string()),
+        ("d.align", D_SRC.to_string()),
+        ("main.align", MAIN_SRC.to_string()),
+    ]
+}
+
+/// A throwaway multi-file project under the system temp dir. RAII-only: the directory (sources,
+/// caches, staging, linked exes) is removed on `Drop`, so a panicking assertion never leaks it.
+pub struct Proj {
+    pub dir: PathBuf,
+    pub entry: String,
+}
+
+impl Proj {
+    /// A project from explicit `(name, source)` files, with `entry` the entry unit's filename.
+    pub fn new(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
+        let dir = std::env::temp_dir().join(format!("align-thin-{}-{tag}-{}", std::process::id(), thin_nonce()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir project");
+        let proj = Proj { dir, entry: entry.to_string() };
+        for (name, src) in files {
+            proj.write(name, src);
+        }
+        proj
+    }
+    /// The standard 4-unit DAG with the given `c` body; entry = `main.align`.
+    pub fn dag(tag: &str, cver: &str) -> Proj {
+        let files = dag_files(cver);
+        let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        Proj::new(tag, &refs, "main.align")
+    }
+    pub fn write(&self, name: &str, src: &str) {
+        std::fs::write(self.dir.join(name), src).expect("write source");
+    }
+    /// An ENABLED cache under `<dir>/cache`.
+    pub fn cache(&self) -> CacheContext {
+        CacheContext::at(self.cache_root())
+    }
+    pub fn cache_root(&self) -> PathBuf {
+        self.dir.join("cache")
+    }
+}
+
+impl Drop for Proj {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// One library-level `--thin-lto` build of `proj`'s program: a fresh per-unit walk, a fresh staging
+/// dir + object paths (so a hit copies the CAS blob into a clean file), the two-phase outcome vector,
+/// and the per-unit prelink `.bc` paths the driver wrote.
+pub struct ThinBuilt {
+    pub outcomes: Vec<CacheOutcome>,
+    pub objs: Vec<PathBuf>,
+    pub bc_paths: Vec<PathBuf>,
+    pub link_libs: Vec<String>,
+    pub units: Vec<String>,
+}
+
+/// Build `proj`'s program the ThinLTO way (all three phases) with `cache` + `jobs` workers.
+pub fn thin_build(proj: &Proj, cache: &CacheContext, jobs: usize) -> ThinBuilt {
+    let entry = proj.dir.join(&proj.entry);
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    assert!(!walk.diags.has_errors(), "unexpected build errors");
+    let n = walk.units.len();
+    let staging = proj.dir.join(format!("stg-{}", thin_nonce()));
+    std::fs::create_dir_all(&staging).expect("mkdir staging");
+    let objs: Vec<PathBuf> = (0..n).map(|i| staging.join(format!("o{i}.o"))).collect();
+    let build = build_thin_lto(
+        &walk.units, &objs, cache, &BuildTarget::Baseline, Profile::Release, &[], false, &staging, jobs,
+    )
+    .expect("thin-lto build");
+    // First-seen (DAG-order) union of every unit's capability link libs.
+    let mut link_libs: Vec<String> = Vec::new();
+    for u in &walk.units {
+        for l in &u.mir.link_libs {
+            if !link_libs.contains(l) {
+                link_libs.push(l.clone());
+            }
+        }
+    }
+    ThinBuilt {
+        outcomes: build.outcomes,
+        objs,
+        bc_paths: build.prelink_bc,
+        link_libs,
+        units: walk.units.iter().map(|u| u.unit.clone()).collect(),
+    }
+}
+
+impl ThinBuilt {
+    pub fn outcome(&self, unit: &str, stage: CacheStage) -> &CacheOutcome {
+        self.outcomes
+            .iter()
+            .find(|o| o.unit == unit && o.stage == stage)
+            .unwrap_or_else(|| panic!("no {stage:?} outcome for unit `{unit}`"))
+    }
+    pub fn prelink(&self, unit: &str) -> &CacheOutcome {
+        self.outcome(unit, CacheStage::ThinLtoPrelink)
+    }
+    pub fn backend(&self, unit: &str) -> &CacheOutcome {
+        self.outcome(unit, CacheStage::ThinLtoBackend)
+    }
+    pub fn all_hit(&self) -> bool {
+        self.outcomes.iter().all(|o| o.hit)
+    }
+    pub fn all_miss(&self) -> bool {
+        self.outcomes.iter().all(|o| !o.hit)
+    }
+    pub fn unit_index(&self, unit: &str) -> usize {
+        self.units.iter().position(|u| u == unit).expect("unit present")
+    }
+    pub fn obj_bytes(&self) -> Vec<Vec<u8>> {
+        self.objs.iter().map(|p| std::fs::read(p).expect("read obj")).collect()
+    }
+    fn link_to(&self, proj: &Proj) -> PathBuf {
+        let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
+        let exe = proj.dir.join(format!("exe-{}", thin_nonce()));
+        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
+        exe
+    }
+    /// Link + read the exe bytes. Caller must have checked `cc_available()`.
+    pub fn exe_bytes(&self, proj: &Proj) -> Vec<u8> {
+        std::fs::read(self.link_to(proj)).expect("read exe")
+    }
+    /// Link + run; returns stdout. Caller must have checked `cc_available()`.
+    pub fn run(&self, proj: &Proj) -> String {
+        let exe = self.link_to(proj);
+        String::from_utf8_lossy(&Command::new(&exe).output().expect("run").stdout).into_owned()
+    }
 }

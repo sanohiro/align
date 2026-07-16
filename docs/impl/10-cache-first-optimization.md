@@ -386,6 +386,21 @@ corruption recovery, and cold-vs-hit byte identity. The interface reader also ve
 public-surface hash before exposing effect bits. Future frontend/link cache layers must rerun this
 matrix at their new stage boundary; this status does not pre-approve those deferred caches.
 
+**ThinLTO stage status (2026-07-17): automated for the `prelink`/`thinbackend` phase boundaries.**
+`--thin-lto` adds two cacheable phases (`CacheStage::ThinLtoPrelink` + `ThinLtoBackend`) with their
+own CAS namespaces; the matrix rows that apply to those stages are pinned by `thin_lto_cache.rs` (S2)
+and `thin_lto_sv.rs` (SV). `thin_lto_cache.rs`: private-body-edit precise backend invalidation,
+public-signature transitive miss, import-sensitive precision, thin/non-thin namespace separation,
+cold-vs-hit byte identity through both phases (same `-j`), parallel==`-j1`, cross-process all-hit,
+and corrupted-prelink-blob digest-failure/eviction/rebuild. `thin_lto_sv.rs`: build-twice + cross-`-j`
+cold determinism, a `-j2`-cold/`-j4`+`-j1`-hot byte-identical serve (the different-`-j` cold-vs-hit
+row), a summary-level stale-summary mutation (a valid-but-different prelink `.bc` rejected on the
+content digest — NOT merely on a parse failure), the profile/target/CPU/**LLVM/compiler** and
+`--rt-lto` key-component rows at unit level (disjoint keys, never mixed), and an explicit
+compile-time-regression bound. The serial thin-link (phase 2) is never cached (reruns every build),
+so it has no cache-identity row. The ThinLTO arc (S0–SV) is CLOSED; see the roadmap
+"ThinLTO SV SHIPPED" record.
+
 ---
 
 ## 8. CPU-cache candidates not already scheduled

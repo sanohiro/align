@@ -1,183 +1,40 @@
 //! ThinLTO SV — the verification bundle that CLOSES the ThinLTO arc (S0–SV). It pins what S1
-//! (`thin_lto.rs`) and S2 (`thin_lto_cache.rs`) did not:
+//! (`thin_lto.rs`) and S2 (`thin_lto_cache.rs`) did not. The DAG corpus / `Proj` guard / `ThinBuilt`
+//! result live in `common` (shared with `thin_lto_cache.rs`).
 //!
-//!  1. **Build-twice determinism as a permanent gate** — two independent COLD `--thin-lto` builds
-//!     (separate cache roots, same inputs, same `-j`) produce byte-identical objects AND a
-//!     byte-identical final exe, at N=4 with real cross-unit imports; plus cold determinism across
-//!     DIFFERENT `-j` values with no cache reuse (separate cold roots, `-j1` vs `-j4`).
-//!  2. **Summary-level stale-summary fail-closed mutation** — the S2 corruption gate replaces a
-//!     cached prelink blob with NON-bitcode garbage; SV replaces it with a *structurally valid but
-//!     different* prelink `.bc` (a sibling unit's bitcode in 2a, a different-body build of the same
-//!     unit in 2b). The read path must reject on the CONTENT DIGEST (not on a bitcode-parse failure)
-//!     → `CorruptEntry` eviction + deterministic rebuild + correct exe. This proves the digest-verify
-//!     is what closes the hole, independent of whether the swapped bytes parse.
+//!  1. **Build-twice determinism as a permanent gate** — independent COLD `--thin-lto` builds with
+//!     SEPARATE cache roots produce byte-identical objects AND exe, at N=4 with real cross-unit
+//!     imports (main → {b → c, d}); a single matrix gate pins same-input AND cross-`-j` determinism
+//!     cold; a hot-serve gate pins that a cold publish at one `-j` is served byte-identically to hot
+//!     builds at other `-j`; a real-driver subprocess gate pins the end-to-end exe (with explicit
+//!     cold-independence via `--cache-stats`).
+//!  2. **Summary-level stale-summary fail-closed mutation** — the S2 corruption gate replaces a cached
+//!     prelink blob with NON-bitcode garbage; SV replaces it with a *structurally valid but different*
+//!     prelink `.bc` (a sibling unit's bitcode in 2a, a different-body build of the same unit in 2b).
+//!     Both still parse as bitcode, so only the CONTENT DIGEST can reject them → `CorruptEntry`
+//!     eviction + deterministic rebuild + correct exe.
 //!  3. **Explicit compile-time regression bound** — a COLD `--thin-lto` build's wall-time vs the
-//!     flag-off cold build on the fixed 4-unit chain stays under a generous cap (best-of-N min over
-//!     the real DEBUG-`alignc` subprocess; see `gate_sv3` for why this cannot flake).
+//!     flag-off cold build on the fixed 4-unit chain stays under a generous cap (interleaved A/B per
+//!     round, best-of-N min; see `gate_sv3` for why this cannot flake).
 //!  4. **Invalidation-matrix completion (unit level)** — the LLVM-version, compiler-build-id, and
-//!     `--rt-lto` components of the prelink/backend keys each yield disjoint keys (never mix), a
-//!     `--rt-lto`-on/off pair produces disjoint prelink keys, and two `--rt-lto` digests differ. Pure
-//!     key/manifest tests (no real second LLVM, no backend), simulating each matrix row by mutating
-//!     one key component.
+//!     `--rt-lto` components of the prelink/backend keys each yield disjoint keys (never mix); plus an
+//!     END-TO-END gate that `--rt-lto` on vs off changes a unit's own prelink `.bc` content.
 //!
 //! Hole finding (2a): the read path (`materialize_blob`) DOES digest-verify every CAS blob against the
 //! manifest's stored `blob_digest` before use — shared by both ThinLTO phases via `try_hit_phase`. So
 //! 2a found NO hole; the rejection is by digest, which SV proves holds for valid-but-different bitcode.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::*;
+
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use align_driver::{
-    build_per_unit, build_thin_lto, link_objects, BackendKey, BuildTarget, CacheContext,
-    CacheLookup, CacheOutcome, CacheStage, FirstDiff, Hash128, InboundImport, PrelinkKey, Profile,
-};
-use align_span::SourceMap;
-
-static NONCE: AtomicU64 = AtomicU64::new(0);
-fn nonce() -> u64 {
-    NONCE.fetch_add(1, Ordering::Relaxed)
-}
+use align_driver::CacheLookup;
 
 fn backend() -> bool {
-    align_driver::backend_available()
-}
-
-fn cc_available() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// The 4-unit DAG with real cross-unit imports: main → {b → c, d}. `c` has a private helper (an
-/// editable body behind a stable interface). Duplicated from `thin_lto_cache.rs` — each integration
-/// test file is its own crate.
-const C_V1: &str = "module c\nfn helper(x: i64) -> i64 = x * 2\npub fn cval() -> i64 = helper(10)\n";
-const C_BODY: &str = "module c\nfn helper(x: i64) -> i64 = x * 3\npub fn cval() -> i64 = helper(10)\n";
-const B_SRC: &str = "module b\nimport c\npub fn bval() -> i64 = c.cval() + 100\n";
-const D_SRC: &str = "module d\npub fn dval() -> i64 = 5\n";
-const MAIN_SRC: &str = "import b\nimport d\nfn main() {\n  print(b.bval() + d.dval())\n}\n";
-
-fn dag_files(cver: &str) -> [(&'static str, String); 4] {
-    [
-        ("c.align", cver.to_string()),
-        ("b.align", B_SRC.to_string()),
-        ("d.align", D_SRC.to_string()),
-        ("main.align", MAIN_SRC.to_string()),
-    ]
-}
-
-/// A throwaway multi-file project (removed on drop).
-struct Proj {
-    dir: PathBuf,
-}
-
-impl Proj {
-    fn dag(tag: &str, cver: &str) -> Proj {
-        let dir = std::env::temp_dir().join(format!("align-thin-sv-{}-{tag}-{}", std::process::id(), nonce()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir project");
-        let proj = Proj { dir };
-        for (name, src) in dag_files(cver) {
-            proj.write(name, &src);
-        }
-        proj
-    }
-    fn write(&self, name: &str, src: &str) {
-        std::fs::write(self.dir.join(name), src).expect("write source");
-    }
-}
-
-impl Drop for Proj {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// One library-level `--thin-lto` build over `proj`'s DAG. Fresh per-unit walk, fresh staging dir, so
-/// a hit copies the CAS blob into a clean file. Returns the two-phase outcomes + artifact paths.
-struct ThinBuilt {
-    outcomes: Vec<CacheOutcome>,
-    objs: Vec<PathBuf>,
-    bc_paths: Vec<PathBuf>,
-    link_libs: Vec<String>,
-    units: Vec<String>,
-}
-
-fn thin_build(proj: &Proj, cache: &CacheContext, jobs: usize) -> ThinBuilt {
-    let entry = proj.dir.join("main.align");
-    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
-    let mut sm = SourceMap::new();
-    let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
-    assert!(!walk.diags.has_errors(), "unexpected build errors");
-    let n = walk.units.len();
-    let staging = proj.dir.join(format!("stg-{}", nonce()));
-    std::fs::create_dir_all(&staging).expect("mkdir staging");
-    let objs: Vec<PathBuf> = (0..n).map(|i| staging.join(format!("o{i}.o"))).collect();
-    let bc_paths: Vec<PathBuf> = (0..n).map(|i| staging.join(format!("unit{i}.prelink.bc"))).collect();
-    let outcomes = build_thin_lto(
-        &walk.units, &objs, cache, &BuildTarget::Baseline, Profile::Release, &[], false, &staging, jobs,
-    )
-    .expect("thin-lto build");
-    let mut link_libs: Vec<String> = Vec::new();
-    for u in &walk.units {
-        for l in &u.mir.link_libs {
-            if !link_libs.contains(l) {
-                link_libs.push(l.clone());
-            }
-        }
-    }
-    ThinBuilt {
-        outcomes,
-        objs,
-        bc_paths,
-        link_libs,
-        units: walk.units.iter().map(|u| u.unit.clone()).collect(),
-    }
-}
-
-impl ThinBuilt {
-    fn phase(&self, unit: &str, stage: CacheStage) -> &CacheOutcome {
-        self.outcomes
-            .iter()
-            .find(|o| o.unit == unit && o.stage == stage)
-            .unwrap_or_else(|| panic!("no {stage:?} outcome for `{unit}`"))
-    }
-    fn prelink(&self, unit: &str) -> &CacheOutcome {
-        self.phase(unit, CacheStage::ThinLtoPrelink)
-    }
-    fn backend(&self, unit: &str) -> &CacheOutcome {
-        self.phase(unit, CacheStage::ThinLtoBackend)
-    }
-    fn unit_index(&self, unit: &str) -> usize {
-        self.units.iter().position(|u| u == unit).expect("unit present")
-    }
-    fn obj_bytes(&self) -> Vec<Vec<u8>> {
-        self.objs.iter().map(|p| std::fs::read(p).expect("read obj")).collect()
-    }
-    fn exe_bytes(&self, proj: &Proj) -> Vec<u8> {
-        let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
-        let exe = proj.dir.join(format!("exe-{}", nonce()));
-        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
-        std::fs::read(&exe).expect("read exe")
-    }
-    fn run(&self, proj: &Proj) -> String {
-        let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
-        let exe = proj.dir.join(format!("exe-{}", nonce()));
-        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
-        String::from_utf8_lossy(&Command::new(&exe).output().expect("run").stdout).into_owned()
-    }
-}
-
-/// The `cas/<hex[..2]>/<hex>` blob path for a content digest under `root`.
-fn cas_blob_path(root: &Path, digest: Hash128) -> PathBuf {
-    let hex = digest.to_hex();
-    root.join("cas").join(&hex[..2]).join(&hex)
+    backend_available()
 }
 
 /// LLVM bitcode magic (`BC\xC0\xDE`). Used to self-document that a swapped-in blob still *parses* as
@@ -190,49 +47,67 @@ fn is_llvm_bitcode(bytes: &[u8]) -> bool {
 // Gate SV1: build-twice determinism (permanent gate)
 // ================================================================================================
 
-/// Two independent COLD `--thin-lto` builds — separate cache roots, same inputs, same `-j` — produce
-/// byte-identical objects AND a byte-identical final exe. N=4 with real cross-unit imports (main →
-/// {b → c, d}), so promotion (`.llvm.<hash>` names) + import/export decisions must be stable.
+/// The determinism matrix: three independent COLD `--thin-lto` builds of the N=4 DAG (real cross-unit
+/// imports), each with its OWN fresh cache root, at `-j1` / `-j2` / `-j4`. Every pair must produce
+/// byte-identical objects AND a byte-identical exe. This single gate pins BOTH same-input determinism
+/// (any two) AND cross-`-j` cold determinism with no cache reuse (S2 gate6 pins `-j1==-j4` only with
+/// the cache DISABLED; here the cache is ENABLED-but-cold, so the parallel claim order can leak into
+/// neither an object nor a cached artifact).
 #[test]
-fn gate_sv1_build_twice_determinism_separate_roots() {
+fn gate_sv1_build_twice_determinism_matrix() {
     if !backend() {
         return;
     }
-    let proj = Proj::dag("det-roots", C_V1);
-    let root_a = CacheContext::at(proj.dir.join("cache-a"));
-    let root_b = CacheContext::at(proj.dir.join("cache-b"));
-    // Both builds are COLD (each root is fresh) and use the SAME -j.
-    let a = thin_build(&proj, &root_a, 2);
-    let b = thin_build(&proj, &root_b, 2);
-    assert!(a.outcomes.iter().all(|o| !o.hit), "build A is cold (fresh root)");
-    assert!(b.outcomes.iter().all(|o| !o.hit), "build B is cold (fresh root)");
-    assert_eq!(a.obj_bytes(), b.obj_bytes(), "two cold --thin-lto builds must emit byte-identical objects");
+    let proj = Proj::dag("det-matrix", C_V1);
+    let builds: Vec<ThinBuilt> = [(1usize, "r1"), (2, "r2"), (4, "r3")]
+        .into_iter()
+        .map(|(jobs, root)| {
+            let b = thin_build(&proj, &CacheContext::at(proj.dir.join(root)), jobs);
+            assert!(b.all_miss(), "each separate-root build is cold");
+            b
+        })
+        .collect();
+
+    let objs: Vec<Vec<Vec<u8>>> = builds.iter().map(|b| b.obj_bytes()).collect();
+    assert_eq!(objs[0], objs[1], "cold -j1 and -j2 builds must emit byte-identical objects");
+    assert_eq!(objs[0], objs[2], "cold -j1 and -j4 builds must emit byte-identical objects");
     if cc_available() {
-        assert_eq!(a.exe_bytes(&proj), b.exe_bytes(&proj), "two cold --thin-lto builds must link a byte-identical exe");
+        let exes: Vec<Vec<u8>> = builds.iter().map(|b| b.exe_bytes(&proj)).collect();
+        assert_eq!(exes[0], exes[1], "cold -j1 and -j2 builds must link a byte-identical exe");
+        assert_eq!(exes[0], exes[2], "cold -j1 and -j4 builds must link a byte-identical exe");
     }
 }
 
-/// Cold determinism across DIFFERENT `-j` with NO cache reuse: two separate cold roots, one at `-j1`
-/// and one at `-j4`, must still emit byte-identical objects + exe. (S2 gate6 pins `-j1 == -j4` with
-/// cache DISABLED; this pins it with the cache ENABLED-but-cold, so the parallel claim order can't
-/// leak into a cached artifact either.)
+/// Cross-`-j` HOT-serve: a cold publish at `-j2` into a SHARED cache root must be served
+/// byte-identically to hot all-hit builds at `-j4` and `-j1` (objects + exe). This closes the
+/// different-`-j` hot-serve gap the settled SV list named alongside S2 gate5 (which pins cold-vs-hit
+/// only at the SAME `-j`).
 #[test]
-fn gate_sv1_cold_determinism_across_jobs() {
+fn gate_sv1_cross_jobs_hot_serve_byte_identical() {
     if !backend() {
         return;
     }
-    let proj = Proj::dag("det-jobs", C_V1);
-    let serial = thin_build(&proj, &CacheContext::at(proj.dir.join("cache-j1")), 1);
-    let parallel = thin_build(&proj, &CacheContext::at(proj.dir.join("cache-j4")), 4);
-    assert!(serial.outcomes.iter().all(|o| !o.hit) && parallel.outcomes.iter().all(|o| !o.hit), "both cold");
-    assert_eq!(serial.obj_bytes(), parallel.obj_bytes(), "-j1 and -j4 cold builds must emit byte-identical objects");
-    if cc_available() {
-        assert_eq!(serial.exe_bytes(&proj), parallel.exe_bytes(&proj), "-j1 and -j4 cold builds must link a byte-identical exe");
+    let proj = Proj::dag("det-hotjobs", C_V1);
+    let cache = proj.cache(); // ONE shared root
+    let cold = thin_build(&proj, &cache, 2);
+    assert!(cold.all_miss(), "the first build is cold");
+    let cold_objs = cold.obj_bytes();
+    let cold_exe = cc_available().then(|| cold.exe_bytes(&proj));
+
+    for jobs in [4usize, 1] {
+        let hot = thin_build(&proj, &cache, jobs);
+        assert!(hot.all_hit(), "a repeat build at -j{jobs} hits every phase");
+        assert_eq!(cold_objs, hot.obj_bytes(), "the -j2 cold objects are served byte-identically at -j{jobs}");
+        if let Some(ref exe) = cold_exe {
+            assert_eq!(*exe, hot.exe_bytes(&proj), "the -j2 cold exe is served byte-identically at -j{jobs}");
+        }
     }
 }
 
 /// End-to-end (real driver, subprocess): two cold `alignc build --thin-lto` runs with two distinct
-/// `ALIGNC_CACHE` roots produce a byte-identical executable.
+/// `ALIGNC_CACHE` roots produce a byte-identical executable. The exe is deleted before each build (and
+/// re-existence asserted) so the comparison can never pass by reading a stale artifact, and each
+/// build's coldness/independence is asserted via `--cache-stats` (`0 hit, 4 miss` in both phases).
 #[test]
 fn gate_sv1_subprocess_build_twice_byte_identical() {
     if !backend() || !cc_available() {
@@ -240,15 +115,21 @@ fn gate_sv1_subprocess_build_twice_byte_identical() {
     }
     let proj = Proj::dag("det-subproc", C_V1);
     let alignc = env!("CARGO_BIN_EXE_alignc");
+    let exe_path = proj.dir.join("main");
     let build = |root: &str| -> Vec<u8> {
+        let _ = std::fs::remove_file(&exe_path); // never let a stale exe satisfy the comparison
         let out = Command::new(alignc)
-            .args(["build", "main.align", "--thin-lto", "-p", "release"])
+            .args(["build", "main.align", "--thin-lto", "--cache-stats", "-p", "release"])
             .current_dir(&proj.dir)
             .env("ALIGNC_CACHE", proj.dir.join(root))
             .output()
             .expect("spawn alignc");
         assert!(out.status.success(), "--thin-lto build failed: {}", String::from_utf8_lossy(&out.stderr));
-        std::fs::read(proj.dir.join("main")).expect("read built exe")
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("prelink: 0 hit, 4 miss"), "the build must be cold (all prelink miss):\n{err}");
+        assert!(err.contains("backend: 0 hit, 4 miss"), "the build must be cold (all backend miss):\n{err}");
+        assert!(exe_path.exists(), "the build produced the exe");
+        std::fs::read(&exe_path).expect("read built exe")
     };
     let a = build("xr-a");
     let b = build("xr-b");
@@ -269,11 +150,11 @@ fn gate_sv2a_valid_but_different_prelink_blob_rejected_by_digest() {
         return;
     }
     let proj = Proj::dag("stale-valid", C_V1);
-    let cache = CacheContext::at(proj.dir.join("cache"));
+    let cache = proj.cache();
     let cold = thin_build(&proj, &cache, 1);
-    assert!(cold.outcomes.iter().all(|o| !o.hit), "cold build all-miss");
+    assert!(cold.all_miss(), "cold build all-miss");
 
-    let root = proj.dir.join("cache");
+    let root = proj.cache_root();
     let c_bc = std::fs::read(&cold.bc_paths[cold.unit_index("c")]).expect("read c prelink bc");
     let d_bc = std::fs::read(&cold.bc_paths[cold.unit_index("d")]).expect("read d prelink bc");
     assert!(is_llvm_bitcode(&c_bc) && is_llvm_bitcode(&d_bc), "both units' prelink outputs are real bitcode");
@@ -285,7 +166,6 @@ fn gate_sv2a_valid_but_different_prelink_blob_rejected_by_digest() {
     std::fs::write(&c_blob, &d_bc).expect("swap in a valid-but-different .bc");
 
     let hot = thin_build(&proj, &cache, 1);
-    assert!(!hot.prelink("c").hit, "a content-mismatched (but valid) prelink blob is not served");
     assert_eq!(
         hot.prelink("c").miss_reason,
         Some(FirstDiff::CorruptEntry),
@@ -293,36 +173,37 @@ fn gate_sv2a_valid_but_different_prelink_blob_rejected_by_digest() {
     );
     assert!(hot.backend("c").hit, "the deterministic prelink rebuild re-hits c's (uncorrupted) backend object");
     if cc_available() {
-        assert_eq!(hot.run(&proj), "125\n", "the exe is correct after the digest-rejection rebuild");
+        assert_eq!(hot.run(&proj), DAG_OUT_V1, "the exe is correct after the digest-rejection rebuild");
     }
 }
 
 /// 2b: the stale-manifest race shape — publish a valid manifest+blob, then replace the blob with a
 /// DIFFERENT valid prelink `.bc` (a different-BODY build of the SAME unit `c`, digest mismatch). Same
 /// digest-verify rejection path; proves the mutation is caught even when the replacement is a genuine
-/// alternative prelink of the very unit being served.
+/// alternative prelink of the very unit being served. The alternate bitcode is harvested from a small
+/// 2-unit variant project (no need for a full 4-unit build).
 #[test]
 fn gate_sv2b_stale_manifest_different_body_blob_rejected() {
     if !backend() {
         return;
     }
     let proj = Proj::dag("stale-body", C_V1);
-    let cache = CacheContext::at(proj.dir.join("cache"));
+    let cache = proj.cache();
     let cold = thin_build(&proj, &cache, 1);
-    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    assert!(cold.all_miss());
     let c_bc_v1 = std::fs::read(&cold.bc_paths[cold.unit_index("c")]).expect("read c v1 prelink bc");
 
-    // Produce a genuinely different (but valid) prelink .bc for `c` by building a variant project whose
-    // c body is edited. `alt.bc_paths` are in the variant's own staging.
-    let alt_proj = Proj::dag("stale-body-alt", C_BODY);
-    let alt = thin_build(&alt_proj, &CacheContext::Disabled, 1);
-    let c_bc_v2 = std::fs::read(&alt.bc_paths[alt.unit_index("c")]).expect("read c v2 prelink bc");
+    // Harvest a genuinely different (but valid) prelink .bc for `c` from a minimal 2-unit variant whose
+    // c body is edited (C_BODY).
+    let alt_main = "import c\nfn main() {\n  print(c.cval())\n}\n";
+    let alt = Proj::new("stale-body-alt", &[("c.align", C_BODY), ("main.align", alt_main)], "main.align");
+    let alt_built = thin_build(&alt, &CacheContext::Disabled, 1);
+    let c_bc_v2 = std::fs::read(&alt_built.bc_paths[alt_built.unit_index("c")]).expect("read c v2 prelink bc");
     assert!(is_llvm_bitcode(&c_bc_v2), "the variant's c prelink is real bitcode");
     assert_ne!(c_bc_v1, c_bc_v2, "the different body yields a different prelink .bc");
 
     // Publish-then-replace: overwrite the ORIGINAL c CAS blob with the different-body valid bitcode.
-    let root = proj.dir.join("cache");
-    let c_blob = cas_blob_path(&root, Hash128::of(&c_bc_v1));
+    let c_blob = cas_blob_path(&proj.cache_root(), Hash128::of(&c_bc_v1));
     assert!(c_blob.exists());
     std::fs::write(&c_blob, &c_bc_v2).expect("replace with a different valid prelink .bc");
 
@@ -334,7 +215,7 @@ fn gate_sv2b_stale_manifest_different_body_blob_rejected() {
     );
     assert!(hot.backend("c").hit, "the rebuilt prelink is deterministic → c's backend object still hits");
     if cc_available() {
-        assert_eq!(hot.run(&proj), "125\n", "the ORIGINAL c body is rebuilt + served (not the stale swapped body)");
+        assert_eq!(hot.run(&proj), DAG_OUT_V1, "the ORIGINAL c body is rebuilt + served (not the stale swapped body)");
     }
 }
 
@@ -351,8 +232,11 @@ fn gate_sv2b_stale_manifest_different_body_blob_rejected() {
 ///     (process spawn + a debug-Rust frontend + the `cc` link) is IDENTICAL in both and appears in
 ///     BOTH numerator and denominator, pulling the ratio toward 1. ThinLTO's own delta (a second opt
 ///     pipeline pass + a ~0.1 ms thin-link) is a small fraction of that fixed cost.
-///   * We take the BEST-OF-N min wall-time for each side (the least-scheduler-contended run), so the
-///     ratio compares two reproducible best cases rather than two noisy samples.
+///   * off/thin are INTERLEAVED within each round (A then B, same round) so a load spike that starts
+///     mid-test hits both sides symmetrically — never the block-sequential bias where all `off` runs
+///     precede all `thin` runs (`bench/README.md`).
+///   * We take the BEST-OF-N min wall-time for each side (the least-scheduler-contended run) and keep
+///     `min` (never a mean) — the min discards one-time page-in, so no separate warm-up is needed.
 ///   * `ALIGNC_CACHE=off` forces every run cold (no reuse skew).
 ///   * `CAP = 3.0` is ~2× the headroom over the observed ratio (~1.1–1.5× in practice), so ordinary
 ///     CI scheduler noise cannot cross it.
@@ -362,7 +246,7 @@ fn gate_sv3_compile_time_regression_bound() {
         return;
     }
     const CAP: f64 = 3.0;
-    const ROUNDS: usize = 5;
+    const ROUNDS: usize = 3;
     let proj = Proj::dag("ct-bound", C_V1);
     let alignc = env!("CARGO_BIN_EXE_alignc");
 
@@ -380,12 +264,14 @@ fn gate_sv3_compile_time_regression_bound() {
         assert!(out.status.success(), "build failed (thin={thin}): {}", String::from_utf8_lossy(&out.stderr));
         dt
     };
-    let best = |thin: bool| (0..ROUNDS).map(|_| one_build(thin)).fold(f64::INFINITY, f64::min);
 
-    // Warm up (page-in the alignc binary + link toolchain) so neither side pays a one-time cost.
-    let _ = one_build(false);
-    let off = best(false);
-    let thin = best(true);
+    // Interleave off/thin per round; keep the per-side min.
+    let mut off = f64::INFINITY;
+    let mut thin = f64::INFINITY;
+    for _ in 0..ROUNDS {
+        off = off.min(one_build(false));
+        thin = thin.min(one_build(true));
+    }
     let ratio = thin / off;
     assert!(
         ratio < CAP,
@@ -394,21 +280,21 @@ fn gate_sv3_compile_time_regression_bound() {
 }
 
 // ================================================================================================
-// Gate SV4: invalidation-matrix completion (unit level — key/manifest, no backend)
+// Gate SV4: invalidation-matrix completion
 // ================================================================================================
 
-fn h(seed: u64) -> Hash128 {
+fn hh(seed: u64) -> Hash128 {
     Hash128 { lo: seed, hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
 }
 
 fn base_prelink_key() -> PrelinkKey {
     PrelinkKey {
-        cache_format_version: 2,
-        compiler_build_id: h(1),
+        cache_format_version: CACHE_KEY_FORMAT_VERSION,
+        compiler_build_id: hh(1),
         frontend_schema: 1,
         located: false,
-        impl_hash: h(2),
-        dep_interface_hashes: vec![("c".to_string(), h(3))],
+        impl_hash: hh(2),
+        dep_interface_hashes: vec![("c".to_string(), hh(3))],
         exports: vec![],
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
         object_format: 0,
@@ -423,8 +309,8 @@ fn base_prelink_key() -> PrelinkKey {
 
 fn base_backend_key() -> BackendKey {
     BackendKey {
-        cache_format_version: 2,
-        compiler_build_id: h(1),
+        cache_format_version: CACHE_KEY_FORMAT_VERSION,
+        compiler_build_id: hh(1),
         llvm_version: "22.1.8".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
         object_format: 0,
@@ -435,10 +321,10 @@ fn base_backend_key() -> BackendKey {
         profile_name: "release".to_string(),
         pipeline: "default<O2>".to_string(),
         codegen_opt: "O2".to_string(),
-        own_prelink_digest: h(10),
-        inbound_imports: vec![("c".to_string(), 42u64, true) as InboundImport],
+        own_prelink_digest: hh(10),
+        inbound_imports: vec![("c".to_string(), 42u64, true)],
         outbound_exports: vec![7u64],
-        import_source_digests: vec![("c".to_string(), h(11))],
+        import_source_digests: vec![("c".to_string(), hh(11))],
         exports: vec![],
         unit: "b".to_string(),
     }
@@ -448,7 +334,7 @@ fn base_backend_key() -> BackendKey {
 /// key). Returns the lookup so a test can assert Hit/Miss + the first-diff reason — the real
 /// key/slot/manifest machinery, no backend.
 fn publish_then_lookup(bytes: &[u8], key: &PrelinkKey, probe: &PrelinkKey) -> CacheLookup {
-    let dir = std::env::temp_dir().join(format!("align-sv4-{}-{}", std::process::id(), nonce()));
+    let dir = std::env::temp_dir().join(format!("align-sv4-{}-{}", std::process::id(), thin_nonce()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cache = CacheContext::at(dir.join("cache"));
@@ -480,9 +366,11 @@ fn gate_sv4_prelink_llvm_version_component() {
     let mut b = a.clone();
     b.llvm_version = "23.0.0".to_string();
     assert_ne!(a.full_digest(), b.full_digest(), "different LLVM versions must not share a prelink key");
-    let l = publish_then_lookup(b"BC\xc0\xde-prelink-a", &a, &b);
-    assert!(!is_hit(&l), "a different LLVM version must not hit");
-    assert_eq!(miss_reason(&l), Some(FirstDiff::LlvmVersion), "the miss reason names the LLVM version");
+    assert_eq!(
+        miss_reason(&publish_then_lookup(b"BC\xc0\xde-prelink-a", &a, &b)),
+        Some(FirstDiff::LlvmVersion),
+        "a different LLVM version misses, and the reason names the LLVM version"
+    );
     // The same key re-hits its own artifact (baseline: publish and lookup are consistent).
     assert!(is_hit(&publish_then_lookup(b"BC\xc0\xde-prelink-a", &a, &a)), "the identical key re-hits");
 }
@@ -493,13 +381,15 @@ fn gate_sv4_prelink_llvm_version_component() {
 fn gate_sv4_prelink_compiler_build_id_component() {
     let a = base_prelink_key();
     let mut b = a.clone();
-    b.compiler_build_id = h(999);
+    b.compiler_build_id = hh(999);
     assert_ne!(a.full_digest(), b.full_digest(), "different compiler build ids must not share a prelink key");
     // compiler_build_id is part of the slot core, so a changed build id targets a fresh slot → a clean
     // miss (no prior entry to diff), never a stale hit.
-    let l = publish_then_lookup(b"BC\xc0\xde-prelink-b", &a, &b);
-    assert!(!is_hit(&l), "a different compiler build id must not hit");
-    assert_eq!(miss_reason(&l), Some(FirstDiff::NoPriorEntry), "a build-id change targets a disjoint slot → no prior entry");
+    assert_eq!(
+        miss_reason(&publish_then_lookup(b"BC\xc0\xde-prelink-b", &a, &b)),
+        Some(FirstDiff::NoPriorEntry),
+        "a build-id change targets a disjoint slot → no prior entry (never a stale hit)"
+    );
 }
 
 /// `--rt-lto` on/off produces disjoint prelink keys (never mix); the on-side further keys on the merge
@@ -509,21 +399,23 @@ fn gate_sv4_prelink_rt_lto_toggle_disjoint() {
     let off = base_prelink_key();
     let mut on1 = off.clone();
     on1.rt_lto = true;
-    on1.rt_lto_digest = Some(h(500));
+    on1.rt_lto_digest = Some(hh(500));
     let mut on2 = on1.clone();
-    on2.rt_lto_digest = Some(h(501));
+    on2.rt_lto_digest = Some(hh(501));
 
     assert_ne!(off.full_digest(), on1.full_digest(), "--rt-lto on/off must be disjoint prelink keys");
     assert_ne!(on1.full_digest(), on2.full_digest(), "two --rt-lto merge digests must be disjoint prelink keys");
 
-    // End-to-end: publishing the flag-off artifact must NOT be served to an --rt-lto probe (rt_lto is
-    // not in the slot core → the slot is found → the diff reports the rt-lto mode).
-    let l = publish_then_lookup(b"BC\xc0\xde-rtlto-off", &off, &on1);
-    assert!(!is_hit(&l), "an --rt-lto build must not be served the flag-off prelink");
-    assert_eq!(miss_reason(&l), Some(FirstDiff::RtLto), "the miss reason names the rt-lto mode");
+    // End-to-end: the flag-off artifact must NOT be served to an --rt-lto probe (rt_lto is not in the
+    // slot core → the slot is found → the diff reports the rt-lto mode).
+    assert_eq!(
+        miss_reason(&publish_then_lookup(b"BC\xc0\xde-rtlto-off", &off, &on1)),
+        Some(FirstDiff::RtLto),
+        "an --rt-lto build is not served the flag-off prelink; the reason names the rt-lto mode"
+    );
 
     // And the two never mix: publish BOTH to one root, each re-hits its OWN distinct artifact.
-    let dir = std::env::temp_dir().join(format!("align-sv4-rt-{}-{}", std::process::id(), nonce()));
+    let dir = std::env::temp_dir().join(format!("align-sv4-rt-{}-{}", std::process::id(), thin_nonce()));
     std::fs::create_dir_all(&dir).unwrap();
     let cache = CacheContext::at(dir.join("cache"));
     let f_off = dir.join("off.bc");
@@ -552,18 +444,53 @@ fn gate_sv4_backend_key_components_disjoint() {
     assert_ne!(base.full_digest(), llvm.full_digest(), "LLVM version must split the backend key");
 
     let mut bid = base.clone();
-    bid.compiler_build_id = h(999);
+    bid.compiler_build_id = hh(999);
     assert_ne!(base.full_digest(), bid.full_digest(), "compiler build id must split the backend key");
 
     // --rt-lto changes the unit's prelink bitcode (merged runtime bodies), which is pinned in the
     // backend key as `own_prelink_digest` (and every import-source's digest). A changed prelink digest
     // therefore splits the backend key — this is the rt-lto interaction at the backend phase.
     let mut prelink = base.clone();
-    prelink.own_prelink_digest = h(777);
+    prelink.own_prelink_digest = hh(777);
     assert_ne!(base.full_digest(), prelink.full_digest(), "a changed own prelink digest must split the backend key");
 
     // Cross-unit inputs (import edges / import-source digests / outbound exports) also split it.
     let mut xunit = base.clone();
-    xunit.import_source_digests = vec![("c".to_string(), h(888))];
+    xunit.import_source_digests = vec![("c".to_string(), hh(888))];
     assert_ne!(base.full_digest(), xunit.full_digest(), "a changed import-source digest must split the backend key");
+}
+
+/// END-TO-END grounding for the "rt-lto captured transitively through `own_prelink_digest`" claim:
+/// building the SAME unit (one that references a runtime primitive, `str ==`) with `--rt-lto` ON vs
+/// OFF must yield DIFFERENT prelink `.bc` content — because the runtime bodies are merged BEFORE the
+/// prelink `.bc` is hashed (the `build_thin_lto` structural invariant). If they were equal, the
+/// backend key's rt-lto sensitivity would rest on the prelink KEY's explicit `rt_lto` bit alone; this
+/// proves the bitcode content itself carries the difference.
+#[test]
+fn gate_sv4_rt_lto_changes_prelink_bitcode_end_to_end() {
+    if !backend() {
+        return;
+    }
+    // A 2-unit program whose `lib` references the runtime string-equality primitive.
+    let lib = "module lib\npub fn eq(x: str) -> bool = x == \"hello\"\n";
+    let main = "import lib\nfn main() {\n  print(lib.eq(\"hello\"))\n}\n";
+    let prelink_digest = |rt_lto: bool, tag: &str| -> Hash128 {
+        let proj = Proj::new(tag, &[("lib.align", lib), ("main.align", main)], "main.align");
+        let entry = proj.dir.join("main.align");
+        let entry_src = std::fs::read_to_string(&entry).unwrap();
+        let mut sm = SourceMap::new();
+        let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+        let lib_i = walk.units.iter().position(|u| u.unit == "lib").expect("lib unit");
+        let staging = proj.dir.join("stg");
+        std::fs::create_dir_all(&staging).unwrap();
+        let objs: Vec<PathBuf> = (0..walk.units.len()).map(|i| staging.join(format!("o{i}.o"))).collect();
+        let build = build_thin_lto(
+            &walk.units, &objs, &CacheContext::Disabled, &BuildTarget::Baseline, Profile::Release, &[], rt_lto, &staging, 1,
+        )
+        .expect("thin-lto build");
+        Hash128::of(&std::fs::read(&build.prelink_bc[lib_i]).expect("read lib prelink bc"))
+    };
+    let off = prelink_digest(false, "rt-off");
+    let on = prelink_digest(true, "rt-on");
+    assert_ne!(off, on, "--rt-lto on vs off must change lib's own prelink .bc content (runtime bodies merged pre-prelink)");
 }

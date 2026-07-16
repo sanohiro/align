@@ -2360,6 +2360,38 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    clear "not yet" (its discarded buffer would leak) and lands when enum/Result Move payloads gain
    discard-drop support.
 
+### Separate compilation + ThinLTO — SHIPPED (M15 + ThinLTO S0–SV; design SETTLED 2026-07-14)
+
+Recorded 2026-07-12; owner-mandated. "One `Program` → one whole-program object" is no longer Align's
+only compilation model. **Design SETTLED 2026-07-14** by the mandated two-lens review
+(language/soundness + driver/artifacts/cache); the full settlement + slice plan (S0–SV) is the "M15
+design SETTLED" block in the roadmap M15 section (implementation source of truth). Key decisions:
+unit = one module/file, driver-discovered DAG (cyclic imports = hard error, no other new syntax); the
+unit interface is COMPLETE (escape/Move/MoveCheck need no body summaries; purity = a 3-valued
+per-`pub`-fn effect bit, fail-CLOSED — missing/Unknown ⇒ Impure ⇒ rejected at parallel boundaries);
+generics = instantiate-in-consumer with serialized template ASTs (duplicate internal monomorphs
+accepted in v1); visibility = `{main} ∪ --export ∪ pub` external, everything else internal;
+incremental cache on the doc-10 contract with an interface-vs-impl hash split (interface hash
+INCLUDES effect bits + generic template bodies); hard cutover (N=1 IS whole-program, byte-identical).
+**SHIPPED 2026-07-15: M15 separate compilation COMPLETE through SV** (per-unit
+interfaces/sema/codegen/link, the default-on incremental object cache, parallel unit codegen, the
+doc-10 §7 verification bundle).
+
+**Cross-module optimization — scope of the resolution:** the recorded "multi-file loses cross-module
+inlining" trade is RESOLVED **only under the opt-in `--thin-lto` flag on the `release`/`fast`
+profiles.** Default builds and every `debug` multi-file build still run with ZERO cross-unit
+optimization by design — each unit is compiled in isolation, and `--thin-lto` is never folded into a
+profile in v1. Under that flag the ThinLTO arc (S0 spike → S1 serial → S2 cache/parallel → SV
+verification) is CLOSED (2026-07-17); the roadmap "ThinLTO design SETTLED" / "ThinLTO S1/S2 SHIPPED" /
+"ThinLTO SV SHIPPED" paragraphs are the record, and `impl/10-cache-first-optimization.md` §7 is the
+invalidation-matrix source of truth. **S2 correction 2026-07-16:** ThinLTO composes via separate
+`prelink`/`thinbackend` phase keys + CAS namespaces, so the M15-reserved empty `cross_unit_opt_digest`
+codegen-key field was removed outright rather than populated. The genuinely-open follow-ups (cross-unit
+`pub` internalization, precise-vs-conservative digest evolution, ThinLTO-aware
+`explain-opt`/`emit-llvm --stage`, `extern "C"` export-of-body / fully-escaping cross-unit fn values)
+stay findable as a slim "Separate compilation / ThinLTO — remaining deferrals" entry in the Open
+section, alongside the parallel/pipeline/cache companion-audit records.
+
 ## Open (to be decided)
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
@@ -2425,38 +2457,25 @@ type-check in *either* module — a `map` must end in a reduction (`.sum()`) or 
 (`map_into`); there is no bare `map`→`array` collect. The bug reproduces cleanly with a valid
 terminal, which is what the tests use.
 
-### Separate compilation (multi-module compilation units) — SHIPPED (M15 COMPLETE + ThinLTO S0–SV; design SETTLED 2026-07-14)
+### Separate compilation / ThinLTO — remaining deferrals (design SHIPPED; decision record in Settled)
 
-Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not
-remain Align's only compilation model: separate compilation is REQUIRED, near-term.
-Language-level modules already exist; the missing piece is per-unit compilation +
-incremental builds. **Design SETTLED 2026-07-14 by the mandated two-lens review
-(language/soundness + driver/artifacts/cache); the full settlement + slice plan (S0–SV) is the
-"M15 design SETTLED" block in the roadmap M15 section — that is the implementation source of
-truth.** Key decisions: unit = one module/file, driver-discovered DAG (new rule: cyclic imports
-= hard error, no new syntax otherwise); the unit interface is COMPLETE (escape/Move/MoveCheck
-need no body summaries by construction; purity reduces to a 3-valued per-`pub`-fn effect bit,
-fail-CLOSED — missing/Unknown ⇒ Impure+unknown-indirect ⇒ rejected at parallel boundaries);
-generics = instantiate-in-consumer with serialized template ASTs, duplicate internal monomorphs
-accepted in v1; visibility = `{main} ∪ --export ∪ pub}` external, everything else internal;
-v1 ships ZERO cross-unit optimization (real ThinLTO later — the artifact envelope reserves
-bitcode/summary parts and the codegen key carries an empty-in-v1 cross-unit-opt digest so no
-format break; **ThinLTO design SETTLED 2026-07-16 + S0 spike GO** — the roadmap post-upgrade-wave
-"ThinLTO design SETTLED" paragraph is the S1/S2/SV source of truth; **S2 correction 2026-07-16:
-ThinLTO composes via separate `prelink`/`thinbackend` phase keys + CAS namespaces, so the reserved
-empty `cross_unit_opt_digest` codegen-key field was removed outright at S2 rather than populated**); incremental cache on the doc-10 contract with interface-vs-impl hash split
-(interface hash INCLUDES effect bits + generic template bodies); hard cutover (N=1 IS
-whole-program, byte-identical). Recorded honest trade: multi-file programs lose cross-module
-inlining until ThinLTO; single-file unaffected. `extern "C"` export-of-body stays out of M15
-(out-param noalias trust chain). **SHIPPED 2026-07-15: M15 separate compilation is COMPLETE
-through SV** (per-unit interfaces/sema/codegen/link, the default-on incremental object cache,
-parallel unit codegen, the doc-10 §7 verification bundle). **The recorded "multi-file loses
-cross-module inlining until ThinLTO" trade is now RESOLVED: ThinLTO S0 spike → S1 serial → S2
-cache/parallel → SV verification is CLOSED (2026-07-17)** — the roadmap post-upgrade-wave
-"ThinLTO … SHIPPED"/"ThinLTO SV SHIPPED" paragraphs are the record. Kept-Open deferrals, each a
-future trigger not a blocker: cross-unit `pub` internalization, a precise-vs-conservative digest
-evolution, ThinLTO-aware `explain-opt`/`emit-llvm --stage`, and the standing `extern "C"`
-export-of-body / fully-escaping-cross-unit-fn-value deferrals.
+The separate-compilation + ThinLTO **decision is settled and SHIPPED**; the durable decision record
+moved to the Settled section ("Separate compilation + ThinLTO — SHIPPED (M15 + ThinLTO S0–SV)").
+What stays genuinely OPEN is a short list of deferred follow-ups — each a future trigger, not a
+blocker:
+
+- **Cross-unit `pub` internalization** — v1's fail-closed preserve set keeps every `pub` fn external
+  in its ThinLTO object; the win waits for a whole-program-visibility pass.
+- **Precise-vs-conservative backend digest evolution** — v1 uses the precise ThinLTO backend digest
+  (own prelink ⊕ inbound imports ⊕ outbound exports ⊕ import-source digests); a coarser conservative
+  digest that trades hit rate for simpler invalidation is deferred.
+- **ThinLTO-aware `explain-opt` / `emit-llvm --stage`** — they stay per-unit-in-isolation (the honest
+  zero-cross-unit-opt view) until a cross-unit remark story is designed.
+- **`extern "C"` export-of-body + fully-escaping cross-unit function values** — standing deferrals
+  (out-param noalias trust chain / heap-owned closure environment), unchanged by ThinLTO.
+
+The companion audits below remain the durable implementation records for this workstream; several
+carry active measure-first probes, which is why they stay in Open.
 
 **Cache-first companion audit (2026-07-12):** `impl/10-cache-first-optimization.md` is the durable
 detail for this item's artifact identity and invalidation questions. Its confirmed pre-M15

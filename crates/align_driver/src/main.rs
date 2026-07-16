@@ -855,7 +855,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         let outcomes = match align_driver::build_thin_lto(
             &walk.units, &obj_paths, &cache, &target, profile, &[], rt_lto, object_stage.path(), jobs,
         ) {
-            Ok(o) => o,
+            Ok(build) => build.outcomes,
             Err(e) => {
                 eprintln!("alignc: {e}");
                 return Err(ExitCode::FAILURE);
