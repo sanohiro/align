@@ -56,7 +56,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | moved slots | MIR prunes cleanup edges whose drop flag is definitely false | **FIXED 2026-07-15**; no known-null destructor call |
 | filesystem/path ABI views | Rust consumers borrow; C consumers construct `CString` directly | **SHIPPED 2026-07-16**; redundant allocation/copy removed |
 | UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
-| `builder.to_string()` | header allocation + grow buffer + final allocation/copy | **CONFIRMED P1** copy count; M14 only solves call overhead |
+| `builder.to_string()` | allocator-compatible grow buffer transfers into owned result | **SHIPPED 2026-07-16**; no final allocation/copy |
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
 | `chunks(n)` | always materializes `array<slice<T>>` headers | **CONFIRMED P1** for direct consumers |
 | str-key group/dictionary | output buffers exist, but runtime stages in extra Vecs then copies | **CONFIRMED P1** for single aggregates/dictionary |
@@ -311,19 +311,24 @@ tail setup without imposing a second scan on long invalid/multibyte inputs; AVX2
 share their full-block ASCII fast path. This changes no language surface. Do **not** infer an aarch64
 threshold from the 32-byte AVX2 result: run the same checked-in probe on native NEON hardware first.
 
-### 6.3 CONFIRMED P1 — make owned builder freeze compatible with its backing allocation
+### 6.3 SHIPPED 2026-07-16 — owned builder freeze transfers allocator-compatible storage
 
-A surface builder currently owns a Rust `Vec<u8>` in a boxed header. `to_string()` allocates again
+At the audit baseline, a surface builder owned a Rust `Vec<u8>` in a boxed header. `to_string()` allocated again
 through `align_rt_alloc`, copies the complete output, then drops the Vec
 ([freeze](../../crates/align_runtime/src/lib.rs#L4427)). For a one-write tiny string that means a
 header allocation, a Vec allocation, a final allocation, and one full copy.
 
 The existing `array_builder` proves the compatible shape: C `malloc/realloc` storage can be handed to
-an Align owned value and freed by the existing size-less `align_rt_free`. Prototype a raw
-malloc/realloc-backed text builder so owned freeze transfers the pointer without copying. Preserve:
+an Align owned value and freed by the existing size-less `align_rt_free`. `BuilderBuf` now uses that
+same C allocator family directly, so owned freeze transfers its pointer without copying. This is
+allocator-compatible on glibc, musl, macOS, and other supported C runtimes without assuming Rust's
+global allocator happens to be the system allocator. Builder, exported allocation ABI, and
+array-builder storage route through one internal alloc/free/realloc family; exported positive
+`i64` sizes pass `safe_len` before conversion, including on 32-bit targets. The implementation
+preserves:
 
 - UTF-8-by-construction writes;
-- geometric growth and checked capacity arithmetic;
+- geometric growth and checked capacity arithmetic (the initial capacity hint remains best-effort);
 - builder Move/drop and null-on-move behavior;
 - arena template behavior as a distinct case — an arena result still needs arena-owned storage;
 - direct builder-to-I/O paths, which should never freeze a string merely to write it.
@@ -354,6 +359,32 @@ result was small/noisy, so this does not justify a short-string representation c
 confirm the raw-buffer transfer as **P1 for medium/large owned freezes**; the implementation gate
 must additionally cover unknown/geometrically grown capacity and non-glibc targets rather than
 depending on this proxy's allocator compatibility.
+
+**Shipped adoption gate (2026-07-16, same Ryzen 9 5950X, release/native, balanced median of nine):**
+the checked-in ignored probe gives both paths the same C-allocator grow buffer and one bulk input
+write. The control recreates only the removed final malloc+copy; the candidate transfers the grow
+pointer. Exact pre-sizing and capacity-zero geometric growth both win across every measured size:
+
+| growth | bytes | copy freeze | transferred freeze | copy/transfer |
+|---|---:|---:|---:|---:|
+| exact | 64 | 14.83 ns | 8.75 ns | 1.70x |
+| exact | 1,024 | 27.46 ns | 14.97 ns | 1.83x |
+| exact | 4,096 | 91.29 ns | 48.48 ns | 1.88x |
+| exact | 16,384 | 406.81 ns | 145.03 ns | 2.80x |
+| exact | 65,536 | 1.816 us | 0.895 us | 2.03x |
+| exact | 262,144 | 9.150 us | 4.410 us | 2.07x |
+| exact | 1,048,576 | 36.967 us | 18.429 us | 2.01x |
+| grow | 64 | 16.69 ns | 10.50 ns | 1.59x |
+| grow | 1,024 | 29.75 ns | 15.50 ns | 1.92x |
+| grow | 4,096 | 93.26 ns | 49.21 ns | 1.90x |
+| grow | 16,384 | 410.68 ns | 146.38 ns | 2.81x |
+| grow | 65,536 | 1.804 us | 0.901 us | 2.00x |
+| grow | 262,144 | 9.432 us | 4.501 us | 2.10x |
+| grow | 1,048,576 | 39.388 us | 19.207 us | 2.05x |
+
+Pointer-identity tests pin transfer for boxed and stack headers after exact or geometric growth;
+arena finish remains a distinct copy into arena-owned storage, empty freeze stays canonical null/0,
+and unfinished Drop plus direct builder-to-file/writer paths retain their existing ownership shape.
 
 ### 6.4 CONFIRMED P1 — remove staging copies in `read_dir` and DNS results
 
@@ -591,9 +622,9 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 |---|---:|---:|---|
 | empty `str.clone()` | 0 | 0 | keep |
 | nonempty `str.clone()` | 1 | 1 input→final | keep; ownership requires it |
-| `builder.to_string()` | Vec + final (Box only on conservative fallback) | 1 Vec→final | compatible grow buffer, zero-copy freeze |
-| template in arena | Vec + arena | 1 Vec→arena | direct arena/sink fill after ownership settlement |
-| template outside arena | Vec + owned final | 1 Vec→final, then scoped free | zero-copy owned freeze (P1) |
+| `builder.to_string()` | grow buffer (Box only on conservative fallback) | 0 | keep allocator-compatible zero-copy freeze |
+| template in arena | grow buffer + arena | 1 grow→arena | direct arena/sink fill after ownership settlement |
+| template outside arena | grow buffer | 0 | keep zero-copy owned freeze + scoped free |
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
 | `path.normalize` | components + output Vec + final | output Vec→final | one final allocation/direct fill |
 | `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
@@ -670,7 +701,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### P2 — remove proven staging
 
-1. Make owned builder freeze allocator-compatible and zero-copy.
+1. ~~Make owned builder freeze allocator-compatible and zero-copy.~~ **DONE 2026-07-16.**
 2. Virtualize direct-consumer `chunks`.
 3. Write single str-group and dictionary outputs directly.
 4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.
