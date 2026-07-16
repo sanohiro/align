@@ -844,34 +844,30 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     })?;
     // One object path per unit (DAG-index-named, not the `.`-containing module path).
     let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
-    if thin_lto {
-        // ThinLTO S1: cross-unit-optimizing build, SERIAL, and — deliberately — with the object cache
-        // BYPASSED entirely for this invocation (fail-closed, like ALIGN_SORT_ADAPTIVE's guard). The
-        // S3 codegen cache keys per-unit objects in isolation; a ThinLTO object depends on its import
-        // sources' bitcode, an identity the current cache key does NOT capture, so composing them would
-        // be unsound. S2 integrates a proper `prelink-bitcode` part-kind + precise digest; until then,
-        // `--thin-lto` never reads or writes the object cache.
-        if cache_stats {
-            eprintln!("alignc: cache: bypassed under --thin-lto (S1; S2 integrates cache composition)");
-        }
-        if let [_single] = walk.units.as_slice() {
-            // N=1: skip all three ThinLTO phases — there is no cross-unit boundary to remove. Emit
-            // exactly today's whole-program object (byte-identical to a no-flag / cache-off build).
-            if let Err(e) = align_driver::emit_object_file(&walk.units[0].mir, &obj_paths[0], target.clone(), profile, &[], rt_lto) {
-                eprintln!("alignc: codegen failed for unit `{}`: {e}", walk.units[0].unit);
+    // Opt-in codegen cache (ALIGNC_CACHE), default-ON; disabled ⇒ each unit emits verbatim.
+    let cache = CacheContext::from_env();
+    if thin_lto && walk.units.len() >= 2 {
+        // ThinLTO S2: cross-unit-optimizing build with two cacheable phases per unit (prelink bitcode
+        // + backend object) and a serial thin-link between them; misses run in parallel (`jobs`
+        // workers). Fail-closed on any shim failure — NEVER a silent fallback to the non-ThinLTO path
+        // (the user asked for --thin-lto). N=1 skips ThinLTO and falls through to the ordinary object
+        // cache below (byte-identical to today's whole-program object, one shared key namespace).
+        let outcomes = match align_driver::build_thin_lto(
+            &walk.units, &obj_paths, &cache, &target, profile, &[], rt_lto, object_stage.path(), jobs,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("alignc: {e}");
                 return Err(ExitCode::FAILURE);
             }
-        } else if let Err(e) = align_driver::build_thin_lto(&walk.units, &obj_paths, &target, profile, &[], rt_lto, object_stage.path()) {
-            // Fail-closed: name the phase + unit and abort — NEVER silently fall back to the
-            // non-ThinLTO path (the user asked for --thin-lto).
-            eprintln!("alignc: {e}");
-            return Err(ExitCode::FAILURE);
+        };
+        if cache_stats {
+            render_thin_cache_stats(&outcomes, cache.is_enabled());
         }
         return finish_link(&walk, &obj_paths, exe, profile);
     }
-    // Opt-in codegen cache (ALIGNC_CACHE); disabled ⇒ each unit emits verbatim. Codegen runs in
-    // parallel over cache MISSES (`jobs` workers); lookups are serial and results stay DAG-ordered.
-    let cache = CacheContext::from_env();
+    // Codegen runs in parallel over cache MISSES (`jobs` workers); lookups are serial and results stay
+    // DAG-ordered. This is also the N=1 `--thin-lto` path (a single unit has no cross-unit boundary).
     let outcomes = match align_driver::codegen_units_parallel(&walk.units, &obj_paths, &cache, &target, profile, rt_lto, jobs) {
         Ok(o) => o,
         Err(e) => {
@@ -949,6 +945,30 @@ fn render_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
         }
     }
     eprintln!("alignc: cache: {} unit(s): {hits} hit, {misses} miss", outcomes.len());
+}
+
+/// Render the `--cache-stats` report for a `--thin-lto` build: one `<unit> <phase> hit`/`miss (<r>)`
+/// line per phase per unit (`prelink` then `backend`), then a per-phase summary. A disabled cache
+/// prints the single disabled note (there are no per-unit lookups to report).
+fn render_thin_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
+    if !enabled {
+        eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");
+        return;
+    }
+    for stage in [align_driver::CacheStage::ThinLtoPrelink, align_driver::CacheStage::ThinLtoBackend] {
+        let (mut hits, mut misses) = (0usize, 0usize);
+        for o in outcomes.iter().filter(|o| o.stage == stage) {
+            if o.hit {
+                hits += 1;
+                eprintln!("alignc: cache: {} {} hit", o.unit, stage.label());
+            } else {
+                misses += 1;
+                let reason = o.miss_reason.map(|r| r.reason()).unwrap_or("miss");
+                eprintln!("alignc: cache: {} {} miss ({reason})", o.unit, stage.label());
+            }
+        }
+        eprintln!("alignc: cache: {} {}: {hits} hit, {misses} miss", hits + misses, stage.label());
+    }
 }
 
 /// `alignc cache clear` — remove the cache-owned subtrees (`cas`/`actions`/`index`) under the resolved

@@ -2442,7 +2442,9 @@ accepted in v1; visibility = `{main} ∪ --export ∪ pub}` external, everything
 v1 ships ZERO cross-unit optimization (real ThinLTO later — the artifact envelope reserves
 bitcode/summary parts and the codegen key carries an empty-in-v1 cross-unit-opt digest so no
 format break; **ThinLTO design SETTLED 2026-07-16 + S0 spike GO** — the roadmap post-upgrade-wave
-"ThinLTO design SETTLED" paragraph is the S1/S2/SV source of truth); incremental cache on the doc-10 contract with interface-vs-impl hash split
+"ThinLTO design SETTLED" paragraph is the S1/S2/SV source of truth; **S2 correction 2026-07-16:
+ThinLTO composes via separate `prelink`/`thinbackend` phase keys + CAS namespaces, so the reserved
+empty `cross_unit_opt_digest` codegen-key field was removed outright at S2 rather than populated**); incremental cache on the doc-10 contract with interface-vs-impl hash split
 (interface hash INCLUDES effect bits + generic template bodies); hard cutover (N=1 IS
 whole-program, byte-identical). Recorded honest trade: multi-file programs lose cross-module
 inlining until ThinLTO; single-file unaffected. `extern "C"` export-of-body stays out of M15

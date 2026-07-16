@@ -276,6 +276,16 @@ and include a compiler build/schema id so a codegen change cannot reuse an old o
 The key must use the **resolved** CPU/features. `native` as a string is not identity: two machines
 resolve it differently.
 
+> **ThinLTO S2 supersession (2026-07-16):** an earlier plan reserved a single *cross-unit-opt input
+> digest* in this codegen key (empty in the non-ThinLTO build, to be populated once ThinLTO landed).
+> ThinLTO instead composes as **two separate phase keys with their own CAS action namespaces** — a
+> `prelink` bitcode key (this list MINUS the pure backend/target knobs) and a `thinbackend` object key
+> (own prelink-bc digest ⊕ inbound imports ⊕ outbound exports ⊕ import-source prelink digests ⊕
+> backend/target bits). Separate keys/namespaces give structurally stronger toggle isolation than one
+> shared key discriminated by an empty-vs-non-empty digest (a `--thin-lto` object can never even
+> address a non-ThinLTO action), so the reserved digest field was removed outright at S2 (no dead
+> field). See `docs/impl/07-roadmap.md` "ThinLTO S2 SHIPPED".
+
 ### 6.3 Runtime and link key
 
 The current runtime freshness check compares `libalign_runtime.a` mtime only with
