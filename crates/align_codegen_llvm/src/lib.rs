@@ -8,7 +8,7 @@
 //! loads, writes are stores; `if` is conditional branches; comparisons are `icmp`;
 //! calls are `call`. The generated `main` is the C entry (crt0 calls it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
@@ -1037,6 +1037,14 @@ fn build_module<'c>(
     mark_alloc_like(ctx, builder_new);
     funcs.insert("builder_new".to_string(), builder_new);
     funcs.insert(
+        "builder_init_stack".to_string(),
+        module.add_function(
+            "align_rt_builder_init_stack",
+            ptr.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_write".to_string(),
         module.add_function(
             "align_rt_builder_write",
@@ -1418,6 +1426,14 @@ fn build_module<'c>(
     mark_alloc_like(ctx, array_builder_new);
     funcs.insert("array_builder_new".to_string(), array_builder_new);
     funcs.insert(
+        "array_builder_init_stack".to_string(),
+        module.add_function(
+            "align_rt_array_builder_init_stack",
+            ptr.fn_type(&[ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // b.push(v) (b: *ArrayBuilder, bits: i64) -> void; append one scalar element.
         "array_builder_push".to_string(),
         module.add_function("align_rt_array_builder_push", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
@@ -1438,14 +1454,38 @@ fn build_module<'c>(
         module.add_function("align_rt_array_builder_build", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        "array_builder_build_stack".to_string(),
+        module.add_function(
+            "align_rt_array_builder_build_stack",
+            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // drop(b) scalar element (b: *ArrayBuilder) -> void; free storage + header.
         "array_builder_free".to_string(),
         module.add_function("align_rt_array_builder_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        "array_builder_free_stack".to_string(),
+        module.add_function(
+            "align_rt_array_builder_free_stack",
+            ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // drop(b) string element (b: *ArrayBuilder) -> void; deep-free each string, then storage.
         "array_builder_free_strings".to_string(),
         module.add_function("align_rt_array_builder_free_strings", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "array_builder_free_strings_stack".to_string(),
+        module.add_function(
+            "align_rt_array_builder_free_strings_stack",
+            ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
     );
     funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
@@ -1478,6 +1518,14 @@ fn build_module<'c>(
         "builder_finish".to_string(),
         module.add_function(
             "align_rt_builder_finish",
+            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_finish_stack".to_string(),
+        module.add_function(
+            "align_rt_builder_finish_stack",
             slice_struct_type(ctx).fn_type(&[ptr.into()], false),
             None,
         ),
@@ -2056,9 +2104,25 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "builder_into_string_stack".to_string(),
+        module.add_function(
+            "align_rt_builder_into_string_stack",
+            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_free".to_string(),
         module.add_function(
             "align_rt_builder_free",
+            ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_free_stack".to_string(),
+        module.add_function(
+            "align_rt_builder_free_stack",
             ctx.void_type().fn_type(&[ptr.into()], false),
             None,
         ),
@@ -2260,6 +2324,7 @@ fn build_module<'c>(
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
+        let stack_headers = stack_header_plan(f);
         // Under debug info, give each function a DISubprogram (anchored to its first source line)
         // and attach it to the LLVM function, so its instructions can carry DILocations.
         let fn_line = debug_ctx.as_ref().map_or(0, |_| first_fn_line(f));
@@ -2298,6 +2363,12 @@ fn build_module<'c>(
             func: funcs[&f.name],
             slots: HashMap::new(),
             values: HashMap::new(),
+            stack_header_slots: stack_headers.slots,
+            stack_header_new_values: stack_headers.new_values,
+            stack_header_load_values: stack_headers.load_values,
+            stack_headers: HashMap::new(),
+            stack_template_values: stack_headers.template_values,
+            stack_template_headers: HashMap::new(),
             blocks: Vec::new(),
             alias_scopes: HashMap::new(),
             dibuilder: debug_ctx.as_ref().map(|dc| &dc.dib),
@@ -3613,6 +3684,17 @@ struct FnGen<'c, 'a> {
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     values: HashMap<ValueId, BasicValueEnum<'c>>,
+    /// Conservative whole-MIR proof for builder headers whose pointer never leaves its defining
+    /// function/local. Each selected local gets one reusable 64-byte entry alloca; new/load value
+    /// maps choose the stack init and consuming runtime entry points.
+    stack_header_slots: HashSet<Slot>,
+    stack_header_new_values: HashMap<ValueId, Slot>,
+    stack_header_load_values: HashMap<ValueId, Slot>,
+    stack_headers: HashMap<Slot, inkwell::values::PointerValue<'c>>,
+    /// Template builders are compiler-internal and unconditionally consumed before their result
+    /// value is published, so each dynamic template expression gets its own reusable entry buffer.
+    stack_template_values: HashSet<ValueId>,
+    stack_template_headers: HashMap<ValueId, inkwell::values::PointerValue<'c>>,
     blocks: Vec<BasicBlock<'c>>,
     /// Per-`map_into`-loop scoped-`noalias` metadata, keyed by the MIR loop's scope id: the
     /// `(in_list, out_list)` scope lists (each a one-scope MDNode) built lazily on first use. The
@@ -3631,9 +3713,227 @@ struct FnGen<'c, 'a> {
     fn_line: u32,
 }
 
+fn is_builder_header_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Builder | Ty::ArrayBuilder(_))
+}
+
+#[derive(Default)]
+struct StackHeaderPlan {
+    slots: HashSet<Slot>,
+    new_values: HashMap<ValueId, Slot>,
+    load_values: HashMap<ValueId, Slot>,
+    template_values: HashSet<ValueId>,
+}
+
+/// Select only directly-bound builder locals whose header cannot escape. This deliberately rejects
+/// aliases, user-call arguments/returns, lifted-lambda threading, and any derived builder-typed SSA
+/// value. False negatives retain the boxed ABI; a false positive would return a stack pointer, so
+/// the proof stays intentionally small and auditable.
+fn stack_header_plan(f: &Function) -> StackHeaderPlan {
+    let mut new_defs = HashMap::<ValueId, Ty>::new();
+    let mut load_defs = HashMap::<ValueId, Slot>::new();
+    let mut template_values = HashSet::<ValueId>::new();
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            if let Stmt::Let(v, rv) = stmt {
+                match rv {
+                    Rvalue::BuilderNew { .. } | Rvalue::ArrayBuilderNew { .. } => {
+                        new_defs.insert(*v, f.value_tys[*v as usize]);
+                    }
+                    Rvalue::Load(slot) if is_builder_header_ty(f.slots[*slot as usize]) => {
+                        load_defs.insert(*v, *slot);
+                    }
+                    Rvalue::Template(..) => {
+                        // The header exists only inside `gen_template`: no MIR operand can name it,
+                        // and both arena/non-arena paths consume it before publishing the string.
+                        template_values.insert(*v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut stores = HashMap::<Slot, Vec<ValueId>>::new();
+    let mut bad = HashSet::<Slot>::new();
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            if let Stmt::Store(slot, op) = stmt
+                && is_builder_header_ty(f.slots[*slot as usize])
+            {
+                match op {
+                    Operand::Value(v) if new_defs.get(v) == Some(&f.slots[*slot as usize]) => {
+                        stores.entry(*slot).or_default().push(*v);
+                    }
+                    _ => {
+                        bad.insert(*slot);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut slots: HashSet<Slot> = stores.keys().copied().collect();
+    slots.retain(|slot| !bad.contains(slot));
+    // One freshly-created pointer may initialize exactly one local exactly once. Re-storing or
+    // aliasing it rejects every destination rather than trying to prove mutually-exclusive lives.
+    let mut owner = HashMap::<ValueId, Slot>::new();
+    for (&slot, values) in &stores {
+        for &value in values {
+            if let Some(other) = owner.insert(value, slot) {
+                bad.insert(slot);
+                bad.insert(other);
+            }
+        }
+    }
+
+    fn reject_header_operand(
+        op: &Operand,
+        load_defs: &HashMap<ValueId, Slot>,
+        new_owner: &HashMap<ValueId, Slot>,
+        bad: &mut HashSet<Slot>,
+    ) {
+        if let Operand::Value(v) = op {
+            if let Some(slot) = load_defs.get(v) {
+                bad.insert(*slot);
+            }
+            if let Some(slot) = new_owner.get(v) {
+                bad.insert(*slot);
+            }
+        }
+    }
+    fn allow_loaded(
+        op: &Operand,
+        load_defs: &HashMap<ValueId, Slot>,
+        new_owner: &HashMap<ValueId, Slot>,
+        allowed: &mut HashSet<ValueId>,
+        bad: &mut HashSet<Slot>,
+    ) {
+        if let Operand::Value(v) = op {
+            if load_defs.contains_key(v) {
+                allowed.insert(*v);
+            }
+            // Audited runtime operations may use a pointer only after it has been loaded from its
+            // owning slot; a direct use of the new SSA value would create a second live handle.
+            if let Some(slot) = new_owner.get(v) {
+                bad.insert(*slot);
+            }
+        }
+    }
+    let mut allowed_loads = HashSet::<ValueId>::new();
+
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Store(slot, Operand::Value(value)) if owner.get(value) == Some(slot) => {}
+                Stmt::Store(_, op) => reject_header_operand(op, &load_defs, &owner, &mut bad),
+                Stmt::Let(v, rv) => {
+                    // Any builder-typed transform other than a direct new/load can carry a pointer
+                    // across a call/branch/return boundary. Reject every candidate of that type.
+                    if is_builder_header_ty(f.value_tys[*v as usize])
+                        && !matches!(rv, Rvalue::BuilderNew { .. } | Rvalue::ArrayBuilderNew { .. } | Rvalue::Load(_))
+                    {
+                        let ty = f.value_tys[*v as usize];
+                        for slot in stores.keys().copied().filter(|s| f.slots[*s as usize] == ty) {
+                            bad.insert(slot);
+                        }
+                    }
+                    match rv {
+                        Rvalue::BuilderWriteStr(b, _)
+                        | Rvalue::BuilderWriteInt(b, _)
+                        | Rvalue::BuilderWriteBool(b, _)
+                        | Rvalue::BuilderWriteChar(b, _)
+                        | Rvalue::BuilderWriteFloat(b, _)
+                        | Rvalue::BuilderToString(b) => {
+                            allow_loaded(b, &load_defs, &owner, &mut allowed_loads, &mut bad)
+                        }
+                        Rvalue::BuilderWriteStrIntStr(b, _, _, _) => {
+                            allow_loaded(b, &load_defs, &owner, &mut allowed_loads, &mut bad)
+                        }
+                        Rvalue::WriterWriteBuilder(_, b) | Rvalue::FsWriteFileBuilder { builder: b, .. } => {
+                            allow_loaded(b, &load_defs, &owner, &mut allowed_loads, &mut bad);
+                        }
+                        Rvalue::ArrayBuilderPush { builder, .. }
+                        | Rvalue::ArrayBuilderPushStr { builder, .. }
+                        | Rvalue::ArrayBuilderAppend { builder, .. }
+                        | Rvalue::ArrayBuilderBuild { builder } => {
+                            allow_loaded(builder, &load_defs, &owner, &mut allowed_loads, &mut bad);
+                        }
+                        Rvalue::Call(_, args) => {
+                            for op in args {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
+                        Rvalue::CallIndirect { callee, args, .. } => {
+                            reject_header_operand(callee, &load_defs, &owner, &mut bad);
+                            for op in args {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
+                        Rvalue::Closure { captures, .. } => {
+                            for op in captures {
+                                reject_header_operand(op, &load_defs, &owner, &mut bad);
+                            }
+                        }
+                        Rvalue::Use(op) => reject_header_operand(op, &load_defs, &owner, &mut bad),
+                        Rvalue::BuilderNew { .. }
+                        | Rvalue::ArrayBuilderNew { .. }
+                        | Rvalue::Load(_)
+                        | Rvalue::StrLit(_)
+                        | Rvalue::StrClone(_)
+                        | Rvalue::SliceLen(_)
+                        | Rvalue::Bin(..)
+                        | Rvalue::Cast { .. } => {}
+                        // This is intentionally fail-closed. A new or unaudited rvalue might retain
+                        // a builder operand inside an aggregate even when its result is not itself
+                        // builder-typed. Rejecting every candidate in the function is a harmless
+                        // optimization false negative; silently accepting it could make a stack
+                        // header escape. Add a narrower arm above only after auditing all operands.
+                        _ => bad.extend(slots.iter().copied()),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Term::Return(Some(op)) = &block.term {
+            reject_header_operand(op, &load_defs, &owner, &mut bad);
+        }
+    }
+
+    // A load not consumed by one of the audited non-retaining operations above is an unknown use.
+    for (&value, &slot) in &load_defs {
+        if slots.contains(&slot) && !allowed_loads.contains(&value) {
+            bad.insert(slot);
+        }
+    }
+    slots.retain(|slot| !bad.contains(slot));
+
+    let mut plan = StackHeaderPlan { slots, template_values, ..StackHeaderPlan::default() };
+    for (&slot, values) in &stores {
+        if plan.slots.contains(&slot) {
+            for &value in values {
+                plan.new_values.insert(value, slot);
+            }
+        }
+    }
+    for (value, slot) in load_defs {
+        if plan.slots.contains(&slot) {
+            plan.load_values.insert(value, slot);
+        }
+    }
+    plan
+}
+
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    fn stack_header_slot_for_operand(&self, op: &Operand) -> Option<Slot> {
+        match op {
+            Operand::Value(v) => self.stack_header_load_values.get(v).copied(),
+            _ => None,
+        }
     }
 
     /// The `(in_list, out_list)` scoped-`noalias` metadata lists for `map_into` loop `scope`, built
@@ -4002,6 +4302,35 @@ impl<'c, 'a> FnGen<'c, 'a> {
             inst.set_alignment(align).map_err(|e| self.err(e))?;
             self.slots.insert(i as Slot, ptr);
         }
+        // Runtime-owned payloads keep their existing representation. Only a proven-nonescaping
+        // header uses caller storage: one conservative 64-byte/16-aligned buffer per local, reused
+        // across reassignments after the previous header has been consumed or dropped.
+        let mut header_slots: Vec<Slot> = self.stack_header_slots.iter().copied().collect();
+        header_slots.sort_unstable(); // deterministic IR/object bytes
+        for slot in header_slots {
+            let ptr = self
+                .builder
+                .build_alloca(self.ctx.i8_type().array_type(64), &format!("header_{slot}"))
+                .map_err(|e| self.err(e))?;
+            let inst = ptr
+                .as_instruction()
+                .ok_or_else(|| self.err("header alloca did not yield an instruction"))?;
+            inst.set_alignment(16).map_err(|e| self.err(e))?;
+            self.stack_headers.insert(slot, ptr);
+        }
+        let mut template_values: Vec<ValueId> = self.stack_template_values.iter().copied().collect();
+        template_values.sort_unstable();
+        for value in template_values {
+            let ptr = self
+                .builder
+                .build_alloca(self.ctx.i8_type().array_type(64), &format!("template_header_{value}"))
+                .map_err(|e| self.err(e))?;
+            let inst = ptr
+                .as_instruction()
+                .ok_or_else(|| self.err("template header alloca did not yield an instruction"))?;
+            inst.set_alignment(16).map_err(|e| self.err(e))?;
+            self.stack_template_headers.insert(value, ptr);
+        }
 
         // Establish a fallback debug location (a no-op without debug info) so every body
         // instruction — including ones from statements with no recorded line — carries one.
@@ -4028,7 +4357,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             match s {
                 Stmt::Let(v, rv) => {
                     let result_ty = self.f.value_tys[*v as usize];
-                    if let Some(val) = self.gen_rvalue(rv, result_ty)? {
+                    if let Some(val) = self.gen_rvalue(*v, rv, result_ty)? {
                         self.values.insert(*v, val);
                     }
                 }
@@ -4258,8 +4587,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropb")
                             .map_err(|e| self.err(e))?;
+                        let free = if self.stack_header_slots.contains(slot) {
+                            "builder_free_stack"
+                        } else {
+                            "builder_free"
+                        };
                         self.builder
-                            .build_call(self.funcs["builder_free"], &[p.into()], "")
+                            .build_call(self.funcs[free], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if let Ty::ArrayBuilder(elem) = ty {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
@@ -4267,8 +4601,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // `free_string_array`-class helper); a scalar builder frees the flat storage.
                         // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
                         // slot was nulled at `build`'s move site).
-                        let free_fn = if elem == align_sema::Scalar::String {
+                        let stack = self.stack_header_slots.contains(slot);
+                        let free_fn = if elem == align_sema::Scalar::String && stack {
+                            "array_builder_free_strings_stack"
+                        } else if elem == align_sema::Scalar::String {
                             "array_builder_free_strings"
+                        } else if stack {
+                            "array_builder_free_stack"
                         } else {
                             "array_builder_free"
                         };
@@ -4520,7 +4859,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// Lower an rvalue. Returns `None` for a value-less result (a void call).
     /// `result_ty` is the type of the value being defined (needed to build a bare `None`).
-    fn gen_rvalue(&mut self, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+    fn gen_rvalue(&mut self, result_id: ValueId, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand(op),
             Rvalue::Load(slot) => {
@@ -5768,6 +6107,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // pre-sizes the backing buffer so appends don't reallocate (0 = default).
                 let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
                 let cap = self.operand(capacity);
+                if let Some(slot) = self.stack_header_new_values.get(&result_id).copied() {
+                    let header = self.stack_headers[&slot];
+                    return Ok(Some(
+                        self.builder
+                            .build_call(
+                                self.funcs["builder_init_stack"],
+                                &[header.into(), null.into(), cap.into()],
+                                "builder.stack",
+                            )
+                            .map_err(|e| self.err(e))?
+                            .try_as_basic_value()
+                            .basic()
+                            .expect("builder_init_stack returns a pointer"),
+                    ));
+                }
                 self.builder
                     .build_call(self.funcs["builder_new"], &[null.into(), cap.into()], "builder")
                     .map_err(|e| self.err(e))?
@@ -5868,16 +6222,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BuilderToString(bld) => {
                 // Finish into an owned `string` `{ptr,len}` (a fresh heap buffer); the builder
-                // object is freed by the runtime.
+                // object is freed by the runtime, or consumed in caller stack storage when the
+                // whole-MIR noescape proof selected that local.
                 let b = self.operand(bld).into();
+                let finish = if self.stack_header_slot_for_operand(bld).is_some() {
+                    "builder_into_string_stack"
+                } else {
+                    "builder_into_string"
+                };
                 self.builder
-                    .build_call(self.funcs["builder_into_string"], &[b], "tostr")
+                    .build_call(self.funcs[finish], &[b], "tostr")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
                     .expect("builder_into_string returns a {ptr,len}")
             }
-            Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
+            Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
@@ -6053,7 +6413,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `#[inline(never)]` dispatcher, so `gen_rvalue` gains a single tiny arm rather than five
             // inline bodies (the #296 expr-depth lesson, mirroring the file-rvalue dispatcher).
             Rvalue::ArrayBuilderNew { .. } | Rvalue::ArrayBuilderPush { .. } | Rvalue::ArrayBuilderPushStr { .. }
-            | Rvalue::ArrayBuilderAppend { .. } | Rvalue::ArrayBuilderBuild { .. } => return self.gen_array_builder_rvalue(rv),
+            | Rvalue::ArrayBuilderAppend { .. } | Rvalue::ArrayBuilderBuild { .. } => {
+                return self.gen_array_builder_rvalue(result_id, rv);
+            }
             // fs.write_file — marshal the path `{ptr,len}` and the str/bytes data `{ptr,len}`, return
             // an i32 errno-status.
             Rvalue::FsWriteFile { path, data } => {
@@ -7507,7 +7869,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         (g.as_pointer_value(), self.ctx.i64_type().const_int(s.len() as u64, false))
     }
 
-    /// `template "..."` → builder_new, a write per piece, then builder_finish → str.
+    /// `template "..."` → in-place builder init, a write per piece, then in-place finish → str.
     /// `json.decode` into struct `struct_id`: zero the out slot, build a field-descriptor
     /// table `[{ name_ptr, name_len: i64, tag: i32, offset: i64 }]` (tag = byte width for
     /// ints, 0 for bool; offset from the target layout), and call the runtime parser. Returns
@@ -7832,7 +8194,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
     }
 
-    fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_template(
+        &mut self,
+        result_id: ValueId,
+        pieces: &[align_mir::TemplatePiece],
+        arena: Option<&Operand>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         // Pass the enclosing arena handle, or null for an individually owned finish retained by a
         // synthetic MIR string owner.
         let arena_ptr = match arena {
@@ -7842,13 +8209,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // A template/json.encode builder uses the default capacity (0) — static-part presizing is a
         // separate future opt; the user-facing `builder(capacity)` is the capacity surface.
         let zero = self.ctx.i64_type().const_zero();
+        let header = self.stack_template_headers[&result_id];
         let bptr = self
             .builder
-            .build_call(self.funcs["builder_new"], &[arena_ptr.into(), zero.into()], "b")
+            .build_call(
+                self.funcs["builder_init_stack"],
+                &[header.into(), arena_ptr.into(), zero.into()],
+                "b.stack",
+            )
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
-            .expect("builder_new returns a pointer");
+            .expect("builder_init_stack returns a pointer");
         let i64t = self.ctx.i64_type();
         for piece in pieces {
             match piece {
@@ -7914,7 +8286,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
         }
-        let finish = if arena.is_some() { "builder_finish" } else { "builder_into_string" };
+        let finish = if arena.is_some() { "builder_finish_stack" } else { "builder_into_string_stack" };
         Ok(self
             .builder
             .build_call(self.funcs[finish], &[bptr.into()], "s")
@@ -7928,11 +8300,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// so `gen_rvalue` stays flat (the #296 expr-depth lesson, mirroring `gen_file_rvalue`). Returns
     /// `Some` for the value-producing ops (new/build) and `None` for the void growth ops.
     #[inline(never)]
-    fn gen_array_builder_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+    fn gen_array_builder_rvalue(
+        &mut self,
+        result_id: ValueId,
+        rv: &Rvalue,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         match rv {
             // `array_builder<T>()` — open an empty typed builder sized to the element stride.
             Rvalue::ArrayBuilderNew { elem_size } => {
                 let es = self.ctx.i64_type().const_int(*elem_size as u64, false);
+                if let Some(slot) = self.stack_header_new_values.get(&result_id).copied() {
+                    let header = self.stack_headers[&slot];
+                    let v = self
+                        .builder
+                        .build_call(
+                            self.funcs["array_builder_init_stack"],
+                            &[header.into(), es.into()],
+                            "ab.stack",
+                        )
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .expect("array_builder_init_stack returns a pointer");
+                    return Ok(Some(v));
+                }
                 let v = self
                     .builder
                     .build_call(self.funcs["array_builder_new"], &[es.into()], "ab")
@@ -7986,9 +8377,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // off the storage and frees only the builder header.
             Rvalue::ArrayBuilderBuild { builder } => {
                 let bp = self.operand(builder).into();
+                let build = if self.stack_header_slot_for_operand(builder).is_some() {
+                    "array_builder_build_stack"
+                } else {
+                    "array_builder_build"
+                };
                 let v = self
                     .builder
-                    .build_call(self.funcs["array_builder_build"], &[bp], "abbuild")
+                    .build_call(self.funcs[build], &[bp], "abbuild")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("array_builder_build returns a {ptr,len}");
                 Ok(Some(v))
@@ -8764,6 +9160,201 @@ mod tests {
         // chunk list, which can reallocate (free) memory allocated before the call.
         assert!(!group_has("align_rt_arena_alloc", "nofree"), "bump alloc must not be nofree:\n{out}");
         assert!(!group_has("align_rt_tg_alloc", "nofree"), "bump alloc must not be nofree:\n{out}");
+    }
+
+    #[test]
+    fn proven_nonescaping_builder_headers_use_stack_storage() {
+        let out = ir(
+            "fn main() -> i32 {\n\
+               b := builder()\n\
+               b.write(\"x\")\n\
+               s := b.to_string()\n\
+               mut a: array_builder<i64> := array_builder()\n\
+               a.push(7)\n\
+               xs := a.build()\n\
+               return (s.len() + xs.len()) as i32\n\
+             }\n",
+        );
+        assert!(out.contains("call ptr @align_rt_builder_init_stack("), "local builder should use stack init:\n{out}");
+        assert!(
+            out.contains("call { ptr, i64 } @align_rt_builder_into_string_stack("),
+            "local builder should consume its stack header:\n{out}"
+        );
+        assert!(
+            out.contains("call ptr @align_rt_array_builder_init_stack("),
+            "local array_builder should use stack init:\n{out}"
+        );
+        assert!(
+            out.contains("call { ptr, i64 } @align_rt_array_builder_build_stack("),
+            "local array_builder should consume its stack header:\n{out}"
+        );
+        assert!(!out.contains("call ptr @align_rt_builder_new("), "local builder must not box its header:\n{out}");
+        assert!(
+            !out.contains("call ptr @align_rt_array_builder_new("),
+            "local array_builder must not box its header:\n{out}"
+        );
+        assert!(out.contains("alloca [64 x i8], align 16"), "want aligned caller header storage:\n{out}");
+    }
+
+    #[test]
+    fn unaudited_rvalue_wrapping_builder_rejects_stack_header() {
+        // Build deliberately invalid future-shaped MIR: sema currently forbids Builder inside an
+        // Option, but a newly-added aggregate rvalue must fail closed here until its operands are
+        // audited. This pins the safety property independently of today's surface type limits.
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let f = Function {
+            name: "future_wrapper".into(),
+            params: vec![],
+            ret: Ty::Unit,
+            slots: vec![Ty::Builder],
+            slot_align: vec![None],
+            value_tys: vec![Ty::Builder, Ty::Builder, Ty::Unit],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let(0, Rvalue::BuilderNew { capacity: Operand::Const(Const::Int(0, i64_ty)) }),
+                    Stmt::Store(0, Operand::Value(0)),
+                    Stmt::Let(1, Rvalue::Load(0)),
+                    Stmt::Let(2, Rvalue::OptionSome(Operand::Value(1))),
+                ],
+                stmt_lines: vec![(0, 0); 4],
+                term: Term::Return(None),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        assert!(stack_header_plan(&f).slots.is_empty(), "an unaudited wrapper must retain the boxed ABI");
+    }
+
+    #[test]
+    fn escaping_array_builder_keeps_boxed_header() {
+        let out = ir(
+            "fn make() -> array_builder<i64> {\n\
+               return array_builder()\n\
+             }\n\
+             fn main() -> i32 {\n\
+               mut b := make()\n\
+               b.push(1)\n\
+               return b.build().len() as i32\n\
+             }\n",
+        );
+        assert!(out.contains("call ptr @align_rt_array_builder_new("), "escaping return must keep boxed header:\n{out}");
+        assert!(
+            !out.contains("call ptr @align_rt_array_builder_init_stack("),
+            "escaping return must not use caller-owned stack storage:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_builder_crossing_user_call_stays_boxed() {
+        let out = ir(
+            "fn pass(b: array_builder<i64>) -> array_builder<i64> {\n\
+               return b\n\
+             }\n\
+             fn main() -> i32 {\n\
+               mut b: array_builder<i64> := array_builder()\n\
+               b.push(1)\n\
+               mut c := pass(b)\n\
+               c.push(2)\n\
+               return c.build().len() as i32\n\
+             }\n",
+        );
+        assert!(out.contains("call ptr @align_rt_array_builder_new("), "call-crossing header must be boxed:\n{out}");
+        assert!(
+            !out.contains("call ptr @align_rt_array_builder_init_stack("),
+            "a header passed to user code must not point into its caller's stack:\n{out}"
+        );
+    }
+
+    #[test]
+    fn stack_header_reassignment_reuses_storage_after_drop() {
+        let out = ir(
+            "fn main() -> i32 {\n\
+               mut b := builder()\n\
+               b.write(\"old\")\n\
+               b = builder()\n\
+               b.write(\"new\")\n\
+               return 0\n\
+             }\n",
+        );
+        assert_eq!(
+            out.matches("alloca [64 x i8], align 16").count(),
+            1,
+            "one local must reuse one header buffer:\n{out}"
+        );
+        assert_eq!(
+            out.matches("call ptr @align_rt_builder_init_stack(").count(),
+            2,
+            "both assignments must initialize the reusable header:\n{out}"
+        );
+        assert!(
+            out.matches("call void @align_rt_builder_free_stack(").count() >= 2,
+            "the old value and final unfinished value must both be dropped in place:\n{out}"
+        );
+        assert!(!out.contains("call ptr @align_rt_builder_new("), "reassignment must not fall back to Box:\n{out}");
+    }
+
+    #[test]
+    fn unfinished_stack_headers_use_element_aware_drop() {
+        let out = ir(
+            "fn main() -> i32 {\n\
+               b := builder()\n\
+               b.write(\"text\")\n\
+               mut nums: array_builder<i64> := array_builder()\n\
+               nums.push(1)\n\
+               mut names: array_builder<string> := array_builder()\n\
+               names.push(\"owned\".clone())\n\
+               return 0\n\
+             }\n",
+        );
+        assert!(out.contains("call void @align_rt_builder_free_stack("), "unfinished builder must drop in place:\n{out}");
+        assert!(
+            out.contains("call void @align_rt_array_builder_free_stack("),
+            "unfinished scalar array builder must shallow-free its payload:\n{out}"
+        );
+        assert!(
+            out.contains("call void @align_rt_array_builder_free_strings_stack("),
+            "unfinished string array builder must deep-free its payload:\n{out}"
+        );
+        assert!(!out.contains("call void @align_rt_builder_free("), "stack builder must not free caller storage:\n{out}");
+        assert!(
+            !out.contains("call void @align_rt_array_builder_free_strings("),
+            "stack string array builder must not free caller storage as a Box:\n{out}"
+        );
+    }
+
+    #[test]
+    fn internal_template_builders_always_use_stack_headers() {
+        let out = ir(
+            "fn main() -> i32 {\n\
+               n := 7\n\
+               heap_view := template \"heap={n}\"\n\
+               arena {\n\
+                 arena_view := template \"arena={n}\"\n\
+                 print(arena_view)\n\
+               }\n\
+               return heap_view.len() as i32\n\
+             }\n",
+        );
+        assert_eq!(
+            out.matches("alloca [64 x i8], align 16").count(),
+            2,
+            "each dynamic template expression needs one reusable entry buffer:\n{out}"
+        );
+        assert_eq!(
+            out.matches("call ptr @align_rt_builder_init_stack(").count(),
+            2,
+            "both internal template builders must initialize in place:\n{out}"
+        );
+        assert!(
+            out.contains("call { ptr, i64 } @align_rt_builder_into_string_stack("),
+            "arena-free template must consume its in-place header into the synthetic owner:\n{out}"
+        );
+        assert!(
+            out.contains("call { ptr, i64 } @align_rt_builder_finish_stack("),
+            "arena template must consume its in-place header into arena storage:\n{out}"
+        );
+        assert!(!out.contains("call ptr @align_rt_builder_new("), "internal template headers never need a Box:\n{out}");
     }
 
     #[test]

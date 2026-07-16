@@ -1585,19 +1585,45 @@ pub struct Builder {
     arena: *mut Arena,
 }
 
-/// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
-/// bulk at the block's end); otherwise the caller must use [`align_rt_builder_into_string`] and
-/// retain/drop the returned owner. `capacity` (bytes) pre-sizes the backing buffer so appends don't
-/// reallocate as it grows; 0 = default (empty).
-#[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut Builder {
+// Internal compiler/runtime ABI for nonescaping headers. Codegen reserves a 64-byte, 16-aligned
+// entry alloca; fail compilation here if a future Rust layout change outgrows that conservative
+// envelope instead of silently writing past the caller's stack storage.
+const _: () = assert!(core::mem::size_of::<Builder>() <= 64 && core::mem::align_of::<Builder>() <= 16);
+
+fn builder_value(arena: *mut Arena, capacity: i64) -> Builder {
     // `try_reserve` (not `with_capacity`) so a bogus/huge user capacity can't abort the process on
     // OOM — an over-large reservation just fails silently and the buffer grows on demand instead.
     let mut buf = Vec::new();
     if let Ok(cap) = safe_len(capacity) {
         let _ = buf.try_reserve(cap);
     }
-    Box::into_raw(Box::new(Builder { buf, arena }))
+    Builder { buf, arena }
+}
+
+/// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
+/// bulk at the block's end); otherwise the caller must use [`align_rt_builder_into_string`] and
+/// retain/drop the returned owner. `capacity` (bytes) pre-sizes the backing buffer so appends don't
+/// reallocate as it grows; 0 = default (empty).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut Builder {
+    Box::into_raw(Box::new(builder_value(arena, capacity)))
+}
+
+/// Initialize a compiler-provided nonescaping header buffer and return its typed pointer. Payload
+/// storage remains the same `Vec`; only the header's `Box` is removed.
+///
+/// # Safety
+/// `out` must point to at least 64 writable bytes aligned to 16, and must be uninitialized or have
+/// had its previous `Builder` value consumed/dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_init_stack(out: *mut u8, arena: *mut Arena, capacity: i64) -> *mut Builder {
+    if out.is_null() {
+        return core::ptr::null_mut();
+    }
+    debug_assert_eq!(out as usize % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
+    let b = out.cast::<Builder>();
+    unsafe { b.write(builder_value(arena, capacity)) };
+    b
 }
 
 /// Append raw bytes (a static template part or a `str` value).
@@ -4488,7 +4514,28 @@ impl<'a> JsonParser<'a> {
 /// this call consumes it (frees the `Builder` object), so `b` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
-    let b = unsafe { Box::from_raw(b) };
+    let b = *unsafe { Box::from_raw(b) };
+    unsafe { builder_finish_value(b) }
+}
+
+/// Stack-header counterpart to [`align_rt_builder_finish`]: consume the header in place without
+/// attempting to deallocate its caller-owned storage.
+///
+/// # Safety
+/// `b` must point to a live `Builder` initialized by [`align_rt_builder_init_stack`] and not yet
+/// consumed or dropped. The caller-owned storage must remain valid for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_finish_stack(b: *mut Builder) -> AlignStr {
+    if b.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    unsafe { builder_finish_value(b.read()) }
+}
+
+/// Finish a builder header by value. This is the shared ownership operation behind the boxed ABI
+/// and the nonescaping-header probe; moving the `Builder` drops its `Vec` after the result has been
+/// copied/transferred as appropriate, without assuming where the header itself was stored.
+unsafe fn builder_finish_value(b: Builder) -> AlignStr {
     let len = b.buf.len() as i64;
     if len == 0 {
         // Empty: no allocation needed; a dangling non-null ptr is valid for a 0-len view.
@@ -4517,7 +4564,27 @@ pub unsafe extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
 /// this call consumes it (frees the `Builder` object), so `b` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignStr {
-    let b = unsafe { Box::from_raw(b) };
+    let b = *unsafe { Box::from_raw(b) };
+    unsafe { builder_into_string_value(b) }
+}
+
+/// Stack-header counterpart to [`align_rt_builder_into_string`].
+///
+/// # Safety
+/// `b` must point to a live `Builder` initialized by [`align_rt_builder_init_stack`] and not yet
+/// consumed or dropped. This call consumes that value without deallocating its storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_into_string_stack(b: *mut Builder) -> AlignStr {
+    if b.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    unsafe { builder_into_string_value(b.read()) }
+}
+
+/// Convert a builder header by value into an owned Align string. Shared with the stack-header probe
+/// so it measures only header placement; the payload allocation/copy path stays byte-for-byte the
+/// same as the public boxed ABI.
+unsafe fn builder_into_string_value(b: Builder) -> AlignStr {
     let len = b.buf.len() as i64;
     if len == 0 {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
@@ -4537,6 +4604,18 @@ pub unsafe extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignS
 pub unsafe extern "C" fn align_rt_builder_free(b: *mut Builder) {
     if !b.is_null() {
         drop(unsafe { Box::from_raw(b) });
+    }
+}
+
+/// Drop an unfinished nonescaping builder header in place; the caller owns the stack bytes.
+///
+/// # Safety
+/// `b` must be null or point to a live `Builder` initialized by [`align_rt_builder_init_stack`] and
+/// not yet consumed or dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_free_stack(b: *mut Builder) {
+    if !b.is_null() {
+        unsafe { b.drop_in_place() };
     }
 }
 
@@ -7730,6 +7809,8 @@ pub struct ArrayBuilder {
     elem_size: usize,
 }
 
+const _: () = assert!(core::mem::size_of::<ArrayBuilder>() <= 64 && core::mem::align_of::<ArrayBuilder>() <= 16);
+
 impl ArrayBuilder {
     /// Ensure room for `additional` more elements, growing by amortized doubling. Aborts on a
     /// capacity/byte-size overflow (the `checked_*` FFI-growth-math rule) or OOM (via
@@ -7759,12 +7840,36 @@ impl ArrayBuilder {
     }
 }
 
+fn array_builder_value(elem_size: i64) -> ArrayBuilder {
+    let es = safe_len(elem_size).unwrap_or(0).max(1);
+    ArrayBuilder { data: core::ptr::null_mut(), len: 0, cap: 0, elem_size: es }
+}
+
 /// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 1`;
 /// 16 for a `string` element). Growth is deferred to the first `push`/`append`.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
-    let es = safe_len(elem_size).unwrap_or(0).max(1);
-    Box::into_raw(Box::new(ArrayBuilder { data: core::ptr::null_mut(), len: 0, cap: 0, elem_size: es }))
+    Box::into_raw(Box::new(array_builder_value(elem_size)))
+}
+
+/// Initialize a compiler-provided nonescaping array-builder header. Its realloc-compatible payload
+/// remains unchanged and can still transfer zero-copy into the built array.
+///
+/// # Safety
+/// `out` must point to at least 64 writable bytes aligned to 16, with no live header value in it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_init_stack(out: *mut u8, elem_size: i64) -> *mut ArrayBuilder {
+    if out.is_null() {
+        return core::ptr::null_mut();
+    }
+    debug_assert_eq!(
+        out as usize % core::mem::align_of::<ArrayBuilder>(),
+        0,
+        "stack ArrayBuilder storage is misaligned"
+    );
+    let b = out.cast::<ArrayBuilder>();
+    unsafe { b.write(array_builder_value(elem_size)) };
+    b
 }
 
 /// `b.push(v)` for a Copy-scalar element — append `elem_size` (`<= 8`) bytes of the scalar `bits`
@@ -7861,8 +7966,29 @@ pub unsafe extern "C" fn align_rt_array_builder_build(b: *mut ArrayBuilder) -> A
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
-    let bx = unsafe { Box::from_raw(b) };
-    AlignStr { ptr: bx.data as *const u8, len: bx.len as i64 }
+    let b = *unsafe { Box::from_raw(b) };
+    array_builder_build_value(b)
+}
+
+fn array_builder_build_value(b: ArrayBuilder) -> AlignStr {
+    AlignStr { ptr: b.data as *const u8, len: b.len as i64 }
+}
+
+/// Consume a nonescaping header in place and transfer its payload to the built array.
+///
+/// # Safety
+/// `b` must point to a live `ArrayBuilder` initialized by [`align_rt_array_builder_init_stack`] and
+/// not yet frozen or dropped. This call consumes the value without deallocating its storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_build_stack(b: *mut ArrayBuilder) -> AlignStr {
+    if b.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    array_builder_build_value(unsafe { b.read() })
+}
+
+unsafe fn array_builder_free_value(b: ArrayBuilder) {
+    unsafe { free(b.data as *mut core::ffi::c_void) };
 }
 
 /// Drop an unfrozen scalar-element `array_builder` — free its storage, then the header. Null-safe (a
@@ -7875,8 +8001,34 @@ pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     if b.is_null() {
         return;
     }
-    let bx = unsafe { Box::from_raw(b) };
-    unsafe { free(bx.data as *mut core::ffi::c_void) };
+    let b = *unsafe { Box::from_raw(b) };
+    unsafe { array_builder_free_value(b) };
+}
+
+/// Drop an unfrozen scalar-element stack header in place, freeing only its payload.
+///
+/// # Safety
+/// `b` must be null or point to a live scalar-element `ArrayBuilder` initialized by
+/// [`align_rt_array_builder_init_stack`] and not yet frozen or dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_free_stack(b: *mut ArrayBuilder) {
+    if !b.is_null() {
+        unsafe { array_builder_free_value(b.read()) };
+    }
+}
+
+unsafe fn array_builder_free_strings_value(b: ArrayBuilder) {
+    debug_assert_eq!(b.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
+    if !b.data.is_null() {
+        let base = b.data as *const AlignStr;
+        for i in 0..b.len {
+            let entry = unsafe { core::ptr::read_unaligned(base.add(i)) };
+            unsafe { free(entry.ptr as *mut core::ffi::c_void) };
+            #[cfg(test)]
+            LIVE_ARRAY_BUILDER_STRINGS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { free(b.data as *mut core::ffi::c_void) };
+    }
 }
 
 /// Drop an unfrozen `string`-element `array_builder` — deep-free each pushed string, then the
@@ -7890,17 +8042,19 @@ pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilde
     if b.is_null() {
         return;
     }
-    let bx = unsafe { Box::from_raw(b) };
-    debug_assert_eq!(bx.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
-    if !bx.data.is_null() {
-        let base = bx.data as *const AlignStr;
-        for i in 0..bx.len {
-            let entry = unsafe { core::ptr::read_unaligned(base.add(i)) };
-            unsafe { free(entry.ptr as *mut core::ffi::c_void) };
-            #[cfg(test)]
-            LIVE_ARRAY_BUILDER_STRINGS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        unsafe { free(bx.data as *mut core::ffi::c_void) };
+    let b = *unsafe { Box::from_raw(b) };
+    unsafe { array_builder_free_strings_value(b) };
+}
+
+/// Deep-drop an unfrozen string-element stack header in place.
+///
+/// # Safety
+/// `b` must be null or point to a live string-element `ArrayBuilder` initialized by
+/// [`align_rt_array_builder_init_stack`] and not yet frozen or dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_free_strings_stack(b: *mut ArrayBuilder) {
+    if !b.is_null() {
+        unsafe { array_builder_free_strings_value(b.read()) };
     }
 }
 
@@ -12211,6 +12365,10 @@ pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
 mod tests {
     use super::*;
 
+    /// Matches the opaque storage envelope reserved by codegen for nonescaping builder headers.
+    #[repr(C, align(16))]
+    struct StackHeader([u8; 64]);
+
     /// The ABI conversion seam itself, isolated from filesystem syscalls and DNS latency: Rust
     /// consumers must borrow the caller's exact bytes, while C consumers receive one direct
     /// NUL-terminated copy. These are the audited short-path lengths from document 13 §6.1.
@@ -13551,6 +13709,55 @@ mod tests {
             }
 
             assert_eq!(batched.buf, separate.buf, "batched writes match separate writes for {v}");
+        }
+    }
+
+    #[test]
+    fn stack_builder_header_finish_transfer_and_unfinished_drop() {
+        let mut storage = StackHeader([0; 64]);
+
+        // Arena-backed finish copies into the arena and consumes only the in-place header value.
+        let arena = align_rt_arena_begin();
+        let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), arena, 8) };
+        assert_eq!(b.cast::<u8>(), storage.0.as_mut_ptr());
+        unsafe { align_rt_builder_write(b, b"arena".as_ptr(), 5) };
+        let view = unsafe { align_rt_builder_finish_stack(b) };
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"arena");
+        unsafe { align_rt_arena_end(arena) };
+
+        // The same storage can be initialized again after consumption. Owned finish transfers a
+        // fresh allocation to the result, which remains valid after the header value is gone.
+        let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), core::ptr::null_mut(), 0) };
+        unsafe { align_rt_builder_write(b, b"owned".as_ptr(), 5) };
+        let owned = unsafe { align_rt_builder_into_string_stack(b) };
+        assert_eq!(unsafe { safe_slice(owned.ptr, owned.len) }, b"owned");
+        unsafe { align_rt_free(owned.ptr as *mut u8) };
+
+        // An unfinished value drops its Vec payload without trying to free the caller's bytes.
+        let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), core::ptr::null_mut(), 0) };
+        unsafe { align_rt_builder_write(b, b"drop me".as_ptr(), 7) };
+        unsafe { align_rt_builder_free_stack(b) };
+    }
+
+    #[test]
+    fn stack_array_builder_header_build_transfer_and_unfinished_drop() {
+        let mut storage = StackHeader([0; 64]);
+        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8) };
+        assert_eq!(b.cast::<u8>(), storage.0.as_mut_ptr());
+        unsafe {
+            align_rt_array_builder_push(b, 10);
+            align_rt_array_builder_push(b, 20);
+            align_rt_array_builder_push(b, 30);
+        }
+        let frozen = unsafe { align_rt_array_builder_build_stack(b) };
+        assert_eq!(frozen.len, 3);
+        assert_eq!(unsafe { core::slice::from_raw_parts(frozen.ptr.cast::<u64>(), 3) }, [10, 20, 30]);
+        unsafe { align_rt_free(frozen.ptr as *mut u8) };
+
+        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8) };
+        unsafe {
+            align_rt_array_builder_push(b, 99);
+            align_rt_array_builder_free_stack(b);
         }
     }
 
@@ -15746,6 +15953,123 @@ mod tests {
             mb,
             simd / memcpy * 100.0
         );
+    }
+
+    /// Manual allocation-inclusive ceiling probe for replacing a proven-nonescaping builder header's
+    /// `Box` with caller stack storage while leaving its payload representation and every write/push
+    /// call unchanged. The 0/1/4 cases are the decision gate; 1K/1M are regression controls where
+    /// header placement should disappear into payload/call cost. Run with:
+    ///
+    /// `cargo test -p align_runtime --release nonescaping_builder_header_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn nonescaping_builder_header_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn boxed_text(n: usize) -> i64 {
+            let b = black_box(align_rt_builder_new(core::ptr::null_mut(), 0));
+            let byte = b'x';
+            for _ in 0..n {
+                unsafe { align_rt_builder_write(b, &byte, 1) };
+            }
+            let out = unsafe { align_rt_builder_into_string(b) };
+            let len = out.len;
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            len
+        }
+
+        #[inline(never)]
+        fn stack_text(n: usize) -> i64 {
+            let mut b = builder_value(core::ptr::null_mut(), 0);
+            let ptr = black_box(&mut b as *mut Builder);
+            let byte = b'x';
+            for _ in 0..n {
+                unsafe { align_rt_builder_write(ptr, &byte, 1) };
+            }
+            let out = unsafe { builder_into_string_value(b) };
+            let len = out.len;
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            len
+        }
+
+        #[inline(never)]
+        fn boxed_array(n: usize) -> i64 {
+            let b = black_box(align_rt_array_builder_new(8));
+            for i in 0..n {
+                unsafe { align_rt_array_builder_push(b, i as u64) };
+            }
+            let out = unsafe { align_rt_array_builder_build(b) };
+            let len = out.len;
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            len
+        }
+
+        #[inline(never)]
+        fn stack_array(n: usize) -> i64 {
+            let mut b = array_builder_value(8);
+            let ptr = black_box(&mut b as *mut ArrayBuilder);
+            for i in 0..n {
+                unsafe { align_rt_array_builder_push(ptr, i as u64) };
+            }
+            let out = array_builder_build_value(b);
+            let len = out.len;
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            len
+        }
+
+        fn time(path: fn(usize) -> i64, n: usize, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0i64;
+            for _ in 0..iters {
+                checksum ^= black_box(path)(black_box(n));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        fn compare(boxed: fn(usize) -> i64, stack: fn(usize) -> i64, n: usize) -> (f64, f64) {
+            let iters = match n {
+                0..=4 => 100_000,
+                5..=1024 => 1_000,
+                _ => 1,
+            };
+            let mut boxed_samples = Vec::with_capacity(9);
+            let mut stack_samples = Vec::with_capacity(9);
+            for trial in 0..9 {
+                if trial % 2 == 0 {
+                    boxed_samples.push(time(boxed, n, iters));
+                    stack_samples.push(time(stack, n, iters));
+                } else {
+                    stack_samples.push(time(stack, n, iters));
+                    boxed_samples.push(time(boxed, n, iters));
+                }
+            }
+            (median(boxed_samples), median(stack_samples))
+        }
+
+        println!("nonescaping builder header ceiling (median of 9, allocation-inclusive ns/op):");
+        println!(" kind          | elements | boxed header | stack header | boxed/stack");
+        for (kind, boxed, stack) in [
+            ("builder", boxed_text as fn(usize) -> i64, stack_text as fn(usize) -> i64),
+            ("array_builder", boxed_array as fn(usize) -> i64, stack_array as fn(usize) -> i64),
+        ] {
+            for n in [0usize, 1, 4, 1024, 1_000_000] {
+                let (boxed_ns, stack_ns) = compare(boxed, stack, n);
+                assert_eq!(boxed(n), n as i64);
+                assert_eq!(stack(n), n as i64);
+                println!(
+                    "{kind:13} | {n:8} | {boxed_ns:12.2} | {stack_ns:12.2} | {:10.2}x",
+                    boxed_ns / stack_ns
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -18903,6 +19227,25 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert!(
             (after - before).abs() <= 50,
             "array_builder<string>'s Drop must free every pushed-but-not-frozen entry (no leak): {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn stack_array_builder_unfrozen_string_drop_frees_pushed_strings_no_leak() {
+        let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            let mut storage = StackHeader([0; 64]);
+            let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 16) };
+            for s in ["stack", "header", "deep", "drop"] {
+                let (ptr, len) = owned_string_buf(s);
+                unsafe { align_rt_array_builder_push_str(b, ptr, len) };
+            }
+            unsafe { align_rt_array_builder_free_strings_stack(b) };
+        }
+        let after = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (after - before).abs() <= 50,
+            "stack array_builder<string>'s Drop must free every pushed entry (no leak): {before} -> {after}"
         );
     }
 
