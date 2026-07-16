@@ -501,9 +501,11 @@ closer to 1.0 but drop tail-swap / 1 %-swap below 1.10x (forfeiting the wins). *
 "all keyed negatives within 3 % AND keyed tail-swap/1 % ≥ 1.10x"** — the two constraints cross on
 opposite sides of `w64`, and the ≈ 2-3 % measurement floor is comparable to the ≈ 3.5 % cell. Skipping
 refinement 2 for keyed entirely is rejected upstream (it recreates the doc-rejected precheck-alone
-shape for keyed tail-swap). The single `w64` threshold currently ships for both key modes; the keyed
-lowcard-100k cell is a bounded, measured single-cell exception **pending an owner decision — accept the
-exception (this record stands) or restructure** — not decided here.
+shape for keyed tail-swap). The single `w64` threshold ships for both key modes; the keyed
+lowcard-100k cell is **ACCEPTED (2026-07-16) as a bounded, measured single-cell exception**: it is
+one workload at one size, comparable to the measurement floor, and the price of the retained keyed
+tail-swap/1 %-swap wins (≥ 1.10x at 100k) and the ordered-input wins (keyed 4.6-15.6x). Reconsider
+only if a real consumer is dominated by keyed low-cardinality sorts near 100k elements.
 
 ### 4.2 SHIPPED / GOOD — vectorization parity with C
 

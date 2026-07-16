@@ -65,7 +65,7 @@ on a ≤ 16-distinct-value key at 100k is a stable ≈ 3.5 % regression (correct
 three runs, control 0.996-0.999x — real, not bias); the same key at 1M is ≈ 1.00x and every other keyed
 workload is within ≈ 2 %. Cause: the keyed straight-copy moves two buffers (elements + keys), so
 refinement 2 has less upside for keyed sorts while the tie-heavy 16-value boundary decision mispredicts.
-Recorded pending a keyed-specific decision (see doc-12 §4.1).
+Accepted as a bounded, measured single-cell exception (see doc-12 §4.1).
 
 ## Root-cause note (why `w64`, not the first cut)
 

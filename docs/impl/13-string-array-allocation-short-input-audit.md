@@ -63,7 +63,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
-| sorting | stable O(n log n); adaptive total-order path (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy from pass 2, `width>=64`) | **SHIPPED 2026-07-16** (document 12 §4.1, `w64` shape); ordered-input wins, plain-sort negatives within ≈ 2% (drift-immune control-corrected); one keyed low-cardinality-100k workload at ≈ 3.5% recorded pending a keyed-specific decision; insertion base case kept |
+| sorting | stable O(n log n); adaptive total-order path (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy from pass 2, `width>=64`) | **SHIPPED 2026-07-16** (document 12 §4.1, `w64` shape); ordered-input wins, plain-sort negatives within ≈ 2% (drift-immune control-corrected); one keyed low-cardinality-100k workload at ≈ 3.5% accepted as a bounded measured exception (document 12 §4.1); insertion base case kept |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
 freeing them without owner/view liveness would convert a leak into a UAF.
