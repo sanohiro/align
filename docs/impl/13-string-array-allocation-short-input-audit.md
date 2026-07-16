@@ -63,7 +63,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
-| sorting | stable O(n log n), but allocates unused merge scratch at tiny N and ignores ordered runs | **MEASURED P1** adaptive total-order path in document 12; keep insertion base case |
+| sorting | stable O(n log n); adaptive total-order path added (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy) | **IMPLEMENTED 2026-07-16** (document 12 §4.1); delayed-scratch cleanup proven, but the negative-workload 3% gate is unmet on WSL2 (reverse ≈ 0.94x) — bare-metal confirmation pending before shipping; insertion base case kept |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
 freeing them without owner/view liveness would convert a leak into a UAF.
@@ -733,8 +733,13 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### P3 — larger portfolios after measurement
 
-1. Add document 12's measured total-order ordered-run sort path while retaining the tiny insertion
-   base case; remove only scratch that no merge pass can read.
+1. ~~Add document 12's measured total-order ordered-run sort path while retaining the tiny insertion
+   base case; remove only scratch that no merge pass can read.~~ **IMPLEMENTED 2026-07-16** (document
+   12 §4.1): delayed `len>32`-gated ping scratch (a `len<=32` sort allocates only the materialize
+   buffer(s) — proven by the guarded-ping-alloc IR gate below), plus the ordered early exit and
+   ordered-boundary straight-copy, total-order keys only. Delayed-scratch cleanup verified; the
+   throughput no-regression gate on merge-heavy inputs is **unmet on WSL2** and awaits bare-metal
+   confirmation before shipping.
 2. Pool large constant array literals after the top-level aggregate-constant surface exists.
 3. Run unique-buffer donation, repeated-needle plan, JSON escape scan, and short-N group strategy
    gates independently.
@@ -763,7 +768,11 @@ IR gates:
   (**shipped and regression-pinned 2026-07-16**);
 - mapped materializers retain `min.iters.check` and a scalar short path;
 - large constant-array positive case uses a private constant and direct read/one memcpy, while the
-  short control retains the winning inline shape.
+  short control retains the winning inline shape;
+- **guarded ping-alloc for sorting (implemented 2026-07-16):** the merge ping buffer (`tmp`/keyed
+  `ktmp`) `HeapAllocBuf` sits behind the `len > 32` gate — it must not appear before it, so a
+  `len <= 32` sort allocates only the materialize buffer(s); an int-key sort's adaptive
+  ordered-boundary negate is present in MIR and a float-key sort's is absent (`sort_adaptive.rs`).
 
 Benchmark adoption requires the matrix in §4.2, balanced AB/BA, allocation/copy counters, optimized
 IR, and a negative workload. Large-input throughput never excuses a short-input regression, and a

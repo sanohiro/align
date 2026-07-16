@@ -76,8 +76,13 @@ After those are closed, the highest-value performance refinements from this audi
 4. ~~Complete the already-planned reader/`io.copy` uninitialized-buffer work and remove the
    redundant URL/request copy in `http.get_many`.~~ **SHIPPED 2026-07-16.** Syscall-dispatched
    `io.copy` remains a separate throughput fast path.
-5. Add the measured total-order stable-sort fast path: avoid unused tiny scratch, detect a fully
-   ordered input, and skip comparison-merging adjacent runs whose boundary is already ordered.
+5. ~~Add the measured total-order stable-sort fast path: avoid unused tiny scratch, detect a fully
+   ordered input, and skip comparison-merging adjacent runs whose boundary is already ordered.~~
+   **IMPLEMENTED 2026-07-16 (behind a no-regression gate — see §4.1):** all three refinements are in
+   `lower_array_sort`, total-order keys only, correctness-verified (`sort_adaptive.rs`). The
+   delayed-scratch cleanup and the ordered wins reproduce; the negative-workload 3% no-regression gate
+   is **not** met on the WSL2 reproduction (reverse ≈ 0.94x, random ≈ 0.96x) and needs bare-metal
+   confirmation (the doc's own candidate measured within 3%) before shipping.
 
 The priority is cache traffic, not novelty. A global replacement allocator, blanket `alwaysinline`,
 and compiler-internal SIMD over enum-heavy MIR are not recommended.
@@ -385,7 +390,7 @@ alignment checked-add with ordinary add fails the exact intrinsic-count gate.
 | `map_into(out)` | No output allocation; one length-preserving loop into caller storage | Best materializing path; scoped input/output alias metadata removes overlap checks |
 | `to_soa` | One contiguous aligned arena buffer, one fused transpose | Good representation; wide schemas may benefit from already-planned blocking |
 | `partition` | Two upper-bound output buffers, one pass | Predictable but write-stream/RSS heavy; measure compaction before changing |
-| `sort` / `sort_by_key` | Materialize, stable bottom-up merge sort with 32-element insertion runs; decorate keys once | Good worst-case/stability shape; measured ordered-run adaptation below remains unimplemented |
+| `sort` / `sort_by_key` | Materialize, stable bottom-up merge sort with 32-element insertion runs; decorate keys once; **adaptive total-order fast paths (below), gated by a no-regression check** | Good worst-case/stability shape; ordered-run adaptation IMPLEMENTED (total-order keys), correctness-verified, but its negative-workload 3% gate is unmet on WSL2 — see §4.1 |
 | `scan` | Loop-carried dependency | Correctly scalar in the general case; lack of vectorization is not a missed LLVM flag |
 
 The upper-bound allocation used by filtering does not necessarily touch every page: malloc-backed
@@ -423,6 +428,41 @@ allocation measured 2.3x at two elements and 1.4x at eight; 16-32 elements were 
 only the unused ping buffers, retain the insertion run, and gate this mechanical cleanup by zero
 scratch allocations plus the document-13 short-size matrix rather than claiming a broad throughput
 win.
+
+**IMPLEMENTED 2026-07-16 (total-order keys only; NOT yet cleared to ship).** All three refinements
+are in `lower_array_sort` ([`crates/align_mir/src/lib.rs`](../../crates/align_mir/src/lib.rs)):
+`sort_key_order` classifies the key scalar (fail-closed — every non-total scalar keeps the plain
+merge; float structurally cannot take any new path), a whole-input ordered early exit before scratch
+allocation, an ordered run-boundary straight-copy, and delayed `len > 32`-gated ping-buffer
+allocation. Correctness is fully covered by
+[`crates/align_driver/tests/sort_adaptive.rs`](../../crates/align_driver/tests/sort_adaptive.rs) (a
+packed strictly-ascending differential/stability oracle across every input state and structural size
+boundary, str keys, an impure-key evaluation-count pin, float/NaN behavior + a MIR gate, the
+ping-scratch-behind-the-gate MIR gate, and leak/double-free coverage). The measurement probe is
+[`bench/adaptive_sort`](../../bench/adaptive_sort/README.md).
+
+The delayed-scratch cleanup is proven (a `len <= 32` sort allocates only the materialize buffer —
+plain: 1, keyed: 2 — versus 2/4 before). The ordered wins reproduce. But the **negative-workload 3%
+no-regression gate is not met** on the WSL2 reproduction (Ryzen 9 5950X, `taskset`-pinned, but no
+CPU-frequency isolation), unbiased-per-control (after-vs-after control = 1.00x). Sequential
+`before/after` on `sort_u64`:
+
+| `u64` input state | 1,024 | 100,000 | 1,000,000 |
+|---|---:|---:|---:|
+| already sorted | 4.2x | 3.8-4.2x | 3.6-4.2x |
+| only a tail swap | 1.40x | 1.13x | 1.14x |
+| 1% adjacent swaps | 1.7-1.9x | 1.16-1.18x | 1.12-1.18x |
+| random | 0.99x | 0.96-0.97x | 0.96x |
+| reverse | 0.96x | 0.94-0.95x | 0.94x |
+| 16-value cardinality | 0.96x | 0.99x | 0.99x |
+
+Reverse (≈ 4-6%) and random (≈ 1-4%) exceed the 3% gate; low-cardinality is borderline/within. The
+cost is inherent to the run-boundary check, which runs once per merged run pair and is
+pass-1-dominated on merge-heavy inputs (the hot merge/copyback loops are byte-for-byte identically
+vectorized before/after — same 22× `<4 x i64>` in the optimized IR — so this is the price of the
+tail-swap/1%/sorted wins, not an optimization regression). **Before shipping, confirm the negatives on
+an isolated bare-metal core matching the original candidate's setup, or reduce the per-run-pair
+boundary-check cost.** The NaN/total-order caveat holds: float keys are structurally excluded.
 
 ### 4.2 SHIPPED / GOOD — vectorization parity with C
 

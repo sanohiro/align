@@ -6113,6 +6113,66 @@ struct SortKey {
 /// the 16–32 band the binary-optimization audit recommended.
 const SORT_INSERTION_THRESHOLD: usize = 32;
 
+/// Whether a sort key type carries a **total order** or only a **partial order**. The adaptive
+/// ordered-run fast paths in [`lower_array_sort`] (whole-input ordered early exit + ordered
+/// run-boundary straight-copy, doc-12 §4.1) are sound only for a total order: they use the negated
+/// strict compare `!(right < left)` as an "already ordered" proof, which holds when `<` is a strict
+/// total order but not for IEEE floats — a NaN makes `!(right < left)` non-transitive, so it is not
+/// a real ordering witness. Total-order keys take the fast path; every other key type keeps the
+/// exact stable bottom-up merge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOrder {
+    /// A strict total order (integers, characters, byte-lexicographic strings, booleans): the
+    /// adaptive ordered-run paths are emitted.
+    Total,
+    /// Not a proven total order (IEEE floats with NaN, and — fail-closed — every other scalar):
+    /// keep the plain merge path, no adaptive blocks.
+    PartialFloat,
+}
+
+/// Classify a sort key scalar's ordering. **Fail-closed:** only the enumerated total-order scalars
+/// take the adaptive fast path; every other variant — including any `Scalar` added in the future —
+/// maps to [`KeyOrder::PartialFloat`] and keeps the plain merge path. There is deliberately **no
+/// `_` / `..` wildcard**: a new `Scalar` variant must be classified here explicitly, or this stops
+/// compiling (the project's fail-closed-on-new-IR-variant rule).
+fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
+    use align_sema::Scalar;
+    match s {
+        // Strict total orders. `str` is byte-lexicographic (`Ord(str)`), which is total; `bool`
+        // orders `false < true`. `BinOp::Lt` is already wired for each of these in the merge.
+        Scalar::Int(_) | Scalar::Char | Scalar::Str | Scalar::Bool => KeyOrder::Total,
+        // IEEE 754: not a total order (NaN is unordered) — must keep the merge path.
+        Scalar::Float(_) => KeyOrder::PartialFloat,
+        // Fail-closed. These are not valid sort keys today (sema restricts `sort` to numeric
+        // scalars and `sort_by_key` to primitive scalars), but they are enumerated explicitly so a
+        // future new `Scalar` variant is a compile error here until it is deliberately triaged into
+        // Total or PartialFloat.
+        Scalar::Unit
+        | Scalar::Struct(_)
+        | Scalar::String
+        | Scalar::DynArray(_)
+        | Scalar::DynStructArray(_)
+        | Scalar::DynResponseArray
+        | Scalar::Slice(_)
+        | Scalar::Enum(_)
+        | Scalar::Soa(_)
+        | Scalar::Param(_)
+        | Scalar::Reader
+        | Scalar::Writer
+        | Scalar::Buffer
+        | Scalar::CliParsed
+        | Scalar::TcpConn
+        | Scalar::TcpListener
+        | Scalar::UdpSocket
+        | Scalar::Child
+        | Scalar::File
+        | Scalar::HttpResponse
+        | Scalar::HttpServer
+        | Scalar::HttpRequestCtx
+        | Scalar::HttpStream => KeyOrder::PartialFloat,
+    }
+}
+
 /// `let v = x <op> y` on `i64`, returning `v` as an operand.
 fn sort_int(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
     let v = b.fresh_value(i64_ty());
@@ -6124,6 +6184,14 @@ fn sort_int(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
 fn sort_cmp(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
     let v = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(v, Rvalue::Bin(op, x, y)));
+    Operand::Value(v)
+}
+
+/// Boolean negation `!x` (i1). Used by the total-order boundary test `!(right < left)` so the
+/// adaptive path needs no separate `Le` primitive (doc-12 §4.1).
+fn sort_not(b: &mut Builder, x: Operand) -> Operand {
+    let v = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(v, Rvalue::Un(UnOp::Not, x)));
     Operand::Value(v)
 }
 
@@ -6211,6 +6279,18 @@ fn sort_copy_step(
 /// Elements are always Copy scalars (sema restricts `sort` to numeric scalars and `sort_by_key` to
 /// primitive scalars), so no element ever needs a deep move/drop. Reads use `SliceIndex`; writes use
 /// `PtrStore` through a buffer pointer (`SlicePtr`).
+///
+/// **Adaptive ordered-run fast paths (doc-12 §4.1), total-order keys only** ([`sort_key_order`] ==
+/// [`KeyOrder::Total`] — integers, characters, byte-lexicographic strings, booleans; IEEE floats
+/// keep the plain merge because `!(right < left)` is not an ordering witness under NaN). (1) After
+/// decoration, a whole-input ordered scan returns `arr` untouched — allocating no ping buffer — when
+/// it is already sorted. (2) A merge pass copies an adjacent run pair straight into `tmp` (no
+/// comparison) when its boundary is already ordered (`!(cmp_src[mid] < cmp_src[mid-1])`) or the right
+/// run is empty, which yields the identical stable output.
+///
+/// Independently of key order, the ping buffers (`tmp`, and keyed `ktmp`) are allocated only behind
+/// a `len > 32` gate, so a `len <= 32` sort — handled entirely by the insertion base case — makes
+/// zero ping-buffer allocations. Worst case stays a stable O(n log n) merge.
 fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
     let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
     let has_keys = sort_key.is_some();
@@ -6237,6 +6317,10 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         }
     };
 
+    // The key-scalar ordering decides whether the adaptive ordered-run fast paths (doc-12 §4.1) are
+    // emitted at all. Fail-closed: a non-scalar / unclassifiable key keeps the plain merge path.
+    let key_order = align_sema::ty_to_scalar(kty).map(|s| sort_key_order(&s)).unwrap_or(KeyOrder::PartialFloat);
+
     let arr_ptr = {
         let p = b.fresh_value(Ty::Box(scalar_of(elem)));
         b.push(Stmt::Let(p, Rvalue::SlicePtr(arr.clone())));
@@ -6248,23 +6332,33 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         Operand::Value(l)
     };
 
-    // Fewer than 2 elements → already sorted; return the collected buffer untouched (this also
-    // avoids the zero-length scratch allocation the sort path would otherwise make).
+    // Shared exit plumbing (all key types): `ret` returns `arr`; `free_keys` (created below, after
+    // the `keys` allocation) frees the `sort_by_key` decorate buffer on every post-decorate exit;
+    // the merge path additionally frees the ping buffers before reaching `free_keys`. `keys` must be
+    // freed on every exit *after* it is allocated, but the `len < 2` exit happens *before* any
+    // allocation, so it targets `ret`.
+    let ret = b.new_block();
+
+    // Fewer than 2 elements → already sorted; return the collected buffer untouched. Nothing has
+    // been allocated yet (not even `keys`), so this exits straight to `ret`.
     let sort_start = b.new_block();
-    let done = b.new_block();
     let ge2 = sort_cmp(b, BinOp::Ge, len.clone(), index_const(2));
-    b.terminate(Term::Branch(ge2, sort_start, done));
+    b.terminate(Term::Branch(ge2, sort_start, ret));
 
     b.cur = sort_start;
 
-    // Scratch: `keys` (decorate target, `sort_by_key` only), the element ping buffer `tmp`, and —
-    // sorting by key — the key ping buffer `ktmp`. All are transient heap allocations freed before
-    // `done`. When `!has_keys`, the key buffers are unused dummies (`arr`) that no code path reads.
+    // Only the decorate buffer `keys` (`sort_by_key` only) is allocated up front — its lifetime spans
+    // decorate, the ordered precheck, the insertion runs, and every merge. The element ping buffer
+    // `tmp` (and, when keyed, the key ping buffer `ktmp`) are deferred behind the `len > 32` merge
+    // gate below, so a `len <= 32` sort performs zero ping-buffer allocations (doc-12 §4.1). When
+    // `!has_keys`, `keys` is an unused dummy (`arr`) that no code path reads or frees.
     let (keys_ptr, keys_val) =
         if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
-    let (tmp_ptr, tmp_val) = sort_alloc_buf(b, elem, &len);
-    let (ktmp_ptr, ktmp_val) =
-        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+
+    // `free_keys` is created *after* the `keys` allocation so its `DropValue(keys_val)` references a
+    // value whose defining block is emitted earlier (codegen fills SSA values in block-creation
+    // order during a single linear pass, so a definition must precede its uses in that order).
+    let free_keys = b.new_block();
 
     // Decorate: keys[i] = key(arr[i]) for i in 0..len (each key computed exactly once).
     if has_keys {
@@ -6290,6 +6384,51 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         b.terminate(Term::Goto(dh));
 
         b.cur = dexit;
+    }
+
+    // The comparison-key column read by the ordered precheck and the ordered run-boundary test:
+    // the decorated `keys` when sorting by key, else the collected elements themselves. Reading it
+    // never re-calls the key function (keys are already decorated), so the key evaluation count is
+    // unchanged. Owned (cloned) so later `DropValue(keys_val)` / `arr` moves stay unentangled.
+    let cmp_src = if has_keys { keys_val.clone() } else { arr.clone() };
+
+    // (1) Whole-input ordered early exit — total-order keys only (doc-12 §4.1). Scan adjacent key
+    // pairs; if none is out of order the input is already sorted, so return `arr` untouched without
+    // ever allocating a ping buffer. For `sort_by_key` this runs *after* exactly-once decoration, so
+    // key effects/evaluation count do not change. Float/partial-order keys skip this entirely (a
+    // `!(right < left)` scan is not a valid ordering witness under NaN).
+    if key_order == KeyOrder::Total {
+        let oi = b.new_slot(i64_ty());
+        b.push(Stmt::Store(oi, index_const(0)));
+        let ord_head = b.new_block();
+        let ord_body = b.new_block();
+        let ord_next = b.new_block();
+        let not_ordered = b.new_block();
+        b.terminate(Term::Goto(ord_head));
+
+        // ord_head: while i < len-1 (else every adjacent pair held → fully ordered → free_keys).
+        b.cur = ord_head;
+        let ov = sort_load(b, oi);
+        let lm1 = sort_int(b, BinOp::Sub, len.clone(), index_const(1));
+        let ocond = sort_cmp(b, BinOp::Lt, ov, lm1);
+        b.terminate(Term::Branch(ocond, ord_body, free_keys));
+
+        // ord_body: if cmp_src[i+1] < cmp_src[i] the input is not sorted → fall through to the sort.
+        b.cur = ord_body;
+        let ob = sort_load(b, oi);
+        let ob1 = sort_int(b, BinOp::Add, ob.clone(), index_const(1));
+        let ka = sort_read(b, &cmp_src, ob.clone(), kty);
+        let kb = sort_read(b, &cmp_src, ob1, kty);
+        let out_of_order = sort_cmp(b, BinOp::Lt, kb, ka);
+        b.terminate(Term::Branch(out_of_order, not_ordered, ord_next));
+
+        b.cur = ord_next;
+        let on = sort_int(b, BinOp::Add, ob, index_const(1));
+        b.push(Stmt::Store(oi, on));
+        b.terminate(Term::Goto(ord_head));
+
+        // not_ordered: proceed into the insertion base case (fall through in `b.cur`).
+        b.cur = not_ordered;
     }
 
     // Base case: insertion-sort each run of up to THRESHOLD elements in place (carrying `keys`).
@@ -6388,19 +6527,34 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.push(Stmt::Store(rs, rsn));
     b.terminate(Term::Goto(base_head));
 
-    // Merge passes: while width < len, merge adjacent run pairs of `width` into `tmp`, copy back.
+    // (3) Delayed merge-only scratch (all key types, doc-12 §4.1). A merge pass runs only while
+    // `width < len` with `width` starting at THRESHOLD, i.e. only when `len > 32`. Allocate the ping
+    // buffers `tmp` (and, when keyed, `ktmp`) only on that branch, so a `len <= 32` sort — fully
+    // handled by the insertion base case — never allocates them and exits straight to `free_keys`.
     b.cur = merge_setup;
+    let need_merge = sort_cmp(b, BinOp::Gt, len.clone(), index_const(SORT_INSERTION_THRESHOLD));
+    let alloc_scratch = b.new_block();
+    b.terminate(Term::Branch(need_merge, alloc_scratch, free_keys));
+
+    // alloc_scratch dominates every merge/copyback block (they are reachable only through it), so
+    // the ping-buffer SSA values are defined before use on every path that reads them.
+    b.cur = alloc_scratch;
+    let (tmp_ptr, tmp_val) = sort_alloc_buf(b, elem, &len);
+    let (ktmp_ptr, ktmp_val) =
+        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+
+    // Merge passes: while width < len, merge adjacent run pairs of `width` into `tmp`, copy back.
     let ww = b.new_slot(i64_ty());
     b.push(Stmt::Store(ww, index_const(SORT_INSERTION_THRESHOLD)));
     let pass_head = b.new_block();
     let pass_body = b.new_block();
-    let free_scratch = b.new_block();
+    let merge_free = b.new_block();
     b.terminate(Term::Goto(pass_head));
 
     b.cur = pass_head;
     let wv = sort_load(b, ww);
     let pcond = sort_cmp(b, BinOp::Lt, wv, len.clone());
-    b.terminate(Term::Branch(pcond, pass_body, free_scratch));
+    b.terminate(Term::Branch(pcond, pass_body, merge_free));
 
     b.cur = pass_body;
     let width = sort_load(b, ww);
@@ -6427,7 +6581,60 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         let h = sort_int(b, BinOp::Add, lo_start.clone(), two_w.clone());
         sort_min(b, h, len.clone())
     };
+    // Both the (2) straight-copy path and the comparison merge converge on `merge_done` (advance to
+    // the next run pair). `do_merge` holds the comparison merge; the straight-copy path skips it.
+    let do_merge = b.new_block();
+    let merge_done = b.new_block();
+
+    // (2) Ordered run-boundary / empty-right straight-copy — total-order keys only (doc-12 §4.1).
+    // If the right run is empty (`mid >= hi`, a lone leftover run), or the pair boundary is already
+    // ordered (`!(cmp_src[mid] < cmp_src[mid-1])`), the concatenation `arr[lo_start..hi]` is already
+    // sorted, so copy it straight into `tmp` (a memcpy-shaped loop) instead of comparison-merging.
+    // This yields the identical output to the take-left-on-tie stable merge (a straight copy keeps
+    // input order), so stability is preserved. The empty-right test must come first: it guards the
+    // `cmp_src[mid]` read, which is in range only when the right run is non-empty (`mid < hi`).
+    if key_order == KeyOrder::Total {
+        let sc_head = b.new_block();
+        let sc_body = b.new_block();
+        let bnd_check = b.new_block();
+        let sck = b.new_slot(i64_ty());
+        b.push(Stmt::Store(sck, lo_start.clone()));
+        let right_empty = sort_cmp(b, BinOp::Ge, mid.clone(), hi.clone());
+        b.terminate(Term::Branch(right_empty, sc_head, bnd_check));
+
+        // bnd_check: boundary ordered iff NOT (cmp_src[mid] < cmp_src[mid-1]) (Lt + negate, no `Le`).
+        b.cur = bnd_check;
+        let mid_m1 = sort_int(b, BinOp::Sub, mid.clone(), index_const(1));
+        let k_at_mid = sort_read(b, &cmp_src, mid.clone(), kty);
+        let k_at_prev = sort_read(b, &cmp_src, mid_m1, kty);
+        let inverted = sort_cmp(b, BinOp::Lt, k_at_mid, k_at_prev);
+        let ordered = sort_not(b, inverted);
+        b.terminate(Term::Branch(ordered, sc_head, do_merge));
+
+        // sc_head/sc_body: tmp[k] = arr[k] (and ktmp[k] = keys[k]) for k in lo_start..hi.
+        b.cur = sc_head;
+        let scv = sort_load(b, sck);
+        let sc_cond = sort_cmp(b, BinOp::Lt, scv, hi.clone());
+        b.terminate(Term::Branch(sc_cond, sc_body, merge_done));
+
+        b.cur = sc_body;
+        let sci = sort_load(b, sck);
+        let se = sort_read(b, &arr, sci.clone(), elem);
+        b.push(Stmt::PtrStore(tmp_ptr.clone(), sci.clone(), se));
+        if has_keys {
+            let sk = sort_read(b, &keys_val, sci.clone(), kty);
+            b.push(Stmt::PtrStore(ktmp_ptr.clone(), sci.clone(), sk));
+        }
+        let scn = sort_int(b, BinOp::Add, sci, index_const(1));
+        b.push(Stmt::Store(sck, scn));
+        b.terminate(Term::Goto(sc_head));
+    } else {
+        // Partial-order keys: always comparison-merge (no ordering witness available).
+        b.terminate(Term::Goto(do_merge));
+    }
+
     // Merge arr[lo_start..mid] and arr[mid..hi] into tmp[lo_start..hi] (stable).
+    b.cur = do_merge;
     let mi = b.new_slot(i64_ty());
     b.push(Stmt::Store(mi, lo_start.clone()));
     let mj = b.new_slot(i64_ty());
@@ -6442,7 +6649,6 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     let drain_l_body = b.new_block();
     let drain_r_head = b.new_block();
     let drain_r_body = b.new_block();
-    let merge_done = b.new_block();
     b.terminate(Term::Goto(m_head));
 
     // m_head: while i < mid && j < hi.
@@ -6529,16 +6735,25 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.push(Stmt::Store(ww, wn));
     b.terminate(Term::Goto(pass_head));
 
-    // free_scratch: shallow-spine free of the transient buffers (never `arr`, which is returned).
-    b.cur = free_scratch;
+    // merge_free: shallow-spine free of the ping buffers (only allocated on the `len > 32` path, so
+    // only freed here). Never `arr`, which is returned. Falls into `free_keys`.
+    b.cur = merge_free;
     b.push(Stmt::DropValue(tmp_val));
     if has_keys {
-        b.push(Stmt::DropValue(keys_val));
         b.push(Stmt::DropValue(ktmp_val));
     }
-    b.terminate(Term::Goto(done));
+    b.terminate(Term::Goto(free_keys));
 
-    b.cur = done;
+    // free_keys: free the `sort_by_key` decorate buffer (shallow spine — `str` keys are Copy views).
+    // Reached by every post-decorate exit (ordered early exit, the `len <= 32` gate, and the merge
+    // path via `merge_free`); the pre-decorate `len < 2` exit skips it (nothing allocated).
+    b.cur = free_keys;
+    if has_keys {
+        b.push(Stmt::DropValue(keys_val));
+    }
+    b.terminate(Term::Goto(ret));
+
+    b.cur = ret;
     arr
 }
 

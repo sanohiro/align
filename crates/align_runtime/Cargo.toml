@@ -13,6 +13,13 @@ license.workspace = true
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
 
+[features]
+# Off by default and zero-cost when off: gate atomic allocation counters into `align_rt_alloc` /
+# `align_rt_free` and expose the C-ABI getter `align_rt_alloc_count()`. Used by the manual
+# `bench/adaptive_sort` probe to prove the `len <= 32` sort short-size scratch matrix allocates only
+# the materialize buffer(s). Not a runtime capability — a measurement aid.
+alloc-count = []
+
 [dependencies]
 align_hash = { path = "../align_hash" }
 memchr = "2.8.2"
