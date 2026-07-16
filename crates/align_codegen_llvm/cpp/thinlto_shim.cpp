@@ -24,6 +24,7 @@
 #include "llvm-c/Core.h"
 #include "llvm-c/TargetMachine.h"
 
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Analysis/ModuleSummaryAnalysis.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -148,7 +149,14 @@ struct LinkResult {
 int buildIndex(LinkResult &LR, const char *const *bc_paths,
                const char *const *identifiers, size_t n_modules,
                const char *const *preserve_syms, size_t n_preserve) {
+  // Defensive FFI-boundary checks: a null array or element is a caller bug,
+  // but fail with an rc instead of a segfault.
+  if ((n_modules && (!bc_paths || !identifiers)) ||
+      (n_preserve && !preserve_syms))
+    return 19;
   for (size_t i = 0; i < n_modules; i++) {
+    if (!bc_paths[i] || !identifiers[i])
+      return 19;
     ErrorOr<std::unique_ptr<MemoryBuffer>> MB =
         MemoryBuffer::getFile(bc_paths[i]);
     if (!MB)
@@ -164,9 +172,12 @@ int buildIndex(LinkResult &LR, const char *const *bc_paths,
   }
 
   DenseSet<GlobalValue::GUID> Preserved;
-  for (size_t i = 0; i < n_preserve; i++)
+  for (size_t i = 0; i < n_preserve; i++) {
+    if (!preserve_syms[i])
+      return 19;
     Preserved.insert(
         GlobalValue::getGUIDAssumingExternalLinkage(preserve_syms[i]));
+  }
 
   // Single-copy world: every definition is prevailing (Align guarantees one
   // prevailing copy per external symbol — no ODR duplicates across units;
@@ -312,12 +323,14 @@ extern "C" int align_thinlto_backend(
   // the serialized export pairs, and mark exported locals for promotion /
   // non-exported for internalization in the index. Single-copy world: everything
   // is prevailing.
-  std::map<std::string, DenseSet<GlobalValue::GUID>> ExportMap;
+  // StringMap allows allocation-free StringRef lookup in the hot isExported
+  // callback (a std::map<std::string,...> key would heap-allocate per query).
+  StringMap<DenseSet<GlobalValue::GUID>> ExportMap;
   for (size_t i = 0; i < n_exports; i++)
     ExportMap[exp_mods[i]].insert(
         static_cast<GlobalValue::GUID>(exp_guids[i]));
   auto isExported = [&](StringRef ModuleId, ValueInfo VI) -> bool {
-    auto It = ExportMap.find(ModuleId.str());
+    auto It = ExportMap.find(ModuleId);
     return It != ExportMap.end() && It->second.contains(VI.getGUID());
   };
   auto isPrevailing = [](GlobalValue::GUID,
@@ -335,14 +348,14 @@ extern "C" int align_thinlto_backend(
   // it again so the backend passes' self-lookup keys match the combined index.
   Own->setModuleIdentifier(own_id);
 
-  // stable id -> path map for the module loader.
-  std::map<std::string, std::string> IdToPath;
+  // stable id -> path map for the module loader (StringMap: StringRef lookup).
+  StringMap<std::string> IdToPath;
   for (size_t i = 0; i < n_modules; i++)
     IdToPath[identifiers[i]] = bc_paths[i];
 
   FunctionImporter::ModuleLoaderTy Loader =
       [&](StringRef Identifier) -> Expected<std::unique_ptr<Module>> {
-    auto It = IdToPath.find(Identifier.str());
+    auto It = IdToPath.find(Identifier);
     if (It == IdToPath.end())
       return createStringError(inconvertibleErrorCode(),
                                "unknown module identifier");
