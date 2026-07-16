@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (seventeenth update this day), **THE STABLE-COMPACTION STRUCTURAL AVX2
+_Last updated: 2026-07-16 (eighteenth update this day), **THE FIRST COMPLETE STABLE-COMPACTION
+CONSUMER IS REJECTED AND CLOSED.** The checked-in ignored probe combines an inlined total `i64 > 0`
+predicate, AVX2 four-lane mask formation, and ordered direct materialization, with the current scalar
+predicate/branch/append shape as oracle. Full-prefix/count differential checks precede balanced timing
+over predictable/random 0/1/10/50/90/99/100% distributions at 1 KiB, 1 MiB, and 256 MiB. The best
+candidate averaged 1.93x core and 1.44x allocation-inclusive, with a 2.94x/2.81x named positive, but
+the 1 MiB all-survivor case reproducibly fell to 0.63x/0.49x. Always applying the identity permutation
+did not fix it (0.62x worst) and reduced the matrix core mean, so that variant was discarded. This
+fails the no-regression gate: retain the scalar fused loop, do not add primitive-predicate
+specialization or a predicate-repeating selectivity prepass, and reconsider only for a consumer that
+already owns a mask or a materially different ISA compress primitive. This work is on branch
+**`agent/stable-compaction-consumer`**, based on squash-merged PR #489 (`edcf360`). The complete
+workspace is green (**2200 total = 2187 passed + thirteen ignored manual probes**) and workspace
+clippy passes with warnings denied. **Next recommended after this PR:** implement document 12's
+already-measured P1 total-order adaptive stable-sort path (ordered-input early exit, ordered run-boundary
+copy, and delayed merge-only scratch), while leaving float/NaN keys on the existing path. Native
+aarch64 Base64/hex activation and UTF-8 portability measurement remain deferred. Previous update:
+2026-07-16 (seventeenth update this day), **THE STABLE-COMPACTION STRUCTURAL AVX2
 KERNEL PASSES ITS FULL MATRIX; PRODUCTION CONSUMER INTEGRATION IS STILL GATED.** The checked-in
 ignored probe compares scalar and SIMD against the same precomputed byte mask across predictable and
 random 0/1/10/50/90/99/100% selectivity, 1/4/8/16-byte elements, and 1 KiB/1 MiB/256 MiB inputs. It

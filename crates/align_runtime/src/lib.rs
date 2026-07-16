@@ -14205,6 +14205,235 @@ mod tests {
         );
     }
 
+    /// End-to-end consumer probe for the first production-shaped stable-compaction gateway: an
+    /// inlined, total `i64 > 0` predicate forms each AVX2 lane mask and immediately materializes
+    /// survivors in source order. Unlike [`stable_compaction_probe`], predicate-to-mask formation is
+    /// inside the timed kernel. Run on an otherwise idle x86-64 host with:
+    ///
+    /// `cargo test -p align_runtime --release stable_compaction_consumer_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn stable_compaction_consumer_probe() {
+        use core::arch::x86_64::*;
+        use std::hint::black_box;
+        use std::sync::OnceLock;
+
+        fn scalar(data: &[i64], out: &mut [core::mem::MaybeUninit<i64>]) -> usize {
+            let mut o = 0usize;
+            for &value in data {
+                if value > 0 {
+                    out[o].write(value);
+                    o += 1;
+                }
+            }
+            o
+        }
+
+        fn controls() -> &'static [[i32; 8]] {
+            static TABLE: OnceLock<Vec<[i32; 8]>> = OnceLock::new();
+            TABLE.get_or_init(|| {
+                (0usize..16)
+                    .map(|mask| {
+                        let mut row = [0i32; 8];
+                        let mut o = 0usize;
+                        for lane in 0..4 {
+                            if mask & (1 << lane) != 0 {
+                                row[o] = lane * 2;
+                                row[o + 1] = lane * 2 + 1;
+                                o += 2;
+                            }
+                        }
+                        row
+                    })
+                    .collect()
+            })
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2(data: &[i64], out: &mut [core::mem::MaybeUninit<i64>]) -> usize {
+            let zero = _mm256_setzero_si256();
+            let mut i = 0usize;
+            let mut o = 0usize;
+            while data.len() - i >= 4 {
+                let input = unsafe { _mm256_loadu_si256(data.as_ptr().add(i).cast::<__m256i>()) };
+                let mask = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(input, zero))) as usize;
+                if mask == 0 {
+                    i += 4;
+                    continue;
+                }
+                let selected_count = mask.count_ones() as usize;
+                if selected_count == 1 {
+                    let lane = mask.trailing_zeros() as usize;
+                    out[o].write(unsafe { *data.get_unchecked(i + lane) });
+                    o += 1;
+                    i += 4;
+                    continue;
+                }
+                let packed = if mask == 0x0f {
+                    input
+                } else {
+                    let control = unsafe { _mm256_loadu_si256(controls()[mask].as_ptr().cast::<__m256i>()) };
+                    _mm256_permutevar8x32_epi32(input, control)
+                };
+                // `o <= i` and this is a full four-element source block, so the overlapping
+                // 32-byte store stays inside the source-length upper-bound output allocation.
+                unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(o).cast::<__m256i>(), packed) };
+                o += selected_count;
+                i += 4;
+            }
+            o + scalar(&data[i..], &mut out[o..])
+        }
+
+        fn compact(data: &[i64], simd: bool, out: &mut [core::mem::MaybeUninit<i64>]) -> usize {
+            if simd {
+                unsafe { avx2(data, out) }
+            } else {
+                scalar(data, out)
+            }
+        }
+
+        fn checksum(out: &[core::mem::MaybeUninit<i64>], len: usize) -> u64 {
+            if len == 0 {
+                0
+            } else {
+                len as u64 ^ unsafe { out[0].assume_init() as u64 } ^ unsafe { out[len - 1].assume_init() as u64 }
+            }
+        }
+
+        fn time(data: &[i64], simd: bool, alloc: bool, iters: usize) -> f64 {
+            let mut reusable = if alloc { Vec::new() } else { vec![core::mem::MaybeUninit::uninit(); data.len()] };
+            let start = std::time::Instant::now();
+            let mut sum = 0u64;
+            for _ in 0..iters {
+                if alloc {
+                    let mut out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                    let n = compact(black_box(data), simd, black_box(&mut out));
+                    sum ^= checksum(&out, n);
+                } else {
+                    let n = compact(black_box(data), simd, black_box(&mut reusable));
+                    sum ^= checksum(&reusable, n);
+                }
+            }
+            black_box(sum);
+            start.elapsed().as_secs_f64() / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        fn make_data(n: usize, pct: usize, random: bool) -> Vec<i64> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            (0..n)
+                .map(|i| {
+                    let selected = if random {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state % 100 < pct as u64
+                    } else {
+                        i % 100 < pct
+                    };
+                    let magnitude = (i as i64 & 0x3fff_ffff) + 1;
+                    if selected { magnitude } else { -magnitude }
+                })
+                .collect()
+        }
+
+        if !is_x86_feature_detected!("avx2") {
+            println!("stable compaction consumer probe skipped: AVX2 unavailable");
+            return;
+        }
+        black_box(controls());
+        println!("stable compaction i64>0 consumer (median of 5; scalar/SIMD ratio):");
+        println!(" bytes     | mask       | keep | core x | alloc x | SIMD GB/s");
+        let mut matrix_core_log_sum = 0.0f64;
+        let mut matrix_alloc_log_sum = 0.0f64;
+        let mut matrix_count = 0usize;
+        let mut worst_core = f64::INFINITY;
+        let mut worst_case = String::new();
+        for bytes in [1usize << 10, 1 << 20, 256 << 20] {
+            let elems = bytes / core::mem::size_of::<i64>();
+            let mut size_core_log_sum = 0.0f64;
+            let mut size_alloc_log_sum = 0.0f64;
+            let mut size_count = 0usize;
+            for random in [false, true] {
+                for pct in [0usize, 1, 10, 50, 90, 99, 100] {
+                    let data = make_data(elems, pct, random);
+                    let mut scalar_out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                    let mut simd_out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                    let scalar_len = compact(&data, false, &mut scalar_out);
+                    let simd_len = compact(&data, true, &mut simd_out);
+                    assert_eq!(simd_len, scalar_len, "consumer compaction length mismatch");
+                    assert_eq!(
+                        unsafe { std::slice::from_raw_parts(simd_out.as_ptr().cast::<i64>(), simd_len) },
+                        unsafe { std::slice::from_raw_parts(scalar_out.as_ptr().cast::<i64>(), scalar_len) },
+                        "consumer compaction order/content mismatch",
+                    );
+                    let iters = match bytes {
+                        0..=1024 => 10_000,
+                        1025..=1_048_576 => 20,
+                        _ => 1,
+                    };
+                    let mut scalar_core = Vec::with_capacity(5);
+                    let mut simd_core = Vec::with_capacity(5);
+                    let mut scalar_alloc = Vec::with_capacity(5);
+                    let mut simd_alloc = Vec::with_capacity(5);
+                    for trial in 0..5 {
+                        if trial % 2 == 0 {
+                            scalar_core.push(time(&data, false, false, iters));
+                            simd_core.push(time(&data, true, false, iters));
+                            scalar_alloc.push(time(&data, false, true, iters));
+                            simd_alloc.push(time(&data, true, true, iters));
+                        } else {
+                            simd_core.push(time(&data, true, false, iters));
+                            scalar_core.push(time(&data, false, false, iters));
+                            simd_alloc.push(time(&data, true, true, iters));
+                            scalar_alloc.push(time(&data, false, true, iters));
+                        }
+                    }
+                    let scalar_core = median(scalar_core);
+                    let simd_core = median(simd_core);
+                    let scalar_alloc = median(scalar_alloc);
+                    let simd_alloc = median(simd_alloc);
+                    let core_ratio = scalar_core / simd_core;
+                    let alloc_ratio = scalar_alloc / simd_alloc;
+                    size_core_log_sum += core_ratio.ln();
+                    size_alloc_log_sum += alloc_ratio.ln();
+                    size_count += 1;
+                    matrix_core_log_sum += core_ratio.ln();
+                    matrix_alloc_log_sum += alloc_ratio.ln();
+                    matrix_count += 1;
+                    if core_ratio < worst_core {
+                        worst_core = core_ratio;
+                        worst_case = format!(
+                            "{bytes} B / {} / {pct}%",
+                            if random { "random" } else { "predictable" },
+                        );
+                    }
+                    println!(
+                        "{bytes:>10} | {:>10} | {pct:>3}% | {core_ratio:>6.2}x | {alloc_ratio:>7.2}x | {:>9.2}",
+                        if random { "random" } else { "predictable" },
+                        bytes as f64 / simd_core / 1e9,
+                    );
+                }
+            }
+            println!(
+                "summary: {bytes} B: core {:.2}x, allocation-inclusive {:.2}x",
+                (size_core_log_sum / size_count as f64).exp(),
+                (size_alloc_log_sum / size_count as f64).exp(),
+            );
+        }
+        println!(
+            "matrix geometric mean: core {:.2}x, allocation-inclusive {:.2}x; worst core {worst_core:.2}x ({worst_case})",
+            (matrix_core_log_sum / matrix_count as f64).exp(),
+            (matrix_alloc_log_sum / matrix_count as f64).exp(),
+        );
+    }
+
     /// Manual allocation-inclusive gate for removing the codec staging allocation and full-output
     /// copy. The staged controls use the former Vec encoder followed by `owned_str_copy`; direct
     /// paths call the shipped exact-destination ABI. Run with:
