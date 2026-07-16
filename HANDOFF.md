@@ -17,7 +17,9 @@ one Vec and copy. First-occurrence dense ids, aggregate wrap/min/max/count behav
 and multi-aggregate row-major update locality are unchanged. Every group core now validates signed
 capacity through `safe_len` before pointer arithmetic, and the direct paths state the generated
 input/output non-overlap contract; a sentinel gate pins that neither output crosses capacity. The
-repaired checked-in benchmark (its exported `Row` now follows current interface visibility) stayed
+Gemini review's one valid cleanup was applied: occupied, already-initialized i64 slots now update
+through a direct dereference, while vacant uninitialized output still uses `ptr.write`. The repaired
+checked-in benchmark (its exported `Row` now follows current interface visibility) stayed
 within 3% at 100/10K groups; at 632,390 distinct keys, four single groups improved 690.0→630.4 ms
 (1.09x) and dictionary reuse 200.9→194.7 ms (1.03x), recorded as directional consecutive-run
 evidence rather than balanced AB/BA. The complete workspace is green (**2183 total = 2180 passed +

@@ -3334,8 +3334,10 @@ unsafe fn group_agg_str<'a>(
             std::collections::hash_map::Entry::Occupied(e) => {
                 let id = *e.get();
                 // Every inserted id initialized its output slot in the vacant arm below.
-                let slot = unsafe { out_vals.add(id) };
-                unsafe { slot.write(combine(slot.read(), v)) };
+                unsafe {
+                    let slot = out_vals.add(id);
+                    *slot = combine(*slot, v);
+                }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 let id = count;
