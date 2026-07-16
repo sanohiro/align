@@ -1,0 +1,24 @@
+// Adaptive total-order stable-sort probe kernel (doc-12 §4.1). Each exported function borrows its
+// input as a `slice` (Copy view — the harness keeps ownership and threads the SAME input across
+// rounds), then `.sort()` / `.sort_by_key(...)` **materializes a working copy** of that slice and
+// sorts it. So the measured work is exactly "copy the fixed source into a working array, then sort"
+// — the doc-12 methodology. The sorted array is consumed by a terminal reduction (`.sum()`, or a
+// length sum for `str`) so the sort is load-bearing (not dead-code-eliminated) and the transient is
+// freed inside the kernel. The returned checksum is `black_box`-ed by the harness.
+//
+// `run.sh` compiles this file with the *current* (post-change) `alignc` for the `after` symbols and,
+// after sed-renaming the exports with a `_before` suffix, with a *main-worktree* `alignc` for the
+// `before` symbols, then links both into one harness for in-process AB/BA comparison.
+
+fn idk(x: u64) -> u64 = x
+fn idstr(s: str) -> str = s
+fn slen(s: str) -> i64 = s.len()
+
+// Plain unsigned sort (identity total order): materialize + stable sort + sum.
+pub fn sort_u64(xs: slice<u64>) -> u64 = xs.sort().sum()
+
+// Keyed sort with an identity key (exercises the decorate + keyed merge path).
+pub fn sort_by_key_u64(xs: slice<u64>) -> u64 = xs.sort_by_key(idk).sum()
+
+// Byte-lexicographic string-key sort; reduce to a length sum so the sort is load-bearing.
+pub fn sort_str(xs: slice<str>) -> i64 = xs.sort_by_key(idstr).map(slen).sum()

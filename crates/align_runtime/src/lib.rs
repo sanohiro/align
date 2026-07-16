@@ -8288,6 +8288,32 @@ unsafe fn owned_raw_realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     unsafe { realloc(ptr as *mut core::ffi::c_void, size) as *mut u8 }
 }
 
+/// Test-only allocation counters (feature `alloc-count`, off by default). `ALLOC_CALLS` is the
+/// monotonic count of successful [`align_rt_alloc`] allocations; `FREE_CALLS` the count of non-null
+/// [`align_rt_free`]s. The `bench/adaptive_sort` probe snapshots [`align_rt_alloc_count`] around a
+/// sort to prove the short-size (`len <= 32`) path allocates only the materialize buffer(s). Zero
+/// cost when the feature is off (the whole block, the increments, and the getter compile out).
+#[cfg(feature = "alloc-count")]
+static ALLOC_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(feature = "alloc-count")]
+static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Monotonic count of successful [`align_rt_alloc`] allocations since process start (feature
+/// `alloc-count` only). The delta across a sort equals the number of heap buffers it allocated.
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_alloc_count() -> i64 {
+    ALLOC_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count of non-null [`align_rt_free`]s since process start (feature `alloc-count` only) — pairs
+/// with [`align_rt_alloc_count`] to check for leaks/double-frees in the probe.
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_free_count() -> i64 {
+    FREE_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
 /// buffer). On OOM (`malloc` returns null for a positive request) we fail fast and abort,
 /// rather than hand back a null the generated code would dereference on the first store.
@@ -8303,6 +8329,8 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     if ptr.is_null() {
         panic_abort("out of memory");
     }
+    #[cfg(feature = "alloc-count")]
+    ALLOC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     ptr
 }
 
@@ -8313,6 +8341,10 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
 /// `ptr` must be null or a pointer previously returned by [`align_rt_alloc`] and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
+    #[cfg(feature = "alloc-count")]
+    if !ptr.is_null() {
+        FREE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     unsafe { owned_raw_free(ptr) }
 }
 

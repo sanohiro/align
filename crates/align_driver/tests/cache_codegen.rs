@@ -469,6 +469,58 @@ fn gate10_cross_process_impl_hash_stability() {
     assert_eq!(exe1, exe2, "the cross-process cache-hit executable is byte-identical");
 }
 
+// ---- Gate 13b: the ALIGN_SORT_ADAPTIVE measurement toggle never poisons the shared cache ---------
+
+/// The `ALIGN_SORT_ADAPTIVE` toggle (doc-12 §4.1) changes emitted codegen for a `.sort()` unit. Its
+/// effect flows into `impl_hash` (so the object-cache key already differs), AND `CacheContext::from_env`
+/// forces the cache off when it is set (fail-closed). This end-to-end gate proves no poisoning: a
+/// baseline (`=off`) build between two shipped-shape builds neither publishes into nor reads from the
+/// shared cache, so the shipped-shape object is served byte-identical and is never replaced by the
+/// baseline one. Drives fresh `alignc` subprocesses (isolated env — never touches this process's env).
+#[test]
+fn gate13b_sort_adaptive_toggle_never_poisons_cache() {
+    if !backend() || !cc_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n\
+        \x20 xs := [5, 3, 4, 1, 2].sort()\n\
+        \x20 print(xs[0])\n\
+        \x20 return Ok(())\n\
+        }\n";
+    let proj = Project::new("sortpoison", &[("main.align", src)], "main.align");
+    let alignc = env!("CARGO_BIN_EXE_alignc");
+    let shared = proj.dir.join("scache");
+
+    let build = |adaptive_off: bool| {
+        let mut cmd = std::process::Command::new(alignc);
+        cmd.arg("build").arg("main.align").current_dir(&proj.dir).env("ALIGNC_CACHE", &shared);
+        if adaptive_off {
+            cmd.env("ALIGN_SORT_ADAPTIVE", "off");
+        } else {
+            cmd.env_remove("ALIGN_SORT_ADAPTIVE");
+        }
+        let out = cmd.output().expect("spawn alignc");
+        assert!(out.status.success(), "alignc build failed: {}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read(proj.dir.join("main")).expect("read built exe")
+    };
+
+    // 1. Shipped shape (toggle unset) → publishes the adaptive object; one action manifest.
+    let e1 = build(false);
+    assert_eq!(action_manifest_count(&shared), 1, "the shipped-shape build publishes one action manifest");
+
+    // 2. Baseline (`=off`) → cache forced off: publishes NOTHING (manifest count unchanged) and the
+    //    exe differs from the shipped shape (the toggle genuinely changes codegen — sanity).
+    let e2 = build(true);
+    assert_eq!(action_manifest_count(&shared), 1, "the `=off` build must not publish into the shared cache (cache forced off)");
+    assert_ne!(e1, e2, "the toggle must change emitted codegen (else the poisoning test proves nothing)");
+
+    // 3. Shipped shape again → re-hits the adaptive manifest: byte-identical to run 1, NOT poisoned
+    //    by the intervening baseline build.
+    let e3 = build(false);
+    assert_eq!(action_manifest_count(&shared), 1, "the second shipped-shape build re-hits (no new manifest)");
+    assert_eq!(e1, e3, "the shipped-shape exe must be byte-identical — the baseline build never poisoned the cache");
+}
+
 // ---- Gate 11: an unused, unimported file is outside every existing action -----------------------
 
 #[test]

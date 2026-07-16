@@ -96,3 +96,16 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   arithmetic still loses to Align's own sequential/vectorized `map().sum()` because every element
   crosses an indirect `thunk` call. Use `par_map` for heavier/non-vectorizable work; cheap maps need
   sequential fallback or thunk specialization.
+- **Adaptive stable sort (`bench/adaptive_sort/`): SHIPPED — ordered-input wins (already-sorted 3.6×,
+  tail-swap/1%-swap 1.14–1.17×) with merge-heavy negatives within ≈2%.** Getting there was a
+  measurement lesson. On WSL2 (no CPU-frequency control) a naive block-sequential AB comparison of two
+  differently-sized kernels is doubly corrupted: ±25% frequency drift *between* the after-block and
+  before-block, and state-dependent cross-kernel i-cache/position bias (up to 10% for fast sorts). The
+  fix — used here as the standard for two-build comparisons in one binary — is **median of per-pair
+  adjacent ratios** (after and before measured back-to-back share the instantaneous frequency) plus an
+  **identical-code control** (`after` vs a second copy of `after` under different symbols; its
+  deviation from 1.00 is pure bias, and `corrected = real/control` removes it). That control caught a
+  throughput-neutral refinement being misread as a 10% regression, and an isolation sweep (each
+  refinement toggled independently from one compiler via an env knob + baseline) localized a real 7%
+  regression to a single pass-1 check, fixed by gating it to wider passes. Read the `corrected`
+  column, pin with `taskset -c`; see `bench/adaptive_sort/README.md`.
