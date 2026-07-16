@@ -317,6 +317,12 @@ fn mir_gate_adaptive_blocks_int_present_float_absent() {
         int_text.contains("= !"),
         "int-key sort MIR must contain the adaptive boundary negate (`= !`):\n{int_text}"
     );
+    // The boundary check is width-gated (the w64 shape): it runs only for run pairs >= 64 wide, so a
+    // `>= 64_i64` width compare must be present for an int-key sort.
+    assert!(
+        int_text.contains(">= 64_i64"),
+        "int-key sort MIR must width-gate the boundary check (`>= 64_i64`):\n{int_text}"
+    );
 
     let float_src = "pub fn f(xs: array<f64>) -> array<f64> = xs.sort()\n";
     let float_mir = lower_to_mir(&check(&mut sm, "float_sort", float_src).hir);

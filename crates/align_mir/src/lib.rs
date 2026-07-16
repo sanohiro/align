@@ -6173,6 +6173,16 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
     }
 }
 
+/// The narrowest merge-pass run-pair width for which [`lower_array_sort`] emits the ordered
+/// run-boundary straight-copy check (refinement 2). Pass 1 (`width == SORT_INSERTION_THRESHOLD`) has
+/// the most run pairs and the least straight-copy benefit, so its per-pair boundary check is pure
+/// overhead on merge-heavy inputs (measured ≈ 7% on random/reverse). Applying the check only from
+/// pass 2 (`width >= 2 * SORT_INSERTION_THRESHOLD == 64`) removes that regression (random/reverse/
+/// low-cardinality all within ≈ 1.5% of the pre-change baseline) while retaining the tail-swap /
+/// 1%-swap / already-sorted wins, which come mostly from higher passes — the measured w64 shape in
+/// doc-12 §4.1.
+const SORT_BOUNDARY_MIN_WIDTH: i64 = 2 * SORT_INSERTION_THRESHOLD as i64;
+
 /// `let v = x <op> y` on `i64`, returning `v` as an operand.
 fn sort_int(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
     let v = b.fresh_value(i64_ty());
@@ -6284,9 +6294,11 @@ fn sort_copy_step(
 /// [`KeyOrder::Total`] — integers, characters, byte-lexicographic strings, booleans; IEEE floats
 /// keep the plain merge because `!(right < left)` is not an ordering witness under NaN). (1) After
 /// decoration, a whole-input ordered scan returns `arr` untouched — allocating no ping buffer — when
-/// it is already sorted. (2) A merge pass copies an adjacent run pair straight into `tmp` (no
-/// comparison) when its boundary is already ordered (`!(cmp_src[mid] < cmp_src[mid-1])`) or the right
-/// run is empty, which yields the identical stable output.
+/// it is already sorted. (2) On merge passes at least [`SORT_BOUNDARY_MIN_WIDTH`] wide (i.e. from
+/// pass 2 — the narrow pass-1 check is skipped as measured-net-negative), a pass copies an adjacent
+/// run pair straight into `tmp` (no comparison) when its boundary is already ordered
+/// (`!(cmp_src[mid] < cmp_src[mid-1])`) or the right run is empty, which yields the identical stable
+/// output.
 ///
 /// Independently of key order, the ping buffers (`tmp`, and keyed `ktmp`) are allocated only behind
 /// a `len > 32` gate, so a `len <= 32` sort — handled entirely by the insertion base case — makes
@@ -6321,6 +6333,16 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // emitted at all. Fail-closed: a non-scalar / unclassifiable key keeps the plain merge path.
     let key_order = align_sema::ty_to_scalar(kty).map(|s| sort_key_order(&s)).unwrap_or(KeyOrder::PartialFloat);
 
+    // The adaptive total-order fast paths (doc-12 §4.1) are on by default (the shipped shape). Setting
+    // `ALIGN_SORT_ADAPTIVE=off` reverts to the pre-change algorithm (no ordered early exit, no
+    // ordered-boundary straight-copy, ping buffers allocated up front) — the baseline the
+    // `bench/adaptive_sort` before/after probe compiles from this same compiler. Zero effect when
+    // unset. Refinements are gated by key order: only a total-order key can take any new path.
+    let adaptive = std::env::var("ALIGN_SORT_ADAPTIVE").ok().as_deref() != Some("off");
+    let emit_precheck = adaptive && key_order == KeyOrder::Total;
+    let emit_boundary = adaptive && key_order == KeyOrder::Total;
+    let delay_scratch = adaptive;
+
     let arr_ptr = {
         let p = b.fresh_value(Ty::Box(scalar_of(elem)));
         b.push(Stmt::Let(p, Rvalue::SlicePtr(arr.clone())));
@@ -6354,6 +6376,17 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // `!has_keys`, `keys` is an unused dummy (`arr`) that no code path reads or frees.
     let (keys_ptr, keys_val) =
         if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+
+    // Pre-change baseline (`!delay_scratch`): allocate the ping buffers up front, like the original
+    // algorithm, so the `none` variant is byte-for-byte the pre-change shape (minus the adaptive
+    // blocks). With `delay_scratch` they are allocated behind the `len > 32` gate instead (below).
+    let upfront_scratch: Option<(Operand, Operand, Operand, Operand)> = if delay_scratch {
+        None
+    } else {
+        let (tp, tv) = sort_alloc_buf(b, elem, &len);
+        let (kp, kv) = if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+        Some((tp, tv, kp, kv))
+    };
 
     // `free_keys` is created *after* the `keys` allocation so its `DropValue(keys_val)` references a
     // value whose defining block is emitted earlier (codegen fills SSA values in block-creation
@@ -6397,7 +6430,7 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // ever allocating a ping buffer. For `sort_by_key` this runs *after* exactly-once decoration, so
     // key effects/evaluation count do not change. Float/partial-order keys skip this entirely (a
     // `!(right < left)` scan is not a valid ordering witness under NaN).
-    if key_order == KeyOrder::Total {
+    if emit_precheck {
         let oi = b.new_slot(i64_ty());
         b.push(Stmt::Store(oi, index_const(0)));
         let ord_head = b.new_block();
@@ -6528,20 +6561,26 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.terminate(Term::Goto(base_head));
 
     // (3) Delayed merge-only scratch (all key types, doc-12 §4.1). A merge pass runs only while
-    // `width < len` with `width` starting at THRESHOLD, i.e. only when `len > 32`. Allocate the ping
-    // buffers `tmp` (and, when keyed, `ktmp`) only on that branch, so a `len <= 32` sort — fully
-    // handled by the insertion base case — never allocates them and exits straight to `free_keys`.
+    // `width < len` with `width` starting at THRESHOLD, i.e. only when `len > 32`. With
+    // `delay_scratch`, allocate the ping buffers `tmp` (and keyed `ktmp`) only on that branch, so a
+    // `len <= 32` sort never allocates them and exits straight to `free_keys`. Without it (the
+    // pre-change baseline), the ping buffers were already allocated up front.
     b.cur = merge_setup;
-    let need_merge = sort_cmp(b, BinOp::Gt, len.clone(), index_const(SORT_INSERTION_THRESHOLD));
-    let alloc_scratch = b.new_block();
-    b.terminate(Term::Branch(need_merge, alloc_scratch, free_keys));
-
-    // alloc_scratch dominates every merge/copyback block (they are reachable only through it), so
-    // the ping-buffer SSA values are defined before use on every path that reads them.
-    b.cur = alloc_scratch;
-    let (tmp_ptr, tmp_val) = sort_alloc_buf(b, elem, &len);
-    let (ktmp_ptr, ktmp_val) =
-        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+    let (tmp_ptr, tmp_val, ktmp_ptr, ktmp_val) = if delay_scratch {
+        let need_merge = sort_cmp(b, BinOp::Gt, len.clone(), index_const(SORT_INSERTION_THRESHOLD));
+        let alloc_scratch = b.new_block();
+        b.terminate(Term::Branch(need_merge, alloc_scratch, free_keys));
+        // alloc_scratch dominates every merge/copyback block (they are reachable only through it), so
+        // the ping-buffer SSA values are defined before use on every path that reads them.
+        b.cur = alloc_scratch;
+        let (tp, tv) = sort_alloc_buf(b, elem, &len);
+        let (kp, kv) = if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+        (tp, tv, kp, kv)
+    } else {
+        // Up-front buffers (baseline); `b.cur` stays `merge_setup`, which falls straight into the
+        // pass loop. A `len <= 32` sort still runs the empty pass loop and frees them via merge_free.
+        upfront_scratch.expect("upfront scratch is allocated when !delay_scratch")
+    };
 
     // Merge passes: while width < len, merge adjacent run pairs of `width` into `tmp`, copy back.
     let ww = b.new_slot(i64_ty());
@@ -6593,12 +6632,19 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // This yields the identical output to the take-left-on-tie stable merge (a straight copy keeps
     // input order), so stability is preserved. The empty-right test must come first: it guards the
     // `cmp_src[mid]` read, which is in range only when the right run is non-empty (`mid < hi`).
-    if key_order == KeyOrder::Total {
+    if emit_boundary {
         let sc_head = b.new_block();
         let sc_body = b.new_block();
         let bnd_check = b.new_block();
         let sck = b.new_slot(i64_ty());
         b.push(Stmt::Store(sck, lo_start.clone()));
+        // Width threshold ([`SORT_BOUNDARY_MIN_WIDTH`]): on the narrow early pass (`width == 32`) skip
+        // the boundary check entirely and comparison-merge — it costs the most and helps the least
+        // there. `width` is loop-invariant within a pass, so this guard predicts perfectly.
+        let wide = sort_cmp(b, BinOp::Ge, width.clone(), Operand::Const(Const::Int(SORT_BOUNDARY_MIN_WIDTH.into(), i64_ty())));
+        let bstart = b.new_block();
+        b.terminate(Term::Branch(wide, bstart, do_merge));
+        b.cur = bstart;
         let right_empty = sort_cmp(b, BinOp::Ge, mid.clone(), hi.clone());
         b.terminate(Term::Branch(right_empty, sc_head, bnd_check));
 

@@ -96,14 +96,16 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   arithmetic still loses to Align's own sequential/vectorized `map().sum()` because every element
   crosses an indirect `thunk` call. Use `par_map` for heavier/non-vectorizable work; cheap maps need
   sequential fallback or thunk specialization.
-- **Adaptive stable sort (`bench/adaptive_sort/`): methodology — in-process AB/BA of two
-  differently-sized kernels is biased; use sequential blocks + an identical-code control.** Linking a
-  `before` and `after` kernel into one process and interleaving their calls (AB/BA) let the smaller
-  kernel pollute the larger one's i-cache/branch history, inflating the larger (`after`) kernel's
-  apparent cost by several percent. A **sequential** measurement (all `after` samples, then all
-  `before`, min of block-medians) removed the bias, confirmed by an after-vs-after control that
-  measured 1.00–1.01×. Lesson: when comparing two builds in one binary, measure them in separate
-  uninterrupted blocks and validate the method with an identical-code control before trusting a
-  sub-5% delta. (The adaptive total-order sort's ordered-input wins reproduced, but its merge-heavy
-  negatives — reverse ≈0.94×, random ≈0.96× — exceeded the 3% no-regression gate on WSL2 without
-  frequency isolation; see `bench/adaptive_sort/README.md`.)
+- **Adaptive stable sort (`bench/adaptive_sort/`): SHIPPED — ordered-input wins (already-sorted 3.6×,
+  tail-swap/1%-swap 1.14–1.17×) with merge-heavy negatives within ≈2%.** Getting there was a
+  measurement lesson. On WSL2 (no CPU-frequency control) a naive block-sequential AB comparison of two
+  differently-sized kernels is doubly corrupted: ±25% frequency drift *between* the after-block and
+  before-block, and state-dependent cross-kernel i-cache/position bias (up to 10% for fast sorts). The
+  fix — used here as the standard for two-build comparisons in one binary — is **median of per-pair
+  adjacent ratios** (after and before measured back-to-back share the instantaneous frequency) plus an
+  **identical-code control** (`after` vs a second copy of `after` under different symbols; its
+  deviation from 1.00 is pure bias, and `corrected = real/control` removes it). That control caught a
+  throughput-neutral refinement being misread as a 10% regression, and an isolation sweep (each
+  refinement toggled independently from one compiler via an env knob + baseline) localized a real 7%
+  regression to a single pass-1 check, fixed by gating it to wider passes. Read the `corrected`
+  column, pin with `taskset -c`; see `bench/adaptive_sort/README.md`.

@@ -13,6 +13,7 @@
 //! `sort_by_key` — after the change, versus 2 / 3 before.
 //!
 //! This is a MANUAL probe (`./run.sh`), not a CI assertion. All inputs are LCG-generated at runtime.
+#![allow(dead_code)]
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -42,10 +43,13 @@ struct SliceStr {
 extern "C" {
     fn sort_u64(xs: SliceU64) -> u64;
     fn sort_u64_before(xs: SliceU64) -> u64;
+    fn sort_u64_ctrl(xs: SliceU64) -> u64;
     fn sort_by_key_u64(xs: SliceU64) -> u64;
     fn sort_by_key_u64_before(xs: SliceU64) -> u64;
+    fn sort_by_key_u64_ctrl(xs: SliceU64) -> u64;
     fn sort_str(xs: SliceStr) -> i64;
     fn sort_str_before(xs: SliceStr) -> i64;
+    fn sort_str_ctrl(xs: SliceStr) -> i64;
     // Present because run.sh builds the runtime with `--features alloc-count`.
     fn align_rt_alloc_count() -> i64;
     fn align_rt_free_count() -> i64;
@@ -111,67 +115,6 @@ fn median(v: &mut [f64]) -> f64 {
     v[v.len() / 2]
 }
 
-/// Balanced AB/BA timing of `after` vs `before` over `input`, `samples` each. Returns
-/// `(after_median_ns, before_median_ns)`.
-unsafe fn bench_pair(
-    after: unsafe extern "C" fn(SliceU64) -> u64,
-    before: unsafe extern "C" fn(SliceU64) -> u64,
-    input: &[u64],
-    samples: usize,
-) -> (f64, f64) {
-    let sl = SliceU64 { ptr: input.as_ptr(), len: input.len() as i64 };
-    for _ in 0..3 {
-        black_box(after(black_box(sl)));
-        black_box(before(black_box(sl)));
-    }
-    let mut a = Vec::with_capacity(samples);
-    let mut b = Vec::with_capacity(samples);
-    for r in 0..samples {
-        if r % 2 == 0 {
-            let t = Instant::now();
-            black_box(after(black_box(sl)));
-            a.push(t.elapsed().as_nanos() as f64);
-            let t = Instant::now();
-            black_box(before(black_box(sl)));
-            b.push(t.elapsed().as_nanos() as f64);
-        } else {
-            let t = Instant::now();
-            black_box(before(black_box(sl)));
-            b.push(t.elapsed().as_nanos() as f64);
-            let t = Instant::now();
-            black_box(after(black_box(sl)));
-            a.push(t.elapsed().as_nanos() as f64);
-        }
-    }
-    (median(&mut a), median(&mut b))
-}
-
-fn samples_for(n: usize) -> usize {
-    match n {
-        0..=2_000 => 401,
-        2_001..=200_000 => 51,
-        _ => 21,
-    }
-}
-
-fn print_u64_table(kind: &str, after: unsafe extern "C" fn(SliceU64) -> u64, before: unsafe extern "C" fn(SliceU64) -> u64) {
-    println!("\n== {kind}: before→after speedup (before_ns / after_ns), medians reported twice ==");
-    println!("{:<10} {:>10} {:>14} {:>14} {:>10} {:>10}", "state", "n", "after ns", "before ns", "spd#1", "spd#2");
-    for &n in &SIZES {
-        let s = samples_for(n);
-        for state in STATES {
-            let input = gen(state, n);
-            // Report the median twice (two independent passes) as a stability check.
-            let (a1, b1) = unsafe { bench_pair(after, before, &input, s) };
-            let (a2, b2) = unsafe { bench_pair(after, before, &input, s) };
-            println!(
-                "{:<10} {:>10} {:>14.0} {:>14.0} {:>9.2}x {:>9.2}x",
-                state, n, a1, b1, b1 / a1, b2 / a2
-            );
-        }
-    }
-}
-
 /// Short-size scratch matrix: prove the `len <= 32` sort allocates only the materialize buffer(s).
 fn print_scratch_matrix() {
     println!("\n== short-size scratch matrix: align_rt_alloc delta per call (want after=1 plain / 2 keyed) ==");
@@ -197,103 +140,107 @@ unsafe fn alloc_delta_u64(f: unsafe extern "C" fn(SliceU64) -> u64, sl: SliceU64
     (align_rt_alloc_count() - a0, align_rt_free_count() - f0)
 }
 
-/// A light `str`-key timing (after vs before) at one mid size, plus one sorted state — the str path
-/// is exercised for completeness; the u64 table above is the gated headline.
-fn print_str_timing() {
-    println!("\n== sort_str (str key): before→after speedup, n=100_000 ==");
-    println!("{:<10} {:>10} {:>14} {:>14} {:>10}", "state", "n", "after ns", "before ns", "spd");
-    let n = 100_000usize;
-    for state in ["sorted", "random", "reverse"] {
-        // Build distinct backing strings keyed by the u64 state values so ties/order match.
-        let vals = gen(state, n);
-        let backing: Vec<String> = vals.iter().map(|v| format!("k{:012}", v % 100_000)).collect();
-        let views: Vec<AlignStr> = backing.iter().map(|s| AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }).collect();
-        let sl = SliceStr { ptr: views.as_ptr(), len: views.len() as i64 };
-        for _ in 0..3 {
-            unsafe {
-                black_box(sort_str(black_box(sl)));
-                black_box(sort_str_before(black_box(sl)));
-            }
-        }
-        let s = 41usize;
-        let mut a = Vec::with_capacity(s);
-        let mut b = Vec::with_capacity(s);
-        for r in 0..s {
-            if r % 2 == 0 {
-                let t = Instant::now();
-                unsafe { black_box(sort_str(black_box(sl))) };
-                a.push(t.elapsed().as_nanos() as f64);
-                let t = Instant::now();
-                unsafe { black_box(sort_str_before(black_box(sl))) };
-                b.push(t.elapsed().as_nanos() as f64);
-            } else {
-                let t = Instant::now();
-                unsafe { black_box(sort_str_before(black_box(sl))) };
-                b.push(t.elapsed().as_nanos() as f64);
-                let t = Instant::now();
-                unsafe { black_box(sort_str(black_box(sl))) };
-                a.push(t.elapsed().as_nanos() as f64);
-            }
-        }
-        let (am, bm) = (median(&mut a), median(&mut b));
-        println!("{:<10} {:>10} {:>14.0} {:>14.0} {:>9.2}x", state, n, am, bm, bm / am);
-    }
-}
 
-/// Non-interleaved (sequential) measurement: all `after` samples in one uninterrupted block, then all
-/// `before` — removes the cross-kernel i-cache/branch-history pollution that in-process AB/BA of two
-/// differently-sized kernels introduces. Repeated `reps` times; the min block-median is reported.
-unsafe fn bench_sequential(
+/// Drift-immune ratio: measure `after` and `other` **adjacent** (same instantaneous CPU frequency —
+/// WSL2 has no frequency control, so the block-sequential method is corrupted by ±25% drift between
+/// blocks), record `other/after` per adjacent pair, and return the **median ratio** over `pairs`
+/// pairs. > 1 ⇒ after faster. The median of adjacent ratios cancels slow-frequency episodes.
+unsafe fn ratio_adjacent(
     after: unsafe extern "C" fn(SliceU64) -> u64,
-    before: unsafe extern "C" fn(SliceU64) -> u64,
+    other: unsafe extern "C" fn(SliceU64) -> u64,
     input: &[u64],
-    samples: usize,
-    reps: usize,
-) -> (f64, f64) {
+    pairs: usize,
+) -> f64 {
     let sl = SliceU64 { ptr: input.as_ptr(), len: input.len() as i64 };
     for _ in 0..5 {
         black_box(after(black_box(sl)));
-        black_box(before(black_box(sl)));
+        black_box(other(black_box(sl)));
     }
-    let mut a_best = f64::INFINITY;
-    let mut b_best = f64::INFINITY;
-    for _ in 0..reps {
-        let mut a = Vec::with_capacity(samples);
-        for _ in 0..samples {
-            let t = Instant::now();
-            black_box(after(black_box(sl)));
-            a.push(t.elapsed().as_nanos() as f64);
-        }
-        let mut b = Vec::with_capacity(samples);
-        for _ in 0..samples {
-            let t = Instant::now();
-            black_box(before(black_box(sl)));
-            b.push(t.elapsed().as_nanos() as f64);
-        }
-        a_best = a_best.min(median(&mut a));
-        b_best = b_best.min(median(&mut b));
+    let mut r = Vec::with_capacity(pairs);
+    for _ in 0..pairs {
+        let t = Instant::now();
+        black_box(after(black_box(sl)));
+        let ta = t.elapsed().as_nanos() as f64;
+        let t = Instant::now();
+        black_box(other(black_box(sl)));
+        let tb = t.elapsed().as_nanos() as f64;
+        r.push(tb / ta);
     }
-    (a_best, b_best)
+    median(&mut r)
 }
 
-fn print_sequential_negatives() {
-    println!("\n== sort_u64 SEQUENTIAL (non-interleaved) negatives — before/after, min of block-medians ==");
-    println!("{:<10} {:>10} {:>14} {:>14} {:>10}", "state", "n", "after ns", "before ns", "spd");
-    for &n in &SIZES {
-        let s = samples_for(n).min(101);
-        for state in ["random", "reverse", "lowcard"] {
+/// Print, per state/size: the real after-vs-before ratio (before = `ALIGN_SORT_ADAPTIVE=off`
+/// baseline), the after-vs-ctrl **control** (both the shipped code, so any deviation from 1.00 is
+/// pure cross-kernel i-cache/position bias), and the bias-corrected ratio (real / control). The
+/// corrected column is the verdict: > 1 ⇒ after (shipped) faster.
+fn print_ratio_table(
+    kind: &str,
+    after: unsafe extern "C" fn(SliceU64) -> u64,
+    before: unsafe extern "C" fn(SliceU64) -> u64,
+    ctrl: unsafe extern "C" fn(SliceU64) -> u64,
+) {
+    println!("\n== {kind} drift-immune median-of-adjacent-ratios (after=shipped, before=baseline, ctrl=shipped) ==");
+    println!("{:<10} {:>10} {:>10} {:>10} {:>12}", "state", "n", "real", "ctrl", "corrected");
+    for &n in &[100_000usize, 1_000_000] {
+        let pairs = if n >= 500_000 { 81 } else { 201 };
+        for state in STATES {
             let input = gen(state, n);
-            let (a, b) = unsafe { bench_sequential(sort_u64, sort_u64_before, &input, s, 5) };
-            println!("{:<10} {:>10} {:>14.0} {:>14.0} {:>9.2}x", state, n, a, b, b / a);
+            let real = unsafe { ratio_adjacent(after, before, &input, pairs) };
+            let ctl = unsafe { ratio_adjacent(after, ctrl, &input, pairs) };
+            println!("{:<10} {:>10} {:>9.3}x {:>9.3}x {:>11.3}x", state, n, real, ctl, real / ctl);
         }
+    }
+}
+
+/// Backing strings for `sort_str` — one distinct string per LCG state value; the key is the whole
+/// byte-lexicographic string. Returns the storage (keep alive) and the `AlignStr` views.
+fn gen_str(state: &str, n: usize) -> (Vec<String>, Vec<AlignStr>) {
+    let vals = gen(state, n);
+    let backing: Vec<String> = vals.iter().map(|v| format!("k{:012}", v % 100_000)).collect();
+    let views: Vec<AlignStr> = backing.iter().map(|s| AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }).collect();
+    (backing, views)
+}
+
+unsafe fn ratio_adjacent_str(
+    after: unsafe extern "C" fn(SliceStr) -> i64,
+    other: unsafe extern "C" fn(SliceStr) -> i64,
+    views: &[AlignStr],
+    pairs: usize,
+) -> f64 {
+    let sl = SliceStr { ptr: views.as_ptr(), len: views.len() as i64 };
+    for _ in 0..5 {
+        black_box(after(black_box(sl)));
+        black_box(other(black_box(sl)));
+    }
+    let mut r = Vec::with_capacity(pairs);
+    for _ in 0..pairs {
+        let t = Instant::now();
+        black_box(after(black_box(sl)));
+        let ta = t.elapsed().as_nanos() as f64;
+        let t = Instant::now();
+        black_box(other(black_box(sl)));
+        let tb = t.elapsed().as_nanos() as f64;
+        r.push(tb / ta);
+    }
+    median(&mut r)
+}
+
+fn print_str_ratio() {
+    println!("\n== sort_str (byte-lex key) drift-immune median-of-adjacent-ratios, n=100_000 ==");
+    println!("{:<10} {:>10} {:>10} {:>10} {:>12}", "state", "n", "real", "ctrl", "corrected");
+    let n = 100_000usize;
+    for state in ["sorted", "random", "reverse"] {
+        let (_backing, views) = gen_str(state, n);
+        let real = unsafe { ratio_adjacent_str(sort_str, sort_str_before, &views, 121) };
+        let ctl = unsafe { ratio_adjacent_str(sort_str, sort_str_ctrl, &views, 121) };
+        println!("{:<10} {:>10} {:>9.3}x {:>9.3}x {:>11.3}x", state, n, real, ctl, real / ctl);
     }
 }
 
 fn main() {
-    println!("adaptive_sort probe — in-process AB/BA (after = post-change, before = main worktree)");
-    print_sequential_negatives();
+    println!("adaptive_sort probe — after = shipped (w64) shape, before = ALIGN_SORT_ADAPTIVE=off baseline, ctrl = shipped");
     print_scratch_matrix();
-    print_u64_table("sort_u64 (plain)", sort_u64, sort_u64_before);
-    print_u64_table("sort_by_key_u64 (identity key)", sort_by_key_u64, sort_by_key_u64_before);
-    print_str_timing();
+    print_ratio_table("sort_u64 (plain)", sort_u64, sort_u64_before, sort_u64_ctrl);
+    print_ratio_table("sort_by_key_u64 (identity key)", sort_by_key_u64, sort_by_key_u64_before, sort_by_key_u64_ctrl);
+    print_str_ratio();
 }

@@ -8,11 +8,15 @@ use std::env;
 fn main() {
     let after = env::var("ALIGN_KERNEL_AFTER").expect("set ALIGN_KERNEL_AFTER — run via ./run.sh");
     let before = env::var("ALIGN_KERNEL_BEFORE").expect("set ALIGN_KERNEL_BEFORE — run via ./run.sh");
+    let ctrl = env::var("ALIGN_KERNEL_CTRL").expect("set ALIGN_KERNEL_CTRL — run via ./run.sh");
     let rt_dir = env::var("ALIGN_RUNTIME_DIR").expect("set ALIGN_RUNTIME_DIR — run via ./run.sh");
 
-    // Both kernel objects (static), then the runtime resolved dynamically from the cdylib.
+    // All three kernel objects (static), then the runtime resolved dynamically from the cdylib.
     println!("cargo:rustc-link-arg={after}");
     println!("cargo:rustc-link-arg={before}");
+    println!("cargo:rustc-link-arg={ctrl}");
+    println!("cargo:rerun-if-env-changed=ALIGN_KERNEL_CTRL");
+    println!("cargo:rerun-if-changed={ctrl}");
     println!("cargo:rustc-link-search=native={rt_dir}");
     println!("cargo:rustc-link-lib=dylib=align_runtime");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{rt_dir}");

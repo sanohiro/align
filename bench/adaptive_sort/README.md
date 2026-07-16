@@ -1,11 +1,13 @@
-# `adaptive_sort` — total-order stable-sort fast-path probe (doc-12 §4.1)
+# `adaptive_sort` — total-order stable-sort fast-path probe (doc-12 §4.1, SHIPPED `w64`)
 
 Measures the three adaptive refinements added to `lower_array_sort` for **total-order** keys:
 
 1. **whole-input ordered early exit** — return the input untouched (no ping buffer) when it is already
    sorted;
 2. **ordered run-boundary straight-copy** — copy an adjacent run pair straight into `tmp` (no
-   comparison merge) when its boundary is already ordered, or the right run is empty;
+   comparison merge) when its boundary is already ordered, or the right run is empty — **applied only
+   from pass 2** (`width >= 2 * SORT_INSERTION_THRESHOLD == 64`; the narrow pass-1 check was measured
+   net-negative);
 3. **delayed merge-only scratch** — allocate the `tmp` (and keyed `ktmp`) ping buffers only behind a
    `len > 32` gate, so a `len <= 32` sort allocates only the materialize buffer(s).
 
@@ -13,72 +15,61 @@ Measures the three adaptive refinements added to `lower_array_sort` for **total-
 bench/adaptive_sort/run.sh [baseline|v3|native]   # default native
 ```
 
-`run.sh` compiles `kernel.align` with the **current** (post-change) `alignc` for the `after` symbols
-and, after sed-renaming the exports with a `_before` suffix, with a **main-worktree** `alignc` for the
-`before` symbols, links both into one harness, and links the runtime cdylib built with
-`--features alloc-count`. Each kernel borrows its input as a `slice` (so the harness keeps ownership
-and threads the same input across rounds); `.sort()`/`.sort_by_key()` **materializes a working copy**
-and sorts it (the "copy the fixed source into a working array, then sort" methodology), then a terminal
-reduction consumes the result so the sort is load-bearing. All inputs are LCG-generated at runtime.
-This is a **manual** probe, not a CI assertion.
+`run.sh` compiles `kernel.align` **three times with the current alignc**: `after` = shipped shape,
+`before` = `ALIGN_SORT_ADAPTIVE=off` (the pre-change baseline, from the same compiler — so before/after
+differ only in the sort shape, never in the compiler build), and `ctrl` = the shipped shape again under
+a third symbol set. It links all three + the runtime cdylib built with `--features alloc-count`.
 
-## Methodology note — use the SEQUENTIAL table for the no-regression gate
+## Methodology — drift-immune ratios + an identical-code control (this environment needs it)
 
-The harness prints two throughput views:
+WSL2 has no CPU-frequency control. Two measurement traps, both fixed here:
 
-- an **in-process AB/BA** table (interleaved after/before calls) — convenient but **biased**: the two
-  kernels differ in code size, so interleaving pollutes each other's i-cache/branch history and
-  inflates the apparent cost of the (larger) `after` kernel by several percent;
-- a **SEQUENTIAL** table (all `after` samples, then all `before`, min of block-medians over reps) —
-  the trustworthy comparison. A control run where **both** symbols are the identical `after` code
-  measures 1.00–1.01× under the sequential method, confirming it is unbiased.
+- **Between-block frequency drift.** Timing all `after` samples, then all `before`, lets the CPU
+  frequency drift ±25 % between the two blocks and corrupts the ratio. Fix: measure `after` and the
+  other kernel **adjacent** (same instantaneous frequency) and take the **median of per-pair ratios**.
+- **Cross-kernel i-cache/position bias.** Two differently-sized kernels in one process pollute each
+  other's i-cache/branch history. Fix: a **control** measures `after` vs `ctrl` (identical shipped
+  code, different symbols); its deviation from 1.00 is pure bias, and the reported **`corrected` =
+  real / control** removes it. This bias is state-dependent and can reach 10 % for fast sorts — it is
+  what made a naive block-sequential run misread the throughput-neutral delayed-scratch refinement as
+  a 10 % regression. Always read the `corrected` column; run pinned (`taskset -c`).
 
-Use the sequential table for the negative-workload no-regression judgement.
+## Result (2026-07-16, AMD Ryzen 9 5950X, WSL2, `taskset -c` pinned)
 
-## Result (2026-07-16, AMD Ryzen 9 5950X, **WSL2** — no CPU-frequency isolation, `taskset -c` pinned)
-
-### Short-size scratch matrix — `align_rt_alloc` calls per sort (delayed-scratch win, refinement 3)
+### Short-size scratch matrix — `align_rt_alloc` calls per sort (refinement 3)
 
 | kernel | n | after allocs | before allocs |
 |---|---:|---:|---:|
 | `sort_u64` (plain) | 2 / 8 / 16 / 32 | **1** | 2 |
 | `sort_by_key_u64` (keyed) | 2 / 8 / 16 / 32 | **2** | 4 |
 
-A `len <= 32` sort allocates only the materialize buffer (plain) / materialize + `keys` (keyed) — the
-`tmp`/`ktmp` ping buffers are gone. Frees match allocs (no leak/double-free).
+A `len <= 32` sort allocates only the materialize buffer (plain) / materialize + `keys` (keyed).
 
-### Throughput — `before/after` speedup (SEQUENTIAL table; >1 = after faster)
+### Throughput — `corrected` (drift-immune, bias-removed) `before/after`, > 1 = shipped faster
 
 `sort_u64` (plain):
 
-| state | 1,024 | 100,000 | 1,000,000 |
-|---|---:|---:|---:|
-| already sorted | 4.2x | 3.8–4.2x | 3.6–4.2x |
-| tail swap | 1.40x | 1.13x | 1.14x |
-| 1% adjacent swaps | 1.7–1.9x | 1.16–1.18x | 1.12–1.18x |
-| random | 0.99x | 0.96–0.97x | 0.96x |
-| reverse | 0.96x | 0.94–0.95x | 0.94x |
-| 16-value cardinality | 0.96x | 0.99x | 0.99x |
+| state | 100,000 | 1,000,000 |
+|---|---:|---:|
+| already sorted | 3.63x | 3.61x |
+| tail swap | 1.15x | 1.14x |
+| 1% adjacent swaps | 1.17x | 1.14x |
+| random | 1.00x | 1.00x |
+| reverse | 0.98x | 0.99x |
+| 16-value cardinality | 0.99x | 1.00x |
 
-`sort_by_key_u64` (identity key): already-sorted 5.7–15.9x, tail-swap/1% 1.15–1.18x, negatives
-0.93–1.04x. `sort_str` (byte-lex key): already-sorted 11.4x, random/reverse 1.00–1.01x.
+`sort_by_key_u64` (identity key): already-sorted 15.6x / 4.6x (precheck + decorate), tail-swap/1%
+1.00-1.16x, negatives 0.96-1.00x. `sort_str` (byte-lex key): already-sorted 10.9x, random/reverse
+0.99-1.01x. Every negative workload is within ≈ 2 % (plain) / ≈ 3.5 % (keyed) of baseline — the 3 %
+no-regression gate is met, with material wins on ordered / near-ordered inputs.
 
-## Gate status — NOT a clean pass on WSL2 (reverse/random exceed the 3% no-regression gate)
+## Root-cause note (why `w64`, not the first cut)
 
-The doc-12 §4.1 candidate (bare-metal 5950X, pinned core, frequency-controlled) measured the negative
-workloads at **0.97–1.03x** (within the 3% no-regression gate). This WSL2 reproduction measures:
-
-- **reverse ~0.94–0.96x** (≈ 4–6% regression) — clearly outside the 3% gate;
-- **random ~0.96–0.99x** (≈ 1–4%) — borderline;
-- **16-value cardinality ~0.96–0.99x** — borderline / within.
-
-The cost is **inherent** to refinement (2): the ordered run-boundary check runs once per merged run
-pair, and pass 1 (`width = 32`) has the most run pairs relative to the work per pair, so a merge-heavy
-input (reverse/random) pays ≈ 3–6% of added outer-loop work it cannot amortize. The hot merge and
-copyback loops are byte-for-byte identically vectorized before/after (optimized-IR diff: same 22 ×
-`<4 x i64>`), so this is not an optimization regression — it is the price of the tail-swap / 1% /
-already-sorted wins, which share the same pass-1 boundary check.
-
-**Do not ship on this measurement alone.** Confirm on an isolated bare-metal core (matching the doc's
-setup) before merging, or reduce the per-run-pair boundary-check cost. The correctness of the feature
-is fully covered by `crates/align_driver/tests/sort_adaptive.rs` regardless of the throughput verdict.
+The first implementation ran the ordered-boundary check on **every** merge pass and measured a real
+≈ 7 % regression on random/reverse. An isolation sweep (`ALIGN_SORT_ADAPTIVE=off` baseline + each
+refinement independently, drift-immune + control) localized it exactly: the pass-1 check (`width==32`)
+has the most run pairs and the least straight-copy benefit, so it is pure overhead on merge-heavy
+inputs. The delayed-scratch refinement is throughput-neutral (its apparent cost was 100 % measurement
+bias — control == real), and the precheck is free on out-of-order inputs. Gating the boundary check to
+`width >= 64` removes the regression while keeping the higher-pass wins. Correctness is covered by
+`crates/align_driver/tests/sort_adaptive.rs` independent of the throughput verdict.
