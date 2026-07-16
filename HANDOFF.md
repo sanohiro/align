@@ -8,7 +8,35 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (second update this day), **THINLTO SV IS SHIPPED AND THE THINLTO ARC IS
+_Last updated: 2026-07-17 (third update this day), **INSTRUMENT-PGO IS DESIGN-SETTLED AND ITS S0
+SPIKE IS GO — MERGED as #499** (`f45f627`). The M14 wave remainder head after the closed ThinLTO
+arc. Design settled by a two-lens review + orchestrator decisions, recorded as the roadmap's
+"Instrument-PGO design SETTLED" paragraph (the S1/S2/SV source of truth): mechanism = ONE new shim
+entry `align_pgo_run_pipeline` (PassBuilder + the 10-arg LLVM-22 PGOOptions +
+buildPerModuleDefaultPipeline, IRInstr and IRUse) — llvm-sys 221 has NO PGO surface (verified
+setter list; the earlier "likely via raw llvm-sys" guess is CORRECTED) and textual pipelines
+cannot express instr-use; flags = opt-in `--pgo-instrument` / `--pgo-use <file.profdata>`
+(mutually exclusive, release/fast only, build/run/size); PGO × `--thin-lto` rejected loudly in v1;
+`--rt-lto` × `--pgo-use` composes; no merge wrapper (llvm-profdata-22 direct, documented
+prerequisite); profraw = LLVM default + LLVM_PROFILE_FILE with the destination printed; stale
+policy = missing/version-skew/0%-match hard error, partial-stale one aggregated report then
+proceed; cache identity = a `PgoMode { Off | Instrument | Use(Hash128) }` key component (rt_lto
+precedent). The S0 spike (feature-gated `pgo-spike`, 5 ignored tests, default builds
+byte-identical) proved the round trip on a REAL Align binary: gen → 288-byte .profraw at normal
+exit despite M13 internalization + gc-sections (llvm.used/SHF_GNU_RETAIN pin the counters) →
+llvm-profdata-22 merge → IRUse → `!prof branch_weights` with a live diagnostic handler proving no
+hash mismatch. Two load-bearing frictions recorded: ELF omits the `__llvm_profile_runtime`
+reference, so the S1 driver MUST add `-Wl,--undefined=__llvm_profile_runtime` + the
+clang_rt.profile archive to instrumented links; and the shim's USE rc CANNOT signal a
+missing/corrupt profdata (libLLVM diagnoses on the context / exits without a handler), so the
+DRIVER pre-validates the profdata and installs a diagnostic handler — the fail-loud policy lives
+in the driver. Reviewed via /code-review (three findings, all applied pre-merge). Workspace green,
+clippy clean in default/pgo-spike/thinlto-spike states. **Next: PGO S1 — serial whole-program
+correctness behind the two flags, cache bypassed** (gates: gen links/runs/writes profraw; use
+shows !prof mutation-checked; run-parity off/instrument/use; the full rejection matrix; fail-loud
+profdata errors incl. pre-validation; flag-off byte-identity), then S2 (cache), then SV (incl. the
+measured payoff gate on a branch-heavy kernel). Previous update: 2026-07-17 (second update this
+day), **THINLTO SV IS SHIPPED AND THE THINLTO ARC IS
 CLOSED — MERGED as #498** (`e804223`; the full arc: S0 #495 spike → S1 #496 serial → S2 #497
 cache/parallel → SV #498 verification). The SV bundle (`crates/align_driver/tests/thin_lto_sv.rs`,
 11 gates after review fixes): build-twice determinism across separate cold cache roots and across
