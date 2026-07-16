@@ -9227,6 +9227,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_chunks_len_and_index_do_not_materialize_headers() {
+        let out = ir(
+            "fn main() -> i32 {\n\
+               xs := [1, 2, 3, 4, 5]\n\
+               a := xs.chunks(2).len()\n\
+               b := xs.chunks(2)[2].len()\n\
+               return (a + b) as i32\n\
+             }\n",
+        );
+        let main = function_body(&out, "main");
+        assert!(!main.contains("@align_rt_chunks"), "direct consumers must not call the materializer:\n{main}");
+        assert!(!main.contains("@align_rt_alloc"), "direct consumers must not allocate chunk headers:\n{main}");
+        assert!(main.contains("sdiv i64"), "chunk count must be computed from source_len/n:\n{main}");
+        assert!(
+            main.contains("getelementptr inbounds i64"),
+            "direct index must compute one source sub-view:\n{main}"
+        );
+
+        let stored = ir(
+            "fn main() -> i32 {\n\
+               xs := [1, 2, 3, 4, 5]\n\
+               cs := xs.chunks(2)\n\
+               return cs.len() as i32\n\
+             }\n",
+        );
+        assert!(
+            function_body(&stored, "main").contains("call { ptr, i64 } @align_rt_chunks("),
+            "a stored chunks value must retain its owned materialized representation:\n{stored}"
+        );
+    }
+
+    #[test]
     fn escaping_array_builder_keeps_boxed_header() {
         let out = ir(
             "fn make() -> array_builder<i64> {\n\

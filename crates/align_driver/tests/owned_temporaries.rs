@@ -58,18 +58,21 @@ fn main() -> i32 = probe(2) as i32
     let probe = function(&mir, "probe");
     assert!(probe.contains("str_clone"), "string producer missing:\n{probe}");
     assert!(probe.contains("heap_alloc"), "owned array producer missing:\n{probe}");
-    assert!(probe.contains("chunks("), "chunks producer missing:\n{probe}");
+    assert!(
+        !probe.contains("chunks("),
+        "a direct chunks length must use its virtual scalar form:\n{probe}"
+    );
     assert!(probe.contains("array_builder_build"), "builder freeze missing:\n{probe}");
     assert!(
-        real_drop_count(probe) >= 5,
+        real_drop_count(probe) >= 4,
         "each confirmed unbound owner needs a real drop edge:\n{probe}"
     );
     if backend_available() {
         let ir = optimized_llvm(src);
         assert_eq!(
             ir.matches("call void @align_rt_free").count(),
-            5,
-            "the five heap-producing examples must each retain exactly one optimized free:\n{ir}"
+            4,
+            "the four heap-producing examples must each retain exactly one optimized free:\n{ir}"
         );
     }
 }
