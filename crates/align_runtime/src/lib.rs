@@ -5911,7 +5911,6 @@ unsafe fn base64_encode_into_avx2(
 /// triples, bit operations form four 6-bit streams, and `vst4q` writes 64 ordered output bytes.
 /// Full-block loads/stores stay inside the exact input/output ranges; the scalar oracle owns tails.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn base64_encode_into_neon(
     data: &[u8],
@@ -5954,8 +5953,8 @@ unsafe fn base64_encode_into_neon(
     base64_encode_into_scalar(&data[i..], alphabet, pad, &mut out[o..]);
 }
 
-/// Encode directly into the exact destination. Measured large x86-64 inputs use AVX2; short inputs,
-/// unsupported CPUs/targets, and aarch64 pending its native crossover gate stay on the scalar oracle.
+/// Encode directly into the exact destination. Measured large inputs use AVX2 on x86-64 and
+/// baseline NEON on aarch64; short inputs and unsupported CPUs/targets stay on the scalar oracle.
 #[inline]
 fn base64_encode_into(
     data: &[u8],
@@ -5968,6 +5967,15 @@ fn base64_encode_into(
     {
         if data.len() >= 32 && is_x86_feature_detected!("avx2") {
             unsafe { base64_encode_into_avx2(data, alphabet, pad, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Native Apple-M1 probes measured the first complete 48-byte NEON block as the independent
+        // no-regression crossover for both the standard/padded and URL-safe/unpadded alphabets.
+        if data.len() >= 48 {
+            unsafe { base64_encode_into_neon(data, alphabet, pad, out) };
             return;
         }
     }
@@ -13574,14 +13582,7 @@ mod tests {
         fn fill(data: &[u8], url: bool, simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
             let alphabet = if url { &BASE64_URL } else { &BASE64_STD };
             if simd {
-                #[cfg(target_arch = "x86_64")]
                 base64_encode_into(data, alphabet, !url, out);
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    base64_encode_into_neon(data, alphabet, !url, out);
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                base64_encode_into_scalar(data, alphabet, !url, out);
             } else {
                 base64_encode_into_scalar(data, alphabet, !url, out);
             }
@@ -13693,15 +13694,17 @@ mod tests {
                 let scalar_alloc = median(scalar_alloc);
                 let simd_alloc = median(simd_alloc);
                 let gbps = if n == 0 { 0.0 } else { n as f64 / simd_core };
+                let core_ratio = scalar_core / simd_core;
+                let alloc_ratio = if n == 0 { 1.0 } else { scalar_alloc / simd_alloc };
                 if (1..=64).contains(&n) {
-                    short_core_log_sum += (scalar_core / simd_core).ln();
-                    short_alloc_log_sum += (scalar_alloc / simd_alloc).ln();
+                    short_core_log_sum += core_ratio.ln();
+                    short_alloc_log_sum += alloc_ratio.ln();
                     short_count += 1;
                 }
                 println!(
                     "{name:>9} | {n:>8} | {scalar_core:>11.2} | {simd_core:>11.2} | {:>6.2}x | {scalar_alloc:>12.2} | {simd_alloc:>11.2} | {:>6.2}x | {gbps:>9.2}",
-                    scalar_core / simd_core,
-                    scalar_alloc / simd_alloc,
+                    core_ratio,
+                    alloc_ratio,
                 );
             }
             println!(

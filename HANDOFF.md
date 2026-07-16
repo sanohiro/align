@@ -8,7 +8,28 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (nineteenth update this day), **NATIVE APPLE-SILICON UTF-8 KEEPS THE
+_Last updated: 2026-07-16 (twentieth update this day), **NATIVE APPLE-SILICON BASE64 AND BASE64URL
+DISPATCH TO NEON AT THEIR INDEPENDENTLY MEASURED 48-BYTE CROSSOVER.** The checked-in balanced
+median-of-nine probe ran repeatedly on a native Apple M1 (`uname -m = arm64`, Rosetta translation
+flag 0) for both the standard/padded and URL-safe/unpadded encoders. The first complete 48-byte NEON
+block improved allocation-inclusive time by 1.63-1.66x, while the production-path 1..=64
+selected-point geometric mean improved 1.05-1.14x. The measured core/allocation-inclusive gains were:
+
+| Size | Base64 | Base64url |
+|---:|---:|---:|
+| 1 KiB | 5.79-5.81x / 4.63-4.69x | 5.81-5.83x / 4.67-4.69x |
+| 1 MiB | 6.70-6.78x / 6.71-6.73x | 6.78-6.83x / 6.70-6.73x |
+| 64 MiB | 6.67-6.75x / 6.62-6.70x | 6.63-6.78x / 6.61-6.68x |
+
+Candidate input throughput was 15.9-16.2 GB/s at 1 KiB, 18.8-19.2 GB/s at 1 MiB, and 18.6-18.8
+GB/s at 64 MiB.
+Inputs below 48 bytes retain the scalar oracle; direct scalar/NEON differential tests cover every
+length through 4096, both alphabets, all alignments, and a page boundary. Production activation is
+therefore enabled for both encoders. The worst one-byte dispatcher observations were 0.81x core and
+0.92x allocation-inclusive (the latter repeated at 0.96x), while the required allocation-inclusive
+short-suite geometric mean remained positive. **Next:** measure and decide hex independently; do not
+infer its threshold from Base64, UTF-8, or x86. Previous update: 2026-07-16 (nineteenth update this day),
+**NATIVE APPLE-SILICON UTF-8 KEEPS THE
 SCALAR PRODUCTION PATH.** The checked-in probe ran repeatedly on a native Apple M1
 (`uname -m = arm64`, Rosetta translation flag 0) and found no length-only NEON crossover that
 passes every named control. The 1..=64 selected-point candidate speedup versus scalar geometric mean
@@ -19,9 +40,9 @@ the scalar oracle's immediate return. The realistic 64 MiB mixed-text candidate 
 15.1 GB/s versus 3.1 GB/s scalar, but the named regressions fail the no-regression gate. Production
 aarch64 dispatch therefore uses the scalar oracle; the baseline-NEON implementation, tail handling,
 and byte-for-byte differential tests remain as a measured candidate for a materially different
-content-adaptive design. The native ARM UTF-8 deferral is closed as a negative result. This work is
-on branch **`agent/arm64-utf8-crossover`**, based on `main` at `6399784`. **Next:** measure and decide
-the independent Base64/Base64url NEON crossover; do not infer its threshold from UTF-8 or x86.
+content-adaptive design. The native ARM UTF-8 deferral is closed as a negative result. This work was
+squash-merged as PR **#491** (`510922e`). **Next:** measure and decide the independent
+Base64/Base64url NEON crossover; do not infer its threshold from UTF-8 or x86.
 Native aarch64 hex activation remains deferred. Previous update: 2026-07-16 (eighteenth update this
 day), **THE FIRST COMPLETE STABLE-COMPACTION
 CONSUMER IS REJECTED AND CLOSED.** The checked-in ignored probe combines an inlined total `i64 > 0`

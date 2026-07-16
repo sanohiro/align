@@ -62,7 +62,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
-| Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
+| Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex pending | **SHIPPED / PARTIAL** in document 12 |
 | sorting | stable O(n log n), but allocates unused merge scratch at tiny N and ignores ordered runs | **MEASURED P1** adaptive total-order path in document 12; keep insertion base case |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
@@ -752,7 +752,9 @@ AoS/SoA conversion, or a second substring-search algorithm.
 5. ~~Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.~~ **DONE
    2026-07-16.** Base64/Base64url/hex now fill one checked exact final allocation; the balanced probe
    improved every short case and 64 MiB by 1.70-1.86x. An `array<i64>` count-then-direct JSON probe
-   regressed 1K-1M elements to 0.71-0.73x, so the one-pass parser Vec remains.
+   regressed 1K-1M elements to 0.71-0.73x, so the one-pass parser Vec remains. Native Apple-M1
+   Base64/Base64url subsequently cleared their independent 48-byte NEON crossover; native ARM hex
+   remains a separate document-12 gate.
 
 ### P3 — larger portfolios after measurement
 
