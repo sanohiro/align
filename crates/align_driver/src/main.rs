@@ -36,9 +36,21 @@ mod size;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().collect();
+    // Pull the instrument-PGO flags FIRST (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1):
+    // mutually exclusive; a bare `--pgo-use` is a hard error. It must run before the other flag
+    // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
+    // …) still present — otherwise that flag would already be removed and the guard would consume the
+    // verb as the profile value. Serial, cache-bypassed, release/fast only.
+    let (pgo, args) = match parse_pgo(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("alignc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
-    let (target, args) = parse_target(&raw);
+    let (target, args) = parse_target(&args);
     // Pull `--profile <name>` next (also anywhere before the program's own args). A bad value is a
     // hard error here, not a silent fallback.
     let (profile, args) = match parse_profile(&args) {
@@ -65,15 +77,6 @@ fn main() -> ExitCode {
     // Pull the boolean `--thin-lto` flag (ThinLTO S1): opt-in cross-unit optimization. Serial, no
     // cache, release/fast only. Orthogonal to (and composable with) `--rt-lto`.
     let (thin_lto, args) = parse_thin_lto(&args);
-    // Pull the instrument-PGO flags (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1): mutually
-    // exclusive; a bare `--pgo-use` is a hard error here. Serial, cache-bypassed, release/fast only.
-    let (pgo, args) = match parse_pgo(&args) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("alignc: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     // Pull `--cache-stats` (S3b, build/run/size only) and the `-j`/`--jobs` codegen-parallelism flag.
     let (cache_stats, args) = parse_cache_stats(&args);
     let (jobs_flag, args) = match parse_jobs(&args) {
@@ -315,11 +318,15 @@ fn parse_pgo(args: &[String]) -> Result<(align_driver::PgoMode, Vec<String>), St
             use_path = Some(v.to_string());
         } else if a == "--pgo-use" {
             match args.get(i + 1) {
-                Some(v) => {
+                // Likely-flag guard: a value starting with `--` is another flag (or, transitively,
+                // the verb), not a profile path — consuming it silently swallows the flag and, worse,
+                // bypasses the mutual-exclusion check below (`--pgo-use --pgo-instrument` would set the
+                // path to "--pgo-instrument" and leave `instrument` false). Reject it as a missing value.
+                Some(v) if !v.starts_with("--") => {
                     use_path = Some(v.clone());
                     i += 1;
                 }
-                None => {
+                _ => {
                     return Err("--pgo-use requires a value (e.g. `--pgo-use app.profdata`)".to_string());
                 }
             }
@@ -938,6 +945,13 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     // shipping a new artifact identity behind the flag before cache composition). Mutually exclusive
     // with `--thin-lto` (rejected above), so no ThinLTO interaction here.
     if pgo.is_on() {
+        // The object cache is bypassed under PGO in S1 (the `PgoMode` key component is S2). Mirror the
+        // ThinLTO-S1 `--cache-stats` precedent: say so explicitly rather than silently omit the report.
+        if cache_stats {
+            eprintln!(
+                "alignc: cache: bypassed under --pgo-instrument/--pgo-use (S1; S2 integrates cache composition)"
+            );
+        }
         // Fail-loud profdata validation happens BEFORE the shim runs (the S1 caveat: the shim's rc
         // cannot report a bad profile — libLLVM would diagnose-and-exit).
         if let align_driver::PgoMode::Use(p) = pgo
@@ -953,12 +967,14 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
                 return Err(ExitCode::FAILURE);
             }
         };
-        // One aggregated Align-voice staleness report for the whole build, then proceed (the settled
-        // partially-stale policy: report, don't abort; there is no `--pgo-strict` knob).
+        // One aggregated Align-voice report for the whole build, then proceed (the settled
+        // partially-stale policy: report, don't abort; there is no `--pgo-strict` knob). These are
+        // every Warning-severity diagnostic the PGO use pipeline raised — typically profile staleness
+        // (a function changed since the profile was collected), surfaced verbatim so nothing is hidden.
         if !report.warnings.is_empty() {
             eprintln!(
-                "alignc: --pgo-use: proceeding despite {} profile staleness warning(s) across {} unit(s) \
-                 (functions changed since the profile was collected); first: {}",
+                "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across {} unit(s) \
+                 (usually functions changed since the profile was collected); first: {}",
                 report.warnings.len(),
                 report.units,
                 report.warnings[0]
@@ -1038,7 +1054,9 @@ fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: P
             }
         };
         let dest = std::env::var("LLVM_PROFILE_FILE").unwrap_or_else(|_| "default.profraw".to_string());
-        println!(
+        // Surfaced on stderr, not stdout: under `run` the built program's own stdout must stay clean,
+        // and `size` parses stdout — this is a diagnostic note, so it belongs on stderr.
+        eprintln!(
             "alignc: --pgo-instrument: instrumented binary will write its profile to `{dest}` when run \
              (set LLVM_PROFILE_FILE to redirect); then `llvm-profdata-22 merge` it and rebuild with \
              `--pgo-use <file.profdata>`"

@@ -93,16 +93,6 @@ struct DiagSink {
 const LLVM_DS_ERROR: c_int = 0;
 const LLVM_DS_WARNING: c_int = 1;
 
-/// Whether a diagnostic description is about the PROFILE (a hash mismatch / stale or missing
-/// profile), as opposed to an ordinary pipeline diagnostic. The C API exposes only the severity
-/// and the text, not the diagnostic kind, so this classifies by content — deliberately narrow, so
-/// generic optimization remarks (e.g. "loop not vectorized: call instruction cannot be vectorized",
-/// which libLLVM also routes through this handler) are NOT mistaken for profile staleness.
-fn is_profile_related(msg: &str) -> bool {
-    let l = msg.to_ascii_lowercase();
-    l.contains("profile") || l.contains("mismatch") || l.contains("unprofiled")
-}
-
 extern "C" fn collect_diag(info: LLVMDiagnosticInfoRef, ctx: *mut c_void) {
     if ctx.is_null() || info.is_null() {
         return;
@@ -188,17 +178,20 @@ pub unsafe fn run_pgo_pipeline(
         )));
     }
 
-    // Partition captured diagnostics. An Error severity is a hard failure (fail-closed — a profile
-    // that libLLVM rejects outright must never be a silent proceed). Warning severity is the
-    // staleness report the driver aggregates, but ONLY the profile-related ones — libLLVM also routes
-    // ordinary optimization remarks/warnings through this handler, and those are not our concern.
-    // Remark (2) / Note (3) severities are dropped entirely.
+    // Partition captured diagnostics. FAIL-CLOSED policy (S2 note): the diagnostic handler is
+    // installed ONLY around the PGO pipeline run above, so every diagnostic it captured came from that
+    // run. An Error severity is a hard failure (a profile libLLVM rejects outright must never be a
+    // silent proceed). EVERY Warning severity is surfaced verbatim in the report — we deliberately do
+    // NOT keyword-filter for "profile"/"mismatch", because a real PGO degradation warning with unusual
+    // wording (a future LLVM rewording, a counter-overflow warning, …) must not be dropped. Remark (2)
+    // / Note (3) severities are the only thing dropped: those are ordinary optimization remarks (e.g.
+    // "loop not vectorized: call instruction cannot be vectorized") libLLVM also routes here.
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for d in sink.diags {
         if d.severity == LLVM_DS_ERROR {
             errors.push(d.message);
-        } else if d.severity == LLVM_DS_WARNING && is_profile_related(&d.message) {
+        } else if d.severity == LLVM_DS_WARNING {
             warnings.push(d.message);
         }
     }

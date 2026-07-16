@@ -847,15 +847,18 @@ pub struct PgoBuildReport {
 /// caveat, `docs/impl/07-roadmap.md`): the shim's return code CANNOT report a bad profile — libLLVM
 /// diagnoses it on the context and, in the error case, exits the process — so existence /
 /// readability / non-emptiness / a valid indexed-profdata magic are checked HERE, each a hard error
-/// naming the path. The magic is the 8-byte indexed-profile header `llvm-profdata-22 merge` writes
-/// (`0xff 'l' 'p' 'r' 'o' 'f' 'i' 0x81`, host-endian — accepted in either byte order); a raw
-/// `.profraw` (different magic) is rejected, guiding the user to run `merge` first.
+/// naming the path. The magic is the 8-byte indexed-profile header `llvm-profdata-22 merge` writes;
+/// on the little-endian targets we support (x86-64 / arm64) the on-disk bytes are exactly
+/// `ff 6c 70 72 6f 66 69 81` (verified against a real merged `.profdata`) — the 64-bit
+/// `IndexedInstrProf::Magic` serialized LSB-first. A raw `.profraw` (different magic) is rejected,
+/// guiding the user to run `merge` first.
 pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     use std::io::Read;
-    // Indexed-profdata magic, as written on a little-endian (x86-64 / arm64) host. On a big-endian
-    // host LLVM stores the reversed bytes, so both orders are accepted.
-    const MAGIC_LE: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
-    const MAGIC_BE: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
+    // The exact on-disk header of a merged indexed `.profdata` on our little-endian targets, and its
+    // byte-reversed form (what a hypothetical big-endian producer would write) — both accepted so the
+    // check is endianness-robust. `MAGIC` is the empirically-verified on-disk order.
+    const MAGIC: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
+    const MAGIC_SWAPPED: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
     if !path.exists() {
         return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
     }
@@ -871,7 +874,7 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     if n == 0 {
         return Err(format!("--pgo-use: profile data file '{}' is empty", path.display()));
     }
-    if n < 8 || (head != MAGIC_LE && head != MAGIC_BE) {
+    if n < 8 || (head != MAGIC && head != MAGIC_SWAPPED) {
         return Err(format!(
             "--pgo-use: '{}' is not a valid LLVM indexed profile data file (bad magic); \
              merge your `.profraw` first: `llvm-profdata-22 merge -o out.profdata <raw>`",
@@ -881,40 +884,51 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Locate the clang profile runtime archive (`libclang_rt.profile-<arch>.a` on ELF,
-/// `libclang_rt.profile_osx.a` on Mach-O) that defines the `__llvm_profile_runtime` anchor and the
-/// atexit `.profraw` writer. Resolved via `clang-22 -print-file-name` (which echoes the bare name
-/// back when it cannot resolve it — treated as "not found"). The architecture is derived from the
-/// build target's triple. A hard error (naming the probe) when clang or the archive is missing —
-/// an instrumented link without it silently writes no profile.
+/// Locate the clang profile runtime archive that defines the `__llvm_profile_runtime` anchor and the
+/// atexit `.profraw` writer, resolved via `clang-22 -print-file-name` (which echoes the bare name
+/// back verbatim when it cannot resolve it — treated as "not found" per probe).
+///
+/// clang ships this archive under two different layouts, so BOTH are probed, in order:
+///   * the classic flat layout — `libclang_rt.profile-<arch>.a` (ELF) / `libclang_rt.profile_osx.a`
+///     (Mach-O), the Debian/Ubuntu default; then
+///   * the per-target-runtime layout (`LLVM_ENABLE_PER_TARGET_RUNTIME_DIR`, the Fedora/Arch default),
+///     `lib/clang/<ver>/lib/<triple>/libclang_rt.profile.a` — no `-<arch>` suffix, which
+///     `-print-file-name=libclang_rt.profile.a` resolves.
+///
+/// The architecture is derived from the build target's triple. A hard error (naming the probes) only
+/// when clang is absent or NONE of the candidates resolve — an instrumented link without the archive
+/// silently writes no profile.
 pub fn profile_runtime_archive(target: &BuildTarget) -> Result<std::path::PathBuf, String> {
     let rt = align_codegen_llvm::resolve_target_identity(target).map_err(|e| e.to_string())?;
     let arch = rt.triple.split('-').next().unwrap_or("x86_64");
     let format = target_object_format()?;
-    let archive_name = match format {
-        // Mach-O ships a single OS-named archive, not an arch-suffixed one.
-        ObjectFormat::MachO => "libclang_rt.profile_osx.a".to_string(),
-        ObjectFormat::Elf => format!("libclang_rt.profile-{arch}.a"),
+    // Flat-layout name first, per-target-runtime name (`libclang_rt.profile.a`) second.
+    let candidates: Vec<String> = match format {
+        ObjectFormat::MachO => vec!["libclang_rt.profile_osx.a".to_string(), "libclang_rt.profile.a".to_string()],
+        ObjectFormat::Elf => vec![format!("libclang_rt.profile-{arch}.a"), "libclang_rt.profile.a".to_string()],
     };
     let clang = llvm_tool("clang").ok_or_else(|| {
         "--pgo-instrument: clang (clang-22) not found on PATH — needed to locate the profile \
          runtime archive (libclang_rt.profile)"
             .to_string()
     })?;
-    let out = std::process::Command::new(&clang)
-        .arg(format!("-print-file-name={archive_name}"))
-        .output()
-        .map_err(|e| format!("--pgo-instrument: cannot launch {}: {e}", clang.display()))?;
-    let resolved = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    if resolved.is_absolute() && resolved.exists() {
-        Ok(resolved)
-    } else {
-        Err(format!(
-            "--pgo-instrument: profile runtime archive '{archive_name}' not found \
-             (clang '-print-file-name' returned '{}'); install the clang compiler-rt profile library",
-            resolved.display()
-        ))
+    for name in &candidates {
+        let out = std::process::Command::new(&clang)
+            .arg(format!("-print-file-name={name}"))
+            .output()
+            .map_err(|e| format!("--pgo-instrument: cannot launch {}: {e}", clang.display()))?;
+        let resolved = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        // A resolved absolute path that exists is a hit; the bare-name echo (relative, or the name
+        // itself) means this candidate is not present — try the next.
+        if resolved.is_absolute() && resolved.exists() {
+            return Ok(resolved);
+        }
     }
+    Err(format!(
+        "--pgo-instrument: profile runtime archive not found (tried {}); install the clang \
+         compiler-rt profile library",
+        candidates.join(", ")
+    ))
 }
 
 /// Codegen every unit under instrument-PGO, SERIALLY (the S1 discipline) and with the object cache

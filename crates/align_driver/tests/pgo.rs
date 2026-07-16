@@ -12,13 +12,17 @@
 //! sections `__llvm_prf_cnts` / `__llvm_prf_data`).
 //!
 //! Tool-gated: the instrument link needs clang's profile runtime archive; the round trip
-//! needs `llvm-profdata-22`. Tests skip (pass) when a required tool is absent, matching
-//! the repo's existing external-tool gates.
+//! needs `llvm-profdata`. All tools are resolved through the product's own version-matched
+//! resolver (`align_driver::llvm_tool` / `common::llvm_readobj`, honoring `LLVM_SYS_221_PREFIX`
+//! → `<tool>-22` → `<tool>`), never hardcoded names. Tests skip (pass) when a required tool is
+//! absent, matching the repo's existing external-tool gates.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use align_driver::{backend_available, profile_runtime_archive, target_object_format, BuildTarget, ObjectFormat};
+use align_driver::{backend_available, llvm_tool, profile_runtime_archive, BuildTarget};
 
 /// A branch-heavy corpus that prints a deterministic value (so run-parity is meaningful):
 /// the biased branch mix is exactly what PGO records and re-applies.
@@ -51,14 +55,10 @@ fn alignc() -> Command {
     c
 }
 
-fn have_tool(t: &str) -> bool {
-    Command::new(t)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// The version-matched `llvm-profdata`, if discoverable (the driver's own resolver) — the round-trip
+/// tests need it to `merge` a `.profraw`.
+fn llvm_profdata() -> Option<PathBuf> {
+    llvm_tool("llvm-profdata")
 }
 
 /// Whether the clang profile runtime archive is locatable — the instrument link needs it.
@@ -125,11 +125,12 @@ fn instrument_build_writes_profraw_and_prints_destination() {
     let s = Scratch::new("gen");
     let out = build(&s, &["--pgo-instrument"]);
     assert_eq!(out.status.code(), Some(0), "instrument build failed:\n{}", String::from_utf8_lossy(&out.stderr));
-    // Nothing-hidden: the profraw destination is surfaced on stdout.
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Nothing-hidden: the profraw destination is surfaced on STDERR (stdout must stay clean for `run`
+    // and `size`).
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("--pgo-instrument:") && stdout.contains("profile to"),
-        "instrument build did not print the profraw destination:\n{stdout}"
+        stderr.contains("--pgo-instrument:") && stderr.contains("profile to"),
+        "instrument build did not print the profraw destination to stderr:\n{stderr}"
     );
     assert!(s.exe().exists(), "instrument build produced no executable");
 
@@ -153,15 +154,12 @@ fn instrument_binary_has_profile_sections_plain_does_not() {
     if !backend_available() || !profile_rt_available() {
         return;
     }
-    // ELF-only: the section-name gate is format-specific.
-    if target_object_format().ok() != Some(ObjectFormat::Elf) {
+    // `llvm-readobj` (version-matched, both ELF and Mach-O) — the product's binary-inspection tool.
+    let Some(readobj) = common::llvm_readobj() else {
         return;
-    }
-    if !have_tool("readelf") {
-        return;
-    }
+    };
     let section_dump = |exe: &Path| -> String {
-        let out = Command::new("readelf").args(["-SW"]).arg(exe).output().expect("readelf");
+        let out = Command::new(&readobj).arg("--sections").arg(exe).output().expect("llvm-readobj");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
@@ -185,7 +183,8 @@ fn instrument_binary_has_profile_sections_plain_does_not() {
 // ---------------------------------------------------------------------------
 #[test]
 fn full_round_trip_gen_merge_use() {
-    if !backend_available() || !profile_rt_available() || !have_tool("llvm-profdata-22") {
+    let Some(profdata_tool) = llvm_profdata() else { return };
+    if !backend_available() || !profile_rt_available() {
         return;
     }
     let s = Scratch::new("rt");
@@ -196,7 +195,7 @@ fn full_round_trip_gen_merge_use() {
     assert!(std::fs::metadata(&profraw).map(|m| m.len() > 0).unwrap_or(false), "no profraw");
 
     let profdata = s.path().join("rt.profdata");
-    let merged = Command::new("llvm-profdata-22")
+    let merged = Command::new(&profdata_tool)
         .args(["merge", "-o"])
         .arg(&profdata)
         .arg(&profraw)
@@ -223,7 +222,8 @@ fn full_round_trip_gen_merge_use() {
 // ---------------------------------------------------------------------------
 #[test]
 fn run_parity_off_instrument_use() {
-    if !backend_available() || !profile_rt_available() || !have_tool("llvm-profdata-22") {
+    let Some(profdata_tool) = llvm_profdata() else { return };
+    if !backend_available() || !profile_rt_available() {
         return;
     }
     // off
@@ -239,7 +239,7 @@ fn run_parity_off_instrument_use() {
 
     let profdata = instr.path().join("p.profdata");
     assert!(
-        Command::new("llvm-profdata-22").args(["merge", "-o"]).arg(&profdata).arg(&profraw).status().expect("merge").success(),
+        Command::new(&profdata_tool).args(["merge", "-o"]).arg(&profdata).arg(&profraw).status().expect("merge").success(),
         "merge failed"
     );
 
@@ -265,6 +265,20 @@ fn rejection_matrix() {
     let o = alignc().args(["--pgo-instrument", "--pgo-use", "x.profdata", "build", src]).output().unwrap();
     assert_ne!(o.status.code(), Some(0), "both PGO flags must be rejected");
     assert!(String::from_utf8_lossy(&o.stderr).contains("mutually exclusive"));
+
+    // Flag-swallowing (both demonstrated orders): the space-form `--pgo-use` must NOT consume a
+    // following flag/verb as its value. `--pgo-use --pgo-instrument` must not bypass mutual exclusion
+    // with a misleading "file '--pgo-instrument' does not exist"; `--pgo-use --thin-lto build` must
+    // not consume the verb. Both are "requires a value" (the likely-flag guard).
+    let o = alignc().args(["--pgo-use", "--pgo-instrument", "--profile", "release", "build", src]).output().unwrap();
+    assert_ne!(o.status.code(), Some(0), "--pgo-use --pgo-instrument must be rejected");
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("--pgo-use requires a value"), "must not swallow the following flag:\n{e}");
+    assert!(!e.contains("does not exist"), "must not treat the following flag as a profile path:\n{e}");
+
+    let o = alignc().args(["--pgo-use", "--thin-lto", "build", src]).output().unwrap();
+    assert_ne!(o.status.code(), Some(0), "--pgo-use --thin-lto build must be rejected");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--pgo-use requires a value"), "must not consume the verb");
 
     // --pgo-instrument on a wrong verb.
     let o = alignc().args(["--pgo-instrument", "check", src]).output().unwrap();
