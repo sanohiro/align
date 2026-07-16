@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (seventh update this day), **SINGLE STR-KEY GROUPS AND DICTIONARY ENCODING
+_Last updated: 2026-07-16 (eighth update this day), **`path.normalize` FILLS ONE FINAL BUFFER.** The
+runtime allocates the owned result once at the proven `max(input_len, 1)` bound and uses its
+initialized prefix as the component stack; ordinary components append directly and `..` rewinds to
+the preceding separator. The component Vec, output Vec, and final full-output copy are gone while
+relative leading `..`, absolute root clamping, repeated separators, UTF-8 bytes, and the owned-string
+ABI are unchanged. A staged-oracle differential gate covers 1,000 generated paths plus 1,024-level
+normal/`..` stress. The checked-in allocation-inclusive median-of-nine probe measured 2.30x on an
+already-normal 16-byte path, 1.86x on a mixed 10-byte path, and 1.43x on 256 normal components. The
+explicit negative shape (256 appends then 192 pops) is recorded at 0.77x because direct fill writes
+components that a staging stack later discards; the required already-normal short gate still clears
+decisively. Gemini's `rposition` cleanup suggestion was measured and rejected: it regressed all four
+probe shapes by roughly 5-7% versus the explicit initialized-prefix loop. The complete workspace is green (**2185 total = 2181 passed + four ignored manual
+probes**) and workspace clippy passes with warnings denied. This work is in PR **#480**, based on
+squash-merged PR #479 (`b8b9173`). **Next recommended P2:** remove per-entry payload staging from
+`fs.read_dir` and DNS results with explicit unwind cleanup, while retaining generic deep-drop
+ownership. The aarch64 UTF-8 portability measurement remains deferred. Previous update: 2026-07-16
+(seventh update this day), **SINGLE STR-KEY GROUPS AND DICTIONARY ENCODING
 WRITE THEIR FINAL OUTPUTS DIRECTLY.** Vacant string groups now seed the caller's existing
 `out_keys[id]` / `out_vals[id]` slots and occupied entries update `out_vals[id]` in place, removing
 the representative and accumulator Vecs plus both final copies from the shared AoS/SoA core.
@@ -23,8 +39,8 @@ checked-in benchmark (its exported `Row` now follows current interface visibilit
 within 3% at 100/10K groups; at 632,390 distinct keys, four single groups improved 690.0→630.4 ms
 (1.09x) and dictionary reuse 200.9→194.7 ms (1.03x), recorded as directional consecutive-run
 evidence rather than balanced AB/BA. The complete workspace is green (**2183 total = 2180 passed +
-three ignored manual probes**) and workspace clippy passes with warnings denied. This work is in PR
-**#479**, based on squash-merged PR #478 (`e03666e`). **Next recommended P2:** direct-fill staged
+three ignored manual probes**) and workspace clippy passes with warnings denied. This work was
+squash-merged as PR **#479** (`b8b9173`), based on squash-merged PR #478 (`e03666e`). **Next recommended P2:** direct-fill staged
 `path.normalize`, `read_dir`, and DNS result payloads, beginning with the smallest independently
 measurable final-copy removal. The aarch64 UTF-8 portability measurement remains deferred. Previous
 update: 2026-07-16 (sixth update this day), **DIRECT `chunks` LENGTH AND INDEX CONSUMERS ARE
