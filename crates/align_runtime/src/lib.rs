@@ -4018,8 +4018,8 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
 // (aarch64) / scalar paths. The scalar path is `std::str::from_utf8` — the correctness reference and
 // the oracle the SIMD paths are differentially tested against (same discipline as the decode index).
 
-/// Scalar reference validator (and the SIMD oracle): `bytes` is well-formed UTF-8. On aarch64 the
-/// NEON path is baseline (always taken), so this is only the dispatch fallback / test oracle there.
+/// Scalar reference validator (and the SIMD oracle): `bytes` is well-formed UTF-8. This is also the
+/// production aarch64 path after the native Apple-M1 NEON crossover failed its named controls.
 #[inline]
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_utf8_scalar(bytes: &[u8]) -> bool {
@@ -4169,6 +4169,7 @@ unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
 /// ARMv8-A baseline (no runtime detection). `vqtbl1q_u8` does the 16-entry table lookup directly (no
 /// lane duplication). Same carry / tail / incompleteness logic; bytewise-equal to the scalar oracle.
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
     use core::arch::aarch64::*;
@@ -4233,7 +4234,8 @@ unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
 }
 
 /// Validate that `bytes` is well-formed UTF-8 (draft §7/§12). Runtime-dispatched: AVX2 on x86_64 when
-/// present, baseline NEON on aarch64, else the scalar reference — every path returns the same answer.
+/// present and above its measured crossover; scalar on aarch64 and other targets. The retained NEON
+/// candidate remains byte-identical but did not pass the native Apple-M1 no-regression gate.
 fn validate_utf8(bytes: &[u8]) -> bool {
     // Empty input is valid without feature detection or SIMD table setup on every target.
     if bytes.is_empty() {
@@ -4260,7 +4262,11 @@ fn validate_utf8(bytes: &[u8]) -> bool {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { validate_utf8_neon(bytes) }
+        // Native Apple-M1 measurement (2026-07-16) found no length-only crossover that satisfies
+        // the no-regression gate: NEON wins decisively on multibyte input but loses on large ASCII,
+        // late-invalid, and early-invalid input. Keep the measured candidate test-only until a
+        // materially different content-adaptive design clears all named controls.
+        validate_utf8_scalar(bytes)
     }
     #[cfg(not(target_arch = "aarch64"))]
     validate_utf8_scalar(bytes)
@@ -5905,7 +5911,6 @@ unsafe fn base64_encode_into_avx2(
 /// triples, bit operations form four 6-bit streams, and `vst4q` writes 64 ordered output bytes.
 /// Full-block loads/stores stay inside the exact input/output ranges; the scalar oracle owns tails.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn base64_encode_into_neon(
     data: &[u8],
@@ -5948,8 +5953,8 @@ unsafe fn base64_encode_into_neon(
     base64_encode_into_scalar(&data[i..], alphabet, pad, &mut out[o..]);
 }
 
-/// Encode directly into the exact destination. Measured large x86-64 inputs use AVX2; short inputs,
-/// unsupported CPUs/targets, and aarch64 pending its native crossover gate stay on the scalar oracle.
+/// Encode directly into the exact destination. Measured large inputs use AVX2 on x86-64 and
+/// baseline NEON on aarch64; short inputs and unsupported CPUs/targets stay on the scalar oracle.
 #[inline]
 fn base64_encode_into(
     data: &[u8],
@@ -5962,6 +5967,15 @@ fn base64_encode_into(
     {
         if data.len() >= 32 && is_x86_feature_detected!("avx2") {
             unsafe { base64_encode_into_avx2(data, alphabet, pad, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Native Apple-M1 probes measured the first complete 48-byte NEON block as the independent
+        // no-regression crossover for both the standard/padded and URL-safe/unpadded alphabets.
+        if data.len() >= 48 {
+            unsafe { base64_encode_into_neon(data, alphabet, pad, out) };
             return;
         }
     }
@@ -6010,7 +6024,6 @@ unsafe fn hex_encode_into_avx2(data: &[u8], out: &mut [core::mem::MaybeUninit<u8
 /// Baseline-NEON hex encoder: table lookups map 16 high/low-nibble streams and `vzip1`/`vzip2`
 /// interleave them into 32 lower-case output bytes. The scalar oracle owns the final 0..15 bytes.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn hex_encode_into_neon(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     use core::arch::aarch64::*;
@@ -6034,8 +6047,8 @@ unsafe fn hex_encode_into_neon(data: &[u8], out: &mut [core::mem::MaybeUninit<u8
     hex_encode_into_scalar(&data[i..], &mut out[o..]);
 }
 
-/// Encode directly into the exact destination. Measured x86-64 inputs of at least 32 bytes use
-/// AVX2; short inputs, unsupported CPUs/targets, and aarch64 pending its native gate stay scalar.
+/// Encode directly into the exact destination. Measured inputs use AVX2 from 32 bytes on x86-64 and
+/// baseline NEON from 16 bytes on aarch64; short inputs and unsupported CPUs/targets stay scalar.
 #[inline]
 fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     assert_eq!(data.len().checked_mul(2), Some(out.len()), "hex destination length mismatch");
@@ -6043,6 +6056,15 @@ fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     {
         if data.len() >= 32 && is_x86_feature_detected!("avx2") {
             unsafe { hex_encode_into_avx2(data, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Native Apple-M1 probes measured the first complete 16-byte NEON block as hex's independent
+        // no-regression crossover.
+        if data.len() >= 16 {
+            unsafe { hex_encode_into_neon(data, out) };
             return;
         }
     }
@@ -13600,14 +13622,7 @@ mod tests {
         fn fill(data: &[u8], url: bool, simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
             let alphabet = if url { &BASE64_URL } else { &BASE64_STD };
             if simd {
-                #[cfg(target_arch = "x86_64")]
                 base64_encode_into(data, alphabet, !url, out);
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    base64_encode_into_neon(data, alphabet, !url, out);
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                base64_encode_into_scalar(data, alphabet, !url, out);
             } else {
                 base64_encode_into_scalar(data, alphabet, !url, out);
             }
@@ -13719,15 +13734,17 @@ mod tests {
                 let scalar_alloc = median(scalar_alloc);
                 let simd_alloc = median(simd_alloc);
                 let gbps = if n == 0 { 0.0 } else { n as f64 / simd_core };
+                let core_ratio = scalar_core / simd_core;
+                let alloc_ratio = if n == 0 { 1.0 } else { scalar_alloc / simd_alloc };
                 if (1..=64).contains(&n) {
-                    short_core_log_sum += (scalar_core / simd_core).ln();
-                    short_alloc_log_sum += (scalar_alloc / simd_alloc).ln();
+                    short_core_log_sum += core_ratio.ln();
+                    short_alloc_log_sum += alloc_ratio.ln();
                     short_count += 1;
                 }
                 println!(
                     "{name:>9} | {n:>8} | {scalar_core:>11.2} | {simd_core:>11.2} | {:>6.2}x | {scalar_alloc:>12.2} | {simd_alloc:>11.2} | {:>6.2}x | {gbps:>9.2}",
-                    scalar_core / simd_core,
-                    scalar_alloc / simd_alloc,
+                    core_ratio,
+                    alloc_ratio,
                 );
             }
             println!(
@@ -13776,8 +13793,8 @@ mod tests {
         assert_eq!(encode_backend(data), hex_enc(data), "SIMD page-boundary mismatch");
     }
 
-    /// Manual scalar/SIMD adoption probe for hex's retained exact destination. X86 uses the shipped
-    /// dispatch; aarch64 calls its candidate directly so the unmeasured target is not activated.
+    /// Manual scalar/SIMD adoption probe for hex's retained exact destination. The candidate uses
+    /// each architecture's shipped dispatcher, including its independently measured crossover.
     /// Run with:
     ///
     /// `cargo test -p align_runtime --release hex_simd_probe -- --ignored --nocapture
@@ -13790,14 +13807,7 @@ mod tests {
         #[inline(never)]
         fn fill(data: &[u8], simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
             if simd {
-                #[cfg(target_arch = "x86_64")]
                 hex_encode_into(data, out);
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    hex_encode_into_neon(data, out);
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                hex_encode_into_scalar(data, out);
             } else {
                 hex_encode_into_scalar(data, out);
             }
@@ -17983,6 +17993,9 @@ mod tests {
         }
         println!("short UTF-8 crossover (median of 7, ns/call; ratio SIMD/scalar):");
         println!(" len | case       | scalar |   SIMD | shipped | ratio");
+        let mut short_candidate_speedups = Vec::new();
+        let mut short_candidate_non_early_speedups = Vec::new();
+        let mut short_dispatch_speedups = Vec::new();
         for len in [0usize, 1, 4, 8, 12, 16, 24, 31, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 4096] {
             let ascii = vec![b'a'; len];
             let multibyte = valid_multibyte(len);
@@ -18005,7 +18018,62 @@ mod tests {
                     "{len:4} | {name:10} | {scalar_ns:6.2} | {simd_ns:6.2} | {dispatch_ns:7.2} | {:5.2}x",
                     simd_ns / scalar_ns
                 );
+                if (1..=64).contains(&len) {
+                    short_candidate_speedups.push(scalar_ns / simd_ns);
+                    short_dispatch_speedups.push(scalar_ns / dispatch_ns);
+                    if name != "bad-first" {
+                        short_candidate_non_early_speedups.push(scalar_ns / simd_ns);
+                    }
+                }
             }
+        }
+        let geometric_mean = |values: &[f64]| {
+            (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
+        };
+        println!(
+            "1..=64 selected-point candidate speedup versus scalar geometric mean (allocation-free): all {:.2}x | excluding early-invalid {:.2}x | shipped {:.2}x",
+            geometric_mean(&short_candidate_speedups),
+            geometric_mean(&short_candidate_non_early_speedups),
+            geometric_mean(&short_dispatch_speedups)
+        );
+
+        // The codec probes report 1 MiB separately, so retain the same scale point here without
+        // forcing the short-latency helper's 20K-iteration floor over a large buffer.
+        let compare_bulk = |bytes: &[u8]| {
+            let iters = ((64 * 1024 * 1024) / bytes.len().max(1)).clamp(16, 1024);
+            let mut scalar_samples = Vec::with_capacity(7);
+            let mut simd_samples = Vec::with_capacity(7);
+            for trial in 0..7 {
+                if trial % 2 == 0 {
+                    scalar_samples.push(ns_per_call(scalar, bytes, iters));
+                    simd_samples.push(ns_per_call(simd, bytes, iters));
+                } else {
+                    simd_samples.push(ns_per_call(simd, bytes, iters));
+                    scalar_samples.push(ns_per_call(scalar, bytes, iters));
+                }
+            }
+            (median(scalar_samples), median(simd_samples))
+        };
+        println!("1 MiB UTF-8 core crossover (median of 7; candidate speedup versus scalar):");
+        let ascii_1m = vec![b'a'; 1024 * 1024];
+        let multibyte_1m = valid_multibyte(1024 * 1024);
+        let mut invalid_first_1m = ascii_1m.clone();
+        let mut invalid_last_1m = ascii_1m.clone();
+        invalid_first_1m[0] = 0xff;
+        let invalid_last_index = invalid_last_1m.len() - 1;
+        invalid_last_1m[invalid_last_index] = 0xff;
+        for (name, bytes) in [
+            ("ascii", ascii_1m.as_slice()),
+            ("multibyte", multibyte_1m.as_slice()),
+            ("bad-first", invalid_first_1m.as_slice()),
+            ("bad-last", invalid_last_1m.as_slice()),
+        ] {
+            let (scalar_ns, simd_ns) = compare_bulk(bytes);
+            let candidate_gib = bytes.len() as f64 / (1024.0 * 1024.0 * 1024.0) / (simd_ns * 1e-9);
+            println!(
+                "  {name:10}: scalar {scalar_ns:9.1} ns | candidate {simd_ns:9.1} ns | {:6.2}x | {candidate_gib:5.1} GiB/s",
+                scalar_ns / simd_ns
+            );
         }
 
         // ~64 MiB of realistic mostly-ASCII JSON text with some multibyte content.
@@ -18028,7 +18096,8 @@ mod tests {
             }
             mb / 1024.0 / best // GB/s
         };
-        let simd = time(Box::new(|| validate_utf8(bytes)));
+        let candidate = time(Box::new(|| simd(bytes)));
+        let shipped = time(Box::new(|| validate_utf8(bytes)));
         let scalar = time(Box::new(|| validate_utf8_scalar(bytes)));
         let memcpy = {
             let mut dst = vec![0u8; bytes.len()];
@@ -18043,9 +18112,9 @@ mod tests {
         };
         assert!(validate_utf8(bytes), "the probe buffer is valid UTF-8");
         println!(
-            "utf8 validate over {:.0} MiB: SIMD {simd:.1} GB/s | scalar {scalar:.1} GB/s | memcpy {memcpy:.1} GB/s | SIMD/memcpy {:.0}%",
+            "utf8 validate over {:.0} MiB: candidate {candidate:.1} GB/s | scalar {scalar:.1} GB/s | shipped {shipped:.1} GB/s | memcpy {memcpy:.1} GB/s | candidate/memcpy {:.0}%",
             mb,
-            simd / memcpy * 100.0
+            candidate / memcpy * 100.0
         );
     }
 

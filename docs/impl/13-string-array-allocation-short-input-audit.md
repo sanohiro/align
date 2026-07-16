@@ -55,14 +55,14 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | unbound owned temporaries | synthetic path-local owner; scalar early-drop, view retention | **FIXED 2026-07-15**; control flow and loops pinned |
 | moved slots | MIR prunes cleanup edges whose drop flag is definitely false | **FIXED 2026-07-15**; no known-null destructor call |
 | filesystem/path ABI views | Rust consumers borrow; C consumers construct `CString` directly | **SHIPPED 2026-07-16**; redundant allocation/copy removed |
-| UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
+| UTF-8 validation | x86 uses AVX2 from 32 bytes; native Apple-M1 NEON has no no-regression length crossover | **MEASURED / CLOSED**; aarch64 production remains scalar |
 | `builder.to_string()` | allocator-compatible grow buffer transfers into owned result | **SHIPPED 2026-07-16**; no final allocation/copy |
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
 | `chunks(n)` | direct `.len()` / `[i]` are virtual; stored and pipeline values materialize | **SHIPPED 2026-07-16** for direct consumers |
 | str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
-| Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
+| Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 bytes | **SHIPPED** in document 12 |
 | sorting | stable O(n log n); adaptive total-order path (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy from pass 2, `width>=64`) | **SHIPPED 2026-07-16** (document 12 §4.1, `w64` shape); ordered-input wins, plain-sort negatives within ≈ 2% (drift-immune control-corrected); one keyed low-cardinality-100k workload at ≈ 3.5% accepted as a bounded measured exception (document 12 §4.1); insertion base case kept |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
@@ -285,7 +285,7 @@ caller's exact pointer, and pins UTF-8/interior-NUL rejection plus direct C-stri
 runtime file, DNS, TCP, UDP, and process controls remain green, so syscall or DNS latency is outside
 the structural no-copy proof.
 
-### 6.2 PARTIAL 2026-07-16 — x86-64 short scalar crossover shipped; aarch64 needs a native run
+### 6.2 MEASURED 2026-07-16 — x86-64 crossover shipped; Apple-M1 NEON rejected
 
 At the audit baseline, `validate_utf8` entered AVX2 whenever available and NEON unconditionally on
 aarch64. A tail shorter than the vector width was copied into a zeroed 32/16-byte stack block after
@@ -309,7 +309,29 @@ The shipped x86-64 dispatch therefore returns empty immediately, uses scalar bel
 keeps AVX2 from 32 onward. A narrow 33–63-byte all-ASCII proof avoids the otherwise-visible padded
 tail setup without imposing a second scan on long invalid/multibyte inputs; AVX2 and NEON tails now
 share their full-block ASCII fast path. This changes no language surface. Do **not** infer an aarch64
-threshold from the 32-byte AVX2 result: run the same checked-in probe on native NEON hardware first.
+threshold from the 32-byte AVX2 result.
+
+**Measured aarch64 (2026-07-16, native Apple M1, macOS 26.3.1, rustc 1.96.1 / LLVM 22.1.8):**
+the checked-in balanced median-of-seven probe ran repeatedly with one test thread. NEON lost on
+valid four-byte inputs but won from eight bytes for the short ASCII, multibyte, and late-invalid
+cases. Across two 1..=64 selected-point runs, candidate speedup versus scalar geometric mean was
+1.26-1.27x over all four distributions and 1.67-1.68x when the early-invalid failure-only
+distribution was excluded. That short result did not survive the required large negative controls:
+
+| 1 MiB case | NEON speedup versus scalar | NEON throughput |
+|---|---:|---:|
+| ASCII | 0.83x | 23.9 GiB/s |
+| multibyte | 6.40x | 9.5 GiB/s |
+| invalid first byte | effectively 0x | 23.8 GiB/s |
+| invalid last byte | 0.83x | 23.9 GiB/s |
+
+At 1 KiB, the corresponding speedups were approximately 0.96x, 6.4x, 0.08x, and 1.05x. The 64 MiB
+realistic mixed-text candidate reached 15.1 GB/s versus 3.1 GB/s scalar, but a length-only threshold
+cannot retain that gain without the repeatable ASCII, late-invalid, and early-invalid regressions.
+The aarch64 production dispatcher therefore uses `std::str::from_utf8`; the baseline-NEON backend,
+scalar oracle, full-block/tail logic, and differential suite remain for a materially different
+content-adaptive candidate. This native portability item is closed as a negative result rather than
+shipping a benchmark-specific threshold.
 
 ### 6.3 SHIPPED 2026-07-16 — owned builder freeze transfers allocator-compatible storage
 
@@ -713,8 +735,9 @@ AoS/SoA conversion, or a second substring-search algorithm.
    2026-07-14.** `str_eq` cleared the gate, `str_cmp` regressed and remains excluded, while
    `hash64` benefited from native tuning rather than LTO visibility; M14 Slice 2 shipped the guarded
    memcmp-class set behind `--rt-lto`.
-4. Establish the UTF-8 scalar/SIMD crossover per target. **x86-64 DONE 2026-07-16 (scalar below
-   32); aarch64 native measurement remains open.**
+4. Establish the UTF-8 scalar/SIMD crossover per target. **DONE 2026-07-16:** x86-64 uses scalar
+   below 32; native Apple-M1 NEON had no no-regression length-only crossover, so aarch64 production
+   remains scalar and the negative result is closed.
 5. ~~Prototype nonescaping builder/array-builder headers separately from payload changes.~~ **DONE
    2026-07-16.** Proven local and compiler-internal template headers use aligned entry storage;
    escaping/call-crossing values remain boxed. Payload changes remain a separate P2 item.
@@ -729,7 +752,9 @@ AoS/SoA conversion, or a second substring-search algorithm.
 5. ~~Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.~~ **DONE
    2026-07-16.** Base64/Base64url/hex now fill one checked exact final allocation; the balanced probe
    improved every short case and 64 MiB by 1.70-1.86x. An `array<i64>` count-then-direct JSON probe
-   regressed 1K-1M elements to 0.71-0.73x, so the one-pass parser Vec remains.
+   regressed 1K-1M elements to 0.71-0.73x, so the one-pass parser Vec remains. Native Apple-M1
+   Base64/Base64url subsequently cleared their independent 48-byte NEON crossover, and native ARM
+   hex separately cleared its 16-byte NEON crossover.
 
 ### P3 — larger portfolios after measurement
 
