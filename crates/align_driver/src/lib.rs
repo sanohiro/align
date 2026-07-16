@@ -764,18 +764,31 @@ pub fn codegen_units_parallel(
 ) -> Result<UnitCodegen, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
-    // The PGO cache-key component: the settled `PgoMode { Off | Instrument | Use(Hash128) }`. The `Use`
-    // digest is the content hash of the merged `.profdata` BYTES — computed ONCE here (path-independent,
-    // so the same profile via a different path hits, and an edit misses with `FirstDiff::PgoProfile`).
-    // The caller has already `validate_profdata`'d the path; a read error here is still a hard error.
-    let pgo_key = match pgo {
-        PgoMode::Off => cache::PgoKey::Off,
-        PgoMode::Instrument => cache::PgoKey::Instrument,
+    // The PGO cache-key component (the settled `PgoKey { Off | Instrument | Use(Hash128) }`) AND the
+    // key↔content coupling. The `Use` digest is the content hash of the merged `.profdata` BYTES, read
+    // ONCE here. CRITICAL: those exact bytes are then SNAPSHOTTED to a private per-invocation staged copy
+    // (`StagedProfdata`), and it is the STAGED path — never the user's — that every `emit_object_pgo`
+    // hands to libLLVM. Otherwise a profile-iteration loop that rewrites the file mid-build (bytes B1 →
+    // B2 after keying, before a cache-MISS unit's emit re-reads the live path) would PUBLISH B2-optimized
+    // objects under the B1 key, poisoning the cache for a later genuine-B1 build and breaking
+    // hit⟹byte-identical within the racing build. The snapshot makes libLLVM provably read the digested
+    // bytes. `effective_pgo` therefore points at the staged copy for `Use`; the guard outlives the
+    // parallel scope and RAII-cleans the temp file. (Source→MIR and rt-lto baking are the precedents;
+    // profdata was the last live-path pipeline input.) The caller has already `validate_profdata`'d the
+    // user path; a read/stage error here is still a hard error.
+    let mut staged_profdata: Option<StagedProfdata> = None;
+    let (pgo_key, effective_pgo): (cache::PgoKey, PgoMode) = match pgo {
+        PgoMode::Off => (cache::PgoKey::Off, PgoMode::Off),
+        PgoMode::Instrument => (cache::PgoKey::Instrument, PgoMode::Instrument),
         PgoMode::Use(p) => {
             let bytes = std::fs::read(p).map_err(|e| {
                 format!("--pgo-use: cannot read profile data file '{}': {e}", p.display())
             })?;
-            cache::PgoKey::Use(Hash128::of(&bytes))
+            let digest = Hash128::of(&bytes);
+            let staged = StagedProfdata::new(&bytes)?;
+            let staged_path = staged.path().to_path_buf();
+            staged_profdata = Some(staged);
+            (cache::PgoKey::Use(digest), PgoMode::Use(staged_path))
         }
     };
     let n = units.len();
@@ -839,7 +852,7 @@ pub fn codegen_units_parallel(
                     // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
                     // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-rejected
                     // profile into an `Err` here (hard fail); its staleness warnings ride the return.
-                    match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, pgo) {
+                    match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
                         Err(e) => {
                             errors.lock().expect("codegen error lock").push((i, e));
                             failed.store(true, Ordering::Relaxed);
@@ -875,6 +888,10 @@ pub fn codegen_units_parallel(
         }
     }
 
+    // Explicit RAII drop of the profdata snapshot AFTER every emit has read it (the `thread::scope`
+    // above has joined). Also marks the guard read, so the assignment is not dead.
+    drop(staged_profdata);
+
     Ok(UnitCodegen {
         outcomes: outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect(),
         pgo_warnings,
@@ -909,7 +926,57 @@ fn emit_unit_object(
     Ok(report.warnings)
 }
 
-// ---- instrument-PGO (`--pgo-instrument` / `--pgo-use`, S1) ----------------
+// ---- instrument-PGO surface (`--pgo-instrument` / `--pgo-use`) ----------------
+// The driver-facing `PgoMode`, profdata validation + snapshotting, and profile-runtime resolution
+// consumed by the S2 cached per-unit path (`codegen_units_parallel` above) and the instrumented link.
+
+/// A private, per-invocation snapshot of the user's merged `.profdata`. The bytes read to compute the
+/// `PgoKey::Use` digest are written here, and it is THIS path (never the user's live file) that
+/// `emit_object_pgo` hands to libLLVM — so libLLVM provably reads the exact bytes that were digested
+/// into the cache key, even if the user rewrites the original mid-build (a profile-iteration loop).
+/// RAII: the staged file + its dir are removed on drop, after every emit has read it.
+struct StagedProfdata {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+impl StagedProfdata {
+    /// Write `bytes` to a fresh private temp file (unique dir: pid + monotonic nonce + wall stamp).
+    fn new(bytes: &[u8]) -> Result<StagedProfdata, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir();
+        for _ in 0..1024 {
+            let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = base.join(format!(".align-pgo-profdata-{}-{stamp}-{nonce}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    let file = dir.join("staged.profdata");
+                    std::fs::write(&file, bytes)
+                        .map_err(|e| format!("--pgo-use: cannot stage profile data snapshot: {e}"))?;
+                    return Ok(StagedProfdata { dir, file });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("--pgo-use: cannot create profile snapshot dir: {e}")),
+            }
+        }
+        Err("--pgo-use: could not create a unique profile snapshot directory".to_string())
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.file
+    }
+}
+
+impl Drop for StagedProfdata {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 /// The instrument-PGO build mode selected on the command line. `Off` is the byte-identical
 /// default; `Instrument` builds a `-fprofile-generate`-equivalent binary; `Use` rebuilds
@@ -1748,6 +1815,40 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- fix #1 mechanism gate: the profdata snapshot ----------------------------------------------
+    // The cache-poisoning fix routes libLLVM to a private snapshot, not the user's live path. These
+    // assert the plumbing directly (an integration test cannot time a mid-build file rewrite):
+    //   * the staged path is NOT the user path (so a later user rewrite can't reach the emit), and
+    //   * the staged bytes are IDENTICAL to what was digested (key↔content coupling), and
+    //   * the snapshot is RAII-cleaned on drop.
+    #[test]
+    fn staged_profdata_is_a_distinct_copy_of_the_exact_bytes_and_self_cleans() {
+        let bytes = b"MERGED-PROFDATA-BYTES-v1".to_vec();
+        let user_path = std::env::temp_dir().join(format!("align-pgo-user-{}.profdata", std::process::id()));
+        std::fs::write(&user_path, &bytes).unwrap();
+
+        let staged_file;
+        {
+            let staged = StagedProfdata::new(&bytes).expect("stage");
+            // Distinct from the user path — a rewrite of `user_path` can never reach libLLVM.
+            assert_ne!(staged.path(), user_path.as_path(), "staged copy must not be the user path");
+            // Byte-identical to the digested input — the exact bytes `PgoKey::Use(digest)` keys.
+            assert_eq!(std::fs::read(staged.path()).unwrap(), bytes, "staged bytes must equal the digested bytes");
+            assert_eq!(Hash128::of(&std::fs::read(staged.path()).unwrap()), Hash128::of(&bytes));
+            staged_file = staged.path().to_path_buf();
+            assert!(staged_file.exists());
+        }
+        // RAII: dropped snapshot leaves nothing behind.
+        assert!(!staged_file.exists(), "the staged snapshot is removed on drop");
+
+        // Two snapshots of the same bytes get distinct private paths (per-invocation uniqueness).
+        let a = StagedProfdata::new(&bytes).expect("stage a");
+        let b = StagedProfdata::new(&bytes).expect("stage b");
+        assert_ne!(a.path(), b.path(), "each invocation stages to a unique path");
+
+        let _ = std::fs::remove_file(&user_path);
+    }
 
     #[test]
     fn runtime_src_digest_is_content_based_and_mtime_independent() {

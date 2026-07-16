@@ -287,9 +287,12 @@ resolve it differently.
 > address a non-ThinLTO action), so the reserved digest field was removed outright at S2 (no dead
 > field). See `docs/impl/07-roadmap.md` "ThinLTO S2 SHIPPED".
 
-> **Instrument-PGO S2 supersession (2026-07-17):** the codegen key gains a `pgo_mode` component —
-> `PgoMode { Off | Instrument | Use(Hash128) }`, where `Use` carries the content digest of the merged
-> `.profdata` BYTES (path-independent; computed once per invocation after the profile is validated).
+> **Instrument-PGO S2 supersession (2026-07-17):** the codegen key gains a `pgo_mode` component of type
+> `PgoKey { Off | Instrument | Use(Hash128) }` (the cache-side key type; the path-carrying CLI enum
+> `PgoMode` is a distinct thing — `PgoKey` records the profile's content DIGEST, not its path), where
+> `Use` carries the content digest of the merged `.profdata` BYTES (path-independent; computed once per
+> invocation after the profile is validated, and those exact bytes are snapshotted so libLLVM optimizes
+> with the digested profile — see doc note on `PgoKey::Use`).
 > Unlike ThinLTO (two disjoint phase *namespaces*), PGO follows the `rt_lto`/`rt_lto_digest`
 > precedent: **a component of the SAME codegen key**, not a separate CAS namespace — an instrumented /
 > profile-use object is the same artifact KIND as an ordinary object (`.o` for the identical unit),

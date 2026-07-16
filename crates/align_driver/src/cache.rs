@@ -93,7 +93,12 @@ pub enum PgoKey {
     /// `--pgo-instrument`: a `-fprofile-generate`-equivalent object (counters + `__llvm_prf` metadata).
     Instrument,
     /// `--pgo-use <file.profdata>`: a `-fprofile-use` object. The `Hash128` is the content digest of the
-    /// merged `.profdata` bytes, computed ONCE per invocation after the profile is validated.
+    /// merged `.profdata` bytes, computed ONCE per invocation after the profile is validated. Those exact
+    /// bytes are then snapshotted to a private staged copy that libLLVM reads (see
+    /// `align_driver::StagedProfdata`): the digest here and the profile the object is optimized with come
+    /// from the SAME bytes, so a `Use` HIT is provably valid for the digested profile even if the user
+    /// rewrites the original file mid-build. Without the snapshot, a mid-build rewrite would publish
+    /// differently-optimized objects under this key — cache poisoning.
     Use(Hash128),
 }
 

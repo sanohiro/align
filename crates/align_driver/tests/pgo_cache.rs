@@ -21,22 +21,14 @@ use common::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// `common::*` already re-exports BuildTarget / CacheContext / FirstDiff / Hash128 / Profile /
-// SourceMap / backend_available / build_per_unit / Proj / thin_nonce; import only what it does not.
-use align_driver::{
-    codegen_units_parallel, llvm_tool, profile_runtime_archive, CacheLookup, CodegenKey, PgoKey,
-    PgoMode,
-};
+// `common::*` re-exports BuildTarget / CacheContext / FirstDiff / Hash128 / Profile / SourceMap /
+// backend_available / build_per_unit / Proj / thin_nonce, plus the shared PGO helpers (hh / BRANCHY /
+// profile_rt_available / make_profdata); import only the driver API it does not.
+use align_driver::{codegen_units_parallel, CacheLookup, CodegenKey, PgoKey, PgoMode};
 
 // =================================================================================================
 // KEY / CAS-composition layer (synthetic producer — always run, no backend)
 // =================================================================================================
-
-/// A deterministic pseudo-`Hash128` from a seed (mirrors `thin_lto_sv`'s `hh`) — used for the fixed
-/// key fields and the stand-in profdata digests, so nothing here depends on LLVM or a real profile.
-fn hh(seed: u64) -> Hash128 {
-    Hash128 { lo: seed, hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
-}
 
 /// A fully-specified [`CodegenKey`] with fixed values (no target resolution / no backend), so a test
 /// can clone it and vary ONLY `pgo_mode` (or `rt_lto*`) to probe one component's effect on the digest.
@@ -264,35 +256,6 @@ fn rt_lto_and_pgo_use_compose_into_a_distinct_key() {
 // End-to-end layer (real emit / subprocess — backend / tool gated)
 // =================================================================================================
 
-/// Whether the clang profile runtime archive is locatable — the instrument LINK needs it (codegen
-/// alone does not).
-fn profile_rt_available() -> bool {
-    profile_runtime_archive(&BuildTarget::Baseline).is_ok()
-}
-
-/// A branch-heavy single-unit program (its biased branch mix is what PGO records) that prints a
-/// deterministic value, so a cache-served rebuild is verifiable.
-const BRANCHY: &str = "\
-fn classify(n: i64) -> i64 {\n\
-  if n % 2 == 0 {\n\
-    if n % 5 == 0 { return 30 }\n\
-    return 10\n\
-  }\n\
-  if n % 3 == 0 { return 3 }\n\
-  return 1\n\
-}\n\
-fn main() -> i32 {\n\
-  mut i := 0\n\
-  mut acc := 0\n\
-  loop {\n\
-    if i >= 20000 { break }\n\
-    acc = acc + classify(i)\n\
-    i = i + 1\n\
-  }\n\
-  print(acc)\n\
-  return 0\n\
-}\n";
-
 /// Build `BRANCHY`'s single unit through `codegen_units_parallel` with `pgo` + `cache`, into a fresh
 /// object path. Returns `(outcome.hit, object-bytes)`.
 fn run_units(proj: &Proj, cache: &CacheContext, pgo: &PgoMode, tag: &str) -> (bool, Vec<u8>) {
@@ -353,36 +316,6 @@ fn alignc_with_cache(cache_root: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_alignc"));
     c.env("ALIGNC_CACHE", cache_root);
     c
-}
-
-/// Produce a real merged `.profdata` for `BRANCHY` via the CLI round trip (gen build → run → merge),
-/// or `None` when a required tool is absent. Reuses a throwaway (cache-off) instrument build.
-fn make_profdata(dir: &Path) -> Option<PathBuf> {
-    let profdata_tool = llvm_tool("llvm-profdata")?;
-    if !backend_available() || !profile_rt_available() {
-        return None;
-    }
-    std::fs::write(dir.join("prog.align"), BRANCHY).ok()?;
-    let gen_build = Command::new(env!("CARGO_BIN_EXE_alignc"))
-        .env("ALIGNC_CACHE", "off")
-        .current_dir(dir)
-        .args(["--pgo-instrument", "--profile", "release", "build", "prog.align"])
-        .output()
-        .ok()?;
-    if gen_build.status.code() != Some(0) {
-        return None;
-    }
-    let profraw = dir.join("t.profraw");
-    let run = Command::new(dir.join("prog")).env("LLVM_PROFILE_FILE", &profraw).output().ok()?;
-    if run.status.code().is_none() || !std::fs::metadata(&profraw).map(|m| m.len() > 0).unwrap_or(false) {
-        return None;
-    }
-    let profdata = dir.join("t.profdata");
-    let merged = Command::new(&profdata_tool).args(["merge", "-o"]).arg(&profdata).arg(&profraw).output().ok()?;
-    if !merged.status.success() {
-        return None;
-    }
-    Some(profdata)
 }
 
 /// Read the produced executable's bytes for a `build` at `dir/prog`.

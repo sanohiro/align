@@ -2510,7 +2510,10 @@ match-ratio report then proceed; no `--pgo-strict` knob. **(g) Cache identity = 
 Instrument | Use(Hash128 of the profdata bytes) }` KEY COMPONENT on `CodegenKey`** (the `rt_lto_digest`
 precedent — same artifact kind, same key shape → a component, NOT a separate CAS namespace; the
 ThinLTO-S2 lesson applied in reverse). Instrumented builds are cacheable and structurally isolated from
-ordinary and use builds; `CACHE_KEY_FORMAT_VERSION` bumps at S2. **(h) Non-goals**: sample PGO / BOLT
+ordinary and use builds; `CACHE_KEY_FORMAT_VERSION` bumps at S2. [S2: shipped as `PgoKey` on the cache
+side — `PgoMode` remains the driver CLI enum carrying the profile PATH, `PgoKey` is the cache-key type
+carrying the profdata content DIGEST; the digested bytes are snapshotted so libLLVM reads exactly what
+the key names.] **(h) Non-goals**: sample PGO / BOLT
 (later in the wave, driver-managed external pipeline), CSPGO, a value-profiling surface, coverage
 reporting, hotness-gated multiversioning (a separate unimplemented feature), and folding PGO into a
 `--profile`.
