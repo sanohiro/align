@@ -506,7 +506,9 @@ fn slot_pointer_path(root: &Path, slot: Hash128) -> PathBuf {
 }
 
 /// `cas/<hex[0..2]>/<hex>` for a blob digest (hex is 32 chars, so the 2-char shard prefix is safe).
-fn cas_blob_path(root: &Path, digest: Hash128) -> PathBuf {
+/// `pub` so tests (and any external tooling) locate a CAS blob by the same rule the cache uses,
+/// instead of re-deriving the sharding convention.
+pub fn cas_blob_path(root: &Path, digest: Hash128) -> PathBuf {
     let hex = digest.to_hex();
     root.join("cas").join(&hex[..2]).join(&hex)
 }

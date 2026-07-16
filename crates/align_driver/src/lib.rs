@@ -20,8 +20,8 @@ pub mod cache;
 pub mod explain;
 
 pub use cache::{
-    clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage, CodegenKey,
-    FirstDiff, InboundImport, PrelinkKey,
+    cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
+    CodegenKey, FirstDiff, InboundImport, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
 };
 
 /// Result of running the pipeline through sema.
@@ -943,6 +943,23 @@ fn build_backend_key(
 /// Failure policy: any prelink/thin-link/backend shim failure → a loud `Err` naming the phase + unit;
 /// the caller ABORTS (never a silent fallback, since the user asked for `--thin-lto`). A cache-WRITE
 /// failure never fails the build (the artifact on disk is already correct).
+///
+/// **Structural invariant (do not reorder): the `--rt-lto` runtime-bitcode merge MUST happen inside
+/// phase-1 prelink emission (`emit_prelink_bc` consumes `rt_lto_bytes(rt_lto)`), BEFORE the prelink
+/// `.bc` is hashed/cached.** The backend key (phase 3) pins `--rt-lto` only transitively, via each
+/// unit's `own_prelink_digest` (+ import-source prelink digests). Moving the merge after prelink
+/// caching would let an rt-off and an rt-on build share a prelink digest → a stale backend hit could
+/// serve an object built against the wrong runtime bodies. The prelink KEY also carries `rt_lto` +
+/// `rt_lto_digest` explicitly, so the two never even share a prelink cache entry.
+pub struct ThinLtoBuild {
+    /// The two-phase per-unit cache outcomes (`ThinLtoPrelink` then `ThinLtoBackend`), one pair per
+    /// unit — the same vector the pre-`ThinLtoBuild` API returned.
+    pub outcomes: Vec<CacheOutcome>,
+    /// The per-unit summary-bearing prelink `.bc` path this build wrote (in `staging`), indexed by DAG
+    /// unit order. Exposed so callers (tests, tooling) do not re-derive the private staging naming.
+    pub prelink_bc: Vec<std::path::PathBuf>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_thin_lto(
     units: &[PerUnitArtifact],
@@ -954,7 +971,7 @@ pub fn build_thin_lto(
     rt_lto: bool,
     staging: &std::path::Path,
     jobs: usize,
-) -> Result<Vec<CacheOutcome>, String> {
+) -> Result<ThinLtoBuild, String> {
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
     assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
@@ -1129,7 +1146,7 @@ pub fn build_thin_lto(
     let mut outcomes: Vec<CacheOutcome> = Vec::with_capacity(2 * n);
     outcomes.extend(prelink_outcomes.into_iter().map(|o| o.expect("prelink outcome per unit")));
     outcomes.extend(backend_outcomes.into_iter().map(|o| o.expect("backend outcome per unit")));
-    Ok(outcomes)
+    Ok(ThinLtoBuild { outcomes, prelink_bc: bc_paths })
 }
 
 /// Run a ThinLTO phase's MISSES in parallel via the shared atomic-claim pattern (mirrors
