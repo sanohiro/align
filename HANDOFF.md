@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twenty-third update this day), **THINLTO IS DESIGN-SETTLED AND ITS S0
+_Last updated: 2026-07-16 (twenty-fourth update this day), **THINLTO S1 IS SHIPPED — SERIAL
+CROSS-UNIT OPTIMIZATION BEHIND `--thin-lto`, MERGED as #496** (`a3ae142`). The 3-entry shim is now
+a production component of every `alignc` (libLTO stays spike-only); the driver runs
+prelink → thin-link → backend serially over private staging; `--thin-lto` is legal only on
+`release`/`fast` + `build`/`run`/`size` (loud rejection elsewhere); N=1 skips all three phases
+(byte-identical, gated); any shim failure aborts loudly naming phase+unit (no silent fallback);
+and the object cache is BYPASSED under the flag until S2 integrates the precise digest. One
+correctness-forced deviation is recorded in the roadmap S1 paragraph: entry 2 reports imports AND
+exports, and entry 3 threads both through `thinLTOInternalizeAndPromoteInIndex` + an explicit
+`renameModuleForThinLTO` (importing a fn that references its unit's private local requires
+promotion on both sides; a leaf unit still promotes its own exports; the `undefined
+str.llvm.<hash>` link failure and the reparse-identifier SIGSEGV are pinned by diagnosis — bitcode
+reverts a module's identifier to the source filename, so the loader restamps the stable unit id).
+Gates green (`crates/align_driver/tests/thin_lto.rs`, 9): cross-unit inline mutation-checked both
+directions, the M13 wide-tuple sret positive, N=1 byte-identity, run-parity corpus,
+`--export`/pub preserve survival, profile/verb rejection, flag-off byte-determinism, and a
+build-twice determinism pin (de-risks SV). Both gemini findings were verified and applied (FFI
+null guards in `buildIndex` rc 19; `llvm::StringMap` allocation-free lookups in the hot
+`isExported` callback and module loader) with the validation comment posted before squash-merge.
+The complete workspace is green (**2219 total = 2206 passed + 13 ignored**) and clippy passes with
+warnings denied in both feature states. **Next: ThinLTO S2 — cache composition + parallelism**
+per the settled record (populate the precise `cross_unit_opt_digest`, the CAS prelink-bitcode
+part-kind, `CACHE_KEY_FORMAT_VERSION` bump, `FirstDiff` phase split, prelink/backend phases in the
+`thread::scope` claim loop around the serial thin-link; gates: private-body edit → only affected
+backends miss, pub-signature change → transitive miss, cross-process all-hit, parallel == `-j 1`
+byte-identity), then SV. gemini-code-assist ceases review 2026-07-17 — use the `/code-review`
+fallback before merging from S2 onward. Previous update: 2026-07-16 (twenty-third update this
+day), **THINLTO IS DESIGN-SETTLED AND ITS S0
 FEASIBILITY SPIKE IS GO — MERGED as #495** (`32ce6e6`). The M14 post-upgrade wave head (real
 cross-unit optimization, un-mooted by M15) was settled by a two-lens review (soundness/cache-key +
 mechanics/driver) plus orchestrator decisions, recorded as the roadmap's new **"ThinLTO design
