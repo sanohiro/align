@@ -865,7 +865,7 @@ Arena adoption gate:
 
 The already-planned zero-size arena fast path is independent and should land first.
 
-### 6.3 SHIPPED 2026-07-16 — exact-size codecs allocate once
+### 6.3 SHIPPED/PARTIAL 2026-07-16 — exact-size codecs allocate once; x86 Base64 SIMD is live
 
 At the audit baseline, Base64 and hex encoded into a Rust `Vec`, then copied that complete output
 into a second Align-owned allocation. Their output sizes are known:
@@ -886,9 +886,31 @@ full-output copy before any SIMD work.
 The allocation-inclusive median-of-nine probe covered 0-65 bytes, 1 KiB, 1 MiB, and 64 MiB. Every
 short case improved: Base64 1.19-1.65x, Base64url 1.18-1.71x, and hex 1.16-2.01x. At 64 MiB the gains
 were 1.71x, 1.70x, and 1.86x respectively after the final chunked hot loop removed per-byte bounds
-checks. The scalar direct destination is therefore the retained oracle. Next implement the
-**ALREADY PLANNED** Lemire-class Base64 runtime dispatch behind the same ABI. Hex SIMD is a separate
-new **MEASURE-FIRST** extension and must beat the simple scalar exact-destination loop:
+checks. The scalar direct destination is therefore the retained oracle.
+
+The x86-64 runtime now dispatches inputs of at least 32 bytes to a two-lane AVX2 byte-shuffle
+encoder and keeps shorter or non-AVX2 inputs on that scalar oracle. Both paths write the same exact
+destination. A baseline-NEON implementation is present and cross-compiles for
+`aarch64-unknown-linux-gnu`, but production aarch64 dispatch deliberately remains scalar until the
+same checked-in crossover probe runs on native hardware; do not guess an ARM threshold. This is
+separate from, and does not close, the already-deferred native aarch64 UTF-8 portability run.
+
+The balanced median-of-nine x86 probe measured the following scalar/candidate ratios:
+
+| case | Base64 | Base64url |
+|---|---:|---:|
+| 1..=64 selected-point geometric mean, allocation-inclusive | 1.05x | 1.05x |
+| 32 bytes, allocation-inclusive | 1.22x | 1.21x |
+| 1 KiB, allocation-inclusive | 4.12x | 4.09x |
+| 1 MiB, allocation-inclusive | 5.22x | 5.27x |
+| 64 MiB, allocation-inclusive | 1.52x | 1.55x |
+| 1 MiB core input throughput | 11.47 GB/s | 11.64 GB/s |
+
+Differential tests compare the architecture backend directly with scalar for every length through
+4096, both alphabets/padding forms, every input alignment modulo 32, and a page-aligned 4096-byte
+input. The AVX2 loop's readable-byte guard forbids overread; the scalar tail owns the final 0..27
+bytes. Hex SIMD remains a separate new **MEASURE-FIRST** extension and must beat the simple scalar
+exact-destination loop:
 
 - scalar reference for short input and unsupported targets;
 - AVX2/byte-shuffle backend on x86-64, baseline NEON on aarch64; later ISA variants only when tested;
@@ -1044,12 +1066,13 @@ hand-vectorized without a profile. The structural index and UTF-8 passes already
 conversion, schema lookup, and output writes can dominate. Likewise, short HTTP headers and CLI flags
 usually lose to SIMD setup. Preserve the scalar prefix/crossover discipline.
 
-### 8.2 P1 — exact destinations shipped; SIMD Base64 and hex remain
+### 8.2 P1 — x86 Base64 SIMD shipped; native ARM gate and hex probe remain
 
-Exact-final-allocation fill for Base64/hex is shipped in section 6.3. Lemire-class Base64 SIMD remains
-the strongest unimplemented byte-kernel candidate; hex SIMD remains a separate measure-first item.
-Any backend that passes its gate now writes the retained direct destination, so SIMD cannot merely
-accelerate a buffer that is then copied in full.
+Exact-final-allocation fill for Base64/hex and the runtime-dispatched x86-64 AVX2 Base64 backend are
+shipped in section 6.3. The cross-compiled NEON backend still needs a native aarch64 correctness and
+crossover run before production dispatch is enabled. Hex SIMD remains a separate measure-first item.
+Every backend writes the retained direct destination, so SIMD cannot merely accelerate a buffer that
+is then copied in full.
 
 Use architecture intrinsics plus a scalar oracle on stable Rust. Cache CPU feature selection outside
 the inner loop. Differentially test every tail length, alphabet, padding form, invalid byte position,
@@ -1176,7 +1199,7 @@ Do not count the following as new findings from this audit:
 - zero-size arena allocation, reader/`io.copy` zero-fill removal, JSON final-copy measurement;
 - the shipped O(n log n) `sort`/`sort_by_key` replacement and one-time key decoration;
 - Linux `io.copy` sendfile/splice/io_uring-class fast paths, scoped mmap views, and mmap advice/prefetch;
-- Base64 SIMD as an encoding backlog item.
+- native aarch64 Base64 NEON activation and hex SIMD as separate encoding backlog items.
 
 New here are the `where` speculation reproduction and legality split, the ordinary-stage normative
 effect conflict, two now-fixed closure-region UAFs, Unit indirect-call ABI mismatch,
@@ -1239,8 +1262,8 @@ of integer wrap.
   separation (2026-07-16; safety classes + lazy-zero preservation + adoption probe);
 - [x] build lazy multi-source `zip` with its first real consumer; one allocation-free,
   tuple-storage-free vector loop and exact length/alias/effect semantics (2026-07-15);
-- direct-fill exact codec destinations, then evaluate already-planned Base64 SIMD and the separate
-  measure-first hex SIMD probe;
+- [x] direct-fill exact codec destinations and x86-64 Base64 SIMD (2026-07-16; native aarch64
+  activation remains deferred); next run the separate measure-first hex SIMD probe;
 - add the total-order ordered-input/run-boundary stable-sort path and delay merge-only scratch until
   a merge pass can execute; retain the current path for float/NaN keys;
 - execute document 11's range-kernel and low-lock scheduler sequence;
