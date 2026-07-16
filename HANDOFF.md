@@ -15,7 +15,7 @@ Short reads expose only their initialized prefix, EOF exposes zero bytes, and EI
 publication. Lookahead is still drained before fd-fresh data, so the portable `io.copy` oracle keeps
 the buffered-reader correctness fix while inheriting the zero-fill removal. The allocation-inclusive
 fresh 64 KiB-window probe improved 0/1/4 KiB/full-prefix cases by 20.92x/20.83x/11.49x/1.98x. This
-work is green across the complete workspace (**2191 total = 2183 passed + eight ignored manual
+work is green across the complete workspace (**2192 total = 2184 passed + eight ignored manual
 probes**) and workspace clippy passes with warnings denied. It is on branch
 **`agent/io-read-uninit`**, based on squash-merged PR #483 (`51fbb4b`). **Next
 recommended after this PR:** extend the same initialized-prefix discipline to the separately audited

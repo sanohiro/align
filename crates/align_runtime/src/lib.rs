@@ -4868,8 +4868,9 @@ impl Reader {
     /// Ensure the lookahead has raw backing for one refill without logically initializing its
     /// unwritten tail. Allocation failure retains the existing abort-on-OOM behavior of `resize`.
     fn reserve_lookahead(&mut self) {
+        debug_assert!(self.buf.is_empty());
         if self.buf.capacity() < READ_LINE_CHUNK {
-            self.buf.reserve_exact(READ_LINE_CHUNK.saturating_sub(self.buf.len()));
+            self.buf.reserve_exact(READ_LINE_CHUNK);
         }
     }
 
@@ -4975,7 +4976,13 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
     // into `MaybeUninit` spare capacity, so a short read never creates an initialized slice over
     // the untouched tail.
     b.data.clear();
-    debug_assert!(b.data.capacity() >= b.cap);
+    if b.data.capacity() < b.cap && b.data.try_reserve_exact(b.cap).is_err() {
+        // Constructors and every internal growth path maintain `capacity >= cap`; retain a
+        // release-build guard at the raw-write boundary so even a future broken invariant cannot
+        // turn into an out-of-bounds syscall write.
+        b.len = 0;
+        return -(AL_INVALID as i64);
+    }
     loop {
         let dst = b.data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
         let n = unsafe { read(r.fd, dst as *mut core::ffi::c_void, b.cap) };
@@ -12796,6 +12803,28 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0);
         assert_eq!(unsafe { &*b }.data.len(), 0, "EOF publishes no initialized bytes");
         assert_eq!(unsafe { &*b }.data.capacity(), 3, "the caller's read window is retained");
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reader_read_defends_capacity_invariant_at_raw_boundary() {
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_reader_capacity_guard_{}", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"guard").unwrap();
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let mut r: *mut Reader = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_reader_open(path_bytes.as_ptr(), path_bytes.len() as i64, &mut r) }, 0);
+        // Constructors maintain `capacity >= cap`; deliberately violate that private invariant to
+        // pin the release-build guard immediately before the raw syscall write.
+        let b = Box::into_raw(Box::new(Buffer { data: Vec::new(), cap: 5, len: 0 }));
+        assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 5);
+        assert_eq!(unsafe { &*b }.data, b"guard");
+        assert!(unsafe { &*b }.data.capacity() >= 5);
 
         unsafe { align_rt_buffer_free(b) };
         unsafe { align_rt_io_reader_free(r) };
