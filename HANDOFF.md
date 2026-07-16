@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (fourth update this day), **INSTRUMENT-PGO S1 IS SHIPPED — SERIAL
+_Last updated: 2026-07-17 (fifth update this day), **INSTRUMENT-PGO S2 IS SHIPPED — CACHE
+COMPOSITION, MERGED as #501** (`0066b42`). PGO builds now flow through the normal cached +
+parallel per-unit path (the S1 bypass is deleted outright): `PgoKey { Off | Instrument |
+Use(Hash128 of profdata bytes) }` is CodegenKey component #12 (the rt_lto_digest precedent; named
+`PgoKey` to disambiguate from the path-carrying CLI `PgoMode` — doc-10 §6.2 and the settled
+record carry the correction), `FirstDiff::PgoProfile` (exhaustive matches),
+`CACHE_KEY_FORMAT_VERSION` and `MANIFEST_FORMAT_VERSION` both 2→3 (fail-closed decode everywhere
+manifests are read), `slot_digest` deliberately excludes the mode so switches diff to
+`PgoProfile`. Use-phase warnings are mutex-collected, DAG-ordered per unit; an all-HIT use build
+re-reports nothing (staleness was reported at first build — documented); the instrumented link is
+keyed off the CLI mode, not off whether codegen ran, so all-HIT instrument builds still link the
+profile runtime. The /code-review fallback caught a REAL cache-poisoning bug the implementation
+had misclassified as benign TOCTOU: the digest came from one read while libLLVM re-read the LIVE
+user path per unit miss, so a mid-build profdata rewrite published B2-built objects under the B1
+key (a later genuine-B1 build would HIT and silently link them). Fixed structurally: the digested
+bytes are snapshotted once to a private per-invocation RAII `StagedProfdata` whose path is handed
+to every emit — hit ⟹ byte-identical is restored, pinned by a plumbing gate. Gates: new
+`pgo_cache.rs` (9: mode isolation incl. instrumented-never-serves-ordinary, cold→re-hit per mode,
+profdata edit → `PgoProfile` miss, revert → old blob re-hit, path-independence, cold-vs-hit
+byte-identity both modes, rt-lto × pgo-use disjointness) + the snapshot plumbing gate; all prior
+suites green (pgo 7 / cache_codegen 15 / cache_parallel 9 / thin_lto_cache 8 / thin_lto_sv 11);
+full workspace green, clippy clean all feature states. Test fixtures (BRANCHY/hh/
+profile_rt_available/make_profdata) hoisted to tests/common. **Next: PGO SV — the verification
+bundle closing the PGO arc**: build-twice determinism both modes, stale/wrong-profile mutation
+gates, the explicit compile-time bound, and the measured PAYOFF GATE on a branch-heavy kernel
+(bench-style, interleaved) — then the M14 wave tail (sample-PGO/BOLT evaluation) or the next
+recorded priority. Previous update: 2026-07-17 (fourth update this day), **INSTRUMENT-PGO S1 IS
+SHIPPED — SERIAL
 CORRECTNESS BEHIND `--pgo-instrument` / `--pgo-use`, MERGED as #500** (`913724b`). The shim PGO
 entry is a production component (the `pgo-spike` feature and `pgo_spike.rs` were deleted outright;
 the 5 spike tests retargeted onto production `src/pgo.rs`); the driver wires both flags (mutually
