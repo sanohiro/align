@@ -893,7 +893,9 @@ encoder and keeps shorter or non-AVX2 inputs on that scalar oracle. Both paths w
 destination. A baseline-NEON implementation is present and cross-compiles for
 `aarch64-unknown-linux-gnu`, but production aarch64 dispatch deliberately remains scalar until the
 same checked-in crossover probe runs on native hardware; do not guess an ARM threshold. This is
-separate from, and does not close, the already-deferred native aarch64 UTF-8 portability run.
+separate from the native aarch64 UTF-8 portability run, which completed on 2026-07-16 with a
+negative result: no length-only NEON crossover passed its named ASCII/invalid controls, so UTF-8
+production dispatch remains scalar on aarch64.
 
 The balanced median-of-nine x86 probe measured the following scalar/candidate ratios:
 
@@ -963,7 +965,7 @@ whose chunk-vector growth may free old metadata.
 
 | Operation | Small-transfer behavior | Large-transfer behavior | Assessment |
 |---|---|---|---|
-| `fs.read_file` regular known-size file | open/metadata/read path; exact final allocation | exact allocation + direct `read_exact`; SIMD UTF-8 validation; measured about 1.8x over Vec+copy at 128 MiB | **GOOD**; add a small-file crossover benchmark, not a second implementation by intuition |
+| `fs.read_file` regular known-size file | open/metadata/read path; exact final allocation | exact allocation + direct `read_exact`; target-gated UTF-8 validation; measured about 1.8x over Vec+copy at 128 MiB | **GOOD**; x86 uses AVX2, while native Apple-M1 measurement keeps aarch64 scalar |
 | `fs.read_file_view` / bytes view | any nonzero regular file may mmap; zero/special/failure falls back to arena copy | same arena-scoped mmap path; no payload copy | **GOOD** copy avoidance, not nonblocking I/O: string view immediately UTF-8-scans/faults pages; bytes view may fault later |
 | buffered `writer` | accumulates into 64 KiB, amortizing syscalls | flushes then writes a chunk >=64 KiB directly, avoiding double copy | **GOOD** for both sizes; `print` remains the deliberately slow debug rail |
 | buffered `reader.read_line` | `memchr` finds newline; one payload append per lookahead span | 64 KiB lookahead; long lines may append several spans and reallocate while growing | **GOOD** baseline; scoped zero-copy line callback is already planned if copying dominates |
@@ -1071,7 +1073,7 @@ ordinary scalar call.
 | Workload | Current mechanism | Disposition |
 |---|---|---|
 | known-schema struct-array/SoA JSON structural indexing | simdjson-style 64-byte stage 1; AVX2+pclmul on x86, NEON on arm64, scalar oracle | **SHIPPED / GOOD** for its live consumers |
-| UTF-8 validation | Lemire lookup method; AVX2/NEON/scalar differential tests | **SHIPPED / GOOD** |
+| UTF-8 validation | Lemire lookup method; x86 AVX2, aarch64 scalar production, NEON/scalar differential tests | **SHIPPED / MEASURED**; Apple-M1 NEON closed below gate |
 | JSON quote/backslash scan | short scalar prefix, then `memchr2` runtime dispatch | **SHIPPED / GOOD** |
 | substring contains/find/rfind | `memchr::memmem` with mature runtime dispatch | **SHIPPED / GOOD** |
 | `read_line` newline search | `memchr` | **SHIPPED / GOOD** |

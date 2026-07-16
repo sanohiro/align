@@ -8,7 +8,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (eighteenth update this day), **THE FIRST COMPLETE STABLE-COMPACTION
+_Last updated: 2026-07-16 (nineteenth update this day), **NATIVE APPLE-SILICON UTF-8 KEEPS THE
+SCALAR PRODUCTION PATH.** The checked-in probe ran repeatedly on a native Apple M1
+(`uname -m = arm64`, Rosetta translation flag 0) and found no length-only NEON crossover that
+passes every named control. The 1..=64 selected-point scalar/candidate geometric mean was 1.26-1.27x
+overall and 1.67-1.68x excluding early-invalid input, and 1 MiB multibyte input improved 6.40x. However,
+1 MiB ASCII and late-invalid inputs both regressed to 0.83x, while an early-invalid byte retained
+the scalar oracle's immediate return. The realistic 64 MiB mixed-text candidate still reached
+15.1 GB/s versus 3.1 GB/s scalar, but the named regressions fail the no-regression gate. Production
+aarch64 dispatch therefore uses the scalar oracle; the baseline-NEON implementation, tail handling,
+and byte-for-byte differential tests remain as a measured candidate for a materially different
+content-adaptive design. The native ARM UTF-8 deferral is closed as a negative result. This work is
+on branch **`agent/arm64-utf8-crossover`**, based on `main` at `6399784`. **Next:** measure and decide
+the independent Base64/Base64url NEON crossover; do not infer its threshold from UTF-8 or x86.
+Native aarch64 hex activation remains deferred. Previous update: 2026-07-16 (eighteenth update this
+day), **THE FIRST COMPLETE STABLE-COMPACTION
 CONSUMER IS REJECTED AND CLOSED.** The checked-in ignored probe combines an inlined total `i64 > 0`
 predicate, AVX2 four-lane mask formation, and ordered direct materialization, with the current scalar
 predicate/branch/append shape as oracle. Full-prefix/count differential checks precede balanced timing
