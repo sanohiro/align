@@ -11,8 +11,9 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 _Last updated: 2026-07-16 (nineteenth update this day), **NATIVE APPLE-SILICON UTF-8 KEEPS THE
 SCALAR PRODUCTION PATH.** The checked-in probe ran repeatedly on a native Apple M1
 (`uname -m = arm64`, Rosetta translation flag 0) and found no length-only NEON crossover that
-passes every named control. The 1..=64 selected-point scalar/candidate geometric mean was 1.26-1.27x
-overall and 1.67-1.68x excluding early-invalid input, and 1 MiB multibyte input improved 6.40x. However,
+passes every named control. The 1..=64 selected-point candidate speedup versus scalar geometric mean
+was 1.26-1.27x overall and 1.67-1.68x excluding early-invalid input, and 1 MiB multibyte input improved
+6.40x. However,
 1 MiB ASCII and late-invalid inputs both regressed to 0.83x, while an early-invalid byte retained
 the scalar oracle's immediate return. The realistic 64 MiB mixed-text candidate still reached
 15.1 GB/s versus 3.1 GB/s scalar, but the named regressions fail the no-regression gate. Production

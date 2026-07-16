@@ -314,11 +314,11 @@ threshold from the 32-byte AVX2 result.
 **Measured aarch64 (2026-07-16, native Apple M1, macOS 26.3.1, rustc 1.96.1 / LLVM 22.1.8):**
 the checked-in balanced median-of-seven probe ran repeatedly with one test thread. NEON lost on
 valid four-byte inputs but won from eight bytes for the short ASCII, multibyte, and late-invalid
-cases. Across two 1..=64 selected-point runs, scalar/candidate geometric mean speedup was
+cases. Across two 1..=64 selected-point runs, candidate speedup versus scalar geometric mean was
 1.26-1.27x over all four distributions and 1.67-1.68x when the early-invalid failure-only
 distribution was excluded. That short result did not survive the required large negative controls:
 
-| 1 MiB case | scalar / NEON | NEON throughput |
+| 1 MiB case | NEON speedup versus scalar | NEON throughput |
 |---|---:|---:|
 | ASCII | 0.83x | 23.9 GiB/s |
 | multibyte | 6.40x | 9.5 GiB/s |

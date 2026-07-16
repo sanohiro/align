@@ -17995,7 +17995,7 @@ mod tests {
             (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
         };
         println!(
-            "1..=64 selected-point scalar/candidate geometric mean (allocation-free): all {:.2}x | excluding early-invalid {:.2}x | shipped {:.2}x",
+            "1..=64 selected-point candidate speedup versus scalar geometric mean (allocation-free): all {:.2}x | excluding early-invalid {:.2}x | shipped {:.2}x",
             geometric_mean(&short_candidate_speedups),
             geometric_mean(&short_candidate_non_early_speedups),
             geometric_mean(&short_dispatch_speedups)
@@ -18018,7 +18018,7 @@ mod tests {
             }
             (median(scalar_samples), median(simd_samples))
         };
-        println!("1 MiB UTF-8 core crossover (median of 7; scalar/candidate speedup):");
+        println!("1 MiB UTF-8 core crossover (median of 7; candidate speedup versus scalar):");
         let ascii_1m = vec![b'a'; 1024 * 1024];
         let multibyte_1m = valid_multibyte(1024 * 1024);
         let mut invalid_first_1m = ascii_1m.clone();
