@@ -5874,6 +5874,12 @@ unsafe fn base64_encode_into_avx2(
         0,
     ];
     let lut = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(offsets.as_ptr() as *const __m128i) });
+    let mask_hi = _mm256_set1_epi32(0x0fc0_fc00);
+    let mult_hi = _mm256_set1_epi32(0x0400_0040);
+    let mask_lo = _mm256_set1_epi32(0x003f_03f0);
+    let mult_lo = _mm256_set1_epi32(0x0100_0010);
+    let sub_51 = _mm256_set1_epi8(51);
+    let cmp_25 = _mm256_set1_epi8(25);
     let mut i = 0usize;
     let mut o = 0usize;
     while data.len() - i >= 28 {
@@ -5882,17 +5888,11 @@ unsafe fn base64_encode_into_avx2(
         let hi = unsafe { _mm_loadu_si128(ptr.add(12) as *const __m128i) };
         let input = _mm256_set_m128i(hi, lo);
         let shuffled = _mm256_shuffle_epi8(input, shuffle);
-        let hi_bits = _mm256_mulhi_epu16(
-            _mm256_and_si256(shuffled, _mm256_set1_epi32(0x0fc0_fc00)),
-            _mm256_set1_epi32(0x0400_0040),
-        );
-        let lo_bits = _mm256_mullo_epi16(
-            _mm256_and_si256(shuffled, _mm256_set1_epi32(0x003f_03f0)),
-            _mm256_set1_epi32(0x0100_0010),
-        );
+        let hi_bits = _mm256_mulhi_epu16(_mm256_and_si256(shuffled, mask_hi), mult_hi);
+        let lo_bits = _mm256_mullo_epi16(_mm256_and_si256(shuffled, mask_lo), mult_lo);
         let indices = _mm256_or_si256(hi_bits, lo_bits);
-        let mut selector = _mm256_subs_epu8(indices, _mm256_set1_epi8(51));
-        selector = _mm256_sub_epi8(selector, _mm256_cmpgt_epi8(indices, _mm256_set1_epi8(25)));
+        let mut selector = _mm256_subs_epu8(indices, sub_51);
+        selector = _mm256_sub_epi8(selector, _mm256_cmpgt_epi8(indices, cmp_25));
         let encoded = _mm256_add_epi8(indices, _mm256_shuffle_epi8(lut, selector));
         unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(o) as *mut __m256i, encoded) };
         i += 24;
@@ -5922,6 +5922,9 @@ unsafe fn base64_encode_into_neon(
         unsafe { vld1q_u8(alphabet.as_ptr().add(48)) },
     );
     let lookup = |indices: uint8x16_t| -> uint8x16_t { vqtbl4q_u8(table, indices) };
+    let mask_3 = vdupq_n_u8(3);
+    let mask_15 = vdupq_n_u8(15);
+    let mask_63 = vdupq_n_u8(63);
     let mut i = 0usize;
     let mut o = 0usize;
     while data.len() - i >= 48 {
@@ -5930,9 +5933,9 @@ unsafe fn base64_encode_into_neon(
         let b = triples.1;
         let c = triples.2;
         let s0 = vshrq_n_u8(a, 2);
-        let s1 = vorrq_u8(vshlq_n_u8(vandq_u8(a, vdupq_n_u8(3)), 4), vshrq_n_u8(b, 4));
-        let s2 = vorrq_u8(vshlq_n_u8(vandq_u8(b, vdupq_n_u8(15)), 2), vshrq_n_u8(c, 6));
-        let s3 = vandq_u8(c, vdupq_n_u8(63));
+        let s1 = vorrq_u8(vshlq_n_u8(vandq_u8(a, mask_3), 4), vshrq_n_u8(b, 4));
+        let s2 = vorrq_u8(vshlq_n_u8(vandq_u8(b, mask_15), 2), vshrq_n_u8(c, 6));
+        let s3 = vandq_u8(c, mask_63);
         unsafe {
             vst4q_u8(
                 out.as_mut_ptr().add(o).cast::<u8>(),
