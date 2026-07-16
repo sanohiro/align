@@ -8,7 +8,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17, **THINLTO S2 IS SHIPPED — CACHE COMPOSITION + PARALLELISM, MERGED as
+_Last updated: 2026-07-17 (second update this day), **THINLTO SV IS SHIPPED AND THE THINLTO ARC IS
+CLOSED — MERGED as #498** (`e804223`; the full arc: S0 #495 spike → S1 #496 serial → S2 #497
+cache/parallel → SV #498 verification). The SV bundle (`crates/align_driver/tests/thin_lto_sv.rs`,
+11 gates after review fixes): build-twice determinism across separate cold cache roots and across
+`-j1/-j2/-j4` (one 3-build matrix), an end-to-end subprocess determinism gate hardened against
+vacuous passes (exe deleted between builds, cold independence asserted via `--cache-stats`), a
+different-`j` hot-serve byte-identity gate closing the settled plan's cold-vs-hit item beyond S2's
+same-`j` pin, summary-level stale-mutation gates proving rejection is BY CONTENT DIGEST (swapping
+structurally valid bitcode — another unit's, and a different-body same-unit race shape — hits
+`CorruptEntry` → evict+rebuild; the audit found `materialize_blob` already digest-verifies every
+CAS blob, so NO product hole existed), an interleaved-AB compile-time regression gate
+(`--thin-lto`/off ratio < 3.0, measured ~1.0-1.1x), the key-component invalidation matrix
+(llvm-version, compiler-build-id, rt-lto on/off never mix), and an end-to-end pin that the rt-lto
+merge changes prelink bitcode (grounding the backend key's transitive rt-lto capture; the
+merge-precedes-prelink invariant is documented at `build_thin_lto` and in the roadmap). Because
+gemini-code-assist is sunset, this PR was reviewed via the `/code-review` fallback (8 finder
+angles): 10 findings confirmed and ALL applied pre-merge — including hoisting the triplicated
+ThinLTO fixture cluster into `tests/common/mod.rs`, exposing `cache::cas_blob_path` and
+`build_thin_lto`'s written prelink paths (`ThinLtoBuild`) so tests ask the product instead of
+re-deriving private conventions, moving the separate-compilation record Open→Settled in
+`open-questions.md` with the opt-in-only scope qualifier restored (cross-module inlining returns
+ONLY under `--thin-lto` on release/fast; default/debug multi-file builds keep zero cross-unit opt
+by design), and the doc-10 §7 ThinLTO stage status. Deferred (recorded, not blockers): cross-unit
+pub internalization, digest-precision evolution, ThinLTO-aware explain-opt/emit-llvm. The complete
+workspace is green (**2243 total = 2230 passed + 13 ignored**) and clippy passes with warnings
+denied in both feature states. **Next: instrument PGO — the M14 remainder head** (recorded shape:
+InstrProfiling pass + profile runtime hook + `llvm-profdata` merge + `PGOOptions`, likely via raw
+llvm-sys since inkwell does not expose it; sequenced after LTO in the wave order; start with the
+two-lens design review + a feasibility spike, the ThinLTO pattern). Previous update: 2026-07-17,
+**THINLTO S2 IS SHIPPED — CACHE COMPOSITION + PARALLELISM, MERGED as
 #497** (`c5a0244`). `--thin-lto` builds are now incremental and parallel: PHASE 1 prelink
 (parallel, cacheable per unit; artifact = summary-bearing `.bc` in a new CAS `prelink` namespace)
 → PHASE 2 thin-link (serial, uncached, fresh import/export lists every build) → PHASE 3 backend
