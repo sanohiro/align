@@ -8,7 +8,18 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twelfth update this day), **READER AND `io.copy` NO LONGER ZERO UNWRITTEN
+_Last updated: 2026-07-16 (thirteenth update this day), **UDP RECEIVE AND `pread` SHARE THE RAW READ
+WINDOW.** `Buffer::prepare_uninit_window` now centralizes len-clear, release-build capacity repair,
+and spare-capacity access for reader, UDP, and positional file reads. `recvfrom` publishes only the
+returned prefix, including the documented leading-prefix truncation for oversized datagrams.
+`file.pread` calls POSIX `pread(2)` directly instead of forming a fully initialized Rust slice, then
+publishes only the actual short-read prefix or an empty Vec at EOF; fd offset and EINTR semantics are
+unchanged. This work is on branch **`agent/io-recv-pread-uninit`**, based on squash-merged PR #484
+(`d11aaea`). The complete workspace remains green (**2192 total = 2184 passed + eight ignored manual
+probes**) and workspace clippy passes with warnings denied. **Next recommended after this PR:** remove the measured redundant URL/request copy in
+`http.get_many`, using prebuilt immutable requests and preserving bounded claiming, input order, pool
+reuse, and all failure/no-leak gates. The aarch64 UTF-8 portability measurement remains deferred.
+Previous update: 2026-07-16 (twelfth update this day), **READER AND `io.copy` NO LONGER ZERO UNWRITTEN
 TAILS.** Buffered-reader refill and direct `reader.read` now reserve raw Vec capacity, pass only its
 `MaybeUninit` spare-capacity pointer to `read(2)`, and publish exactly the successful byte count.
 Short reads expose only their initialized prefix, EOF exposes zero bytes, and EINTR retries before
@@ -16,8 +27,8 @@ publication. Lookahead is still drained before fd-fresh data, so the portable `i
 the buffered-reader correctness fix while inheriting the zero-fill removal. The allocation-inclusive
 fresh 64 KiB-window probe improved 0/1/4 KiB/full-prefix cases by 20.92x/20.83x/11.49x/1.98x. This
 work is green across the complete workspace (**2192 total = 2184 passed + eight ignored manual
-probes**) and workspace clippy passes with warnings denied. It is on branch
-**`agent/io-read-uninit`**, based on squash-merged PR #483 (`51fbb4b`). **Next
+probes**) and workspace clippy passes with warnings denied. It was squash-merged as PR **#484**
+(`d11aaea`), based on squash-merged PR #483 (`51fbb4b`). **Next
 recommended after this PR:** extend the same initialized-prefix discipline to the separately audited
 UDP receive and positional `pread` paths, preserving datagram truncation, short-read, offset, EINTR,
 and EOF gates. The aarch64 UTF-8 portability measurement remains deferred. Previous update:

@@ -1149,13 +1149,12 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
         b.len = 0;
         return 0;
     }
-    // Ensure the backing storage spans the full capacity (recvfrom fills up to `cap`).
-    if b.data.len() != b.cap {
-        b.data.resize(b.cap, 0);
-    }
+    let Some(dst) = b.prepare_uninit_window() else { return -(AL_INVALID as i64) };
     loop {
-        let n = unsafe { recvfrom(fd, b.data.as_mut_ptr() as *mut core::ffi::c_void, b.cap, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+        let n = unsafe { recvfrom(fd, dst as *mut core::ffi::c_void, b.cap, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
         if n >= 0 {
+            // `recvfrom` initialized exactly the returned prefix (possibly truncated to `cap`).
+            unsafe { b.data.set_len(n as usize) };
             b.len = n as usize;
             return n as i64;
         }
@@ -4975,16 +4974,11 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
     // `buffer(cap)` reserves this whole window. Clear only the logical length: the syscall writes
     // into `MaybeUninit` spare capacity, so a short read never creates an initialized slice over
     // the untouched tail.
-    b.data.clear();
-    if b.data.capacity() < b.cap && b.data.try_reserve_exact(b.cap).is_err() {
-        // Constructors and every internal growth path maintain `capacity >= cap`; retain a
-        // release-build guard at the raw-write boundary so even a future broken invariant cannot
-        // turn into an out-of-bounds syscall write.
+    let Some(dst) = b.prepare_uninit_window() else {
         b.len = 0;
         return -(AL_INVALID as i64);
-    }
+    };
     loop {
-        let dst = b.data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
         let n = unsafe { read(r.fd, dst as *mut core::ffi::c_void, b.cap) };
         if n >= 0 {
             // `read` initialized exactly `n <= cap <= capacity` bytes at `dst`.
@@ -5461,26 +5455,21 @@ pub unsafe extern "C" fn align_rt_io_file_pread(f: *mut RwFile, b: *mut Buffer, 
         b.len = 0;
         return 0;
     }
-    // Ensure the backing storage spans the full capacity (the read fills up to `cap`) — the exact
-    // discipline `reader.read` uses.
-    if b.data.len() != b.cap {
-        b.data.resize(b.cap, 0);
-    }
-    use std::os::unix::fs::FileExt;
-    let file = unsafe { borrow_file(fd) };
-    let cap = b.cap;
+    let Some(dst) = b.prepare_uninit_window() else { return -(AL_INVALID as i64) };
     loop {
-        match file.read_at(&mut b.data[..cap], off as u64) {
-            Ok(n) => {
-                b.len = n;
-                return n as i64;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                b.len = 0;
-                return -(io_error_to_status(&e) as i64);
-            }
+        let n = unsafe { pread(fd, dst as *mut core::ffi::c_void, b.cap, off) };
+        if n >= 0 {
+            // `pread` initialized exactly the returned prefix; EOF publishes an empty Vec.
+            unsafe { b.data.set_len(n as usize) };
+            b.len = n as usize;
+            return n as i64;
         }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        b.len = 0;
+        return -(io_error_to_status(&e) as i64);
     }
 }
 
@@ -5561,6 +5550,19 @@ pub struct Buffer {
     data: Vec<u8>,
     cap: usize,
     len: usize,
+}
+
+impl Buffer {
+    /// Prepare the caller-selected read window as raw spare capacity. No byte becomes part of the
+    /// initialized Vec until the syscall reports how many it wrote.
+    fn prepare_uninit_window(&mut self) -> Option<*mut u8> {
+        self.data.clear();
+        if self.data.capacity() < self.cap && self.data.try_reserve_exact(self.cap).is_err() {
+            self.len = 0;
+            return None;
+        }
+        Some(self.data.spare_capacity_mut().as_mut_ptr().cast::<u8>())
+    }
 }
 
 /// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
@@ -7883,6 +7885,8 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
     // POSIX `read(2)` — a `reader` fills a caller-owned `buffer` straight from its fd.
     fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
+    // POSIX `pread(2)` — the positional sibling used by `file.pread`; does not change fd offset.
+    fn pread(fd: i32, buf: *mut core::ffi::c_void, count: usize, offset: i64) -> isize;
     // POSIX `close(2)` — a file-backed `reader`/`writer` closes the fd it owns at `Drop`.
     fn close(fd: i32) -> i32;
     // POSIX `_exit(2)` — `process.abort()`: terminate immediately with `status`, skipping all
@@ -13022,8 +13026,10 @@ mod tests {
         let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
         unsafe { align_rt_buffer_bytes(b, &mut view) };
         assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"cde");
+        assert_eq!(unsafe { &*b }.data.len(), 3, "pread publishes only its initialized short prefix");
         // At EOF (5) and well past it (100) the read is 0.
         assert_eq!(unsafe { align_rt_io_file_pread(f, b, 5) }, 0);
+        assert_eq!(unsafe { &*b }.data.len(), 0, "pread EOF publishes no initialized bytes");
         assert_eq!(unsafe { align_rt_io_file_pread(f, b, 100) }, 0);
 
         unsafe { align_rt_buffer_free(b) };
@@ -16118,6 +16124,7 @@ mod tests {
         let n = unsafe { align_rt_udp_recv_from(sock, b) };
         assert_eq!(n, 4, "recv_from into a too-small buffer returns the capacity (truncated)");
         let got = unsafe { &*b };
+        assert_eq!(got.data.len(), 4, "recvfrom publishes exactly the initialized truncated prefix");
         assert_eq!(&got.data[..got.len], b"0123", "the leading bytes are kept; the tail is discarded");
 
         unsafe { align_rt_udp_socket_free(sock) };
