@@ -6783,40 +6783,76 @@ pub unsafe extern "C" fn align_rt_path_join(aptr: *const u8, alen: i64, bptr: *c
 pub unsafe extern "C" fn align_rt_path_normalize(ptr: *const u8, len: i64) -> AlignStr {
     let b = unsafe { bytes_view(ptr, len) };
     let absolute = !b.is_empty() && b[0] == b'/';
-    let mut comps: Vec<&[u8]> = Vec::new();
+    // Normalization never grows the input; only the empty relative result needs one byte for `.`.
+    // Allocate the owned result once, then use its initialized prefix as the component stack.
+    let cap = b.len().max(1);
+    let cap_i64 = i64::try_from(cap).unwrap_or_else(|_| panic_abort("path.normalize size overflow"));
+    let dst = align_rt_alloc(cap_i64);
+    let mut out_len = 0usize;
+    if absolute {
+        unsafe { dst.write(b'/') };
+        out_len = 1;
+    }
+
     for comp in b.split(|&c| c == b'/') {
         if comp.is_empty() || comp == b"." {
             continue;
         }
         if comp == b".." {
             if absolute {
-                comps.pop(); // Can't go above the root; empty → no-op.
-            } else if matches!(comps.last(), Some(&last) if last == b"..") || comps.is_empty() {
-                comps.push(comp); // Preserve a leading `..` on a relative path.
+                // Can't go above root. Each backwards scan covers bytes removed by this pop, so a
+                // chain of `..` remains amortized linear rather than repeatedly rescanning input.
+                if out_len > 1 {
+                    let start = unsafe { path_output_component_start(dst, out_len) };
+                    out_len = start.saturating_sub(1).max(1);
+                }
             } else {
-                comps.pop();
+                let start = unsafe { path_output_component_start(dst, out_len) };
+                let last_is_dotdot = out_len - start == 2
+                    && unsafe { *dst.add(start) == b'.' && *dst.add(start + 1) == b'.' };
+                if out_len == 0 || last_is_dotdot {
+                    // Preserve leading/repeated `..` on a relative path.
+                    unsafe { path_output_append(dst, &mut out_len, false, comp) };
+                } else {
+                    out_len = start.saturating_sub(1);
+                }
             }
         } else {
-            comps.push(comp);
+            unsafe { path_output_append(dst, &mut out_len, absolute, comp) };
         }
     }
-    let mut out: Vec<u8> = Vec::new();
-    if absolute {
-        out.push(b'/');
+    if out_len == 0 {
+        unsafe { dst.write(b'.') };
+        out_len = 1;
     }
-    for (i, c) in comps.iter().enumerate() {
-        if i > 0 {
-            out.push(b'/');
-        }
-        out.extend_from_slice(c);
+    AlignStr { ptr: dst, len: i64::try_from(out_len).unwrap_or_else(|_| panic_abort("path.normalize length overflow")) }
+}
+
+/// Start offset of the last component in the initialized `dst[..len]` path.
+///
+/// # Safety
+/// `dst` is readable for `len` initialized bytes.
+#[inline]
+unsafe fn path_output_component_start(dst: *const u8, len: usize) -> usize {
+    let mut start = len;
+    while start > 0 && unsafe { *dst.add(start - 1) } != b'/' {
+        start -= 1;
     }
-    if out.is_empty() {
-        out.push(b'.'); // A relative path that collapsed to nothing → ".".
+    start
+}
+
+/// Append one non-empty component to the initialized output prefix.
+///
+/// # Safety
+/// `dst` has enough writable capacity for the separator and `comp`; it does not overlap `comp`.
+#[inline]
+unsafe fn path_output_append(dst: *mut u8, len: &mut usize, absolute: bool, comp: &[u8]) {
+    if *len > 0 && !(absolute && *len == 1) {
+        unsafe { dst.add(*len).write(b'/') };
+        *len += 1;
     }
-    let n = out.len();
-    let dst = align_rt_alloc(n as i64);
-    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst, n) };
-    AlignStr { ptr: dst, len: n as i64 }
+    unsafe { core::ptr::copy_nonoverlapping(comp.as_ptr(), dst.add(*len), comp.len()) };
+    *len += comp.len();
 }
 
 /// `env.get(name)` — write the owned `string` `{ptr,len}` value of environment variable `name` into
@@ -16435,6 +16471,44 @@ mod tests {
         let (pp, pl) = view_of(p);
         owned_str(unsafe { align_rt_path_normalize(pp, pl) })
     }
+    fn staged_normalize_reference(p: &str) -> AlignStr {
+        let b = p.as_bytes();
+        let absolute = b.first() == Some(&b'/');
+        let mut comps: Vec<&[u8]> = Vec::new();
+        for comp in b.split(|&c| c == b'/') {
+            if comp.is_empty() || comp == b"." {
+                continue;
+            }
+            if comp == b".." {
+                if absolute {
+                    comps.pop();
+                } else if matches!(comps.last(), Some(&last) if last == b"..") || comps.is_empty() {
+                    comps.push(comp);
+                } else {
+                    comps.pop();
+                }
+            } else {
+                comps.push(comp);
+            }
+        }
+        let mut out = Vec::new();
+        if absolute {
+            out.push(b'/');
+        }
+        for (i, comp) in comps.iter().enumerate() {
+            if i > 0 {
+                out.push(b'/');
+            }
+            out.extend_from_slice(comp);
+        }
+        if out.is_empty() {
+            out.push(b'.');
+        }
+        let len = i64::try_from(out.len()).unwrap();
+        let dst = align_rt_alloc(len);
+        unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst, out.len()) };
+        AlignStr { ptr: dst, len }
+    }
     fn join(a: &str, b: &str) -> String {
         let (ap, al) = view_of(a);
         let (bp, bl) = view_of(b);
@@ -16484,6 +16558,100 @@ mod tests {
         assert_eq!(normalize("a/b/../.."), ".");
         assert_eq!(normalize("a/../../b"), "../b");
         assert_eq!(normalize("/usr/./local/../bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn path_normalize_direct_fill_matches_staged_reference() {
+        let mut cases = vec![
+            "界/./α/../β".to_string(),
+            format!("/{}/../../終", "深/".repeat(1024)),
+            format!("{}{}", "../".repeat(1024), "leaf"),
+            format!("{}{}", "a/".repeat(1024), "../".repeat(1024)),
+        ];
+        let atoms = ["", ".", "..", "a", "bb", "界"];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..1000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut path = if case % 3 == 0 { "/".to_string() } else { String::new() };
+            for i in 0..(state as usize % 24) {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if i > 0 || !path.is_empty() {
+                    path.push_str(if state & 1 == 0 { "/" } else { "//" });
+                }
+                path.push_str(atoms[((state >> 32) as usize) % atoms.len()]);
+            }
+            cases.push(path);
+        }
+        for path in cases {
+            let expected = owned_str(staged_normalize_reference(&path));
+            assert_eq!(normalize(&path), expected, "path {path:?}");
+        }
+    }
+
+    /// Manual allocation-inclusive adoption probe for the one-buffer normalizer. Run with:
+    ///
+    /// `cargo test -p align_runtime --release path_normalize_direct_fill_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn path_normalize_direct_fill_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn run(path: &str, direct: bool) -> u64 {
+            let out = if direct {
+                unsafe { align_rt_path_normalize(path.as_ptr(), path.len() as i64) }
+            } else {
+                staged_normalize_reference(path)
+            };
+            let checksum = out.len as u64
+                ^ unsafe { *out.ptr as u64 }
+                ^ unsafe { *out.ptr.add(out.len as usize - 1) as u64 };
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            checksum
+        }
+
+        fn time(path: &str, direct: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(run)(black_box(path), black_box(direct));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        let cases = [
+            ("normal-short", "alpha/beta/gamma".to_string()),
+            ("mixed-short", "a/./b/../c".to_string()),
+            ("deep-normal", (0..256).map(|i| format!("c{i}")).collect::<Vec<_>>().join("/")),
+            ("deep-pop", format!("{}leaf/{}", "a/".repeat(256), "../".repeat(192))),
+        ];
+        println!("path.normalize direct fill (median of 9, allocation-inclusive ns/op):");
+        println!(" shape        | bytes | staged | direct | staged/direct");
+        for (shape, path) in cases {
+            let iters = if path.len() <= 32 { 100_000 } else { 2_000 };
+            let mut staged = Vec::with_capacity(9);
+            let mut direct = Vec::with_capacity(9);
+            for trial in 0..9 {
+                if trial % 2 == 0 {
+                    staged.push(time(&path, false, iters));
+                    direct.push(time(&path, true, iters));
+                } else {
+                    direct.push(time(&path, true, iters));
+                    staged.push(time(&path, false, iters));
+                }
+            }
+            assert_eq!(owned_str(staged_normalize_reference(&path)), normalize(&path));
+            let staged = median(staged);
+            let direct = median(direct);
+            println!("{shape:12} | {:5} | {staged:6.2} | {direct:6.2} | {:13.2}x", path.len(), staged / direct);
+        }
     }
 
     #[test]

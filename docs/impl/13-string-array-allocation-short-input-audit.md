@@ -59,8 +59,8 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `builder.to_string()` | allocator-compatible grow buffer transfers into owned result | **SHIPPED 2026-07-16**; no final allocation/copy |
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
 | `chunks(n)` | direct `.len()` / `[i]` are virtual; stored and pipeline values materialize | **SHIPPED 2026-07-16** for direct consumers |
-| str-key group/dictionary | output buffers exist, but runtime stages in extra Vecs then copies | **CONFIRMED P1** for single aggregates/dictionary |
-| `path.normalize` | component Vec + output Vec + final malloc/copy | **CONFIRMED P1** direct-final-buffer opportunity |
+| str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
+| `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
 | sorting | stable O(n log n), but allocates unused merge scratch at tiny N and ignores ordered runs | **MEASURED P1** adaptive total-order path in document 12; keep insertion base case |
@@ -400,18 +400,20 @@ Do not change `array<string>` representation or introduce a shared hidden slab h
 ownership is observable through Move/drop and the generic deep-free path; a slab requires a distinct
 owner representation.
 
-### 6.5 CONFIRMED P1 — normalize directly into the final buffer
+### 6.5 SHIPPED 2026-07-16 — normalize directly into the final buffer
 
-`path.normalize` creates a component `Vec<&[u8]>`, constructs an output `Vec<u8>`, then allocates and
-copies into the Align-owned result
-([runtime](../../crates/align_runtime/src/lib.rs#L6555)). Normalized output fits
-`max(input_len, 1)`. A one-pass final-buffer implementation can append ordinary components and pop
-the last output component for `..`, scanning back to the preceding separator. Removed bytes are not
-rescanned indefinitely, so the operation remains linear without a second component allocation.
+`path.normalize` now allocates the Align-owned result once at the proven `max(input_len, 1)` upper
+bound. The initialized prefix is the component stack: ordinary components append directly and `..`
+rewinds to the preceding separator. Bytes removed by a pop are not scanned again, so the operation
+remains linear without either the old component `Vec<&[u8]>`, output `Vec<u8>`, or final full copy.
 
-Gate short paths, deep paths, repeated `..`, root clamping, repeated separators, and long UTF-8
-components. Require one payload allocation, zero final full-output copy, byte-identical output, and
-no more than 3% regression for already-normal short paths.
+A staged-oracle differential gate covers 1,000 generated shapes, short/deep paths, repeated `..`,
+root clamping, repeated separators, and long UTF-8 components. The checked-in ignored release probe
+(balanced median of nine, allocation-inclusive) measured 2.30x for an already-normal 16-byte path,
+1.86x for a mixed 10-byte path, and 1.43x for 1,169 bytes/256 normal components. The disclosed
+negative shape — 256 appended components followed by 192 pops — was 0.77x because the direct form
+writes components that a staging stack later discards; this does not affect the short-path adoption
+gate but remains the explicit worst-case tradeoff of the one-allocation representation.
 
 ### 6.6 MEASURED — repeated-needle plan hoisting and JSON escape scan
 
@@ -642,7 +644,7 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | template in arena | grow buffer + arena | 1 grow→arena | direct arena/sink fill after ownership settlement |
 | template outside arena | grow buffer | 0 | keep zero-copy owned freeze + scoped free |
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
-| `path.normalize` | components + output Vec + final | output Vec→final | one final allocation/direct fill |
+| `path.normalize` | 1 exact-upper-bound final | 0 | shipped direct fill |
 | `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
 | Base64/hex encode | Vec + final | Vec→final | document 12 exact destination |
 | JSON decoded string field | 0 per field | 0 | keep zero-copy view |
@@ -723,7 +725,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 2. ~~Virtualize direct-consumer `chunks`.~~ **DONE 2026-07-16** for immediate `.len()` and index;
    stored/escaping and pipeline/`par_map` values retain the owned materialized representation.
 3. ~~Write single str-group and dictionary outputs directly.~~ **DONE 2026-07-16.**
-4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.
+4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads. **`path.normalize` DONE
+   2026-07-16**; `read_dir` and DNS remain.
 5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
 
 ### P3 — larger portfolios after measurement
