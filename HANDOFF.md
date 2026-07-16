@@ -8,7 +8,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (fifth update this day), **OWNED BUILDER FREEZE IS ALLOCATOR-COMPATIBLE
+_Last updated: 2026-07-16 (sixth update this day), **DIRECT `chunks` LENGTH AND INDEX CONSUMERS ARE
+VIRTUAL.** Immediate `.chunks(n).len()` now computes a guarded ceiling count in MIR, and immediate
+`.chunks(n)[i]` constructs exactly one bounds-checked source sub-view. Neither path allocates or
+fills the owned `{ptr,len}` header array. Dynamic, zero, and negative widths preserve the runtime's
+canonical empty result without dividing by zero; a zero-width direct index takes the normal bounds
+failure path. Fresh owned sources retain their synthetic owner through a returned chunk view, while
+the scalar length path drops that owner immediately after consumption. Stored/escaping values and
+pipeline/`par_map` consumers deliberately retain `align_rt_chunks` and its existing owned
+representation. Raw-IR and runtime gates pin the allocation-free direct shapes, the materialized
+fallback, exact/partial/empty results, bounds failure, and owned-temporary lifetime. The complete
+workspace is green (**2181 total = 2178 passed + three ignored manual probes**) and workspace clippy
+passes with warnings denied. This work is in PR **#478**, based on squash-merged PR #477
+(`c2f9d95`). **Next recommended P2:** write single str-key group and dictionary outputs directly
+into their already-allocated result buffers. The aarch64 UTF-8 portability measurement remains
+deferred. Previous update: 2026-07-16 (fifth update this day), **OWNED BUILDER FREEZE IS ALLOCATOR-COMPATIBLE
 AND ZERO-COPY.** `BuilderBuf` now grows with the same C `malloc/realloc/free` family as Align owned
 strings, so `to_string()` transfers its pointer instead of allocating and copying a second payload;
 this does not assume Rust's global allocator matches libc on non-glibc targets. Checked geometric
@@ -23,7 +37,8 @@ arena-owned storage. Pointer-identity gates cover boxed/stack headers, exact cap
 growth. A checked-in allocation-inclusive release probe (balanced median of nine) measured
 1.59x-2.81x over the removed copy freeze from 64 B through 1 MiB, with both exact and capacity-zero
 growth. The complete workspace is green (**2178 total = 2175 passed + three ignored manual probes**)
-and workspace clippy passes with warnings denied. This work is in PR **#477**, based on
+and workspace clippy passes with warnings denied. This work was squash-merged as PR **#477**
+(`c2f9d95`), based on
 squash-merged PR #476 (`5b96d5c`). **Next recommended P2:** virtualize direct-consumer
 `chunks`, starting with `.len()` and direct index while stored/escaping results keep materializing.
 The aarch64 UTF-8 portability measurement remains deferred. Previous update: 2026-07-16 (fourth

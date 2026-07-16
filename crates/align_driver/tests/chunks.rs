@@ -54,6 +54,32 @@ fn chunks_over_owned_array() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n14\n");
 }
 
+#[test]
+fn direct_chunks_consumers_are_semantically_equivalent() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn count(n: i64) -> i64 {\n  xs := [1, 2, 3, 4, 5]\n  return xs.chunks(n).len()\n}\nfn id(x: i64) -> i64 = x\nfn none(x: i64) -> bool = false\nfn main() -> Result<(), Error> {\n  xs := [1, 2, 3, 4, 5]\n  print(count(2))\n  print(xs.chunks(2)[0].sum())\n  print(xs.chunks(2)[2].sum())\n  print(count(0))\n  print(count(-2))\n  print([1, 2, 3].map(id).to_array().chunks(2)[0].sum())\n  print([1, 2].where(none).to_array().chunks(2).len())\n  return Ok(())\n}\n";
+    let out = build_and_run("ch-direct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n0\n0\n3\n0\n");
+}
+
+#[test]
+fn direct_chunks_zero_size_index_aborts() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> i32 {\n  return [1, 2, 3].chunks(0)[0].len() as i32\n}\n";
+    let out = build_and_run("ch-direct-zero-index", src);
+    assert_ne!(out.status.code(), Some(0), "indexing the canonical empty chunks result must abort");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("index out of bounds"),
+        "expected an out-of-bounds message, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // --- diagnostics ---
 
 #[test]

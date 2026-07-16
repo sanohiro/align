@@ -58,7 +58,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
 | `builder.to_string()` | allocator-compatible grow buffer transfers into owned result | **SHIPPED 2026-07-16**; no final allocation/copy |
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
-| `chunks(n)` | always materializes `array<slice<T>>` headers | **CONFIRMED P1** for direct consumers |
+| `chunks(n)` | direct `.len()` / `[i]` are virtual; stored and pipeline values materialize | **SHIPPED 2026-07-16** for direct consumers |
 | str-key group/dictionary | output buffers exist, but runtime stages in extra Vecs then copies | **CONFIRMED P1** for single aggregates/dictionary |
 | `path.normalize` | component Vec + output Vec + final malloc/copy | **CONFIRMED P1** direct-final-buffer opportunity |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
@@ -537,13 +537,13 @@ The shipped gate required 0–4 elements to lose one allocation and improve by a
 more than 3% regression in the 1K/1M append and push controls. Pin optimized IR for no per-element
 call only in the future direct-fill/bulk case — header placement alone cannot remove it.
 
-### 8.2 CONFIRMED P1 — virtualize `chunks` for direct consumers
+### 8.2 SHIPPED 2026-07-16 — virtual `chunks` for direct `.len()` and index
 
 `align_rt_chunks` allocates `ceil(len/n) * 16` bytes and fills every `{ptr,len}` header
-([runtime](../../crates/align_runtime/src/lib.rs#L1348)). MIR materializes this before `.len`, index,
-or a following pipeline ([MIR](../../crates/align_mir/src/lib.rs#L2918)). Thus one short chunk pays a
-heap allocation, while `chunks(1)` on a large input writes an entire metadata array that the next
-loop immediately rereads.
+([runtime](../../crates/align_runtime/src/lib.rs#L1348)). The stored-value and pipeline paths still
+use that representation. Before this slice, even an immediate `.len()` or index materialized it, so
+one short chunk paid a heap allocation and `chunks(1)` wrote an entire metadata array that its next
+consumer immediately reread.
 
 Represent a nonescaping chunk source as `(base, source_len, chunk_len, chunk_count)` and compute each
 view in SSA:
@@ -554,13 +554,20 @@ ptr   = base + start * element_size
 len   = min(chunk_len, source_len - start)
 ```
 
-Fold `.len()` to `chunk_count`, direct index to one view, and feed pipeline/par_map consumers without
-headers. A bound `cs := xs.chunks(n)` may continue to materialize until the language question in
-section 10 is settled. Gate on allocation 1→0, no `N*16` header stores, source-region correctness,
-and byte-identical final partial chunks. Document 11's later explicit-parallel result elision is
-related but does not by itself remove these producer headers.
+MIR now folds `.len()` to `chunk_count` and direct index to one view. Both guard `n <= 0` before any
+division and preserve the runtime's canonical empty result; index then uses the ordinary bounds-fail
+path. Fresh owned sources retain their synthetic owner through the returned slice, while scalar
+`.len()` drops it after consumption. Raw-IR gates require no materializer/allocation and no header
+fill for both direct shapes, and retain `align_rt_chunks` for `cs := xs.chunks(n)`. Runtime gates pin
+exact and partial chunks, `n = 0`, bounds failure, and an owned temporary source.
 
-**Measured (2026-07-14, same host/profile):** for the direct consumer `chunks(k).len()`, current
+A bound/escaping value and pipeline or `par_map` consumer deliberately continue to materialize.
+Virtualizing those iteration sources needs its own end-to-end work/effect-order gate; it is not
+required for the direct-consumer result shipped here. The language question in section 10 remains
+open, and document 11's later explicit-parallel result elision is related but does not itself remove
+these producer headers.
+
+**Measured (2026-07-14, same host/profile):** for the direct consumer `chunks(k).len()`, then-current
 materialization versus the virtual count formula took 613.6 ns versus 1.5 ns for 1,024 headers
 (`k=1`, 396x), and 37.9 us versus 1.5 ns for 65,536 headers (about 25,000x). Even one header was
 9.4 ns versus 1.6 ns. With `k=64`, 1,024 source elements/16 headers still measured 17.2 ns versus
@@ -634,7 +641,8 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | `to_array` | 1 output | source→output fill | keep; donation only for proven unique temporary |
 | `partition` | 2 outputs | one store per source element | keep baseline |
 | `array_builder.build()` | grow payload (Box only when escaping) | 0 | keep nonescaping header elision + freeze |
-| `chunks` | 1 header array | header fill then consumer read | virtualize when not stored |
+| direct `chunks(...).len()` / `[i]` | 0 | 0 / one direct source view | shipped virtual lowering |
+| stored/pipeline `chunks` | 1 header array | header fill then consumer read | retain; measure fused iteration separately |
 | str-key single group | 2 result + HashMap + 2 staging Vecs | 2 staging→result | direct result accumulation |
 
 ## 10. Questions for Claude Code — not decisions
@@ -702,7 +710,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 ### P2 — remove proven staging
 
 1. ~~Make owned builder freeze allocator-compatible and zero-copy.~~ **DONE 2026-07-16.**
-2. Virtualize direct-consumer `chunks`.
+2. ~~Virtualize direct-consumer `chunks`.~~ **DONE 2026-07-16** for immediate `.len()` and index;
+   stored/escaping and pipeline/`par_map` values retain the owned materialized representation.
 3. Write single str-group and dictionary outputs directly.
 4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.
 5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
@@ -732,7 +741,8 @@ IR gates:
 - no allocation for static-only template (**shipped and regression-pinned 2026-07-15**),
   `str.bytes()`, string subview, slice, trim, or direct chunk `.len()`;
 - no `*_free(null)` for definitely moved slots (**shipped and regression-pinned 2026-07-15**);
-- direct-consumer chunks contain no header allocation or `N*16` header-store loop;
+- direct-consumer chunks contain no header allocation or `N*16` header-store loop (**shipped and
+  regression-pinned 2026-07-16**);
 - bulk/direct array builder contains no per-element push call;
 - str-group single aggregate contains no accumulator/representative staging copies;
 - mapped materializers retain `min.iters.check` and a scalar short path;

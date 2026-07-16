@@ -3512,16 +3512,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayChunks { source, n, elem } => {
             // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
-            let src = match source.ty {
-                Ty::Slice(_) => lower_expr(b, source),
-                Ty::DynArray(_) => lower_borrowed_owned(b, source),
-                _ => {
-                    let (slot, len) = array_source_slot(b, source);
-                    let sv = b.fresh_value(Ty::Slice(scalar_of(*elem)));
-                    b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, len)));
-                    Operand::Value(sv)
-                }
-            };
+            let src = lower_chunks_source(b, source, *elem);
             let n_op = lower_expr(b, n);
             let v = b.fresh_value(e.ty);
             inherit_borrow_owners(b, v, [&src]);
@@ -3535,6 +3526,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Len(inner) => {
+            if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
+                // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
+                // materialized, but avoid allocating/filling headers for this scalar consumer.
+                let src = lower_chunks_source(b, source, *elem);
+                let n = lower_expr(b, n);
+                let src_len = b.fresh_value(i64_ty());
+                b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
+                let count = lower_chunks_count(b, Operand::Value(src_len), n);
+                drop_borrow_owners(b, &src);
+                return count;
+            }
             // `str`/`slice` carry the length in their `{ ptr, len }` view.
             let sv = lower_borrowed_owned(b, inner);
             let v = b.fresh_value(e.ty);
@@ -4042,6 +4044,79 @@ fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) ->
     Operand::Const(Const::Unit)
 }
 
+/// Lower a `chunks` source to its borrowed `{ptr,len}` view without allocating chunk headers.
+/// Fresh owned sources retain their synthetic owner through the returned operand.
+fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand {
+    match source.ty {
+        Ty::Slice(_) => lower_expr(b, source),
+        Ty::DynArray(_) => lower_borrowed_owned(b, source),
+        _ => {
+            let (slot, len) = array_source_slot(b, source);
+            let sv = b.fresh_value(Ty::Slice(scalar_of(elem)));
+            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, len)));
+            Operand::Value(sv)
+        }
+    }
+}
+
+/// Compute the runtime `chunks` count without materializing its header array. The CFG guard keeps
+/// the division defined for `n <= 0`, matching `align_rt_chunks`'s canonical empty result.
+fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand {
+    if let Operand::Const(Const::Int(value, _)) = &n
+        && *value <= 0
+    {
+        return Operand::Const(Const::Int(0, i64_ty()));
+    }
+
+    let result = b.new_slot(i64_ty());
+    b.push(Stmt::Store(result, Operand::Const(Const::Int(0, i64_ty()))));
+    let src_positive = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        src_positive,
+        Rvalue::Bin(BinOp::Gt, src_len.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+    ));
+    let valid = if matches!(n, Operand::Const(Const::Int(_, _))) {
+        Operand::Value(src_positive)
+    } else {
+        let n_positive = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            n_positive,
+            Rvalue::Bin(BinOp::Gt, n.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+        ));
+        let valid = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            valid,
+            Rvalue::Bin(BinOp::And, Operand::Value(src_positive), Operand::Value(n_positive)),
+        ));
+        Operand::Value(valid)
+    };
+
+    let calculate = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Branch(valid, calculate, exit));
+
+    b.cur = calculate;
+    let minus_one = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        minus_one,
+        Rvalue::Bin(BinOp::Sub, src_len, Operand::Const(Const::Int(1, i64_ty()))),
+    ));
+    let quotient = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(quotient, Rvalue::Bin(BinOp::Div, Operand::Value(minus_one), n)));
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        count,
+        Rvalue::Bin(BinOp::Add, Operand::Value(quotient), Operand::Const(Const::Int(1, i64_ty()))),
+    ));
+    b.push(Stmt::Store(result, Operand::Value(count)));
+    b.terminate(Term::Goto(exit));
+
+    b.cur = exit;
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(count, Rvalue::Load(result)));
+    Operand::Value(count)
+}
+
 /// `recv[index]` → a bounds-checked scalar element load. A scalar `array<T>` / `slice` loads
 /// through its `{ptr,len}` value (`SliceIndex`); a fixed stack `array` loads through its slot
 /// (`Index`).
@@ -4069,6 +4144,46 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         return Operand::Value(v);
     }
     let idx = lower_expr(b, index);
+    if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
+        // A direct `.chunks(n)[i]` computes exactly one borrowed sub-view. Stored/escaping chunk
+        // arrays and pipeline consumers retain the materialized representation.
+        let src = lower_chunks_source(b, source, *elem);
+        let n = lower_expr(b, n);
+        let src_len = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
+        let count = lower_chunks_count(b, Operand::Value(src_len), n.clone());
+        emit_bounds_check(b, &idx, count);
+
+        let start = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(start, Rvalue::Bin(BinOp::Mul, idx, n.clone())));
+        let remaining = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(
+            remaining,
+            Rvalue::Bin(BinOp::Sub, Operand::Value(src_len), Operand::Value(start)),
+        ));
+        let short = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            short,
+            Rvalue::Bin(BinOp::Lt, Operand::Value(remaining), n.clone()),
+        ));
+        let chunk_len = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(
+            chunk_len,
+            Rvalue::Select { cond: Operand::Value(short), a: Operand::Value(remaining), b: n },
+        ));
+        let chunk = b.fresh_value(elem_ty);
+        b.push(Stmt::Let(
+            chunk,
+            Rvalue::SubSlice {
+                base: src.clone(),
+                start: Operand::Value(start),
+                len: Operand::Value(chunk_len),
+                elem: *elem,
+            },
+        ));
+        inherit_borrow_owners(b, chunk, [&src]);
+        return Operand::Value(chunk);
+    }
     // The length, and whether the element loads from a `{ptr,len}` value or a stack slot.
     enum Src {
         Slice(Operand),
