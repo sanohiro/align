@@ -1154,8 +1154,10 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
         let n = unsafe { recvfrom(fd, dst as *mut core::ffi::c_void, b.cap, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
         if n >= 0 {
             // `recvfrom` initialized exactly the returned prefix (possibly truncated to `cap`).
-            unsafe { b.data.set_len(n as usize) };
-            b.len = n as usize;
+            let n = n as usize;
+            assert!(n <= b.cap, "recvfrom returned more bytes than its destination length");
+            unsafe { b.data.set_len(n) };
+            b.len = n;
             return n as i64;
         }
         let e = std::io::Error::last_os_error();
@@ -5460,8 +5462,10 @@ pub unsafe extern "C" fn align_rt_io_file_pread(f: *mut RwFile, b: *mut Buffer, 
         let n = unsafe { pread(fd, dst as *mut core::ffi::c_void, b.cap, off) };
         if n >= 0 {
             // `pread` initialized exactly the returned prefix; EOF publishes an empty Vec.
-            unsafe { b.data.set_len(n as usize) };
-            b.len = n as usize;
+            let n = n as usize;
+            assert!(n <= b.cap, "pread returned more bytes than its destination length");
+            unsafe { b.data.set_len(n) };
+            b.len = n;
             return n as i64;
         }
         let e = std::io::Error::last_os_error();
