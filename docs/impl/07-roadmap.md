@@ -2325,7 +2325,13 @@ because thin-link always runs (measured ~70 µs at spike scale — the one cheap
 step) and computes fresh import lists; a dep private-body edit therefore misses exactly the
 importing units' backends, preserving the M15 headline win where ThinLTO permits it. Determinism
 pinned by canonical sorted ingestion (import decisions verified order-independent after edge
-sort) + a build-twice byte-identity gate. **(c) Flag = opt-in `--thin-lto`**, legal only on
+sort) + a build-twice byte-identity gate. [**S2 correction (2026-07-16):** the backend key also pins
+this unit's OUTBOUND export set (its cross-module-referenced locals) — entry-3 promotes a unit's own
+locals per its export flags, so an imported-FROM leaf still rewrites its object; keying inbound-only
+would let a backend hit serve a stale-promotion object, caught by the cold-vs-hit byte-identity gate.
+And the digest is NOT a field inside the shared codegen key: prelink and backend are separate phase
+keys with their own CAS namespaces (`prelink`/`thinbackend`), which is why the M15 reserved
+`cross_unit_opt_digest` field was removed outright at S2 — see "ThinLTO S2 SHIPPED".] **(c) Flag = opt-in `--thin-lto`**, legal only on
 `release`/`fast` (the `--rt-lto` precedent), never folded into a profile in v1. **(d) N=1 skips
 all three phases** → byte-identical to today; the flag-off path stays byte-identical.
 **(e) Preserve set fail-closed in v1** = {`main`} ∪ `--export` ∪ all `pub` fns; cross-unit `pub`
@@ -2393,8 +2399,13 @@ export set is a **correctness-forced refinement** of the settled "inbound import
 its export flags (a leaf that is imported-FROM still rewrites its object), so a backend hit is only
 provably valid if the key pins the unit's outbound exports too — proven by the cold-vs-hit
 byte-identity gate. Cached artifact = the final object under the CAS `thinbackend` namespace.
-`CACHE_KEY_FORMAT_VERSION` bumped 1→2 (old empty-digest S3a entries fall out). `FirstDiff` extended
-with `PrelinkInput` (own code changed) + `CrossUnitImports` (inbound/outbound/import-source changed);
+`CACHE_KEY_FORMAT_VERSION` bumped 1→2 (old S3a entries fall out) and `MANIFEST_FORMAT_VERSION` 1→2
+(the codegen-key wire layout changed). The M15-reserved `CodegenKey::cross_unit_opt_digest` field +
+its `FirstDiff::CrossUnitOpt` reason were **removed outright** (no-dead-code): ThinLTO composes via
+the separate phase keys/namespaces above, not by populating a shared-key digest, so the reserved
+field's recorded "ThinLTO later populates it" story is corrected at doc-10 §6.2 and the two roadmap
+paragraphs. `FirstDiff` instead gains `PrelinkInput` (own code changed) + `CrossUnitImports`
+(inbound/outbound/import-source changed);
 `CacheStage` extended with the two phases; `--cache-stats` prints per-phase per-unit lines + a
 per-phase summary. Parallelism = the S3 `std::thread::scope` atomic-claim pattern (fresh `Context` per
 prelink, fresh `Context`/`TargetMachine` per backend), one claim pass per phase with the serial
@@ -2696,7 +2707,10 @@ implementation NOT started).** Per-question decisions:
    The artifact anticipates ThinLTO with no format break: reserved (v1-absent) bitcode +
    thin-summary envelope parts, plus an explicitly-keyed **cross-unit-opt input digest in the
    codegen key that is EMPTY in v1** (ThinLTO later populates it, deliberately trading hit
-   rate for cross-module inlining). **`--rt-lto` under multi-unit v1 merges the baked bitcode
+   rate for cross-module inlining). [**S2 correction (2026-07-16):** ThinLTO did NOT populate this
+   reserved field — it composes via separate `prelink`/`thinbackend` phase keys + CAS namespaces
+   (structurally stronger toggle isolation), so the empty `cross_unit_opt_digest` field was removed
+   outright at S2. See "ThinLTO S2 SHIPPED".] **`--rt-lto` under multi-unit v1 merges the baked bitcode
    per unit** into each unit's raw module before that unit's single opt run (hot loops live in
    arbitrary units; merged bodies are internal and DCE'd post-inline, so duplication is
    negligible — the "merge once" shape returns when a final-link opt run exists).

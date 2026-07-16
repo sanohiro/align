@@ -51,8 +51,10 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 pub const CACHE_KEY_FORMAT_VERSION: u32 = 2;
 
 /// The manifest wire-format version. Bump on ANY change to the encoded byte layout; an old manifest
-/// then fails closed on decode (treated as a miss, its bytes unreferenced).
-const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// then fails closed on decode (treated as a miss, its bytes unreferenced). **Bumped to 2 at ThinLTO
+/// S2**: the codegen-key layout lost its dead `cross_unit_opt_digest` field (ThinLTO composes via the
+/// separate `prelink`/`thinbackend` phase keys instead), and the two ThinLTO manifests were added.
+const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
@@ -112,8 +114,6 @@ pub struct CodegenKey {
     pub rt_lto: bool,
     /// #11 (cont.) merged runtime-bitcode digest (present iff `rt_lto`).
     pub rt_lto_digest: Option<Hash128>,
-    /// #12 the (empty-in-v1) cross-unit-opt digest.
-    pub cross_unit_opt_digest: Vec<u8>,
     /// The unit's module path — part of the slot identity (different units get different slots) and a
     /// component of the full key (harmless: distinct units already differ by `impl_hash`).
     pub unit: String,
@@ -160,7 +160,6 @@ pub enum FirstDiff {
     Exports,
     Profile,
     RtLto,
-    CrossUnitOpt,
     /// (ThinLTO backend phase) the unit's OWN prelink bitcode content digest changed — the unit's own
     /// code changed, so its imported/optimized/emitted object must be rebuilt.
     PrelinkInput,
@@ -188,7 +187,6 @@ impl FirstDiff {
             FirstDiff::Exports => "export set",
             FirstDiff::Profile => "profile",
             FirstDiff::RtLto => "rt-lto mode",
-            FirstDiff::CrossUnitOpt => "cross-unit-opt",
             FirstDiff::PrelinkInput => "own code changed",
             FirstDiff::CrossUnitImports => "cross-unit imports changed",
             FirstDiff::CorruptEntry => "corrupt entry rebuilt",
@@ -233,9 +231,6 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
     }
     if stored.rt_lto != current.rt_lto || stored.rt_lto_digest != current.rt_lto_digest {
         return FirstDiff::RtLto;
-    }
-    if stored.cross_unit_opt_digest != current.cross_unit_opt_digest {
-        return FirstDiff::CrossUnitOpt;
     }
     if stored.cache_format_version != current.cache_format_version {
         return FirstDiff::CacheFormatVersion;
@@ -713,7 +708,6 @@ fn write_full_key(w: &mut Writer, k: &CodegenKey) {
     w.str(&k.llvm_version);
     w.bool(k.rt_lto);
     w.opt_h128(k.rt_lto_digest);
-    w.bytes(&k.cross_unit_opt_digest);
     w.str(&k.unit);
 }
 
@@ -833,7 +827,6 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
     let llvm_version = r.str()?;
     let rt_lto = r.bool()?;
     let rt_lto_digest = r.opt_h128()?;
-    let cross_unit_opt_digest = r.bytes()?;
     let unit = r.str()?;
     let blob_digest = r.h128()?;
     r.finish()?;
@@ -858,7 +851,6 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
             llvm_version,
             rt_lto,
             rt_lto_digest,
-            cross_unit_opt_digest,
             unit,
         },
         blob_digest,
@@ -1421,7 +1413,6 @@ mod tests {
             llvm_version: "22.1.8".to_string(),
             rt_lto: false,
             rt_lto_digest: None,
-            cross_unit_opt_digest: Vec::new(),
             unit: "main".to_string(),
         }
     }
@@ -1517,9 +1508,6 @@ mod tests {
         k.rt_lto = true;
         k.rt_lto_digest = Some(Hash128 { lo: 7, hi: 7 });
         assert_eq!(first_diff(&base, &k), FirstDiff::RtLto);
-        let mut k = base.clone();
-        k.cross_unit_opt_digest = vec![1];
-        assert_eq!(first_diff(&base, &k), FirstDiff::CrossUnitOpt);
         let mut k = base.clone();
         k.cache_format_version += 1;
         assert_eq!(first_diff(&base, &k), FirstDiff::CacheFormatVersion);

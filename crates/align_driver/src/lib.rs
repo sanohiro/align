@@ -667,7 +667,6 @@ pub fn build_codegen_key(
         llvm_version: align_codegen_llvm::llvm_version(),
         rt_lto,
         rt_lto_digest,
-        cross_unit_opt_digest: Vec::new(),
         unit: unit.to_string(),
     })
 }
