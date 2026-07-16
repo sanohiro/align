@@ -73,8 +73,8 @@ After those are closed, the highest-value performance refinements from this audi
    separate new measure-first probe.
 3. Evaluate SIMD block compaction for materializing `where`/`partition`, separately from reducing
    `where`; do not preserve the current unsafe speculative-execution trick merely to get vector code.
-4. ~~Complete the already-planned reader/`io.copy` uninitialized-buffer work.~~ **SHIPPED
-   2026-07-16.** Next remove the redundant URL/request copy in `http.get_many`; syscall-dispatched
+4. ~~Complete the already-planned reader/`io.copy` uninitialized-buffer work and remove the
+   redundant URL/request copy in `http.get_many`.~~ **SHIPPED 2026-07-16.** Syscall-dispatched
    `io.copy` remains a separate throughput fast path.
 5. Add the measured total-order stable-sort fast path: avoid unused tiny scratch, detect a fully
    ordered input, and skip comparison-merging adjacent runs whose boundary is already ordered.
@@ -930,7 +930,7 @@ whose chunk-vector growth may free old metadata.
 | buffered `reader.read_line` | `memchr` finds newline; one payload append per lookahead span | 64 KiB lookahead; long lines may append several spans and reallocate while growing | **GOOD** baseline; scoped zero-copy line callback is already planned if copying dominates |
 | `io.copy` | one raw-capacity 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB shared-reader/shared-writer loop | Memory-bounded, no pre-read zero-fill, and **byte-correct after buffered lookahead** (fixed §3.6) |
 | `file.pread/pwrite` | one synchronous positional syscall/loop | caller-selected buffer size; pwrite handles partial writes | Correct, but blocks the calling OS thread; no batch/vectored surface today |
-| `http.get_many` | per-request allocations matter | bounded dedicated blocking threads overlap latency; input-order slots | Correct concurrency shape; request construction has one removable copy |
+| `http.get_many` | prebuilt immutable requests copy each URL once | bounded dedicated blocking threads overlap latency; input-order slots | **GOOD**; redundant per-worker URL clone removed 2026-07-16 |
 
 Small writes should go through the explicit buffered writer or a builder followed by one write. The
 measured difference from flushing each tiny print is hundreds-fold; adding SIMD to the formatting loop
@@ -990,7 +990,7 @@ syscall paths now share `Buffer::prepare_uninit_window`, including the release-b
 `pread` now calls POSIX `pread(2)` directly instead of forming a full initialized `&mut [u8]` for
 `FileExt::read_at`, preserving the caller's file offset, short-read/EOF behavior, and EINTR retry.
 
-### 7.4 New small allocation/copy cleanup in `http.get_many`
+### 7.4 SHIPPED 2026-07-16 — small allocation/copy cleanup in `http.get_many`
 
 The batch first creates `Vec<String>`, then each worker clones `urls[i]` into a new `HttpRequest` even
 though `http_client_perform` only borrows the request. Prebuild one owned `HttpRequest` per URL and let
@@ -1001,6 +1001,22 @@ Measure 1/8/64/1K URLs with short and long URLs, zero-latency loopback and 10 ms
 least 10% improvement/allocation reduction in the zero-latency small-response case and no more than 3%
 latency/throughput regression in the network-bound case. Batch cursor/slot atomics and false sharing
 belong to the document-11 scheduler methodology, not this small cleanup.
+
+The batch now constructs one immutable `HttpRequest` per borrowed URL before entering the scoped
+workers. A uniquely claimed index borrows `requests[i]`; the former intermediate `Vec<String>` and
+worker-local URL clone are gone. This removes exactly one String allocation and payload copy per URL
+without changing the claim cursor, input-order response slots, shared keepalive pool, lowest-index
+error selection, or run-to-completion cleanup.
+
+The checked-in balanced median-of-nine construction probe covers 1/8/64/1K URLs at 32 and 2,048
+bytes. The short 1/8 cases improved 62.7->50.1 ns (1.25x) and 393.9->333.3 ns (1.18x), while the
+larger request-vector initialization made the isolated 64/1K construction controls 0.94x/0.92x;
+the allocation reduction remains exactly N per N-URL batch. End-to-end old/new loopback controls at
+1/8/64/1K URLs stayed flat or improved through 64 and moved 9.5->9.7 ms at 1K with zero injected
+latency (2.1%); the corresponding 10 ms-latency results were 10.5/11.1/42.4/656.3 ms before and
+10.5/11.2/42.4/655.8 ms after, all inside the 3% network-bound gate. The negative construction
+result is retained rather than generalized into a claim that prebuilding is faster at every batch
+size; the shipped reason is the per-entry allocation/copy removal with end-to-end non-regression.
 
 Vectored `preadv/pwritev` or a batch positional-I/O surface may be valuable for alignpack/database
 consumers, but there is no current repeated-block workload proving a language/API addition. Keep it as
@@ -1234,7 +1250,7 @@ of integer wrap.
 ### Slice P2 — earned throughput fast paths
 
 - syscall-dispatched `io.copy` after the portable buffered-reader oracle is fixed;
-- HTTP batch request-copy removal;
+- [x] HTTP batch request-copy removal (2026-07-16; prebuilt immutable requests, one URL allocation/copy removed per entry);
 - SIMD stream compaction only if its selectivity matrix passes;
 - reduction interleave hints/pass tuning only if equal-LLVM throughput evidence passes;
 - direct spawn-literal lowering after lifetime/record ABI work is stable.
