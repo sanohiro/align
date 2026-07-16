@@ -11,7 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// ThinLTO S0 feasibility spike (feature-gated; not wired into the driver).
+/// ThinLTO driver-facing surface (production): safe wrappers over the C++ shim's
+/// three summary-based entry points, plus the preserve-set / opt-level helpers.
+pub mod thinlto;
+
+/// ThinLTO S0 feasibility spike (feature-gated; historical S0 go/no-go probes).
 #[cfg(feature = "thinlto-spike")]
 pub mod thinlto_spike;
 
@@ -360,6 +364,42 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
     apply_size_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// Build one unit's **ThinLTO prelink bitcode** (`--thin-lto`, S1): identical module
+/// construction to [`emit_object`] (data layout / ABI / `--rt-lto` merge / size attrs),
+/// but instead of `write_object`'s opt+emit, hand the RAW module to the shim, which runs
+/// the ThinLTO pre-link pipeline, builds the module summary index, and writes
+/// summary-bearing bitcode to `out_bc`. The shim owns optimization from here (the driver
+/// must NOT also run `write_object`). `stable_id` is the module's chosen identity (the
+/// unit name), keyed consistently through the thin-link and backend phases. `rt_lto` is
+/// the baked `--thin-lto` + `--rt-lto` composition artifact (unchanged placement: merged
+/// into the raw module before the prelink pipeline), or `None`.
+pub fn emit_prelink_bc(
+    program: &Program,
+    out_bc: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: Option<&[u8]>,
+    stable_id: &str,
+) -> Result<(), CodegenError> {
+    let ctx = Context::create();
+    let module = ctx.create_module("align");
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
+    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
+    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    if let Some(rt) = rt_module {
+        link_in_rt_lto(&ctx, &module, rt)?;
+    }
+    apply_size_attrs(&ctx, &module, profile);
+    // The module (and its `ctx`) must outlive the shim call; `write_prelink_bc` writes the
+    // bitcode synchronously and returns before `module`/`ctx`/`tm` drop here.
+    // SAFETY: `module.as_mut_ptr()` is a live LLVMModuleRef in the process LLVM with a
+    // datalayout set by `build_module`.
+    unsafe {
+        thinlto::write_prelink_bc(module.as_mut_ptr(), stable_id, thinlto::ir_opt_level(profile), out_bc)
+    }
 }
 
 /// Parse the baked `--rt-lto` bitcode for [`emit_object`] / [`emit_llvm_ir`], turning a parse failure
