@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twentieth update this day), **NATIVE APPLE-SILICON BASE64 AND BASE64URL
+_Last updated: 2026-07-16 (twenty-first update this day), **NATIVE APPLE-SILICON HEX DISPATCHES TO
+NEON AT ITS INDEPENDENTLY MEASURED 16-BYTE CROSSOVER.** The checked-in balanced median-of-nine probe
+ran repeatedly on a native Apple M1 (`uname -m = arm64`, Rosetta translation flag 0). The first
+complete 16-byte NEON block improved core/allocation-inclusive time by 2.78-2.82x/1.39x, and the
+production-path 1..=64 allocation-inclusive geometric mean improved 1.30x. Larger controls measured:
+
+| Size | core / allocation-inclusive | candidate input throughput |
+|---:|---:|---:|
+| 1 KiB | 11.34-11.41x / 8.02-8.06x | 23.6-23.7 GB/s |
+| 1 MiB | 7.99-9.58x / 9.84-10.24x | 16.8-20.1 GB/s |
+| 64 MiB | 9.58-9.62x / 9.67-9.69x | 20.0-20.1 GB/s |
+
+The worst short dispatcher observations were 0.92x core at four bytes and 0.96x
+allocation-inclusive at fifteen bytes. Inputs below 16 bytes retain the scalar oracle; direct
+scalar/NEON differential tests cover every length through 4096, all alignments, and a page boundary.
+Production activation is therefore enabled. This completes the requested native ARM UTF-8,
+Base64/Base64url, and hex measurement set without adopting any unrelated future arm64 proposal. This
+work is on branch **`agent/arm64-hex-crossover`**, based on squash-merged Base64 PR **#492**
+(`514bf5d`). **Next:** final workspace validation, review, and merge. Previous update: 2026-07-16
+(twentieth update this day), **NATIVE APPLE-SILICON BASE64 AND BASE64URL
 DISPATCH TO NEON AT THEIR INDEPENDENTLY MEASURED 48-BYTE CROSSOVER.** The checked-in balanced
 median-of-nine probe ran repeatedly on a native Apple M1 (`uname -m = arm64`, Rosetta translation
 flag 0) for both the standard/padded and URL-safe/unpadded encoders. The first complete 48-byte NEON
