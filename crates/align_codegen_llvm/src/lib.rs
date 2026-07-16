@@ -19,6 +19,11 @@ pub mod thinlto;
 #[cfg(feature = "thinlto-spike")]
 pub mod thinlto_spike;
 
+/// Instrument-PGO S0 feasibility spike (feature-gated; go/no-go probes for the
+/// gen→profile→use round trip on a real Align binary).
+#[cfg(feature = "pgo-spike")]
+pub mod pgo_spike;
+
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};

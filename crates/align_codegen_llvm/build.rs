@@ -67,6 +67,14 @@ fn main() {
         .define("__STDC_FORMAT_MACROS", None)
         .define("__STDC_LIMIT_MACROS", None)
         .warnings(false);
+    // The instrument-PGO S0 spike (feature `pgo-spike`) compiles ONE extra shim
+    // entry (`align_pgo_run_pipeline`) guarded by `#ifdef ALIGN_PGO_SPIKE`. Without
+    // the feature the guard is off, so the shim object — and every default build —
+    // is byte-identical to before the spike (the PGO includes/APIs are not even
+    // parsed).
+    if std::env::var_os("CARGO_FEATURE_PGO_SPIKE").is_some() {
+        build.define("ALIGN_PGO_SPIKE", None);
+    }
     build.compile("align_thinlto_shim");
 
     // Link against the same dynamic libLLVM the workspace already uses, plus

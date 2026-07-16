@@ -421,3 +421,85 @@ extern "C" int align_thinlto_backend(
   }
   return 0;
 }
+
+// ===========================================================================
+// Instrument-PGO S0 spike entry (feature `pgo-spike`; compiled ONLY when
+// build.rs passes -DALIGN_PGO_SPIKE, so default builds are byte-identical).
+// ===========================================================================
+//
+// Why a shim at all: llvm-sys 221 exposes NO PGO surface. LLVMPassBuilderOptions
+// has setters for LTO/loop/SLP tuning but nothing for PGOOptions, and the textual
+// pipeline (`LLVMRunPasses(module, "default<O2>", ...)`) can express instr-GEN as
+// a bare pass name but NOT instr-USE (there is no pass-parameter form for the
+// profile-use action; only a process-global test `cl::opt`). The ONE capability
+// the C API cannot reach is constructing a `PassBuilder` with a populated
+// `std::optional<PGOOptions>` and running the default per-module pipeline, which
+// is exactly what clang's `-fprofile-generate` / `-fprofile-use` do under the new
+// pass manager. This entry is that construction and nothing more.
+//
+// It runs the pipeline IN PLACE on `Mref`; it does NOT emit an object (the Rust
+// side owns emission via the same C API `LLVMTargetMachineEmitToFile`, so the
+// spike proves Align's real emit path survives instrumentation).
+//
+//   kind == 0  -> IRInstr (gen): insert __profc_/__profd_ counters, the
+//                 __llvm_profile_runtime anchor, and llvm.used pinning.
+//   kind == 1  -> IRUse  (use): read `profdata_path` (a merged .profdata) and
+//                 attach !prof branch_weights.
+//
+// `profdata_path` is required for USE, ignored (may be null) for GEN — the GEN
+// default output filename is governed by LLVM_PROFILE_FILE at runtime.
+//
+// Returns 0 on success, nonzero on failure.
+#ifdef ALIGN_PGO_SPIKE
+
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/PGOOptions.h"
+#include "llvm/Support/VirtualFileSystem.h"
+
+extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
+                                      LLVMTargetMachineRef tm_ref, int opt_level,
+                                      int kind, const char *profdata_path) {
+  Module *M = unwrap(Mref);
+  if (!M || !tm_ref)
+    return 40;
+  // USE needs a profile; GEN does not.
+  if (kind == 1 && !profdata_path)
+    return 41;
+
+  TargetMachine *TM = reinterpret_cast<TargetMachine *>(tm_ref);
+
+  // PGOOptions in LLVM 22 no longer carries the VFS (it moved to the PassBuilder
+  // ctor's last arg); its ctor is:
+  //   PGOOptions(ProfileFile, CSProfileGenFile, ProfileRemappingFile,
+  //              MemoryProfile, PGOAction, CSPGOAction, ColdFuncOpt,
+  //              DebugInfoForProfiling, PseudoProbeForProfiling,
+  //              AtomicCounterUpdate)
+  // For GEN, ProfileFile is the baked default output name (empty => the runtime's
+  // own default, overridden by LLVM_PROFILE_FILE); for USE it is the .profdata.
+  PGOOptions::PGOAction action =
+      (kind == 1) ? PGOOptions::IRUse : PGOOptions::IRInstr;
+  std::string profileFile = profdata_path ? std::string(profdata_path) : "";
+  PGOOptions pgo(profileFile, /*CSProfileGenFile=*/"",
+                 /*ProfileRemappingFile=*/"", /*MemoryProfile=*/"", action,
+                 PGOOptions::NoCSAction, PGOOptions::ColdFuncOpt::Default,
+                 /*DebugInfoForProfiling=*/false,
+                 /*PseudoProbeForProfiling=*/false,
+                 /*AtomicCounterUpdate=*/false);
+
+  PassBuilder PB(TM, PipelineTuningOptions(), std::optional<PGOOptions>(pgo),
+                 /*PIC=*/nullptr, vfs::getRealFileSystem());
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel(opt_level));
+  MPM.run(*M, MAM);
+  return 0;
+}
+
+#endif // ALIGN_PGO_SPIKE
