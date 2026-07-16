@@ -20,8 +20,8 @@ production-path 1..=64 allocation-inclusive geometric mean improved 1.30x. Large
 | 1 MiB | 7.99-9.58x / 9.84-10.24x | 16.8-20.1 GB/s |
 | 64 MiB | 9.58-9.62x / 9.67-9.69x | 20.0-20.1 GB/s |
 
-The worst short dispatcher observations were 0.92x core at four bytes and 0.96x
-allocation-inclusive at fifteen bytes. Inputs below 16 bytes retain the scalar oracle; direct
+The worst short dispatcher observations were 0.92x core at 4 bytes and 0.96x
+allocation-inclusive at 15 bytes. Inputs below 16 bytes retain the scalar oracle; direct
 scalar/NEON differential tests cover every length through 4096, all alignments, and a page boundary.
 Production activation is therefore enabled. This completes the requested native ARM UTF-8,
 Base64/Base64url, and hex measurement set without adopting any unrelated future arm64 proposal. This

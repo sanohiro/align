@@ -954,8 +954,8 @@ The native Apple-M1 production-path probe reproduced these ARM results:
 | 64 MiB, core / allocation-inclusive | 9.58-9.62x / 9.67-9.69x |
 | candidate input throughput at 1 KiB / 1 MiB / 64 MiB | 23.6-23.7 / 16.8-20.1 / 20.0-20.1 GB/s |
 
-The worst short dispatcher observations were 0.92x core at four bytes and 0.96x
-allocation-inclusive at fifteen bytes. The required allocation-inclusive short-suite mean and every
+The worst short dispatcher observations were 0.92x core at 4 bytes and 0.96x
+allocation-inclusive at 15 bytes. The required allocation-inclusive short-suite mean and every
 large control cleared the gate, so production aarch64 hex dispatch is enabled from 16 bytes.
 
 Every length through 4096, every input alignment modulo 32, and a page-aligned 4096-byte input match

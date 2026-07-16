@@ -62,7 +62,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
-| Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 | **SHIPPED** in document 12 |
+| Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 bytes | **SHIPPED** in document 12 |
 | sorting | stable O(n log n), but allocates unused merge scratch at tiny N and ignores ordered runs | **MEASURED P1** adaptive total-order path in document 12; keep insertion base case |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
