@@ -167,18 +167,9 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     if out.is_null() {
         return 1;
     }
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty/owned path. Use
-    // `try_from` so a `path_len` that doesn't fit `usize` (only possible on a 32-bit target) is a
-    // clean error, not a truncating `as` cast (a heap out-of-bounds).
-    let path_bytes: &[u8] = if path_len <= 0 || path.is_null() {
-        &[]
-    } else {
-        let Ok(n) = safe_len(path_len) else {
-            return 1;
-        };
-        unsafe { std::slice::from_raw_parts(path, n) }
-    };
-    let Ok(path_str) = std::str::from_utf8(path_bytes) else {
+    // Borrow the ABI view directly: filesystem APIs consume the path only during this call, so an
+    // owned `String` would be an unnecessary allocation and copy.
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return 1;
     };
     use std::io::Read;
@@ -245,7 +236,7 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
 /// `path`/`data` must describe valid byte ranges for their lengths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_fs_write_file(path: *const u8, path_len: i64, data: *const u8, data_len: i64) -> i32 {
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     // `from_raw_parts` is UB on a null pointer even for len 0 — guard an empty/owned data view.
@@ -256,7 +247,7 @@ pub unsafe extern "C" fn align_rt_fs_write_file(path: *const u8, path_len: i64, 
         unsafe { std::slice::from_raw_parts(data, n) }
     };
     use std::io::Write;
-    match std::fs::File::create(&path_str).and_then(|mut f| f.write_all(bytes)) {
+    match std::fs::File::create(path_str).and_then(|mut f| f.write_all(bytes)) {
         Ok(()) => 0,
         Err(e) => io_error_to_status(&e),
     }
@@ -286,10 +277,10 @@ pub unsafe extern "C" fn align_rt_fs_write_file_builder(path: *const u8, path_le
 /// `path` must describe a valid byte range for its length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_fs_exists(path: *const u8, path_len: i64) -> i32 {
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return 0;
     };
-    i32::from(std::fs::metadata(&path_str).is_ok())
+    i32::from(std::fs::metadata(path_str).is_ok())
 }
 
 /// `fs.remove(path)` — delete the file at `path`. Returns `0` on success, else the mapped errno.
@@ -299,10 +290,10 @@ pub unsafe extern "C" fn align_rt_fs_exists(path: *const u8, path_len: i64) -> i
 /// `path` must describe a valid byte range for its length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_fs_remove(path: *const u8, path_len: i64) -> i32 {
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
-    match std::fs::remove_file(&path_str) {
+    match std::fs::remove_file(path_str) {
         Ok(()) => 0,
         Err(e) => io_error_to_status(&e),
     }
@@ -325,10 +316,10 @@ pub unsafe extern "C" fn align_rt_fs_read_dir(path: *const u8, path_len: i64, ou
         return AL_INVALID;
     }
     unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
-    let rd = match std::fs::read_dir(&path_str) {
+    let rd = match std::fs::read_dir(path_str) {
         Ok(rd) => rd,
         Err(e) => return io_error_to_status(&e),
     };
@@ -487,14 +478,10 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
         return AL_INVALID;
     }
     unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
-    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
-    // `i64 as usize`), then into a NUL-terminated `CString` for `getaddrinfo`. An interior NUL is a
-    // bad name (`Error.Invalid`), not a panic.
-    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+    // Validate the ABI view and construct getaddrinfo's NUL-terminated input directly. A non-UTF-8,
+    // oversized, or interior-NUL host is a bad name (`Error.Invalid`), not a panic.
+    let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
         return AL_INVALID;
-    };
-    let Ok(c_host) = std::ffi::CString::new(host_str) else {
-        return AL_INVALID; // interior NUL
     };
 
     // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (one entry per address, not per socktype).
@@ -614,13 +601,10 @@ pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, po
     if !(1..=65535).contains(&port) {
         return AL_INVALID;
     }
-    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
-    // `i64 as usize`), then a NUL-terminated `CString`. An interior NUL is a bad name.
-    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+    // Validate the ABI view and construct getaddrinfo's NUL-terminated input directly. An invalid
+    // UTF-8, oversized, or interior-NUL host is a bad name.
+    let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
         return AL_INVALID;
-    };
-    let Ok(c_host) = std::ffi::CString::new(host_str) else {
-        return AL_INVALID; // interior NUL
     };
     // The port passed to `getaddrinfo` as a numeric service string — it fills the correct
     // `sin_port`/`sin6_port` per family, so no manual `sockaddr` surgery is needed. `port` is in
@@ -783,20 +767,18 @@ pub unsafe extern "C" fn align_rt_tcp_listen(host: *const u8, host_len: i64, por
     if !(1..=65535).contains(&port) {
         return AL_INVALID;
     }
-    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
-    // `i64 as usize`). An empty host means "wildcard" — pass a null node to `getaddrinfo` (with
-    // `AI_PASSIVE`). A non-empty host becomes a NUL-terminated `CString`; an interior NUL is a bad
-    // name.
-    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+    // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
+    // is then copied directly into getaddrinfo's NUL-terminated representation.
+    let Some(host_str) = (unsafe { abi_str_view(host, host_len) }) else {
         return AL_INVALID;
     };
     let c_host = if host_str.is_empty() {
         None
     } else {
-        match std::ffi::CString::new(host_str) {
-            Ok(h) => Some(h),
-            Err(_) => return AL_INVALID, // interior NUL
-        }
+        let Ok(host) = std::ffi::CString::new(host_str.as_bytes()) else {
+            return AL_INVALID;
+        };
+        Some(host)
     };
     // The port as a numeric service string — `getaddrinfo` fills the correct `sin_port`/`sin6_port`
     // per family. `port` is in `1..=65535`, so the decimal string never contains an interior NUL.
@@ -955,20 +937,18 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
     if !(1..=65535).contains(&port) {
         return AL_INVALID;
     }
-    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
-    // `i64 as usize`). An empty host means "wildcard" — pass a null node to `getaddrinfo` (with
-    // `AI_PASSIVE`). A non-empty host becomes a NUL-terminated `CString`; an interior NUL is a bad
-    // name.
-    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+    // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
+    // is then copied directly into getaddrinfo's NUL-terminated representation.
+    let Some(host_str) = (unsafe { abi_str_view(host, host_len) }) else {
         return AL_INVALID;
     };
     let c_host = if host_str.is_empty() {
         None
     } else {
-        match std::ffi::CString::new(host_str) {
-            Ok(h) => Some(h),
-            Err(_) => return AL_INVALID, // interior NUL
-        }
+        let Ok(host) = std::ffi::CString::new(host_str.as_bytes()) else {
+            return AL_INVALID;
+        };
+        Some(host)
     };
     // The port as a numeric service string — `getaddrinfo` fills the correct `sin_port`/`sin6_port`
     // per family. `port` is in `1..=65535`, so the decimal string never contains an interior NUL.
@@ -1060,14 +1040,14 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     let payload = unsafe { bytes_view(data, data_len) };
     // Resolve the destination host/port (numeric service). A non-UTF-8 / interior-NUL host is a bad
     // argument. An empty host is not a valid datagram destination → `AL_INVALID`.
-    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+    let Some(host_str) = (unsafe { abi_str_view(host, host_len) }) else {
         return -(AL_INVALID as i64);
     };
     if host_str.is_empty() {
         return -(AL_INVALID as i64);
     }
-    let Ok(c_host) = std::ffi::CString::new(host_str) else {
-        return -(AL_INVALID as i64); // interior NUL
+    let Ok(c_host) = std::ffi::CString::new(host_str.as_bytes()) else {
+        return -(AL_INVALID as i64);
     };
     let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
         return -(AL_INVALID as i64);
@@ -1228,11 +1208,11 @@ unsafe fn fs_read_view_impl(path: *const u8, path_len: i64, arena: *mut Arena, o
     if arena.is_null() {
         return AL_INVALID;
     }
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     use std::os::fd::AsRawFd;
-    let (file, meta) = match std::fs::File::open(&path_str).and_then(|f| f.metadata().map(|m| (f, m))) {
+    let (file, meta) = match std::fs::File::open(path_str).and_then(|f| f.metadata().map(|m| (f, m))) {
         Ok(fm) => fm,
         Err(e) => return io_error_to_status(&e),
     };
@@ -1268,7 +1248,7 @@ unsafe fn fs_read_view_impl(path: *const u8, path_len: i64, arena: *mut Arena, o
     // failed mmap). A directory errors here (`std::fs::read` on a dir → mapped errno). Re-reads by
     // path, so dropping `file` first is fine.
     drop(file);
-    unsafe { read_file_view_into_arena(&path_str, arena, out, validate) }
+    unsafe { read_file_view_into_arena(path_str, arena, out, validate) }
 }
 
 /// # Safety
@@ -4010,8 +3990,15 @@ unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
         let mut buf = [0u8; 32];
         unsafe { core::ptr::copy_nonoverlapping(ptr.add(i), buf.as_mut_ptr(), n - i) };
         let cur = unsafe { _mm256_loadu_si256(buf.as_ptr() as *const __m256i) };
-        err = _mm256_or_si256(err, block_err(cur, prev_input));
-        prev_incomplete = _mm256_subs_epu8(cur, inc_max);
+        if _mm256_movemask_epi8(cur) == 0 {
+            // Match the full-block ASCII fast path. The zero padding is ASCII too; only an
+            // incomplete lead carried out of the previous full block can make this tail invalid.
+            err = _mm256_or_si256(err, prev_incomplete);
+            prev_incomplete = _mm256_setzero_si256();
+        } else {
+            err = _mm256_or_si256(err, block_err(cur, prev_input));
+            prev_incomplete = _mm256_subs_epu8(cur, inc_max);
+        }
     }
     err = _mm256_or_si256(err, prev_incomplete);
     _mm256_testz_si256(err, err) == 1
@@ -4071,8 +4058,14 @@ unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
         let mut buf = [0u8; 16];
         unsafe { core::ptr::copy_nonoverlapping(ptr.add(i), buf.as_mut_ptr(), n - i) };
         let cur = unsafe { vld1q_u8(buf.as_ptr()) };
-        err = vorrq_u8(err, block_err(cur, prev_input));
-        prev_incomplete = vqsubq_u8(cur, inc_max);
+        if vmaxvq_u8(cur) < 0x80 {
+            // Match the full-block ASCII fast path; zero padding cannot introduce a new error.
+            err = vorrq_u8(err, prev_incomplete);
+            prev_incomplete = vdupq_n_u8(0);
+        } else {
+            err = vorrq_u8(err, block_err(cur, prev_input));
+            prev_incomplete = vqsubq_u8(cur, inc_max);
+        }
     }
     err = vorrq_u8(err, prev_incomplete);
     vmaxvq_u8(err) == 0
@@ -4081,8 +4074,25 @@ unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
 /// Validate that `bytes` is well-formed UTF-8 (draft §7/§12). Runtime-dispatched: AVX2 on x86_64 when
 /// present, baseline NEON on aarch64, else the scalar reference — every path returns the same answer.
 fn validate_utf8(bytes: &[u8]) -> bool {
+    // Empty input is valid without feature detection or SIMD table setup on every target.
+    if bytes.is_empty() {
+        return true;
+    }
     #[cfg(target_arch = "x86_64")]
     {
+        // Measured on Zen 3 (2026-07-16): AVX2's three lookup-table broadcasts plus padded-tail
+        // setup lose decisively below one 32-byte vector. At 32 bytes the SIMD path reaches parity
+        // on ASCII and wins on multibyte/late-invalid input. Keep this before feature detection so
+        // tiny inputs avoid even its cached dispatch cost.
+        if bytes.len() < 32 {
+            return validate_utf8_scalar(bytes);
+        }
+        // A single full vector plus a partial tail (33..63 bytes) otherwise pays the table setup and
+        // tail copy for an all-ASCII input. The standard-library scan is a complete UTF-8 proof.
+        // Keep this narrow: a general prepass would double-scan long invalid/multibyte inputs.
+        if (33..64).contains(&bytes.len()) && bytes.is_ascii() {
+            return true;
+        }
         if is_x86_feature_detected!("avx2") {
             return unsafe { validate_utf8_avx2(bytes) };
         }
@@ -4591,19 +4601,30 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> i32 {
     0
 }
 
-/// Copy a `str` view's bytes (`ptr`/`len`) into an owned UTF-8 path `String`. `None` for a
+/// Borrow a `str` view's bytes (`ptr`/`len`) as UTF-8 without allocating or copying. `None` for a
 /// length that doesn't fit `usize` (a 32-bit target) or non-UTF-8 bytes.
 ///
 /// # Safety
-/// `ptr`/`len` must describe a valid byte range when `len > 0`.
-unsafe fn path_from_view(ptr: *const u8, len: i64) -> Option<String> {
+/// `ptr`/`len` must describe a valid byte range when `len > 0`, and the returned borrow must not
+/// outlive that range.
+unsafe fn abi_str_view<'a>(ptr: *const u8, len: i64) -> Option<&'a str> {
     let bytes: &[u8] = if len <= 0 || ptr.is_null() {
         &[]
     } else {
         let n = safe_len(len).ok()?;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
-    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+    std::str::from_utf8(bytes).ok()
+}
+
+/// Validate an ABI `str` view and copy it once into the NUL-terminated representation required by
+/// a C API. This deliberately does not stage through an owned Rust `String` first.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range when `len > 0`.
+unsafe fn abi_c_string(ptr: *const u8, len: i64) -> Option<std::ffi::CString> {
+    let view = unsafe { abi_str_view(ptr, len) }?;
+    std::ffi::CString::new(view.as_bytes()).ok()
 }
 
 // --- reader -----------------------------------------------------------------------------------
@@ -4684,11 +4705,11 @@ pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64,
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     use std::os::fd::IntoRawFd;
-    match std::fs::File::open(&path_str) {
+    match std::fs::File::open(path_str) {
         Ok(f) => {
             unsafe { *out = Box::into_raw(Box::new(Reader::unbuffered(f.into_raw_fd(), true))) };
             0
@@ -4954,11 +4975,11 @@ pub unsafe extern "C" fn align_rt_io_writer_create(path: *const u8, path_len: i6
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     use std::os::fd::IntoRawFd;
-    match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path_str) {
+    match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path_str) {
         Ok(f) => {
             unsafe {
                 *out = Box::into_raw(Box::new(Writer {
@@ -5136,11 +5157,11 @@ pub unsafe extern "C" fn align_rt_io_file_create(path: *const u8, path_len: i64,
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     use std::os::fd::IntoRawFd;
-    match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path_str) {
+    match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path_str) {
         Ok(f) => {
             unsafe { *out = Box::into_raw(Box::new(RwFile { fd: f.into_raw_fd() })) };
             0
@@ -5162,11 +5183,11 @@ pub unsafe extern "C" fn align_rt_io_file_open(path: *const u8, path_len: i64, o
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+    let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return AL_INVALID;
     };
     use std::os::fd::IntoRawFd;
-    match std::fs::OpenOptions::new().read(true).write(true).open(&path_str) {
+    match std::fs::OpenOptions::new().read(true).write(true).open(path_str) {
         Ok(f) => {
             unsafe { *out = Box::into_raw(Box::new(RwFile { fd: f.into_raw_fd() })) };
             0
@@ -6862,16 +6883,16 @@ unsafe fn marshal_cmd_argv(
     args: *const AlignStr,
     args_len: i64,
 ) -> Result<(std::ffi::CString, Vec<std::ffi::CString>, Vec<*const u8>), i32> {
-    // `cmd` → a NUL-terminated C string (the `execvp` lookup path). Empty / non-UTF-8 / interior-NUL is
-    // rejected — never a panic.
-    let Some(cmd_str) = (unsafe { path_from_view(cmd, cmd_len) }) else {
+    // `cmd` → a NUL-terminated C string (the `execvp` lookup path), copied directly from the ABI
+    // view. Empty / non-UTF-8 / interior-NUL is rejected — never a panic.
+    let Some(cmd_str) = (unsafe { abi_str_view(cmd, cmd_len) }) else {
         return Err(AL_INVALID);
     };
     if cmd_str.is_empty() {
         return Err(AL_INVALID);
     }
-    let Ok(cmd_c) = std::ffi::CString::new(cmd_str) else {
-        return Err(AL_INVALID); // interior NUL
+    let Ok(cmd_c) = std::ffi::CString::new(cmd_str.as_bytes()) else {
+        return Err(AL_INVALID);
     };
     // `args` → the full argv. An empty argv (no `argv[0]`) is invalid; a null/oversized slice is
     // likewise rejected (`safe_slice` yields empty). Every entry becomes an owned `CString`; an
@@ -12190,6 +12211,33 @@ pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
 mod tests {
     use super::*;
 
+    /// The ABI conversion seam itself, isolated from filesystem syscalls and DNS latency: Rust
+    /// consumers must borrow the caller's exact bytes, while C consumers receive one direct
+    /// NUL-terminated copy. These are the audited short-path lengths from document 13 §6.1.
+    #[test]
+    fn abi_string_views_borrow_and_c_strings_validate() {
+        for n in [0usize, 1, 8, 32, 256] {
+            let bytes = vec![b'x'; n];
+            let view = unsafe { abi_str_view(bytes.as_ptr(), n as i64) }.expect("ASCII ABI view");
+            assert_eq!(view.as_bytes(), bytes);
+            if n > 0 {
+                assert_eq!(view.as_ptr(), bytes.as_ptr(), "filesystem/path view copied {n} bytes");
+            }
+
+            let c = unsafe { abi_c_string(bytes.as_ptr(), n as i64) }.expect("ASCII C string");
+            assert_eq!(c.as_bytes(), bytes);
+            assert_eq!(c.as_bytes_with_nul().last(), Some(&0));
+        }
+
+        let utf8 = "é".as_bytes();
+        assert_eq!(unsafe { abi_str_view(utf8.as_ptr(), utf8.len() as i64) }, Some("é"));
+        let invalid_utf8 = [0xff];
+        assert!(unsafe { abi_str_view(invalid_utf8.as_ptr(), 1) }.is_none());
+        assert!(unsafe { abi_c_string(invalid_utf8.as_ptr(), 1) }.is_none());
+        let interior_nul = b"a\0b";
+        assert!(unsafe { abi_c_string(interior_nul.as_ptr(), interior_nul.len() as i64) }.is_none());
+    }
+
     /// Boundary lengths around the 4/8/16/48-byte branch cuts must not panic and must differ.
     #[test]
     fn align_rt_hash64_boundaries_and_determinism() {
@@ -15539,13 +15587,126 @@ mod tests {
         assert!(aout.ptr.is_null());
     }
 
-    /// Rough throughput probe: the UTF-8 validation added at every `str`-returning I/O entry must cost on
-    /// the order of a `memcpy` (it is a single linear pass), so decode/read paths degrade a few %, not
-    /// materially. Prints SIMD-validate vs scalar-validate vs `memcpy` GB/s. `cargo test -p
-    /// align_runtime -- --ignored --nocapture utf8_validate_throughput`.
+    /// Manual UTF-8 crossover + throughput probe. Measures the scalar oracle, direct SIMD path, and
+    /// shipped dispatch over short ASCII, valid multibyte, and invalid inputs, then retains the
+    /// original 64-MiB throughput control. Run in release mode with one test thread so
+    /// test-harness/debug overhead and sibling tests do not swamp the short-input timings:
+    ///
+    /// `cargo test -p align_runtime --release utf8_validate_throughput -- --ignored --nocapture
+    /// --test-threads=1`.
     #[test]
     #[ignore]
     fn utf8_validate_throughput() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn scalar(bytes: &[u8]) -> bool {
+            validate_utf8_scalar(black_box(bytes))
+        }
+
+        #[inline(never)]
+        fn dispatched(bytes: &[u8]) -> bool {
+            validate_utf8(black_box(bytes))
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline(never)]
+        fn simd(bytes: &[u8]) -> bool {
+            unsafe { validate_utf8_avx2(black_box(bytes)) }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[inline(never)]
+        fn simd(bytes: &[u8]) -> bool {
+            unsafe { validate_utf8_neon(black_box(bytes)) }
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[inline(never)]
+        fn simd(bytes: &[u8]) -> bool {
+            validate_utf8_scalar(black_box(bytes))
+        }
+
+        fn ns_per_call(f: fn(&[u8]) -> bool, bytes: &[u8], iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut result = false;
+            for _ in 0..iters {
+                result ^= black_box(f)(black_box(bytes));
+            }
+            black_box(result);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut values: Vec<f64>) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        }
+
+        fn compare(bytes: &[u8]) -> (f64, f64, f64) {
+            type ValidationPath = fn(&[u8]) -> bool;
+
+            // About 4 MiB per sample for non-tiny inputs, capped so 0–8 byte cases measure path
+            // latency rather than spending most of the probe in the harness loop.
+            let iters = ((4 * 1024 * 1024) / bytes.len().max(1)).clamp(20_000, 200_000);
+            let mut samples: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(7));
+            for trial in 0..7 {
+                // Rotate the order so a consistently warmer/cooler later path cannot decide a close
+                // crossover. One untimed call also resolves the x86 feature-detect cache.
+                black_box(dispatched(bytes));
+                let paths: [(usize, ValidationPath); 3] = match trial % 3 {
+                    0 => [(0, scalar), (1, simd), (2, dispatched)],
+                    1 => [(1, simd), (2, dispatched), (0, scalar)],
+                    _ => [(2, dispatched), (0, scalar), (1, simd)],
+                };
+                for (slot, path) in paths {
+                    samples[slot].push(ns_per_call(path, bytes, iters));
+                }
+            }
+            (median(samples[0].clone()), median(samples[1].clone()), median(samples[2].clone()))
+        }
+
+        fn valid_multibyte(len: usize) -> Vec<u8> {
+            let unit = "é本😀".as_bytes();
+            let mut bytes = Vec::with_capacity(len);
+            while bytes.len() + unit.len() <= len {
+                bytes.extend_from_slice(unit);
+            }
+            bytes.resize(len, b'x');
+            bytes
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("UTF-8 crossover probe skipped: this x86-64 host has no AVX2 path to compare");
+            return;
+        }
+        println!("short UTF-8 crossover (median of 7, ns/call; ratio SIMD/scalar):");
+        println!(" len | case       | scalar |   SIMD | shipped | ratio");
+        for len in [0usize, 1, 4, 8, 12, 16, 24, 31, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 4096] {
+            let ascii = vec![b'a'; len];
+            let multibyte = valid_multibyte(len);
+            let mut invalid_first = ascii.clone();
+            let mut invalid_last = ascii.clone();
+            if len > 0 {
+                invalid_first[0] = 0xff;
+                invalid_last[len - 1] = 0xff;
+            }
+            for (name, bytes) in [
+                ("ascii", ascii.as_slice()),
+                ("multibyte", multibyte.as_slice()),
+                ("bad-first", invalid_first.as_slice()),
+                ("bad-last", invalid_last.as_slice()),
+            ] {
+                let (scalar_ns, simd_ns, dispatch_ns) = compare(bytes);
+                assert_eq!(scalar(bytes), simd(bytes), "probe paths disagree for {name}/{len}");
+                assert_eq!(scalar(bytes), dispatched(bytes), "probe paths disagree for {name}/{len}");
+                println!(
+                    "{len:4} | {name:10} | {scalar_ns:6.2} | {simd_ns:6.2} | {dispatch_ns:7.2} | {:5.2}x",
+                    simd_ns / scalar_ns
+                );
+            }
+        }
+
         // ~64 MiB of realistic mostly-ASCII JSON text with some multibyte content.
         let unit = r#"{"name":"café 日本語 😀","id":123456,"active":true},"#;
         let n = (64 * 1024 * 1024) / unit.len();
@@ -15561,7 +15722,7 @@ mod tests {
             let mut best = f64::MAX;
             for _ in 0..20 {
                 let t = std::time::Instant::now();
-                std::hint::black_box(f());
+                black_box(f());
                 best = best.min(t.elapsed().as_secs_f64());
             }
             mb / 1024.0 / best // GB/s
@@ -15574,7 +15735,7 @@ mod tests {
             for _ in 0..20 {
                 let t = std::time::Instant::now();
                 dst.copy_from_slice(bytes);
-                std::hint::black_box(dst[0]);
+                black_box(dst[0]);
                 best = best.min(t.elapsed().as_secs_f64());
             }
             mb / 1024.0 / best

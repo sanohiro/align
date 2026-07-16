@@ -1412,11 +1412,11 @@ fn build_module<'c>(
         module.add_function("align_rt_buffer_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
     );
     // array_builder<T> (M12 A6): new/push/push_str/append/build + the two Drop frees.
-    funcs.insert(
-        // array_builder(elem_size: i64) -> *ArrayBuilder (opaque handle).
-        "array_builder_new".to_string(),
-        module.add_function("align_rt_array_builder_new", ptr.fn_type(&[i64t2.into()], false), None),
-    );
+    // array_builder(elem_size: i64) -> *ArrayBuilder (opaque handle).
+    let array_builder_new =
+        module.add_function("align_rt_array_builder_new", ptr.fn_type(&[i64t2.into()], false), None);
+    mark_alloc_like(ctx, array_builder_new);
+    funcs.insert("array_builder_new".to_string(), array_builder_new);
     funcs.insert(
         // b.push(v) (b: *ArrayBuilder, bits: i64) -> void; append one scalar element.
         "array_builder_push".to_string(),
@@ -3276,8 +3276,8 @@ fn mark_alloc_common<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 }
 
 /// A **single-shot** allocator that never frees memory reachable at entry (`align_rt_alloc` = one
-/// `malloc`; the `*_begin` handle allocators + `builder_new` = one `Box::new`) — so it additionally
-/// gets `nofree`.
+/// `malloc`; the `*_begin`, `builder_new`, and `array_builder_new` handle allocators = one
+/// `Box::new`) — so it additionally gets `nofree`.
 fn mark_alloc_like<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
     mark_alloc_common(ctx, f);
     add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "nofree");
@@ -8720,6 +8720,7 @@ mod tests {
             "align_rt_arena_begin",
             "align_rt_tg_begin",
             "align_rt_builder_new",
+            "align_rt_array_builder_new",
             "align_rt_par_map", // fresh output buffer
         ] {
             assert!(out.contains(&format!("declare noalias ptr @{sym}")), "want noalias on {sym}:\n{out}");
@@ -8740,8 +8741,23 @@ mod tests {
         };
         // Single-shot allocators get `nofree` + `nounwind` — but deliberately NOT `willreturn` (they
         // `abort` on OOM, so asserting they always return would be a miscompile).
-        assert!(group_has("align_rt_alloc", "nofree"), "want nofree on the single-shot alloc:\n{out}");
-        for sym in ["align_rt_alloc", "align_rt_arena_alloc", "align_rt_tg_alloc", "align_rt_builder_new"] {
+        for sym in [
+            "align_rt_alloc",
+            "align_rt_arena_begin",
+            "align_rt_tg_begin",
+            "align_rt_builder_new",
+            "align_rt_array_builder_new",
+        ] {
+            assert!(group_has(sym, "nofree"), "want nofree on single-shot allocator {sym}:\n{out}");
+            assert!(group_has(sym, "nounwind"), "want nounwind on allocator {sym}:\n{out}");
+        }
+        for sym in [
+            "align_rt_alloc",
+            "align_rt_arena_alloc",
+            "align_rt_tg_alloc",
+            "align_rt_builder_new",
+            "align_rt_array_builder_new",
+        ] {
             assert!(!group_has(sym, "willreturn"), "{sym} can abort — must NOT claim willreturn:\n{out}");
         }
         // The **bump** allocators must NOT carry `nofree`: growing the region `Vec::push`es the
