@@ -8,7 +8,37 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twenty-second update this day), **THE ADAPTIVE TOTAL-ORDER STABLE-SORT
+_Last updated: 2026-07-16 (twenty-third update this day), **THINLTO IS DESIGN-SETTLED AND ITS S0
+FEASIBILITY SPIKE IS GO — MERGED as #495** (`32ce6e6`). The M14 post-upgrade wave head (real
+cross-unit optimization, un-mooted by M15) was settled by a two-lens review (soundness/cache-key +
+mechanics/driver) plus orchestrator decisions, recorded as the roadmap's new **"ThinLTO design
+SETTLED" paragraph — the S1/S2/SV implementation source of truth**. Mechanism = a 3-entry C++ shim
+(prelink summary-bearing bitcode / thin-link per-unit import lists / per-unit backend), because
+llvm-sys 221 structurally cannot emit module summaries nor drive `FunctionImporter`, and the legacy
+`ThinLTOCodeGenerator` C API it exposes SIGSEGVs on summary-less bitcode (fork-probe evidence),
+hides import lists, and runs its own pool+cache — incompatible with cache-first identity. Backend
+cache key = the PRECISE digest (own prelink digest ⊕ import list ⊕ import-source prelink digests);
+flag = opt-in `--thin-lto` on release/fast only; N=1 skips all phases (byte-identity preserved);
+preserve set fail-closed = {main} ∪ --export ∪ pub; rt-lto keeps its pre-opt merge placement with
+attr-xor; CAS prelink part-kind + CACHE_KEY_FORMAT_VERSION bump at S2; non-goals: no
+full-LTO-over-N, no linker-plugin, explain-opt/emit-llvm stay per-unit, no profile-guided
+thresholds. The S0 spike (feature-gated `thinlto-spike`, 6 ignored tests, zero default-build
+impact) proved the full round-trip in-process: the cc-built shim links against prefer-dynamic
+libLLVM-22.so beside llvm-sys, inkwell `LLVMModuleRef` crosses the FFI, and
+`FunctionImporter` + `buildThinLTODefaultPipeline` inline a cross-module callee (relocation
+disappears); import decisions deterministic after canonical edge sort; thin-link ≈70 µs at spike
+scale. LLVM-22 frictions recorded in the roadmap paragraph (getGUIDAssumingExternalLinkage,
+libLTO.so, MemoryBuffer-identifier keying, explicit datalayout). All four gemini findings were
+verified and applied (platform-conditional C++ stdlib link, `OS.has_error()` after write, null-ctx
+guard, `#[cfg(unix)]` fork probe) with the validation comment posted before squash-merge. Default
+workspace unchanged and green (**2210 total = 2197 passed + 13 ignored**; the 6 spike tests exist
+only under the feature); clippy clean in both feature states. **Next: implement ThinLTO S1 —
+serial correctness behind `--thin-lto`** (gates: cross-unit `pub` call inlined, IR-shape
+mutation-checked both directions; the M13 Slice-5 wide-tuple `sret` positive; N=1 byte-identity;
+multi-file run-parity corpus; `--export`/preserve survival), then S2 (cache composition +
+parallelism), then SV. Note: gemini-code-assist ceases review 2026-07-17 — from S1 onward use the
+`/code-review` fallback before merging. Previous update: 2026-07-16 (twenty-second update this
+day), **THE ADAPTIVE TOTAL-ORDER STABLE-SORT
 PATH IS SHIPPED AS THE `w64` SHAPE.** Doc-12 §4.1's measured P1 landed as squash-merged PR **#494**
 (`9be7a1b`): `lower_array_sort` now carries (1) a whole-input ordered early exit after exactly-once
 key decoration, (2) an ordered run-boundary straight-copy applied only from pass 2 (`width >= 64`,
