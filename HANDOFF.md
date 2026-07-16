@@ -8,7 +8,39 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (twenty-first update this day), **NATIVE APPLE-SILICON HEX DISPATCHES TO
+_Last updated: 2026-07-16 (twenty-second update this day), **THE ADAPTIVE TOTAL-ORDER STABLE-SORT
+PATH IS SHIPPED AS THE `w64` SHAPE.** Doc-12 §4.1's measured P1 landed as squash-merged PR **#494**
+(`9be7a1b`): `lower_array_sort` now carries (1) a whole-input ordered early exit after exactly-once
+key decoration, (2) an ordered run-boundary straight-copy applied only from pass 2 (`width >= 64`,
+`Lt`+negate, no new primitive), and (3) merge-only ping scratch delayed behind a `len > 32` guard
+(a `len <= 32` sort allocates only its materialize buffer(s): plain 2→1, keyed 4→2). Key-order
+classification is fail-closed with no wildcard: `Int/Char/Str/Bool` are total-order, `Float` and
+every other explicitly listed `Scalar` variant keep today's merge path, so NaN keys are structurally
+unable to take any new block. Corrected before/after on this Ryzen 9 5950X (drift-immune
+adjacent-ratio + identical-code-control method, the shipped compiler's own `ALIGN_SORT_ADAPTIVE=off`
+baseline): `sort_u64` already-sorted 3.6x, tail-swap/1%-swaps 1.14-1.17x, random 1.00x, reverse
+0.98-0.99x, 16-value cardinality 0.99-1.00x at 100k/1M; `sort_by_key` already-sorted 4.6-15.6x;
+`sort_str` already-sorted 10.9x. The first cut's ≈7% random/reverse regression was root-caused to
+the pass-1 boundary check by a variant-isolation sweep; a keyed width sweep ({32..512}) proved `w64`
+the peak for both key modes, and the one keyed low-cardinality 100k cell (≈3.5%, comparable to the
+measurement floor) is ACCEPTED as a bounded measured single-cell exception with its full trade-off
+table in doc-12 §4.1. The `ALIGN_SORT_ADAPTIVE` toggle is read at MIR-lowering time so `impl_hash`
+already keys the two shapes apart; defense-in-depth force-disables the object cache when the toggle
+is set, pinned by cache gate13b (three subprocess builds, byte-identity across an intervening
+baseline build). New `sort_adaptive.rs` (9 gates: differential/stability oracle across six input
+states, structural size matrix 0..129/1024/20000, str keys, Impure-key exactly-N evaluation pin,
+float/NaN old-path MIR gate, guarded-ping-alloc MIR gate, leak/double-free on early-exit and small-N
+paths), the `bench/adaptive_sort/` manual probe, and an off-by-default `alloc-count` runtime
+feature. Gemini reviewed with zero findings; the merge absorbed the ARM PRs #491-#493 with one
+doc-13 table conflict resolved by keeping both shipped rows. The complete workspace is green
+(**2210 total = 2197 passed + 13 ignored manual probes**) and workspace clippy passes with warnings
+denied. Doc-12's priority list is now fully dispositioned (items 1/2/4/5/6 shipped; item 3
+compaction rejected+closed by #490) and doc-13 C0/P1/P2 plus P3 item 1 are done. **Next recommended:
+begin the M14 post-upgrade remainder with ThinLTO / real cross-unit optimization** — its recorded
+precondition (multi-module separate compilation) is satisfied by M15, the v1 artifact reserves the
+bitcode/thin-summary envelope and the empty-in-v1 cross-unit-opt digest precisely to receive it
+(roadmap M15 §5 + M14 wave order), and instrument PGO then sample-PGO/BOLT stay sequenced behind
+it. Previous update: 2026-07-16 (twenty-first update this day), **NATIVE APPLE-SILICON HEX DISPATCHES TO
 NEON AT ITS INDEPENDENTLY MEASURED 16-BYTE CROSSOVER.** The checked-in balanced median-of-nine probe
 ran repeatedly on a native Apple M1 (`uname -m = arm64`, Rosetta translation flag 0). The first
 complete 16-byte NEON block improved core/allocation-inclusive time by 2.78-2.82x/1.39x, and the
