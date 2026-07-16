@@ -8,16 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (fourteenth update this day), **`http.get_many` BUILDS EACH IMMUTABLE REQUEST
-ONCE.** The batch now copies each caller URL directly into its final `HttpRequest`, and the uniquely
+_Last updated: 2026-07-16 (fifteenth update this day), **X86-64 BASE64 ENCODE DISPATCHES TO AVX2 AT
+THE MEASURED 32-BYTE CROSSOVER.** The two-lane byte-shuffle backend writes the existing exact final
+destination and leaves shorter/non-AVX2 inputs on the scalar oracle. Direct differential coverage
+compares every length through 4096, both alphabets/padding forms, every alignment modulo 32, and a
+page-aligned input. On this Ryzen 9 5950X the allocation-inclusive 1..=64 selected-point geometric
+mean improved 1.05x for both Base64 and Base64url; 32 B improved 1.22x/1.21x, 1 KiB 4.12x/4.09x,
+1 MiB 5.22x/5.27x, and 64 MiB 1.52x/1.55x. A baseline-NEON backend is implemented and cross-compiles
+for `aarch64-unknown-linux-gnu`, but production aarch64 dispatch remains scalar until the checked-in
+probe runs on native hardware; do not guess its threshold. This work is on branch
+**`agent/base64-simd-runtime`**, based on squash-merged PR #486 (`3270e2b`). The complete workspace is
+green (**2196 total = 2186 passed + ten ignored manual probes**) and workspace clippy passes with
+warnings denied. **Next recommended after this PR:** run the separate measure-first hex SIMD probe;
+do not fold it into Base64 merely because the destination machinery is shared. Both the aarch64
+Base64 activation gate and the older aarch64 UTF-8 portability measurement remain deferred. Previous
+update: 2026-07-16 (fourteenth update this day), **`http.get_many` BUILDS EACH IMMUTABLE REQUEST ONCE.**
+The batch now copies each caller URL directly into its final `HttpRequest`, and the uniquely
 claiming worker borrows `requests[i]`; the intermediate URL vector and worker-local String clone are
 gone. Bounded claiming, input-order response slots, shared keepalive reuse, lowest-index all-or-Err,
 and run-to-completion failure cleanup are unchanged. The balanced construction probe removed exactly
 one allocation/copy per URL and improved short 1/8-entry batches by 1.25x/1.18x; isolated 64/1K
 construction was 0.94x/0.92x because the larger request headers are prebuilt, but end-to-end
 zero-latency HTTP stayed flat through 64 and remained within the 3% gate at 1K (9.5->9.7 ms). The 10
-ms-latency 1/8/64/1K controls were all within 1%. This work is on branch
-**`agent/http-get-many-request-copy`**, based on squash-merged PR #485 (`b802545`). The complete
+ms-latency 1/8/64/1K controls were all within 1%. This work was squash-merged as PR **#486**
+(`3270e2b`), based on squash-merged PR #485 (`b802545`). The complete
 workspace is green (**2194 total = 2185 passed + nine ignored manual probes**) and workspace clippy
 passes with warnings denied. **Next recommended after this PR:** implement the already-planned
 runtime-dispatched Base64 SIMD backend against the shipped exact destination, with scalar differential

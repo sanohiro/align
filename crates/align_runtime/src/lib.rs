@@ -5795,7 +5795,8 @@ fn base64_encoded_len(input_len: usize, pad: bool) -> Option<usize> {
 
 /// Encode `data` into an exact uninitialized destination using `alphabet`; append `=` padding to a
 /// whole 4-char group iff `pad` (standard Base64 pads; URL-safe does not — `draft.md` §18.2).
-fn base64_encode_into(
+#[cfg_attr(not(test), allow(dead_code))]
+fn base64_encode_into_scalar(
     data: &[u8],
     alphabet: &[u8; 64],
     pad: bool,
@@ -5837,6 +5838,134 @@ fn base64_encode_into(
         }
         _ => {}
     }
+}
+
+/// AVX2 Base64 encoder: two independent 12-byte lanes become 32 output bytes per iteration. Each
+/// 16-byte lane load has at least 16 readable bytes (`len - i >= 28`), so the SIMD path never reads
+/// beyond the caller's input. The scalar oracle finishes the final 0..27 bytes, including padding.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn base64_encode_into_avx2(
+    data: &[u8],
+    alphabet: &[u8; 64],
+    pad: bool,
+    out: &mut [core::mem::MaybeUninit<u8>],
+) {
+    use core::arch::x86_64::*;
+
+    static SHUFFLE: [u8; 16] = [1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10];
+    let shuffle = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(SHUFFLE.as_ptr() as *const __m128i) });
+    let offsets = [
+        65i8,
+        71,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        -4,
+        (alphabet[62] as i16 - 62) as i8,
+        (alphabet[63] as i16 - 63) as i8,
+        0,
+        0,
+    ];
+    let lut = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(offsets.as_ptr() as *const __m128i) });
+    let mask_hi = _mm256_set1_epi32(0x0fc0_fc00);
+    let mult_hi = _mm256_set1_epi32(0x0400_0040);
+    let mask_lo = _mm256_set1_epi32(0x003f_03f0);
+    let mult_lo = _mm256_set1_epi32(0x0100_0010);
+    let sub_51 = _mm256_set1_epi8(51);
+    let cmp_25 = _mm256_set1_epi8(25);
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while data.len() - i >= 28 {
+        let ptr = unsafe { data.as_ptr().add(i) };
+        let lo = unsafe { _mm_loadu_si128(ptr as *const __m128i) };
+        let hi = unsafe { _mm_loadu_si128(ptr.add(12) as *const __m128i) };
+        let input = _mm256_set_m128i(hi, lo);
+        let shuffled = _mm256_shuffle_epi8(input, shuffle);
+        let hi_bits = _mm256_mulhi_epu16(_mm256_and_si256(shuffled, mask_hi), mult_hi);
+        let lo_bits = _mm256_mullo_epi16(_mm256_and_si256(shuffled, mask_lo), mult_lo);
+        let indices = _mm256_or_si256(hi_bits, lo_bits);
+        let mut selector = _mm256_subs_epu8(indices, sub_51);
+        selector = _mm256_sub_epi8(selector, _mm256_cmpgt_epi8(indices, cmp_25));
+        let encoded = _mm256_add_epi8(indices, _mm256_shuffle_epi8(lut, selector));
+        unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(o) as *mut __m256i, encoded) };
+        i += 24;
+        o += 32;
+    }
+    base64_encode_into_scalar(&data[i..], alphabet, pad, &mut out[o..]);
+}
+
+/// Baseline-NEON Base64 encoder: `vld3q` deinterleaves 48 input bytes into the three bytes of 16
+/// triples, bit operations form four 6-bit streams, and `vst4q` writes 64 ordered output bytes.
+/// Full-block loads/stores stay inside the exact input/output ranges; the scalar oracle owns tails.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[target_feature(enable = "neon")]
+unsafe fn base64_encode_into_neon(
+    data: &[u8],
+    alphabet: &[u8; 64],
+    pad: bool,
+    out: &mut [core::mem::MaybeUninit<u8>],
+) {
+    use core::arch::aarch64::*;
+
+    let table = uint8x16x4_t(
+        unsafe { vld1q_u8(alphabet.as_ptr()) },
+        unsafe { vld1q_u8(alphabet.as_ptr().add(16)) },
+        unsafe { vld1q_u8(alphabet.as_ptr().add(32)) },
+        unsafe { vld1q_u8(alphabet.as_ptr().add(48)) },
+    );
+    let lookup = |indices: uint8x16_t| -> uint8x16_t { vqtbl4q_u8(table, indices) };
+    let mask_3 = vdupq_n_u8(3);
+    let mask_15 = vdupq_n_u8(15);
+    let mask_63 = vdupq_n_u8(63);
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while data.len() - i >= 48 {
+        let triples = unsafe { vld3q_u8(data.as_ptr().add(i)) };
+        let a = triples.0;
+        let b = triples.1;
+        let c = triples.2;
+        let s0 = vshrq_n_u8(a, 2);
+        let s1 = vorrq_u8(vshlq_n_u8(vandq_u8(a, mask_3), 4), vshrq_n_u8(b, 4));
+        let s2 = vorrq_u8(vshlq_n_u8(vandq_u8(b, mask_15), 2), vshrq_n_u8(c, 6));
+        let s3 = vandq_u8(c, mask_63);
+        unsafe {
+            vst4q_u8(
+                out.as_mut_ptr().add(o).cast::<u8>(),
+                uint8x16x4_t(lookup(s0), lookup(s1), lookup(s2), lookup(s3)),
+            )
+        };
+        i += 48;
+        o += 64;
+    }
+    base64_encode_into_scalar(&data[i..], alphabet, pad, &mut out[o..]);
+}
+
+/// Encode directly into the exact destination. Measured large x86-64 inputs use AVX2; short inputs,
+/// unsupported CPUs/targets, and aarch64 pending its native crossover gate stay on the scalar oracle.
+#[inline]
+fn base64_encode_into(
+    data: &[u8],
+    alphabet: &[u8; 64],
+    pad: bool,
+    out: &mut [core::mem::MaybeUninit<u8>],
+) {
+    assert_eq!(base64_encoded_len(data.len(), pad), Some(out.len()), "Base64 destination length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if data.len() >= 32 && is_x86_feature_detected!("avx2") {
+            unsafe { base64_encode_into_avx2(data, alphabet, pad, out) };
+            return;
+        }
+    }
+    base64_encode_into_scalar(data, alphabet, pad, out);
 }
 
 fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
@@ -13202,12 +13331,12 @@ mod tests {
 
     // --- std.encoding (M10 Slice 1) ----------------------------------------------------------
 
-    /// Encode via the same exact-destination core as the FFI path.
+    /// Scalar Base64 oracle for the runtime-dispatched FFI path.
     fn b64_enc(data: &[u8], url: bool) -> Vec<u8> {
         let pad = !url;
         let len = base64_encoded_len(data.len(), pad).unwrap();
         let mut out = vec![core::mem::MaybeUninit::uninit(); len];
-        base64_encode_into(data, if url { &BASE64_URL } else { &BASE64_STD }, pad, &mut out);
+        base64_encode_into_scalar(data, if url { &BASE64_URL } else { &BASE64_STD }, pad, &mut out);
         out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
     }
 
@@ -13302,6 +13431,207 @@ mod tests {
         }
         assert_eq!(base64_encoded_len(usize::MAX, true), None);
         assert_eq!(base64_encoded_len(usize::MAX, false), None);
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn base64_simd_backends_match_scalar_oracle() {
+        fn encode_backend(data: &[u8], url: bool) -> Vec<u8> {
+            let pad = !url;
+            let alphabet = if url { &BASE64_URL } else { &BASE64_STD };
+            let mut out = vec![core::mem::MaybeUninit::uninit(); base64_encoded_len(data.len(), pad).unwrap()];
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                base64_encode_into_avx2(data, alphabet, pad, &mut out);
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                base64_encode_into_neon(data, alphabet, pad, &mut out);
+            }
+            out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for n in 0usize..=4096 {
+            let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add((n as u8).wrapping_mul(11))).collect();
+            for url in [false, true] {
+                assert_eq!(encode_backend(&data, url), b64_enc(&data, url), "SIMD mismatch at len={n} url={url}");
+            }
+        }
+
+        // Exercise every input alignment with a non-block-aligned length and both alphabets.
+        let backing: Vec<u8> = (0..160).map(|i| (i as u8).wrapping_mul(73).wrapping_add(19)).collect();
+        for offset in 0usize..32 {
+            let data = &backing[offset..offset + 97];
+            for url in [false, true] {
+                assert_eq!(encode_backend(data, url), b64_enc(data, url), "SIMD misalignment mismatch at offset={offset}");
+            }
+        }
+
+        // Put one complete input exactly between page-aligned addresses and exercise its block/tail
+        // boundary. The backend's loop guards are expressed in readable input bytes.
+        const PAGE: usize = 4096;
+        let mut page_backing: Vec<u8> = (0..PAGE * 3).map(|i| (i as u8).wrapping_mul(29).wrapping_add(7)).collect();
+        let aligned = (PAGE - page_backing.as_ptr() as usize % PAGE) % PAGE;
+        let data = &mut page_backing[aligned..aligned + PAGE];
+        for url in [false, true] {
+            assert_eq!(encode_backend(data, url), b64_enc(data, url), "SIMD page-boundary mismatch url={url}");
+        }
+    }
+
+    /// Manual scalar/SIMD crossover and throughput probe for Base64's retained exact destination.
+    /// Reports the core fill separately from allocation-inclusive ABI work. Run with:
+    ///
+    /// `cargo test -p align_runtime --release base64_simd_probe -- --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn base64_simd_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn fill(data: &[u8], url: bool, simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
+            let alphabet = if url { &BASE64_URL } else { &BASE64_STD };
+            if simd {
+                #[cfg(target_arch = "x86_64")]
+                base64_encode_into(data, alphabet, !url, out);
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    base64_encode_into_neon(data, alphabet, !url, out);
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                base64_encode_into_scalar(data, alphabet, !url, out);
+            } else {
+                base64_encode_into_scalar(data, alphabet, !url, out);
+            }
+            if out.is_empty() {
+                0
+            } else {
+                out.len() as u64 ^ unsafe { out[0].assume_init() as u64 } ^ unsafe { out[out.len() - 1].assume_init() as u64 }
+            }
+        }
+
+        fn time_core(data: &[u8], url: bool, simd: bool, iters: usize) -> f64 {
+            let mut out = vec![core::mem::MaybeUninit::uninit(); base64_encoded_len(data.len(), !url).unwrap()];
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(fill)(black_box(data), black_box(url), black_box(simd), black_box(&mut out));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn time_alloc(data: &[u8], url: bool, simd: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                let out_len = base64_encoded_len(data.len(), !url).unwrap();
+                let out = unsafe {
+                    owned_str_exact(out_len, |dst| {
+                        checksum ^= black_box(fill)(black_box(data), black_box(url), black_box(simd), dst);
+                    })
+                };
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            println!("Base64 SIMD probe skipped: AVX2 unavailable");
+            return;
+        }
+        println!("Base64 SIMD candidate (median of 9, ns/op; GB/s uses input bytes):");
+        println!(" alphabet | input    | scalar core | candidate   | core x | scalar alloc | candidate   | alloc x | cand GB/s");
+        for (name, url) in [("standard", false), ("url", true)] {
+            let mut short_core_log_sum = 0.0f64;
+            let mut short_alloc_log_sum = 0.0f64;
+            let mut short_count = 0usize;
+            for n in [
+                0usize,
+                1,
+                2,
+                3,
+                4,
+                7,
+                8,
+                15,
+                16,
+                24,
+                27,
+                28,
+                31,
+                32,
+                36,
+                48,
+                63,
+                64,
+                65,
+                96,
+                128,
+                256,
+                1024,
+                4096,
+                1 << 20,
+                64 << 20,
+            ] {
+                let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+                let iters = match n {
+                    0..=64 => 100_000,
+                    65..=256 => 30_000,
+                    257..=1024 => 10_000,
+                    1025..=1_048_576 => 30,
+                    _ => 3,
+                };
+                let mut scalar_core = Vec::with_capacity(9);
+                let mut simd_core = Vec::with_capacity(9);
+                let mut scalar_alloc = Vec::with_capacity(9);
+                let mut simd_alloc = Vec::with_capacity(9);
+                for trial in 0..9 {
+                    if trial % 2 == 0 {
+                        scalar_core.push(time_core(&data, url, false, iters));
+                        simd_core.push(time_core(&data, url, true, iters));
+                        scalar_alloc.push(time_alloc(&data, url, false, iters));
+                        simd_alloc.push(time_alloc(&data, url, true, iters));
+                    } else {
+                        simd_core.push(time_core(&data, url, true, iters));
+                        scalar_core.push(time_core(&data, url, false, iters));
+                        simd_alloc.push(time_alloc(&data, url, true, iters));
+                        scalar_alloc.push(time_alloc(&data, url, false, iters));
+                    }
+                }
+                let scalar_core = median(scalar_core);
+                let simd_core = median(simd_core);
+                let scalar_alloc = median(scalar_alloc);
+                let simd_alloc = median(simd_alloc);
+                let gbps = if n == 0 { 0.0 } else { n as f64 / simd_core };
+                if (1..=64).contains(&n) {
+                    short_core_log_sum += (scalar_core / simd_core).ln();
+                    short_alloc_log_sum += (scalar_alloc / simd_alloc).ln();
+                    short_count += 1;
+                }
+                println!(
+                    "{name:>9} | {n:>8} | {scalar_core:>11.2} | {simd_core:>11.2} | {:>6.2}x | {scalar_alloc:>12.2} | {simd_alloc:>11.2} | {:>6.2}x | {gbps:>9.2}",
+                    scalar_core / simd_core,
+                    scalar_alloc / simd_alloc,
+                );
+            }
+            println!(
+                "{name:>9} | 1..=64 geometric mean: core {:>5.2}x, allocation-inclusive {:>5.2}x",
+                (short_core_log_sum / short_count as f64).exp(),
+                (short_alloc_log_sum / short_count as f64).exp(),
+            );
+        }
     }
 
     /// Manual allocation-inclusive gate for removing the codec staging allocation and full-output
