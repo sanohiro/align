@@ -11535,6 +11535,10 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
     }
 }
 
+fn http_get_request(url: String) -> HttpRequest {
+    HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new() }
+}
+
 /// `cl.get(url)` — perform a `GET url` (plaintext or verified TLS for `https://`) over a pooled or
 /// fresh connection, writing the parsed response to `*out` and returning `0`, or a mapped
 /// transport/protocol status leaving `*out` null. A 4xx/5xx is a successful `Ok(response)` (P2); a
@@ -11606,14 +11610,16 @@ pub unsafe extern "C" fn align_rt_http_get_many(
     if n == 0 {
         return 0; // empty batch → Ok empty {null,0}
     }
-    // Materialize each URL as an owned `String` up front (a worker builds a GET request from it; owned
-    // strings are `Send` and outlive the scope, so no per-request borrow of the caller's views).
+    // Materialize the immutable requests up front. Each URL is copied from the caller's borrowed view
+    // exactly once, then the uniquely claiming worker borrows its request for the scoped exchange.
     let views = unsafe { safe_slice(urls_ptr, urls_len) };
     if views.len() != n {
         return AL_INVALID; // a null/short view range under a positive len — malformed
     }
-    let urls: Vec<String> =
-        views.iter().map(|s| String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()).collect();
+    let requests: Vec<HttpRequest> = views
+        .iter()
+        .map(|s| http_get_request(String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()))
+        .collect();
 
     // Per-index result slots (input order) + per-index status (0 = ok). Atomics so the workers write
     // disjoint slots without a lock; each index is claimed by exactly one worker.
@@ -11647,10 +11653,8 @@ pub unsafe extern "C" fn align_rt_http_get_many(
                     if i >= n {
                         break;
                     }
-                    let req =
-                        HttpRequest { method: "GET".to_string(), url: urls[i].clone(), headers: Vec::new(), body: Vec::new() };
                     let mut resp: *mut HttpResponse = core::ptr::null_mut();
-                    let code = unsafe { http_client_perform(shared.ptr(), &req, &mut resp) };
+                    let code = unsafe { http_client_perform(shared.ptr(), &requests[i], &mut resp) };
                     if code == 0 {
                         results[i].store(resp, Ordering::Relaxed);
                     } else {
@@ -19769,6 +19773,114 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         }
         let hdr = out.ptr as *const *mut HttpResponse;
         (0..out.len as usize).map(|i| unsafe { *hdr.add(i) }).collect()
+    }
+
+    #[test]
+    fn http_get_request_moves_url_without_copy() {
+        let url = "http://127.0.0.1/identity".to_string();
+        let ptr = url.as_ptr();
+        let req = http_get_request(url);
+        assert_eq!(req.url.as_ptr(), ptr, "building the immutable GET request must move, not clone, its owned URL");
+    }
+
+    /// Manual allocation-inclusive gate for prebuilding immutable requests before workers claim
+    /// indices. The staged control reproduces the former `Vec<String>` plus per-worker URL clone;
+    /// the direct path creates the retained `Vec<HttpRequest>` in one pass. Run with:
+    ///
+    /// `cargo test -p align_runtime --release http_get_many_request_copy_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn http_get_many_request_copy_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn construct(views: &[AlignStr], direct: bool) -> usize {
+            if direct {
+                let requests: Vec<HttpRequest> = views
+                    .iter()
+                    .map(|s| http_get_request(String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()))
+                    .collect();
+                let checksum = requests.iter().fold(0usize, |sum, req| {
+                    black_box(req.url.as_ptr());
+                    sum.wrapping_add(req.url.len())
+                });
+                black_box(requests);
+                checksum
+            } else {
+                let urls: Vec<String> = views
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned())
+                    .collect();
+                let mut checksum = 0usize;
+                for url in &urls {
+                    let req = http_get_request(url.clone());
+                    black_box(req.url.as_ptr());
+                    checksum = checksum.wrapping_add(req.url.len());
+                    black_box(req);
+                }
+                black_box(urls);
+                checksum
+            }
+        }
+
+        fn time(views: &[AlignStr], direct: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0usize;
+            for _ in 0..iters {
+                checksum ^= black_box(construct)(black_box(views), black_box(direct));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        println!("http.get_many request construction (median of 9, allocation-inclusive ns/batch):");
+        println!(" urls | url bytes | staged       | direct       | staged/direct | allocations removed");
+        for n in [1usize, 8, 64, 1024] {
+            for url_len in [32usize, 2048] {
+                let storage: Vec<String> = (0..n)
+                    .map(|i| {
+                        let mut url = format!("http://127.0.0.1/{i}/");
+                        url.push_str(&"x".repeat(url_len.saturating_sub(url.len())));
+                        url
+                    })
+                    .collect();
+                let views: Vec<AlignStr> = storage.iter().map(|url| as_view(url)).collect();
+                let iters = match (n, url_len) {
+                    (1, 32) => 100_000,
+                    (1, _) => 20_000,
+                    (8, 32) => 20_000,
+                    (8, _) => 2_000,
+                    (64, 32) => 2_000,
+                    (64, _) => 200,
+                    (1024, 32) => 100,
+                    _ => 10,
+                };
+                let mut staged = Vec::with_capacity(9);
+                let mut direct = Vec::with_capacity(9);
+                for trial in 0..9 {
+                    if trial % 2 == 0 {
+                        staged.push(time(&views, false, iters));
+                        direct.push(time(&views, true, iters));
+                    } else {
+                        direct.push(time(&views, true, iters));
+                        staged.push(time(&views, false, iters));
+                    }
+                }
+                assert_eq!(construct(&views, false), construct(&views, true));
+                let staged = median(staged);
+                let direct = median(direct);
+                println!(
+                    "{n:>5} | {url_len:>9} | {staged:>12.1} | {direct:>12.1} | {:>13.2}x | {n}",
+                    staged / direct
+                );
+            }
+        }
     }
 
     /// get_many round-trip: N GETs concurrently, results in INPUT ORDER regardless of completion

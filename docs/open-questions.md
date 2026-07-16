@@ -2485,9 +2485,12 @@ is complete with checked heap/arena/SoA byte arithmetic and boundary/mutation ga
 measure-first work included the per-callsite initialized-before-read arena split and exact-final
 Base64/hex fill; both shipped 2026-07-16 after their gates. Arena chunks now distinguish raw
 `MaybeUninit` backing from lazy-zero backing, while the public/generated ABI and task records remain
-conservative; only file-copy, arena-builder-finish, and strict SoA decode use raw storage. Remaining
-work is the Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar
-vs SIMD stable compaction. Existing work from documents 10/11 remains attributed there.
+conservative; only file-copy, arena-builder-finish, and strict SoA decode use raw storage. The HTTP
+batch request-copy removal also shipped 2026-07-16: immutable requests are prebuilt once and the
+workers borrow uniquely claimed entries, removing one URL allocation/copy per request while retaining
+the bounded claim loop and ordered all-or-Err cleanup. Remaining work is the Base64 SIMD backlog plus
+a new hex SIMD probe and scalar vs SIMD stable compaction. Existing work from documents 10/11 remains
+attributed there.
 
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)

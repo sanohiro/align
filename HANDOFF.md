@@ -8,18 +8,33 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (thirteenth update this day), **UDP RECEIVE AND `pread` SHARE THE RAW READ
-WINDOW.** `Buffer::prepare_uninit_window` now centralizes len-clear, release-build capacity repair,
-and spare-capacity access for reader, UDP, and positional file reads. `recvfrom` publishes only the
-returned prefix, including the documented leading-prefix truncation for oversized datagrams.
-`file.pread` calls POSIX `pread(2)` directly instead of forming a fully initialized Rust slice, then
-publishes only the actual short-read prefix or an empty Vec at EOF; fd offset and EINTR semantics are
-unchanged. This work is on branch **`agent/io-recv-pread-uninit`**, based on squash-merged PR #484
-(`d11aaea`). The complete workspace remains green (**2192 total = 2184 passed + eight ignored manual
-probes**) and workspace clippy passes with warnings denied. **Next recommended after this PR:** remove the measured redundant URL/request copy in
-`http.get_many`, using prebuilt immutable requests and preserving bounded claiming, input order, pool
-reuse, and all failure/no-leak gates. The aarch64 UTF-8 portability measurement remains deferred.
-Previous update: 2026-07-16 (twelfth update this day), **READER AND `io.copy` NO LONGER ZERO UNWRITTEN
+_Last updated: 2026-07-16 (fourteenth update this day), **`http.get_many` BUILDS EACH IMMUTABLE REQUEST
+ONCE.** The batch now copies each caller URL directly into its final `HttpRequest`, and the uniquely
+claiming worker borrows `requests[i]`; the intermediate URL vector and worker-local String clone are
+gone. Bounded claiming, input-order response slots, shared keepalive reuse, lowest-index all-or-Err,
+and run-to-completion failure cleanup are unchanged. The balanced construction probe removed exactly
+one allocation/copy per URL and improved short 1/8-entry batches by 1.25x/1.18x; isolated 64/1K
+construction was 0.94x/0.92x because the larger request headers are prebuilt, but end-to-end
+zero-latency HTTP stayed flat through 64 and remained within the 3% gate at 1K (9.5->9.7 ms). The 10
+ms-latency 1/8/64/1K controls were all within 1%. This work is on branch
+**`agent/http-get-many-request-copy`**, based on squash-merged PR #485 (`b802545`). The complete
+workspace is green (**2194 total = 2185 passed + nine ignored manual probes**) and workspace clippy
+passes with warnings denied. **Next recommended after this PR:** implement the already-planned
+runtime-dispatched Base64 SIMD backend against the shipped exact destination, with scalar differential
+and per-target crossover gates; keep hex SIMD as a separate measure-first probe. The aarch64 UTF-8
+portability measurement remains deferred. Previous update: 2026-07-16 (thirteenth update this day),
+**UDP RECEIVE AND `pread` SHARE THE RAW READ WINDOW.** `Buffer::prepare_uninit_window` now centralizes
+len-clear, release-build capacity repair, and spare-capacity access for reader, UDP, and positional
+file reads. `recvfrom` publishes only the returned prefix, including the documented leading-prefix
+truncation for oversized datagrams. `file.pread` calls POSIX `pread(2)` directly instead of forming a
+fully initialized Rust slice, then publishes only the actual short-read prefix or an empty Vec at
+EOF; fd offset and EINTR semantics are unchanged. This work was squash-merged as PR **#485**
+(`b802545`), based on squash-merged PR #484 (`d11aaea`). The complete workspace remains green (**2192
+total = 2184 passed + eight ignored manual probes**) and workspace clippy passes with warnings denied.
+**Next recommended after this PR:** remove the measured redundant URL/request copy in `http.get_many`,
+using prebuilt immutable requests and preserving bounded claiming, input order, pool reuse, and all
+failure/no-leak gates. The aarch64 UTF-8 portability measurement remains deferred. Previous update:
+2026-07-16 (twelfth update this day), **READER AND `io.copy` NO LONGER ZERO UNWRITTEN
 TAILS.** Buffered-reader refill and direct `reader.read` now reserve raw Vec capacity, pass only its
 `MaybeUninit` spare-capacity pointer to `read(2)`, and publish exactly the successful byte count.
 Short reads expose only their initialized prefix, EOF exposes zero bytes, and EINTR retries before
