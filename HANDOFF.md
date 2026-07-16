@@ -16,9 +16,12 @@ canonical empty result without dividing by zero; a zero-width direct index takes
 failure path. Fresh owned sources retain their synthetic owner through a returned chunk view, while
 the scalar length path drops that owner immediately after consumption. Stored/escaping values and
 pipeline/`par_map` consumers deliberately retain `align_rt_chunks` and its existing owned
-representation. Raw-IR and runtime gates pin the allocation-free direct shapes, the materialized
-fallback, exact/partial/empty results, bounds failure, and owned-temporary lifetime. The complete
-workspace is green (**2181 total = 2178 passed + three ignored manual probes**) and workspace clippy
+representation. Gemini caught that the initial direct-index path evaluated its index before the
+chunk source and width; the fix restored receiver-first order and closed the same pre-existing gap
+for ordinary array/slice indexing. An Impure runtime gate pins source → width → index and ordinary
+source → index order. Raw-IR and runtime gates also pin the allocation-free direct shapes, the
+materialized fallback, exact/partial/empty results, bounds failure, and owned-temporary lifetime.
+The complete workspace is green (**2182 total = 2179 passed + three ignored manual probes**) and workspace clippy
 passes with warnings denied. This work is in PR **#478**, based on squash-merged PR #477
 (`c2f9d95`). **Next recommended P2:** write single str-key group and dictionary outputs directly
 into their already-allocated result buffers. The aarch64 UTF-8 portability measurement remains

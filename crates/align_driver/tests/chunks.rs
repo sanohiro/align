@@ -80,6 +80,17 @@ fn direct_chunks_zero_size_index_aborts() {
     );
 }
 
+#[test]
+fn index_receivers_evaluate_before_indices() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn source() -> array<i64> {\n  print(1)\n  return [1, 2, 3].to_array()\n}\nfn width() -> i64 {\n  print(2)\n  return 2\n}\nfn chunk_index() -> i64 {\n  print(3)\n  return 0\n}\nfn scalar_source() -> array<i64> {\n  print(4)\n  return [9].to_array()\n}\nfn scalar_index() -> i64 {\n  print(5)\n  return 0\n}\nfn main() -> Result<(), Error> {\n  print(source().chunks(width())[chunk_index()].sum())\n  print(scalar_source()[scalar_index()])\n  return Ok(())\n}\n";
+    let out = build_and_run("ch-eval-order", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n3\n4\n5\n9\n");
+}
+
 // --- diagnostics ---
 
 #[test]

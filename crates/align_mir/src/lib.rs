@@ -4143,12 +4143,12 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         b.push(Stmt::Let(v, Rvalue::SoaGather { base: sv, index: idx, struct_id }));
         return Operand::Value(v);
     }
-    let idx = lower_expr(b, index);
     if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
         // A direct `.chunks(n)[i]` computes exactly one borrowed sub-view. Stored/escaping chunk
         // arrays and pipeline consumers retain the materialized representation.
         let src = lower_chunks_source(b, source, *elem);
         let n = lower_expr(b, n);
+        let idx = lower_expr(b, index);
         let src_len = b.fresh_value(i64_ty());
         b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
         let count = lower_chunks_count(b, Operand::Value(src_len), n.clone());
@@ -4207,6 +4207,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
             (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
         }
     };
+    let idx = lower_expr(b, index);
     emit_bounds_check(b, &idx, len);
     let v = b.fresh_value(elem_ty);
     let borrowed_src = match &src {
