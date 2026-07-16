@@ -6181,6 +6181,12 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
 /// low-cardinality all within ≈ 1.5% of the pre-change baseline) while retaining the tail-swap /
 /// 1%-swap / already-sorted wins, which come mostly from higher passes — the measured w64 shape in
 /// doc-12 §4.1.
+/// The minimum merge-pass run-pair width at which the ordered run-boundary check (refinement 2) is
+/// emitted, for **both** plain sort and `sort_by_key`. A key-mode-dependent threshold was measured
+/// (doc-12 §4.1 keyed sweep over {32, 64, 128, 256, 512}) and **rejected**: `64` is the peak for
+/// keyed too — lower widths regress every keyed workload, higher widths pull the keyed negatives a
+/// little closer but forfeit the keyed tail-swap / 1 %-swap wins (drop them below 1.10x), and none
+/// clears all keyed negatives *and* keeps the wins. So a single threshold stays.
 const SORT_BOUNDARY_MIN_WIDTH: i64 = 2 * SORT_INSERTION_THRESHOLD as i64;
 
 /// `let v = x <op> y` on `i64`, returning `v` as an operand.

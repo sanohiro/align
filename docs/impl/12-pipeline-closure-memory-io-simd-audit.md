@@ -473,17 +473,37 @@ separately (a `len <= 32` sort allocates only the materialize buffer — plain: 
 2 / 4 before). Worst case stays a stable O(n log n) merge; the NaN/total-order caveat holds (float
 keys excluded).
 
-**One keyed negative workload is over the 3 % line (recorded, pending a keyed-specific decision):**
+**One keyed negative workload is over the 3 % line (recorded, keyed-width sweep run):**
 `sort_by_key` on a ≤ 16-distinct-value key at 100,000 elements measures a **stable ≈ 3.4-3.7 %
 regression** (corrected 0.963 / 0.966 / 0.963x across three runs; identical-code control 0.996-0.999x,
 so it is real, not measurement bias). The same key at 1,000,000 elements is fine (≈ 1.00x), and every
 other keyed workload (random/reverse at both sizes, low-cardinality at 1M) is within ≈ 2 %. Cause: the
 keyed straight-copy must copy **two** buffers (elements + decorated keys), so refinement 2 has less
-upside for keyed sorts, while a 16-value key makes the pass-2+ boundary decision a coin flip
+upside for keyed sorts, while a 16-value key makes the pass-2 boundary decision a coin flip
 (mispredict) that the copy no longer offsets — plain low-cardinality has the same tie pattern but a
-one-buffer copy, so it stays ≈ 1.00x. Open decision (not taken unilaterally): raise the keyed boundary
-width threshold above `w64`, or skip refinement 2 for keyed sorts (which would forfeit the keyed
-tail-swap / 1 %-swap wins, ≈ 1.13-1.16x at 100k, that vanish anyway by 1M).
+one-buffer copy, so it stays ≈ 1.00x.
+
+A **key-mode-dependent boundary width was swept and rejected.** Keyed boundary min-width over
+{32, 64, 128, 256, 512}, corrected (drift-immune + control), at 100k — the failing lowcard cell and
+the tail-swap/1 %-swap wins that must stay ≥ 1.10x:
+
+| keyed width | lowcard-100k | tail-swap-100k | 1 %-swap-100k |
+|---|---:|---:|---:|
+| 32 | 0.91-0.94 | 1.04-1.14 | 1.08-1.10 |
+| **64 (shipped)** | **0.94-0.96** | **1.03-1.13** | **1.06-1.16** |
+| 128 | 0.93-0.94 | 1.01-1.08 | 1.03-1.12 |
+| 256 | 0.96-0.99 | 1.02-1.08 | 1.03-1.11 |
+| 512 | 0.97 | 1.04 | 1.08 |
+
+`w64` is the **peak**: it maximizes the tail-swap / 1 %-swap wins (only `w64` reliably keeps them
+≥ 1.10x). Lower (`w32`) regresses every keyed workload; higher widths pull the lowcard cell a little
+closer to 1.0 but drop tail-swap / 1 %-swap below 1.10x (forfeiting the wins). **No width satisfies
+"all keyed negatives within 3 % AND keyed tail-swap/1 % ≥ 1.10x"** — the two constraints cross on
+opposite sides of `w64`, and the ≈ 2-3 % measurement floor is comparable to the ≈ 3.5 % cell. Skipping
+refinement 2 for keyed entirely is rejected upstream (it recreates the doc-rejected precheck-alone
+shape for keyed tail-swap). The single `w64` threshold currently ships for both key modes; the keyed
+lowcard-100k cell is a bounded, measured single-cell exception **pending an owner decision — accept the
+exception (this record stands) or restructure** — not decided here.
 
 ### 4.2 SHIPPED / GOOD — vectorization parity with C
 
