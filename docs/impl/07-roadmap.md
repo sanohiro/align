@@ -2375,6 +2375,42 @@ profile/verb rejection, flag-off byte-determinism, and an extra build-twice dete
 (de-risks SV). Compile-time cost at corpus scale: milliseconds (prelink ~0.7 ms/unit, thin-link
 ~0.1 ms, backend 2-6 ms/unit). Next: S2 per the settled slice plan.
 
+**ThinLTO S2 SHIPPED (2026-07-16): cache composition + parallelism.** A `--thin-lto` build now
+composes with the M15 object cache as two cacheable phases per unit plus the one serial global step,
+and the S1 object-cache BYPASS is removed outright (no-backward-compat). **Phase 1 prelink** (parallel
+over misses, `CacheStage::ThinLtoPrelink`): a new `PrelinkKey` = today's codegen key MINUS the pure
+backend/target knobs (cpu/features/reloc/code-model/machine-opt) — triple + object-format stay
+(datalayout identity), everything else that can change the summary-bearing `.bc` is present
+(impl_hash, transitive dep interface hashes, profile/pipeline, LLVM version, `--rt-lto` digest,
+compiler build id). Cached artifact = the summary-bearing prelink `.bc` under the CAS `prelink`
+action namespace. **Phase 2 thin-link** (serial, NEVER cached): runs every build over all units'
+prelink bitcode (stable ids, DAG order, preserve set) → per-unit import edges + the global export set.
+**Phase 3 backend** (parallel over misses, `CacheStage::ThinLtoBackend`): a new `BackendKey` = own
+prelink-bc content digest ⊕ inbound import list `(src, GUID, kind)` ⊕ **this unit's outbound export
+set** ⊕ the prelink-bc content digests of import-source units ⊕ the backend/target bits. The outbound
+export set is a **correctness-forced refinement** of the settled "inbound import list" text: entry-3's
+`thinLTOInternalizeAndPromoteInIndex` + `renameModuleForThinLTO` promote THIS unit's own locals per
+its export flags (a leaf that is imported-FROM still rewrites its object), so a backend hit is only
+provably valid if the key pins the unit's outbound exports too — proven by the cold-vs-hit
+byte-identity gate. Cached artifact = the final object under the CAS `thinbackend` namespace.
+`CACHE_KEY_FORMAT_VERSION` bumped 1→2 (old empty-digest S3a entries fall out). `FirstDiff` extended
+with `PrelinkInput` (own code changed) + `CrossUnitImports` (inbound/outbound/import-source changed);
+`CacheStage` extended with the two phases; `--cache-stats` prints per-phase per-unit lines + a
+per-phase summary. Parallelism = the S3 `std::thread::scope` atomic-claim pattern (fresh `Context` per
+prelink, fresh `Context`/`TargetMachine` per backend), one claim pass per phase with the serial
+thin-link between; `-j`/`ALIGNC_JOBS` honored; N=1 skips ThinLTO and shares the ordinary object-cache
+namespace (byte-identical). Fail-closed: a corrupt/unparseable cached prelink blob is evicted (loud
+corruption note) + rebuilt; digest-verify on every part read; full-key equality checked before
+materializing. Gates green (`thin_lto_cache.rs`, 8): headline private-body precision (edit C →
+C prelink miss, B backend miss on CrossUnitImports, D imports-nothing-from-C hits both, main
+transitive backend miss); pub-signature transitive prelink+backend miss; import-sensitive precision
+(importer prelink hit + backend miss); toggle isolation (disjoint `codegen`/`prelink`/`thinbackend`
+namespaces); cold-vs-hit object+exe byte-identity through both phases; parallel==`-j1` byte-identity;
+cross-process second build all-hit; corrupted-prelink-blob rebuild. Flag-off + all existing S3a cache
+gates stay green untouched (fresh temp roots); clippy `-D warnings` clean in both feature states;
+workspace 2219 pass. SV runway remains (explicit compile-time-regression bound; stale-summary
+mutation deepening).
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,

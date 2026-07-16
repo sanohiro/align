@@ -19,7 +19,10 @@ pub use align_interface::{Hash128, InterfaceSummary};
 pub mod cache;
 pub mod explain;
 
-pub use cache::{clear_cache, CacheContext, CacheLookup, CacheOutcome, CacheStage, CodegenKey, FirstDiff};
+pub use cache::{
+    clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage, CodegenKey,
+    FirstDiff, InboundImport, PrelinkKey,
+};
 
 /// Result of running the pipeline through sema.
 pub struct Checked {
@@ -814,95 +817,360 @@ pub fn codegen_units_parallel(
     Ok(outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect())
 }
 
-/// **ThinLTO S1 (`--thin-lto`): the serial cross-unit-optimizing build.** Runs all three phases
-/// FRESH and SERIALLY for a multi-unit program (`units.len() >= 2`), producing one object per unit
-/// into `obj_paths` (the caller then links them exactly as the non-ThinLTO path does). No cache, no
-/// parallelism in v1 — S2 adds cache composition + parallel backends.
+/// The shared, per-build target/LLVM identity used by both ThinLTO cache keys — resolved once (the
+/// same resolution `emit_prelink_bc` / `thinlto::backend` use, so a cache hit implies byte-identical
+/// bytes).
+struct ThinTargetIdentity {
+    rt: align_codegen_llvm::ResolvedTarget,
+    object_format: u8,
+    llvm_version: String,
+}
+
+fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, String> {
+    let rt = align_codegen_llvm::resolve_target_identity(target).map_err(|e| e.to_string())?;
+    let object_format = match target_object_format()? {
+        ObjectFormat::Elf => 0u8,
+        ObjectFormat::MachO => 1u8,
+    };
+    Ok(ThinTargetIdentity { rt, object_format, llvm_version: align_codegen_llvm::llvm_version() })
+}
+
+/// Build the phase-1 **prelink** cache key: today's codegen key minus the pure backend/target knobs
+/// (cpu/features/reloc/code-model/machine-opt) — see [`cache::PrelinkKey`].
+fn build_prelink_key(
+    unit: &str,
+    impl_hash: Hash128,
+    dep_interface_hashes: &[(String, Hash128)],
+    exports: &[String],
+    id: &ThinTargetIdentity,
+    profile: Profile,
+    rt_lto: bool,
+) -> cache::PrelinkKey {
+    let mut dep_hashes = dep_interface_hashes.to_vec();
+    dep_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut exp = exports.to_vec();
+    exp.sort();
+    exp.dedup();
+    cache::PrelinkKey {
+        cache_format_version: cache::CACHE_KEY_FORMAT_VERSION,
+        compiler_build_id: cache::compiler_build_id(),
+        frontend_schema: align_interface::FORMAT_VERSION,
+        located: false,
+        impl_hash,
+        dep_interface_hashes: dep_hashes,
+        exports: exp,
+        target_triple: id.rt.triple.clone(),
+        object_format: id.object_format,
+        profile_name: profile.name().to_string(),
+        pipeline: profile.pipeline().to_string(),
+        llvm_version: id.llvm_version.clone(),
+        rt_lto,
+        rt_lto_digest: rt_lto.then(|| Hash128::of(rt_lto_bitcode())),
+        unit: unit.to_string(),
+    }
+}
+
+/// Build the phase-3 **backend** cache key — the precise cross-unit digest (see [`cache::BackendKey`]).
+/// `inbound`, `outbound_exports`, and `import_source_digests` come from the thin-link plan; they are
+/// sorted+deduped here so the key is order-independent.
+#[allow(clippy::too_many_arguments)]
+fn build_backend_key(
+    unit: &str,
+    exports: &[String],
+    id: &ThinTargetIdentity,
+    profile: Profile,
+    own_prelink_digest: Hash128,
+    inbound: Vec<cache::InboundImport>,
+    outbound_exports: Vec<u64>,
+    import_source_digests: Vec<(String, Hash128)>,
+) -> cache::BackendKey {
+    let mut inbound = inbound;
+    inbound.sort();
+    inbound.dedup();
+    let mut outbound_exports = outbound_exports;
+    outbound_exports.sort_unstable();
+    outbound_exports.dedup();
+    let mut import_source_digests = import_source_digests;
+    import_source_digests.sort_by(|a, b| a.0.cmp(&b.0));
+    import_source_digests.dedup();
+    let mut exp = exports.to_vec();
+    exp.sort();
+    exp.dedup();
+    cache::BackendKey {
+        cache_format_version: cache::CACHE_KEY_FORMAT_VERSION,
+        compiler_build_id: cache::compiler_build_id(),
+        llvm_version: id.llvm_version.clone(),
+        target_triple: id.rt.triple.clone(),
+        object_format: id.object_format,
+        resolved_cpu: id.rt.cpu.clone(),
+        resolved_features: id.rt.features.clone(),
+        reloc_model: id.rt.reloc_model.to_string(),
+        code_model: id.rt.code_model.to_string(),
+        profile_name: profile.name().to_string(),
+        pipeline: profile.pipeline().to_string(),
+        codegen_opt: profile.codegen_opt_name().to_string(),
+        own_prelink_digest,
+        inbound_imports: inbound,
+        outbound_exports,
+        import_source_digests,
+        exports: exp,
+        unit: unit.to_string(),
+    }
+}
+
+/// **ThinLTO S2 (`--thin-lto`): the cache-composing, parallel cross-unit-optimizing build.** Runs the
+/// three phases for a multi-unit program (`units.len() >= 2`), producing one object per unit into
+/// `obj_paths` (the caller links them exactly as the non-ThinLTO path does), and returns a
+/// [`CacheOutcome`] per phase per unit (prelink outcomes first, then backend outcomes — the model the
+/// `--cache-stats` gates assert).
 ///
-/// Flow (DAG / unit order throughout — the ids are the stable, deterministic module names):
-///  1. **prelink** — per unit, `emit_prelink_bc` builds the module (identical construction to the
-///     normal object path, including any `--rt-lto` merge) and hands it to the shim, which runs the
-///     ThinLTO pre-link pipeline + summary and writes summary-bearing bitcode into `staging`.
-///  2. **thin-link** — one shim call over all units computes the per-unit cross-module import lists.
-///  3. **backend** — per unit, the shim imports (per that unit's threaded import list) + runs the
-///     ThinLTO backend pipeline with the driver's own `TargetMachine` + emits the object.
+/// Two cacheable phases + one serial global step (`docs/impl/07-roadmap.md` ThinLTO S2):
+///  1. **prelink** (parallel, cacheable as [`CacheStage::ThinLtoPrelink`]) — per unit, look up
+///     [`build_prelink_key`]; a hit materializes the summary-bearing `.bc` from the CAS, a miss runs
+///     `emit_prelink_bc` (the shim's pre-link pipeline + summary) into `staging` and publishes it.
+///     Every unit's `.bc` is on disk afterwards (thin-link + backends read the full set).
+///  2. **thin-link** (serial, NEVER cached) — one shim call over all `.bc` computes the fresh
+///     per-unit import edges + the global export set, so a dep private-body edit is always reflected.
+///  3. **backend** (parallel, cacheable as [`CacheStage::ThinLtoBackend`]) — per unit, look up
+///     [`build_backend_key`] (own prelink digest ⊕ inbound imports ⊕ outbound exports ⊕ import-source
+///     prelink digests ⊕ backend/target bits); a hit materializes the object, a miss runs the shim's
+///     import+optimize+emit and publishes.
 ///
-/// Preserve set (fail-closed v1) = `{main}` ∪ every unit's exported (`pub` / entry-`main`) symbols;
-/// `exports` (only ever non-empty from `emit-obj`/`emit-llvm`, never `build`/`run`/`size`) folds in
-/// too. A single prevailing copy per external symbol is guaranteed by Align's model, so the shim's
-/// `isPrevailing = true` is sound; duplicate consumer-side generic monomorphs are internal linkage,
-/// which ThinLTO handles per-module.
+/// Determinism: prelink `.bc` and backend objects are produced by independent single-threaded LLVM
+/// operations (fresh `Context` / `TargetMachine` per unit), so `-j N` is byte-identical to `-j 1`;
+/// the serial thin-link between the passes computes order-independent decisions (edges sorted).
+/// Preserve set (fail-closed v1) = `{main}` ∪ every unit's exported symbols ∪ any `--export` roots.
 ///
-/// Failure policy: any shim phase failing → a loud `Err` naming the phase + unit; the caller ABORTS
-/// the build (fail-closed — never a silent fallback to the non-ThinLTO path, since the user asked
-/// for `--thin-lto`).
+/// Failure policy: any prelink/thin-link/backend shim failure → a loud `Err` naming the phase + unit;
+/// the caller ABORTS (never a silent fallback, since the user asked for `--thin-lto`). A cache-WRITE
+/// failure never fails the build (the artifact on disk is already correct).
+#[allow(clippy::too_many_arguments)]
 pub fn build_thin_lto(
     units: &[PerUnitArtifact],
     obj_paths: &[std::path::PathBuf],
+    cache: &CacheContext,
     target: &BuildTarget,
     profile: Profile,
     exports: &[String],
     rt_lto: bool,
     staging: &std::path::Path,
-) -> Result<(), String> {
+    jobs: usize,
+) -> Result<Vec<CacheOutcome>, String> {
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
     assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
 
-    // Stable module ids = the (unique) unit names, in DAG order.
+    let enabled = cache.is_enabled();
+    let identity = if enabled { Some(resolve_thin_identity(target)?) } else { None };
+    let n = units.len();
     let ids: Vec<String> = units.iter().map(|u| u.unit.clone()).collect();
+    let unit_index: std::collections::HashMap<&str, usize> =
+        ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let bc_paths: Vec<std::path::PathBuf> =
-        (0..units.len()).map(|i| staging.join(format!("unit{i}.prelink.bc"))).collect();
+        (0..n).map(|i| staging.join(format!("unit{i}.prelink.bc"))).collect();
+    let unit_exports = |i: usize| -> &[String] {
+        if units[i].is_entry {
+            exports
+        } else {
+            &[]
+        }
+    };
 
-    // Phase 1: prelink bitcode per unit. Exports apply only to the entry unit (a non-entry `pub` fn
-    // is already external via per-unit lowering); every other unit prelinks with no export roots.
-    for (i, unit) in units.iter().enumerate() {
-        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
+    // ---- Phase 1: prelink (parallel over misses) --------------------------------------------------
+    let mut prelink_keys: Vec<Option<cache::PrelinkKey>> = (0..n).map(|_| None).collect();
+    let mut prelink_outcomes: Vec<Option<CacheOutcome>> = (0..n).map(|_| None).collect();
+    let mut prelink_misses: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if let Some(id) = &identity {
+            let key = build_prelink_key(
+                &ids[i],
+                units[i].summary.impl_hash,
+                &units[i].dep_interface_hashes,
+                unit_exports(i),
+                id,
+                profile,
+                rt_lto,
+            );
+            match cache.lookup_prelink(&key, &bc_paths[i]) {
+                CacheLookup::Hit(o) => prelink_outcomes[i] = Some(o),
+                CacheLookup::Miss { reason } => {
+                    prelink_outcomes[i] = Some(CacheOutcome {
+                        stage: CacheStage::ThinLtoPrelink,
+                        unit: ids[i].clone(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
+                    prelink_misses.push(i);
+                }
+            }
+            prelink_keys[i] = Some(key);
+        } else {
+            prelink_outcomes[i] = Some(CacheOutcome {
+                stage: CacheStage::ThinLtoPrelink,
+                unit: ids[i].clone(),
+                hit: false,
+                miss_reason: None,
+            });
+            prelink_misses.push(i);
+        }
+    }
+    run_thin_phase(&prelink_misses, jobs, |i| {
         align_codegen_llvm::emit_prelink_bc(
-            &unit.mir,
+            &units[i].mir,
             &bc_paths[i],
             target,
             profile,
-            unit_exports,
+            unit_exports(i),
             rt_lto_bytes(rt_lto),
             &ids[i],
         )
-        .map_err(|e| format!("ThinLTO prelink failed for unit `{}`: {e}", unit.unit))?;
+        .map_err(|e| format!("ThinLTO prelink failed for unit `{}`: {e}", units[i].unit))?;
+        if let Some(key) = &prelink_keys[i] {
+            cache.publish_prelink(key, &bc_paths[i]);
+        }
+        Ok(())
+    })?;
+
+    // Every unit's prelink `.bc` is now on disk (hit or produced). Its content digest — hashed
+    // uniformly from disk so a hit (cached blob) and a miss (fresh build) yield the same value —
+    // feeds each importer's backend key.
+    let mut prelink_digests: Vec<Hash128> = Vec::with_capacity(n);
+    for path in &bc_paths {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("ThinLTO: cannot read prelink bitcode {}: {e}", path.display()))?;
+        prelink_digests.push(Hash128::of(&bytes));
     }
 
-    // Preserve set: {main} ∪ every unit's exported symbols ∪ any --export roots (entry-unit only).
+    // ---- Phase 2: thin-link (serial, never cached) ------------------------------------------------
     let mut preserve: Vec<String> = vec!["main".to_string()];
-    for unit in units {
-        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
-        for s in align_codegen_llvm::thinlto::exported_symbols(&unit.mir, unit_exports) {
+    for (i, unit) in units.iter().enumerate() {
+        for s in align_codegen_llvm::thinlto::exported_symbols(&unit.mir, unit_exports(i)) {
             if !preserve.contains(&s) {
                 preserve.push(s);
             }
         }
     }
-
-    // Phase 2: thin-link over all units → the complete decision set (import edges +
-    // export set), keyed by stable ids. Computed ONCE and threaded into each backend.
     let plan = align_codegen_llvm::thinlto::thin_link(&bc_paths, &ids, &preserve)
         .map_err(|e| format!("ThinLTO thin-link failed: {e}"))?;
 
-    // Phase 3: per-unit backend. Feed each unit its own import edges + the global
-    // export set (the promote/internalize step walks the whole index).
-    for (i, unit) in units.iter().enumerate() {
-        let imports: Vec<align_codegen_llvm::thinlto::ImportEdge> =
-            plan.imports.iter().filter(|e| e.dest == ids[i]).cloned().collect();
+    // Per-unit slices of the thin-link decision set (kept for both the backend key and the shim call).
+    let inbound: Vec<Vec<align_codegen_llvm::thinlto::ImportEdge>> =
+        (0..n).map(|i| plan.imports.iter().filter(|e| e.dest == ids[i]).cloned().collect()).collect();
+
+    // ---- Phase 3: backend (parallel over misses) --------------------------------------------------
+    let mut backend_keys: Vec<Option<cache::BackendKey>> = (0..n).map(|_| None).collect();
+    let mut backend_outcomes: Vec<Option<CacheOutcome>> = (0..n).map(|_| None).collect();
+    let mut backend_misses: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if let Some(id) = &identity {
+            let inbound_key: Vec<cache::InboundImport> =
+                inbound[i].iter().map(|e| (e.src.clone(), e.guid, e.is_definition)).collect();
+            let outbound: Vec<u64> =
+                plan.exports.iter().filter(|e| e.module == ids[i]).map(|e| e.guid).collect();
+            let src_digests: Vec<(String, Hash128)> = {
+                let mut srcs: Vec<&str> = inbound[i].iter().map(|e| e.src.as_str()).collect();
+                srcs.sort_unstable();
+                srcs.dedup();
+                srcs.iter()
+                    .filter_map(|s| unit_index.get(s).map(|&j| ((*s).to_string(), prelink_digests[j])))
+                    .collect()
+            };
+            let key = build_backend_key(
+                &ids[i],
+                unit_exports(i),
+                id,
+                profile,
+                prelink_digests[i],
+                inbound_key,
+                outbound,
+                src_digests,
+            );
+            match cache.lookup_backend(&key, &obj_paths[i]) {
+                CacheLookup::Hit(o) => backend_outcomes[i] = Some(o),
+                CacheLookup::Miss { reason } => {
+                    backend_outcomes[i] = Some(CacheOutcome {
+                        stage: CacheStage::ThinLtoBackend,
+                        unit: ids[i].clone(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
+                    backend_misses.push(i);
+                }
+            }
+            backend_keys[i] = Some(key);
+        } else {
+            backend_outcomes[i] = Some(CacheOutcome {
+                stage: CacheStage::ThinLtoBackend,
+                unit: ids[i].clone(),
+                hit: false,
+                miss_reason: None,
+            });
+            backend_misses.push(i);
+        }
+    }
+    run_thin_phase(&backend_misses, jobs, |i| {
         align_codegen_llvm::thinlto::backend(
             &bc_paths,
             &ids,
             i,
             &preserve,
-            &imports,
+            &inbound[i],
             &plan.exports,
             target,
             profile,
             &obj_paths[i],
         )
-        .map_err(|e| format!("ThinLTO backend failed for unit `{}`: {e}", unit.unit))?;
+        .map_err(|e| format!("ThinLTO backend failed for unit `{}`: {e}", units[i].unit))?;
+        if let Some(key) = &backend_keys[i] {
+            cache.publish_backend(key, &obj_paths[i]);
+        }
+        Ok(())
+    })?;
+
+    let mut outcomes: Vec<CacheOutcome> = Vec::with_capacity(2 * n);
+    outcomes.extend(prelink_outcomes.into_iter().map(|o| o.expect("prelink outcome per unit")));
+    outcomes.extend(backend_outcomes.into_iter().map(|o| o.expect("backend outcome per unit")));
+    Ok(outcomes)
+}
+
+/// Run a ThinLTO phase's MISSES in parallel via the shared atomic-claim pattern (mirrors
+/// [`codegen_units_parallel`]): `jobs` workers pull the next miss index, run `produce`, and stop
+/// claiming new work once any unit has errored (an in-progress `produce` is never interrupted). The
+/// reported error is the lowest DAG index among those collected. Empty misses ⇒ a no-op.
+fn run_thin_phase<F>(misses: &[usize], jobs: usize, produce: F) -> Result<(), String>
+where
+    F: Fn(usize) -> Result<(), String> + Sync,
+{
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    if misses.is_empty() {
+        return Ok(());
+    }
+    let worker_count = jobs.max(1).min(misses.len());
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    break;
+                }
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= misses.len() {
+                    break;
+                }
+                let i = misses[k];
+                if let Err(e) = produce(i) {
+                    errors.lock().expect("thin phase error lock").push((i, e));
+                    failed.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let mut errs = errors.into_inner().expect("thin phase error lock");
+    if !errs.is_empty() {
+        errs.sort_by_key(|(i, _)| *i);
+        return Err(errs.remove(0).1);
     }
     Ok(())
 }

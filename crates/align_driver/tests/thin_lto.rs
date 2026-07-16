@@ -33,12 +33,23 @@ fn norm(sym: &str) -> &str {
     sym.strip_prefix('_').unwrap_or(sym)
 }
 
-/// Build a program's per-unit objects the ThinLTO way (all three phases) into `dir/thin<i>.o`.
+/// Build a program's per-unit objects the ThinLTO way (all three phases) into `dir/thin<i>.o`. Uses a
+/// DISABLED cache + `-j 1` so these S1 symbol-shape gates see a fresh, deterministic build.
 fn thin_objects(per: &PerUnitBuilt) -> Vec<PathBuf> {
     let n = per.walk.units.len();
     let objs: Vec<PathBuf> = (0..n).map(|i| per.dir.join(format!("thin{i}.o"))).collect();
-    align_driver::build_thin_lto(&per.walk.units, &objs, &BuildTarget::Baseline, Profile::Release, &[], false, &per.dir)
-        .expect("thin-lto build");
+    align_driver::build_thin_lto(
+        &per.walk.units,
+        &objs,
+        &align_driver::CacheContext::Disabled,
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+        &per.dir,
+        1,
+    )
+    .expect("thin-lto build");
     objs
 }
 
@@ -341,8 +352,9 @@ fn main() {
     let n = per.walk.units.len();
     let a: Vec<PathBuf> = (0..n).map(|i| per.dir.join(format!("da{i}.o"))).collect();
     let b: Vec<PathBuf> = (0..n).map(|i| per.dir.join(format!("db{i}.o"))).collect();
-    align_driver::build_thin_lto(&per.walk.units, &a, &BuildTarget::Baseline, Profile::Release, &[], false, &per.dir).expect("thin-lto a");
-    align_driver::build_thin_lto(&per.walk.units, &b, &BuildTarget::Baseline, Profile::Release, &[], false, &per.dir).expect("thin-lto b");
+    let disabled = align_driver::CacheContext::Disabled;
+    align_driver::build_thin_lto(&per.walk.units, &a, &disabled, &BuildTarget::Baseline, Profile::Release, &[], false, &per.dir, 1).expect("thin-lto a");
+    align_driver::build_thin_lto(&per.walk.units, &b, &disabled, &BuildTarget::Baseline, Profile::Release, &[], false, &per.dir, 1).expect("thin-lto b");
     for i in 0..n {
         assert_eq!(
             std::fs::read(&a[i]).unwrap(),
