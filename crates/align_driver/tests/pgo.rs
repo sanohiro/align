@@ -22,34 +22,15 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use align_driver::{backend_available, llvm_tool, profile_runtime_archive, BuildTarget};
-
-/// A branch-heavy corpus that prints a deterministic value (so run-parity is meaningful):
-/// the biased branch mix is exactly what PGO records and re-applies.
-const BRANCHY: &str = "\
-fn classify(n: i64) -> i64 {\n\
-  if n % 2 == 0 {\n\
-    if n % 5 == 0 { return 30 }\n\
-    return 10\n\
-  }\n\
-  if n % 3 == 0 { return 3 }\n\
-  return 1\n\
-}\n\
-fn main() -> i32 {\n\
-  mut i := 0\n\
-  mut acc := 0\n\
-  loop {\n\
-    if i >= 20000 { break }\n\
-    acc = acc + classify(i)\n\
-    i = i + 1\n\
-  }\n\
-  print(acc)\n\
-  return 0\n\
-}\n";
+use align_driver::{backend_available, llvm_tool};
+// `BRANCHY` (the branch-heavy corpus) and `profile_rt_available` are hoisted into `common` — shared
+// verbatim with the S2 `pgo_cache` gates (one source of truth for the PGO test corpus).
+use common::{profile_rt_available, BRANCHY};
 
 fn alignc() -> Command {
-    // Isolate from the (default-ON) user cache: PGO builds bypass the cache in S1, but
-    // keep the env clean and deterministic anyway.
+    // ALIGNC_CACHE=off is load-bearing test ISOLATION: a PGO build now uses the default-ON object cache
+    // (S2), so these subprocess gates must not read/write the developer's real cache — pin it off for a
+    // clean, deterministic run. (The cache-composition behavior itself is gated in `pgo_cache.rs`.)
     let mut c = Command::new(env!("CARGO_BIN_EXE_alignc"));
     c.env("ALIGNC_CACHE", "off");
     c
@@ -59,11 +40,6 @@ fn alignc() -> Command {
 /// tests need it to `merge` a `.profraw`.
 fn llvm_profdata() -> Option<PathBuf> {
     llvm_tool("llvm-profdata")
-}
-
-/// Whether the clang profile runtime archive is locatable — the instrument link needs it.
-fn profile_rt_available() -> bool {
-    profile_runtime_archive(&BuildTarget::Baseline).is_ok()
 }
 
 /// An RAII temp directory holding a test's source + emitted executable. Each test gets its

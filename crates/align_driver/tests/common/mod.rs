@@ -485,6 +485,75 @@ pub fn thin_nonce() -> u64 {
     THIN_NONCE.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
+// ---- shared PGO / cache-key test helpers (used by `pgo`, `pgo_cache`, `thin_lto_sv`) ------------
+
+/// A deterministic pseudo-`Hash128` from a seed — for fixed key fields and stand-in profdata digests
+/// in key-algebra tests (no LLVM, no real profile).
+pub fn hh(seed: u64) -> Hash128 {
+    Hash128 { lo: seed, hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
+}
+
+/// A branch-heavy single-unit program whose biased branch mix is exactly what PGO records; it prints a
+/// deterministic value so run-parity / a cache-served rebuild is verifiable. Shared by the instrument
+/// (`pgo`) and cache-composition (`pgo_cache`) gates.
+pub const BRANCHY: &str = "\
+fn classify(n: i64) -> i64 {\n\
+  if n % 2 == 0 {\n\
+    if n % 5 == 0 { return 30 }\n\
+    return 10\n\
+  }\n\
+  if n % 3 == 0 { return 3 }\n\
+  return 1\n\
+}\n\
+fn main() -> i32 {\n\
+  mut i := 0\n\
+  mut acc := 0\n\
+  loop {\n\
+    if i >= 20000 { break }\n\
+    acc = acc + classify(i)\n\
+    i = i + 1\n\
+  }\n\
+  print(acc)\n\
+  return 0\n\
+}\n";
+
+/// Whether the clang profile runtime archive is locatable — the instrument LINK needs it (codegen
+/// alone does not).
+pub fn profile_rt_available() -> bool {
+    align_driver::profile_runtime_archive(&BuildTarget::Baseline).is_ok()
+}
+
+/// Produce a real merged `.profdata` for [`BRANCHY`] via the CLI round trip (gen build → run → merge)
+/// into `dir`, writing `dir/prog.align` first. Returns `None` when a required tool (`llvm-profdata`,
+/// the clang profile runtime, or the backend) is absent — the caller then skips (tool-gated).
+pub fn make_profdata(dir: &Path) -> Option<PathBuf> {
+    let profdata_tool = align_driver::llvm_tool("llvm-profdata")?;
+    if !backend_available() || !profile_rt_available() {
+        return None;
+    }
+    std::fs::write(dir.join("prog.align"), BRANCHY).ok()?;
+    let gen_build = Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .env("ALIGNC_CACHE", "off")
+        .current_dir(dir)
+        .args(["--pgo-instrument", "--profile", "release", "build", "prog.align"])
+        .output()
+        .ok()?;
+    if gen_build.status.code() != Some(0) {
+        return None;
+    }
+    let profraw = dir.join("t.profraw");
+    let run = Command::new(dir.join("prog")).env("LLVM_PROFILE_FILE", &profraw).output().ok()?;
+    if run.status.code().is_none() || !std::fs::metadata(&profraw).map(|m| m.len() > 0).unwrap_or(false) {
+        return None;
+    }
+    let profdata = dir.join("t.profdata");
+    let merged = Command::new(&profdata_tool).args(["merge", "-o"]).arg(&profdata).arg(&profraw).output().ok()?;
+    if !merged.status.success() {
+        return None;
+    }
+    Some(profdata)
+}
+
 // The 4-unit DAG: main → {b → c, d}. `c` has a PRIVATE helper (editable body, stable interface);
 // `d` imports nothing from `c`. main prints `b.bval() + d.dval()`.
 //   C_V1:   helper = x*2 → cval = 20 → bval = 120 → prints 125

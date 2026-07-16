@@ -940,48 +940,6 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     })?;
     // One object path per unit (DAG-index-named, not the `.`-containing module path).
     let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
-    // Instrument-PGO path (`--pgo-instrument` / `--pgo-use`): SERIAL, per-unit shim codegen with the
-    // object cache BYPASSED (the `PgoMode` cache-key component is S2 — the ThinLTO-S1 precedent of
-    // shipping a new artifact identity behind the flag before cache composition). Mutually exclusive
-    // with `--thin-lto` (rejected above), so no ThinLTO interaction here.
-    if pgo.is_on() {
-        // The object cache is bypassed under PGO in S1 (the `PgoMode` key component is S2). Mirror the
-        // ThinLTO-S1 `--cache-stats` precedent: say so explicitly rather than silently omit the report.
-        if cache_stats {
-            eprintln!(
-                "alignc: cache: bypassed under --pgo-instrument/--pgo-use (S1; S2 integrates cache composition)"
-            );
-        }
-        // Fail-loud profdata validation happens BEFORE the shim runs (the S1 caveat: the shim's rc
-        // cannot report a bad profile — libLLVM would diagnose-and-exit).
-        if let align_driver::PgoMode::Use(p) = pgo
-            && let Err(e) = align_driver::validate_profdata(p)
-        {
-            eprintln!("alignc: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-        let report = match align_driver::codegen_units_pgo(&walk.units, &obj_paths, &target, profile, rt_lto, pgo) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("alignc: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        };
-        // One aggregated Align-voice report for the whole build, then proceed (the settled
-        // partially-stale policy: report, don't abort; there is no `--pgo-strict` knob). These are
-        // every Warning-severity diagnostic the PGO use pipeline raised — typically profile staleness
-        // (a function changed since the profile was collected), surfaced verbatim so nothing is hidden.
-        if !report.warnings.is_empty() {
-            eprintln!(
-                "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across {} unit(s) \
-                 (usually functions changed since the profile was collected); first: {}",
-                report.warnings.len(),
-                report.units,
-                report.warnings[0]
-            );
-        }
-        return finish_link(&walk, &obj_paths, exe, profile, &target, pgo);
-    }
     // Opt-in codegen cache (ALIGNC_CACHE), default-ON; disabled ⇒ each unit emits verbatim.
     let cache = CacheContext::from_env();
     if thin_lto && walk.units.len() >= 2 {
@@ -1004,19 +962,45 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         }
         return finish_link(&walk, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
     }
+    // Instrument-PGO (`--pgo-instrument` / `--pgo-use`, S2) now flows through the NORMAL cached +
+    // parallel per-unit path below — the object cache composes it via the `PgoKey` key component
+    // (instrumented / profile-use / ordinary objects are structurally isolated and never share a CAS
+    // blob). Only two PGO-specific bits remain: the per-unit emit swaps in the PGO pipeline
+    // (`codegen_units_parallel` → `emit_object_pgo`), and the link pulls the profile runtime
+    // (`finish_link` under `--pgo-instrument`). Fail-loud profdata validation runs HERE, before codegen,
+    // so a missing/corrupt profile is a clean CLI error rather than a libLLVM diagnose-and-exit (the S1
+    // caveat) — even on an all-hit build where no LLVM would otherwise run.
+    if let align_driver::PgoMode::Use(p) = pgo
+        && let Err(e) = align_driver::validate_profdata(p)
+    {
+        eprintln!("alignc: {e}");
+        return Err(ExitCode::FAILURE);
+    }
     // Codegen runs in parallel over cache MISSES (`jobs` workers); lookups are serial and results stay
     // DAG-ordered. This is also the N=1 `--thin-lto` path (a single unit has no cross-unit boundary).
-    let outcomes = match align_driver::codegen_units_parallel(&walk.units, &obj_paths, &cache, &target, profile, rt_lto, jobs) {
-        Ok(o) => o,
+    let build = match align_driver::codegen_units_parallel(&walk.units, &obj_paths, &cache, &target, profile, rt_lto, jobs, pgo) {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("alignc: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
     if cache_stats {
-        render_cache_stats(&outcomes, cache.is_enabled());
+        render_cache_stats(&build.outcomes, cache.is_enabled());
     }
-    finish_link(&walk, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off)
+    // One aggregated Align-voice report for the `--pgo-use` staleness warnings the pipeline raised on the
+    // units that actually ran (cache MISSES), then proceed — the settled partially-stale policy (report,
+    // don't abort; no `--pgo-strict` knob). An all-hit build ran no LLVM, so has no warnings to surface:
+    // any staleness was reported when each object was first built and is intrinsic to the cached bytes.
+    if !build.pgo_warnings.is_empty() {
+        eprintln!(
+            "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across the rebuilt \
+             unit(s) (usually functions changed since the profile was collected); first: {}",
+            build.pgo_warnings.len(),
+            build.pgo_warnings[0]
+        );
+    }
+    finish_link(&walk, &obj_paths, exe, profile, &target, pgo)
 }
 
 /// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in

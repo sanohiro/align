@@ -48,13 +48,20 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// (`prelink-bitcode` + thin-backend object) that share this version component. The bump also drops
 /// every S3a single-phase entry cleanly (they carried `cache_format_version == 1`), so no stale
 /// object can be reused across the S2 layout change.
-pub const CACHE_KEY_FORMAT_VERSION: u32 = 2;
+///
+/// **Bumped to 3 at instrument-PGO S2**: [`CodegenKey`] gains the [`PgoKey`] `pgo_mode` component (the
+/// settled `PgoMode { Off | Instrument | Use(Hash128) }` cache identity), so an instrumented / profile-
+/// use object can never be served to an ordinary build. The bump also drops every pre-PGO codegen entry
+/// cleanly (they carried `cache_format_version == 2`), so no PGO-blind object survives the layout change.
+pub const CACHE_KEY_FORMAT_VERSION: u32 = 3;
 
 /// The manifest wire-format version. Bump on ANY change to the encoded byte layout; an old manifest
 /// then fails closed on decode (treated as a miss, its bytes unreferenced). **Bumped to 2 at ThinLTO
 /// S2**: the codegen-key layout lost its dead `cross_unit_opt_digest` field (ThinLTO composes via the
 /// separate `prelink`/`thinbackend` phase keys instead), and the two ThinLTO manifests were added.
-const MANIFEST_FORMAT_VERSION: u32 = 2;
+/// **Bumped to 3 at instrument-PGO S2**: the codegen-key manifest body gains the [`PgoKey`] `pgo_mode`
+/// field (a tag byte + an optional `Hash128` profdata digest), so the wire layout changed.
+const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
@@ -66,6 +73,34 @@ const CORRUPT_NOTE: &str = "alignc: cache entry corrupt; rebuilding";
 const SEQ_PREALLOC_CAP: usize = 1024;
 
 // ---- key ----------------------------------------------------------------------------------------
+
+/// The instrument-PGO cache-key component (the settled `PgoMode { Off | Instrument | Use(Hash128) }`,
+/// `docs/impl/07-roadmap.md` "Instrument-PGO design SETTLED" (g)). This is the KEY-side form of the
+/// driver-facing `align_driver::PgoMode`: that one carries the profile's on-disk PATH (a CLI concern),
+/// this one carries the content DIGEST of the profdata BYTES so the key is path-independent — the same
+/// profile reached via a different path yields the same key (and hits), and editing the profile bytes
+/// changes the key (and misses with [`FirstDiff::PgoProfile`]).
+///
+/// It is a KEY COMPONENT, not a separate CAS namespace — the `rt_lto`/`rt_lto_digest` precedent (same
+/// artifact kind, same key shape), the ThinLTO-S2 lesson applied in reverse. `Off` / `Instrument` /
+/// `Use(digest)` produce three structurally-disjoint full-key digests, so an instrumented object can
+/// never be served to an ordinary (or a profile-use) build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PgoKey {
+    /// No PGO — the byte-identical default (`--pgo-*` absent). The only variant an `emit-obj` /
+    /// non-PGO per-unit build ever uses.
+    Off,
+    /// `--pgo-instrument`: a `-fprofile-generate`-equivalent object (counters + `__llvm_prf` metadata).
+    Instrument,
+    /// `--pgo-use <file.profdata>`: a `-fprofile-use` object. The `Hash128` is the content digest of the
+    /// merged `.profdata` bytes, computed ONCE per invocation after the profile is validated. Those exact
+    /// bytes are then snapshotted to a private staged copy that libLLVM reads (see
+    /// `align_driver::StagedProfdata`): the digest here and the profile the object is optimized with come
+    /// from the SAME bytes, so a `Use` HIT is provably valid for the digested profile even if the user
+    /// rewrites the original file mid-build. Without the snapshot, a mid-build rewrite would publish
+    /// differently-optimized objects under this key — cache poisoning.
+    Use(Hash128),
+}
 
 /// The decomposed codegen action key (doc-10 §6.2). The FULL set is hashed into the action-manifest
 /// path and stored verbatim in the manifest; a stable-core SUBSET is hashed into the slot-pointer path
@@ -114,6 +149,10 @@ pub struct CodegenKey {
     pub rt_lto: bool,
     /// #11 (cont.) merged runtime-bitcode digest (present iff `rt_lto`).
     pub rt_lto_digest: Option<Hash128>,
+    /// #12 instrument-PGO mode ([`PgoKey`]) — `Off`/`Instrument`/`Use(profdata-digest)`. Isolates an
+    /// instrumented / profile-use object from an ordinary one; `Use` folds in the profile content digest
+    /// so a bytes edit misses ([`FirstDiff::PgoProfile`]) and a revert re-hits.
+    pub pgo_mode: PgoKey,
     /// The unit's module path — part of the slot identity (different units get different slots) and a
     /// component of the full key (harmless: distinct units already differ by `impl_hash`).
     pub unit: String,
@@ -160,6 +199,10 @@ pub enum FirstDiff {
     Exports,
     Profile,
     RtLto,
+    /// The instrument-PGO mode ([`PgoKey`]) changed — `Off`↔`Instrument`↔`Use`, or the `Use` profdata
+    /// content digest differs (the profile bytes were edited/re-merged). A structural isolation boundary
+    /// AND the profile-staleness invalidation, in one component.
+    PgoProfile,
     /// (ThinLTO backend phase) the unit's OWN prelink bitcode content digest changed — the unit's own
     /// code changed, so its imported/optimized/emitted object must be rebuilt.
     PrelinkInput,
@@ -187,6 +230,7 @@ impl FirstDiff {
             FirstDiff::Exports => "export set",
             FirstDiff::Profile => "profile",
             FirstDiff::RtLto => "rt-lto mode",
+            FirstDiff::PgoProfile => "pgo mode/profile",
             FirstDiff::PrelinkInput => "own code changed",
             FirstDiff::CrossUnitImports => "cross-unit imports changed",
             FirstDiff::CorruptEntry => "corrupt entry rebuilt",
@@ -231,6 +275,9 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
     }
     if stored.rt_lto != current.rt_lto || stored.rt_lto_digest != current.rt_lto_digest {
         return FirstDiff::RtLto;
+    }
+    if stored.pgo_mode != current.pgo_mode {
+        return FirstDiff::PgoProfile;
     }
     if stored.cache_format_version != current.cache_format_version {
         return FirstDiff::CacheFormatVersion;
@@ -667,6 +714,19 @@ impl Writer {
             None => self.u8(0),
         }
     }
+    /// The [`PgoKey`] component: a tag byte (`0` Off, `1` Instrument, `2` Use) plus, for `Use`, the
+    /// profdata content digest. Distinct tags make `Off`/`Instrument`/`Use` digests structurally
+    /// disjoint; the `Use` digest folds the profile bytes into the key.
+    fn pgo(&mut self, p: PgoKey) {
+        match p {
+            PgoKey::Off => self.u8(0),
+            PgoKey::Instrument => self.u8(1),
+            PgoKey::Use(d) => {
+                self.u8(2);
+                self.h128(d);
+            }
+        }
+    }
     fn bytes(&mut self, b: &[u8]) {
         self.u32(u32_len(b.len()));
         self.buf.extend_from_slice(b);
@@ -710,6 +770,7 @@ fn write_full_key(w: &mut Writer, k: &CodegenKey) {
     w.str(&k.llvm_version);
     w.bool(k.rt_lto);
     w.opt_h128(k.rt_lto_digest);
+    w.pgo(k.pgo_mode);
     w.str(&k.unit);
 }
 
@@ -773,6 +834,15 @@ impl<'a> Reader<'a> {
             tag => Err(CacheDecodeError::BadTag { what: "option", tag }),
         }
     }
+    /// The [`PgoKey`] component (mirror of [`Writer::pgo`]). Fail-closed on an unknown tag.
+    fn pgo(&mut self) -> Result<PgoKey, CacheDecodeError> {
+        match self.u8()? {
+            0 => Ok(PgoKey::Off),
+            1 => Ok(PgoKey::Instrument),
+            2 => Ok(PgoKey::Use(self.h128()?)),
+            tag => Err(CacheDecodeError::BadTag { what: "pgo", tag }),
+        }
+    }
     /// A length prefix, then that many bytes — bounds-checked (the `take` validates the count against
     /// the real buffer, so a huge length simply fails `Truncated`, never pre-allocates).
     fn bytes(&mut self) -> Result<Vec<u8>, CacheDecodeError> {
@@ -829,6 +899,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
     let llvm_version = r.str()?;
     let rt_lto = r.bool()?;
     let rt_lto_digest = r.opt_h128()?;
+    let pgo_mode = r.pgo()?;
     let unit = r.str()?;
     let blob_digest = r.h128()?;
     r.finish()?;
@@ -853,6 +924,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
             llvm_version,
             rt_lto,
             rt_lto_digest,
+            pgo_mode,
             unit,
         },
         blob_digest,
@@ -1415,6 +1487,7 @@ mod tests {
             llvm_version: "22.1.8".to_string(),
             rt_lto: false,
             rt_lto_digest: None,
+            pgo_mode: PgoKey::Off,
             unit: "main".to_string(),
         }
     }
@@ -1510,6 +1583,19 @@ mod tests {
         k.rt_lto = true;
         k.rt_lto_digest = Some(Hash128 { lo: 7, hi: 7 });
         assert_eq!(first_diff(&base, &k), FirstDiff::RtLto);
+        // Only the PGO mode differs → PgoProfile (each of the three transitions).
+        let mut k = base.clone();
+        k.pgo_mode = PgoKey::Instrument;
+        assert_eq!(first_diff(&base, &k), FirstDiff::PgoProfile);
+        let mut k = base.clone();
+        k.pgo_mode = PgoKey::Use(Hash128 { lo: 100, hi: 200 });
+        assert_eq!(first_diff(&base, &k), FirstDiff::PgoProfile);
+        // A profdata bytes edit (same Use variant, different digest) → PgoProfile.
+        let mut stored = base.clone();
+        stored.pgo_mode = PgoKey::Use(Hash128 { lo: 1, hi: 1 });
+        let mut k = base.clone();
+        k.pgo_mode = PgoKey::Use(Hash128 { lo: 2, hi: 2 });
+        assert_eq!(first_diff(&stored, &k), FirstDiff::PgoProfile);
         let mut k = base.clone();
         k.cache_format_version += 1;
         assert_eq!(first_diff(&base, &k), FirstDiff::CacheFormatVersion);

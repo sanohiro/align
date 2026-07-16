@@ -283,9 +283,8 @@ fn gate_sv3_compile_time_regression_bound() {
 // Gate SV4: invalidation-matrix completion
 // ================================================================================================
 
-fn hh(seed: u64) -> Hash128 {
-    Hash128 { lo: seed, hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
-}
+// `hh` (a deterministic pseudo-`Hash128` from a seed) is hoisted into `common` and shared via the
+// `use common::*` glob above.
 
 fn base_prelink_key() -> PrelinkKey {
     PrelinkKey {

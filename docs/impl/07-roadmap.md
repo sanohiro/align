@@ -2510,7 +2510,10 @@ match-ratio report then proceed; no `--pgo-strict` knob. **(g) Cache identity = 
 Instrument | Use(Hash128 of the profdata bytes) }` KEY COMPONENT on `CodegenKey`** (the `rt_lto_digest`
 precedent — same artifact kind, same key shape → a component, NOT a separate CAS namespace; the
 ThinLTO-S2 lesson applied in reverse). Instrumented builds are cacheable and structurally isolated from
-ordinary and use builds; `CACHE_KEY_FORMAT_VERSION` bumps at S2. **(h) Non-goals**: sample PGO / BOLT
+ordinary and use builds; `CACHE_KEY_FORMAT_VERSION` bumps at S2. [S2: shipped as `PgoKey` on the cache
+side — `PgoMode` remains the driver CLI enum carrying the profile PATH, `PgoKey` is the cache-key type
+carrying the profdata content DIGEST; the digested bytes are snapshotted so libLLVM reads exactly what
+the key names.] **(h) Non-goals**: sample PGO / BOLT
 (later in the wave, driver-managed external pipeline), CSPGO, a value-profiling surface, coverage
 reporting, hotness-gated multiversioning (a separate unimplemented feature), and folding PGO into a
 `--profile`.
@@ -2555,6 +2558,29 @@ both modes, cold-vs-hit byte-identity, stale/wrong-profile mutation gates, an ex
 and the PAYOFF GATE: a measured PGO win on a branch-heavy/dispatch kernel (bench-style, interleaved) —
 PGO's whole justification, since the numeric core is already branchless-vectorized and M13 already made
 fail edges cold.
+
+**Instrument-PGO S2 SHIPPED (2026-07-17): cache composition.** The S1 total bypass is deleted outright
+(no compat path). A PGO build now flows through the NORMAL cached + parallel per-unit codegen path
+(`codegen_units_parallel`), composed via a `PgoKey { Off | Instrument | Use(Hash128) }` component #12 on
+`CodegenKey` — the `rt_lto_digest` precedent (a KEY component, not a CAS namespace). `Use` carries the
+content digest of the merged `.profdata` BYTES (path-independent; `Hash128::of(read(path))` computed once
+per invocation, after `validate_profdata`). `FirstDiff::PgoProfile` (exhaustive, no wildcard) names a
+mode switch OR a profdata-bytes edit. `CACHE_KEY_FORMAT_VERSION` 2→3, `MANIFEST_FORMAT_VERSION` 2→3 (the
+key gained a field; both bumps drop pre-PGO entries cleanly). The only PGO-specific bits left are the
+per-unit pipeline swap (`emit_object_pgo`, already seamed at S1) and the instrumented link; USE staleness
+warnings + the fail-loud diagnostic handler fire on every cache MISS and are aggregated (DAG-ordered)
+into `UnitCodegen::pgo_warnings`. **All-HIT USE builds run no LLVM → emit no diagnostics — correct: the
+staleness was reported when each object was first built and is intrinsic to the cached bytes** (documented
+at the `codegen_units_parallel` branch + doc-10 §6.2). `--cache-stats` now reports normal per-unit hit/miss
+under PGO (the S1 "bypassed" line is gone). Gates in `tests/pgo_cache.rs` (9, all green): key-level
+isolation (off/instrument/use → three disjoint full-digests, same slot) + the load-bearing "cache never
+serves an instrumented object to an ordinary build" (`FirstDiff::PgoProfile`), the profdata-digest
+edit→miss / revert→old-CAS-blob-HIT row, path-independence (same bytes different path → same key → HIT),
+rt-lto × pgo-use composition (distinct key), and end-to-end (real `emit_object_pgo` caches+re-hits
+byte-identical; subprocess exe-level cold-vs-hit byte-identity for instrument AND use; `--cache-stats`
+reports normal). The S1 gate suite + `cache_codegen`/`cache_parallel`/`thin_lto_cache`/`thin_lto_sv` stay
+green unchanged (the version-const bumps flow through the exported consts). Next = **SV** (build-twice
+determinism both modes, stale/wrong-profile mutation gates, the compile-time bound, and the PAYOFF GATE).
 
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
