@@ -8,7 +8,44 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-15 (twenty-second update this day), **ARENA-FREE DYNAMIC TEMPLATES HAVE SCOPED
+_Last updated: 2026-07-16 (third update this day), **THE X86-64 UTF-8 CROSSOVER IS MEASURED AND
+SHIPPED.** The existing ignored runtime probe now reports balanced median-of-seven scalar, direct
+SIMD, and shipped-dispatch latency for ASCII, valid multibyte, early-invalid, and late-invalid
+inputs from 0 through 4096 bytes, plus its 64-MiB throughput control. On this Ryzen 9 5950X / Zen 3
+host AVX2 lost by 1.2–3.7x through 16 bytes; at 24/31 only multibyte favored AVX2, while at exactly
+32 bytes AVX2 reached parity or won on every shape except the failure-only early-invalid case. The
+x86-64 dispatcher now returns empty immediately, uses `std::str::from_utf8` below 32 bytes, keeps
+AVX2 from 32 onward, and gives the awkward 33–63-byte all-ASCII tail a narrow complete ASCII proof.
+AVX2/NEON padded tails also share the existing full-block ASCII fast path. In the before/after probe,
+the shipped 1-byte path fell from about 12.8 ns to 4.4 ns and 4 bytes from 11.1 ns to 5.4 ns; the
+64-MiB mixed-text control remains memcpy-class (**18.6 GB/s SIMD vs 4.0 scalar and 18.4 memcpy**).
+The aarch64 threshold remains deliberately unchanged until this same checked-in probe runs on native
+NEON hardware. Differential SIMD/scalar fuzz, the complete workspace (**2165 total = 2164 passed +
+one ignored manual probe**), and workspace clippy with warnings denied are green. **Next recommended
+local P1:** prototype nonescaping builder/array-builder headers separately from payload changes;
+portability follow-up: run the UTF-8 probe on native aarch64 when available. Previous update:
+2026-07-16 (second update this day), **`ARRAY_BUILDER_NEW` NOW CARRIES THE AUDITED
+ALLOCATOR CONTRACT.** The LLVM declaration for `align_rt_array_builder_new` now uses the same
+`mark_alloc_like` path as `align_rt_builder_new`: fresh returns are `noalias`, and the function is
+`nofree` + `nounwind` without the unsound `willreturn` claim because OOM aborts. The allocator IR
+gate now pins all four parts of that contract. The audit priority list was also corrected to record
+that M14's equality/order/hash ceiling probe and guarded runtime-bitcode slice already shipped on
+2026-07-14. The complete workspace remains green (**2165 total = 2164 passed + one ignored manual
+probe**) and workspace clippy passes with warnings denied. **Next recommended P1 measurement:**
+establish the UTF-8 scalar/SIMD crossover per target before changing `utf8_valid` dispatch.
+Previous update: 2026-07-16, **ABI STRINGS NO LONGER STAGE THROUGH OWNED `String`.** Filesystem, path,
+reader/writer/file, and mmap consumers now borrow the caller's validated UTF-8 bytes directly;
+`getaddrinfo` and `execvp` consumers construct their required `CString` directly from that view.
+The public C ABI remains defensive: non-UTF-8 and interior-NUL inputs are rejected, while wildcard
+empty hosts retain their allocation-free null-node path. A helper-level 0/1/8/32/256-byte gate pins
+pointer identity for borrowed views, direct C-string contents, and invalid-input behavior; the full
+filesystem/network/process runtime and driver controls remain green. The complete workspace is
+green (**2165 total = 2164 passed + one ignored manual probe**) and workspace clippy passes with
+warnings denied. The first full-suite attempt exposed two different runtime archives under
+`target/debug` and `target/debug/deps`; `cargo build --workspace` refreshed the ordinary CLI
+staticlib, their content hashes then matched, and the byte-identity gate plus the complete workspace
+passed. Previous update: 2026-07-15 (twenty-second update
+this day), **ARENA-FREE DYNAMIC TEMPLATES HAVE SCOPED
 OWNERS.** The surface result remains `str`: an explicit arena keeps the existing arena-backed path,
 while an arena-free `template` or `json.encode` now finishes into a hidden synthetic `string` owner.
 Borrow-owner propagation retains that allocation across local/view consumers and loop/function

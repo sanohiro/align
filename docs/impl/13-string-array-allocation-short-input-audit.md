@@ -3,7 +3,9 @@
 > Status: audit record, 2026-07-13. **Partial corrective implementation shipped in the working
 > tree on 2026-07-13:** the UTF-8 range-boundary part of §3.1 is fixed and regression-pinned;
 > its zero-cost `s.bytes()` companion and §3.2's `str + str` contract correction shipped
-> 2026-07-15. The other findings remain open. No other implementation in this document is
+> 2026-07-15. Arena-free template ownership, unbound Move temporaries, and known-null cleanup
+> pruning shipped that day; §6.1's borrowed ABI strings shipped 2026-07-16. The other findings
+> remain open. No other implementation in this document is
 > shipped merely because it is described here. Performance changes remain gated unless an existing
 > roadmap item already says otherwise. The complete corrective wave is summarized in
 > [`source-correctness-fixes-2026-07-13.md`](source-correctness-fixes-2026-07-13.md).
@@ -52,7 +54,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | arena-free `template` / `json.encode` | hidden owned `string` backs the surface `str` view | **FIXED 2026-07-15**; frame-bounded and dropped |
 | unbound owned temporaries | synthetic path-local owner; scalar early-drop, view retention | **FIXED 2026-07-15**; control flow and loops pinned |
 | moved slots | MIR prunes cleanup edges whose drop flag is definitely false | **FIXED 2026-07-15**; no known-null destructor call |
-| filesystem/path ABI views | common helper copies every short path into `String` | **CONFIRMED P1** avoidable allocation/copy |
+| filesystem/path ABI views | Rust consumers borrow; C consumers construct `CString` directly | **SHIPPED 2026-07-16**; redundant allocation/copy removed |
 | UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
 | `builder.to_string()` | header allocation + grow buffer + final allocation/copy | **CONFIRMED P1** copy count; M14 only solves call overhead |
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
@@ -262,15 +264,14 @@ around the existing representation first.
 
 ## 6. String allocation and copy opportunities
 
-### 6.1 CONFIRMED P1 — borrow ABI path strings instead of copying them
+### 6.1 SHIPPED 2026-07-16 — ABI path strings are borrowed or copied once at the C boundary
 
-`path_from_view` validates bytes, then calls `to_string()`
-([runtime](../../crates/align_runtime/src/lib.rs#L4512)). It is used by file existence/removal,
-directory reads, mmap views, reader/writer/file open/create, multiple network host paths, and process
-launch. Thus even a five-byte path pays an owned allocation/copy before a filesystem API that only
-needs `&str`.
+The audit baseline's `path_from_view` validated bytes, then called `to_string()`. It was used by file
+existence/removal, directory reads, mmap views, reader/writer/file open/create, multiple network host
+paths, and process launch. Thus even a five-byte path paid an owned allocation/copy before a
+filesystem API that only needed `&str`; C consumers then copied it again into `CString`.
 
-Split the helper by the real boundary need:
+The runtime now splits conversion by the real boundary need:
 
 - filesystem/path consumers: `abi_str_view -> Option<&str>` with the same defensive UTF-8 check,
   then pass the borrow directly to `std::fs`;
@@ -279,20 +280,36 @@ Split the helper by the real boundary need:
 - language-only trusted callers may later avoid redundant UTF-8 validation only if the public C ABI
   and its safety contract are split explicitly. Do not silently make malformed external calls UB.
 
-Gate the helper itself at 0/1/8/32/256 bytes and run end-to-end file/network controls so syscall or
-DNS latency does not hide whether the allocation actually disappeared.
+The helper gate covers 0/1/8/32/256-byte inputs, proves that every nonempty Rust view retains the
+caller's exact pointer, and pins UTF-8/interior-NUL rejection plus direct C-string contents. The full
+runtime file, DNS, TCP, UDP, and process controls remain green, so syscall or DNS latency is outside
+the structural no-copy proof.
 
-### 6.2 MEASURE FIRST — add a short scalar crossover to UTF-8 validation
+### 6.2 PARTIAL 2026-07-16 — x86-64 short scalar crossover shipped; aarch64 needs a native run
 
-`validate_utf8` enters AVX2 whenever available and NEON unconditionally on aarch64
-([dispatch](../../crates/align_runtime/src/lib.rs#L4002)). A tail shorter than the vector width is
-copied into a zeroed 32/16-byte stack block after lookup vectors are loaded. This differs from the
-JSON quote scan's 16-byte scalar prefix and memmem's explicit `<64` strategy.
+At the audit baseline, `validate_utf8` entered AVX2 whenever available and NEON unconditionally on
+aarch64. A tail shorter than the vector width was copied into a zeroed 32/16-byte stack block after
+lookup vectors were loaded. This differed from the JSON quote scan's 16-byte scalar prefix and
+memmem's explicit `<64` strategy.
 
-Probe per-target thresholds using valid ASCII, multibyte boundary crossings, and invalid inputs.
-Keep `std::str::from_utf8` as the oracle/scalar path and existing AVX2/NEON as the large path. The
-threshold is an implementation constant, not a language feature; choose it from allocator-excluded
-latency and retain differential fuzzing across the crossover.
+The durable ignored release probe now compares `std::str::from_utf8`, the direct SIMD path, and the
+shipped dispatch using balanced order and median-of-seven samples over valid ASCII, valid multibyte,
+early-invalid, and late-invalid inputs. The existing 30,000 raw-byte plus 5,000 valid/corrupted-case
+differential gate remains the correctness oracle across the crossover.
+
+**Measured x86-64 (2026-07-16, Ryzen 9 5950X / Zen 3, WSL2, release):** direct AVX2 was 1.2–3.7x
+slower than scalar for the nonempty 1–16-byte matrix. At 24 and 31 bytes only the multibyte case
+favored AVX2 (0.83–0.88x); ASCII and both invalid placements still favored scalar. At exactly 32
+bytes AVX2 reached 0.86x on ASCII and 0.25–0.41x on multibyte/late-invalid input. An early invalid
+byte continues to favor scalar because `from_utf8` returns immediately, but that failure-only shape
+does not justify scanning every valid input twice. The 64-MiB mixed-text control remained at 18.6
+GB/s versus 4.0 GB/s scalar and 18.4 GB/s memcpy.
+
+The shipped x86-64 dispatch therefore returns empty immediately, uses scalar below 32 bytes, and
+keeps AVX2 from 32 onward. A narrow 33–63-byte all-ASCII proof avoids the otherwise-visible padded
+tail setup without imposing a second scan on long invalid/multibyte inputs; AVX2 and NEON tails now
+share their full-block ASCII fast path. This changes no language surface. Do **not** infer an aarch64
+threshold from the 32-byte AVX2 result: run the same checked-in probe on native NEON hardware first.
 
 ### 6.3 CONFIRMED P1 — make owned builder freeze compatible with its backing allocation
 
@@ -428,9 +445,10 @@ builders therefore allocate once, 1–4 elements allocate twice, and larger loop
 
 Separate refinements:
 
-1. Mark `align_rt_array_builder_new` with the same audited allocator attributes as `builder_new`.
-   The declaration is currently registered without `mark_alloc_like`
-   ([codegen](../../crates/align_codegen_llvm/src/lib.rs#L1223)). This is hygiene, not the main speedup.
+1. ~~Mark `align_rt_array_builder_new` with the same audited allocator attributes as
+   `builder_new`.~~ **DONE 2026-07-16.** Its declaration now goes through `mark_alloc_like`; the IR
+   gate pins `noalias`, `nofree`, and `nounwind` while forbidding the unsound `willreturn`. This is
+   hygiene, not the main speedup.
 2. Probe an entry-alloca/by-value header for a proven nonescaping local, retaining boxed headers for
    escaping values. Payload allocation and pointer stability remain unchanged.
 3. Prefer existing bulk `append(slice)` whenever a source slice exists.
@@ -610,10 +628,14 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### P1 — short fixed costs
 
-1. Borrow filesystem/path ABI strings and construct C strings directly.
-2. Add the audited `array_builder_new` allocator attributes.
-3. Run M14's already-planned runtime-bitcode ceiling probe on short string equality/order/hash.
-4. Establish the UTF-8 scalar/SIMD crossover per target.
+1. ~~Borrow filesystem/path ABI strings and construct C strings directly.~~ **DONE 2026-07-16.**
+2. ~~Add the audited `array_builder_new` allocator attributes.~~ **DONE 2026-07-16.**
+3. ~~Run M14's runtime-bitcode ceiling probe on short string equality/order/hash.~~ **DONE
+   2026-07-14.** `str_eq` cleared the gate, `str_cmp` regressed and remains excluded, while
+   `hash64` benefited from native tuning rather than LTO visibility; M14 Slice 2 shipped the guarded
+   memcmp-class set behind `--rt-lto`.
+4. Establish the UTF-8 scalar/SIMD crossover per target. **x86-64 DONE 2026-07-16 (scalar below
+   32); aarch64 native measurement remains open.**
 5. Prototype nonescaping builder/array-builder headers separately from payload changes.
 
 ### P2 — remove proven staging
