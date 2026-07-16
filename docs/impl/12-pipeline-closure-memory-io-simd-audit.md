@@ -465,13 +465,25 @@ higher passes. Drift-immune, control-corrected `before/after` on `sort_u64` (bef
 | reverse | 0.99x | 0.99x |
 | 16-value cardinality | 1.00x | 1.00x |
 
-All three negative workloads are within ≈ 2 % of baseline (gate met); already-sorted / tail-swap /
-1 %-swap keep material wins. `sort_by_key` adds a large already-sorted win via the precheck (4.6-15.6x
-— the decorate cost dominates the tiny scan) with negatives within ≈ 3.5 %; `sort_str` (byte-lex key)
-is 10.9x already-sorted and within ≈ 1 % on random/reverse. The delayed-scratch cleanup is proven
+For **plain `sort_u64`** all three negative workloads are within ≈ 2 % of baseline (gate met) and
+already-sorted / tail-swap / 1 %-swap keep material wins. `sort_by_key` adds a large already-sorted
+win via the precheck (4.6-15.6x — the decorate cost dominates the tiny scan); `sort_str` (byte-lex
+key) is 10.9x already-sorted and within ≈ 1 % on random/reverse. The delayed-scratch cleanup is proven
 separately (a `len <= 32` sort allocates only the materialize buffer — plain: 1, keyed: 2 — versus
 2 / 4 before). Worst case stays a stable O(n log n) merge; the NaN/total-order caveat holds (float
 keys excluded).
+
+**One keyed negative workload is over the 3 % line (recorded, pending a keyed-specific decision):**
+`sort_by_key` on a ≤ 16-distinct-value key at 100,000 elements measures a **stable ≈ 3.4-3.7 %
+regression** (corrected 0.963 / 0.966 / 0.963x across three runs; identical-code control 0.996-0.999x,
+so it is real, not measurement bias). The same key at 1,000,000 elements is fine (≈ 1.00x), and every
+other keyed workload (random/reverse at both sizes, low-cardinality at 1M) is within ≈ 2 %. Cause: the
+keyed straight-copy must copy **two** buffers (elements + decorated keys), so refinement 2 has less
+upside for keyed sorts, while a 16-value key makes the pass-2+ boundary decision a coin flip
+(mispredict) that the copy no longer offsets — plain low-cardinality has the same tie pattern but a
+one-buffer copy, so it stays ≈ 1.00x. Open decision (not taken unilaterally): raise the keyed boundary
+width threshold above `w64`, or skip refinement 2 for keyed sorts (which would forfeit the keyed
+tail-swap / 1 %-swap wins, ≈ 1.13-1.16x at 100k, that vanish anyway by 1M).
 
 ### 4.2 SHIPPED / GOOD — vectorization parity with C
 

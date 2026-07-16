@@ -270,6 +270,15 @@ impl CacheContext {
     /// versions). If the default root cannot be resolved (no `HOME`/`XDG_CACHE_HOME`), the on/unset
     /// case degrades to disabled rather than guessing a root.
     pub fn from_env() -> CacheContext {
+        // Fail-closed measurement guard: the `ALIGN_SORT_ADAPTIVE` toggle (doc-12 §4.1) changes
+        // emitted codegen for `.sort()`/`.sort_by_key()` units. Its effect already flows into the
+        // per-unit `impl_hash` (it is read only in MIR lowering, so the MIR fingerprint captures it
+        // and the object-cache key differs — verified), but force the cache **off** whenever it is set
+        // so a `bench/adaptive_sort` baseline build can never read or publish a cross-toggle object
+        // into the shared cache under any future refactor. Zero effect on normal builds (toggle unset).
+        if std::env::var_os("ALIGN_SORT_ADAPTIVE").is_some() {
+            return CacheContext::Disabled;
+        }
         let default_on = || match default_cache_root() {
             Some(root) => CacheContext::Enabled { root },
             None => CacheContext::Disabled,

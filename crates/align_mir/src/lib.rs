@@ -6338,6 +6338,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // ordered-boundary straight-copy, ping buffers allocated up front) — the baseline the
     // `bench/adaptive_sort` before/after probe compiles from this same compiler. Zero effect when
     // unset. Refinements are gated by key order: only a total-order key can take any new path.
+    //
+    // Cache safety: this env read MUST stay at MIR-lowering level (here), never in codegen — the
+    // per-unit `impl_hash` fingerprints the lowered MIR text, so reading it here makes the object-cache
+    // key differ between the two shapes. `CacheContext::from_env` additionally forces the object cache
+    // off whenever this var is set (fail-closed). Do not move this read into `align_codegen_llvm`.
     let adaptive = std::env::var("ALIGN_SORT_ADAPTIVE").ok().as_deref() != Some("off");
     let emit_precheck = adaptive && key_order == KeyOrder::Total;
     let emit_boundary = adaptive && key_order == KeyOrder::Total;

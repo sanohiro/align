@@ -59,9 +59,13 @@ A `len <= 32` sort allocates only the materialize buffer (plain) / materialize +
 | 16-value cardinality | 0.99x | 1.00x |
 
 `sort_by_key_u64` (identity key): already-sorted 15.6x / 4.6x (precheck + decorate), tail-swap/1%
-1.00-1.16x, negatives 0.96-1.00x. `sort_str` (byte-lex key): already-sorted 10.9x, random/reverse
-0.99-1.01x. Every negative workload is within ≈ 2 % (plain) / ≈ 3.5 % (keyed) of baseline — the 3 %
-no-regression gate is met, with material wins on ordered / near-ordered inputs.
+1.00-1.16x. `sort_str` (byte-lex key): already-sorted 10.9x, random/reverse 0.99-1.01x. Plain-sort
+negatives are all within ≈ 2 % (gate met). **One keyed workload is over the 3 % line:** `sort_by_key`
+on a ≤ 16-distinct-value key at 100k is a stable ≈ 3.5 % regression (corrected 0.963/0.966/0.963x over
+three runs, control 0.996-0.999x — real, not bias); the same key at 1M is ≈ 1.00x and every other keyed
+workload is within ≈ 2 %. Cause: the keyed straight-copy moves two buffers (elements + keys), so
+refinement 2 has less upside for keyed sorts while the tie-heavy 16-value boundary decision mispredicts.
+Recorded pending a keyed-specific decision (see doc-12 §4.1).
 
 ## Root-cause note (why `w64`, not the first cut)
 
