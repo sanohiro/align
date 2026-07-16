@@ -575,20 +575,29 @@ materialization versus the virtual count formula took 613.6 ns versus 1.5 ns for
 the `.len()` fold and direct-index virtualization; pipeline consumers still need their own
 end-to-end gate because they do real work after producing each virtual view.
 
-### 8.3 CONFIRMED P1 — write str-group results directly into existing outputs
+### 8.3 SHIPPED 2026-07-16 — write single str-group and dictionary results directly
 
 Generated str-key group-by already allocates `out_keys` and `out_vals` at the row-count upper bound.
-The runtime nevertheless accumulates into `reprs: Vec<AlignStr>` and `acc: Vec<i64>`, then copies both
-into those outputs ([runtime](../../crates/align_runtime/src/lib.rs#L3105)). For a single aggregate,
-write a representative and seed directly at `out_[id]` on a vacant hash entry, then update
-`out_vals[id]` on hits. This removes two internal Vec allocations and two final copies without
-changing the hash table or output ownership.
+The single-aggregate runtime now writes a representative and seed directly at `out_[id]` on a
+vacant hash entry, then updates `out_vals[id]` on hits. This removes `reprs: Vec<AlignStr>` and
+`acc: Vec<i64>` plus both final copies without changing the hash table, first-occurrence dense ids,
+or output ownership. The AoS and two-column SoA entry points share this core.
 
-`dict_encode` similarly stages dictionary representatives in a Vec before copying to its already
-allocated dictionary buffer ([runtime](../../crates/align_runtime/src/lib.rs#L3449)); write them
-directly. Multi-aggregate group-by deliberately keeps a row-major accumulator for update locality,
-so do not scatter it into K output streams without measurement. It can still avoid allocating
-`ops`/`val_offs` Vecs from the call's already-present specs.
+`dict_encode` likewise writes each vacant representative directly to its already allocated
+dictionary buffer, eliminating its staging Vec and final copy. Both paths convert the signed caller
+capacity to `usize` before pointer arithmetic, stop before the first out-of-capacity write, and state
+the generated input/output non-overlap contract explicitly. A sentinel guard test pins both output
+boundaries; the existing AoS/SoA/dictionary and reuse suites pin values and first-occurrence order.
+
+**Measured (2026-07-16, native, 1M rows, consecutive min-of-20 runs):** at 632,390 distinct keys,
+four single group-bys (`a1`) fell from 690.0 to 630.4 ms (1.09x) and dictionary reuse (`a2`) from
+200.9 to 194.7 ms (1.03x). At 100 and 10,000 groups both stayed within 3%. This is supporting
+directional evidence rather than a balanced adoption duel; the deterministic adoption fact is the
+removal of three internal Vec allocations and three final copies across the two runtime shapes.
+
+Multi-aggregate group-by deliberately keeps a row-major accumulator for update locality, so do not
+scatter it into K output streams without measurement. It can still avoid allocating `ops`/`val_offs`
+Vecs from the call's already-present specs.
 
 Add a small-N strategy probe: for `n <= 8/16`, a linear scan over the caller output may beat a heap
 HashMap. This remains measure-first and must include duplicate-heavy and all-distinct inputs.
@@ -643,7 +652,8 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | `array_builder.build()` | grow payload (Box only when escaping) | 0 | keep nonescaping header elision + freeze |
 | direct `chunks(...).len()` / `[i]` | 0 | 0 / one direct source view | shipped virtual lowering |
 | stored/pipeline `chunks` | 1 header array | header fill then consumer read | retain; measure fused iteration separately |
-| str-key single group | 2 result + HashMap + 2 staging Vecs | 2 staging→result | direct result accumulation |
+| str-key single group | 2 result + HashMap | 0 | shipped direct result accumulation |
+| `dict_encode` | ids + dictionary + HashMap | 0 | shipped direct dictionary representatives |
 
 ## 10. Questions for Claude Code — not decisions
 
@@ -712,7 +722,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 1. ~~Make owned builder freeze allocator-compatible and zero-copy.~~ **DONE 2026-07-16.**
 2. ~~Virtualize direct-consumer `chunks`.~~ **DONE 2026-07-16** for immediate `.len()` and index;
    stored/escaping and pipeline/`par_map` values retain the owned materialized representation.
-3. Write single str-group and dictionary outputs directly.
+3. ~~Write single str-group and dictionary outputs directly.~~ **DONE 2026-07-16.**
 4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.
 5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
 
@@ -744,7 +754,8 @@ IR gates:
 - direct-consumer chunks contain no header allocation or `N*16` header-store loop (**shipped and
   regression-pinned 2026-07-16**);
 - bulk/direct array builder contains no per-element push call;
-- str-group single aggregate contains no accumulator/representative staging copies;
+- str-group single aggregate and `dict_encode` contain no accumulator/representative staging copies
+  (**shipped and regression-pinned 2026-07-16**);
 - mapped materializers retain `min.iters.check` and a scalar short path;
 - large constant-array positive case uses a private constant and direct read/one memcpy, while the
   short control retains the winning inline shape.

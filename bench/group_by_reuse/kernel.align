@@ -18,7 +18,7 @@
 // moves it back out instead (the param slot is nulled, its exit drop frees null), letting the C-ABI
 // harness keep ownership and thread the same `{ptr,len}` across rounds. (Value correctness is proven
 // by the merged `dict_encode_reuse_matches_a1_string_group_by` test; this kernel measures time.)
-Row { name: str, a: i64, b: i64, c: i64, d: i64 }
+pub Row { name: str, a: i64, b: i64, c: i64, d: i64 }
 
 // Naive: four str-key group_bys (re-interns the key column each time).
 pub fn a1(us: array<Row>) -> array<Row> {
