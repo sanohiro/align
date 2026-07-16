@@ -816,6 +816,151 @@ pub fn codegen_units_parallel(
     Ok(outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect())
 }
 
+// ---- instrument-PGO (`--pgo-instrument` / `--pgo-use`, S1) ----------------
+
+/// The instrument-PGO build mode selected on the command line. `Off` is the byte-identical
+/// default; `Instrument` builds a `-fprofile-generate`-equivalent binary; `Use` rebuilds
+/// with `-fprofile-use` reading a merged `.profdata`. Mutually exclusive by construction.
+#[derive(Clone, Debug)]
+pub enum PgoMode {
+    Off,
+    Instrument,
+    Use(std::path::PathBuf),
+}
+
+impl PgoMode {
+    /// Whether any PGO mode is active (either flag present).
+    pub fn is_on(&self) -> bool {
+        !matches!(self, PgoMode::Off)
+    }
+}
+
+/// The aggregated outcome of a PGO build: how many units were compiled and every use-phase
+/// staleness warning captured across them (one Align-voice report, `Nothing-hidden`).
+#[derive(Clone, Debug, Default)]
+pub struct PgoBuildReport {
+    pub units: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Validate a merged `.profdata` before it is handed to the PGO USE pipeline (the S1 fail-loud
+/// caveat, `docs/impl/07-roadmap.md`): the shim's return code CANNOT report a bad profile — libLLVM
+/// diagnoses it on the context and, in the error case, exits the process — so existence /
+/// readability / non-emptiness / a valid indexed-profdata magic are checked HERE, each a hard error
+/// naming the path. The magic is the 8-byte indexed-profile header `llvm-profdata-22 merge` writes
+/// (`0xff 'l' 'p' 'r' 'o' 'f' 'i' 0x81`, host-endian — accepted in either byte order); a raw
+/// `.profraw` (different magic) is rejected, guiding the user to run `merge` first.
+pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    // Indexed-profdata magic, as written on a little-endian (x86-64 / arm64) host. On a big-endian
+    // host LLVM stores the reversed bytes, so both orders are accepted.
+    const MAGIC_LE: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
+    const MAGIC_BE: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
+    if !path.exists() {
+        return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
+    }
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
+    let mut head = [0u8; 8];
+    let n = f
+        .read(&mut head)
+        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
+    if n == 0 {
+        return Err(format!("--pgo-use: profile data file '{}' is empty", path.display()));
+    }
+    if n < 8 || (head != MAGIC_LE && head != MAGIC_BE) {
+        return Err(format!(
+            "--pgo-use: '{}' is not a valid LLVM indexed profile data file (bad magic); \
+             merge your `.profraw` first: `llvm-profdata-22 merge -o out.profdata <raw>`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Locate the clang profile runtime archive (`libclang_rt.profile-<arch>.a` on ELF,
+/// `libclang_rt.profile_osx.a` on Mach-O) that defines the `__llvm_profile_runtime` anchor and the
+/// atexit `.profraw` writer. Resolved via `clang-22 -print-file-name` (which echoes the bare name
+/// back when it cannot resolve it — treated as "not found"). The architecture is derived from the
+/// build target's triple. A hard error (naming the probe) when clang or the archive is missing —
+/// an instrumented link without it silently writes no profile.
+pub fn profile_runtime_archive(target: &BuildTarget) -> Result<std::path::PathBuf, String> {
+    let rt = align_codegen_llvm::resolve_target_identity(target).map_err(|e| e.to_string())?;
+    let arch = rt.triple.split('-').next().unwrap_or("x86_64");
+    let format = target_object_format()?;
+    let archive_name = match format {
+        // Mach-O ships a single OS-named archive, not an arch-suffixed one.
+        ObjectFormat::MachO => "libclang_rt.profile_osx.a".to_string(),
+        ObjectFormat::Elf => format!("libclang_rt.profile-{arch}.a"),
+    };
+    let clang = llvm_tool("clang").ok_or_else(|| {
+        "--pgo-instrument: clang (clang-22) not found on PATH — needed to locate the profile \
+         runtime archive (libclang_rt.profile)"
+            .to_string()
+    })?;
+    let out = std::process::Command::new(&clang)
+        .arg(format!("-print-file-name={archive_name}"))
+        .output()
+        .map_err(|e| format!("--pgo-instrument: cannot launch {}: {e}", clang.display()))?;
+    let resolved = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    if resolved.is_absolute() && resolved.exists() {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "--pgo-instrument: profile runtime archive '{archive_name}' not found \
+             (clang '-print-file-name' returned '{}'); install the clang compiler-rt profile library",
+            resolved.display()
+        ))
+    }
+}
+
+/// Codegen every unit under instrument-PGO, SERIALLY (the S1 discipline) and with the object cache
+/// BYPASSED. The cache is bypassed because a PGO object is NOT keyed by the profile in S1 — the
+/// `PgoMode` cache-key component and instrumented/ordinary isolation are S2 (the ThinLTO-S1
+/// precedent: a new artifact identity ships behind the flag first, cache composition second). PGO
+/// instrumentation is a purely per-module pipeline swap (GEN inserts counters, USE reads the same
+/// merged profile by function hash), so wiring the SAME shim call per unit is trivially correct for a
+/// multi-unit build — exactly clang's per-TU `-fprofile-generate`/`-fprofile-use` model. Returns the
+/// aggregated report (unit count + every captured use-phase warning).
+pub fn codegen_units_pgo(
+    units: &[PerUnitArtifact],
+    obj_paths: &[std::path::PathBuf],
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    pgo: &PgoMode,
+) -> Result<PgoBuildReport, String> {
+    assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
+    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
+    // Resolve the shim action ONCE — `Off` is a caller contract violation (the build path only calls
+    // this under an active mode), surfaced as a hard error rather than a panic (fail-closed).
+    let action = match pgo {
+        PgoMode::Instrument => align_codegen_llvm::pgo::PgoAction::Instrument,
+        PgoMode::Use(p) => align_codegen_llvm::pgo::PgoAction::Use(p.as_path()),
+        PgoMode::Off => {
+            return Err("internal error: codegen_units_pgo called with PgoMode::Off".to_string())
+        }
+    };
+    let mut report = PgoBuildReport { units: units.len(), warnings: Vec::new() };
+    for (i, unit) in units.iter().enumerate() {
+        let run = align_codegen_llvm::emit_object_pgo(
+            &unit.mir,
+            &obj_paths[i],
+            target,
+            profile,
+            &[],
+            rt_lto_bytes(rt_lto),
+            action,
+        )
+        .map_err(|e| format!("codegen failed for unit `{}`: {e}", unit.unit))?;
+        report.warnings.extend(run.warnings);
+    }
+    Ok(report)
+}
+
 /// The shared, per-build target/LLVM identity used by both ThinLTO cache keys — resolved once (the
 /// same resolution `emit_prelink_bc` / `thinlto::backend` use, so a cache hit implies byte-identical
 /// bytes).
@@ -1226,6 +1371,27 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
 pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+    link_objects_inner(objs, exe, link_libs, profile, None)
+}
+
+/// [`link_objects`] for an instrument-PGO (`--pgo-instrument`) build: additionally links the clang
+/// profile runtime archive (`profile_rt`, from [`profile_runtime_archive`]) and forces the
+/// `__llvm_profile_runtime` anchor undefined so the archive's atexit `.profraw` writer is pulled in.
+/// On ELF the instrumented object carries NO reference to the runtime (LLVM relies on the
+/// `__start/__stop___llvm_prf_*` section brackets), so WITHOUT the forced-undefined symbol the link
+/// succeeds silently and no profile is ever written — exactly the flag clang's own driver injects
+/// (measured at PGO S0, `docs/impl/07-roadmap.md`).
+pub fn link_objects_instrumented(
+    objs: &[&std::path::Path],
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+    profile_rt: &std::path::Path,
+) -> Result<(), String> {
+    link_objects_inner(objs, exe, link_libs, profile, Some(profile_rt))
+}
+
+fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
     let mut cmd = std::process::Command::new("cc");
@@ -1261,6 +1427,22 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
     // (threads, dlopen, math) independent of any Align feature — NOT capability-gated. On Mach-O
     // all three are libSystem re-exports, so the list is empty.
     cmd.args(support_libs(format));
+    // Instrument-PGO (`--pgo-instrument`): append the clang profile runtime archive and force the
+    // `__llvm_profile_runtime` anchor undefined so its atexit `.profraw` writer is pulled from the
+    // archive (see [`link_objects_instrumented`]). Placed AFTER the objects/archive that (indirectly)
+    // need it — `-l`/archive resolution is left-to-right — and the forced-undefined symbol is spelled
+    // per object format (ELF `--undefined=SYM`; Mach-O `-u,_SYM`, its symbols carry a leading `_`).
+    if let Some(profile_rt) = profile_rt {
+        cmd.arg(profile_rt);
+        match format {
+            ObjectFormat::Elf => {
+                cmd.arg("-Wl,--undefined=__llvm_profile_runtime");
+            }
+            ObjectFormat::MachO => {
+                cmd.arg("-Wl,-u,___llvm_profile_runtime");
+            }
+        }
+    }
     // Capability + user libraries. `libz`/`libzstd`/`libcrypto`/`libssl` are NO LONGER linked
     // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
     // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user

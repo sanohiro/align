@@ -27,11 +27,6 @@ cc = "1"
 # headers (llvm-22-dev, already a workspace prerequisite) and llvm-config-22 on
 # PATH. Normal builds are unaffected.
 thinlto-spike = ["dep:libc"]
-# Instrument-PGO S0 feasibility spike. OFF by default: enabling it makes build.rs
-# pass -DALIGN_PGO_SPIKE so the C++ shim compiles the one extra `align_pgo_run_pipeline`
-# entry (needs the LLVM 22 C++ headers, already a workspace prerequisite), and turns on
-# the `pgo_spike` Rust module + its #[ignore] harness tests. Normal builds are unaffected.
-pgo-spike = []
 
 [dev-dependencies]
 align_diag = { path = "../align_diag" }

@@ -19,10 +19,9 @@ pub mod thinlto;
 #[cfg(feature = "thinlto-spike")]
 pub mod thinlto_spike;
 
-/// Instrument-PGO S0 feasibility spike (feature-gated; go/no-go probes for the
-/// gen→profile→use round trip on a real Align binary).
-#[cfg(feature = "pgo-spike")]
-pub mod pgo_spike;
+/// Instrument-PGO driver-facing surface (production): the safe wrapper over the
+/// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
+pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
@@ -369,6 +368,48 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
     apply_size_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// Emit one unit's object under instrument-PGO (`--pgo-instrument` / `--pgo-use`, S1).
+///
+/// Module construction is IDENTICAL to [`emit_object`] (data layout / ABI / `--rt-lto`
+/// merge / size attrs) — only the optimization step differs: instead of `write_object`'s
+/// stock `default<O*>` opt run, the RAW module is handed to the PGO shim, which runs the
+/// per-module default pipeline with a populated `PGOOptions` (GEN inserts counters; USE
+/// attaches `!prof branch_weights`). Object emission then stays on the same
+/// `tm.write_to_file` seam. `pgo::PgoAction::Use` requires a caller-validated profile
+/// (see [`pgo::run_pgo_pipeline`]'s contract). Returns the run's [`pgo::PgoRunReport`]
+/// (USE staleness warnings; empty for GEN) so the driver can aggregate one report.
+///
+/// This is a SEPARATE entry from [`emit_object`] so the flag-off path stays byte-identical.
+pub fn emit_object_pgo(
+    program: &Program,
+    out: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: Option<&[u8]>,
+    action: pgo::PgoAction<'_>,
+) -> Result<pgo::PgoRunReport, CodegenError> {
+    let ctx = Context::create();
+    let module = ctx.create_module("align");
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
+    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
+    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    if let Some(rt) = rt_module {
+        link_in_rt_lto(&ctx, &module, rt)?;
+    }
+    apply_size_attrs(&ctx, &module, profile);
+    // The per-module default pipeline opt level matches a normal build (release = O2,
+    // fast = O3) — reusing the ThinLTO opt-level mapping (both are middle-end levels).
+    let opt = thinlto::ir_opt_level(profile);
+    // SAFETY: `module.as_mut_ptr()` / `tm.as_mut_ptr()` are live handles in the process
+    // LLVM with a datalayout set by `build_module`; `module`/`tm`/`ctx` outlive the call.
+    let report =
+        unsafe { pgo::run_pgo_pipeline(module.as_mut_ptr(), tm.as_mut_ptr(), opt, action)? };
+    tm.write_to_file(&module, FileType::Object, out)
+        .map_err(|e| CodegenError::Target(e.to_string()))?;
+    Ok(report)
 }
 
 /// Build one unit's **ThinLTO prelink bitcode** (`--thin-lto`, S1): identical module

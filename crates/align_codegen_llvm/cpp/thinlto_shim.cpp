@@ -2,14 +2,13 @@
 //!
 //! A minimal C++ bridge for surface the llvm-sys 221 C API lacks: the three
 //! summary-based ThinLTO entry points (no way to emit a module summary index,
-//! no combined-index/FunctionImporter surface), plus a feature-gated
-//! instrument-PGO pipeline entry (`ALIGN_PGO_SPIKE`; no PGOOptions C surface —
-//! becomes production at PGO S1). Compiled
-//! UNCONDITIONALLY by build.rs (the `--thin-lto` driver needs it in every
-//! `alignc`), against the SAME libLLVM-22.so the workspace links (prefer-dynamic),
-//! so there is a single LLVM in the process.
+//! no combined-index/FunctionImporter surface), plus the instrument-PGO
+//! pipeline entry `align_pgo_run_pipeline` (no `PGOOptions` C surface at all).
+//! Compiled UNCONDITIONALLY by build.rs (the `--thin-lto` and `--pgo-*` driver
+//! paths both need it in every `alignc`), against the SAME libLLVM-22.so the
+//! workspace links (prefer-dynamic), so there is a single LLVM in the process.
 //!
-//! All three entry points take/return plain C types so the Rust side declares
+//! All entry points take/return plain C types so the Rust side declares
 //! them with `extern "C"`. `LLVMModuleRef` / `LLVMTargetMachineRef` values are
 //! inkwell/llvm-sys handles that we `llvm::unwrap` / `reinterpret_cast` back into
 //! their C++ types in that same libLLVM.
@@ -41,7 +40,9 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/PGOOptions.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/FunctionImport.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
@@ -425,8 +426,7 @@ extern "C" int align_thinlto_backend(
 }
 
 // ===========================================================================
-// Instrument-PGO S0 spike entry (feature `pgo-spike`; compiled ONLY when
-// build.rs passes -DALIGN_PGO_SPIKE, so default builds are byte-identical).
+// Instrument-PGO pipeline entry (production; compiled unconditionally).
 // ===========================================================================
 //
 // Why a shim at all: llvm-sys 221 exposes NO PGO surface. LLVMPassBuilderOptions
@@ -458,12 +458,6 @@ extern "C" int align_thinlto_backend(
 // (existence/readability/magic) BEFORE this call and install a context
 // diagnostic handler to observe use-phase degradation; the S1 driver owns that
 // fail-loud policy (roadmap "Instrument-PGO design SETTLED").
-#ifdef ALIGN_PGO_SPIKE
-
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Support/PGOOptions.h"
-#include "llvm/Support/VirtualFileSystem.h"
-
 extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
                                       LLVMTargetMachineRef tm_ref, int opt_level,
                                       int kind, const char *profdata_path) {
@@ -509,5 +503,3 @@ extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
   MPM.run(*M, MAM);
   return 0;
 }
-
-#endif // ALIGN_PGO_SPIKE
