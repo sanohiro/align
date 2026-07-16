@@ -73,8 +73,9 @@ After those are closed, the highest-value performance refinements from this audi
    separate new measure-first probe.
 3. Evaluate SIMD block compaction for materializing `where`/`partition`, separately from reducing
    `where`; do not preserve the current unsafe speculative-execution trick merely to get vector code.
-4. Remove a redundant URL/request copy in `http.get_many`, and complete the already-planned I/O
-   uninitialized-buffer and `io.copy` syscall fast paths.
+4. ~~Complete the already-planned reader/`io.copy` uninitialized-buffer work.~~ **SHIPPED
+   2026-07-16.** Next remove the redundant URL/request copy in `http.get_many`; syscall-dispatched
+   `io.copy` remains a separate throughput fast path.
 5. Add the measured total-order stable-sort fast path: avoid unused tiny scratch, detect a fully
    ordered input, and skip comparison-merging adjacent runs whose boundary is already ordered.
 
@@ -905,7 +906,7 @@ Do not use unstable `std::simd` in the stable runtime.
 | blocked wide AoS->SoA construction | **ALREADY PLANNED** in document 10 |
 | packed spawn env/result/error record | **ALREADY PLANNED** in document 11; measure false sharing after block claiming |
 | one `Arc<TgWaitState>` instead of separate task/cursor/barrier Arcs | New small follow-up; measure after scheduler P2 because the work-first descriptor may subsume it |
-| I/O `Vec::resize(..., 0)` removal | Reader/`io.copy` **ALREADY PLANNED**; UDP/pread are a new audited extension; use spare-capacity/raw-write discipline |
+| I/O `Vec::resize(..., 0)` removal | Reader/`io.copy` **SHIPPED 2026-07-16** with spare-capacity/raw-write discipline; UDP/pread remain a new audited extension |
 | JSON Vec->malloc final copy | Exact-count `array<i64>` direct fill **REJECTED 2026-07-16**: an extra lexical count pass fell to 0.71-0.73x at 1K-1M elements; retain one-pass staging unless a different ownership mechanism avoids the second parse |
 | C-realloc-backed template Builder with zero-copy string freeze | Plausible P3; current evidence says per-write FFI, not final copy, dominates |
 | upper-bound filter allocation right-sizing | Do not retry alone; untouched pages are lazy and prior right-sizing measured no win |
@@ -927,7 +928,7 @@ whose chunk-vector growth may free old metadata.
 | `fs.read_file_view` / bytes view | any nonzero regular file may mmap; zero/special/failure falls back to arena copy | same arena-scoped mmap path; no payload copy | **GOOD** copy avoidance, not nonblocking I/O: string view immediately UTF-8-scans/faults pages; bytes view may fault later |
 | buffered `writer` | accumulates into 64 KiB, amortizing syscalls | flushes then writes a chunk >=64 KiB directly, avoiding double copy | **GOOD** for both sizes; `print` remains the deliberately slow debug rail |
 | buffered `reader.read_line` | `memchr` finds newline; one payload append per lookahead span | 64 KiB lookahead; long lines may append several spans and reallocate while growing | **GOOD** baseline; scoped zero-copy line callback is already planned if copying dominates |
-| `io.copy` | one 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB shared-reader/shared-writer loop | Memory-bounded and **byte-correct after buffered lookahead** (fixed §3.6) |
+| `io.copy` | one raw-capacity 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB shared-reader/shared-writer loop | Memory-bounded, no pre-read zero-fill, and **byte-correct after buffered lookahead** (fixed §3.6) |
 | `file.pread/pwrite` | one synchronous positional syscall/loop | caller-selected buffer size; pwrite handles partial writes | Correct, but blocks the calling OS thread; no batch/vectored surface today |
 | `http.get_many` | per-request allocations matter | bounded dedicated blocking threads overlap latency; input-order slots | Correct concurrency shape; request construction has one removable copy |
 
@@ -976,10 +977,13 @@ sendfile/splice/io_uring-class dispatch is **ALREADY PLANNED**; macOS sendfile/f
 validation are a new extension from this audit. Require throughput/RSS results for 0 B, 1 B, 4 KiB,
 64 KiB boundaries, 1 MiB, and multi-GiB sparse/real files.
 
-The **ALREADY PLANNED** zero-fill removal covers reader/lookahead and `io.copy`; this audit extends the
-same proof obligation to UDP receive and `pread`. Use `spare_capacity_mut`/`MaybeUninit` or raw pointers
-and set the initialized logical length only after a successful syscall. Never form an initialized Rust
-slice covering the unwritten tail of a short read.
+The reader/lookahead and `io.copy` zero-fill removal **SHIPPED 2026-07-16**. Their buffers now reserve
+raw capacity, pass only a spare-capacity pointer to `read(2)`, and call `set_len` with exactly the
+successful byte count. A short read or EOF therefore never creates an initialized Rust slice over
+the unwritten tail; EINTR retries while the logical length remains zero, and `io.copy` still drains
+buffered lookahead through the shared reader path. The checked-in allocation-inclusive 64 KiB-window
+probe improved fresh 0/1/4 KiB/full reads by 20.92x/20.83x/11.49x/1.98x. This audit extends the same
+proof obligation to UDP receive and `pread`, which remain separate follow-up work.
 
 ### 7.4 New small allocation/copy cleanup in `http.get_many`
 
@@ -1219,7 +1223,8 @@ of integer wrap.
 - add the total-order ordered-input/run-boundary stable-sort path and delay merge-only scratch until
   a merge pass can execute; retain the current path for float/NaN keys;
 - execute document 11's range-kernel and low-lock scheduler sequence;
-- land the already-planned I/O uninitialized-read-buffer work.
+- [x] land the already-planned I/O uninitialized-read-buffer work (2026-07-16; reader lookahead,
+  direct read, and portable `io.copy`; short-read/EOF/lookahead gates + adoption probe).
 
 ### Slice P2 — earned throughput fast paths
 
