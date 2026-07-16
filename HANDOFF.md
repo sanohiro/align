@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (third update this day), **INSTRUMENT-PGO IS DESIGN-SETTLED AND ITS S0
+_Last updated: 2026-07-17 (fourth update this day), **INSTRUMENT-PGO S1 IS SHIPPED — SERIAL
+CORRECTNESS BEHIND `--pgo-instrument` / `--pgo-use`, MERGED as #500** (`913724b`). The shim PGO
+entry is a production component (the `pgo-spike` feature and `pgo_spike.rs` were deleted outright;
+the 5 spike tests retargeted onto production `src/pgo.rs`); the driver wires both flags (mutually
+exclusive, release/fast only, build/run/size, loud rejection elsewhere and with `--thin-lto`;
+`--rt-lto` composes); N>1 wires the same per-module pipeline swap per unit, serially, verified
+end-to-end on a 2-module program; the object cache is bypassed under either flag (S2 integrates
+the `PgoMode` key component) with the explicit `--cache-stats` bypass line. The S0 ELF friction is
+applied (instrumented links add `-Wl,--undefined=__llvm_profile_runtime` + the clang_rt.profile
+archive, now probing BOTH the flat and per-target runtime layouts) and the fail-loud policy lives
+in the driver: profdata pre-validation (exists/readable/non-empty/valid magic both byte orders,
+hard errors naming the path) + a context diagnostic handler where Error severity hard-fails and
+EVERY Warning-severity diagnostic is reported verbatim (the keyword filter was removed as
+fail-open during review). Gates (`crates/align_driver/tests/pgo.rs`, 7 + extended rejection
+matrix; 5 codegen `pgo::` unit tests): gen writes a non-empty profraw + prints the destination to
+stderr; the full gen→run→llvm-profdata merge→use round trip; `!prof`/`__profc_` IR mutation
+checks; run-parity off/instrument/use; fail-loud profdata errors; flag-off byte-identity (also
+pinning the review's build_program_module prologue dedup). The /code-review fallback confirmed 8
+findings, all applied pre-merge — notably the parse_pgo flag-swallowing bug (root cause: flag
+strippers ran before parse_pgo, exposing the verb; fixed by ordering + a likely-flag guard).
+Workspace green (**2255 total = 2237 passed + 18 ignored**), clippy clean in default +
+thinlto-spike states. **Next: PGO S2 — cache composition** per the settled record: the
+`PgoMode { Off | Instrument | Use(Hash128 of profdata bytes) }` component on `CodegenKey` (the
+rt_lto_digest precedent), `FirstDiff::PgoProfile`, `CACHE_KEY_FORMAT_VERSION` bump, re-route PGO
+builds through the normal cached/parallel path, with instrumented-vs-ordinary isolation, digest,
+revert, and cold-vs-hit gates; then SV (determinism both modes, stale/wrong-profile mutations,
+compile-time bound, and the measured payoff gate on a branch-heavy kernel). Previous update:
+2026-07-17 (third update this day), **INSTRUMENT-PGO IS DESIGN-SETTLED AND ITS S0
 SPIKE IS GO — MERGED as #499** (`f45f627`). The M14 wave remainder head after the closed ThinLTO
 arc. Design settled by a two-lens review + orchestrator decisions, recorded as the roadmap's
 "Instrument-PGO design SETTLED" paragraph (the S1/S2/SV source of truth): mechanism = ONE new shim
