@@ -2516,7 +2516,7 @@ reporting, hotness-gated multiversioning (a separate unimplemented feature), and
 `--profile`.
 
 **Instrument-PGO S0 spike GO record (2026-07-17, `pgo-spike` feature, 5 ignored tests,
-`crates/align_codegen_llvm/src/pgo_spike.rs`).** END-TO-END on a REAL Align binary: a branch-heavy program
+`crates/align_codegen_llvm/src/pgo_spike.rs`).** *(Promoted to production `crates/align_codegen_llvm/src/pgo.rs` at S1; the `pgo-spike` feature and `pgo_spike.rs` were removed, and the shim entry now compiles unconditionally — this record is retained as the historical S0 go/no-go.)* END-TO-END on a REAL Align binary: a branch-heavy program
 compiled through the actual frontend + `build_module` emit path with the opt run replaced by the shim GEN
 entry, emitted as an object, linked under Align's real link hygiene (`--gc-sections`/`--as-needed`) with
 the clang profile runtime archive appended, run with `LLVM_PROFILE_FILE` set → a 288-byte `.profraw`

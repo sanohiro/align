@@ -19,10 +19,9 @@ pub mod thinlto;
 #[cfg(feature = "thinlto-spike")]
 pub mod thinlto_spike;
 
-/// Instrument-PGO S0 feasibility spike (feature-gated; go/no-go probes for the
-/// gen→profile→use round trip on a real Align binary).
-#[cfg(feature = "pgo-spike")]
-pub mod pgo_spike;
+/// Instrument-PGO driver-facing surface (production): the safe wrapper over the
+/// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
+pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
@@ -353,22 +352,77 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
 /// the baked bitcode is parsed FIRST; only if that succeeds are the guarded declares left
 /// un-curated. An unparseable artifact emits a loud diagnostic and falls back to the flag-off path
 /// with the curated contract intact (never silently dropped).
-pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String], rt_lto: Option<&[u8]>) -> Result<(), CodegenError> {
-    let ctx = Context::create();
+/// The shared module-construction prologue for every whole-unit emit path — the ordinary object
+/// ([`emit_object`]), instrument-PGO ([`emit_object_pgo`]), and ThinLTO prelink ([`emit_prelink_bc`]).
+///
+/// It builds the [`TargetMachine`] and the fully-populated [`Module`] (probe the baked `--rt-lto`
+/// bitcode → `build_module` → merge/internalize the fast-path bodies on a hit → size-attr sweep), then
+/// returns both for the caller's optimize+emit tail. Extracting it makes the "identical construction"
+/// contract these three paths share COMPILER-ENFORCED rather than three hand-copied prologues that can
+/// silently drift. The caller owns the [`Context`] (a `Module` borrows it), so it is passed in.
+fn build_program_module<'c>(
+    ctx: &'c Context,
+    program: &Program,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: Option<&[u8]>,
+) -> Result<(Module<'c>, TargetMachine), CodegenError> {
     let module = ctx.create_module("align");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
     // Probe the baked bitcode before deciding whether to skip curating the guarded declares.
-    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
-    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(ctx, bc));
+    build_module(ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
     if let Some(rt) = rt_module {
         // On a datalayout mismatch `link_in_rt_lto` falls back on its own (loud diagnostic, guarded
         // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
-        link_in_rt_lto(&ctx, &module, rt)?;
+        link_in_rt_lto(ctx, &module, rt)?;
     }
     // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
-    apply_size_attrs(&ctx, &module, profile);
+    apply_size_attrs(ctx, &module, profile);
+    Ok((module, tm))
+}
+
+pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String], rt_lto: Option<&[u8]>) -> Result<(), CodegenError> {
+    let ctx = Context::create();
+    let (module, tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
     write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// Emit one unit's object under instrument-PGO (`--pgo-instrument` / `--pgo-use`, S1).
+///
+/// Module construction is IDENTICAL to [`emit_object`] (data layout / ABI / `--rt-lto`
+/// merge / size attrs) — only the optimization step differs: instead of `write_object`'s
+/// stock `default<O*>` opt run, the RAW module is handed to the PGO shim, which runs the
+/// per-module default pipeline with a populated `PGOOptions` (GEN inserts counters; USE
+/// attaches `!prof branch_weights`). Object emission then stays on the same
+/// `tm.write_to_file` seam. `pgo::PgoAction::Use` requires a caller-validated profile
+/// (see [`pgo::run_pgo_pipeline`]'s contract). Returns the run's [`pgo::PgoRunReport`]
+/// (USE staleness warnings; empty for GEN) so the driver can aggregate one report.
+///
+/// This is a SEPARATE entry from [`emit_object`] so the flag-off path stays byte-identical.
+pub fn emit_object_pgo(
+    program: &Program,
+    out: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: Option<&[u8]>,
+    action: pgo::PgoAction<'_>,
+) -> Result<pgo::PgoRunReport, CodegenError> {
+    let ctx = Context::create();
+    let (module, tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
+    // The per-module default pipeline opt level matches a normal build (release = O2,
+    // fast = O3) — reusing the ThinLTO opt-level mapping (both are middle-end levels).
+    let opt = thinlto::ir_opt_level(profile);
+    // SAFETY: `module.as_mut_ptr()` / `tm.as_mut_ptr()` are live handles in the process
+    // LLVM with a datalayout set by `build_module`; `module`/`tm`/`ctx` outlive the call.
+    let report =
+        unsafe { pgo::run_pgo_pipeline(module.as_mut_ptr(), tm.as_mut_ptr(), opt, action)? };
+    tm.write_to_file(&module, FileType::Object, out)
+        .map_err(|e| CodegenError::Target(e.to_string()))?;
+    Ok(report)
 }
 
 /// Build one unit's **ThinLTO prelink bitcode** (`--thin-lto`, S1): identical module
@@ -390,14 +444,9 @@ pub fn emit_prelink_bc(
     stable_id: &str,
 ) -> Result<(), CodegenError> {
     let ctx = Context::create();
-    let module = ctx.create_module("align");
-    let tm = create_target_machine(target, profile.codegen_opt_level())?;
-    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
-    build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
-    if let Some(rt) = rt_module {
-        link_in_rt_lto(&ctx, &module, rt)?;
-    }
-    apply_size_attrs(&ctx, &module, profile);
+    // `_tm` is unused past construction (the ThinLTO prelink shim takes no TargetMachine) but is kept
+    // named so it outlives the shim call alongside `ctx`/`module`.
+    let (module, _tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
     // The module (and its `ctx`) must outlive the shim call; `write_prelink_bc` writes the
     // bitcode synchronously and returns before `module`/`ctx`/`tm` drop here.
     // SAFETY: `module.as_mut_ptr()` is a live LLVMModuleRef in the process LLVM with a

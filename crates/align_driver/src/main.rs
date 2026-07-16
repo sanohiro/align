@@ -36,9 +36,21 @@ mod size;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().collect();
+    // Pull the instrument-PGO flags FIRST (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1):
+    // mutually exclusive; a bare `--pgo-use` is a hard error. It must run before the other flag
+    // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
+    // …) still present — otherwise that flag would already be removed and the guard would consume the
+    // verb as the profile value. Serial, cache-bypassed, release/fast only.
+    let (pgo, args) = match parse_pgo(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("alignc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
-    let (target, args) = parse_target(&raw);
+    let (target, args) = parse_target(&args);
     // Pull `--profile <name>` next (also anywhere before the program's own args). A bad value is a
     // hard error here, not a silent fallback.
     let (profile, args) = match parse_profile(&args) {
@@ -136,6 +148,37 @@ fn main() -> ExitCode {
         }
     }
 
+    // Instrument-PGO (`--pgo-instrument` / `--pgo-use`) is legal only on the whole-program build verbs
+    // (`build`/`run`/`size`) and the inlining profiles (`release`/`fast`) — the same discipline as
+    // `--thin-lto` — and is REJECTED loudly combined with `--thin-lto` in v1 (correct ThinLTO+PGO
+    // needs PGOOptions threaded through all three ThinLTO phases + profile-aware import; its own later
+    // slice). `--rt-lto` composes freely. Mutual exclusion + a bare `--pgo-use` were already caught in
+    // `parse_pgo`.
+    if pgo.is_on() {
+        if !matches!(cmd, Some("build") | Some("run") | Some("size")) {
+            eprintln!(
+                "alignc: --pgo-instrument/--pgo-use is only valid for `build`/`run`/`size` (got `{}`)",
+                cmd.unwrap_or("<none>")
+            );
+            return ExitCode::FAILURE;
+        }
+        if matches!(profile, Profile::Dev | Profile::Small | Profile::Tiny) {
+            eprintln!(
+                "alignc: --pgo-instrument/--pgo-use is incompatible with the `{}` profile (it needs an \
+                 inlining pipeline; use `release` or `fast`)",
+                profile.name()
+            );
+            return ExitCode::FAILURE;
+        }
+        if thin_lto {
+            eprintln!(
+                "alignc: --pgo-instrument/--pgo-use cannot be combined with --thin-lto in v1 \
+                 (ThinLTO+PGO is a separate later slice)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     // `--export` only means something where codegen produces a standalone object/IR with linker-
     // visible symbols (`emit-obj`/`emit-llvm`); anywhere else a nonempty export set would either be
     // silently ignored or silently change linkage no one asked for — neither is acceptable
@@ -171,7 +214,7 @@ fn main() -> ExitCode {
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
-        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, thin_lto, jobs, cache_stats),
+        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         // `cache clear` — remove the cache-owned subtrees under the resolved cache root (S3b).
         (Some("cache"), Some(sub)) if sub == "clear" => run_cache_clear(),
         (Some("cache"), other) => {
@@ -186,9 +229,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, thin_lto, jobs, cache_stats),
+        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, jobs, cache_stats),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -252,6 +295,55 @@ fn parse_thin_lto(args: &[String]) -> (bool, Vec<String>) {
         }
     }
     (thin_lto, rest)
+}
+
+/// Pull the instrument-PGO flags (`--pgo-instrument` / `--pgo-use <path>` / `--pgo-use=<path>`, S1),
+/// returning the resolved [`align_driver::PgoMode`] and the remaining args. Errors (all hard):
+///   * a bare `--pgo-use` with no following value (never a guessed profile path);
+///   * `--pgo-instrument` and `--pgo-use` together (mutually exclusive — an instrument build and a
+///     use build are different artifacts).
+fn parse_pgo(args: &[String]) -> Result<(align_driver::PgoMode, Vec<String>), String> {
+    let mut instrument = false;
+    let mut use_path: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--pgo-instrument" {
+            instrument = true;
+        } else if let Some(v) = a.strip_prefix("--pgo-use=") {
+            if v.is_empty() {
+                return Err("--pgo-use requires a value (e.g. `--pgo-use app.profdata`)".to_string());
+            }
+            use_path = Some(v.to_string());
+        } else if a == "--pgo-use" {
+            match args.get(i + 1) {
+                // Likely-flag guard: a value starting with `--` is another flag (or, transitively,
+                // the verb), not a profile path — consuming it silently swallows the flag and, worse,
+                // bypasses the mutual-exclusion check below (`--pgo-use --pgo-instrument` would set the
+                // path to "--pgo-instrument" and leave `instrument` false). Reject it as a missing value.
+                Some(v) if !v.starts_with("--") => {
+                    use_path = Some(v.clone());
+                    i += 1;
+                }
+                _ => {
+                    return Err("--pgo-use requires a value (e.g. `--pgo-use app.profdata`)".to_string());
+                }
+            }
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    let mode = match (instrument, use_path) {
+        (true, Some(_)) => {
+            return Err("--pgo-instrument and --pgo-use are mutually exclusive".to_string());
+        }
+        (true, None) => align_driver::PgoMode::Instrument,
+        (false, Some(p)) => align_driver::PgoMode::Use(std::path::PathBuf::from(p)),
+        (false, None) => align_driver::PgoMode::Off,
+    };
+    Ok((mode, rest))
 }
 
 /// Pull the boolean `--cache-stats` flag (M15 S3b) out of `args`. Valueless, idempotent; with it, the
@@ -462,6 +554,10 @@ fn usage() {
                        string primitives' bitcode into the program and inline it before the opt run\n  \
          --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — optimize across the\n  \
                        per-unit boundary (serial, no cache in v1); composes with --rt-lto\n  \
+         --pgo-instrument (build/run/size; release/fast only) build a profile-generating binary; run\n  \
+                       it to write a .profraw, `llvm-profdata-22 merge` it, then rebuild with --pgo-use\n  \
+         --pgo-use F   (build/run/size; release/fast only) rebuild using merged profile data F\n  \
+                       (.profdata); exclusive with --pgo-instrument; not combinable with --thin-lto\n  \
          --cache-stats (build/run/size) print a per-unit codegen-cache hit/miss report\n  \
          -j, --jobs N  (build/run/size) codegen worker threads (default: available parallelism;\n  \
                        overrides ALIGNC_JOBS)\n  \
@@ -836,7 +932,7 @@ impl Drop for ArtifactStage {
 /// deterministically first-seen across units; the executable is published to `exe` by same-directory
 /// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
 #[allow(clippy::too_many_arguments)]
-fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
+fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
     let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
@@ -844,6 +940,48 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     })?;
     // One object path per unit (DAG-index-named, not the `.`-containing module path).
     let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
+    // Instrument-PGO path (`--pgo-instrument` / `--pgo-use`): SERIAL, per-unit shim codegen with the
+    // object cache BYPASSED (the `PgoMode` cache-key component is S2 — the ThinLTO-S1 precedent of
+    // shipping a new artifact identity behind the flag before cache composition). Mutually exclusive
+    // with `--thin-lto` (rejected above), so no ThinLTO interaction here.
+    if pgo.is_on() {
+        // The object cache is bypassed under PGO in S1 (the `PgoMode` key component is S2). Mirror the
+        // ThinLTO-S1 `--cache-stats` precedent: say so explicitly rather than silently omit the report.
+        if cache_stats {
+            eprintln!(
+                "alignc: cache: bypassed under --pgo-instrument/--pgo-use (S1; S2 integrates cache composition)"
+            );
+        }
+        // Fail-loud profdata validation happens BEFORE the shim runs (the S1 caveat: the shim's rc
+        // cannot report a bad profile — libLLVM would diagnose-and-exit).
+        if let align_driver::PgoMode::Use(p) = pgo
+            && let Err(e) = align_driver::validate_profdata(p)
+        {
+            eprintln!("alignc: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+        let report = match align_driver::codegen_units_pgo(&walk.units, &obj_paths, &target, profile, rt_lto, pgo) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("alignc: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        // One aggregated Align-voice report for the whole build, then proceed (the settled
+        // partially-stale policy: report, don't abort; there is no `--pgo-strict` knob). These are
+        // every Warning-severity diagnostic the PGO use pipeline raised — typically profile staleness
+        // (a function changed since the profile was collected), surfaced verbatim so nothing is hidden.
+        if !report.warnings.is_empty() {
+            eprintln!(
+                "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across {} unit(s) \
+                 (usually functions changed since the profile was collected); first: {}",
+                report.warnings.len(),
+                report.units,
+                report.warnings[0]
+            );
+        }
+        return finish_link(&walk, &obj_paths, exe, profile, &target, pgo);
+    }
     // Opt-in codegen cache (ALIGNC_CACHE), default-ON; disabled ⇒ each unit emits verbatim.
     let cache = CacheContext::from_env();
     if thin_lto && walk.units.len() >= 2 {
@@ -864,7 +1002,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         if cache_stats {
             render_thin_cache_stats(&outcomes, cache.is_enabled());
         }
-        return finish_link(&walk, &obj_paths, exe, profile);
+        return finish_link(&walk, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
     }
     // Codegen runs in parallel over cache MISSES (`jobs` workers); lookups are serial and results stay
     // DAG-ordered. This is also the N=1 `--thin-lto` path (a single unit has no cross-unit boundary).
@@ -878,13 +1016,13 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     if cache_stats {
         render_cache_stats(&outcomes, cache.is_enabled());
     }
-    finish_link(&walk, &obj_paths, exe, profile)
+    finish_link(&walk, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off)
 }
 
 /// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in
 /// DAG order) + link + atomic-rename publish. Shared by the normal cached path and the `--thin-lto`
 /// path (the objects differ; the link step is identical).
-fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: Profile) -> Result<(), ExitCode> {
+fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
     // Deterministic capability union across units, first-seen in DAG (unit) order — never completion
     // order (parallel codegen may finish units out of order, but this iterates `walk.units`).
     let mut link_libs: Vec<String> = Vec::new();
@@ -903,7 +1041,31 @@ fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: P
     })?;
     let staged_exe = publish_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
     let obj_refs: Vec<&Path> = obj_paths.iter().map(|p| p.as_path()).collect();
-    if let Err(e) = link_objects(&obj_refs, &staged_exe, &link_libs, profile) {
+    // Under `--pgo-instrument` the link additionally pulls the clang profile runtime and forces the
+    // `__llvm_profile_runtime` anchor undefined (so the atexit `.profraw` writer survives) — and, per
+    // Nothing-hidden, PRINTS where the running binary will write its profile. `--pgo-use` links
+    // ordinarily (the profile is already baked into the optimized objects).
+    let link_result = if matches!(pgo, align_driver::PgoMode::Instrument) {
+        let profile_rt = match align_driver::profile_runtime_archive(target) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("alignc: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        let dest = std::env::var("LLVM_PROFILE_FILE").unwrap_or_else(|_| "default.profraw".to_string());
+        // Surfaced on stderr, not stdout: under `run` the built program's own stdout must stay clean,
+        // and `size` parses stdout — this is a diagnostic note, so it belongs on stderr.
+        eprintln!(
+            "alignc: --pgo-instrument: instrumented binary will write its profile to `{dest}` when run \
+             (set LLVM_PROFILE_FILE to redirect); then `llvm-profdata-22 merge` it and rebuild with \
+             `--pgo-use <file.profdata>`"
+        );
+        align_driver::link_objects_instrumented(&obj_refs, &staged_exe, &link_libs, profile, &profile_rt)
+    } else {
+        link_objects(&obj_refs, &staged_exe, &link_libs, profile)
+    };
+    if let Err(e) = link_result {
         eprintln!("alignc: {e}");
         return Err(ExitCode::FAILURE);
     }
@@ -914,9 +1076,10 @@ fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: P
     Ok(())
 }
 
-fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
+#[allow(clippy::too_many_arguments)]
+fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
     let exe = PathBuf::from(stem(path));
-    match build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, jobs, cache_stats) {
+    match build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -996,7 +1159,7 @@ fn run_cache_clear() -> ExitCode {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
     let stage = match ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
@@ -1005,7 +1168,7 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, jobs, cache_stats) {
+    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the

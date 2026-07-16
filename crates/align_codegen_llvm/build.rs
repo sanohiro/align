@@ -8,9 +8,13 @@
 //! LLVM in the process. Requires `llvm-config-22` on PATH and the LLVM 22 C++
 //! headers (`llvm-22-dev`) — already workspace prerequisites.
 //!
+//! The shim also carries the production instrument-PGO entry
+//! (`align_pgo_run_pipeline`) — no `PGOOptions` C surface exists, so `--pgo-*`
+//! needs it in every `alignc` too. It links against libLLVM only.
+//!
 //! The `thinlto-spike` feature adds ONLY the legacy `ThinLTOCodeGenerator` C API
-//! (`libLTO.so`) that the S0 spike tests use for their collapse/minimal-mechanism
-//! probes; the production 3-entry shim itself needs only libLLVM.
+//! (`libLTO.so`) that the ThinLTO S0 spike tests use for their collapse/
+//! minimal-mechanism probes; the production shim entries need only libLLVM.
 
 use std::process::Command;
 
@@ -67,14 +71,6 @@ fn main() {
         .define("__STDC_FORMAT_MACROS", None)
         .define("__STDC_LIMIT_MACROS", None)
         .warnings(false);
-    // The instrument-PGO S0 spike (feature `pgo-spike`) compiles ONE extra shim
-    // entry (`align_pgo_run_pipeline`) guarded by `#ifdef ALIGN_PGO_SPIKE`. Without
-    // the feature the guard is off, so the shim object — and every default build —
-    // is byte-identical to before the spike (the PGO includes/APIs are not even
-    // parsed).
-    if std::env::var_os("CARGO_FEATURE_PGO_SPIKE").is_some() {
-        build.define("ALIGN_PGO_SPIKE", None);
-    }
     build.compile("align_thinlto_shim");
 
     // Link against the same dynamic libLLVM the workspace already uses, plus
