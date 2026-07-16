@@ -906,7 +906,7 @@ Do not use unstable `std::simd` in the stable runtime.
 | blocked wide AoS->SoA construction | **ALREADY PLANNED** in document 10 |
 | packed spawn env/result/error record | **ALREADY PLANNED** in document 11; measure false sharing after block claiming |
 | one `Arc<TgWaitState>` instead of separate task/cursor/barrier Arcs | New small follow-up; measure after scheduler P2 because the work-first descriptor may subsume it |
-| I/O `Vec::resize(..., 0)` removal | Reader/`io.copy` **SHIPPED 2026-07-16** with spare-capacity/raw-write discipline; UDP/pread remain a new audited extension |
+| I/O `Vec::resize(..., 0)` removal | Reader/`io.copy` plus audited UDP/pread extension **SHIPPED 2026-07-16** with one shared spare-capacity/raw-write discipline |
 | JSON Vec->malloc final copy | Exact-count `array<i64>` direct fill **REJECTED 2026-07-16**: an extra lexical count pass fell to 0.71-0.73x at 1K-1M elements; retain one-pass staging unless a different ownership mechanism avoids the second parse |
 | C-realloc-backed template Builder with zero-copy string freeze | Plausible P3; current evidence says per-write FFI, not final copy, dominates |
 | upper-bound filter allocation right-sizing | Do not retry alone; untouched pages are lazy and prior right-sizing measured no win |
@@ -982,8 +982,13 @@ raw capacity, pass only a spare-capacity pointer to `read(2)`, and call `set_len
 successful byte count. A short read or EOF therefore never creates an initialized Rust slice over
 the unwritten tail; EINTR retries while the logical length remains zero, and `io.copy` still drains
 buffered lookahead through the shared reader path. The checked-in allocation-inclusive 64 KiB-window
-probe improved fresh 0/1/4 KiB/full reads by 20.92x/20.83x/11.49x/1.98x. This audit extends the same
-proof obligation to UDP receive and `pread`, which remain separate follow-up work.
+probe improved fresh 0/1/4 KiB/full reads by 20.92x/20.83x/11.49x/1.98x.
+
+The audited UDP receive and positional `pread` extension **SHIPPED 2026-07-16**. All three buffer
+syscall paths now share `Buffer::prepare_uninit_window`, including the release-build capacity guard.
+`recvfrom` publishes only its returned prefix while retaining kernel datagram truncation semantics;
+`pread` now calls POSIX `pread(2)` directly instead of forming a full initialized `&mut [u8]` for
+`FileExt::read_at`, preserving the caller's file offset, short-read/EOF behavior, and EINTR retry.
 
 ### 7.4 New small allocation/copy cleanup in `http.get_many`
 
