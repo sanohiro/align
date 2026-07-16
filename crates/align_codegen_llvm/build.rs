@@ -1,19 +1,20 @@
 //! Build script for align_codegen_llvm.
 //!
-//! By default this is a NO-OP: ordinary `cargo build` / `cargo test` do not
-//! compile any C++ and require no LLVM C++ headers beyond what llvm-sys already
-//! needs. The ThinLTO S0 spike shim (`cpp/thinlto_shim.cpp`) is compiled ONLY
-//! when the `thinlto-spike` feature is enabled, and it links against the SAME
-//! libLLVM-22 the workspace already links via llvm-sys (prefer-dynamic).
+//! Compiles the ThinLTO C++ shim (`cpp/thinlto_shim.cpp`) UNCONDITIONALLY: the
+//! `--thin-lto` driver path needs the three summary-based entry points in every
+//! `alignc` binary (llvm-sys 221 cannot emit module summaries nor drive
+//! `FunctionImporter` on its own). The shim links against the SAME libLLVM-22 the
+//! workspace already links via llvm-sys (prefer-dynamic), so there is a single
+//! LLVM in the process. Requires `llvm-config-22` on PATH and the LLVM 22 C++
+//! headers (`llvm-22-dev`) — already workspace prerequisites.
+//!
+//! The `thinlto-spike` feature adds ONLY the legacy `ThinLTOCodeGenerator` C API
+//! (`libLTO.so`) that the S0 spike tests use for their collapse/minimal-mechanism
+//! probes; the production 3-entry shim itself needs only libLLVM.
 
 use std::process::Command;
 
 fn main() {
-    // Feature gate: nothing to do for normal builds.
-    if std::env::var_os("CARGO_FEATURE_THINLTO_SPIKE").is_none() {
-        return;
-    }
-
     println!("cargo:rerun-if-changed=cpp/thinlto_shim.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -44,7 +45,7 @@ fn main() {
         .unwrap_or_else(|| panic!("cannot parse LLVM version {version:?}"));
     assert_eq!(
         major, 22,
-        "thinlto-spike requires LLVM 22 (llvm-config reports {version}); \
+        "align_codegen_llvm requires LLVM 22 (llvm-config reports {version}); \
          set LLVM_CONFIG to an llvm-config-22"
     );
 
@@ -80,12 +81,15 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
-    // The legacy ThinLTOCodeGenerator C API (llvm-sys `lto` bindings, used by
-    // the spike's collapse + minimal-mechanism tests) lives in libLTO.so, NOT
-    // libLLVM. The 3-entry shim itself needs only libLLVM; this is a spike-test
-    // dependency.
-    println!("cargo:rustc-link-lib=dylib=LTO");
-    // Bake an rpath so the spike test binary finds libLTO/libLLVM at runtime
-    // (the LLVM libdir is not necessarily on the default loader path).
+    // Bake an rpath so the binary finds libLLVM-22 at runtime (the LLVM libdir is
+    // not necessarily on the default loader path). The prefer-dynamic llvm-sys
+    // already needs it; this keeps the shim's own dep resolvable too.
     println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+
+    // The legacy ThinLTOCodeGenerator C API (llvm-sys `lto` bindings, used ONLY
+    // by the S0 spike's collapse + minimal-mechanism tests) lives in libLTO.so,
+    // NOT libLLVM. Link it only when that feature is enabled.
+    if std::env::var_os("CARGO_FEATURE_THINLTO_SPIKE").is_some() {
+        println!("cargo:rustc-link-lib=dylib=LTO");
+    }
 }

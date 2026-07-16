@@ -814,6 +814,99 @@ pub fn codegen_units_parallel(
     Ok(outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect())
 }
 
+/// **ThinLTO S1 (`--thin-lto`): the serial cross-unit-optimizing build.** Runs all three phases
+/// FRESH and SERIALLY for a multi-unit program (`units.len() >= 2`), producing one object per unit
+/// into `obj_paths` (the caller then links them exactly as the non-ThinLTO path does). No cache, no
+/// parallelism in v1 — S2 adds cache composition + parallel backends.
+///
+/// Flow (DAG / unit order throughout — the ids are the stable, deterministic module names):
+///  1. **prelink** — per unit, `emit_prelink_bc` builds the module (identical construction to the
+///     normal object path, including any `--rt-lto` merge) and hands it to the shim, which runs the
+///     ThinLTO pre-link pipeline + summary and writes summary-bearing bitcode into `staging`.
+///  2. **thin-link** — one shim call over all units computes the per-unit cross-module import lists.
+///  3. **backend** — per unit, the shim imports (per that unit's threaded import list) + runs the
+///     ThinLTO backend pipeline with the driver's own `TargetMachine` + emits the object.
+///
+/// Preserve set (fail-closed v1) = `{main}` ∪ every unit's exported (`pub` / entry-`main`) symbols;
+/// `exports` (only ever non-empty from `emit-obj`/`emit-llvm`, never `build`/`run`/`size`) folds in
+/// too. A single prevailing copy per external symbol is guaranteed by Align's model, so the shim's
+/// `isPrevailing = true` is sound; duplicate consumer-side generic monomorphs are internal linkage,
+/// which ThinLTO handles per-module.
+///
+/// Failure policy: any shim phase failing → a loud `Err` naming the phase + unit; the caller ABORTS
+/// the build (fail-closed — never a silent fallback to the non-ThinLTO path, since the user asked
+/// for `--thin-lto`).
+pub fn build_thin_lto(
+    units: &[PerUnitArtifact],
+    obj_paths: &[std::path::PathBuf],
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+    staging: &std::path::Path,
+) -> Result<(), String> {
+    assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
+    assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
+    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
+
+    // Stable module ids = the (unique) unit names, in DAG order.
+    let ids: Vec<String> = units.iter().map(|u| u.unit.clone()).collect();
+    let bc_paths: Vec<std::path::PathBuf> =
+        (0..units.len()).map(|i| staging.join(format!("unit{i}.prelink.bc"))).collect();
+
+    // Phase 1: prelink bitcode per unit. Exports apply only to the entry unit (a non-entry `pub` fn
+    // is already external via per-unit lowering); every other unit prelinks with no export roots.
+    for (i, unit) in units.iter().enumerate() {
+        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
+        align_codegen_llvm::emit_prelink_bc(
+            &unit.mir,
+            &bc_paths[i],
+            target,
+            profile,
+            unit_exports,
+            rt_lto_bytes(rt_lto),
+            &ids[i],
+        )
+        .map_err(|e| format!("ThinLTO prelink failed for unit `{}`: {e}", unit.unit))?;
+    }
+
+    // Preserve set: {main} ∪ every unit's exported symbols ∪ any --export roots (entry-unit only).
+    let mut preserve: Vec<String> = vec!["main".to_string()];
+    for unit in units {
+        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
+        for s in align_codegen_llvm::thinlto::exported_symbols(&unit.mir, unit_exports) {
+            if !preserve.contains(&s) {
+                preserve.push(s);
+            }
+        }
+    }
+
+    // Phase 2: thin-link over all units → the complete decision set (import edges +
+    // export set), keyed by stable ids. Computed ONCE and threaded into each backend.
+    let plan = align_codegen_llvm::thinlto::thin_link(&bc_paths, &ids, &preserve)
+        .map_err(|e| format!("ThinLTO thin-link failed: {e}"))?;
+
+    // Phase 3: per-unit backend. Feed each unit its own import edges + the global
+    // export set (the promote/internalize step walks the whole index).
+    for (i, unit) in units.iter().enumerate() {
+        let imports: Vec<align_codegen_llvm::thinlto::ImportEdge> =
+            plan.imports.iter().filter(|e| e.dest == ids[i]).cloned().collect();
+        align_codegen_llvm::thinlto::backend(
+            &bc_paths,
+            &ids,
+            i,
+            &preserve,
+            &imports,
+            &plan.exports,
+            target,
+            profile,
+            &obj_paths[i],
+        )
+        .map_err(|e| format!("ThinLTO backend failed for unit `{}`: {e}", unit.unit))?;
+    }
+    Ok(())
+}
+
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
 /// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same

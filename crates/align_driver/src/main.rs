@@ -62,6 +62,9 @@ fn main() -> ExitCode {
     // primitives' bitcode into the program module before the one opt run. Orthogonal to `--profile`
     // (Nothing-hidden: the mechanism is named, not folded into `fast`).
     let (rt_lto, args) = parse_rt_lto(&args);
+    // Pull the boolean `--thin-lto` flag (ThinLTO S1): opt-in cross-unit optimization. Serial, no
+    // cache, release/fast only. Orthogonal to (and composable with) `--rt-lto`.
+    let (thin_lto, args) = parse_thin_lto(&args);
     // Pull `--cache-stats` (S3b, build/run/size only) and the `-j`/`--jobs` codegen-parallelism flag.
     let (cache_stats, args) = parse_cache_stats(&args);
     let (jobs_flag, args) = match parse_jobs(&args) {
@@ -109,6 +112,30 @@ fn main() -> ExitCode {
         }
     }
 
+    // `--thin-lto` links N per-unit objects with cross-unit optimization, so it only means something
+    // on the build-producing verbs that link a whole program (`build`/`run`/`size`). `emit-obj` /
+    // `emit-llvm` are per-unit-in-isolation by settlement (the honest zero-cross-unit-opt lens), so
+    // ThinLTO is rejected there rather than silently ignored.
+    if thin_lto {
+        if !matches!(cmd, Some("build") | Some("run") | Some("size")) {
+            eprintln!(
+                "alignc: --thin-lto is only valid for `build`/`run`/`size` (got `{}`)",
+                cmd.unwrap_or("<none>")
+            );
+            return ExitCode::FAILURE;
+        }
+        // Same profile constraint as `--rt-lto`: `dev` is O0 (nothing inlines), and `small`/`tiny`
+        // run the size sweep — ThinLTO needs an inlining pipeline. Reject rather than silently no-op.
+        if matches!(profile, Profile::Dev | Profile::Small | Profile::Tiny) {
+            eprintln!(
+                "alignc: --thin-lto is incompatible with the `{}` profile (it needs an inlining \
+                 pipeline; use `release` or `fast`)",
+                profile.name()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     // `--export` only means something where codegen produces a standalone object/IR with linker-
     // visible symbols (`emit-obj`/`emit-llvm`); anywhere else a nonempty export set would either be
     // silently ignored or silently change linkage no one asked for — neither is acceptable
@@ -144,7 +171,7 @@ fn main() -> ExitCode {
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
-        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, jobs, cache_stats),
+        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, thin_lto, jobs, cache_stats),
         // `cache clear` — remove the cache-owned subtrees under the resolved cache root (S3b).
         (Some("cache"), Some(sub)) if sub == "clear" => run_cache_clear(),
         (Some("cache"), other) => {
@@ -159,9 +186,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, jobs, cache_stats),
+        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, thin_lto, jobs, cache_stats),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, jobs, cache_stats),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, jobs, cache_stats),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -210,6 +237,21 @@ fn parse_rt_lto(args: &[String]) -> (bool, Vec<String>) {
         }
     }
     (rt_lto, rest)
+}
+
+/// Pull the boolean `--thin-lto` flag (ThinLTO S1) out of `args`, returning whether it was present
+/// and the remaining arguments. Valueless; repeated occurrences are idempotent.
+fn parse_thin_lto(args: &[String]) -> (bool, Vec<String>) {
+    let mut thin_lto = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "--thin-lto" {
+            thin_lto = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (thin_lto, rest)
 }
 
 /// Pull the boolean `--cache-stats` flag (M15 S3b) out of `args`. Valueless, idempotent; with it, the
@@ -418,6 +460,8 @@ fn usage() {
                        library/benchmark object exposes it to the linker\n  \
          --rt-lto      (build/run/emit-obj/size/emit-llvm; release/fast only) link the fast-path\n  \
                        string primitives' bitcode into the program and inline it before the opt run\n  \
+         --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — optimize across the\n  \
+                       per-unit boundary (serial, no cache in v1); composes with --rt-lto\n  \
          --cache-stats (build/run/size) print a per-unit codegen-cache hit/miss report\n  \
          -j, --jobs N  (build/run/size) codegen worker threads (default: available parallelism;\n  \
                        overrides ALIGNC_JOBS)\n  \
@@ -791,7 +835,8 @@ impl Drop for ArtifactStage {
 /// by a per-unit index, not the `.`-containing module path); capability libraries are unioned
 /// deterministically first-seen across units; the executable is published to `exe` by same-directory
 /// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
-fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
+#[allow(clippy::too_many_arguments)]
+fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
     let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
@@ -799,6 +844,31 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     })?;
     // One object path per unit (DAG-index-named, not the `.`-containing module path).
     let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
+    if thin_lto {
+        // ThinLTO S1: cross-unit-optimizing build, SERIAL, and — deliberately — with the object cache
+        // BYPASSED entirely for this invocation (fail-closed, like ALIGN_SORT_ADAPTIVE's guard). The
+        // S3 codegen cache keys per-unit objects in isolation; a ThinLTO object depends on its import
+        // sources' bitcode, an identity the current cache key does NOT capture, so composing them would
+        // be unsound. S2 integrates a proper `prelink-bitcode` part-kind + precise digest; until then,
+        // `--thin-lto` never reads or writes the object cache.
+        if cache_stats {
+            eprintln!("alignc: cache: bypassed under --thin-lto (S1; S2 integrates cache composition)");
+        }
+        if let [_single] = walk.units.as_slice() {
+            // N=1: skip all three ThinLTO phases — there is no cross-unit boundary to remove. Emit
+            // exactly today's whole-program object (byte-identical to a no-flag / cache-off build).
+            if let Err(e) = align_driver::emit_object_file(&walk.units[0].mir, &obj_paths[0], target.clone(), profile, &[], rt_lto) {
+                eprintln!("alignc: codegen failed for unit `{}`: {e}", walk.units[0].unit);
+                return Err(ExitCode::FAILURE);
+            }
+        } else if let Err(e) = align_driver::build_thin_lto(&walk.units, &obj_paths, &target, profile, &[], rt_lto, object_stage.path()) {
+            // Fail-closed: name the phase + unit and abort — NEVER silently fall back to the
+            // non-ThinLTO path (the user asked for --thin-lto).
+            eprintln!("alignc: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+        return finish_link(&walk, &obj_paths, exe, profile);
+    }
     // Opt-in codegen cache (ALIGNC_CACHE); disabled ⇒ each unit emits verbatim. Codegen runs in
     // parallel over cache MISSES (`jobs` workers); lookups are serial and results stay DAG-ordered.
     let cache = CacheContext::from_env();
@@ -812,8 +882,15 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     if cache_stats {
         render_cache_stats(&outcomes, cache.is_enabled());
     }
+    finish_link(&walk, &obj_paths, exe, profile)
+}
+
+/// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in
+/// DAG order) + link + atomic-rename publish. Shared by the normal cached path and the `--thin-lto`
+/// path (the objects differ; the link step is identical).
+fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: Profile) -> Result<(), ExitCode> {
     // Deterministic capability union across units, first-seen in DAG (unit) order — never completion
-    // order (the parallel codegen above may finish units out of order, but this iterates `walk.units`).
+    // order (parallel codegen may finish units out of order, but this iterates `walk.units`).
     let mut link_libs: Vec<String> = Vec::new();
     for unit in &walk.units {
         for lib in &unit.mir.link_libs {
@@ -841,9 +918,9 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     Ok(())
 }
 
-fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
+fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
     let exe = PathBuf::from(stem(path));
-    match build_per_unit_to(path, &exe, target, profile, rt_lto, jobs, cache_stats) {
+    match build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, jobs, cache_stats) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -898,7 +975,8 @@ fn run_cache_clear() -> ExitCode {
     }
 }
 
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
+#[allow(clippy::too_many_arguments)]
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, jobs: usize, cache_stats: bool) -> ExitCode {
     let stage = match ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
@@ -907,7 +985,7 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, jobs, cache_stats) {
+    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, jobs, cache_stats) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the
