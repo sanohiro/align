@@ -1,8 +1,10 @@
-//! ThinLTO shim (production component of align_codegen_llvm).
+//! LLVM C++ shim (production component of align_codegen_llvm).
 //!
-//! A minimal C++ bridge exposing the three summary-based ThinLTO entry points
-//! that the llvm-sys 221 C API cannot drive on its own (it has no way to emit a
-//! module summary index, no combined-index/FunctionImporter surface). Compiled
+//! A minimal C++ bridge for surface the llvm-sys 221 C API lacks: the three
+//! summary-based ThinLTO entry points (no way to emit a module summary index,
+//! no combined-index/FunctionImporter surface), plus a feature-gated
+//! instrument-PGO pipeline entry (`ALIGN_PGO_SPIKE`; no PGOOptions C surface —
+//! becomes production at PGO S1). Compiled
 //! UNCONDITIONALLY by build.rs (the `--thin-lto` driver needs it in every
 //! `alignc`), against the SAME libLLVM-22.so the workspace links (prefer-dynamic),
 //! so there is a single LLVM in the process.
@@ -449,7 +451,13 @@ extern "C" int align_thinlto_backend(
 // `profdata_path` is required for USE, ignored (may be null) for GEN — the GEN
 // default output filename is governed by LLVM_PROFILE_FILE at runtime.
 //
-// Returns 0 on success, nonzero on failure.
+// Returns 0 on success, nonzero on argument errors. CONTRACT CAVEAT (measured):
+// a missing/unreadable/corrupt profdata does NOT surface through this return
+// code — libLLVM diagnoses it on the LLVMContext (and without a diagnostic
+// handler installed, exits the process). The caller MUST validate the profdata
+// (existence/readability/magic) BEFORE this call and install a context
+// diagnostic handler to observe use-phase degradation; the S1 driver owns that
+// fail-loud policy (roadmap "Instrument-PGO design SETTLED").
 #ifdef ALIGN_PGO_SPIKE
 
 #include "llvm/Passes/PassBuilder.h"

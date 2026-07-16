@@ -2527,7 +2527,7 @@ with an in-process LLVM diagnostic handler capturing NO hash-mismatch/unprofiled
 matching module AND capturing a mismatch on a structurally-different control (so the handler is live and
 the clean result is meaningful); a no-PGO control has neither counters nor `branch_weights`. **LLVM-22
 frictions recorded**: (i) `PGOOptions` lost its VFS argument — the filesystem moved to `PassBuilder`'s last
-param (default `vfs::getRealFileSystem()`); the ctor is the 11-arg `PGOOptions(ProfileFile, "", "", "",
+param (default `vfs::getRealFileSystem()`); the ctor is the 10-arg `PGOOptions(ProfileFile, "", "", "",
 Action, NoCSAction, ColdFuncOpt::Default, false, false, false)`. (ii) **On ELF the instrumented object
 carries NO `__llvm_profile_runtime` reference** (LLVM relies on the `__start/__stop___llvm_prf_*` section
 brackets), so the **S1 driver MUST add `-Wl,--undefined=__llvm_profile_runtime` plus the `clang_rt.profile`
@@ -2543,7 +2543,12 @@ the force-undefined-symbol + profile archive on the gen link line, and the `PgoM
 **Instrument-PGO slice plan: S1** = serial whole-program correctness behind the two flags, cache BYPASSED
 (gates: an instrument build links/runs/writes a profraw; a use build shows `!prof` on a branch-heavy
 kernel, mutation-checked; run-parity across off/instrument/use; rejections incl. the `--thin-lto` combo
-and non-`release`/`fast` profiles; fail-loud profdata errors; flag-off byte-identity). **S2** = cache
+and non-`release`/`fast` profiles; fail-loud profdata errors; flag-off byte-identity). S1 caveat
+(measured in S0 review): the shim's USE return code CANNOT signal a missing/corrupt profdata —
+libLLVM diagnoses on the context and, without a handler, exits the process; so the DRIVER must
+validate the profdata (existence/readability/magic + version) BEFORE invoking the shim and install
+a context diagnostic handler to detect use-phase degradation — that is where the fail-loud policy
+lives, never the shim rc. **S2** = cache
 composition (the `PgoMode` key component, `FirstDiff::PgoProfile`, `CACHE_KEY_FORMAT_VERSION` bump,
 instrumented-vs-ordinary isolation + profdata-digest + revert gates). **SV** = build-twice determinism in
 both modes, cold-vs-hit byte-identity, stale/wrong-profile mutation gates, an explicit compile-time bound,
