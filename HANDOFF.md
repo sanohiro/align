@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (sixth update this day), **DIRECT `chunks` LENGTH AND INDEX CONSUMERS ARE
+_Last updated: 2026-07-16 (seventh update this day), **SINGLE STR-KEY GROUPS AND DICTIONARY ENCODING
+WRITE THEIR FINAL OUTPUTS DIRECTLY.** Vacant string groups now seed the caller's existing
+`out_keys[id]` / `out_vals[id]` slots and occupied entries update `out_vals[id]` in place, removing
+the representative and accumulator Vecs plus both final copies from the shared AoS/SoA core.
+`dict_encode` likewise writes representatives directly into its caller-owned dictionary, removing
+one Vec and copy. First-occurrence dense ids, aggregate wrap/min/max/count behavior, result ownership,
+and multi-aggregate row-major update locality are unchanged. Every group core now validates signed
+capacity through `safe_len` before pointer arithmetic, and the direct paths state the generated
+input/output non-overlap contract; a sentinel gate pins that neither output crosses capacity. The
+repaired checked-in benchmark (its exported `Row` now follows current interface visibility) stayed
+within 3% at 100/10K groups; at 632,390 distinct keys, four single groups improved 690.0→630.4 ms
+(1.09x) and dictionary reuse 200.9→194.7 ms (1.03x), recorded as directional consecutive-run
+evidence rather than balanced AB/BA. The complete workspace is green (**2183 total = 2180 passed +
+three ignored manual probes**) and workspace clippy passes with warnings denied. This work is in PR
+**#479**, based on squash-merged PR #478 (`e03666e`). **Next recommended P2:** direct-fill staged
+`path.normalize`, `read_dir`, and DNS result payloads, beginning with the smallest independently
+measurable final-copy removal. The aarch64 UTF-8 portability measurement remains deferred. Previous
+update: 2026-07-16 (sixth update this day), **DIRECT `chunks` LENGTH AND INDEX CONSUMERS ARE
 VIRTUAL.** Immediate `.chunks(n).len()` now computes a guarded ceiling count in MIR, and immediate
 `.chunks(n)[i]` constructs exactly one bounds-checked source sub-view. Neither path allocates or
 fills the owned `{ptr,len}` header array. Dynamic, zero, and negative widths preserve the runtime's
@@ -22,7 +39,7 @@ for ordinary array/slice indexing. An Impure runtime gate pins source → width 
 source → index order. Raw-IR and runtime gates also pin the allocation-free direct shapes, the
 materialized fallback, exact/partial/empty results, bounds failure, and owned-temporary lifetime.
 The complete workspace is green (**2182 total = 2179 passed + three ignored manual probes**) and workspace clippy
-passes with warnings denied. This work is in PR **#478**, based on squash-merged PR #477
+passes with warnings denied. This work was squash-merged as PR **#478** (`e03666e`), based on squash-merged PR #477
 (`c2f9d95`). **Next recommended P2:** write single str-key group and dictionary outputs directly
 into their already-allocated result buffers. The aarch64 UTF-8 portability measurement remains
 deferred. Previous update: 2026-07-16 (fifth update this day), **OWNED BUILDER FREEZE IS ALLOCATOR-COMPATIBLE

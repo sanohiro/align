@@ -2963,6 +2963,7 @@ unsafe fn group_agg_i64(
     if cap < 0 || out_keys.is_null() || out_vals.is_null() {
         return -1;
     }
+    let Ok(cap) = safe_len(cap) else { return -1 };
 
     // Pre-scan for the key range, bailing out of the dense path the instant the span reaches `n`
     // (so a sparse key set pays only a partial scan before falling through to the hash table). The
@@ -3007,7 +3008,7 @@ unsafe fn group_agg_i64(
                     *occ.get_unchecked_mut(idx) = true;
                     *acc.get_unchecked_mut(idx) = v;
                     count += 1;
-                    if count > cap as usize {
+                    if count > cap {
                         return -1;
                     }
                 }
@@ -3025,7 +3026,7 @@ unsafe fn group_agg_i64(
                 }
             }
         }
-        return count as i64;
+        return i64::try_from(count).unwrap_or(-1);
     }
 
     let mut tsize = 16usize;
@@ -3045,7 +3046,7 @@ unsafe fn group_agg_i64(
                     *tkey.get_unchecked_mut(slot) = k;
                     *tacc.get_unchecked_mut(slot) = v;
                     count += 1;
-                    if count > cap as usize {
+                    if count > cap {
                         return -1;
                     }
                     if count > tsize / 4 * 3 {
@@ -3092,7 +3093,7 @@ unsafe fn group_agg_i64(
             g += 1;
         }
     }
-    count as i64
+    i64::try_from(count).unwrap_or(-1)
 }
 
 /// `keys`/`vals` as `&[i64]` of `len`, or empty slices when degenerate (null / non-positive). The
@@ -3300,9 +3301,9 @@ unsafe fn read_key_slice<'a>(row: *const u8, key_off: usize) -> (&'a [u8], Align
 }
 
 /// Core of the str-key group-by: intern each row's `str` key to a dense id in **first-occurrence
-/// order** (a `HashMap<&[u8], id>`), accumulate `value_at(i)` per id with `combine`, then emit the
-/// distinct keys (first-occurrence view as representative) + their accumulators. Key and value are
-/// **index closures** over `0..n`, so the same core serves both a strided AoS record
+/// order** (a `HashMap<&[u8], id>`), seed the caller's result slots on a vacant entry, then update
+/// `out_vals[id]` in place with `combine`. Key and value are **index closures** over `0..n`, so the
+/// same core serves both a strided AoS record
 /// (`align_rt_group_*_str`, key+value in one row) and two separate contiguous soa columns
 /// (`align_rt_group_*_str_cols`). Returns the group count, or -1 on a null/cap error. `out_keys` /
 /// `out_vals` must hold at least `cap` elements. (Callers validate their own input pointers + `n`.)
@@ -3319,12 +3320,12 @@ unsafe fn group_agg_str<'a>(
     if cap < 0 || out_keys.is_null() || out_vals.is_null() {
         return -1;
     }
+    let Ok(cap) = safe_len(cap) else { return -1 };
     // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
     // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
-    let initial = n.min(cap as usize).min(1024);
+    let initial = n.min(cap).min(1024);
     let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
-    let mut acc: Vec<i64> = Vec::with_capacity(initial);
-    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
+    let mut count = 0usize;
     for i in 0..n {
         let (bytes, ks) = key_at(i);
         let v = value_at(i);
@@ -3332,25 +3333,25 @@ unsafe fn group_agg_str<'a>(
         match ids.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => {
                 let id = *e.get();
-                unsafe { *acc.get_unchecked_mut(id) = combine(*acc.get_unchecked(id), v) };
+                // Every inserted id initialized its output slot in the vacant arm below.
+                let slot = unsafe { out_vals.add(id) };
+                unsafe { slot.write(combine(slot.read(), v)) };
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let id = acc.len();
-                if id >= cap as usize {
+                let id = count;
+                if id >= cap {
                     return -1;
                 }
                 e.insert(id);
-                acc.push(v);
-                reprs.push(ks);
+                unsafe {
+                    out_keys.add(id).write(ks);
+                    out_vals.add(id).write(v);
+                }
+                count += 1;
             }
         }
     }
-    let count = acc.len();
-    let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
-    let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
-    out_keys.copy_from_slice(&reprs);
-    out_vals.copy_from_slice(&acc);
-    count as i64
+    i64::try_from(count).unwrap_or(-1)
 }
 
 /// Read the i64 value at `base + i*stride + val_off` — the AoS value-column index closure.
@@ -3370,6 +3371,7 @@ unsafe fn aos_key_at<'a>(base: *const u8, stride: usize, key_off: usize) -> impl
 ///
 /// # Safety
 /// `base` addresses `n` records of `stride` bytes; `key_off`/`val_off` are valid field offsets.
+/// The output ranges are valid for `cap` elements and do not overlap the input or each other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
     if n <= 0 || base.is_null() {
@@ -3445,7 +3447,8 @@ unsafe fn soa_value_at(val_col: *const i64) -> impl Fn(usize) -> i64 {
 /// [`align_rt_group_sum_str`].
 ///
 /// # Safety
-/// `key_col` addresses `n` `AlignStr`s, `val_col` `n` `i64`s; `out_keys`/`out_vals` hold ≥`cap`.
+/// `key_col` addresses `n` `AlignStr`s, `val_col` `n` `i64`s; `out_keys`/`out_vals` hold ≥`cap`
+/// and do not overlap either input column or each other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_str_cols(key_col: *const AlignStr, val_col: *const i64, n: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
     if n <= 0 || key_col.is_null() || val_col.is_null() {
@@ -3537,6 +3540,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     }
     let Ok(n) = safe_len(n) else { return 0 };
     let Ok(k) = safe_len(k) else { return -1 };
+    let Ok(cap) = safe_len(cap) else { return -1 };
     let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let specs: &[GroupMultiSpec] = if k == 0 { &[] } else { unsafe { std::slice::from_raw_parts(specs, k) } };
     // Per aggregate: the value reader (a row pointer → i64; `count` reads `1`) and the combine op. The
@@ -3544,7 +3548,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     let ops: Vec<i64> = specs.iter().map(|s| s.op).collect();
     let val_offs: Vec<usize> = specs.iter().map(|s| usize::try_from(s.val_off).unwrap_or(0)).collect();
 
-    let initial = n.min(usize::try_from(cap).unwrap_or(0)).min(1024);
+    let initial = n.min(cap).min(1024);
     let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     // Accumulators, row-major per group: `acc[id*k + j]`. One contiguous buffer keeps a group's K
     // accumulators adjacent (cache-friendly on the update).
@@ -3590,7 +3594,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
                 // Bail early if the group count would exceed the caller's output capacity, before
                 // growing the tables further (cap = the row count in generated code, so unreachable
                 // there, but keeps the function safe for any caller).
-                if id >= cap as usize {
+                if id >= cap {
                     return -1;
                 }
                 e.insert(id);
@@ -3617,7 +3621,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
             *slot = unsafe { *acc.get_unchecked(g * k + j) };
         }
     }
-    count as i64
+    i64::try_from(count).unwrap_or(-1)
 }
 
 /// **Dictionary-encode** a strided `str` column over an AoS `array<Struct>` — the A2 reuse rail.
@@ -3631,7 +3635,8 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
 ///
 /// # Safety
 /// `base` points to `n` `stride`-byte rows, each with a valid `AlignStr` at `key_off`. `out_ids` must
-/// be valid for `n` `i64` writes; `out_dict` for `cap` `AlignStr` writes.
+/// be valid for `n` `i64` writes; `out_dict` for `cap` `AlignStr` writes. Both output ranges are
+/// disjoint from the input and each other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, stride: i64, key_off: i64, out_ids: *mut i64, out_dict: *mut AlignStr, cap: i64) -> i64 {
     use std::collections::HashMap;
@@ -3643,35 +3648,33 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
         return -1;
     }
     let Ok(n) = safe_len(n) else { return 0 };
+    let Ok(cap) = safe_len(cap) else { return -1 };
     let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
-    let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
-    let initial = n.min(usize::try_from(cap).unwrap_or(0)).min(1024);
+    let initial = n.min(cap).min(1024);
     let mut ids: HashMap<WyKey, i64, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
-    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
-    for (i, out_id) in out_ids.iter_mut().enumerate() {
+    let mut count = 0usize;
+    for i in 0..n {
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         let key = WyKey::new(bytes);
         let id = match ids.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let id = reprs.len() as i64;
+                let Ok(id) = i64::try_from(count) else { return -1 };
                 // The dictionary would exceed `out_dict`'s capacity — abort early (don't grow the
                 // table for a result we can't return).
-                if id >= cap {
+                if count >= cap {
                     return -1;
                 }
                 e.insert(id);
-                reprs.push(ks);
+                unsafe { out_dict.add(count).write(ks) };
+                count += 1;
                 id
             }
         };
-        *out_id = id;
+        unsafe { out_ids.add(i).write(id) };
     }
-    let count = reprs.len(); // <= cap (the loop aborts past it) and out_dict is non-null (checked up front)
-    let out_dict = unsafe { std::slice::from_raw_parts_mut(out_dict, count) };
-    out_dict.copy_from_slice(&reprs);
-    count as i64
+    i64::try_from(count).unwrap_or(-1)
 }
 
 /// Label a column of dictionary ids back to `str` views — the A2 result step. `ids[i]` (a dense id
@@ -13436,6 +13439,60 @@ mod tests {
         // Empty / null inputs encode nothing.
         assert_eq!(unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, 0, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 0) }, 0);
         assert_eq!(unsafe { align_rt_dict_encode_str(std::ptr::null(), 6, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 6) }, 0);
+    }
+
+    #[test]
+    fn direct_str_outputs_stop_at_caller_capacity() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+            val: i64,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        let rows = [Row { key: s(b"a"), val: 10 }, Row { key: s(b"b"), val: 20 }];
+        let stride = std::mem::size_of::<Row>() as i64;
+        let key_off = std::mem::offset_of!(Row, key) as i64;
+        let val_off = std::mem::offset_of!(Row, val) as i64;
+
+        let mut group_keys = [AlignStr { ptr: std::ptr::null(), len: -1 }; 2];
+        let mut group_vals = [-1i64; 2];
+        assert_eq!(
+            unsafe {
+                align_rt_group_sum_str(
+                    rows.as_ptr() as *const u8,
+                    rows.len() as i64,
+                    stride,
+                    key_off,
+                    val_off,
+                    group_keys.as_mut_ptr(),
+                    group_vals.as_mut_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(group_keys[1].len, -1, "group output must not write beyond cap");
+        assert_eq!(group_vals[1], -1, "group accumulator output must not write beyond cap");
+
+        let mut ids = [-1i64; 2];
+        let mut dict = [AlignStr { ptr: std::ptr::null(), len: -1 }; 2];
+        assert_eq!(
+            unsafe {
+                align_rt_dict_encode_str(
+                    rows.as_ptr() as *const u8,
+                    rows.len() as i64,
+                    stride,
+                    key_off,
+                    ids.as_mut_ptr(),
+                    dict.as_mut_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(ids[1], -1, "failed row id must remain unwritten");
+        assert_eq!(dict[1].len, -1, "dictionary output must not write beyond cap");
     }
 
     #[test]

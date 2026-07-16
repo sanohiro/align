@@ -93,3 +93,26 @@ Rust baseline for a known batch.
 A2's remaining honest niche is **sequential / interactive** reuse: when the aggregates arrive over time
 (can't be fused into one pass), re-using the encoding beats re-interning per query (the 2.4–3.5× a1/a2
 gap). For a known batch, single-pass wins.
+
+## Direct-output follow-up (2026-07-16)
+
+Single str-key aggregates now seed and update the caller's existing result columns directly;
+`dict_encode` writes vacant representatives directly into its existing dictionary. This removes two
+staging Vecs + two final copies from each single aggregate and one Vec + one copy from dictionary
+encoding. The benchmark kernel's `Row` was also made public to satisfy the current exported-interface
+check; that is a harness-only visibility repair.
+
+Consecutive same-host native min-of-20 runs before and after the runtime change measured:
+
+```text
+ groups  distinct      a1 before/after       a2 before/after
+    100       100       41.056 / 40.712 ms    19.872 / 20.386 ms
+  10000     10000       94.913 / 93.658 ms    36.494 / 36.750 ms
+1000000    632390      690.010 / 630.425 ms   200.940 / 194.669 ms
+```
+
+The short/low-cardinality cases stayed within 3%; at 632,390 distinct keys A1 improved 1.09x and A2
+1.03x. Treat these consecutive runs as directional evidence, not a balanced AB/BA claim. The
+structural result is exact: three internal Vec allocations and three final copies are gone across
+the single-aggregate and dictionary shapes, while fused `a3` deliberately keeps its row-major
+multi-aggregate accumulator.
