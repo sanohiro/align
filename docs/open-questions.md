@@ -2425,7 +2425,7 @@ type-check in *either* module — a `map` must end in a reduction (`.sum()`) or 
 (`map_into`); there is no bare `map`→`array` collect. The bug reproduces cleanly with a valid
 terminal, which is what the tests use.
 
-### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15; design SETTLED 2026-07-14
+### Separate compilation (multi-module compilation units) — SHIPPED (M15 COMPLETE + ThinLTO S0–SV; design SETTLED 2026-07-14)
 
 Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not
 remain Align's only compilation model: separate compilation is REQUIRED, near-term.
@@ -2448,7 +2448,15 @@ empty `cross_unit_opt_digest` codegen-key field was removed outright at S2 rathe
 (interface hash INCLUDES effect bits + generic template bodies); hard cutover (N=1 IS
 whole-program, byte-identical). Recorded honest trade: multi-file programs lose cross-module
 inlining until ThinLTO; single-file unaffected. `extern "C"` export-of-body stays out of M15
-(out-param noalias trust chain). Implementation NOT started; item stays Open until M15 ships.
+(out-param noalias trust chain). **SHIPPED 2026-07-15: M15 separate compilation is COMPLETE
+through SV** (per-unit interfaces/sema/codegen/link, the default-on incremental object cache,
+parallel unit codegen, the doc-10 §7 verification bundle). **The recorded "multi-file loses
+cross-module inlining until ThinLTO" trade is now RESOLVED: ThinLTO S0 spike → S1 serial → S2
+cache/parallel → SV verification is CLOSED (2026-07-17)** — the roadmap post-upgrade-wave
+"ThinLTO … SHIPPED"/"ThinLTO SV SHIPPED" paragraphs are the record. Kept-Open deferrals, each a
+future trigger not a blocker: cross-unit `pub` internalization, a precise-vs-conservative digest
+evolution, ThinLTO-aware `explain-opt`/`emit-llvm --stage`, and the standing `extern "C"`
+export-of-body / fully-escaping-cross-unit-fn-value deferrals.
 
 **Cache-first companion audit (2026-07-12):** `impl/10-cache-first-optimization.md` is the durable
 detail for this item's artifact identity and invalidation questions. Its confirmed pre-M15

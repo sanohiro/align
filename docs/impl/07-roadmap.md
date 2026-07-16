@@ -2422,6 +2422,52 @@ gates stay green untouched (fresh temp roots); clippy `-D warnings` clean in bot
 workspace 2219 pass. SV runway remains (explicit compile-time-regression bound; stale-summary
 mutation deepening).
 
+**ThinLTO SV SHIPPED (2026-07-17): the verification bundle — the ThinLTO arc is CLOSED.** SV pins
+the four things S1/S2 left open, in `crates/align_driver/tests/thin_lto_sv.rs` (10 gates). **(1)
+Build-twice determinism as a PERMANENT gate** at N=4 with real cross-unit imports (main → {b → c,
+d}): two independent COLD `--thin-lto` builds with SEPARATE cache roots + same `-j` emit
+byte-identical objects AND a byte-identical exe (library level), plus a real-driver subprocess
+variant (two cold `alignc build --thin-lto` runs, distinct `ALIGNC_CACHE` roots → identical exe);
+and cold determinism across DIFFERENT `-j` with NO cache reuse (separate cold Enabled roots, `-j1`
+vs `-j4` → byte-identical), strengthening S2 gate6 (which pinned `-j1==-j4` only with the cache
+DISABLED) to the cache-enabled-but-cold case, so the parallel claim order can leak into neither an
+object nor a cached artifact. **(2) Summary-level stale-summary fail-closed mutation** — S2's
+corruption gate replaced a cached prelink blob with NON-bitcode garbage; SV replaces it with a
+STRUCTURALLY VALID but different prelink `.bc`: (a) a sibling unit's real bitcode, (b) a
+different-BODY build of the SAME unit (the stale-manifest race shape). Both still parse as bitcode
+(asserted via the `BC\xC0\xDE` magic), so only the CONTENT DIGEST can reject them → `CorruptEntry`
+eviction + deterministic rebuild + correct exe. **HOLE FINDING: NONE — the read path was already
+fail-closed.** `materialize_blob` digest-verifies every CAS blob against the manifest's stored
+`blob_digest` before use, shared by both ThinLTO phases via `try_hit_phase`; the SV gates prove the
+rejection is by digest (not by a downstream bitcode-parse failure), which is the property S2's
+garbage-blob gate could not distinguish. No source change was needed to close 2a. **(3) Explicit
+compile-time regression bound** (the rt-lto bound discipline): a COLD `--thin-lto` build's wall-time
+over the fixed 4-unit chain must stay under `CAP = 3.0`× the flag-off cold build. Chosen to be
+non-flaky by construction — the SAME real DEBUG-`alignc` subprocess, SAME sources, SAME `-p release`,
+only the `--thin-lto` flag differs; the large fixed cost (process spawn + debug-Rust frontend + `cc`
+link) is identical in both and appears in numerator and denominator, pulling the ratio toward 1;
+best-of-5 min per side (least-contended run); `ALIGNC_CACHE=off` forces every run cold. Measured on
+this host: off min 0.310 s, thin min 0.346 s → **1.12×** (≈2.7× headroom under the 3.0× cap), so
+ordinary CI scheduler noise cannot cross it. **(4) Invalidation-matrix completion (unit level)** —
+the doc-10 §7 rows applicable to ThinLTO not already pinned by S1/S2: the LLVM-version and
+compiler-build-id components of BOTH the prelink and backend keys yield disjoint keys (a "second
+LLVM" / "second compiler build" simulated by mutating one key component — no real second toolchain);
+`--rt-lto` on/off produces disjoint prelink keys and two `--rt-lto` merge digests differ, and the
+end-to-end publish/lookup shows an `--rt-lto` build is never served the flag-off prelink (`RtLto`
+miss) while both re-hit their own artifacts (never mix); at the backend phase the `--rt-lto`
+interaction is captured transitively through `own_prelink_digest`. All 10 SV gates green; the full
+ThinLTO trio (S1 `thin_lto.rs` + S2 `thin_lto_cache.rs` + SV) stays green; workspace all green;
+clippy `-D warnings` clean in both feature states (default + `thinlto-spike`). **The ThinLTO arc
+(S0 spike → S1 serial → S2 cache/parallel → SV verification) is CLOSED.** Deferred, NOT blockers,
+each with a natural future trigger: (i) cross-unit `pub` internalization (the fail-closed v1 preserve
+set keeps every `pub` external; the win waits for a whole-program-visibility pass); (ii) a
+precise-vs-conservative digest evolution (v1 uses the precise backend digest — own prelink ⊕ inbound
+imports ⊕ outbound exports ⊕ import-source digests; a coarser conservative digest that trades hit
+rate for simpler invalidation was considered and rejected for v1); (iii) ThinLTO-aware `explain-opt`
+/ `emit-llvm --stage` (they stay per-unit-in-isolation — the honest zero-cross-unit-opt view — until
+a cross-unit remark story is designed); (iv) fully-escaping function values across units and
+`extern "C"` export-of-body remain out of scope (their own settled deferrals, unchanged by ThinLTO).
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,
