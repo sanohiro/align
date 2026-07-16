@@ -6024,7 +6024,6 @@ unsafe fn hex_encode_into_avx2(data: &[u8], out: &mut [core::mem::MaybeUninit<u8
 /// Baseline-NEON hex encoder: table lookups map 16 high/low-nibble streams and `vzip1`/`vzip2`
 /// interleave them into 32 lower-case output bytes. The scalar oracle owns the final 0..15 bytes.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn hex_encode_into_neon(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     use core::arch::aarch64::*;
@@ -6048,8 +6047,8 @@ unsafe fn hex_encode_into_neon(data: &[u8], out: &mut [core::mem::MaybeUninit<u8
     hex_encode_into_scalar(&data[i..], &mut out[o..]);
 }
 
-/// Encode directly into the exact destination. Measured x86-64 inputs of at least 32 bytes use
-/// AVX2; short inputs, unsupported CPUs/targets, and aarch64 pending its native gate stay scalar.
+/// Encode directly into the exact destination. Measured inputs use AVX2 from 32 bytes on x86-64 and
+/// baseline NEON from 16 bytes on aarch64; short inputs and unsupported CPUs/targets stay scalar.
 #[inline]
 fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     assert_eq!(data.len().checked_mul(2), Some(out.len()), "hex destination length mismatch");
@@ -6057,6 +6056,15 @@ fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     {
         if data.len() >= 32 && is_x86_feature_detected!("avx2") {
             unsafe { hex_encode_into_avx2(data, out) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Native Apple-M1 probes measured the first complete 16-byte NEON block as hex's independent
+        // no-regression crossover.
+        if data.len() >= 16 {
+            unsafe { hex_encode_into_neon(data, out) };
             return;
         }
     }
@@ -13753,8 +13761,8 @@ mod tests {
         assert_eq!(encode_backend(data), hex_enc(data), "SIMD page-boundary mismatch");
     }
 
-    /// Manual scalar/SIMD adoption probe for hex's retained exact destination. X86 uses the shipped
-    /// dispatch; aarch64 calls its candidate directly so the unmeasured target is not activated.
+    /// Manual scalar/SIMD adoption probe for hex's retained exact destination. The candidate uses
+    /// each architecture's shipped dispatcher, including its independently measured crossover.
     /// Run with:
     ///
     /// `cargo test -p align_runtime --release hex_simd_probe -- --ignored --nocapture
@@ -13767,14 +13775,7 @@ mod tests {
         #[inline(never)]
         fn fill(data: &[u8], simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
             if simd {
-                #[cfg(target_arch = "x86_64")]
                 hex_encode_into(data, out);
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    hex_encode_into_neon(data, out);
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                hex_encode_into_scalar(data, out);
             } else {
                 hex_encode_into_scalar(data, out);
             }
