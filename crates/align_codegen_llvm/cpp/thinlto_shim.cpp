@@ -89,7 +89,8 @@ extern "C" int align_thinlto_write_prelink_bc(LLVMModuleRef Mref,
   WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/false, &Index,
                      /*GenerateHash=*/true);
   OS.flush();
-  return EC ? 12 : 0;
+  // EC only reflects the open; write failures surface via the stream state.
+  return OS.has_error() ? 12 : 0;
 }
 
 // ---------------------------------------------------------------------------

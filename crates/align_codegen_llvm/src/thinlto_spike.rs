@@ -80,6 +80,9 @@ extern "C" fn collect_edge(
     guid: u64,
     is_definition: c_int,
 ) {
+    if ctx.is_null() {
+        return;
+    }
     unsafe {
         let dest = slice_to_string(dest_mod, dest_len);
         let src = slice_to_string(src_mod, src_len);
@@ -283,6 +286,7 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     #[ignore = "spike: requires clang-22 + LLVM C++ shim"]
+    #[cfg(unix)]
     fn collapse_thinltocodegen_rejects_summaryless() {
         assert!(have_tool("clang-22"), "clang-22 required");
         let dir = scratch();

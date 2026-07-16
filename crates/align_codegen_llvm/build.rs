@@ -72,7 +72,14 @@ fn main() {
     // the C++ runtime for the shim's own std:: usage.
     println!("cargo:rustc-link-search=native={libdir}");
     println!("cargo:rustc-link-lib=dylib=LLVM-22");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // The C++ runtime name differs per platform: libc++ on macOS, libstdc++ on
+    // Linux (the M1 host builds this workspace too).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=dylib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     // The legacy ThinLTOCodeGenerator C API (llvm-sys `lto` bindings, used by
     // the spike's collapse + minimal-mechanism tests) lives in libLTO.so, NOT
     // libLLVM. The 3-entry shim itself needs only libLLVM; this is a spike-test
