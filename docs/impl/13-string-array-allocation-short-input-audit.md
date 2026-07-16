@@ -386,15 +386,15 @@ Pointer-identity tests pin transfer for boxed and stack headers after exact or g
 arena finish remains a distinct copy into arena-owned storage, empty freeze stays canonical null/0,
 and unfinished Drop plus direct builder-to-file/writer paths retain their existing ownership shape.
 
-### 6.4 CONFIRMED P1 — remove staging copies in `read_dir` and DNS results
+### 6.4 SHIPPED 2026-07-16 — direct payloads in `read_dir` and DNS results
 
-`fs.read_dir` collects every UTF-8 name into `Vec<Vec<u8>>`, then allocates each final Align string
-and copies again ([runtime](../../crates/align_runtime/src/lib.rs#L324)). DNS resolution does the same
-for short numeric IP strings ([runtime](../../crates/align_runtime/src/lib.rs#L500)). Allocate each
-final payload once while enumerating and keep only `AlignStr` headers in the fallible staging list;
-on a later error, free already-created payloads before returning. Then publish one final header
-buffer. This removes one payload allocation/copy per entry while preserving generic
-`array<string>` deep-drop.
+`fs.read_dir` and DNS resolution now allocate each final UTF-8 name/numeric-IP payload once while
+enumerating and retain only `AlignStr` headers in a shared RAII list. A later iteration or size error
+drops that list and frees every payload accumulated so far while the ABI output remains canonical
+`{null,0}`. Success publishes one final header buffer and clears the temporary owner, transferring
+the payloads to generic `array<string>` deep-drop. DNS duplicate detection reads those same final
+payloads, so ordering and deduplication are unchanged. This removes one staging allocation and one
+full payload copy per returned entry.
 
 Do not change `array<string>` representation or introduce a shared hidden slab here. Per-element
 ownership is observable through Move/drop and the generic deep-free path; a slab requires a distinct
@@ -645,7 +645,7 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 | template outside arena | grow buffer | 0 | keep zero-copy owned freeze + scoped free |
 | `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
 | `path.normalize` | 1 exact-upper-bound final | 0 | shipped direct fill |
-| `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
+| `fs.read_dir` / DNS, N names | N final + header + header Vec | 0 | shipped direct payloads + RAII unwind |
 | Base64/hex encode | Vec + final | Vec→final | document 12 exact destination |
 | JSON decoded string field | 0 per field | 0 | keep zero-copy view |
 | JSON decoded array | parser Vec + final | Vec→final | already-planned measure-first |
@@ -725,8 +725,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 2. ~~Virtualize direct-consumer `chunks`.~~ **DONE 2026-07-16** for immediate `.len()` and index;
    stored/escaping and pipeline/`par_map` values retain the owned materialized representation.
 3. ~~Write single str-group and dictionary outputs directly.~~ **DONE 2026-07-16.**
-4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads. **`path.normalize` DONE
-   2026-07-16**; `read_dir` and DNS remain.
+4. ~~Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.~~ **DONE 2026-07-16.**
 5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
 
 ### P3 — larger portfolios after measurement
