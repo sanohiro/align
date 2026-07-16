@@ -1116,6 +1116,34 @@ predictable and random masks, 1/4/8/16-byte elements, and 1 KiB through 256 MiB.
 on a named positive case, no more than 3% geometric-mean regression, exact order/drop/trap behavior,
 and improved branch-miss or bandwidth evidence. Otherwise record-and-close it.
 
+**MEASURED 2026-07-16 — the structural AVX2 kernel passes; production consumer integration remains
+gated.** The checked-in ignored `stable_compaction_probe` gives scalar and SIMD the same precomputed
+byte keep-mask, then compares the complete initialized output prefix and survivor count before every
+timed case. Its AVX2 candidate uses ordered `pshufb` sub-blocks for one-byte elements and
+`vpermd` control tables for 4/8/16-byte elements. Empty blocks skip the input and output entirely,
+full blocks copy directly, and one-survivor blocks copy that lane directly; these cases are necessary
+to avoid the low-selectivity regression of an unconditional full-width shuffle/store.
+
+On an AMD Ryzen 9 5950X (`x86_64-unknown-linux-gnu`, rustc 1.96.0, LLVM 22.1.2), balanced median-of-five
+runs covered all 168 combinations required above at 1 KiB, 1 MiB, and 256 MiB. The full matrix
+geometric mean was **3.08x core** and **2.62x allocation-inclusive**. At 256 MiB the one-byte/random-50%
+named positive case improved 9.61x core and 8.86x allocation-inclusive; source throughput for the SIMD
+core was 2.36 GB/s. Per-width allocation-inclusive geometric means at 256 MiB were 3.66x, 1.96x,
+1.22x, and 0.98x for widths 1/4/8/16. The worst core observation was approximately 0.99x. The
+allocation-inclusive panel also contained a 0.66x outlier at width 16, predictable 0%: both sides make
+the same untouched upper-bound virtual allocation, while their reusable-output core ratio was 1.00x,
+so this is retained as allocation/fault noise rather than evidence for a different materializer.
+The global geometric-mean and named-positive gates pass, and the recorded SIMD bandwidth establishes
+the structural candidate.
+
+Do **not** enable production dispatch from this result alone. The probe intentionally excludes
+predicate evaluation and mask formation, while the current `where(...).to_array()` consumer does not
+yet expose such a mask. The next gate must lower one real, total, SIMD-vectorizable primitive predicate
+to predicate + mask + ordered direct materialization, benchmark that complete consumer against the
+current fused scalar loop, and retain scalar execution for opaque/expensive predicates and any shape
+that misses the crossover. It must also prove inactive-lane trap suppression and exact predicate/drop
+order. Native aarch64 work remains deferred; no x86-only production path was introduced by this probe.
+
 ### 8.4 Numeric parsing, formatting, and other byte loops
 
 - JSON integer parsing is already a tuned one-pass scalar conversion after SIMD structural discovery.
@@ -1290,7 +1318,8 @@ of integer wrap.
 
 - syscall-dispatched `io.copy` after the portable buffered-reader oracle is fixed;
 - [x] HTTP batch request-copy removal (2026-07-16; prebuilt immutable requests, one URL allocation/copy removed per entry);
-- SIMD stream compaction only if its selectivity matrix passes;
+- [x] measure structural SIMD stream compaction across the full selectivity/width matrix (2026-07-16;
+  kernel passes, but real predicate-to-mask consumer integration remains separately gated);
 - reduction interleave hints/pass tuning only if equal-LLVM throughput evidence passes;
 - direct spawn-literal lowering after lifetime/record ABI work is stable.
 

@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (sixteenth update this day), **X86-64 HEX ENCODE DISPATCHES TO AVX2 AT ITS
+_Last updated: 2026-07-16 (seventeenth update this day), **THE STABLE-COMPACTION STRUCTURAL AVX2
+KERNEL PASSES ITS FULL MATRIX; PRODUCTION CONSUMER INTEGRATION IS STILL GATED.** The checked-in
+ignored probe compares scalar and SIMD against the same precomputed byte mask across predictable and
+random 0/1/10/50/90/99/100% selectivity, 1/4/8/16-byte elements, and 1 KiB/1 MiB/256 MiB inputs. It
+verifies the complete survivor prefix and count before timing. Empty/full/one-survivor block handling
+removed the structural low-selectivity regression; on this Ryzen 9 5950X the 168-case geometric mean
+is 3.08x core and 2.62x allocation-inclusive, with a 9.61x/8.86x named positive at 256 MiB,
+one-byte, random 50%. The reusable-output core worst case is approximately 0.99x. No production
+dispatch changed: the probe deliberately starts from a precomputed mask, so the next gate is one real
+total/vectorizable primitive `where(...).to_array()` consumer including predicate-to-mask formation,
+inactive-lane trap suppression, exact predicate/drop order, and scalar crossover. This work is on
+branch **`agent/stable-compaction-probe`**, based on squash-merged PR #488 (`3de1fd3`). The complete
+workspace is green (**2199 total = 2187 passed + twelve ignored manual probes**) and workspace clippy
+passes with warnings denied. **Next recommended after this PR:** build and measure that complete
+predicate-to-mask materialization consumer; do not promote the isolated kernel by itself. Native
+aarch64 Base64/hex activation, aarch64 UTF-8 portability measurement, and any production compaction
+backend remain deferred. Previous update: 2026-07-16 (sixteenth update this day), **X86-64 HEX
+ENCODE DISPATCHES TO AVX2 AT ITS
 INDEPENDENTLY MEASURED 32-BYTE CROSSOVER.** The nibble-lookup/unpack backend writes the existing exact
 final destination; shorter/non-AVX2 inputs retain the scalar oracle. Differential coverage compares
 every length through 4096, every alignment modulo 32, and a page-aligned input. On this Ryzen 9 5950X

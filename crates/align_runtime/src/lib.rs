@@ -13863,6 +13863,348 @@ mod tests {
         );
     }
 
+    /// Structural probe for document 12's stable block-compaction candidate. It isolates the
+    /// materialization step from predicate evaluation by giving scalar and AVX2 the same byte mask.
+    /// Run on an otherwise idle x86-64 host with:
+    ///
+    /// `cargo test -p align_runtime --release stable_compaction_probe -- --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn stable_compaction_probe() {
+        use core::arch::x86_64::*;
+        use std::hint::black_box;
+        use std::sync::OnceLock;
+
+        fn scalar(data: &[u8], keep: &[u8], width: usize, out: &mut [core::mem::MaybeUninit<u8>]) -> usize {
+            let mut o = 0usize;
+            for (i, &selected) in keep.iter().enumerate() {
+                if selected != 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(i * width),
+                            out.as_mut_ptr().add(o * width).cast::<u8>(),
+                            width,
+                        )
+                    };
+                    o += 1;
+                }
+            }
+            o
+        }
+
+        fn byte_controls() -> &'static [[u8; 16]] {
+            static TABLE: OnceLock<Vec<[u8; 16]>> = OnceLock::new();
+            TABLE.get_or_init(|| {
+                (0u16..256)
+                    .map(|mask| {
+                        let mut row = [0x80u8; 16];
+                        let mut o = 0usize;
+                        for lane in 0..8 {
+                            if mask & (1 << lane) != 0 {
+                                row[o] = lane as u8;
+                                o += 1;
+                            }
+                        }
+                        row
+                    })
+                    .collect()
+            })
+        }
+
+        fn dword_controls(width: usize) -> &'static [[i32; 8]] {
+            static W4: OnceLock<Vec<[i32; 8]>> = OnceLock::new();
+            static W8: OnceLock<Vec<[i32; 8]>> = OnceLock::new();
+            static W16: OnceLock<Vec<[i32; 8]>> = OnceLock::new();
+            let (table, lanes, dwords) = match width {
+                4 => (&W4, 8usize, 1usize),
+                8 => (&W8, 4, 2),
+                16 => (&W16, 2, 4),
+                _ => unreachable!(),
+            };
+            table.get_or_init(|| {
+                (0usize..1usize << lanes)
+                    .map(|mask| {
+                        let mut row = [0i32; 8];
+                        let mut o = 0usize;
+                        for lane in 0..lanes {
+                            if mask & (1 << lane) != 0 {
+                                for part in 0..dwords {
+                                    row[o] = (lane * dwords + part) as i32;
+                                    o += 1;
+                                }
+                            }
+                        }
+                        row
+                    })
+                    .collect()
+            })
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2(data: &[u8], keep: &[u8], width: usize, out: &mut [core::mem::MaybeUninit<u8>]) -> usize {
+            let lanes = 32 / width;
+            let mut i = 0usize;
+            let mut o = 0usize;
+            while keep.len() - i >= lanes {
+                let mask = match lanes {
+                    8 => {
+                        let selected = unsafe { _mm_loadl_epi64(keep.as_ptr().add(i) as *const __m128i) };
+                        _mm_movemask_epi8(selected) as usize & 0xff
+                    }
+                    4 => {
+                        let selected = unsafe { core::ptr::read_unaligned(keep.as_ptr().add(i).cast::<i32>()) };
+                        _mm_movemask_epi8(_mm_cvtsi32_si128(selected)) as usize & 0x0f
+                    }
+                    2 => {
+                        let selected = unsafe { core::ptr::read_unaligned(keep.as_ptr().add(i).cast::<i16>()) };
+                        _mm_movemask_epi8(_mm_cvtsi32_si128(selected as i32)) as usize & 0x03
+                    }
+                    32 => unreachable!("byte compaction uses 8-lane sub-blocks"),
+                    _ => unreachable!(),
+                };
+                if mask == 0 {
+                    i += lanes;
+                    continue;
+                }
+                let selected_count = mask.count_ones() as usize;
+                if selected_count == 1 {
+                    let lane = mask.trailing_zeros() as usize;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add((i + lane) * width),
+                            out.as_mut_ptr().add(o * width).cast::<u8>(),
+                            width,
+                        )
+                    };
+                    o += 1;
+                    i += lanes;
+                    continue;
+                }
+                let input = unsafe { _mm256_loadu_si256(data.as_ptr().add(i * width) as *const __m256i) };
+                let packed = if mask == (1usize << lanes) - 1 {
+                    input
+                } else {
+                    let control = unsafe {
+                        _mm256_loadu_si256(dword_controls(width)[mask].as_ptr() as *const __m256i)
+                    };
+                    _mm256_permutevar8x32_epi32(input, control)
+                };
+                unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(o * width) as *mut __m256i, packed) };
+                o += selected_count;
+                i += lanes;
+            }
+            o + scalar(&data[i * width..], &keep[i..], width, &mut out[o * width..])
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2_bytes(data: &[u8], keep: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) -> usize {
+            let mut i = 0usize;
+            let mut o = 0usize;
+            while keep.len() - i >= 8 {
+                let selected = unsafe { _mm_loadl_epi64(keep.as_ptr().add(i) as *const __m128i) };
+                let mask = _mm_movemask_epi8(selected) as usize & 0xff;
+                if mask == 0 {
+                    i += 8;
+                    continue;
+                }
+                let selected_count = mask.count_ones() as usize;
+                if selected_count == 1 {
+                    let lane = mask.trailing_zeros() as usize;
+                    unsafe {
+                        out.as_mut_ptr().add(o).write(core::mem::MaybeUninit::new(*data.get_unchecked(i + lane)))
+                    };
+                    o += 1;
+                    i += 8;
+                    continue;
+                }
+                let input = unsafe { _mm_loadl_epi64(data.as_ptr().add(i) as *const __m128i) };
+                let packed = if mask == 0xff {
+                    input
+                } else {
+                    let control = unsafe { _mm_loadu_si128(byte_controls()[mask].as_ptr() as *const __m128i) };
+                    _mm_shuffle_epi8(input, control)
+                };
+                unsafe { _mm_storel_epi64(out.as_mut_ptr().add(o) as *mut __m128i, packed) };
+                o += selected_count;
+                i += 8;
+            }
+            o + scalar(&data[i..], &keep[i..], 1, &mut out[o..])
+        }
+
+        fn compact(data: &[u8], keep: &[u8], width: usize, simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> usize {
+            if simd {
+                unsafe {
+                    if width == 1 {
+                        avx2_bytes(data, keep, out)
+                    } else {
+                        avx2(data, keep, width, out)
+                    }
+                }
+            } else {
+                scalar(data, keep, width, out)
+            }
+        }
+
+        fn checksum(out: &[core::mem::MaybeUninit<u8>], bytes: usize) -> u64 {
+            if bytes == 0 {
+                0
+            } else {
+                bytes as u64 ^ unsafe { out[0].assume_init() as u64 } ^ unsafe { out[bytes - 1].assume_init() as u64 }
+            }
+        }
+
+        fn time(data: &[u8], keep: &[u8], width: usize, simd: bool, alloc: bool, iters: usize) -> f64 {
+            let mut reusable = if alloc { Vec::new() } else { vec![core::mem::MaybeUninit::uninit(); data.len()] };
+            let start = std::time::Instant::now();
+            let mut sum = 0u64;
+            for _ in 0..iters {
+                if alloc {
+                    let mut out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                    let n = compact(black_box(data), black_box(keep), width, simd, &mut out);
+                    sum ^= checksum(&out, n * width);
+                } else {
+                    let n = compact(black_box(data), black_box(keep), width, simd, black_box(&mut reusable));
+                    sum ^= checksum(&reusable, n * width);
+                }
+            }
+            black_box(sum);
+            start.elapsed().as_secs_f64() / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        fn make_keep(n: usize, pct: usize, random: bool) -> Vec<u8> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            (0..n)
+                .map(|i| {
+                    let selected = if random {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state % 100 < pct as u64
+                    } else {
+                        i % 100 < pct
+                    };
+                    if selected { 0xff } else { 0 }
+                })
+                .collect()
+        }
+
+        if !is_x86_feature_detected!("avx2") {
+            println!("stable compaction probe skipped: AVX2 unavailable");
+            return;
+        }
+        // Warm the tables before any timing.
+        black_box(byte_controls());
+        for width in [4usize, 8, 16] {
+            black_box(dword_controls(width));
+        }
+        println!("stable compaction (median of 5; scalar/SIMD ratio, source GB/s for SIMD core):");
+        println!(" bytes     | elem | mask       | keep | core x | alloc x | SIMD GB/s");
+        let mut matrix_core_log_sum = 0.0f64;
+        let mut matrix_alloc_log_sum = 0.0f64;
+        let mut matrix_count = 0usize;
+        let mut worst_core = f64::INFINITY;
+        let mut worst_core_case = String::new();
+        let mut worst_alloc = f64::INFINITY;
+        let mut worst_case = String::new();
+        for bytes in [1usize << 10, 1 << 20, 256 << 20] {
+            for width in [1usize, 4, 8, 16] {
+                let mut width_core_log_sum = 0.0f64;
+                let mut width_alloc_log_sum = 0.0f64;
+                let mut width_count = 0usize;
+                let elems = bytes / width;
+                let data: Vec<u8> = (0..elems * width).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+                for random in [false, true] {
+                    for pct in [0usize, 1, 10, 50, 90, 99, 100] {
+                        let keep = make_keep(elems, pct, random);
+                        let mut scalar_out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                        let mut simd_out = vec![core::mem::MaybeUninit::uninit(); data.len()];
+                        let scalar_len = compact(&data, &keep, width, false, &mut scalar_out);
+                        let simd_len = compact(&data, &keep, width, true, &mut simd_out);
+                        assert_eq!(simd_len, scalar_len, "compaction length mismatch");
+                        assert_eq!(
+                            unsafe { std::slice::from_raw_parts(simd_out.as_ptr().cast::<u8>(), simd_len * width) },
+                            unsafe { std::slice::from_raw_parts(scalar_out.as_ptr().cast::<u8>(), scalar_len * width) },
+                            "stable compaction order/content mismatch",
+                        );
+                        drop((scalar_out, simd_out));
+                        let iters = match bytes {
+                            0..=1024 => 10_000,
+                            1025..=1_048_576 => 20,
+                            _ => 1,
+                        };
+                        let mut scalar_core = Vec::with_capacity(5);
+                        let mut simd_core = Vec::with_capacity(5);
+                        let mut scalar_alloc = Vec::with_capacity(5);
+                        let mut simd_alloc = Vec::with_capacity(5);
+                        for trial in 0..5 {
+                            if trial % 2 == 0 {
+                                scalar_core.push(time(&data, &keep, width, false, false, iters));
+                                simd_core.push(time(&data, &keep, width, true, false, iters));
+                                scalar_alloc.push(time(&data, &keep, width, false, true, iters));
+                                simd_alloc.push(time(&data, &keep, width, true, true, iters));
+                            } else {
+                                simd_core.push(time(&data, &keep, width, true, false, iters));
+                                scalar_core.push(time(&data, &keep, width, false, false, iters));
+                                simd_alloc.push(time(&data, &keep, width, true, true, iters));
+                                scalar_alloc.push(time(&data, &keep, width, false, true, iters));
+                            }
+                        }
+                        let scalar_core = median(scalar_core);
+                        let simd_core = median(simd_core);
+                        let scalar_alloc = median(scalar_alloc);
+                        let simd_alloc = median(simd_alloc);
+                        let core_ratio = scalar_core / simd_core;
+                        let alloc_ratio = scalar_alloc / simd_alloc;
+                        width_core_log_sum += core_ratio.ln();
+                        width_alloc_log_sum += alloc_ratio.ln();
+                        width_count += 1;
+                        matrix_core_log_sum += core_ratio.ln();
+                        matrix_alloc_log_sum += alloc_ratio.ln();
+                        matrix_count += 1;
+                        if core_ratio < worst_core {
+                            worst_core = core_ratio;
+                            worst_core_case = format!(
+                                "{bytes} B / width {width} / {} / {pct}%",
+                                if random { "random" } else { "predictable" },
+                            );
+                        }
+                        if alloc_ratio < worst_alloc {
+                            worst_alloc = alloc_ratio;
+                            worst_case = format!(
+                                "{bytes} B / width {width} / {} / {pct}%",
+                                if random { "random" } else { "predictable" },
+                            );
+                        }
+                        println!(
+                            "{bytes:>10} | {width:>4} | {:>10} | {pct:>3}% | {:>6.2}x | {:>7.2}x | {:>9.2}",
+                            if random { "random" } else { "predictable" },
+                            core_ratio,
+                            alloc_ratio,
+                            bytes as f64 / simd_core / 1e9,
+                        );
+                    }
+                }
+                println!(
+                    "summary: {bytes} B / width {width}: core {:.2}x, allocation-inclusive {:.2}x",
+                    (width_core_log_sum / width_count as f64).exp(),
+                    (width_alloc_log_sum / width_count as f64).exp(),
+                );
+            }
+        }
+        println!(
+            "matrix geometric mean: core {:.2}x, allocation-inclusive {:.2}x; worst core {worst_core:.2}x ({worst_core_case}); worst allocation-inclusive {worst_alloc:.2}x ({worst_case})",
+            (matrix_core_log_sum / matrix_count as f64).exp(),
+            (matrix_alloc_log_sum / matrix_count as f64).exp(),
+        );
+    }
+
     /// Manual allocation-inclusive gate for removing the codec staging allocation and full-output
     /// copy. The staged controls use the former Vec encoder followed by `owned_str_copy`; direct
     /// paths call the shipped exact-destination ABI. Run with:
