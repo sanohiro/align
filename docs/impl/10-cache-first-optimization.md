@@ -267,6 +267,7 @@ profile + pass pipeline + TargetMachine optimization level
 relocation/code model and codegen-affecting flags
 exact LLVM build/version identity
 LTO/runtime-bitcode mode and merged bitcode digest (when applicable)
+instrument-PGO mode + profile-content digest (when applicable)
 ```
 
 "LLVM major" is not a sufficient cache boundary. Minor/patch changes can alter pass pipelines,
@@ -285,6 +286,22 @@ resolve it differently.
 > shared key discriminated by an empty-vs-non-empty digest (a `--thin-lto` object can never even
 > address a non-ThinLTO action), so the reserved digest field was removed outright at S2 (no dead
 > field). See `docs/impl/07-roadmap.md` "ThinLTO S2 SHIPPED".
+
+> **Instrument-PGO S2 supersession (2026-07-17):** the codegen key gains a `pgo_mode` component —
+> `PgoMode { Off | Instrument | Use(Hash128) }`, where `Use` carries the content digest of the merged
+> `.profdata` BYTES (path-independent; computed once per invocation after the profile is validated).
+> Unlike ThinLTO (two disjoint phase *namespaces*), PGO follows the `rt_lto`/`rt_lto_digest`
+> precedent: **a component of the SAME codegen key**, not a separate CAS namespace — an instrumented /
+> profile-use object is the same artifact KIND as an ordinary object (`.o` for the identical unit),
+> just optimized differently, so distinct-tag key components (`Off`/`Instrument`/`Use(digest)`) give
+> exactly the isolation needed while letting a use build re-hit and a profdata revert re-address its
+> original CAS blob. The miss reason is `FirstDiff::PgoProfile` (a mode switch OR a profdata-bytes
+> edit). `CACHE_KEY_FORMAT_VERSION` bumped 2→3, `MANIFEST_FORMAT_VERSION` 2→3. A PGO build now runs
+> the NORMAL cached + parallel per-unit path (the S1 total bypass is gone); the only PGO-specific bits
+> are the per-unit pipeline swap (`emit_object_pgo`) and the instrumented link. On an all-HIT
+> profile-use build no LLVM runs, so no staleness diagnostics are (re)emitted — correct, because the
+> staleness was already reported when each object was first built and is intrinsic to the cached
+> bytes. See `docs/impl/07-roadmap.md` "Instrument-PGO S2".
 
 ### 6.3 Runtime and link key
 

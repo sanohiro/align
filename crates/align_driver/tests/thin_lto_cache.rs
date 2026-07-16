@@ -154,7 +154,7 @@ fn gate4_thin_and_nonthin_object_namespaces_are_disjoint() {
     let mut sm = SourceMap::new();
     let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
     let nonthin_objs: Vec<PathBuf> = (0..walk.units.len()).map(|i| proj.dir.join(format!("nt{i}.o"))).collect();
-    align_driver::codegen_units_parallel(&walk.units, &nonthin_objs, &cache, &BuildTarget::Baseline, Profile::Release, false, 2)
+    align_driver::codegen_units_parallel(&walk.units, &nonthin_objs, &cache, &BuildTarget::Baseline, Profile::Release, false, 2, &align_driver::PgoMode::Off)
         .expect("non-thin build");
 
     // A ThinLTO build on the SAME cache root populates actions/prelink + actions/thinbackend.
@@ -173,9 +173,9 @@ fn gate4_thin_and_nonthin_object_namespaces_are_disjoint() {
     // build is all-hit. Neither served the other's objects (distinct key structs + subdirs).
     let thin2 = thin_build(&proj, &cache, 2);
     assert!(thin2.all_hit(), "a repeat --thin-lto build hits its own (thinbackend/prelink) namespace");
-    let nonthin2 = align_driver::codegen_units_parallel(&walk.units, &nonthin_objs, &cache, &BuildTarget::Baseline, Profile::Release, false, 2)
+    let nonthin2 = align_driver::codegen_units_parallel(&walk.units, &nonthin_objs, &cache, &BuildTarget::Baseline, Profile::Release, false, 2, &align_driver::PgoMode::Off)
         .expect("non-thin rebuild");
-    assert!(nonthin2.iter().all(|o| o.hit), "a repeat non-thin build hits its own (codegen) namespace");
+    assert!(nonthin2.outcomes.iter().all(|o| o.hit), "a repeat non-thin build hits its own (codegen) namespace");
 }
 
 // ---- Gate 5: cold-vs-hit byte-identity through both phases --------------------------------------

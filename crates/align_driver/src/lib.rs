@@ -21,7 +21,7 @@ pub mod explain;
 
 pub use cache::{
     cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
-    CodegenKey, FirstDiff, InboundImport, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
+    CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
 };
 
 /// Result of running the pipeline through sema.
@@ -627,6 +627,7 @@ pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target:
 /// cache hit implies byte-identical object bytes. `impl_hash` + `dep_interface_hashes` are the unit's
 /// `PerUnitArtifact` fields; `exports` is sorted+deduped and `dep_interface_hashes` sorted by unit
 /// name so semantically equivalent inputs share a key.
+#[allow(clippy::too_many_arguments)]
 pub fn build_codegen_key(
     unit: &str,
     impl_hash: Hash128,
@@ -635,6 +636,7 @@ pub fn build_codegen_key(
     profile: Profile,
     exports: &[String],
     rt_lto: bool,
+    pgo: cache::PgoKey,
 ) -> Result<CodegenKey, String> {
     let rt = align_codegen_llvm::resolve_target_identity(target).map_err(|e| e.to_string())?;
     let object_format = match target_object_format()? {
@@ -667,6 +669,7 @@ pub fn build_codegen_key(
         llvm_version: align_codegen_llvm::llvm_version(),
         rt_lto,
         rt_lto_digest,
+        pgo_mode: pgo,
         unit: unit.to_string(),
     })
 }
@@ -703,8 +706,21 @@ pub fn emit_object_cached(
             miss_reason: None,
         });
     }
-    let key = build_codegen_key(unit, impl_hash, dep_interface_hashes, &target, profile, exports, rt_lto)?;
+    // The `emit-obj` verb has no `--pgo-*` surface (PGO is `build`/`run`/`size` only), so this path is
+    // always `PgoKey::Off` — a non-PGO object, keyed disjoint from any instrumented/use object.
+    let key = build_codegen_key(unit, impl_hash, dep_interface_hashes, &target, profile, exports, rt_lto, cache::PgoKey::Off)?;
     cache.codegen(&key, obj, |out| emit_object_file(mir, out, target.clone(), profile, exports, rt_lto))
+}
+
+/// The aggregated result of [`codegen_units_parallel`]: the per-unit cache outcomes (DAG-ordered) plus,
+/// for an instrument-PGO **use** build, every profile-use staleness warning captured across the units
+/// that actually ran (cache MISSES). On an all-HIT use build `pgo_warnings` is empty by construction —
+/// no LLVM ran, so no diagnostics were produced; the staleness (if any) was already reported the first
+/// time each object was built and is intrinsic to the cached bytes. Off/Instrument builds never warn.
+pub struct UnitCodegen {
+    pub outcomes: Vec<CacheOutcome>,
+    /// Profile-use warnings, flattened in DAG (unit) index order for a deterministic report.
+    pub pgo_warnings: Vec<String>,
 }
 
 /// M15 S3b: codegen every unit of a per-unit build into `obj_paths` (parallel over cache MISSES), the
@@ -718,6 +734,16 @@ pub fn emit_object_cached(
 ///    per call) into its own `obj_paths[i]`, then publishes to the CAS. LLVM's native target is
 ///    initialized ONCE on this (main) thread before the scope, never racily inside a worker.
 ///
+/// **Instrument-PGO (S2):** when `pgo` is active this is the SAME cached, parallel path — the only
+/// PGO-specific bits are (a) the [`cache::PgoKey`] key component (built once here from the profile
+/// content digest, so instrumented / profile-use / ordinary objects are structurally isolated and
+/// never share a CAS blob), and (b) the per-unit emit swaps the stock opt run for the PGO pipeline
+/// (`emit_object_pgo`; GEN inserts counters, USE attaches `!prof branch_weights`). The USE run's
+/// fail-loud diagnostic handler (a libLLVM-rejected profile → hard error) and its staleness warnings
+/// live inside `emit_object_pgo`, so they fire on every cache MISS and are aggregated into
+/// `UnitCodegen::pgo_warnings`; an all-HIT use build runs no LLVM and needs none (see [`UnitCodegen`]).
+/// The instrumented link (profile runtime archive + force-undefined symbol) is the caller's job.
+///
 /// Determinism: results return in DAG (unit) index order regardless of which worker finished first;
 /// the caller iterates the returned outcomes / the units' capability libs in that same order. `-j 1`
 /// is byte-identical to any `-j N` (each object is produced by an independent single-threaded codegen;
@@ -725,6 +751,7 @@ pub fn emit_object_cached(
 ///
 /// `obj_paths.len()` must equal `units.len()`. `build`/`run`/`size` pass no export roots (a unit's
 /// `pub` fns are already external; the entry's `main` is the only linker root).
+#[allow(clippy::too_many_arguments)]
 pub fn codegen_units_parallel(
     units: &[PerUnitArtifact],
     obj_paths: &[std::path::PathBuf],
@@ -733,9 +760,24 @@ pub fn codegen_units_parallel(
     profile: Profile,
     rt_lto: bool,
     jobs: usize,
-) -> Result<Vec<CacheOutcome>, String> {
+    pgo: &PgoMode,
+) -> Result<UnitCodegen, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
+    // The PGO cache-key component: the settled `PgoMode { Off | Instrument | Use(Hash128) }`. The `Use`
+    // digest is the content hash of the merged `.profdata` BYTES — computed ONCE here (path-independent,
+    // so the same profile via a different path hits, and an edit misses with `FirstDiff::PgoProfile`).
+    // The caller has already `validate_profdata`'d the path; a read error here is still a hard error.
+    let pgo_key = match pgo {
+        PgoMode::Off => cache::PgoKey::Off,
+        PgoMode::Instrument => cache::PgoKey::Instrument,
+        PgoMode::Use(p) => {
+            let bytes = std::fs::read(p).map_err(|e| {
+                format!("--pgo-use: cannot read profile data file '{}': {e}", p.display())
+            })?;
+            cache::PgoKey::Use(Hash128::of(&bytes))
+        }
+    };
     let n = units.len();
     // LLVM native-target init once, on the main thread, before any worker touches codegen.
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
@@ -748,7 +790,7 @@ pub fn codegen_units_parallel(
     let mut misses: Vec<usize> = Vec::new();
     for (i, unit) in units.iter().enumerate() {
         if enabled {
-            let key = build_codegen_key(&unit.unit, unit.summary.impl_hash, &unit.dep_interface_hashes, target, profile, &[], rt_lto)?;
+            let key = build_codegen_key(&unit.unit, unit.summary.impl_hash, &unit.dep_interface_hashes, target, profile, &[], rt_lto, pgo_key)?;
             match cache.lookup(&key, &obj_paths[i]) {
                 cache::CacheLookup::Hit(o) => outcomes[i] = Some(o),
                 cache::CacheLookup::Miss { reason } => {
@@ -764,23 +806,27 @@ pub fn codegen_units_parallel(
     }
 
     // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
-    // reads `units`/`obj_paths`/`keys` and appends any error under a short-held lock.
+    // reads `units`/`obj_paths`/`keys` and appends any error (or PGO-use warning) under a short-held lock.
+    let mut pgo_warnings: Vec<String> = Vec::new();
     if !misses.is_empty() {
         use std::sync::atomic::AtomicBool;
         let worker_count = jobs.max(1).min(misses.len());
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
+        // Per-unit PGO-use warnings, kept index-tagged so the aggregate is DAG-ordered (not scheduling-
+        // dependent). Empty for Off/Instrument and for every all-hit unit.
+        let warnings = std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new());
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| loop {
                     // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
-                    // between units — an in-progress `emit_object_file` is never interrupted. Codegen
-                    // errors are rare (sema already validated in the walk), so this mainly bounds the
-                    // wasted work when a *systemic* failure (e.g. disk full) would otherwise compile
-                    // every remaining object before the build fails. `Relaxed` is correct: the flag is
-                    // a best-effort early-exit hint that publishes no data (errors ride the Mutex, and
-                    // the final read happens-after the scope join).
+                    // between units — an in-progress emit is never interrupted. Codegen errors are rare
+                    // (sema already validated in the walk), so this mainly bounds the wasted work when a
+                    // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
+                    // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
+                    // hint that publishes no data (errors ride the Mutex, and the final read
+                    // happens-after the scope join).
                     if failed.load(Ordering::Relaxed) {
                         break;
                     }
@@ -790,10 +836,20 @@ pub fn codegen_units_parallel(
                     }
                     let i = misses[k];
                     let unit = &units[i];
-                    if let Err(e) = emit_object_file(&unit.mir, &obj_paths[i], target.clone(), profile, &[], rt_lto) {
-                        errors.lock().expect("codegen error lock").push((i, e));
-                        failed.store(true, Ordering::Relaxed);
-                        continue;
+                    // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
+                    // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-rejected
+                    // profile into an `Err` here (hard fail); its staleness warnings ride the return.
+                    match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, pgo) {
+                        Err(e) => {
+                            errors.lock().expect("codegen error lock").push((i, e));
+                            failed.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        Ok(warns) => {
+                            if !warns.is_empty() {
+                                warnings.lock().expect("pgo warning lock").push((i, warns));
+                            }
+                        }
                     }
                     if let Some(key) = &keys[i] {
                         cache.publish_after_miss(key, &obj_paths[i]);
@@ -811,9 +867,46 @@ pub fn codegen_units_parallel(
             let (i, e) = &errs[0];
             return Err(format!("codegen failed for unit `{}`: {e}", units[*i].unit));
         }
+        // Flatten the PGO-use warnings in DAG (unit) index order for a stable aggregate report.
+        let mut warns = warnings.into_inner().expect("pgo warning lock");
+        warns.sort_by_key(|(i, _)| *i);
+        for (_, mut w) in warns {
+            pgo_warnings.append(&mut w);
+        }
     }
 
-    Ok(outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect())
+    Ok(UnitCodegen {
+        outcomes: outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect(),
+        pgo_warnings,
+    })
+}
+
+/// Emit one per-unit object, swapping in the instrument-PGO pipeline when `pgo` is active. `Off` is the
+/// stock, byte-identical [`emit_object_file`]; `Instrument`/`Use` route through
+/// [`align_codegen_llvm::emit_object_pgo`] (GEN counters / USE `!prof` weights) and return that run's
+/// profile-use staleness warnings (empty for GEN). Called from the parallel miss producer — each call
+/// builds its own LLVM `Context`, so the USE diagnostic handler is per-thread and never races.
+fn emit_unit_object(
+    mir: &align_mir::Program,
+    obj: &std::path::Path,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    pgo: &PgoMode,
+) -> Result<Vec<String>, String> {
+    let action = match pgo {
+        PgoMode::Off => {
+            emit_object_file(mir, obj, target.clone(), profile, &[], rt_lto)?;
+            return Ok(Vec::new());
+        }
+        PgoMode::Instrument => align_codegen_llvm::pgo::PgoAction::Instrument,
+        PgoMode::Use(p) => align_codegen_llvm::pgo::PgoAction::Use(p.as_path()),
+    };
+    let report = align_codegen_llvm::emit_object_pgo(
+        mir, obj, target, profile, &[], rt_lto_bytes(rt_lto), action,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(report.warnings)
 }
 
 // ---- instrument-PGO (`--pgo-instrument` / `--pgo-use`, S1) ----------------
@@ -833,14 +926,6 @@ impl PgoMode {
     pub fn is_on(&self) -> bool {
         !matches!(self, PgoMode::Off)
     }
-}
-
-/// The aggregated outcome of a PGO build: how many units were compiled and every use-phase
-/// staleness warning captured across them (one Align-voice report, `Nothing-hidden`).
-#[derive(Clone, Debug, Default)]
-pub struct PgoBuildReport {
-    pub units: usize,
-    pub warnings: Vec<String>,
 }
 
 /// Validate a merged `.profdata` before it is handed to the PGO USE pipeline (the S1 fail-loud
@@ -929,50 +1014,6 @@ pub fn profile_runtime_archive(target: &BuildTarget) -> Result<std::path::PathBu
          compiler-rt profile library",
         candidates.join(", ")
     ))
-}
-
-/// Codegen every unit under instrument-PGO, SERIALLY (the S1 discipline) and with the object cache
-/// BYPASSED. The cache is bypassed because a PGO object is NOT keyed by the profile in S1 — the
-/// `PgoMode` cache-key component and instrumented/ordinary isolation are S2 (the ThinLTO-S1
-/// precedent: a new artifact identity ships behind the flag first, cache composition second). PGO
-/// instrumentation is a purely per-module pipeline swap (GEN inserts counters, USE reads the same
-/// merged profile by function hash), so wiring the SAME shim call per unit is trivially correct for a
-/// multi-unit build — exactly clang's per-TU `-fprofile-generate`/`-fprofile-use` model. Returns the
-/// aggregated report (unit count + every captured use-phase warning).
-pub fn codegen_units_pgo(
-    units: &[PerUnitArtifact],
-    obj_paths: &[std::path::PathBuf],
-    target: &BuildTarget,
-    profile: Profile,
-    rt_lto: bool,
-    pgo: &PgoMode,
-) -> Result<PgoBuildReport, String> {
-    assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
-    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
-    // Resolve the shim action ONCE — `Off` is a caller contract violation (the build path only calls
-    // this under an active mode), surfaced as a hard error rather than a panic (fail-closed).
-    let action = match pgo {
-        PgoMode::Instrument => align_codegen_llvm::pgo::PgoAction::Instrument,
-        PgoMode::Use(p) => align_codegen_llvm::pgo::PgoAction::Use(p.as_path()),
-        PgoMode::Off => {
-            return Err("internal error: codegen_units_pgo called with PgoMode::Off".to_string())
-        }
-    };
-    let mut report = PgoBuildReport { units: units.len(), warnings: Vec::new() };
-    for (i, unit) in units.iter().enumerate() {
-        let run = align_codegen_llvm::emit_object_pgo(
-            &unit.mir,
-            &obj_paths[i],
-            target,
-            profile,
-            &[],
-            rt_lto_bytes(rt_lto),
-            action,
-        )
-        .map_err(|e| format!("codegen failed for unit `{}`: {e}", unit.unit))?;
-        report.warnings.extend(run.warnings);
-    }
-    Ok(report)
 }
 
 /// The shared, per-build target/LLVM identity used by both ThinLTO cache keys — resolved once (the
