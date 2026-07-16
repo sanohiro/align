@@ -4018,8 +4018,8 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
 // (aarch64) / scalar paths. The scalar path is `std::str::from_utf8` — the correctness reference and
 // the oracle the SIMD paths are differentially tested against (same discipline as the decode index).
 
-/// Scalar reference validator (and the SIMD oracle): `bytes` is well-formed UTF-8. On aarch64 the
-/// NEON path is baseline (always taken), so this is only the dispatch fallback / test oracle there.
+/// Scalar reference validator (and the SIMD oracle): `bytes` is well-formed UTF-8. This is also the
+/// production aarch64 path after the native Apple-M1 NEON crossover failed its named controls.
 #[inline]
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_utf8_scalar(bytes: &[u8]) -> bool {
@@ -4169,6 +4169,7 @@ unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
 /// ARMv8-A baseline (no runtime detection). `vqtbl1q_u8` does the 16-entry table lookup directly (no
 /// lane duplication). Same carry / tail / incompleteness logic; bytewise-equal to the scalar oracle.
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "neon")]
 unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
     use core::arch::aarch64::*;
@@ -4233,7 +4234,8 @@ unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
 }
 
 /// Validate that `bytes` is well-formed UTF-8 (draft §7/§12). Runtime-dispatched: AVX2 on x86_64 when
-/// present, baseline NEON on aarch64, else the scalar reference — every path returns the same answer.
+/// present and above its measured crossover; scalar on aarch64 and other targets. The retained NEON
+/// candidate remains byte-identical but did not pass the native Apple-M1 no-regression gate.
 fn validate_utf8(bytes: &[u8]) -> bool {
     // Empty input is valid without feature detection or SIMD table setup on every target.
     if bytes.is_empty() {
@@ -4260,7 +4262,11 @@ fn validate_utf8(bytes: &[u8]) -> bool {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { validate_utf8_neon(bytes) }
+        // Native Apple-M1 measurement (2026-07-16) found no length-only crossover that satisfies
+        // the no-regression gate: NEON wins decisively on multibyte input but loses on large ASCII,
+        // late-invalid, and early-invalid input. Keep the measured candidate test-only until a
+        // materially different content-adaptive design clears all named controls.
+        validate_utf8_scalar(bytes)
     }
     #[cfg(not(target_arch = "aarch64"))]
     validate_utf8_scalar(bytes)
@@ -17951,6 +17957,9 @@ mod tests {
         }
         println!("short UTF-8 crossover (median of 7, ns/call; ratio SIMD/scalar):");
         println!(" len | case       | scalar |   SIMD | shipped | ratio");
+        let mut short_candidate_speedups = Vec::new();
+        let mut short_candidate_non_early_speedups = Vec::new();
+        let mut short_dispatch_speedups = Vec::new();
         for len in [0usize, 1, 4, 8, 12, 16, 24, 31, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 4096] {
             let ascii = vec![b'a'; len];
             let multibyte = valid_multibyte(len);
@@ -17973,7 +17982,62 @@ mod tests {
                     "{len:4} | {name:10} | {scalar_ns:6.2} | {simd_ns:6.2} | {dispatch_ns:7.2} | {:5.2}x",
                     simd_ns / scalar_ns
                 );
+                if (1..=64).contains(&len) {
+                    short_candidate_speedups.push(scalar_ns / simd_ns);
+                    short_dispatch_speedups.push(scalar_ns / dispatch_ns);
+                    if name != "bad-first" {
+                        short_candidate_non_early_speedups.push(scalar_ns / simd_ns);
+                    }
+                }
             }
+        }
+        let geometric_mean = |values: &[f64]| {
+            (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
+        };
+        println!(
+            "1..=64 selected-point candidate speedup versus scalar geometric mean (allocation-free): all {:.2}x | excluding early-invalid {:.2}x | shipped {:.2}x",
+            geometric_mean(&short_candidate_speedups),
+            geometric_mean(&short_candidate_non_early_speedups),
+            geometric_mean(&short_dispatch_speedups)
+        );
+
+        // The codec probes report 1 MiB separately, so retain the same scale point here without
+        // forcing the short-latency helper's 20K-iteration floor over a large buffer.
+        let compare_bulk = |bytes: &[u8]| {
+            let iters = ((64 * 1024 * 1024) / bytes.len().max(1)).clamp(16, 1024);
+            let mut scalar_samples = Vec::with_capacity(7);
+            let mut simd_samples = Vec::with_capacity(7);
+            for trial in 0..7 {
+                if trial % 2 == 0 {
+                    scalar_samples.push(ns_per_call(scalar, bytes, iters));
+                    simd_samples.push(ns_per_call(simd, bytes, iters));
+                } else {
+                    simd_samples.push(ns_per_call(simd, bytes, iters));
+                    scalar_samples.push(ns_per_call(scalar, bytes, iters));
+                }
+            }
+            (median(scalar_samples), median(simd_samples))
+        };
+        println!("1 MiB UTF-8 core crossover (median of 7; candidate speedup versus scalar):");
+        let ascii_1m = vec![b'a'; 1024 * 1024];
+        let multibyte_1m = valid_multibyte(1024 * 1024);
+        let mut invalid_first_1m = ascii_1m.clone();
+        let mut invalid_last_1m = ascii_1m.clone();
+        invalid_first_1m[0] = 0xff;
+        let invalid_last_index = invalid_last_1m.len() - 1;
+        invalid_last_1m[invalid_last_index] = 0xff;
+        for (name, bytes) in [
+            ("ascii", ascii_1m.as_slice()),
+            ("multibyte", multibyte_1m.as_slice()),
+            ("bad-first", invalid_first_1m.as_slice()),
+            ("bad-last", invalid_last_1m.as_slice()),
+        ] {
+            let (scalar_ns, simd_ns) = compare_bulk(bytes);
+            let candidate_gib = bytes.len() as f64 / (1024.0 * 1024.0 * 1024.0) / (simd_ns * 1e-9);
+            println!(
+                "  {name:10}: scalar {scalar_ns:9.1} ns | candidate {simd_ns:9.1} ns | {:6.2}x | {candidate_gib:5.1} GiB/s",
+                scalar_ns / simd_ns
+            );
         }
 
         // ~64 MiB of realistic mostly-ASCII JSON text with some multibyte content.
@@ -17996,7 +18060,8 @@ mod tests {
             }
             mb / 1024.0 / best // GB/s
         };
-        let simd = time(Box::new(|| validate_utf8(bytes)));
+        let candidate = time(Box::new(|| simd(bytes)));
+        let shipped = time(Box::new(|| validate_utf8(bytes)));
         let scalar = time(Box::new(|| validate_utf8_scalar(bytes)));
         let memcpy = {
             let mut dst = vec![0u8; bytes.len()];
@@ -18011,9 +18076,9 @@ mod tests {
         };
         assert!(validate_utf8(bytes), "the probe buffer is valid UTF-8");
         println!(
-            "utf8 validate over {:.0} MiB: SIMD {simd:.1} GB/s | scalar {scalar:.1} GB/s | memcpy {memcpy:.1} GB/s | SIMD/memcpy {:.0}%",
+            "utf8 validate over {:.0} MiB: candidate {candidate:.1} GB/s | scalar {scalar:.1} GB/s | shipped {shipped:.1} GB/s | memcpy {memcpy:.1} GB/s | candidate/memcpy {:.0}%",
             mb,
-            simd / memcpy * 100.0
+            candidate / memcpy * 100.0
         );
     }
 
