@@ -1180,6 +1180,11 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
 /// # Safety
 /// `arena` must be a valid arena handle; `out` must point to a writable `{ptr,len}` slot.
 unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut AlignStr, validate: bool) -> i32 {
+    // The sole current caller already guards this boundary, but keep the helper independently
+    // null-safe so a future fallback path cannot turn a missing arena handle into UB.
+    if arena.is_null() {
+        return AL_INVALID;
+    }
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => return io_error_to_status(&e),
@@ -7440,7 +7445,9 @@ impl ArenaChunk {
         }
     }
 
-    fn spare_is_zeroed(&self) -> bool {
+    /// Whether bytes at and after the arena's monotonic bump cursor are still untouched zeroes.
+    /// Previously allocated prefixes may be dirty; reset drops every chunk instead of rewinding it.
+    fn unused_suffix_is_zeroed(&self) -> bool {
         matches!(self, ArenaChunk::Zeroed(_))
     }
 }
@@ -7505,7 +7512,7 @@ impl Arena {
         if let Some(chunk) = self.chunks.last_mut() {
             let off = aligned_off(chunk.as_ptr() as usize, self.off);
             if off + need <= chunk.len() {
-                let zero_spare = chunk.spare_is_zeroed();
+                let zero_spare = chunk.unused_suffix_is_zeroed();
                 let ptr = unsafe { chunk.as_mut_ptr().add(off) };
                 self.off = off + need;
                 if zeroed && !zero_spare {
@@ -14781,6 +14788,13 @@ mod tests {
         let zero = arena.alloc_zeroed(19, 8);
         assert_eq!((zero as usize) % 8, 0);
         assert!(unsafe { std::slice::from_raw_parts(zero, 19) }.iter().all(|&b| b == 0));
+
+        // Reset never rewinds a dirty chunk: it drops all backing storage, so the next
+        // conservative allocation starts in a fresh zeroed chunk.
+        unsafe { align_rt_arena_reset(a) };
+        assert!(unsafe { &*a }.chunks.is_empty());
+        let fresh_zero = unsafe { &mut *a }.alloc_zeroed(19, 8);
+        assert!(unsafe { std::slice::from_raw_parts(fresh_zero, 19) }.iter().all(|&b| b == 0));
 
         unsafe { align_rt_arena_end(a) };
     }
