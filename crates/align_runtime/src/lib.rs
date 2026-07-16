@@ -77,13 +77,28 @@ pub extern "C" fn align_rt_print_char(c: u32) {
 /// Append a float's shortest round-trip decimal (Rust's `Display`), ensuring it reads as a
 /// float: if the rendering has no `.`/exponent and isn't `inf`/`NaN`, a `.0` is appended.
 /// Generic over `Display` so the value is written straight into `buf` (no temporary `String`).
-fn push_float<T: std::fmt::Display>(buf: &mut Vec<u8>, x: T) {
-    use std::io::Write;
-    let start = buf.len();
+trait FloatWrite: std::io::Write {
+    fn bytes(&self) -> &[u8];
+    fn append(&mut self, bytes: &[u8]);
+}
+
+impl FloatWrite for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+fn push_float<T: std::fmt::Display>(buf: &mut impl FloatWrite, x: T) {
+    let start = buf.bytes().len();
     let _ = write!(buf, "{x}");
-    let looks_float = buf[start..].iter().any(|&b| matches!(b, b'.' | b'e' | b'E') || b.is_ascii_alphabetic());
+    let looks_float =
+        buf.bytes()[start..].iter().any(|&b| matches!(b, b'.' | b'e' | b'E') || b.is_ascii_alphabetic());
     if !looks_float {
-        buf.extend_from_slice(b".0");
+        buf.append(b".0");
     }
 }
 
@@ -1576,11 +1591,116 @@ pub unsafe extern "C" fn align_rt_par_map(
     out_buf
 }
 
+/// A growable byte buffer allocated by the same C malloc/realloc/free family as Align owned
+/// strings. This makes an owned builder freeze a pointer transfer rather than a full second
+/// allocation/copy, including on targets where Rust's global allocator is not the C allocator.
+struct BuilderBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl BuilderBuf {
+    fn new(capacity: i64) -> BuilderBuf {
+        let mut out = BuilderBuf { ptr: core::ptr::null_mut(), len: 0, cap: 0 };
+        // Preserve the old best-effort capacity hint: an impossible/failed eager reservation is
+        // ignored, while an actual later write still follows the runtime's fail-fast OOM policy.
+        if let Ok(cap) = safe_len(capacity)
+            && cap > 0
+        {
+            let ptr = unsafe { owned_raw_alloc(cap) };
+            if !ptr.is_null() {
+                out.ptr = ptr;
+                out.cap = cap;
+            }
+        }
+        out
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        let Some(required) = self.len.checked_add(additional) else {
+            panic_abort("builder allocation too large");
+        };
+        if required <= self.cap {
+            return;
+        }
+        let max = isize::MAX as usize;
+        if required > max {
+            panic_abort("builder allocation too large");
+        }
+        let doubled = self.cap.saturating_mul(2).min(max);
+        let new_cap = required.max(doubled).max(8);
+        self.ptr = unsafe { align_rt_realloc(self.ptr, new_cap as i64) };
+        self.cap = new_cap;
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.reserve(bytes.len());
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len()) };
+        self.len += bytes.len();
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.extend_from_slice(core::slice::from_ref(&byte));
+    }
+
+    fn into_raw_parts(self) -> (*mut u8, usize) {
+        let this = core::mem::ManuallyDrop::new(self);
+        (this.ptr, this.len)
+    }
+}
+
+impl Drop for BuilderBuf {
+    fn drop(&mut self) {
+        unsafe { align_rt_free(self.ptr) };
+    }
+}
+
+impl std::io::Write for BuilderBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl FloatWrite for BuilderBuf {
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. The grow buffer is heap-backed; finishing either copies bytes into an arena or
-/// transfers them to a separately owned `string` allocation.
+/// transfers its allocator-compatible storage to a separately owned `string`.
 pub struct Builder {
-    buf: Vec<u8>,
+    buf: BuilderBuf,
     /// Where an arena finish places the bytes; null selects an individually owned finish.
     arena: *mut Arena,
 }
@@ -1591,13 +1711,7 @@ pub struct Builder {
 const _: () = assert!(core::mem::size_of::<Builder>() <= 64 && core::mem::align_of::<Builder>() <= 16);
 
 fn builder_value(arena: *mut Arena, capacity: i64) -> Builder {
-    // `try_reserve` (not `with_capacity`) so a bogus/huge user capacity can't abort the process on
-    // OOM — an over-large reservation just fails silently and the buffer grows on demand instead.
-    let mut buf = Vec::new();
-    if let Ok(cap) = safe_len(capacity) {
-        let _ = buf.try_reserve(cap);
-    }
-    Builder { buf, arena }
+    Builder { buf: BuilderBuf::new(capacity), arena }
 }
 
 /// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
@@ -1637,7 +1751,7 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
     b.buf.extend_from_slice(unsafe { safe_slice(ptr, len) });
 }
 
-fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
+fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
     if (-999..=999).contains(&v) {
         // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,
         // so the hot path pays a single capacity check / length update rather than one per digit.
@@ -1792,7 +1906,7 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
 /// Append the JSON escape for one byte that needs escaping (`"`, `\`, or a C0 control), per
 /// RFC 8259 — the short forms where defined, else `\u00XX`. Caller guarantees `c` needs escaping.
 #[inline]
-fn write_json_escape(buf: &mut Vec<u8>, c: u8) {
+fn write_json_escape(buf: &mut BuilderBuf, c: u8) {
     match c {
         b'"' => buf.extend_from_slice(b"\\\""),
         b'\\' => buf.extend_from_slice(b"\\\\"),
@@ -4533,16 +4647,16 @@ pub unsafe extern "C" fn align_rt_builder_finish_stack(b: *mut Builder) -> Align
 }
 
 /// Finish a builder header by value. This is the shared ownership operation behind the boxed ABI
-/// and the nonescaping-header probe; moving the `Builder` drops its `Vec` after the result has been
-/// copied/transferred as appropriate, without assuming where the header itself was stored.
+/// and nonescaping headers, without assuming where the header itself was stored.
 unsafe fn builder_finish_value(b: Builder) -> AlignStr {
     let len = b.buf.len() as i64;
     if len == 0 {
         // Empty: no allocation needed; a dangling non-null ptr is valid for a 0-len view.
         AlignStr { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0 }
     } else if b.arena.is_null() {
-        // No arena: leak the buffer so the view stays valid (process-lifetime).
-        let ptr = Box::leak(b.buf.into_boxed_slice()).as_ptr();
+        // Legacy FFI fallback: transfer and intentionally leak the C-allocator buffer so the
+        // process-lifetime view remains valid.
+        let (ptr, _) = b.buf.into_raw_parts();
         AlignStr { ptr, len }
     } else {
         // Copy into the arena so the view is freed with it (no leak).
@@ -4554,10 +4668,9 @@ unsafe fn builder_finish_value(b: Builder) -> AlignStr {
 }
 
 /// Finish a surface `builder` (`b.to_string()`), returning an **owned** `string` `{ptr,len}`
-/// (MMv2 slice 7c) and freeing the builder object. The bytes are copied into a fresh
-/// [`align_rt_alloc`] buffer, freed by the generated code's `Drop` of the owning slot — so the
-/// finished string outlives the builder and any arena. An empty result owns no buffer (null
-/// ptr), so its `free(null)` drop is a harmless no-op.
+/// (MMv2 slice 7c) and freeing the builder object. The grow buffer uses the same C allocator as
+/// [`align_rt_alloc`], so ownership transfers without another allocation or full copy. The
+/// generated `Drop` frees it through [`align_rt_free`]. An empty result owns no buffer (null ptr).
 ///
 /// # Safety
 /// `b` must be a non-null pointer returned by [`align_rt_builder_new`] and not yet finished/freed;
@@ -4581,17 +4694,15 @@ pub unsafe extern "C" fn align_rt_builder_into_string_stack(b: *mut Builder) -> 
     unsafe { builder_into_string_value(b.read()) }
 }
 
-/// Convert a builder header by value into an owned Align string. Shared with the stack-header probe
-/// so it measures only header placement; the payload allocation/copy path stays byte-for-byte the
-/// same as the public boxed ABI.
+/// Convert a builder header by value into an owned Align string by transferring its C-allocator
+/// buffer. Capacity slack is harmless because Align owned values use size-less C `free`.
 unsafe fn builder_into_string_value(b: Builder) -> AlignStr {
     let len = b.buf.len() as i64;
     if len == 0 {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
-    let dst = align_rt_alloc(len);
-    unsafe { core::ptr::copy_nonoverlapping(b.buf.as_ptr(), dst, b.buf.len()) };
-    AlignStr { ptr: dst, len }
+    let (ptr, _) = b.buf.into_raw_parts();
+    AlignStr { ptr, len }
 }
 
 /// Free a `builder` object that was never finished (`to_string()` not called) — the `Drop` of an
@@ -7729,6 +7840,22 @@ const MAP_PRIVATE: i32 = 0x2;
 /// `mmap` failure sentinel — `(void*)-1`, not null.
 const MAP_FAILED: *mut core::ffi::c_void = usize::MAX as *mut core::ffi::c_void;
 
+// One internal allocator family for every payload that can cross into an Align owned value. Keep
+// the non-aborting raw allocation entry separate so a best-effort capacity hint may fail without
+// changing the public `align_rt_alloc` fail-fast contract. A future allocator replacement changes
+// these three helpers together; builders and the exported ABI cannot silently diverge.
+unsafe fn owned_raw_alloc(size: usize) -> *mut u8 {
+    unsafe { malloc(size) as *mut u8 }
+}
+
+unsafe fn owned_raw_free(ptr: *mut u8) {
+    unsafe { free(ptr as *mut core::ffi::c_void) };
+}
+
+unsafe fn owned_raw_realloc(ptr: *mut u8, size: usize) -> *mut u8 {
+    unsafe { realloc(ptr as *mut core::ffi::c_void, size) as *mut u8 }
+}
+
 /// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
 /// buffer). On OOM (`malloc` returns null for a positive request) we fail fast and abort,
 /// rather than hand back a null the generated code would dereference on the first store.
@@ -7737,7 +7864,10 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     if size <= 0 {
         return core::ptr::null_mut();
     }
-    let ptr = unsafe { malloc(size as usize) as *mut u8 };
+    let Ok(size) = safe_len(size) else {
+        panic_abort("allocation too large");
+    };
+    let ptr = unsafe { owned_raw_alloc(size) };
     if ptr.is_null() {
         panic_abort("out of memory");
     }
@@ -7751,7 +7881,7 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
 /// `ptr` must be null or a pointer previously returned by [`align_rt_alloc`] and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
-    unsafe { free(ptr as *mut core::ffi::c_void) }
+    unsafe { owned_raw_free(ptr) }
 }
 
 /// Grow/shrink a heap buffer from the [`align_rt_alloc`] family (C `realloc`). `realloc(null, n)` is
@@ -7767,10 +7897,13 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u8 {
     if new_size <= 0 {
-        unsafe { free(ptr as *mut core::ffi::c_void) };
+        unsafe { owned_raw_free(ptr) };
         return core::ptr::null_mut();
     }
-    let p = unsafe { realloc(ptr as *mut core::ffi::c_void, new_size as usize) as *mut u8 };
+    let Ok(new_size) = safe_len(new_size) else {
+        panic_abort("allocation too large");
+    };
+    let p = unsafe { owned_raw_realloc(ptr, new_size) };
     if p.is_null() {
         panic_abort("out of memory");
     }
@@ -7988,7 +8121,7 @@ pub unsafe extern "C" fn align_rt_array_builder_build_stack(b: *mut ArrayBuilder
 }
 
 unsafe fn array_builder_free_value(b: ArrayBuilder) {
-    unsafe { free(b.data as *mut core::ffi::c_void) };
+    unsafe { owned_raw_free(b.data) };
 }
 
 /// Drop an unfrozen scalar-element `array_builder` — free its storage, then the header. Null-safe (a
@@ -8023,11 +8156,11 @@ unsafe fn array_builder_free_strings_value(b: ArrayBuilder) {
         let base = b.data as *const AlignStr;
         for i in 0..b.len {
             let entry = unsafe { core::ptr::read_unaligned(base.add(i)) };
-            unsafe { free(entry.ptr as *mut core::ffi::c_void) };
+            unsafe { owned_raw_free(entry.ptr as *mut u8) };
             #[cfg(test)]
             LIVE_ARRAY_BUILDER_STRINGS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         }
-        unsafe { free(b.data as *mut core::ffi::c_void) };
+        unsafe { owned_raw_free(b.data) };
     }
 }
 
@@ -13047,9 +13180,9 @@ mod tests {
             out
         }
         let encode = |s: &[u8]| -> Vec<u8> {
-            let mut b = Builder { buf: Vec::new(), arena: core::ptr::null_mut() };
+            let mut b = builder_value(core::ptr::null_mut(), 0);
             unsafe { align_rt_builder_write_json_str(&mut b, s.as_ptr(), s.len() as i64) };
-            b.buf
+            b.buf.as_slice().to_vec()
         };
 
         let mut cases: Vec<Vec<u8>> = vec![
@@ -13687,28 +13820,28 @@ mod tests {
     fn builder_write_int_matches_format() {
         // The hand-rolled itoa must equal `format!("{v}")` across the i64 range incl. edges.
         for v in [0i64, 7, -1, 42, -123, i64::MAX, i64::MIN, 1000000000000, -9999] {
-            let mut b = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            let mut b = builder_value(std::ptr::null_mut(), 0);
             unsafe { align_rt_builder_write_int(&mut b, v) };
-            assert_eq!(String::from_utf8(b.buf).unwrap(), format!("{v}"), "write_int({v})");
+            assert_eq!(String::from_utf8(b.buf.as_slice().to_vec()).unwrap(), format!("{v}"), "write_int({v})");
         }
     }
 
     #[test]
     fn builder_write_str_int_str_matches_three_writes() {
         for v in [0i64, 7, -1, 42, -123, 999, -999, i64::MAX, i64::MIN] {
-            let mut batched = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            let mut batched = builder_value(std::ptr::null_mut(), 0);
             unsafe {
                 align_rt_builder_write_str_int_str(&mut batched, b"item-".as_ptr(), 5, v, b"-status ".as_ptr(), 8);
             }
 
-            let mut separate = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            let mut separate = builder_value(std::ptr::null_mut(), 0);
             unsafe {
                 align_rt_builder_write(&mut separate, b"item-".as_ptr(), 5);
                 align_rt_builder_write_int(&mut separate, v);
                 align_rt_builder_write(&mut separate, b"-status ".as_ptr(), 8);
             }
 
-            assert_eq!(batched.buf, separate.buf, "batched writes match separate writes for {v}");
+            assert_eq!(batched.buf.as_slice(), separate.buf.as_slice(), "batched writes match separate writes for {v}");
         }
     }
 
@@ -13721,15 +13854,19 @@ mod tests {
         let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), arena, 8) };
         assert_eq!(b.cast::<u8>(), storage.0.as_mut_ptr());
         unsafe { align_rt_builder_write(b, b"arena".as_ptr(), 5) };
+        let grow_ptr = unsafe { (*b).buf.as_ptr() };
         let view = unsafe { align_rt_builder_finish_stack(b) };
         assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"arena");
+        assert_ne!(view.ptr, grow_ptr, "arena finish must retain distinct arena ownership");
         unsafe { align_rt_arena_end(arena) };
 
         // The same storage can be initialized again after consumption. Owned finish transfers a
         // fresh allocation to the result, which remains valid after the header value is gone.
         let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), core::ptr::null_mut(), 0) };
         unsafe { align_rt_builder_write(b, b"owned".as_ptr(), 5) };
+        let grow_ptr = unsafe { (*b).buf.as_ptr() };
         let owned = unsafe { align_rt_builder_into_string_stack(b) };
+        assert_eq!(owned.ptr, grow_ptr, "owned stack-header freeze must transfer the grow buffer");
         assert_eq!(unsafe { safe_slice(owned.ptr, owned.len) }, b"owned");
         unsafe { align_rt_free(owned.ptr as *mut u8) };
 
@@ -13737,6 +13874,30 @@ mod tests {
         let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), core::ptr::null_mut(), 0) };
         unsafe { align_rt_builder_write(b, b"drop me".as_ptr(), 7) };
         unsafe { align_rt_builder_free_stack(b) };
+    }
+
+    #[test]
+    fn owned_builder_freeze_transfers_exact_and_grown_buffers() {
+        let payload: Vec<u8> = (0..8193).map(|i| b'a' + (i % 26) as u8).collect();
+        for capacity in [0, 1, payload.len() as i64] {
+            let b = align_rt_builder_new(core::ptr::null_mut(), capacity);
+            // Split the writes so capacity 0/1 necessarily exercise geometric realloc growth.
+            unsafe {
+                align_rt_builder_write(b, payload[..17].as_ptr(), 17);
+                align_rt_builder_write(b, payload[17..].as_ptr(), (payload.len() - 17) as i64);
+            }
+            let grow_ptr = unsafe { (*b).buf.as_ptr() };
+            let owned = unsafe { align_rt_builder_into_string(b) };
+            assert_eq!(owned.ptr, grow_ptr, "capacity {capacity} must freeze without a final copy");
+            assert_eq!(unsafe { safe_slice(owned.ptr, owned.len) }, payload);
+            unsafe { align_rt_free(owned.ptr as *mut u8) };
+        }
+
+        // A capacity hint does not make an empty owned value retain an otherwise-unobservable
+        // allocation; the consumed buffer is dropped and the ABI stays canonical null/0.
+        let empty = unsafe { align_rt_builder_into_string(align_rt_builder_new(core::ptr::null_mut(), 64)) };
+        assert!(empty.ptr.is_null());
+        assert_eq!(empty.len, 0);
     }
 
     #[test]
@@ -16067,6 +16228,91 @@ mod tests {
                 println!(
                     "{kind:13} | {n:8} | {boxed_ns:12.2} | {stack_ns:12.2} | {:10.2}x",
                     boxed_ns / stack_ns
+                );
+            }
+        }
+    }
+
+    /// Manual allocation-inclusive adoption probe for the owned-freeze payload change alone. Both
+    /// paths use the same C-allocator grow buffer and one bulk write; the control recreates the old
+    /// final malloc+copy while the candidate transfers the grow pointer. Exact capacity and
+    /// capacity-zero/geometric growth are reported separately. Run with:
+    ///
+    /// `cargo test -p align_runtime --release owned_builder_freeze_probe -- --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn owned_builder_freeze_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn copy_freeze(bytes: &[u8], exact: bool) -> u64 {
+            let mut b = builder_value(core::ptr::null_mut(), if exact { bytes.len() as i64 } else { 0 });
+            b.buf.extend_from_slice(black_box(bytes));
+            let dst = align_rt_alloc(b.buf.len() as i64);
+            unsafe { core::ptr::copy_nonoverlapping(b.buf.as_ptr(), dst, b.buf.len()) };
+            let checksum = unsafe { (*dst as u64) ^ (*dst.add(bytes.len() - 1) as u64) };
+            drop(b);
+            unsafe { align_rt_free(dst) };
+            checksum
+        }
+
+        #[inline(never)]
+        fn transfer_freeze(bytes: &[u8], exact: bool) -> u64 {
+            let mut b = builder_value(core::ptr::null_mut(), if exact { bytes.len() as i64 } else { 0 });
+            b.buf.extend_from_slice(black_box(bytes));
+            let out = unsafe { builder_into_string_value(b) };
+            let checksum = unsafe { (*out.ptr as u64) ^ (*out.ptr.add(bytes.len() - 1) as u64) };
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            checksum
+        }
+
+        fn time(path: fn(&[u8], bool) -> u64, bytes: &[u8], exact: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(path)(black_box(bytes), black_box(exact));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        println!("owned builder freeze (median of 9, allocation-inclusive ns/op):");
+        println!(" growth | bytes   | copy freeze | transfer | copy/transfer");
+        for exact in [true, false] {
+            for n in [64usize, 1024, 4096, 16_384, 65_536, 262_144, 1_048_576] {
+                let bytes: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(1)).collect();
+                let iters = match n {
+                    0..=64 => 100_000,
+                    65..=4096 => 10_000,
+                    4097..=16_384 => 2_000,
+                    16_385..=65_536 => 500,
+                    65_537..=262_144 => 100,
+                    _ => 30,
+                };
+                let mut copy = Vec::with_capacity(9);
+                let mut transfer = Vec::with_capacity(9);
+                for trial in 0..9 {
+                    if trial % 2 == 0 {
+                        copy.push(time(copy_freeze, &bytes, exact, iters));
+                        transfer.push(time(transfer_freeze, &bytes, exact, iters));
+                    } else {
+                        transfer.push(time(transfer_freeze, &bytes, exact, iters));
+                        copy.push(time(copy_freeze, &bytes, exact, iters));
+                    }
+                }
+                let copy = median(copy);
+                let transfer = median(transfer);
+                assert_eq!(copy_freeze(&bytes, exact), transfer_freeze(&bytes, exact));
+                println!(
+                    "{:6} | {n:7} | {copy:11.2} | {transfer:8.2} | {:13.2}x",
+                    if exact { "exact" } else { "grow" },
+                    copy / transfer
                 );
             }
         }

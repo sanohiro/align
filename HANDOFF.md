@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (fourth update this day), **PROVEN NONESCAPING BUILDER HEADERS NOW USE
+_Last updated: 2026-07-16 (fifth update this day), **OWNED BUILDER FREEZE IS ALLOCATOR-COMPATIBLE
+AND ZERO-COPY.** `BuilderBuf` now grows with the same C `malloc/realloc/free` family as Align owned
+strings, so `to_string()` transfers its pointer instead of allocating and copying a second payload;
+this does not assume Rust's global allocator matches libc on non-glibc targets. Checked geometric
+growth, best-effort capacity hints, unfinished Drop, direct file/writer borrows, and canonical empty
+null/0 results are preserved. Gemini's claimed current allocator mismatch was not present (all
+three exported allocation calls already used the same C family), and using fail-fast
+`align_rt_alloc` for a best-effort hint would change behavior; the valid future-drift concern was
+addressed by routing builder, public ABI, and array-builder storage through one internal allocator
+family. The same review pass closed positive oversized `i64` truncation on 32-bit alloc/realloc
+calls with `safe_len`. Arena finish remains intentionally distinct and copies into
+arena-owned storage. Pointer-identity gates cover boxed/stack headers, exact capacity, and geometric
+growth. A checked-in allocation-inclusive release probe (balanced median of nine) measured
+1.59x-2.81x over the removed copy freeze from 64 B through 1 MiB, with both exact and capacity-zero
+growth. The complete workspace is green (**2178 total = 2175 passed + three ignored manual probes**)
+and workspace clippy passes with warnings denied. This work is in PR **#477**, based on
+squash-merged PR #476 (`5b96d5c`). **Next recommended P2:** virtualize direct-consumer
+`chunks`, starting with `.len()` and direct index while stored/escaping results keep materializing.
+The aarch64 UTF-8 portability measurement remains deferred. Previous update: 2026-07-16 (fourth
+update this day), **PROVEN NONESCAPING BUILDER HEADERS NOW USE
 ENTRY STACK STORAGE.** A checked-in ignored release probe isolated header placement while retaining
 the exact payload representation and write/push calls: at 0/1/4 elements, `builder` improved by
 2.69x/1.42x/1.31x and `array_builder` by 3.37x/1.59x/1.33x; 1K/1M controls stayed within 0.3%.
@@ -22,8 +41,8 @@ Drop, and boxed call/return escape controls. Gemini's three findings were applie
 rvalues now reject every stack-header candidate fail-closed, a future aggregate-wrapper MIR gate
 pins that rule, and both stack initializers debug-check the concrete header alignment. After
 refreshing the ordinary CLI/staticlib pair, the complete workspace is green (**2176 total = 2174
-passed + two ignored manual probes**) and workspace clippy passes with warnings denied. This work is
-in PR **#476**, based on merged PR #475. **Next recommended
+passed + two ignored manual probes**) and workspace clippy passes with warnings denied. This work was
+squash-merged as PR **#476**, based on merged PR #475. **Next recommended
 P2:** make owned builder freeze allocator-compatible and zero-copy, measured independently from the
 now-shipped header placement. Portability follow-up remains: run the UTF-8 probe on native aarch64;
 do not infer its threshold from x86. Previous update: 2026-07-16 (third update this day), **THE X86-64 UTF-8 CROSSOVER IS MEASURED AND
