@@ -5968,13 +5968,85 @@ fn base64_encode_into(
     base64_encode_into_scalar(data, alphabet, pad, out);
 }
 
-fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+fn hex_encode_into_scalar(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     const HEX: [u8; 16] = *b"0123456789abcdef";
     assert_eq!(data.len().checked_mul(2), Some(out.len()), "hex destination length mismatch");
     for (pair, &byte) in out.chunks_exact_mut(2).zip(data) {
         pair[0].write(HEX[(byte >> 4) as usize]);
         pair[1].write(HEX[(byte & 15) as usize]);
     }
+}
+
+/// AVX2 hex encoder: 32 input bytes become 64 lower-case output bytes. `shuffle_epi8` maps each
+/// nibble through the 16-byte alphabet; unpack plus a cross-lane permutation restores byte order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hex_encode_into_avx2(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    use core::arch::x86_64::*;
+
+    static HEX: [u8; 16] = *b"0123456789abcdef";
+    let alphabet = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(HEX.as_ptr() as *const __m128i) });
+    let mask = _mm256_set1_epi8(0x0f);
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while data.len() - i >= 32 {
+        let bytes = unsafe { _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i) };
+        let hi = _mm256_shuffle_epi8(alphabet, _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask));
+        let lo = _mm256_shuffle_epi8(alphabet, _mm256_and_si256(bytes, mask));
+        let pairs_lo = _mm256_unpacklo_epi8(hi, lo);
+        let pairs_hi = _mm256_unpackhi_epi8(hi, lo);
+        let first = _mm256_permute2x128_si256(pairs_lo, pairs_hi, 0x20);
+        let second = _mm256_permute2x128_si256(pairs_lo, pairs_hi, 0x31);
+        unsafe {
+            _mm256_storeu_si256(out.as_mut_ptr().add(o) as *mut __m256i, first);
+            _mm256_storeu_si256(out.as_mut_ptr().add(o + 32) as *mut __m256i, second);
+        }
+        i += 32;
+        o += 64;
+    }
+    hex_encode_into_scalar(&data[i..], &mut out[o..]);
+}
+
+/// Baseline-NEON hex encoder: table lookups map 16 high/low-nibble streams and `vzip1`/`vzip2`
+/// interleave them into 32 lower-case output bytes. The scalar oracle owns the final 0..15 bytes.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[target_feature(enable = "neon")]
+unsafe fn hex_encode_into_neon(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    use core::arch::aarch64::*;
+
+    static HEX: [u8; 16] = *b"0123456789abcdef";
+    let alphabet = unsafe { vld1q_u8(HEX.as_ptr()) };
+    let mask = vdupq_n_u8(0x0f);
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while data.len() - i >= 16 {
+        let bytes = unsafe { vld1q_u8(data.as_ptr().add(i)) };
+        let hi = vqtbl1q_u8(alphabet, vandq_u8(vshrq_n_u8(bytes, 4), mask));
+        let lo = vqtbl1q_u8(alphabet, vandq_u8(bytes, mask));
+        unsafe {
+            vst1q_u8(out.as_mut_ptr().add(o).cast::<u8>(), vzip1q_u8(hi, lo));
+            vst1q_u8(out.as_mut_ptr().add(o + 16).cast::<u8>(), vzip2q_u8(hi, lo));
+        }
+        i += 16;
+        o += 32;
+    }
+    hex_encode_into_scalar(&data[i..], &mut out[o..]);
+}
+
+/// Encode directly into the exact destination. Measured x86-64 inputs of at least 32 bytes use
+/// AVX2; short inputs, unsupported CPUs/targets, and aarch64 pending its native gate stay scalar.
+#[inline]
+fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    assert_eq!(data.len().checked_mul(2), Some(out.len()), "hex destination length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if data.len() >= 32 && is_x86_feature_detected!("avx2") {
+            unsafe { hex_encode_into_avx2(data, out) };
+            return;
+        }
+    }
+    hex_encode_into_scalar(data, out);
 }
 
 /// Decode a Base64 `input` (accepting `url`-safe or standard alphabet by the flag). `None` on any
@@ -13342,7 +13414,7 @@ mod tests {
 
     fn hex_enc(data: &[u8]) -> Vec<u8> {
         let mut out = vec![core::mem::MaybeUninit::uninit(); data.len() * 2];
-        hex_encode_into(data, &mut out);
+        hex_encode_into_scalar(data, &mut out);
         out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
     }
 
@@ -13632,6 +13704,163 @@ mod tests {
                 (short_alloc_log_sum / short_count as f64).exp(),
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn hex_simd_backends_match_scalar_oracle() {
+        fn encode_backend(data: &[u8]) -> Vec<u8> {
+            let mut out = vec![core::mem::MaybeUninit::uninit(); data.len() * 2];
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                hex_encode_into_avx2(data, &mut out);
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                hex_encode_into_neon(data, &mut out);
+            }
+            out.into_iter().map(|byte| unsafe { byte.assume_init() }).collect()
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for n in 0usize..=4096 {
+            let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(n as u8)).collect();
+            assert_eq!(encode_backend(&data), hex_enc(&data), "SIMD mismatch at len={n}");
+        }
+
+        let backing: Vec<u8> = (0..160).map(|i| (i as u8).wrapping_mul(73).wrapping_add(19)).collect();
+        for offset in 0usize..32 {
+            let data = &backing[offset..offset + 97];
+            assert_eq!(encode_backend(data), hex_enc(data), "SIMD misalignment mismatch at offset={offset}");
+        }
+
+        const PAGE: usize = 4096;
+        let page_backing: Vec<u8> = (0..PAGE * 3).map(|i| (i as u8).wrapping_mul(29).wrapping_add(7)).collect();
+        let aligned = (PAGE - page_backing.as_ptr() as usize % PAGE) % PAGE;
+        let data = &page_backing[aligned..aligned + PAGE];
+        assert_eq!(encode_backend(data), hex_enc(data), "SIMD page-boundary mismatch");
+    }
+
+    /// Manual scalar/SIMD adoption probe for hex's retained exact destination. X86 uses the shipped
+    /// dispatch; aarch64 calls its candidate directly so the unmeasured target is not activated.
+    /// Run with:
+    ///
+    /// `cargo test -p align_runtime --release hex_simd_probe -- --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn hex_simd_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn fill(data: &[u8], simd: bool, out: &mut [core::mem::MaybeUninit<u8>]) -> u64 {
+            if simd {
+                #[cfg(target_arch = "x86_64")]
+                hex_encode_into(data, out);
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    hex_encode_into_neon(data, out);
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                hex_encode_into_scalar(data, out);
+            } else {
+                hex_encode_into_scalar(data, out);
+            }
+            if out.is_empty() {
+                0
+            } else {
+                out.len() as u64 ^ unsafe { out[0].assume_init() as u64 } ^ unsafe { out[out.len() - 1].assume_init() as u64 }
+            }
+        }
+
+        fn time(data: &[u8], simd: bool, alloc: bool, iters: usize) -> f64 {
+            let mut reusable = vec![core::mem::MaybeUninit::uninit(); data.len() * 2];
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                if alloc {
+                    let out = unsafe {
+                        owned_str_exact(data.len() * 2, |dst| {
+                            checksum ^= black_box(fill)(black_box(data), black_box(simd), dst);
+                        })
+                    };
+                    unsafe { align_rt_free(out.ptr as *mut u8) };
+                } else {
+                    checksum ^= black_box(fill)(black_box(data), black_box(simd), black_box(&mut reusable));
+                }
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            println!("hex SIMD probe skipped: AVX2 unavailable");
+            return;
+        }
+        println!("hex SIMD candidate (median of 9, ns/op; GB/s uses input bytes):");
+        println!(" input    | scalar core | candidate   | core x | scalar alloc | candidate   | alloc x | cand GB/s");
+        let mut short_core_log_sum = 0.0f64;
+        let mut short_alloc_log_sum = 0.0f64;
+        let mut short_count = 0usize;
+        for n in [
+            0usize, 1, 2, 3, 4, 7, 8, 15, 16, 24, 31, 32, 48, 63, 64, 65, 96, 128, 256, 1024, 4096, 1 << 20,
+            64 << 20,
+        ] {
+            let data: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+            let iters = match n {
+                0..=64 => 100_000,
+                65..=256 => 30_000,
+                257..=4096 => 10_000,
+                4097..=1_048_576 => 30,
+                _ => 3,
+            };
+            let mut scalar_core = Vec::with_capacity(9);
+            let mut simd_core = Vec::with_capacity(9);
+            let mut scalar_alloc = Vec::with_capacity(9);
+            let mut simd_alloc = Vec::with_capacity(9);
+            for trial in 0..9 {
+                if trial % 2 == 0 {
+                    scalar_core.push(time(&data, false, false, iters));
+                    simd_core.push(time(&data, true, false, iters));
+                    scalar_alloc.push(time(&data, false, true, iters));
+                    simd_alloc.push(time(&data, true, true, iters));
+                } else {
+                    simd_core.push(time(&data, true, false, iters));
+                    scalar_core.push(time(&data, false, false, iters));
+                    simd_alloc.push(time(&data, true, true, iters));
+                    scalar_alloc.push(time(&data, false, true, iters));
+                }
+            }
+            let scalar_core = median(scalar_core);
+            let simd_core = median(simd_core);
+            let scalar_alloc = median(scalar_alloc);
+            let simd_alloc = median(simd_alloc);
+            if (1..=64).contains(&n) {
+                short_core_log_sum += (scalar_core / simd_core).ln();
+                short_alloc_log_sum += (scalar_alloc / simd_alloc).ln();
+                short_count += 1;
+            }
+            let gbps = if n == 0 { 0.0 } else { n as f64 / simd_core };
+            println!(
+                "{n:>9} | {scalar_core:>11.2} | {simd_core:>11.2} | {:>6.2}x | {scalar_alloc:>12.2} | {simd_alloc:>11.2} | {:>6.2}x | {gbps:>9.2}",
+                scalar_core / simd_core,
+                scalar_alloc / simd_alloc,
+            );
+        }
+        println!(
+            "1..=64 geometric mean: core {:.2}x, allocation-inclusive {:.2}x",
+            (short_core_log_sum / short_count as f64).exp(),
+            (short_alloc_log_sum / short_count as f64).exp(),
+        );
     }
 
     /// Manual allocation-inclusive gate for removing the codec staging allocation and full-output
