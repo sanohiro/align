@@ -2482,10 +2482,12 @@ spawn-capture, closure-result region, Unit indirect-call ABI, and buffered-reade
 fixed and regression-pinned in `impl/source-correctness-fixes-2026-07-13.md`; ordinary sequential
 effects are settled as Impure-allowed with exact guarded order. Dynamic allocation-size hardening
 is complete with checked heap/arena/SoA byte arithmetic and boundary/mutation gates. New
-measure-first work is the per-callsite initialized-before-read
-`arena_alloc_uninit` / conservative-zeroed split, exact-final Base64/hex fill paired with the existing
-Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
-stable compaction. Existing work from documents 10/11 remains attributed there.
+measure-first work included the per-callsite initialized-before-read arena split and exact-final
+Base64/hex fill; both shipped 2026-07-16 after their gates. Arena chunks now distinguish raw
+`MaybeUninit` backing from lazy-zero backing, while the public/generated ABI and task records remain
+conservative; only file-copy, arena-builder-finish, and strict SoA decode use raw storage. Remaining
+work is the Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar
+vs SIMD stable compaction. Existing work from documents 10/11 remains attributed there.
 
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)

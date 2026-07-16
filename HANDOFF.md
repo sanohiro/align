@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (tenth update this day), **BASE64/BASE64URL/HEX FILL ONE EXACT FINAL
+_Last updated: 2026-07-16 (eleventh update this day), **ARENA INITIALIZATION CLASSES PRESERVE BOTH
+RAW SPEED AND LAZY ZEROING.** Arena chunks now carry either raw `MaybeUninit<u8>` backing or
+conservative `Vec<u8>` backing; no initialized Rust byte slice covers raw capacity. Fresh raw chunks
+skip the old 64 KiB blanket zero, fresh conservative chunks retain platform lazy/calloc zero pages,
+and a conservative allocation inside raw backing zeroes only its requested range. The public/generated
+ABI and task records stay conservative. Only the proved full-overwrite file-view fallback, arena
+builder finish, and strict SoA decode use raw storage. The balanced probe improved overwrite paths
+13.42-13.52x through 48 B, 10.78x at the 2.5 KiB gateway shape, 1.91x at 64 KiB, and 1.99x at 1 MiB;
+64 MiB stayed at parity. Conservative medians remained within 1% and the robust task-shaped p99
+panel stayed within 5%. An intermediate exact-memset design was rejected because it destroyed lazy
+zeroing on fresh 64 MiB conservative chunks. The complete workspace is green (**2190 total = 2183
+passed + seven ignored manual probes**) and workspace clippy passes with warnings denied. This work
+is on branch **`agent/arena-init-classes`**,
+based on squash-merged PR #482 (`2402149`). **Next recommended after this PR:** apply the same
+initialized-write discipline to the roadmap's reader/`io.copy` zero-fill removal, with short-read,
+EINTR, EOF, and lookahead correctness gates first. The aarch64 UTF-8 portability measurement remains
+deferred. Previous update: 2026-07-16 (tenth update this day), **BASE64/BASE64URL/HEX FILL ONE EXACT FINAL
 PAYLOAD.** All three scalar encoders now compute checked group/tail output lengths, allocate only the
 final Align-owned string, and initialize it through `MaybeUninit<u8>`; the staging Vec, second
 allocation, and full-output copy are gone. Empty output remains `{null,0}`, positive OOM remains the
@@ -19,8 +35,8 @@ loop removed per-byte bounds checks. The roadmap JSON-copy probe was also
 executed end to end for `array<i64>` with the required lexical count pass: it won only at 1-8
 elements, reversed by 64, and reached 0.71-0.73x at 1K-1M, so the existing one-pass staged decoder is
 retained and the negative result is recorded. The complete workspace is green (**2188 total = 2182
-passed + six ignored manual probes**) and workspace clippy passes with warnings denied. This work is on branch
-**`agent/exact-codec-destinations`**, based on squash-merged PR #481 (`be74904`). **Next recommended
+passed + six ignored manual probes**) and workspace clippy passes with warnings denied. This work was
+squash-merged as PR **#482** (`2402149`), based on squash-merged PR #481 (`be74904`). **Next recommended
 after this PR:** take document 12's highest remaining measured item, the
 initialized-before-read/uninitialized arena split, beginning with its safety classification and
 gateway adoption probe. The aarch64 UTF-8 portability measurement remains deferred. Previous

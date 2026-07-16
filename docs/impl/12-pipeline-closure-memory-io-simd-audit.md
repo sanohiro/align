@@ -64,9 +64,10 @@ come before further SIMD or parallel widening:
 
 After those are closed, the highest-value performance refinements from this audit are:
 
-1. Split arena allocation into **proven-initialized-before-read / uninitialized** and conservative
-   **zeroed** paths. A fresh chunk logically initializes at least 64 KiB even for a tiny request;
-   existing reuse measurements show that mandatory full re-zeroing dominates that microbenchmark.
+1. ~~Split arena allocation into **proven-initialized-before-read / uninitialized** and conservative
+   **zeroed** paths.~~ **SHIPPED 2026-07-16.** Fresh uninitialized chunks avoid the 64 KiB blanket
+   zero; fresh conservative chunks retain lazy/calloc zeroing, and reused raw chunks zero only the
+   requested range.
 2. ~~Fill exact-size Base64 and hex output directly into its final allocation.~~ **SHIPPED
    2026-07-16.** Next add the already planned runtime-dispatched Base64 SIMD backend; hex SIMD is a
    separate new measure-first probe.
@@ -780,7 +781,7 @@ Prefer reducing allocation count and touched bytes. Reconsider a concurrent allo
 task/runtime benchmarks attribute a material fraction to allocator lock contention; compare the
 platform allocator and at least one mature alternative under identical thread counts and RSS gates.
 
-### 6.2 Highest-value new refinement — initialized-before-read arena allocation classes
+### 6.2 SHIPPED 2026-07-16 — initialized-before-read arena allocation classes
 
 The arena is a correct bump allocator after a chunk exists, but every fresh chunk is created as:
 
@@ -831,6 +832,23 @@ Preferred implementation:
 4. Use MIR initialization/drop facts, not function-name guesses, to maintain the proof.
 5. Only after the split passes memory-safety gates, re-evaluate a capped thread-local chunk pool. The
    previous pool result remains closed for the blanket-zero policy.
+
+**Implementation result.** Chunk backing is now an `ArenaChunk::Uninit(Vec<MaybeUninit<u8>>)` or
+`ArenaChunk::Zeroed(Vec<u8>)`; no Rust byte slice covers raw capacity. `alloc_uninit` and
+`alloc_zeroed` share bump/alignment logic. A fresh conservative chunk deliberately keeps `Vec<u8>`
+so the platform allocator can retain lazy/calloc zero pages; a zeroed allocation in an uninitialized
+chunk memsets only its requested range. The public/generated ABI and task-group records remain
+conservative. The runtime routes only three proved overwrite sites to uninitialized storage:
+file-view fallback copy, arena builder finish, and strict successful SoA JSON decode. Error paths do
+not publish their raw allocation, and SoA padding is never a semantic field or bulk-read range.
+
+The checked-in allocation-inclusive median-of-nine probe includes 1/8/48 B, 1 KiB, the 2.5 KiB
+gateway shape, 64 KiB, 1/64 MiB, plus a median-of-nine p99 panel for 48 B/1 KiB/64 KiB task-shaped
+conservative records. Overwrite paths improved 13.42-13.52x through 48 B, 10.78x at 2.5 KiB, 1.91x
+at 64 KiB, and 1.99x at 1 MiB; 64 MiB stayed at parity. Conservative medians stayed within 1%, and
+the task-shaped p99 panel stayed within the 5% gate. An intermediate exact-memset design was rejected
+before shipment because it faulted every page of a fresh 64 MiB conservative allocation while the
+old lazy-zero Vec did not.
 
 Arena adoption gate:
 
@@ -1192,7 +1210,8 @@ of integer wrap.
 
 ### Slice P1 — cache traffic and visible loops
 
-- implement and benchmark arena initialized-before-read/uninitialized vs conservative-zeroed separation;
+- [x] implement and benchmark arena initialized-before-read/uninitialized vs conservative-zeroed
+  separation (2026-07-16; safety classes + lazy-zero preservation + adoption probe);
 - [x] build lazy multi-source `zip` with its first real consumer; one allocation-free,
   tuple-storage-free vector loop and exact length/alias/effect semantics (2026-07-15);
 - direct-fill exact codec destinations, then evaluate already-planned Base64 SIMD and the separate

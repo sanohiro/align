@@ -1194,10 +1194,7 @@ unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut Ali
         return AL_INVALID;
     }
     let Ok(len_z) = isize::try_from(data.len()) else { return AL_INVALID };
-    let dst = unsafe { align_rt_arena_alloc(arena, len_z as i64, 1) };
-    if dst.is_null() {
-        return AL_INVALID;
-    }
+    let dst = unsafe { (&mut *arena).alloc_uninit(data.len(), 1) };
     unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
     unsafe { *out = AlignStr { ptr: dst as *const u8, len: len_z as i64 } };
     0
@@ -2756,16 +2753,10 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     let Some((cols, total, max_align)) = soa_layout(&widths, n_rows) else {
         return 1; // byte size overflowed usize — reject rather than under-allocate
     };
-    let Ok(total_i64) = i64::try_from(total) else {
+    if i64::try_from(total).is_err() {
         return 1; // size doesn't fit the i64 arena ABI
-    };
-    let base = unsafe { align_rt_arena_alloc(arena, total_i64, max_align.max(1) as i64) };
-    // The arena hands back zeroed chunks, but a missing field must still read 0 — zero defensively
-    // (cheap relative to the parse) so a partial record leaves declared columns at 0, like the AoS
-    // path's per-element `buf.resize(.., 0)`.
-    if !base.is_null() && total > 0 {
-        unsafe { core::ptr::write_bytes(base, 0, total) };
     }
+    let base = unsafe { (&mut *arena).alloc_uninit(total, max_align.max(1)) };
 
     // Pass 2: decode each record's values directly into its columns.
     let mut pat_ncol: i64 = -1;
@@ -4685,7 +4676,7 @@ unsafe fn builder_finish_value(b: Builder) -> AlignStr {
     } else {
         // Copy into the arena so the view is freed with it (no leak).
         let arena = unsafe { &mut *b.arena };
-        let dst = arena.alloc(b.buf.len(), 1);
+        let dst = arena.alloc_uninit(b.buf.len(), 1);
         unsafe { std::ptr::copy_nonoverlapping(b.buf.as_ptr(), dst, b.buf.len()) };
         AlignStr { ptr: dst, len }
     }
@@ -7422,8 +7413,42 @@ pub unsafe extern "C" fn align_rt_process_exec(
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer
 /// `Vec` growing never moves an inner buffer), so returned pointers stay valid until end.
+enum ArenaChunk {
+    Zeroed(Vec<u8>),
+    Uninit(Vec<core::mem::MaybeUninit<u8>>),
+}
+
+impl ArenaChunk {
+    fn len(&self) -> usize {
+        match self {
+            ArenaChunk::Zeroed(data) => data.len(),
+            ArenaChunk::Uninit(data) => data.len(),
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            ArenaChunk::Zeroed(data) => data.as_ptr(),
+            ArenaChunk::Uninit(data) => data.as_ptr().cast::<u8>(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            ArenaChunk::Zeroed(data) => data.as_mut_ptr(),
+            ArenaChunk::Uninit(data) => data.as_mut_ptr().cast::<u8>(),
+        }
+    }
+
+    fn spare_is_zeroed(&self) -> bool {
+        matches!(self, ArenaChunk::Zeroed(_))
+    }
+}
+
 pub struct Arena {
-    chunks: Vec<Vec<u8>>,
+    // Chunk capacity is raw backing storage, not an initialized byte slice. Individual allocation
+    // classes decide whether the requested range must be zeroed; spare capacity is never exposed.
+    chunks: Vec<ArenaChunk>,
     /// Byte offset into the last chunk.
     off: usize,
     /// `mmap` views registered by `fs.read_file_view` — `(addr, len)` pairs `munmap`ped in bulk when
@@ -7450,7 +7475,7 @@ impl Arena {
 const CHUNK: usize = 64 * 1024;
 
 impl Arena {
-    fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+    fn alloc_class(&mut self, size: usize, align: usize, zeroed: bool) -> *mut u8 {
         // The bit-trick below requires a power-of-two alignment; normalize so a future
         // ABI passing odd alignments stays correct.
         let align = align.max(1).next_power_of_two();
@@ -7480,18 +7505,48 @@ impl Arena {
         if let Some(chunk) = self.chunks.last_mut() {
             let off = aligned_off(chunk.as_ptr() as usize, self.off);
             if off + need <= chunk.len() {
+                let zero_spare = chunk.spare_is_zeroed();
                 let ptr = unsafe { chunk.as_mut_ptr().add(off) };
                 self.off = off + need;
+                if zeroed && !zero_spare {
+                    unsafe { core::ptr::write_bytes(ptr, 0, size) };
+                }
                 return ptr;
             }
         }
         // A fresh chunk: size it so an aligned `need` always fits (+align worst case).
-        self.chunks.push(vec![0u8; CHUNK.max(need + align)]);
+        let Some(cap) = need.checked_add(align) else {
+            align_rt_alloc_size_fail();
+        };
+        let cap = CHUNK.max(cap);
+        let chunk = if zeroed {
+            // Preserve the platform allocator's lazy-zero/calloc behavior for a fresh large
+            // conservative allocation. An explicit exact-range memset here would fault every page.
+            ArenaChunk::Zeroed(vec![0u8; cap])
+        } else {
+            let mut data = Vec::<core::mem::MaybeUninit<u8>>::with_capacity(cap);
+            // `MaybeUninit<u8>` has no initialization invariant, so publishing this logical length
+            // is sound and performs no blanket memset of the fresh chunk.
+            unsafe { data.set_len(cap) };
+            ArenaChunk::Uninit(data)
+        };
+        self.chunks.push(chunk);
         let chunk = self.chunks.last_mut().unwrap();
         let off = aligned_off(chunk.as_ptr() as usize, 0);
         let ptr = unsafe { chunk.as_mut_ptr().add(off) };
         self.off = off + need;
         ptr
+    }
+
+    /// Allocate raw arena storage. The caller must initialize every byte it can later observe.
+    fn alloc_uninit(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.alloc_class(size, align, false)
+    }
+
+    /// Conservative allocation class: initialize exactly the requested range, never the chunk's
+    /// untouched spare capacity.
+    fn alloc_zeroed(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.alloc_class(size, align, true)
     }
 }
 
@@ -7523,7 +7578,9 @@ pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, alig
         return core::ptr::null_mut();
     };
     let arena = unsafe { &mut *arena };
-    arena.alloc(size, align)
+    // The public/generated ABI remains conservative until MIR initialization facts select an
+    // explicit uninitialized call. Runtime-internal proven overwrite/copy sites use `alloc_uninit`.
+    arena.alloc_zeroed(size, align)
 }
 
 /// Bulk-release every allocation, keeping the arena for reuse.
@@ -7596,7 +7653,9 @@ pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align:
     }
     let Ok(size_u) = safe_len(size) else { return core::ptr::null_mut() };
     let Ok(align_u) = safe_len(align) else { return core::ptr::null_mut() };
-    unsafe { &mut *tg }.arena.alloc(size_u, align_u)
+    // Capture/result/error records have evolving aggregate/drop layouts; keep them conservative
+    // until MIR initialization facts prove every semantically visited byte is written first.
+    unsafe { &mut *tg }.arena.alloc_zeroed(size_u, align_u)
 }
 
 /// Register a deferred task (its trampoline + closure pointer + env + result slot).
@@ -14705,6 +14764,136 @@ mod tests {
         }
         assert_eq!(unsafe { &*a }.chunks.len(), 1, "zero-size allocations after a real one still add no chunks");
         unsafe { align_rt_arena_end(a) };
+    }
+
+    #[test]
+    fn arena_allocation_classes_initialize_only_by_contract() {
+        let a = align_rt_arena_begin();
+        let arena = unsafe { &mut *a };
+
+        // The uninitialized class is observable only after its caller has initialized every byte.
+        let raw = arena.alloc_uninit(48, 16);
+        assert_eq!((raw as usize) % 16, 0);
+        unsafe { core::ptr::write_bytes(raw, 0xa5, 48) };
+        assert!(unsafe { std::slice::from_raw_parts(raw, 48) }.iter().all(|&b| b == 0xa5));
+
+        // The conservative class initializes exactly its published range before returning.
+        let zero = arena.alloc_zeroed(19, 8);
+        assert_eq!((zero as usize) % 8, 0);
+        assert!(unsafe { std::slice::from_raw_parts(zero, 19) }.iter().all(|&b| b == 0));
+
+        unsafe { align_rt_arena_end(a) };
+    }
+
+    /// Allocation-inclusive adoption probe for replacing a blanket-zeroed fresh chunk with raw
+    /// backing plus per-allocation initialization classes. `overwrite` models final-copy/fill sites;
+    /// `zeroed` pins the conservative ABI. Run with:
+    ///
+    /// `cargo test -p align_runtime --release arena_initialization_class_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn arena_initialization_class_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        fn old_blanket(size: usize, overwrite: bool) -> u64 {
+            // Recreate the old Arena shape, including its outer chunk-list allocation.
+            let mut chunks = Vec::with_capacity(1);
+            chunks.extend([vec![0u8; CHUNK.max(size + 16)]]);
+            let chunk = chunks.last_mut().unwrap();
+            let base = chunk.as_mut_ptr() as usize;
+            let off = ((base + 15) & !15) - base;
+            let ptr = unsafe { chunk.as_mut_ptr().add(off) };
+            if overwrite {
+                unsafe { core::ptr::write_bytes(ptr, 0xa5, size) };
+            }
+            black_box(unsafe { *ptr as u64 ^ *ptr.add(size - 1) as u64 })
+        }
+
+        #[inline(never)]
+        fn split_class(size: usize, overwrite: bool) -> u64 {
+            let mut arena = Arena { chunks: Vec::new(), off: 0, maps: Vec::new() };
+            let ptr = if overwrite { arena.alloc_uninit(size, 16) } else { arena.alloc_zeroed(size, 16) };
+            if overwrite {
+                unsafe { core::ptr::write_bytes(ptr, 0xa5, size) };
+            }
+            black_box(unsafe { *ptr as u64 ^ *ptr.add(size - 1) as u64 })
+        }
+
+        fn time(path: fn(usize, bool) -> u64, size: usize, overwrite: bool, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(path)(black_box(size), black_box(overwrite));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        println!("arena initialization classes (median of 9, allocation-inclusive ns/op):");
+        println!(" class     | bytes    | blanket zero | split class  | blanket/split");
+        for overwrite in [true, false] {
+            for size in [1usize, 8, 48, 1024, 2560, 64 << 10, 1 << 20, 64 << 20] {
+                let iters = match size {
+                    0..=48 => 100_000,
+                    49..=2560 => 20_000,
+                    2561..=1_048_576 => 50,
+                    _ => 3,
+                };
+                let mut old = Vec::with_capacity(9);
+                let mut split = Vec::with_capacity(9);
+                for trial in 0..9 {
+                    if trial % 2 == 0 {
+                        old.push(time(old_blanket, size, overwrite, iters));
+                        split.push(time(split_class, size, overwrite, iters));
+                    } else {
+                        split.push(time(split_class, size, overwrite, iters));
+                        old.push(time(old_blanket, size, overwrite, iters));
+                    }
+                }
+                assert_eq!(old_blanket(size, overwrite), split_class(size, overwrite));
+                let old = median(old);
+                let split = median(split);
+                println!(
+                    "{:9} | {size:8} | {old:12.2} | {split:12.2} | {:13.2}x",
+                    if overwrite { "overwrite" } else { "zeroed" },
+                    old / split
+                );
+            }
+        }
+
+        println!("task-shaped conservative zero p99 (median of 9 x 100 balanced batches, ns/op):");
+        println!(" bytes | blanket p99 | split p99 | blanket/split");
+        for size in [48usize, 1024, 64 << 10] {
+            let batch_iters = if size <= 1024 { 500 } else { 50 };
+            let mut old_panels = Vec::with_capacity(9);
+            let mut split_panels = Vec::with_capacity(9);
+            for panel in 0..9 {
+                let mut old = Vec::with_capacity(100);
+                let mut split = Vec::with_capacity(100);
+                for trial in 0..100 {
+                    if (panel + trial) % 2 == 0 {
+                        old.push(time(old_blanket, size, false, batch_iters));
+                        split.push(time(split_class, size, false, batch_iters));
+                    } else {
+                        split.push(time(split_class, size, false, batch_iters));
+                        old.push(time(old_blanket, size, false, batch_iters));
+                    }
+                }
+                old.sort_by(f64::total_cmp);
+                split.sort_by(f64::total_cmp);
+                old_panels.push(old[98]);
+                split_panels.push(split[98]);
+            }
+            let (old, split) = (median(old_panels), median(split_panels));
+            println!("{size:6} | {old:11.2} | {split:9.2} | {:13.2}x", old / split);
+        }
     }
 
     #[test]
