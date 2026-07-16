@@ -2653,6 +2653,12 @@ every valid finding addressed. Disposition:
   8. **I/O buffer zero-fill** (`Vec::resize(64KiB, 0)` before `read` overwrite, runtime ~4558/
      ~4995). Adopt `spare_capacity_mut`+`set_len` — but correctness tests (short read/EINTR/
      EOF) FIRST; throughput-only.
+     **DONE for reader/lookahead/`io.copy` (2026-07-16):** the direct reader and buffered lookahead
+     now read into reserved `MaybeUninit` spare capacity and publish exactly the successful prefix;
+     the portable `io.copy` loop inherits the same path, including lookahead-first semantics. EOF
+     leaves logical length zero and EINTR retries before publication. The allocation-inclusive fresh
+     64 KiB-window probe improved 0/1/4 KiB/full-prefix cases by 20.92x/20.83x/11.49x/1.98x. UDP
+     receive and positional `pread` remain the separately audited extension.
 - **Hardening (adopt):**
   9. **attribute kind-ID fail-loud** — `add_enum_attr` doesn't check
      `get_named_enum_kind_id() == 0` (silent no-op on a renamed/typo'd attr); make it a codegen

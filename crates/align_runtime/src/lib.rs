@@ -4865,18 +4865,30 @@ impl Reader {
         Reader { fd, owns_fd, buffered: false, buf: Vec::new(), start: 0, filled: 0 }
     }
 
+    /// Ensure the lookahead has raw backing for one refill without logically initializing its
+    /// unwritten tail. Allocation failure retains the existing abort-on-OOM behavior of `resize`.
+    fn reserve_lookahead(&mut self) {
+        if self.buf.capacity() < READ_LINE_CHUNK {
+            self.buf.reserve_exact(READ_LINE_CHUNK.saturating_sub(self.buf.len()));
+        }
+    }
+
     /// Refill the (fully consumed) lookahead from the fd, retrying `EINTR`. Returns the number of
     /// bytes read (`0` = EOF) on success, or the mapped errno-status on error. Only called when the
     /// lookahead is empty (`start == filled`), so no unconsumed bytes are lost.
     fn refill(&mut self) -> Result<usize, i32> {
         self.start = 0;
         self.filled = 0;
-        if self.buf.len() != READ_LINE_CHUNK {
-            self.buf.resize(READ_LINE_CHUNK, 0);
-        }
+        self.buf.clear();
+        self.reserve_lookahead();
         loop {
-            let n = unsafe { read(self.fd, self.buf.as_mut_ptr() as *mut core::ffi::c_void, READ_LINE_CHUNK) };
+            // `read` may initialize only a short prefix. Keep the rest as `MaybeUninit` spare
+            // capacity and publish exactly the successful byte count below.
+            let dst = self.buf.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            let n = unsafe { read(self.fd, dst as *mut core::ffi::c_void, READ_LINE_CHUNK) };
             if n >= 0 {
+                // `read` initialized exactly `n <= READ_LINE_CHUNK <= capacity` bytes at `dst`.
+                unsafe { self.buf.set_len(n as usize) };
                 self.filled = n as usize;
                 return Ok(n as usize);
             }
@@ -4953,21 +4965,23 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
     // to before (an unbuffered reader has an empty lookahead, so this is skipped).
     if r.buffered && r.start < r.filled {
         let n = (r.filled - r.start).min(b.cap);
-        if b.data.len() < n {
-            b.data.resize(n, 0);
-        }
-        b.data[..n].copy_from_slice(&r.buf[r.start..r.start + n]);
+        b.data.clear();
+        b.data.extend_from_slice(&r.buf[r.start..r.start + n]);
         b.len = n;
         r.start += n;
         return n as i64;
     }
-    // Ensure the backing storage spans the full capacity (read fills up to `cap`).
-    if b.data.len() != b.cap {
-        b.data.resize(b.cap, 0);
-    }
+    // `buffer(cap)` reserves this whole window. Clear only the logical length: the syscall writes
+    // into `MaybeUninit` spare capacity, so a short read never creates an initialized slice over
+    // the untouched tail.
+    b.data.clear();
+    debug_assert!(b.data.capacity() >= b.cap);
     loop {
-        let n = unsafe { read(r.fd, b.data.as_mut_ptr() as *mut core::ffi::c_void, b.cap) };
+        let dst = b.data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+        let n = unsafe { read(r.fd, dst as *mut core::ffi::c_void, b.cap) };
         if n >= 0 {
+            // `read` initialized exactly `n <= cap <= capacity` bytes at `dst`.
+            unsafe { b.data.set_len(n as usize) };
             b.len = n as usize;
             return n as i64;
         }
@@ -4995,7 +5009,7 @@ pub unsafe extern "C" fn align_rt_io_reader_buffered(r: *mut Reader) -> *mut Rea
     let rr = unsafe { &mut *r };
     rr.buffered = true;
     if rr.buf.is_empty() {
-        rr.buf.resize(READ_LINE_CHUNK, 0);
+        rr.reserve_lookahead();
         rr.start = 0;
         rr.filled = 0;
     }
@@ -5027,7 +5041,7 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
     if !r.buffered || r.buf.is_empty() {
         r.buffered = true;
         if r.buf.is_empty() {
-            r.buf.resize(READ_LINE_CHUNK, 0);
+            r.reserve_lookahead();
             r.start = 0;
             r.filled = 0;
         }
@@ -12778,7 +12792,10 @@ mod tests {
         assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"hel");
         // Second read: "lo". Third: EOF.
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 2);
+        assert_eq!(unsafe { &*b }.data.len(), 2, "only the initialized short-read prefix is published");
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0);
+        assert_eq!(unsafe { &*b }.data.len(), 0, "EOF publishes no initialized bytes");
+        assert_eq!(unsafe { &*b }.data.capacity(), 3, "the caller's read window is retained");
 
         unsafe { align_rt_buffer_free(b) };
         unsafe { align_rt_io_reader_free(r) };
@@ -13597,6 +13614,78 @@ mod tests {
     #[test]
     fn io_copy_null_handles_are_invalid_not_a_crash() {
         assert_eq!(unsafe { align_rt_io_copy(std::ptr::null_mut(), std::ptr::null_mut()) }, -(AL_INVALID as i64));
+    }
+
+    /// Allocation-inclusive model of the first read into a fresh 64 KiB buffer. The simulated
+    /// kernel write initializes exactly the returned prefix; the old control first publishes and
+    /// zeroes the full capacity. Run with:
+    ///
+    /// `cargo test -p align_runtime --release io_read_uninitialized_window_probe -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn io_read_uninitialized_window_probe() {
+        use std::hint::black_box;
+
+        #[inline(never)]
+        #[allow(clippy::slow_vector_initialization)] // exact pre-change reader control
+        fn old_zeroed(cap: usize, n: usize) -> u64 {
+            let mut data = Vec::<u8>::with_capacity(cap);
+            data.resize(cap, 0);
+            black_box(data.as_mut_ptr());
+            unsafe { core::ptr::write_bytes(data.as_mut_ptr(), 0xa5, n) };
+            let checksum = if n == 0 { 0 } else { data[0] as u64 ^ data[n - 1] as u64 };
+            black_box(checksum)
+        }
+
+        #[inline(never)]
+        fn uninit_window(cap: usize, n: usize) -> u64 {
+            let mut data = Vec::<u8>::with_capacity(cap);
+            let dst = data.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            black_box(dst);
+            unsafe {
+                core::ptr::write_bytes(dst, 0xa5, n);
+                data.set_len(n);
+            }
+            let checksum = if n == 0 { 0 } else { data[0] as u64 ^ data[n - 1] as u64 };
+            black_box(checksum)
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        fn time(path: fn(usize, usize) -> u64, cap: usize, n: usize, iters: usize) -> f64 {
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                checksum ^= black_box(path)(black_box(cap), black_box(n));
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        const CAP: usize = 64 * 1024;
+        println!("fresh 64 KiB read window (median of 9, allocation-inclusive ns/op):");
+        println!(" bytes read | zero full cap | uninit tail | zero/uninit");
+        for n in [0usize, 1, 4096, CAP] {
+            let iters = if n <= 1 { 20_000 } else { 2_000 };
+            let mut old = Vec::with_capacity(9);
+            let mut uninit = Vec::with_capacity(9);
+            for trial in 0..9 {
+                if trial % 2 == 0 {
+                    old.push(time(old_zeroed, CAP, n, iters));
+                    uninit.push(time(uninit_window, CAP, n, iters));
+                } else {
+                    uninit.push(time(uninit_window, CAP, n, iters));
+                    old.push(time(old_zeroed, CAP, n, iters));
+                }
+            }
+            assert_eq!(old_zeroed(CAP, n), uninit_window(CAP, n));
+            let (old, uninit) = (median(old), median(uninit));
+            println!("{n:11} | {old:13.2} | {uninit:11.2} | {:11.2}x", old / uninit);
+        }
     }
 
     #[test]

@@ -8,7 +8,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-16 (eleventh update this day), **ARENA INITIALIZATION CLASSES PRESERVE BOTH
+_Last updated: 2026-07-16 (twelfth update this day), **READER AND `io.copy` NO LONGER ZERO UNWRITTEN
+TAILS.** Buffered-reader refill and direct `reader.read` now reserve raw Vec capacity, pass only its
+`MaybeUninit` spare-capacity pointer to `read(2)`, and publish exactly the successful byte count.
+Short reads expose only their initialized prefix, EOF exposes zero bytes, and EINTR retries before
+publication. Lookahead is still drained before fd-fresh data, so the portable `io.copy` oracle keeps
+the buffered-reader correctness fix while inheriting the zero-fill removal. The allocation-inclusive
+fresh 64 KiB-window probe improved 0/1/4 KiB/full-prefix cases by 20.92x/20.83x/11.49x/1.98x. This
+work is green across the complete workspace (**2191 total = 2183 passed + eight ignored manual
+probes**) and workspace clippy passes with warnings denied. It is on branch
+**`agent/io-read-uninit`**, based on squash-merged PR #483 (`51fbb4b`). **Next
+recommended after this PR:** extend the same initialized-prefix discipline to the separately audited
+UDP receive and positional `pread` paths, preserving datagram truncation, short-read, offset, EINTR,
+and EOF gates. The aarch64 UTF-8 portability measurement remains deferred. Previous update:
+2026-07-16 (eleventh update this day), **ARENA INITIALIZATION CLASSES PRESERVE BOTH
 RAW SPEED AND LAZY ZEROING.** Arena chunks now carry either raw `MaybeUninit<u8>` backing or
 conservative `Vec<u8>` backing; no initialized Rust byte slice covers raw capacity. Fresh raw chunks
 skip the old 64 KiB blanket zero, fresh conservative chunks retain platform lazy/calloc zero pages,
@@ -20,9 +33,9 @@ builder finish, and strict SoA decode use raw storage. The balanced probe improv
 panel stayed within 5%. An intermediate exact-memset design was rejected because it destroyed lazy
 zeroing on fresh 64 MiB conservative chunks. The complete workspace is green (**2190 total = 2183
 passed + seven ignored manual probes**) and workspace clippy passes with warnings denied. This work
-is on branch **`agent/arena-init-classes`**,
-based on squash-merged PR #482 (`2402149`). **Next recommended after this PR:** apply the same
-initialized-write discipline to the roadmap's reader/`io.copy` zero-fill removal, with short-read,
+was squash-merged as PR **#483** (`51fbb4b`), based on squash-merged PR #482 (`2402149`). **Next
+recommended after this PR:** apply the same initialized-write discipline to the roadmap's
+reader/`io.copy` zero-fill removal, with short-read,
 EINTR, EOF, and lookahead correctness gates first. The aarch64 UTF-8 portability measurement remains
 deferred. Previous update: 2026-07-16 (tenth update this day), **BASE64/BASE64URL/HEX FILL ONE EXACT FINAL
 PAYLOAD.** All three scalar encoders now compute checked group/tail output lengths, allocate only the
