@@ -2305,6 +2305,57 @@ run right after the LLVM 22 upgrade landed (#425). Three findings changed the sh
   NOT benefit (their loops live inside the runtime; inlining is pure bloat). Expected shape of
   the win: scalar constant-factor (call overhead + fast-path exposure), NOT vectorization.
 
+**ThinLTO design SETTLED (2026-07-16, two-lens review: soundness/cache-key + mechanics/driver;
+S0 spike GO the same day). This paragraph is the S1/S2/SV implementation source of truth.**
+M15 shipped, so the 2026-07-12 "MOOT" verdict above is lifted; ThinLTO is the wave head again.
+Settled decisions: **(a) mechanism = a 3-entry C++ shim** (`align_codegen_llvm/cpp/thinlto_shim.cpp`,
+~300 LoC, `cc`-built by the crate's `build.rs` against the same LLVM 22 with a loud
+`llvm-config-22` major assert): (1) pre-link — `buildThinLTOPreLinkDefaultPipeline` +
+`buildModuleSummaryIndex` + `WriteBitcodeToFile(EmitSummaryIndex)` → summary-bearing per-unit
+bitcode; (2) thin-link — `readModuleSummaryIndex` combine + `computeDeadSymbolsWithConstProp` +
+`ComputeCrossModuleImport` → per-unit import lists `(src module, GUID, kind)`; (3) backend —
+`FunctionImporter::importFunctions` + `buildThinLTODefaultPipeline` + object emission. A shim is
+the ideal form, not a workaround: llvm-sys 221 structurally cannot emit module summaries
+(`bit_writer.rs` has no `EmitSummaryIndex`) nor drive `FunctionImporter` (zero C surface), and
+the legacy `ThinLTOCodeGenerator` C API it does expose SIGSEGVs on summary-less bitcode (S0
+fork-probe evidence), hides per-unit import lists, and runs its own thread pool + cache —
+incompatible with cache-first identity. **(b) Backend cache key = the PRECISE digest**: own
+prelink-bc digest ⊕ inbound import list ⊕ the prelink-bc digests of import-source units. Sound
+because thin-link always runs (measured ~70 µs at spike scale — the one cheap serial global
+step) and computes fresh import lists; a dep private-body edit therefore misses exactly the
+importing units' backends, preserving the M15 headline win where ThinLTO permits it. Determinism
+pinned by canonical sorted ingestion (import decisions verified order-independent after edge
+sort) + a build-twice byte-identity gate. **(c) Flag = opt-in `--thin-lto`**, legal only on
+`release`/`fast` (the `--rt-lto` precedent), never folded into a profile in v1. **(d) N=1 skips
+all three phases** → byte-identical to today; the flag-off path stays byte-identical.
+**(e) Preserve set fail-closed in v1** = {`main`} ∪ `--export` ∪ all `pub` fns; cross-unit `pub`
+internalization is a deferred follow-up win. **(f) `--rt-lto` composes**: its merge keeps the
+pre-opt placement inside phase 1 and the attr-xor shed rule holds for merged bodies.
+**(g) Artifact**: the CAS gains a `prelink-bitcode` part-kind at S2; thin-link output is NOT
+cached in v1; no `InterfaceSummary` format change in this arc; `CACHE_KEY_FORMAT_VERSION` bumps
+at S2 so old empty-digest entries fall out cleanly. **(h) Non-goals**: no full-LTO-over-N (at
+most a measured stopgap, never the design), no linker-plugin LTO, `explain-opt` and
+`emit-llvm --stage` stay per-unit-in-isolation (the honest zero-cross-unit-opt truth), no
+profile-guided import thresholds (PGO territory, sequenced after). **S0 spike GO record
+(2026-07-16, `thinlto-spike` feature, 6 ignored tests):** summary emission, per-unit import
+lists, and cross-module inlining all proven in-process (the imported callee's relocation
+disappears from the caller's object); the `cc`-built shim links cleanly against prefer-dynamic
+`libLLVM-22.so` and coexists with llvm-sys in one process; inkwell `LLVMModuleRef` crosses the
+FFI and `llvm::unwrap` recovers `Module*`. LLVM-22 frictions recorded: `GlobalValue::getGUID` →
+`getGUIDAssumingExternalLinkage`; the `thinlto_*` C API lives in `libLTO.so` (only the rejected
+minimal variant needs it); the combined index keys modules by MemoryBuffer identifier (S1 must
+pass stable chosen ids); ThinLTO requires an explicit datalayout on inkwell-built modules.
+Timing at spike scale: prelink ≈ 690 µs ×2, thin-link ≈ 70 µs, backend ≈ 2.2 ms. S1 shim
+final form: thread the serialized import list into entry 3 instead of recomputing (the spike
+shortcut), real `isPrevailing`/preserve policy from driver symbol visibility, and the driver's
+own `TargetMachine`/cpu/features. **Slice plan: S1** = serial correctness behind `--thin-lto`
+(gates: a cross-unit `pub` call inlined — IR-shape mutation-checked both directions; the M13
+Slice-5 wide-tuple `sret` positive; N=1 byte-identity; multi-file run-parity corpus;
+`--export`/preserve survival). **S2** = cache composition + parallelism (digest population, the
+part-kind, `FirstDiff` phase split, invalidation-matrix rows, parallel == `-j 1` byte-identity).
+**SV** = build-twice determinism, cold-vs-hit byte-identity through both phases, a
+stale-summary fail-closed mutation, and an explicit compile-time regression bound.
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,

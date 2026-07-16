@@ -20,7 +20,9 @@ dependencies = [
  "align_mir",
  "align_parser",
  "align_sema",
+ "cc",
  "inkwell",
+ "libc",
  "llvm-sys",
 ]
 

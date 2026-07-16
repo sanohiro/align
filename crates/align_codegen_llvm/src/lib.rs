@@ -11,6 +11,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// ThinLTO S0 feasibility spike (feature-gated; not wired into the driver).
+#[cfg(feature = "thinlto-spike")]
+pub mod thinlto_spike;
+
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};

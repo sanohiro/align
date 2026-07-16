@@ -16,6 +16,17 @@ inkwell = { version = "0.9", features = ["llvm22-1"] }
 # build is now possible — but we keep dynamic linking: it is smaller to link, matches the
 # rustc-side toolchain, and avoids re-litigating the archive set. See .cargo/config.toml.
 llvm-sys = { version = "221", features = ["prefer-dynamic"] }
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+cc = "1"
+
+[features]
+# ThinLTO S0 feasibility spike. OFF by default: enabling it makes build.rs
+# compile the C++ shim (cpp/thinlto_shim.cpp), which requires the LLVM 22 C++
+# headers (llvm-22-dev, already a workspace prerequisite) and llvm-config-22 on
+# PATH. Normal builds are unaffected.
+thinlto-spike = ["dep:libc"]
 
 [dev-dependencies]
 align_diag = { path = "../align_diag" }
