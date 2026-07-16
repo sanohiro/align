@@ -2356,6 +2356,25 @@ part-kind, `FirstDiff` phase split, invalidation-matrix rows, parallel == `-j 1`
 **SV** = build-twice determinism, cold-vs-hit byte-identity through both phases, a
 stale-summary fail-closed mutation, and an explicit compile-time regression bound.
 
+**ThinLTO S1 SHIPPED (2026-07-16): serial cross-unit optimization behind `--thin-lto`.** The shim
+is now a production component compiled into every `alignc` (libLTO stays spike-only); the driver
+runs the three phases serially over private staging, `--thin-lto` is legal only on `release`/`fast`
++ `build`/`run`/`size` (loud rejection elsewhere), N=1 skips all phases (byte-identical, gated),
+any shim failure aborts loudly naming phase+unit (no silent fallback), and the object cache is
+BYPASSED under the flag until S2 integrates the precise digest. One recorded deviation from the
+settled shim shape, correctness-forced: entry 2 reports imports AND exports, and entry 3 threads
+both plus `thinLTOInternalizeAndPromoteInIndex` + an explicit `renameModuleForThinLTO` — importing
+a fn that references its unit's private local (e.g. a string constant) requires consistent
+promotion on both sides, and a leaf unit that imports nothing still must promote its own exports
+(the `undefined str.llvm.<hash>` link failure and the reparse-identifier SIGSEGV are both pinned
+by the diagnosis: bitcode reverts a module's identifier to the source filename, so the loader
+restamps the stable unit id). Still zero thin-link recompute in backends. Gates green: cross-unit
+inline mutation-checked both directions (nm/relocation), the M13 wide-tuple sret positive at 4/8
+i64, N=1 byte-identity, run-parity corpus vs whole-program, `--export`/pub preserve survival,
+profile/verb rejection, flag-off byte-determinism, and an extra build-twice determinism pin
+(de-risks SV). Compile-time cost at corpus scale: milliseconds (prelink ~0.7 ms/unit, thin-link
+~0.1 ms, backend 2-6 ms/unit). Next: S2 per the settled slice plan.
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,
