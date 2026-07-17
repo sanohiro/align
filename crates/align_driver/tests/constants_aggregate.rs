@@ -393,7 +393,7 @@ fn the_read_only_write_diagnostic_names_the_fix() {
         "agg-write-msg",
         "TABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  s[0] = 9\n  return 0\n}\n",
     );
-    assert!(d.contains("read-only view of a constant table") && d.contains("copy it into an owned array"), "got:\n{d}");
+    assert!(d.contains("read-only view (e.g., a constant table or mmap view)") && d.contains("copy it into an owned array"), "got:\n{d}");
 }
 
 #[test]
@@ -562,7 +562,7 @@ fn a_shuffle_of_a_constant_view_is_rejected() {
         "agg-shuffle",
         "import std.rand\nTABLE := [1, 2, 3, 4]\nfn main() -> i32 {\n  mut r := rand.seed_with(1)\n  mut s := TABLE\n  r.shuffle(s)\n  return 0\n}\n",
     );
-    assert!(d.contains("read-only view of a constant table"), "got:\n{d}");
+    assert!(d.contains("read-only view (e.g., a constant table or mmap view)"), "got:\n{d}");
 }
 
 #[test]
