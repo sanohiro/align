@@ -159,9 +159,11 @@ const GEN: &str = "fn gen(n: i64) -> array<i64> {\n\
     \x20 return b.build()\n\
     }\n";
 
-/// Compile+run `src` once; the default (donation ON) and toggle-off builds must print the same.
-/// The toggle-off path is exercised by the in-process MIR test above and the bench; here both runs
-/// use the shipped default, and the differential is against a hand-written reference in the source.
+/// Compile+run `src` once under the shipped default (donation ON); the differential is against a
+/// hand-written reference in the source. The donation-on-vs-off EXECUTION differential (including
+/// bound and escaping donated results) is `donation_on_and_off_execute_identically` below, which
+/// drives `alignc run` subprocesses so the child env carries the toggle without racing this
+/// process.
 fn run_prog(name: &str, body: &str) -> String {
     let src = format!(
         "{GEN}fn add(a: i64, b: i64) -> i64 = a + b\nfn dbl(x: i64) -> i64 = x * 2\n\
@@ -197,5 +199,56 @@ fn donation_execution_matches_reference() {
         ),
         // 4*(1..=500) summed = 4 * 500*501/2 = 501_000 (all already even).
         "501000"
+    );
+}
+
+/// Donation-on vs donation-off EXECUTION differential, including a bound donated result and an
+/// escaping (returned) donated result. Two `alignc run` subprocesses per program: the shipped
+/// default and `ALIGN_BUFFER_DONATE=off` in the CHILD env (never this process's), cache off in
+/// both so the toggle's cache guard is not load-bearing here. Identical stdout is the contract —
+/// donation must be observationally invisible.
+#[test]
+fn donation_on_and_off_execute_identically() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{GEN}fn dbl(x: i64) -> i64 = x * 2\nfn even(x: i64) -> bool = x % 2 == 0\n\
+         fn add(a: i64, b: i64) -> i64 = a + b\n\
+         fn escape() -> array<i64> = gen(1000).where(even).map(dbl).to_array()\n\
+         fn main() -> Result<(), Error> {{\n\
+         \x20 ys := gen(1000).map(dbl).to_array()\n\
+         \x20 print(ys.sum())\n\
+         \x20 print(ys[999])\n\
+         \x20 zs := escape()\n\
+         \x20 print(zs.sum())\n\
+         \x20 print(zs[0])\n\
+         \x20 ws := gen(100).scan(0, add).to_array()\n\
+         \x20 print(ws.sum())\n\
+         \x20 return Ok(())\n}}\n"
+    );
+    let dir = std::env::temp_dir().join(format!("align_donate_exec_ab_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("ab.align");
+    std::fs::write(&path, &src).expect("write source");
+    let run = |off: bool| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
+        cmd.arg("run").arg(&path).env("ALIGNC_CACHE", "off").current_dir(&dir);
+        if off {
+            cmd.env("ALIGN_BUFFER_DONATE", "off");
+        }
+        let out = cmd.output().expect("spawn alignc run");
+        assert!(out.status.success(), "run(off={off}) failed: {}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    };
+    let on = run(false);
+    let off = run(true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(on, off, "donation must be observationally invisible");
+    // And the outputs are the hand-computed reference, not merely mutually wrong.
+    assert_eq!(
+        String::from_utf8_lossy(&on),
+        "1001000\n2000\n501000\n4\n171700\n",
+        "bound + escaping donated results must match the reference values"
     );
 }
