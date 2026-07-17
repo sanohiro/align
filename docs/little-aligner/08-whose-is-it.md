@@ -95,7 +95,7 @@ print(shout("align"))
 
 **Q12.** If I create 10,000 temporary strings in a loop and free them one by one, what is the cost?
 
-**A12.** In other languages, 10,000 trips to the OS allocator, 10,000 thread locks, and 10,000 cache misses to track memory metadata. In an `arena`, 10,000 strings cost exactly one pointer addition each. You bypass the OS completely. The arena is not just about cleanup; it is about *blinding allocation speed*.
+**A12.** In other languages, 10,000 round-trips through a general-purpose allocator, each with its locks and bookkeeping. In an `arena`, 10,000 strings cost one pointer bump each. The arena is not just about cleanup; it is about *blinding allocation speed*.
 
 ---
 

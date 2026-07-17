@@ -26,6 +26,6 @@
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`、`agg`、`dict_encode`
 11. [Do It Until](11-do-it-until.md) — `loop` 式、pipeline で言い表せないとき
 12. [Four at a Time](12-four-at-a-time.md) — 明示的 SIMD、ベクトル、マスク
-13. [The Big Crunch](13-the-big-crunch.md) — mmap、アロケーションゼロのパイプライン、そしてすべてを統合する
+13. [The Big Crunch](13-the-big-crunch.md) — mmap、ゼロコピーのパイプライン、そしてすべてを統合する
 
 ここにあるものはすべて、いまの `alignc` で動きます。それでは、始めましょう。

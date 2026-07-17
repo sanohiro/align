@@ -15,36 +15,41 @@ You have a `Player` class that holds its own `health`, `x`, `y`, and an `update(
 Data and behavior are separate. Furthermore, an individual `Player` is rarely the right unit of abstraction. You do not update *a* player; you update *the* positions.
 
 ```align
-// Instead of Player { health, x, y }
+Player { x: f64, velocity_x: f64, health: i64 }
+
+// Instead of updating Player objects one by one:
 arena {
-    players: soa<Player> = load_players()
-    
-    // Update all positions in one bulk, cache-friendly pass
-    players.x.zip(players.velocity_x).map(fn (x, v) { x + v }).to_array()
+    rows := [
+        Player { x: 0.0, velocity_x: 1.0, health: 100 },
+        Player { x: 5.0, velocity_x: -1.0, health: 80 },
+    ]
+    players := rows.to_soa()
+
+    // Compute every next position in one bulk, cache-friendly pass
+    xs := players.x
+    vxs := players.velocity_x
+    next_x := zip(xs, vxs).map(fn v { v.0 + v.1 }).to_array()
 }
 ```
 
 ## 2. The "Polymorphic List" Anti-Pattern
 
 **The OOP Way:** 
-A list of `Shape` interfaces, containing `Circle`, `Rectangle`, and `Triangle` objects. You loop over them and call `shape.draw()`. This causes virtual method dispatch (cache misses) on every iteration.
+A list of `Shape` interfaces, containing `Circle`, `Rectangle`, and `Triangle` objects. You loop over them and call `shape.area()`. This causes virtual method dispatch (cache misses) on every iteration.
 
 **The Align Way:**
-Use sum types (`enum`) if the collection is small and mixed, or separate arrays if processing speed is paramount.
+Use a sum type if the collection is small and mixed, or separate arrays if processing speed is paramount.
 
 If you must mix them:
 ```align
-enum Shape {
-    Circle { radius: f32 },
-    Rect { w: f32, h: f32 },
-}
+Shape { Circle(f64), Rect(f64, f64) }
 
-shapes.map(fn s {
+areas := shapes.map(fn s {
     match s {
-        Circle { radius } => draw_circle(radius),
-        Rect { w, h } => draw_rect(w, h),
+        Circle(r) => 3.14159 * r * r,
+        Rect(w, h) => w * h,
     }
-})
+}).to_array()
 ```
 However, the true data-oriented approach is to store all Circles in one `soa<Circle>` and all Rects in a `soa<Rect>`, and process them in two separate, blazing-fast pipelines with no branching at all.
 
@@ -54,13 +59,12 @@ However, the true data-oriented approach is to store all Circles in one `soa<Cir
 You append to a list inside a loop. The list resizes itself automatically, allocating heap memory unpredictably. 
 
 **The Align Way:**
-Align has `heap.alloc`, but its idiomatic use is rare. If you need dynamic memory, you use an `arena`. When the arena block ends, all memory is freed instantly. You never `new` or `delete` individual objects inside a hot loop. 
+Align has `heap.new`, but its idiomatic use is rare. If you need dynamic memory, you use an `arena`. When the arena block ends, all memory is freed instantly. You never `new` or `delete` individual objects inside a hot loop. And you never grow a collection by side effect — the pipeline itself accumulates, with exactly one visible allocation at the end:
 
 ```align
 arena {
-    // Accumulate results into the arena without individual frees
-    mut results := []
-    lines.where(.is_error).map(fn l { results.push(l.msg) })
+    // One visible allocation, at the end of the pipeline — no hidden growth
+    spikes := readings.where(fn r { r > threshold }).to_array()
 } // Boom. Gone.
 ```
 

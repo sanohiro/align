@@ -60,9 +60,9 @@ Shape { Circle(i64), Rect(i64, i64), Dot }
 
 ---
 
-**Q8.** In other languages, I would use class inheritance and a virtual `draw()` method to handle different shapes. Why does Align use `enum` and `match`?
+**Q8.** In other languages, I would use class inheritance and a virtual `draw()` method to handle different shapes. Why does Align use sum types and `match`?
 
-**A8.** Inheritance scatters the logic across many files, and dynamic dispatch (virtual methods) hides what code actually runs from the CPU's branch predictor, destroying performance. `enum` and `match` gather the logic into one place and guarantee at compile-time that every case is handled. The CPU loves a clear path, and the reader loves the whole truth in one place.
+**A8.** Inheritance scatters the logic across many files, and dynamic dispatch (virtual methods) hides the callee behind an indirect jump — hard to predict, impossible to inline or vectorize. A sum type and `match` gather the logic into one place and guarantee at compile-time that every case is handled. The CPU loves a clear path, and the reader loves the whole truth in one place.
 
 ---
 

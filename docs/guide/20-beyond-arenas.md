@@ -12,68 +12,59 @@ In an Object-Oriented language, you would `new Player()` and let the Garbage Col
 
 ## The Pool
 
-A Pool is just a pre-allocated array (or SoA) that reuses slots. Instead of asking the OS for memory every time a player joins, we hold a contiguous block of memory and manage the vacancy ourselves.
+A Pool is just a pre-allocated block of parallel columns (chapter 11's layout) that reuses slots. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column:
 
 ```align
-Player { name: string, hp: i64 }
-
-Pool {
-    slots: array<Option<Player>>,
-    next_free: i64,
-}
+mut alive := [false, false, false, false].to_array()
+mut hp    := [0, 0, 0, 0].to_array()
 ```
 
-When a player joins, we find the first `None` slot (or use a freelist to track empty slots in `O(1)`), put the `Player` there, and return the `i64` index. When they leave, we set the slot back to `None`.
+When a player joins, we find the first free slot — `alive[i] == false` — (or use a freelist to track empty slots in `O(1)`), write their data into row `i` of every column, and return the `i64` index. When they leave, we set `alive[i]` back to `false`.
 
 No OS calls. No garbage collector pauses. Just changing bytes in an array.
 
-## The ABA Problem
+## The stale-index problem
 
 There is a fatal flaw with returning raw `i64` indices. 
-1. Alice joins and gets assigned `id = 4`.
-2. Bob (Alice's friend) saves `target = 4` to heal her later.
-3. Alice disconnects. Slot 4 is now `None`.
-4. Charlie joins and is assigned the newly vacant `id = 4`.
-5. Bob casts his heal on `target = 4`. Charlie gets healed instead of Alice!
+1. Alice joins and gets assigned `id = 2`.
+2. Bob (Alice's friend) saves `target = 2` to heal her later.
+3. Alice disconnects. Slot 2 is now free.
+4. Charlie joins and is assigned the newly vacant `id = 2`.
+5. Bob casts his heal on `target = 2`. Charlie gets healed instead of Alice!
 
-This is the classic [ABA problem](https://en.wikipedia.org/wiki/ABA_problem) of resource reuse. If we were using pointers in C++, this would be a Use-After-Free security vulnerability.
+This is the classic stale-handle flavor of the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem): the slot you point at has been reused behind your back. If we were using pointers in C++, this would be a Use-After-Free security vulnerability.
 
 ## Generational Indices
 
 To solve this, we don't just hand out an `i64` index. We hand out a ticket that includes both the index and a **generation counter**.
 
 ```align
-Entity {
-    index: i32,
-    generation: i32,
-}
+Entity { index: i64, generation: i64 }
 ```
 
-We upgrade our Pool to track the generation of each slot:
+We upgrade our Pool with one more column that tracks the generation of each slot, and a check that a ticket is still current:
 
 ```align
-Slot {
-    value: Option<Player>,
-    generation: i32,
-}
+mut generation := [0, 0, 0, 0].to_array()
+```
 
-Pool {
-    slots: array<Slot>,
-}
+```align
+fn is_live(alive: slice<bool>, generation: slice<i64>, e: Entity) -> bool =
+    alive[e.index] && generation[e.index] == e.generation
 ```
 
 Now, the timeline looks like this:
-1. Alice joins. Slot 4 is at generation 1. Alice is given `Entity { index: 4, generation: 1 }`.
-2. Bob saves `target = Entity { index: 4, generation: 1 }`.
-3. Alice disconnects. Slot 4's value becomes `None`, and **we increment Slot 4's generation to 2**.
-4. Charlie joins. He is placed in Slot 4, and is given `Entity { index: 4, generation: 2 }`.
-5. Bob tries to heal `Entity { index: 4, generation: 1 }`. The Pool looks at Slot 4, sees that its current generation is `2`, which does not match Bob's ticket (`1`). The Pool safely rejects the heal.
+1. Alice joins. Slot 2 is at generation 1. Alice is given `Entity { index: 2, generation: 1 }`.
+2. Bob saves `target = Entity { index: 2, generation: 1 }`.
+3. Alice disconnects. `alive[2]` becomes `false`, and **we increment `generation[2]` to 2**.
+4. Charlie joins. He is placed in slot 2, and is given `Entity { index: 2, generation: 2 }`.
+5. Bob tries to heal `Entity { index: 2, generation: 1 }`. The Pool checks slot 2, sees that its current generation is `2`, which does not match Bob's ticket (`1`). `is_live` returns `false`, and the heal is safely rejected.
 
 ## Why this is the Align way
 
 Notice what we have achieved:
 1. **Zero Allocations:** Players can join and leave millions of times without a single call to the OS allocator.
-2. **Cache Locality:** All players live contiguously in memory, making bulk updates (like applying poison damage to everyone) incredibly fast via pipelines.
+2. **Cache Locality:** All players live contiguously in memory, making bulk updates (like applying poison damage to everyone) incredibly fast via pipelines — `hp` is already a column.
 3. **Absolute Safety:** No Use-After-Free bugs, no dangling pointers, and no garbage collection pauses.
 
 When you need unpredictable lifetimes, do not look for a garbage collector. Build a Pool, and hand out tickets.
