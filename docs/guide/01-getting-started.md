@@ -35,6 +35,8 @@ cargo build
 
 The compiler is now at `./target/debug/alignc`. It is not on `PATH`; either call it by path or add an alias. (A `--release` build produces `./target/release/alignc` — the compiler itself runs faster, the generated code is the same.) `alignc` dynamically uses LLVM 22 and invokes `cc` to link the programs it builds, so installing the executable alone does not remove those native toolchain requirements.
 
+Ubuntu 24.04's default OpenSSL 3.0 is sufficient for TLS, hashes, HMAC, HKDF, and AEAD. The `crypto.argon2id` provider was added in OpenSSL 3.2; install a newer OpenSSL when you need that operation, otherwise it reports an engine error at runtime.
+
 ## Hello, Align
 
 Save this as `hello.align`:
@@ -60,13 +62,19 @@ A `main` that can fail returns `Result` instead; that form (and what happens to 
 ## The subcommands
 
 ```text
-alignc check     file.align          type-check only, print diagnostics
-alignc build     file.align          produce a native executable (./file)
-alignc run       file.align [args…]  build + run; trailing args go to main(args)
-alignc fmt       file.align [--write] format (prints to stdout; --write rewrites in place)
-alignc emit-mir  file.align          dump the mid-level IR (for the curious)
-alignc emit-llvm file.align          dump LLVM IR (see exactly what your code became)
-alignc emit-obj  file.align [out.o]  object file only, no link
+alignc check          file.align          type-check and lint
+alignc check-per-unit file.align          check each imported unit through its interface
+alignc emit-interface file.align          print public interfaces and their hashes
+alignc build          file.align          produce a native executable (./file)
+alignc run            file.align [args…]  build + run; trailing args go to main(args)
+alignc fmt            file.align [--write] format (prints; --write rewrites in place)
+alignc emit-mir       file.align          dump the mid-level IR
+alignc emit-llvm      file.align          dump raw or optimized LLVM IR
+alignc emit-obj       file.align [out.o]  object file only, no link
+alignc explain-opt    file.align          explain optimizer decisions at source lines
+alignc size           file.align          build and report the executable's size
+alignc cache clear                        clear the resolved codegen cache
+alignc --version                          print the compiler version
 ```
 
 The everyday loop is `check` while editing, `run` to try it. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.

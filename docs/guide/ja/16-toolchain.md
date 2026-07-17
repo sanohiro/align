@@ -87,4 +87,4 @@ unused import           その file で使われない imported capability
 
 ## 意図的に欠けているもの
 
-package manager、project manifest、general test runner、debugger integration はまだありません。`pkg` layer は core と std の外に残す設計です。現在の contract は意図的に小さく、1 binary、import-discovered build、content-identified artifact、inspectable optimization です。
+Align 言語用 package registry/resolver、project manifest、general test runner、debugger integration はまだありません。Homebrew と apt が配布するのはコンパイラ本体であり、source dependency は将来の `pkg` layer として core と std の外に残します。現在の contract は意図的に小さく、1 binary、import-discovered build、content-identified artifact、inspectable optimization です。

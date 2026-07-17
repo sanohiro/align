@@ -8,9 +8,11 @@
 //!   alignc emit-llvm <file>   Print LLVM IR as text (--stage raw|optimized; default raw)
 //!   alignc emit-obj  <file>   Write an object file (no link, no `main` required)
 //!   alignc explain-opt <file> Report the -O2 optimizer's data-path decisions (--verbose)
+//!   alignc fmt       <file>   Format source (`--write` rewrites in place)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
 //!   alignc size      <file>   Build then report the executable's size breakdown
+//!   alignc cache clear        Remove the resolved codegen cache
 //!
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
 //! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
@@ -47,7 +49,7 @@ fn main() -> ExitCode {
     // mutually exclusive; a bare `--pgo-use` is a hard error. It must run before the other flag
     // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
     // …) still present — otherwise that flag would already be removed and the guard would consume the
-    // verb as the profile value. Serial, cache-bypassed, release/fast only.
+    // verb as the profile value. Cached/parallel per unit, release/fast only.
     let (pgo, args) = match parse_pgo(&raw) {
         Ok(v) => v,
         Err(e) => {
@@ -81,8 +83,8 @@ fn main() -> ExitCode {
     // primitives' bitcode into the program module before the one opt run. Orthogonal to `--profile`
     // (Nothing-hidden: the mechanism is named, not folded into `fast`).
     let (rt_lto, args) = parse_rt_lto(&args);
-    // Pull the boolean `--thin-lto` flag (ThinLTO S1): opt-in cross-unit optimization. Serial, no
-    // cache, release/fast only. Orthogonal to (and composable with) `--rt-lto`.
+    // Pull the boolean `--thin-lto` flag: opt-in cross-unit optimization. Its prelink and backend
+    // phases are cached and parallel; release/fast only; composable with `--rt-lto`.
     let (thin_lto, args) = parse_thin_lto(&args);
     // Pull `--cache-stats` (S3b, build/run/size only) and the `-j`/`--jobs` codegen-parallelism flag.
     let (cache_stats, args) = parse_cache_stats(&args);
@@ -560,8 +562,8 @@ fn usage() {
                        library/benchmark object exposes it to the linker\n  \
          --rt-lto      (build/run/emit-obj/size/emit-llvm; release/fast only) link the fast-path\n  \
                        string primitives' bitcode into the program and inline it before the opt run\n  \
-         --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — optimize across the\n  \
-                       per-unit boundary (serial, no cache in v1); composes with --rt-lto\n  \
+         --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — cached, parallel\n  \
+                       prelink/backend phases with a serial thin-link; composes with --rt-lto\n  \
          --pgo-instrument (build/run/size; release/fast only) build a profile-generating binary; run\n  \
                        it to write a .profraw, `llvm-profdata-22 merge` it, then rebuild with --pgo-use\n  \
          --pgo-use F   (build/run/size; release/fast only) rebuild using merged profile data F\n  \

@@ -51,9 +51,9 @@ cargo run --bin alignc -- run examples/arena.align     # arena + heap box; exits
 cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; exits 24
 ```
 
-`alignc` subcommands include `check`, `fmt`, `emit-mir`, `emit-llvm`, `emit-obj`, `build`, `run`, and `size`.
+The everyday commands are `check`, `fmt`, `build`, and `run`. Inspection and build-control commands are `check-per-unit`, `emit-interface`, `emit-mir`, `emit-llvm`, `emit-obj`, `explain-opt`, `size`, and `cache clear`; `alignc --version` reports the compiler version. Multi-file codegen is parallel and cached by default, with explicit `--rt-lto`, `--thin-lto`, and instrumented-PGO modes for production builds.
 
-**Requirements for a source build:** Rust 1.96+, LLVM 22 (`llvm-config-22` on `PATH`), and a C compiler (`cc`) for linking. Programs that use compression or crypto/HTTP also need the zlib, zstd, and OpenSSL development libraries.
+**Requirements for a source build:** Rust 1.96+, LLVM 22 (`llvm-config-22` on `PATH`), and a C compiler (`cc`) for linking. Programs that use compression or crypto/HTTP also need the zlib, zstd, and OpenSSL development libraries. Most crypto operations work with OpenSSL 3.0; `crypto.argon2id` requires OpenSSL 3.2+ and returns an engine error when that provider is unavailable.
 
 ## Install a release
 
@@ -73,7 +73,7 @@ curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
 sudo apt install alignc
 ```
 
-Release archives and `.deb` files are also attached to each GitHub release. `alignc` dynamically uses LLVM 22 and invokes the system C linker, so these are native packages with declared toolchain dependencies rather than fully static binaries.
+Release archives and `.deb` files are also attached to each GitHub release. A raw archive must keep `alignc` and its matching `libalign_runtime.a` together. `alignc` dynamically uses LLVM 22 and invokes the system C linker, so these are native packages with declared toolchain dependencies rather than fully static binaries.
 
 ## Status
 
@@ -86,7 +86,7 @@ The default build uses a **safe, portable per-architecture baseline** (`x86-64-v
 ## Layout
 
 - `draft.md` — authoritative language specification
-- `docs/guide/` — hands-on tutorial, 18 chapters (English + Japanese)
+- `docs/guide/` — hands-on tutorial, 19 chapters (`00`–`18`, English + Japanese)
 - `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs
