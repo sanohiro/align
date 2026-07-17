@@ -10236,7 +10236,7 @@ impl<'a, 't> Checker<'a, 't> {
         if self.readonly_locals.contains(&id) || self.readonly_locals.contains(&self.root_local(id)) {
             let name = self.locals[id as usize].name.clone();
             self.diags.error(
-                format!("cannot {verb} '{name}': it is a read-only view of a constant table (a constant table is read-only; copy it into an owned array — `mut a := ...` over its elements — to modify)"),
+                format!("cannot {verb} '{name}': it is a read-only view (e.g., a constant table or mmap view); copy it into an owned array to modify"),
                 span,
             );
             return true;
@@ -10274,6 +10274,8 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.hir_is_readonly_view(opt) || self.hir_is_readonly_view(fallback)
             }
+            ExprKind::Try(inner) => self.hir_is_readonly_view(inner),
+            ExprKind::FsReadFileView { .. } | ExprKind::FsReadBytesView { .. } => true,
             _ => false,
         }
     }
