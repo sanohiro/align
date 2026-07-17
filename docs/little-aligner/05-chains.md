@@ -40,13 +40,19 @@ xs.where(fn x { x > 0 }).map(fn x { x - 10 }).count()
 
 ---
 
-**Q5.** How many loops does a five-stage chain compile to?
+**Q5.** Why don't we just write `for` loops like in C or Go?
 
-**A5.** One. Always one. `map`–`where`–`map`–`scan`–`sum` — one counted loop, intermediates in registers, ready for the vectorizer. You may check: `alignc emit-llvm yourfile.align`.
+**A5.** A `for` loop is a set of instructions on *how* to move the CPU's feet. A pipeline is a statement of *what* the data becomes. When you declare *what* the data is doing, the compiler is free to optimize the *how*—vectorizing, fusing, and unrolling—far better than hand-written loops. 
 
 ---
 
-**Q6.** So when I split a long chain across lines, does it cost anything?
+**Q6.** In other languages, chaining `map` and `where` creates temporary intermediate arrays for every step, chewing up memory. Does Align?
+
+**A6.** No. Align pipelines are lazy until the final collapse. The compiler fuses all five stages—`map`–`where`–`map`–`scan`–`sum`—into exactly one loop. It does not allocate intermediate arrays. It is as if you wrote a painstakingly hand-optimized C loop, but you didn't have to.
+
+---
+
+**Q7.** So when I split a long chain across lines, does it cost anything?
 
 ```align
 total := items
@@ -56,23 +62,23 @@ total := items
     .sum()
 ```
 
-**A6.** Nothing. A line starting with `.` continues the chain. Layout is for the reader; the compiler sees one pipeline either way.
+**A7.** Nothing. A line starting with `.` continues the chain. Layout is for the reader; the compiler sees one pipeline either way.
 
 ---
 
-**Q7.** May I stop a chain in the middle and hold the half-done work?
+**Q8.** May I stop a chain in the middle and hold the half-done work?
 
 ```align
 halfway := items.where(.active).price
 ```
 
-**A7.** No — a chain must end in a collapse (`sum`, `count`, …) or a materialization (`to_array`, `sort`, `map_into`). A held middle would be a secret unfinished loop. End it, or don't start it.
+**A8.** No — a chain must end in a collapse (`sum`, `count`, …) or a materialization (`to_array`, `sort`, `map_into`). A held middle would be a secret unfinished loop. End it, or don't start it.
 
 ---
 
-**Q8.** Then how do I *reuse* a filtered set for two questions?
+**Q9.** Then how do I *reuse* a filtered set for two questions?
 
-**A8.** Materialize once, ask twice:
+**A9.** Materialize once, ask twice:
 
 ```align
 active := items.where(.active).price.to_array()
@@ -84,29 +90,29 @@ One visible allocation, two cheap reductions. (One day you'll want *many* aggreg
 
 ---
 
-**Q9.** What does `chunks` do here?
+**Q10.** What does `chunks` do here?
 
 ```align
 [1, 2, 3, 4, 5].chunks(2).map(fn c { c.sum() }).to_array()
 ```
 
-**A9.** `[3, 7, 5]` — sums of `[1,2]`, `[3,4]`, `[5]`. `chunks(n)` deals the array into hands of `n` (last hand short), each a slice, each pipelined like anything else.
+**A10.** `[3, 7, 5]` — sums of `[1,2]`, `[3,4]`, `[5]`. `chunks(n)` deals the array into hands of `n` (last hand short), each a slice, each pipelined like anything else.
 
 ---
 
-**Q10.** A chain that writes into memory *you* own — what is `map_into`?
+**Q11.** A chain that writes into memory *you* own — what is `map_into`?
 
 ```align
 src.map(dbl).map_into(dst)
 ```
 
-**A10.** The zero-allocation ending: results go into the slice `dst`, which must be the same length, and which the compiler proves doesn't overlap `src`. For the hot path that recycles buffers.
+**A11.** The zero-allocation ending: results go into the slice `dst`, which must be the same length, and which the compiler proves doesn't overlap `src`. For the hot path that recycles buffers.
 
 ---
 
-**Q11.** The habit, then. You are about to write a loop. What do you ask first?
+**Q12.** The habit, then. You are about to write a loop. What do you ask first?
 
-**A11.** *"What is the transformation?"* Then you write it as stages: change-each → keep-some → collapse. If you cannot name the stages, chapter 11 (`loop`) is waiting — but ask the question first, every time.
+**A12.** *"What is the transformation?"* Then you write it as stages: change-each → keep-some → collapse. If you cannot name the stages, chapter 11 (`loop`) is waiting — but ask the question first, every time.
 
 ---
 

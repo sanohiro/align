@@ -34,9 +34,15 @@ active: true   false true
 
 ---
 
-**Q4.** How do we turn data sideways in Align?
+**Q4.** If sideways (SoA) is so much faster, why did the programming world invent Object-Oriented Programming (AoS)?
 
-**A4.** One call, inside an arena:
+**A4.** Because humans think in entities. We imagine a 'User' walking around with a name and an age. But the CPU does not see entities; it sees flat streams of bytes. Object-Oriented Programming prioritizes the human's imagination. Data-Oriented Design (SoA) prioritizes the physical reality of the silicon.
+
+---
+
+**Q5.** How do we turn data sideways in Align?
+
+**A5.** One call, inside an arena:
 
 ```align
 User { active: bool, score: i64, age: i64 }
@@ -51,51 +57,51 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 
 ---
 
-**Q5.** What is `s.age`?
+**Q6.** What is `s.age`?
 
-**A5.** The age **column** — a plain slice of `i64`. And a slice means every chapter so far applies: `s.age.sum()`, `s.age.max()`, `s.age.map(...)...`.
-
----
-
-**Q6.** With the three users above, what is `s.age.sum()`?
-
-**A6.** `96`. One dense line of memory, summed.
+**A6.** The age **column** — a plain slice of `i64`. And a slice means every chapter so far applies: `s.age.sum()`, `s.age.max()`, `s.age.map(...)...`.
 
 ---
 
-**Q7.** What is `s.where(.active).age.sum()`?
+**Q7.** With the three users above, what is `s.age.sum()`?
 
-**A7.** `71` — `30 + 41`; bob is inactive. Two columns touched (`active` to filter, `age` to sum); the names never left RAM. That is the entire trick, and it is a big one.
-
----
-
-**Q8.** May we still have alice back — the whole row?
-
-**A8.** `u := s[0]` gathers one `User` from the three columns. Costlier than a column read (three fetches instead of one) — the sideways layout charges for *rows* what it saved on *columns*.
+**A7.** `96`. One dense line of memory, summed.
 
 ---
 
-**Q9.** And one cell? A write?
+**Q8.** What is `s.where(.active).age.sum()`?
 
-**A9.** `s[0].age` reads one cell; with a `mut` soa, `s[1].score = 99` writes one — straight into the column.
-
----
-
-**Q10.** A window? The middle of a column?
-
-**A10.** `s.age[1..3].sum()` — slice the column like any slice: `25 + 41 = 66`.
+**A8.** `71` — `30 + 41`; bob is inactive. Two columns touched (`active` to filter, `age` to sum); the names never left RAM. That is the entire trick, and it is a big one.
 
 ---
 
-**Q11.** When does the sideways layout *lose*?
+**Q9.** May we still have alice back — the whole row?
 
-**A11.** When you touch whole rows, rarely and singly — a config record, one request. Gathering every field re-scatters what SoA gathered. Rows you handle whole: AoS. Columns you scan in bulk: SoA.
+**A9.** `u := s[0]` gathers one `User` from the three columns. Costlier than a column read (three fetches instead of one) — the sideways layout charges for *rows* what it saved on *columns*.
 
 ---
 
-**Q12.** The data arrives as JSON. Must we build rows first and turn them after?
+**Q10.** And one cell? A write?
 
-**A12.** No — decode *directly* sideways:
+**A10.** `s[0].age` reads one cell; with a `mut` soa, `s[1].score = 99` writes one — straight into the column.
+
+---
+
+**Q11.** A window? The middle of a column?
+
+**A11.** `s.age[1..3].sum()` — slice the column like any slice: `25 + 41 = 66`.
+
+---
+
+**Q12.** When does the sideways layout *lose*?
+
+**A12.** When you touch whole rows, rarely and singly — a config record, one request. Gathering every field re-scatters what SoA gathered. Rows you handle whole: AoS. Columns you scan in bulk: SoA.
+
+---
+
+**Q13.** The data arrives as JSON. Must we build rows first and turn them after?
+
+**A13.** No — decode *directly* sideways:
 
 ```align
 s: soa<User> := json.decode(data)?
@@ -105,15 +111,15 @@ The parser fills columns as it reads; no row-shaped middleman, and string column
 
 ---
 
-**Q13.** Why did every soa live inside an `arena`?
+**Q14.** Why did every soa live inside an `arena`?
 
-**A13.** Chapter 8's answer: columns are a *batch* with one lifetime — born from one decode, dead after one analysis. The arena states it; the compiler holds you to it.
+**A14.** Chapter 8's answer: columns are a *batch* with one lifetime — born from one decode, dead after one analysis. The arena states it; the compiler holds you to it.
 
 ---
 
-**Q14.** Say the habit.
+**Q15.** Say the habit.
 
-**A14.** *When I scan fields in bulk, I turn the data sideways at the door* — `to_soa()`, or `json.decode` straight into `soa<T>` — *and speak in columns from then on.*
+**A15.** *When I scan fields in bulk, I turn the data sideways at the door* — `to_soa()`, or `json.decode` straight into `soa<T>` — *and speak in columns from then on.*
 
 ---
 

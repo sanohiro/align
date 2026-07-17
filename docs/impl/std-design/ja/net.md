@@ -1,6 +1,6 @@
-このディレクトリには、ロードマップの本文だけでは足りない std モジュールについて、Opus がそのまま実装に
-移せる粒度の設計仕様を収めている。執筆はメインループ (Fable) が担当しており、各モジュールを実装する際は
-これが source of truth となる。
+このディレクトリには、ロードマップの本文ではカバーしきれない `std` モジュールについて、Opus がそのまま実装に
+着手できる粒度の設計仕様を収めている。執筆はメインループ（Fable）が担当しており、各モジュールの実装において
+これが信頼できる情報源（source of truth）となる。
 
 # std.net — implementation design (M11)
 
@@ -73,7 +73,7 @@ syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECO
 
 ## Concurrency model
 
-記録済みのレール(open-questions「Network std rails」)は、デフォルトでコネクションを再利用する(keepalive
+記録済みの基盤（レール）(open-questions「Network std rails」)は、デフォルトでコネクションを再利用する(keepalive
 ON)ことである。net は、上限付き並行バッチングのための **基盤** を提供する — `task_group` と `par_map` の
 ブロッキングプールである(新しい async ランタイムではない。`io_uring` はあくまで後日の Linux バックエンド
 であって、意味論上のモデルではない)。具体的なバッチ API(`get_many`、パイプライン化した write-then-read)
@@ -102,7 +102,7 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 3. `tcp_listener` + `listen` + `accept`(サーバ側)。
 4. `udp_socket` + `bind` + `send_to` + `recv_from`。
 
-(バッチ化した `get_many` のレールは、ここではなく `std.http` で実装する — HTTP 型が要るからである。net が
+(バッチ化した `get_many` の基盤（レール）は、ここではなく `std.http` で実装する — HTTP 型が要るからである。net が
 供給するのは `task_group` + ブロッキングプールの基盤だけで、これはすでに利用できる。)
 
 ## Pitfalls (implement carefully)
