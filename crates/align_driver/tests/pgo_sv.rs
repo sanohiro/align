@@ -8,12 +8,14 @@
 //!     produce a byte-identical executable, for `--pgo-instrument` (`gate_sv1a`) AND `--pgo-use` with the
 //!     same profdata (`gate_sv1b`). The exe is deleted before each build and each build's coldness is
 //!     asserted via `--cache-stats` (`0 hit, 1 miss`), so the comparison can never pass on a stale artifact.
-//!  2. **Stale / wrong-profile mutation matrix** — (a) a profile from a DIFFERENT program → the settled
-//!     0%-match HARD ERROR (`gate_sv2a`); (b) a profile from an OLDER source version (the program is
-//!     edited after profiling, but a surviving function still matches) → the aggregated staleness report
-//!     on stderr, the build PROCEEDS, and the exe is correct (`gate_sv2b`); (c) a profdata whose body is
-//!     corrupted PAST the magic (a flipped version field) so it slips the driver's magic pre-check but
-//!     libLLVM's reader rejects it → the Error-severity diagnostic-handler HARD ERROR (`gate_sv2c`).
+//!  2. **Stale / wrong-profile mutation matrix** — (a) a profile from a DIFFERENT program → a prominent
+//!     "matched 0 of N — is this profile from this program?" WARNING, exit 0, and a CORRECT exe (parity
+//!     with flag-off), because a mismatched profile is performance-only, never a correctness bug
+//!     (`gate_sv2a`); (b) a profile from an OLDER source version (the program is edited after profiling,
+//!     but a surviving function still matches) → the aggregated staleness report on stderr, the build
+//!     PROCEEDS, and the exe is correct (`gate_sv2b`); (c) a profdata whose body is corrupted PAST the
+//!     magic (a flipped version field) so it slips the driver's magic pre-check but libLLVM's reader
+//!     rejects it → the Error-severity diagnostic-handler HARD ERROR (`gate_sv2c`).
 //!  3. **Compile-time bound** — a COLD `--pgo-instrument` and a COLD `--pgo-use` build's wall-time vs the
 //!     flag-off cold build stays under a generous cap (interleaved per round, best-of-N min; `gate_sv3`,
 //!     the `thin_lto_sv::gate_sv3` shape).
@@ -21,10 +23,14 @@
 //!     `--pgo-use` build beats the flag-off build by a MEASURED margin (interleaved A/B, min-of-N,
 //!     black-box output, subprocess runs). Asserts a conservative floor well below the measured win.
 //!
-//! GAP FOUND + FIXED (2a): before SV, a wrong-program `--pgo-use` build PROCEEDED (one warning, exit 0),
-//! contradicting the settled fail-loud "0%-match = hard error" policy. The fix threads a profile-match
-//! tally from the shim (`Function::getEntryCount` over the optimized module) up to the driver, which hard-
-//! errors when ZERO functions across the rebuilt units received profile data. See the roadmap SV record.
+//! POLICY (2a): a wrong/stale profile is a WARNING, not a hard error. A `/code-review` pass falsified the
+//! initial "0%-match = hard error" attempt — there is no reliable match signal (the post-pipeline
+//! `Function::getEntryCount` tally undercounts inlined+DCE'd matches and, with `--rt-lto`, overcounts
+//! baked runtime primitives that match any program; per-unit cache hits structurally bypass a build-level
+//! gate). So the settled policy is amended: hard errors stay at the RELIABLE layer (missing/unreadable/
+//! empty/bad-magic profdata + Error-severity libLLVM diagnostics — gate_sv2c), while a 0%/partial MATCH
+//! ships as a prominent Align-voice warning (clang parity: profile mismatch is performance-only). The
+//! tally still feeds that report. See the roadmap "Instrument-PGO SV SHIPPED" 2a paragraph.
 //!
 //! Tool-gated exactly like `pgo.rs`: the instrument link needs clang's profile runtime archive, the round
 //! trip needs `llvm-profdata` (via the product's version-matched resolver), and the exe link needs `cc`.
@@ -36,8 +42,6 @@ use common::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
-
-use align_driver::llvm_tool;
 
 fn backend() -> bool {
     backend_available()
@@ -200,27 +204,6 @@ fn build(kit: &Kit, cache: &str, flags: &[&str]) -> std::process::Output {
     c.output().expect("run alignc build")
 }
 
-/// Collect a merged `.profdata` for the kit's CURRENT `prog.align`: gen build (cache off) → run with
-/// `LLVM_PROFILE_FILE` → `llvm-profdata merge`. Returns `None` (caller skips) when a required tool is
-/// absent, matching the repo's external-tool gate convention.
-fn collect_profdata(kit: &Kit) -> Option<PathBuf> {
-    let tool = llvm_tool("llvm-profdata")?;
-    if !backend() || !profile_rt_available() {
-        return None;
-    }
-    if build(kit, "off", &["--pgo-instrument"]).status.code() != Some(0) {
-        return None;
-    }
-    let profraw = kit.path("p.profraw");
-    let run = Command::new(kit.exe()).env("LLVM_PROFILE_FILE", &profraw).output().ok()?;
-    if run.status.code().is_none() || !std::fs::metadata(&profraw).map(|m| m.len() > 0).unwrap_or(false) {
-        return None;
-    }
-    let profdata = kit.path("p.profdata");
-    let merged = Command::new(&tool).args(["merge", "-o"]).arg(&profdata).arg(&profraw).output().ok()?;
-    merged.status.success().then_some(profdata)
-}
-
 /// stderr of a build as an owned `String` (for message assertions).
 fn err_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -259,7 +242,7 @@ fn gate_sv1b_use_build_twice_byte_identical() {
         return;
     }
     let kit = Kit::new("det-use", BRANCHY);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, BRANCHY) else {
         return;
     };
     let prof = profdata.to_str().unwrap();
@@ -279,25 +262,36 @@ fn gate_sv1b_use_build_twice_byte_identical() {
 // Gate SV2: stale / wrong-profile mutation matrix
 // ================================================================================================
 
-/// 2a: a profile from a DIFFERENT program → the settled 0%-match HARD ERROR. `BRANCHY`'s profile is
-/// applied to [`DIFFERENT_PROG`], whose functions match none of the profile records → 0 functions
-/// receive profile data → the driver hard-errors (naming the profile), rather than silently proceeding
-/// (the pre-SV behavior — the gap this bundle closes).
+/// 2a: a profile from a DIFFERENT program → a prominent 0%-match WARNING, exit 0, and a CORRECT exe.
+/// `BRANCHY`'s profile is applied to [`DIFFERENT_PROG`], whose functions match none of the profile
+/// records → 0 functions receive profile data → the driver emits the aggregated "is this profile from
+/// this program?" warning and PROCEEDS. A mismatched profile is a performance concern only (clang
+/// parity), so the build must succeed and the exe must be correct (identical stdout to a flag-off build).
 #[test]
-fn gate_sv2a_wrong_program_profile_hard_errors() {
+fn gate_sv2a_wrong_program_profile_warns_and_proceeds() {
+    if !cc_available() {
+        return;
+    }
     let kit = Kit::new("wrongprog", BRANCHY);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, BRANCHY) else {
         return;
     };
     // Swap in a structurally different program; apply BRANCHY's profile to it.
     kit.write(DIFFERENT_PROG);
     let out = build(&kit, "off", &["--pgo-use", profdata.to_str().unwrap()]);
-    assert_ne!(out.status.code(), Some(0), "a wrong-program profile must hard-error, not proceed");
+    assert_eq!(out.status.code(), Some(0), "a wrong-program profile must WARN + proceed, not hard-error:\n{}", err_of(&out));
     let err = err_of(&out);
     assert!(
-        err.contains("matches NONE of this program"),
-        "the 0%-match error must name the wrong-profile cause:\n{err}"
+        err.contains("matched 0 of") && err.contains("is this profile from this program"),
+        "the prominent 0%-match warning must appear on stderr:\n{err}"
     );
+    let use_stdout = Command::new(kit.exe()).output().expect("run use exe").stdout;
+
+    // Correctness: a flag-off build of the same program must produce identical output (the ignored
+    // profile changed nothing but performance).
+    assert_eq!(build(&kit, "off", &[]).status.code(), Some(0), "flag-off build of the wrong-program source failed");
+    let off_stdout = Command::new(kit.exe()).output().expect("run off exe").stdout;
+    assert_eq!(use_stdout, off_stdout, "the profile-ignored --pgo-use exe must be correct (== flag-off output)");
 }
 
 /// 2b: a profile from an OLDER source version → partial staleness. The program is profiled, then `tag` is
@@ -311,7 +305,7 @@ fn gate_sv2b_stale_source_partial_reports_and_proceeds() {
         return;
     }
     let kit = Kit::new("stalesrc", RECUR_V1);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, RECUR_V1) else {
         return;
     };
     // Edit the program (the profile is now partially stale); build with the stale profile.
@@ -339,7 +333,7 @@ fn gate_sv2b_stale_source_partial_reports_and_proceeds() {
 #[test]
 fn gate_sv2c_corrupt_profile_valid_magic_hard_errors() {
     let kit = Kit::new("corrupt", BRANCHY);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, BRANCHY) else {
         return;
     };
     let mut bytes = std::fs::read(&profdata).expect("read profdata");
@@ -377,7 +371,7 @@ fn gate_sv3_compile_time_bound_both_modes() {
         return;
     }
     let kit = Kit::new("ctbound", BRANCHY);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, BRANCHY) else {
         return;
     };
     let prof = profdata.to_str().unwrap().to_string();
@@ -418,7 +412,7 @@ fn gate_sv4_payoff_pgo_use_beats_flag_off() {
         return;
     }
     let kit = Kit::new("payoff", PAYOFF);
-    let Some(profdata) = collect_profdata(&kit) else {
+    let Some(profdata) = make_profdata(&kit.dir, PAYOFF) else {
         return;
     };
     let prof = profdata.to_str().unwrap();

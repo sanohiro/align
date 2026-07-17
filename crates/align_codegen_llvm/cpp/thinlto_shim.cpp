@@ -467,11 +467,13 @@ extern "C" int align_thinlto_backend(
 // matching structural hash; a hash mismatch or an absent record leaves it unset. So
 // `matched == 0 && total > 0` after a USE run means NONE of this module's functions
 // matched the profile — the "0%-match" wrong-program/incompatible-profile signal the
-// driver turns into a hard error (the settled fail-loud policy). For a GEN run the
-// pass sets no entry counts, so `matched` is 0 and the driver ignores it (GEN reads
-// no profile). The count is taken AFTER the default pipeline; inlining/DCE can drop a
-// matched callee, but the ZERO-vs-NONZERO boundary the driver keys on is robust
-// (`main` is never inlined away and keeps its entry count on any real match).
+// driver surfaces as a prominent WARNING (a mismatched profile is performance-only,
+// never a correctness issue; there is no reliable hard-error signal here — see the
+// driver's `codegen_units_parallel` note). For a GEN run the pass sets no entry counts,
+// so `matched` is 0 and the driver ignores it (GEN reads no profile). The count is taken
+// AFTER the default pipeline, so it is approximate — inlining/DCE can drop a matched
+// callee (undercount) and, under `--rt-lto`, baked runtime primitives match any program
+// (overcount) — which is exactly why it drives a warning, not a hard error.
 extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
                                       LLVMTargetMachineRef tm_ref, int opt_level,
                                       int kind, const char *profdata_path,
@@ -528,11 +530,12 @@ extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
   // the SIMPLIFIED CFG (post the early passes that precede `addPGOInstrPasses`), so the only
   // faithful match check is inside the real pipeline — a separate un-simplified measurement
   // mis-hashes and matches nothing. `matched == 0 && total > 0` after a USE run therefore means
-  // 0% of the optimized module got profile data: the profile is for a different program, or
-  // every function it could have applied to changed shape since it was collected — either way
-  // it contributes nothing to this build, which the driver escalates to a hard error. A build
-  // with any surviving matched function (`matched > 0`) is at most partially stale and proceeds.
-  // For a GEN run the pass sets no entry counts (`matched == 0`) and the driver ignores it.
+  // 0% of the optimized module got profile data: the profile is likely for a different program,
+  // or every function it could have applied to changed shape since it was collected — which the
+  // driver surfaces as a prominent WARNING (never a hard error: the tally is approximate, and a
+  // mismatched profile is performance-only). A build with any surviving matched function
+  // (`matched > 0`) is at most partially stale. For a GEN run the pass sets no entry counts
+  // (`matched == 0`) and the driver ignores it.
   if (out_matched || out_total) {
     int matched = 0;
     int total = 0;

@@ -77,8 +77,9 @@ pub struct PgoRunReport {
     /// `matched` = defined functions this run gave a PGO entry count (found in the profile
     /// with a matching structural hash), `total` = defined functions in the module. For a
     /// [`PgoAction::Use`] run `matched == 0 && total > 0` is the "0%-match" signal — the
-    /// profile matched NONE of this module's functions (a wrong-program / incompatible
-    /// profile) — which the driver escalates to a hard error across the build. For
+    /// profile matched NONE of this module's functions (a likely wrong-program / incompatible
+    /// profile) — which the driver surfaces as a prominent WARNING (the tally is approximate
+    /// and a mismatched profile is performance-only; never a hard error). For
     /// [`PgoAction::Instrument`] the pass sets no entry counts, so `matched` is 0 and the
     /// value is meaningless (GEN reads no profile).
     pub matched_fns: u32,

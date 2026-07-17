@@ -714,13 +714,19 @@ pub fn emit_object_cached(
 
 /// The aggregated result of [`codegen_units_parallel`]: the per-unit cache outcomes (DAG-ordered) plus,
 /// for an instrument-PGO **use** build, every profile-use staleness warning captured across the units
-/// that actually ran (cache MISSES). On an all-HIT use build `pgo_warnings` is empty by construction —
-/// no LLVM ran, so no diagnostics were produced; the staleness (if any) was already reported the first
-/// time each object was built and is intrinsic to the cached bytes. Off/Instrument builds never warn.
+/// that actually ran (cache MISSES) and the summed profile-match tally. On an all-HIT use build
+/// `pgo_warnings` is empty and the tally is `0/0` by construction — no LLVM ran, so no diagnostics or
+/// entry counts were produced; the staleness (if any) was already reported the first time each object was
+/// built and is intrinsic to the cached bytes. Off/Instrument builds never warn and leave the tally `0/0`.
 pub struct UnitCodegen {
     pub outcomes: Vec<CacheOutcome>,
     /// Profile-use warnings, flattened in DAG (unit) index order for a deterministic report.
     pub pgo_warnings: Vec<String>,
+    /// `--pgo-use` only: how many of the rebuilt units' OPTIMIZED functions carried a PGO entry count
+    /// (matched the profile), out of `pgo_total` defined functions. `pgo_matched == 0 && pgo_total > 0`
+    /// is the "profile matched nothing" signal the caller surfaces as a prominent warning (not an error).
+    pub pgo_matched: u32,
+    pub pgo_total: u32,
 }
 
 /// M15 S3b: codegen every unit of a per-unit build into `obj_paths` (parallel over cache MISSES), the
@@ -731,18 +737,21 @@ pub struct UnitCodegen {
 ///    queued for codegen. When the cache is disabled every unit is a miss and NO key work runs.
 /// 2. **Parallel** codegen of the misses via `std::thread::scope` — `jobs` worker threads pull the
 ///    next miss through a shared atomic index; each runs [`emit_object_file`] (a fresh LLVM `Context`
-///    per call) into its own `obj_paths[i]`, then publishes to the CAS. LLVM's native target is
-///    initialized ONCE on this (main) thread before the scope, never racily inside a worker.
+///    per call) into its own `obj_paths[i]`, then publishes it to the CAS IMMEDIATELY. LLVM's native
+///    target is initialized ONCE on this (main) thread before the scope, never racily inside a worker.
 ///
 /// **Instrument-PGO (S2):** when `pgo` is active this is the SAME cached, parallel path — the only
 /// PGO-specific bits are (a) the [`cache::PgoKey`] key component (built once here from the profile
 /// content digest, so instrumented / profile-use / ordinary objects are structurally isolated and
 /// never share a CAS blob), and (b) the per-unit emit swaps the stock opt run for the PGO pipeline
-/// (`emit_object_pgo`; GEN inserts counters, USE attaches `!prof branch_weights`). The USE run's
-/// fail-loud diagnostic handler (a libLLVM-rejected profile → hard error) and its staleness warnings
-/// live inside `emit_object_pgo`, so they fire on every cache MISS and are aggregated into
-/// `UnitCodegen::pgo_warnings`; an all-HIT use build runs no LLVM and needs none (see [`UnitCodegen`]).
-/// The instrumented link (profile runtime archive + force-undefined symbol) is the caller's job.
+/// (`emit_object_pgo`; GEN inserts counters, USE attaches `!prof branch_weights`). A USE run's fail-loud
+/// diagnostic handler turns a libLLVM-REJECTED profile (Error severity — e.g. an unsupported version)
+/// into a hard error, and its staleness warnings + profile-match tally ride the return; both are
+/// aggregated into `UnitCodegen` (see there). A profile that merely fails to MATCH (0% or partial) is
+/// surfaced by the caller as a warning, never an error — there is no reliable 0%-match hard-error signal
+/// (see the tally note in the body) and, as with clang, a mismatched profile is performance-only. An
+/// all-HIT use build runs no LLVM and needs none. The instrumented link (profile runtime archive +
+/// force-undefined symbol) is the caller's job.
 ///
 /// Determinism: results return in DAG (unit) index order regardless of which worker finished first;
 /// the caller iterates the returned outcomes / the units' capability libs in that same order. `-j 1`
@@ -819,12 +828,15 @@ pub fn codegen_units_parallel(
     }
 
     // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
-    // reads `units`/`obj_paths`/`keys` and appends any error (or PGO-use result) under a short-held lock.
-    // Publishing to the CAS is DEFERRED to after the scope + the aggregate 0%-match check, so a
-    // wrong-program `--pgo-use` profile (rejected below) never poisons the cache with objects the build
-    // then refuses — a later rebuild with that same profile would otherwise HIT the poisoned blobs and
-    // silently proceed, contradicting this build's hard error.
+    // reads `units`/`obj_paths`/`keys`, appends its result (or error) under a short-held lock, and
+    // PUBLISHES its object to the CAS IMMEDIATELY on success. Immediate publish is correct regardless of
+    // any PGO match ratio: the cache key already carries the profile-content digest (`PgoKey::Use`), so a
+    // published object is only ever served to a build with the identical profile+source — correctness
+    // never depended on how well the profile matched. Publishing in the worker (not deferred to a
+    // post-scope pass) also means a build where ONE unit fails codegen still leaves its
+    // already-succeeded sibling units published (a warm rebuild re-hits them), matching every non-PGO mode.
     let mut pgo_warnings: Vec<String> = Vec::new();
+    let (mut pgo_matched, mut pgo_total): (u32, u32) = (0, 0);
     if !misses.is_empty() {
         use std::sync::atomic::AtomicBool;
         let worker_count = jobs.max(1).min(misses.len());
@@ -855,9 +867,9 @@ pub fn codegen_units_parallel(
                     let i = misses[k];
                     let unit = &units[i];
                     // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
-                    // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-rejected
-                    // profile into an `Err` here (hard fail); its staleness warnings + match tally ride
-                    // the return.
+                    // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
+                    // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
+                    // staleness warnings + profile-match tally ride the return.
                     match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
                         Err(e) => {
                             errors.lock().expect("codegen error lock").push((i, e));
@@ -867,6 +879,9 @@ pub fn codegen_units_parallel(
                         Ok(run) => {
                             results.lock().expect("pgo result lock").push((i, run));
                         }
+                    }
+                    if let Some(key) = &keys[i] {
+                        cache.publish_after_miss(key, &obj_paths[i]);
                     }
                 });
             }
@@ -881,40 +896,24 @@ pub fn codegen_units_parallel(
             let (i, e) = &errs[0];
             return Err(format!("codegen failed for unit `{}`: {e}", units[*i].unit));
         }
-        // DAG-order the per-unit results for a stable warning aggregate + a deterministic match tally.
+        // DAG-order the per-unit results for a stable warning aggregate, and sum the profile-match tally
+        // across the rebuilt (cache-MISS) USE units. `matched`/`total` count the OPTIMIZED module's
+        // functions that carried a PGO entry count vs total defined (the shim's `Function::getEntryCount`
+        // tally). The caller turns this into an aggregated Align-voice report: a `matched == 0` build is a
+        // prominent "does this profile belong to this program?" WARNING, a partial match rides the
+        // per-unit staleness warnings — NEVER a hard error. There is no reliable 0%-match hard-error
+        // signal (the tally undercounts inlined+DCE'd matches and, with `--rt-lto`, overcounts baked
+        // runtime primitives that match any program), and — as with clang — a mismatched profile is a
+        // performance concern, never a correctness one. Hard fails stay at the reliable layer: a
+        // missing/unreadable/empty/bad-magic profdata (`validate_profdata`) and an Error-severity libLLVM
+        // diagnostic (above).
         let mut runs = results.into_inner().expect("pgo result lock");
         runs.sort_by_key(|(i, _)| *i);
-
-        // 0%-MATCH HARD ERROR (settled fail-loud policy, `--pgo-use` only). Each rebuilt unit's PGO run
-        // reports (matched, total) = how many of its OPTIMIZED functions carry profile data out of the
-        // total defined (the shim's `Function::getEntryCount` tally; see its contract note). If ZERO of
-        // the functions across every rebuilt unit received profile data (`matched == 0`, `total > 0`),
-        // the profile contributes nothing to this build — it was collected from a different program or an
-        // incompatible build — a hard error, raised BEFORE any object is published (deferred below) so a
-        // rejected build never poisons the cache. A build with any matched function is at most partially
-        // stale and proceeds (the aggregated warning below). Guarded by `!any_hit`: a cache HIT under this
-        // profile's key means the profile already matched this program on an earlier build, so a rebuild
-        // whose (changed) units all happen to miss is partial staleness, not a wrong profile. Off /
-        // Instrument never read a profile, so the check does not apply.
         if matches!(effective_pgo, PgoMode::Use(_)) {
-            let any_hit = outcomes.iter().flatten().any(|o| o.hit);
-            let matched: u32 = runs.iter().map(|(_, r)| r.matched_fns).sum();
-            let total: u32 = runs.iter().map(|(_, r)| r.total_fns).sum();
-            if !any_hit && total > 0 && matched == 0 {
-                return Err(format!(
-                    "--pgo-use: the profile matches NONE of this program — 0 of {total} rebuilt \
-                     function(s) were found in the profile. It was collected from a different program \
-                     or an incompatible build; re-profile with `--pgo-instrument`."
-                ));
-            }
+            pgo_matched = runs.iter().map(|(_, r)| r.matched_fns).sum();
+            pgo_total = runs.iter().map(|(_, r)| r.total_fns).sum();
         }
-
-        // Cleared the 0%-match gate: publish each successfully-emitted miss to the CAS (deterministic
-        // DAG order), then flatten the PGO-use warnings for a stable aggregate report.
-        for (i, run) in runs {
-            if let Some(key) = &keys[i] {
-                cache.publish_after_miss(key, &obj_paths[i]);
-            }
+        for (_, run) in runs {
             pgo_warnings.extend(run.warnings);
         }
     }
@@ -926,6 +925,8 @@ pub fn codegen_units_parallel(
     Ok(UnitCodegen {
         outcomes: outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect(),
         pgo_warnings,
+        pgo_matched,
+        pgo_total,
     })
 }
 
