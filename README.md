@@ -36,7 +36,7 @@ Create a file named `hello.align`:
 
 ```align
 fn main() -> i32 {
-    print("hello, align\n")
+    print("hello, align")
     return 0
 }
 ```
