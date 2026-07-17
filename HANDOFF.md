@@ -8,7 +8,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (fifth update this day), **INSTRUMENT-PGO S2 IS SHIPPED — CACHE
+_Last updated: 2026-07-17 (sixth update this day), **INSTRUMENT-PGO SV IS SHIPPED AND THE PGO ARC
+IS CLOSED — MERGED as #502** (`0355782`; the full arc: S0 #499 spike → S1 #500 serial → S2 #501
+cache → SV #502 verification + payoff). The SV bundle (`crates/align_driver/tests/pgo_sv.rs`, 7
+gates): build-twice byte-identity for instrument AND use modes (separate cold roots, coldness via
+`--cache-stats`), wrong-program / stale-source / version-corrupt profile mutation gates, the
+interleaved compile-time bound (< 3.0x both modes), and the **measured PAYOFF GATE: ≈1.16x at
+N=40M** (1.11–1.13x at larger N, ±0.005 stable) from profile-driven hot-loop block layout —
+`step` inlined in BOTH builds (objdump-confirmed), so the win is layout, not inlining; floor
+asserted at 1.03x. Two dispatch kernels (8-/16-way skewed) measured ~0.98x/0.88x — hardware
+already predicts skewed dispatch — recorded as the durable negative so the sample-PGO/BOLT slice
+doesn't re-measure them. **The settled 0%-match hard-error policy was AMENDED on review
+evidence** (bracketed correction in the roadmap): no reliable match signal exists — the
+post-pipeline entry-count tally undercounts inlined+DCE'd matches (false hard error on a
+same-program stale profile), per-unit cache HITs structurally bypass any build-level gate, and
+--rt-lto baked primitives match every rt-lto profile — so 0%/partial match ships as ONE prominent
+aggregated warning with exit 0 (clang parity; profile mismatch is performance-only), while hard
+errors stay at the reliable layer (missing/unreadable/empty/bad-magic profdata + Error-severity
+diagnostics incl. version skew). The match-tally plumbing (shim out-params →
+`UnitCodegen.pgo_matched/pgo_total`) feeds the warning; the `!any_hit` guard and rejected-build
+deferred publish were deleted and immediate in-worker publish restored (objects are valid for
+their keys regardless of ratio — the key carries the profile-content digest; doc-10 records the
+semantics). `make_profdata` generalized in tests/common. Workspace green (**2272 total = 2254
+passed + 18 ignored**), clippy clean default + --all-features. Deferred (arc closed): sample
+PGO / BOLT evaluation (the M14 wave tail), CSPGO, PGO × --thin-lto composition. **Next: pick the
+next work item from the recorded priorities** — candidates: the M14 wave tail (sample-PGO/BOLT
+evaluation, "driver-managed external pipeline, evaluate later"), doc-13 P3 item 3's four
+independent measure-first gates (unique-buffer donation / repeated-needle plan-hoisting / JSON
+escape SIMD classifier / short-N group strategy), or the deferred ThinLTO follow-ups; the
+orchestrator selects per the owner rubric. Previous update: 2026-07-17 (fifth update this day),
+**INSTRUMENT-PGO S2 IS SHIPPED — CACHE
 COMPOSITION, MERGED as #501** (`0066b42`). PGO builds now flow through the normal cached +
 parallel per-unit path (the S1 bypass is deleted outright): `PgoKey { Off | Instrument |
 Use(Hash128 of profdata bytes) }` is CodegenKey component #12 (the rt_lto_digest precedent; named
