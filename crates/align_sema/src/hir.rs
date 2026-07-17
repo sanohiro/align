@@ -522,6 +522,15 @@ pub enum ExprKind {
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
+    /// A substituted top-level **aggregate constant** — the array-literal analogue of
+    /// [`ExprKind::Str`]. `NAME := [1, 2, 3]` folds to a `ConstVal::Array` and is substituted at
+    /// each use as this node, typed `slice<elem>` with `Region::Static`: the elements live in a
+    /// per-unit private read-only global (rodata), and the value is a borrowed `{ptr, len}` view of
+    /// it (exactly like a `str` literal is a static view of its bytes — ownership is a property of
+    /// the type, so a top-level array constant is a `slice<T>`, never an owned `array<T>`). `elems`
+    /// are the already-folded scalar/str literal elements; `elem` is their shared scalar type and
+    /// `len` is the fixed length. Carries no borrow provenance and is never moved/dropped.
+    ConstArray { elems: Vec<Expr>, elem: crate::Scalar, len: u32 },
     /// `zip(a, b, …)` — a lazy multi-source pipeline head. Each source is an array/slice of a
     /// Copy scalar; `tuple_id` describes the per-index SSA tuple. There is no tuple array and this
     /// node is valid only as the `source` of a pipeline terminal.

@@ -120,6 +120,22 @@ A constant's type is fixed at the definition (it does not infer from a use site 
 across modules), so an unannotated integer defaults to `i64` / a float to `f64`; annotate otherwise.
 `pub` exports it; an importer names it qualified (`mod.NAME`), like a `pub` function/type. (`draft.md` §3/§4.)
 
+An initializer may be an **array literal** — an aggregate constant, typed **`slice<T>` not `array<T>`**
+(ownership is a property of the type, so a top-level constant owns nothing; like a `str` literal, it
+is a `{ptr,len}` view of a per-unit read-only table, shared and never copied):
+
+```align
+PRIMES := [2, 3, 5, 7]          // slice<i64> (inferred)
+SCALE: slice<f64> := [0.5, 1.0] // annotated element type
+DAYS := ["Mon", "Tue"]          // slice<str>
+```
+
+Elements are scalars / `str` sharing one type (inferred or from the `slice<T>` annotation), each
+folded like a scalar constant. A constant index folds to the element (`PRIMES[1]` is `3`, no load); a
+dynamic index / `.len()` / slice / pipeline reads the table with no allocation. An `array<T>`
+annotation is rejected. Deferred in an element: function calls, `as` casts, nested arrays, references
+to other aggregate constants, and struct constants / elements.
+
 ### Type declarations (keyword-less)
 
 ```text

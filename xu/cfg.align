@@ -1,0 +1,3 @@
+module cfg
+SECRET := 5
+pub TABLE := [SECRET, 2]

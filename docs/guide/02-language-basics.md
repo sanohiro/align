@@ -124,6 +124,17 @@ fn main() -> i32 = AREA         // exits 42
 
 Top-level `NAME := expr` is a compile-time constant: keyword-less like everything in Align, immutable, folded and substituted at each use. Definition order doesn't matter (a constant may reference one defined later). An unannotated integer constant is `i64`.
 
+A constant can also be an **array literal** — a compile-time lookup table:
+
+```align
+PRIMES := [2, 3, 5, 7, 11]      // slice<i64>
+DAYS := ["Mon", "Tue", "Wed"]   // slice<str>
+
+fn main() -> i32 = PRIMES[3] as i32   // exits 7
+```
+
+Its type is **`slice<T>`, not `array<T>`** — in Align ownership is a property of the type, and a top-level constant owns nothing. Just as a string literal `"hello"` is a `str` (a view of read-only bytes) rather than an owned `string`, `PRIMES` is a `slice<i64>` viewing a read-only table baked into the program. Indexing (`PRIMES[3]`), `.len()`, and pipelines (`PRIMES.where(...).sum()`) all read it directly with no allocation, and a constant index folds to the element at compile time. Because the table is read-only, you cannot write through it (`PRIMES[0] = 9` is a compile error) — copy it into an owned array first if you need to modify it. Write `slice<T>` for the annotation (or omit it); an `array<T>` annotation is rejected.
+
 ## `print` and template strings
 
 `print(x)` writes any primitive value and a newline: integers, floats (`1.0` prints as `1.0`, shortest round-trip), `bool` (`true`/`false`), `char`, and strings. For composing text there are **template strings**:

@@ -30,8 +30,9 @@ keyword-less binding form (`NAME := expr` / `NAME: T := expr`), is immutable (`m
 top level), and is **evaluated at compile time** to a scalar / string value that is substituted as a
 literal at every use — so a constant never reaches MIR/codegen (zero new backend surface). Its value
 is built from literals, unary/binary operators, and references to other constants (cross-module
-references *inside* an initializer are deferred; aggregate/struct constants and `as` in a constant
-are deferred). A constant's type is **fixed at the definition** (unlike a local it does not infer
+references *inside* an initializer are deferred; **scalar/`str`-array aggregate constants landed
+2026-07-17 — see the extension below**; struct constants and `as` in a constant stay deferred). A
+constant's type is **fixed at the definition** (unlike a local it does not infer
 from a use site — it must be stable across modules), so an unannotated integer defaults to `i64` /
 a float to `f64`. Constants are **per-module namespaced like functions/types** (`module$NAME`
 canonical, entry unmangled so single-file programs stay byte-identical): `pub` exports one, an
@@ -39,6 +40,42 @@ importer names it qualified (`mod.NAME`), and a name may not be both a function 
 one module. Overflow wraps (defined two's-complement); division by zero, a cyclic definition, and a
 type mismatch are compile-time errors. Folded values feed the const string pool (`draft.md` §12).
 Record: `draft.md` §3/§4, `docs/language-spec.md`, `impl/02-frontend.md` §3, `examples/constants.align`, `tests/constants.rs`
+
+**Extension — aggregate (array) constants (S1, DONE 2026-07-17).** An initializer may be an **array
+literal** (`PRIMES := [2, 3, 5]`, `SCALE: slice<f64> := […]`, `DAYS := ["Mon", "Tue"]`). Its type is
+**`slice<T>` with `Region::Static`, never `array<T>`** — ownership is a property of the type, so a
+top-level array constant owns nothing; it is the exact analogue of a `str` literal (a static view of
+rodata). The folded elements become one **per-unit private read-only global** and the constant is a
+`{ptr,len}` view of it — shared, never copied, returnable, never dropped. Because it is a `slice<T>`,
+indexing, `.len()`, slicing, and pipelines flow through the existing borrowed-view paths with **no
+allocation** and no array-constant-as-value seam; a **constant index folds to the element** (no load),
+a dynamic index reads the table. Elements are S1 scalars / `str`, each folded by the same const-eval
+as a scalar (so element positions accept the `AREA := W*H` capability); the element type is inferred
+(`[1,2,3]` → `slice<i64>`) or taken from a `slice<T>` annotation. An `array<T>` annotation is rejected
+with guidance (a top-level array constant is a static `slice<T>` view). **Read-only enforcement:** the
+view is `Static` rodata, so writing through it (`TABLE[i] = v`, or an `out slice<T>` argument) is
+rejected even through a `mut` binding / sub-slice / rebind — a `readonly_locals` provenance set,
+grown at binding and slice reassignment (insert-only → sound-conservative), checked at `check_place`
+and the `out`-argument site; the same rule covers a string literal's `.bytes()` view. Cross-unit: a
+`pub` aggregate constant exports its initializer source (`IConst.value_src`, already folded into
+`interface_hash`), so each consumer rematerializes it against its own rodata and an edit invalidates
+dependents for free — no `FORMAT_VERSION` bump. A `pub` constant's value is part of the exported
+interface, so its initializer may reference only `pub` constants — enforced **producer-side** at the
+defining unit (Pass 0d-2) so whole-program and per-unit builds reach the same verdict (this fixed a
+pre-existing D1 divergence for the scalar `pub A := SECRET` shape too). **Deferred (recorded S1.5):**
+struct constants and struct elements; in an element position — function calls, `as` casts, nested
+arrays, and references to other aggregate constants (all fail-closed). **S3 (next):** a
+local-array-literal pooling probe (hoist a function-local `[…]` literal to the same rodata when it
+never escapes / is never mutated).
+Record: `draft.md` §3 (Constants) / §12, `docs/language-spec.md`, `docs/design-notes.md` (Memory model v2),
+`impl/02-frontend.md` §3, `impl/13-…` §8.4, `tests/constants_aggregate.rs`, `tests/per_unit.rs`, `tests/cache_codegen.rs`, `align_interface/tests/summary.rs`
+
+**Open follow-up (pre-existing, exposed here):** the read-only-view write check flags *compile-time
+constant* provenance (`ConstArray`, a string literal's bytes) traced within a function. The broader
+analogue — a slice viewing a **non-writable arena `mmap` view** (`fs.read_file_view`), or a constant
+laundered through a plain (non-`out`) `slice<T>` parameter across a call — is not yet flagged (it needs
+whole-program / buffer-writability provenance). Neither is introduced by aggregate constants; both are
+pre-existing holes. Record here rather than blocking S1.
 
 ### Bitwise & shift operators (DONE 2026-06-26)
 **Decision: integer operators `& | ^ << >>` + unary `~`, NOT bitset methods.** Bit work on integers
@@ -1226,10 +1263,13 @@ Beyond the JSON→SoA / field-skip thrust (which both external reviews converged
 - **Compile-time pipeline evaluation = zero-cost lookup tables.** Verified: a pipeline over literal /
   const data **constant-folds entirely** (`[1..16].sum()` → `mov $136`, no loop). So a declarative
   `[...].map(f)` that builds a lookup table (CRC/hash/codec/math LUT) costs **zero at runtime** (a
-  const global), where idiomatic Rust needs `const fn` (float/alloc-limited) or a build script. **Gap
-  /prerequisite:** top-level constants (PR #145) are scalar/string only — **aggregate (array)
-  constants don't exist yet**, so a top-level const *table* can't be expressed; that is the
-  prerequisite slice. Confidence: high (folding observed). Win is for table-driven code only.
+  const global), where idiomatic Rust needs `const fn` (float/alloc-limited) or a build script.
+  **Prerequisite now met (2026-07-17):** scalar/`str`-array **aggregate constants** shipped (S1 above),
+  so a top-level const *table* is expressible directly (`TABLE := [ … ]` → `slice<T>` over a private
+  rodata global; a constant index folds to the element). Remaining: a **struct**-element table (S1.5)
+  and folding a `[…].map(f)` *initializer* into the table (element positions today take folded scalar
+  expressions, not a pipeline). Confidence: high (folding + rodata lowering observed). Win is for
+  table-driven code only.
 
 **Audit — ruled out a risk (2026-06-27):** Align has no loops (map/reduce + recursion), so tail
 recursion *must* match a Rust loop. Verified: `fn sum_to(n, acc) = if n==0 {acc} else {sum_to(n-1,

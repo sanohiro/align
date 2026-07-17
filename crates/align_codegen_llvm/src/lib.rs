@@ -24,7 +24,7 @@ pub mod thinlto_spike;
 pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
-use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
+use align_mir::{Block, Const, ConstElem, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
@@ -4027,6 +4027,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         | Rvalue::ArrayBuilderNew { .. }
                         | Rvalue::Load(_)
                         | Rvalue::StrLit(_)
+                        | Rvalue::ConstArray { .. }
                         | Rvalue::StrClone(_)
                         | Rvalue::SliceLen(_)
                         | Rvalue::Bin(..)
@@ -6155,6 +6156,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::ConstArray { elems, elem } => {
+                // Build the `{ &rodata, len }` slice view over the per-unit private constant global.
+                let (ptr, len) = self.const_array_global(elems, *elem);
+                let sty = slice_struct_type(self.ctx);
+                let agg = self
+                    .builder
+                    .build_insert_value(sty.get_poison(), ptr, 0, "captr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(agg, len, 1, "calen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
             Rvalue::StrClone(op) => {
                 // Extract the source `{ptr,len}` view, deep-copy the bytes into a fresh heap
                 // buffer, and yield the owned `string` `{ptr,len}` the runtime returns.
@@ -8054,6 +8070,60 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_constant(true);
         mark_private_unnamed_addr(g);
         (g.as_pointer_value(), self.ctx.i64_type().const_int(s.len() as u64, false))
+    }
+
+    /// Materialize an aggregate constant's folded elements as a private read-only global and return
+    /// its `(&elements, len)` — the array-literal analogue of [`Self::str_global`]. A `str`-element
+    /// array lays out as `[N x {ptr,len}]` (each element a constant view into the string pool); any
+    /// other scalar as `[N x elem]`. `unnamed_addr` lets the linker merge identical constants, so this
+    /// does no interning of its own.
+    fn const_array_global(&self, elems: &[ConstElem], elem: Ty) -> (inkwell::values::PointerValue<'c>, IntValue<'c>) {
+        let len = self.ctx.i64_type().const_int(elems.len() as u64, false);
+        let arr: inkwell::values::ArrayValue<'c> = match elem {
+            Ty::Str => {
+                let sty = slice_struct_type(self.ctx);
+                let vals: Vec<_> = elems
+                    .iter()
+                    .map(|e| {
+                        let ConstElem::Str(s) = e else { unreachable!("str-element array holds Str elements") };
+                        let (ptr, l) = self.str_global(s);
+                        sty.const_named_struct(&[ptr.into(), l.into()])
+                    })
+                    .collect();
+                sty.const_array(&vals)
+            }
+            Ty::Float(_) => {
+                let ft = float_type(self.ctx, elem);
+                let vals: Vec<_> = elems
+                    .iter()
+                    .map(|e| {
+                        let ConstElem::Float(v) = e else { unreachable!("float-element array holds Float elements") };
+                        ft.const_float(*v)
+                    })
+                    .collect();
+                ft.const_array(&vals)
+            }
+            // Int / Bool / Char — all lower to an LLVM integer of the element width.
+            _ => {
+                let it = int_type(self.ctx, elem);
+                let signed = is_signed(elem);
+                let vals: Vec<_> = elems
+                    .iter()
+                    .map(|e| match e {
+                        ConstElem::Int(v) => it.const_int(*v as u64, signed),
+                        ConstElem::Bool(b) => it.const_int(*b as u64, false),
+                        ConstElem::Char(c) => it.const_int(*c as u64, false),
+                        _ => unreachable!("scalar-element array holds int/bool/char elements"),
+                    })
+                    .collect();
+                it.const_array(&vals)
+            }
+        };
+        let g = self.module.add_global(arr.get_type(), None, "const_arr");
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        mark_private_unnamed_addr(g);
+        (g.as_pointer_value(), len)
     }
 
     /// `template "..."` → in-place builder init, a write per piece, then in-place finish → str.

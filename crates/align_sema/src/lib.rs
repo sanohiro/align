@@ -1713,6 +1713,67 @@ enum ConstVal {
     Bool(bool),
     Char(u32),
     Str(String),
+    /// A folded aggregate constant `[e0, e1, …]` — the elements (each a scalar `ConstVal`) plus
+    /// their shared scalar element type. Substituted as a static `slice<elem>` view (see
+    /// [`hir::ExprKind::ConstArray`]).
+    Array(Vec<ConstVal>, Scalar),
+}
+
+/// Whether a scalar may be an aggregate-constant element (S1): an integer / float / bool / char /
+/// `str`. Struct (and every owned / handle) element is a recorded S1.5 deferral — restricting this
+/// also keeps a `pub` aggregate constant from naming a private element type.
+fn is_aggregate_const_elem(s: Scalar) -> bool {
+    matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)
+}
+
+/// Producer-side check that a `pub` constant's initializer references only `pub` same-module
+/// constants. A `pub` constant's value is part of the exported interface (its source is shipped in
+/// the interface summary and re-folded in every importing unit, where the defining module's PRIVATE
+/// items do not exist), so a reference to a private constant would type-check whole-program yet fail
+/// the per-unit build. `by` is the defining module's `bare → (canonical, is_pub)` const map. Walks
+/// the restricted constant-initializer grammar (literals, `Path`, unary/binary, array literals).
+fn check_pub_const_refs(
+    e: &ast::Expr,
+    by: Option<&HashMap<String, (String, bool)>>,
+    diags: &mut Diagnostics,
+) {
+    match &e.kind {
+        ast::ExprKind::Path(p) => {
+            if let Some(name) = single_name(p)
+                && let Some((_, is_pub)) = by.and_then(|b| b.get(name))
+                && !*is_pub
+            {
+                diags.error(
+                    format!("a `pub` constant's initializer references the private constant `{name}` — its value is part of the exported interface, so it may reference only `pub` constants (mark `{name}` `pub`, or inline its value)"),
+                    e.span,
+                );
+            }
+        }
+        ast::ExprKind::Unary { expr, .. } => check_pub_const_refs(expr, by, diags),
+        ast::ExprKind::Binary { lhs, rhs, .. } => {
+            check_pub_const_refs(lhs, by, diags);
+            check_pub_const_refs(rhs, by, diags);
+        }
+        ast::ExprKind::ArrayLit(elems) => {
+            for el in elems {
+                check_pub_const_refs(el, by, diags);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the HIR literal `ExprKind` for a folded **scalar** constant value. Shared by scalar-constant
+/// substitution and per-element aggregate-constant substitution.
+fn const_scalar_kind(val: &ConstVal) -> ExprKind {
+    match val {
+        ConstVal::Int(v) => ExprKind::Int(*v),
+        ConstVal::Float(v) => ExprKind::Float(*v),
+        ConstVal::Bool(b) => ExprKind::Bool(*b),
+        ConstVal::Char(c) => ExprKind::Char(*c),
+        ConstVal::Str(s) => ExprKind::Str(s.clone()),
+        ConstVal::Array(..) => unreachable!("an aggregate constant may not be an array element (rejected during folding)"),
+    }
 }
 
 /// A constant's declaration facts, collected before evaluation (keyed by canonical name).
@@ -1890,9 +1951,21 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     return None;
                 };
                 let (ty, val) = self.value(&canonical)?;
+                // An aggregate constant may not be referenced from another constant's initializer
+                // (v1 fail-closed, recorded deferral): neither aliased whole (`B := A`) nor used as an
+                // element (`B := [A, …]`). Each aggregate constant materializes its own per-unit
+                // rodata; composing them needs a shared-storage design not settled for S1.
+                if matches!(val, ConstVal::Array(..)) {
+                    self.diags.error(
+                        format!("aggregate constant `{name}` cannot be referenced from another constant's initializer yet"),
+                        e.span,
+                    );
+                    return None;
+                }
                 self.check_const_type(ty, expected, e.span)?;
                 Some((ty, val))
             }
+            K::ArrayLit(elems) => self.array(elems, expected, module, e.span),
             _ => {
                 self.diags.error(
                     "a constant initializer must be a literal, a unary/binary expression, or another constant".to_string(),
@@ -1906,6 +1979,66 @@ impl<'a, 'd> ConstEval<'a, 'd> {
     fn expect_scalar(&mut self, ty: Ty, val: ConstVal, expected: Option<Ty>, span: Span) -> Option<(Ty, ConstVal)> {
         self.check_const_type(ty, expected, span)?;
         Some((ty, val))
+    }
+
+    /// Fold an array-literal constant `[e0, e1, …]` into a [`ConstVal::Array`] typed `slice<elem>`.
+    /// The element type comes from a `slice<T>` annotation (`expected`) or is inferred from the first
+    /// element (unconstrained-literal defaults — `[1, 2, 3]` → `slice<i64>`). Every element folds via
+    /// the same const-eval as a scalar constant; elements must be scalars / `str` (nested arrays and
+    /// references to other aggregate constants are rejected — fail-closed, recorded S1 deferrals).
+    fn array(&mut self, elems: &[ast::Expr], expected: Option<Ty>, module: &str, span: Span) -> Option<(Ty, ConstVal)> {
+        // An annotation constrains the element type; a non-slice annotation is a type mismatch.
+        let mut elem_ty: Option<Ty> = match expected {
+            Some(Ty::Slice(s)) => Some(scalar_to_ty(s)),
+            Some(Ty::Error) | None => None,
+            Some(other) => {
+                self.diags.error(format!("expected {}, found an array literal", ty_name(other)), span);
+                return None;
+            }
+        };
+        if elems.is_empty() {
+            let Some(ty) = elem_ty else {
+                self.diags.error(
+                    "cannot infer the element type of an empty array constant (add a `slice<T>` annotation)".to_string(),
+                    span,
+                );
+                return None;
+            };
+            let es = ty_to_scalar(ty)?;
+            if !is_aggregate_const_elem(es) {
+                self.diags.error(
+                    format!("an aggregate constant's element type must be a scalar or `str`, got {}", ty_name(ty)),
+                    span,
+                );
+                return None;
+            }
+            return Some((Ty::Slice(es), ConstVal::Array(Vec::new(), es)));
+        }
+        let mut vals = Vec::with_capacity(elems.len());
+        for el in elems {
+            let (ty, val) = self.expr(el, elem_ty, module)?;
+            if ty == Ty::Error {
+                return None; // an element failed to fold; do not cascade
+            }
+            if matches!(val, ConstVal::Array(..)) {
+                self.diags.error(
+                    "an array constant's elements must be scalars or `str` (nested arrays are not supported)".to_string(),
+                    el.span,
+                );
+                return None;
+            }
+            // The first concrete element fixes the shared element type; later ones must match.
+            if elem_ty.is_none() {
+                elem_ty = Some(ty);
+            }
+            vals.push(val);
+        }
+        let ty = elem_ty.expect("non-empty array has a fixed element type");
+        let Some(es) = ty_to_scalar(ty) else {
+            self.diags.error(format!("`{}` cannot be an array-constant element type", ty_name(ty)), span);
+            return None;
+        };
+        Some((Ty::Slice(es), ConstVal::Array(vals, es)))
     }
 
     /// A constant has a fixed type; `Some(())` if it matches `expected` (or there is none), else a
@@ -2657,11 +2790,34 @@ pub fn check_program_with_effects(
                 let canonical = mangle_fn(&m.path, m.is_entry, bare);
                 let ann_ty = c.ty.as_ref().map(|t| {
                     let ty = resolve_type(t, tcx!(m.path.as_str(), &no_imports), &[], diags);
-                    if matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error) {
-                        ty
-                    } else {
-                        diags.error(format!("a constant's type must be a scalar or `str`, got {}", ty_name(ty)), t.span());
-                        Ty::Error // suppress a cascading mismatch when folding the initializer
+                    match ty {
+                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error => ty,
+                        // A top-level aggregate constant is a **static `slice<T>` view** of per-unit
+                        // rodata (ownership is a property of the type — like a `str` literal), so the
+                        // only aggregate annotation is `slice<T>`; an owned `array<T>` annotation is
+                        // rejected with guidance. The element must be an S1 scalar / `str` — a
+                        // `slice<Struct>` (etc.) is rejected here, which also closes the pub-exposure
+                        // hole of a `pub` const naming a private element type (struct elements are a
+                        // recorded S1.5 deferral).
+                        Ty::Slice(elem) if is_aggregate_const_elem(elem) => ty,
+                        Ty::Slice(elem) => {
+                            diags.error(
+                                format!("an aggregate constant's element type must be a scalar or `str`, got {}", scalar_name(elem)),
+                                t.span(),
+                            );
+                            Ty::Error
+                        }
+                        Ty::Array(..) | Ty::DynArray(_) | Ty::StructArray(..) | Ty::DynStructArray(..) => {
+                            diags.error(
+                                format!("a top-level array constant is a static `slice<T>` view, got `{}`; write `slice<T>` or omit the annotation", ty_name(ty)),
+                                t.span(),
+                            );
+                            Ty::Error // suppress a cascading mismatch when folding the initializer
+                        }
+                        _ => {
+                            diags.error(format!("a constant's type must be a scalar, `str`, or `slice<T>`, got {}", ty_name(ty)), t.span());
+                            Ty::Error
+                        }
                     }
                 });
                 by.insert(bare.clone(), (canonical.clone(), matches!(c.vis, ast::Vis::Pub)));
@@ -2681,6 +2837,27 @@ pub fn check_program_with_effects(
             eval.value(canonical);
         }
         const_table.values = eval.values;
+    }
+
+    // Pass 0d-2 (producer-side pub-const surface, the D1 divergence for constants): a `pub`
+    // constant's initializer ships as source in the interface summary and is re-folded in every
+    // importing unit, where the defining module's PRIVATE constants do not exist. So a `pub` constant
+    // may reference only `pub` same-module constants — enforced here at the defining unit so
+    // whole-program and per-unit builds reach the same verdict (a `pub A := SECRET` no longer
+    // type-checks whole-program only to fail per-unit with an <interface:…>-located error). Runs for
+    // every real module in both build paths; interface-only dependencies were checked at their own
+    // production time.
+    for m in modules {
+        if m.interface_only {
+            continue;
+        }
+        let by = const_table.by_module.get(&m.path);
+        for item in &m.file.items {
+            let ast::Item::Const(c) = item else { continue };
+            if matches!(c.vis, ast::Vis::Pub) {
+                check_pub_const_refs(&c.value, by, diags);
+            }
+        }
     }
 
     // Pass 0e (M15 S1b, gate finding D1): a generic `pub` fn's BODY is part of its interface — the
@@ -4169,9 +4346,10 @@ impl EffectScan<'_> {
                     self.expr(c);
                 }
             }
-            // Leaves.
+            // Leaves. A `ConstArray`'s elements are already-folded pure literals — no effects.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
+            | ExprKind::ConstArray { .. }
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
@@ -5072,6 +5250,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(..)
             | ExprKind::Char(..)
             | ExprKind::Str(..)
+            // An aggregate constant is a view of process-lifetime rodata — `Static`, like a `str`
+            // literal (its elements borrow nothing; a `str` element views its own static bytes).
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(..)
             | ExprKind::Unary { .. }
             | ExprKind::Cast(..)
@@ -5294,6 +5475,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(..)
             | ExprKind::Char(..)
             | ExprKind::Str(..)
+            // An aggregate constant views process-lifetime rodata, never a function-local slot.
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(..)
             | ExprKind::Unary { .. }
             | ExprKind::Cast(..)
@@ -6337,6 +6520,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            // An aggregate constant is a static rodata view — no borrow provenance to propagate.
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
@@ -6911,11 +7096,13 @@ impl UnnecessaryHeapScan {
             }
             // Leaves and nodes whose only local references (a `Field`/`SoaColumn`/`IndexField` /
             // group-agg base) are never a box local — a box has no fields, columns, or indexing.
+            // A `ConstArray`'s elements are folded literals, never a box local.
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone
             | ExprKind::WriterStd { .. }
@@ -8335,11 +8522,13 @@ impl<'a> MoveCheck<'a> {
                     _ => self.expr(recv, moved, false, false),
                 }
             }
+            // An aggregate constant is a Copy `{ptr,len}` view of rodata — reading it moves nothing.
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone => {}
         }
@@ -8417,6 +8606,15 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
+    /// Slice/bytes locals that (transitively) view **read-only** storage — a constant table
+    /// (`ExprKind::ConstArray`, in per-unit rodata) or a string literal's bytes (`"lit".bytes()`).
+    /// Such a view owns nothing *and* its backing storage is not writable, so writing through it
+    /// (`s[i] = v`, or passing it to an `out slice<T>` parameter) would store into the `constant`
+    /// global — a SIGSEGV at `-O0` and a silently-dropped write at `-O2`. Populated at binding (and a
+    /// slice reassignment) and **only ever grown** (insert-only, so a value read-only on any reaching
+    /// path stays flagged — sound-conservative), then checked at the two write sites. The mutable
+    /// backing-buffer analogue for an arena `mmap` view is a pre-existing follow-up (open-questions).
+    readonly_locals: std::collections::HashSet<LocalId>,
     /// Reader locals bound from `r.buffered()` (or `?`/block tails thereof). `read_line` requires a
     /// buffered receiver; since a buffered and an unbuffered reader share [`Ty::Reader`] (mirroring
     /// the buffered *writer* — one type, many constructors), this per-local provenance set is what
@@ -8541,6 +8739,7 @@ impl<'a, 't> Checker<'a, 't> {
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
+            readonly_locals: std::collections::HashSet::new(),
             buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
             cur_fn: String::new(),
@@ -8994,6 +9193,14 @@ impl<'a, 't> Checker<'a, 't> {
                     if local_ty == Ty::Reader && init_is_buffered_reader(&init) {
                         self.buffered_readers.insert(local);
                     }
+                    // Record read-only-view provenance (`s := TABLE`, `b := "x".bytes()`, a sub-slice
+                    // of either) so a later `s[i] = v` / `out`-argument write to constant rodata is
+                    // rejected. Insert-only (monotone): once read-only, a later reassignment cannot
+                    // clear it (a straight-line overwrite could, but a branch join could not — keeping
+                    // it conservative avoids a false-negative soundness hole).
+                    if self.hir_is_readonly_view(&init) {
+                        self.readonly_locals.insert(local);
+                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -9089,6 +9296,12 @@ impl<'a, 't> Checker<'a, 't> {
                                 Ty::Str => self.check_str_init(value),
                                 _ => self.check_expr(value, Some(ty)),
                             };
+                            // Reassigning a read-only view (`s = TABLE`) taints the slice local
+                            // read-only too. Insert-only: a later `s = writable` cannot clear it, so a
+                            // write reachable from the read-only assignment on any path is rejected.
+                            if matches!(ty, Ty::Slice(_)) && self.hir_is_readonly_view(&v) {
+                                self.readonly_locals.insert(id);
+                            }
                             stmts.push(Stmt::Assign {
                                 local: id,
                                 value: v,
@@ -9197,6 +9410,12 @@ impl<'a, 't> Checker<'a, 't> {
                     format!("cannot assign to an element of immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                     place.span,
                 );
+            }
+            // A `mut` binding does not make a **read-only view** writable: a slice viewing a constant
+            // table (or a string literal's bytes) points at the `constant` rodata global, so a store
+            // through it faults / is dropped. Reject the element write (soundness).
+            if self.reject_readonly_dst(id, place.span, "write to an element of") {
+                return Place::Err;
             }
             // `v[lane] = x` — write one lane of a `mut` vector (a constant lane in `0..N`, M6).
             if let Ty::Vec(s, n) = local_ty {
@@ -9755,14 +9974,21 @@ impl<'a, 't> Checker<'a, 't> {
     /// the expected type — a constant has a fixed type, so a mismatch is a normal type error).
     fn const_literal(&mut self, ty: Ty, val: &ConstVal, expected: Option<Ty>, span: Span) -> Expr {
         self.constrain(ty, expected, span);
-        let kind = match val {
-            ConstVal::Int(v) => ExprKind::Int(*v),
-            ConstVal::Float(v) => ExprKind::Float(*v),
-            ConstVal::Bool(b) => ExprKind::Bool(*b),
-            ConstVal::Char(c) => ExprKind::Char(*c),
-            ConstVal::Str(s) => ExprKind::Str(s.clone()),
-        };
-        Expr { kind, ty, span }
+        if let ConstVal::Array(elems, elem) = val {
+            // Substitute as a static `slice<elem>` view of per-unit rodata: each element is folded
+            // to its scalar literal, materialized as a read-only global in codegen.
+            let elem_ty = scalar_to_ty(*elem);
+            let hir_elems: Vec<Expr> = elems
+                .iter()
+                .map(|v| Expr { kind: const_scalar_kind(v), ty: elem_ty, span })
+                .collect();
+            return Expr {
+                kind: ExprKind::ConstArray { elems: hir_elems, elem: *elem, len: elems.len() as u32 },
+                ty,
+                span,
+            };
+        }
+        Expr { kind: const_scalar_kind(val), ty, span }
     }
 
     /// Build a first-class value for an already-resolved top-level function. Bare and qualified
@@ -10002,6 +10228,56 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
     /// array→slice borrow). Used to record slice provenance for the `out` no-alias check.
+    /// Reject a write to a **read-only view** destination `id` (a local viewing a constant table or a
+    /// string literal's bytes). Returns `true` (after reporting) when the write must be rejected. The
+    /// single guard shared by every slice-write entry point (`s[i] = v`, `s.store(i, v)`,
+    /// `pipeline.map_into(s)`), so a new write site cannot silently miss the read-only check.
+    fn reject_readonly_dst(&mut self, id: LocalId, span: Span, verb: &str) -> bool {
+        if self.readonly_locals.contains(&id) || self.readonly_locals.contains(&self.root_local(id)) {
+            let name = self.locals[id as usize].name.clone();
+            self.diags.error(
+                format!("cannot {verb} '{name}': it is a read-only view of a constant table (a constant table is read-only; copy it into an owned array — `mut a := ...` over its elements — to modify)"),
+                span,
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Whether a checked expression is a **read-only view** — it (transitively) borrows constant
+    /// rodata (a `ConstArray` table, or a string-literal's bytes) rather than writable storage.
+    /// Writing through such a view stores into a `constant` global, so the two write sites
+    /// (`check_place` element assignment, and an `out slice<T>` argument) reject it. A control-flow
+    /// value is read-only if *any* reaching arm is (a write must be rejected if any path could target
+    /// rodata).
+    fn hir_is_readonly_view(&self, e: &Expr) -> bool {
+        match &e.kind {
+            // A constant table lives in per-unit read-only rodata.
+            ExprKind::ConstArray { .. } => true,
+            // `"literal".bytes()` (a `str` constant substitutes to a `str` literal) views the
+            // literal's rodata; a runtime `string`'s bytes are writable and out of scope.
+            ExprKind::StrBytes { inner } => matches!(inner.kind, ExprKind::Str(_)) || self.hir_is_readonly_view(inner),
+            // A bound local carries the provenance recorded at its binding (and any root it borrows).
+            ExprKind::Local(id) => {
+                self.readonly_locals.contains(id) || self.readonly_locals.contains(&self.root_local(*id))
+            }
+            // A borrow / sub-slice of a read-only view is itself read-only.
+            ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv) => self.hir_is_readonly_view(recv),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::Unsafe(b) => {
+                b.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+            }
+            ExprKind::If { then, els, .. } => {
+                then.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+                    || els.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.hir_is_readonly_view(&a.body)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.hir_is_readonly_view(opt) || self.hir_is_readonly_view(fallback)
+            }
+            _ => false,
+        }
+    }
+
     fn expr_root_local(&self, e: &Expr) -> Option<LocalId> {
         match &e.kind {
             ExprKind::Local(id) => Some(self.root_local(*id)),
@@ -10911,11 +11187,28 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        let checked = args
+        let checked: Vec<Expr> = args
             .iter()
             .enumerate()
             .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
             .collect();
+        // An `out slice<T>` parameter is written by the callee, so its argument must be writable
+        // storage. A read-only view of a constant table (or a string literal's bytes) points at the
+        // `constant` rodata global — passing it as `out` would have the callee store into read-only
+        // memory. Reject it (the call-site half of the read-only-view rule; the element-write half is
+        // in `check_place`).
+        for (i, &is_out) in out.iter().enumerate() {
+            if is_out
+                && matches!(param_tys.get(i).map(|t| self.resolve(*t)), Some(Ty::Slice(_)))
+                && checked.get(i).is_some_and(|a| self.hir_is_readonly_view(a))
+            {
+                let sp = args.get(i).map(|a| a.span).unwrap_or(span);
+                self.diags.error(
+                    format!("cannot pass a read-only view of a constant table as the `out` argument to '{name}': an `out` buffer is written by the callee (copy the constant into an owned array first)"),
+                    sp,
+                );
+            }
+        }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
     }
 
@@ -12202,6 +12495,9 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("cannot store into immutable '{name}' (declare with `mut`, or use an `out` parameter)"), recv.span);
             return err;
         }
+        if self.reject_readonly_dst(id, recv.span, "store into") {
+            return err;
+        }
         let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
         if !idx.ty.is_int_like() && idx.ty != Ty::Error {
             self.diags.error(format!("a store index must be an integer, got {}", ty_name(idx.ty)), i.span);
@@ -12745,6 +13041,18 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `.field` projection on an array.
             ast::ExprKind::FieldAccess { recv, field } => {
+                // `mod.CONST` — a qualified reference to an imported module's constant (e.g. an
+                // aggregate constant `cfg.TABLE.sum()`) is the pipeline *source*, not a `.field`
+                // projection over `mod`. A local shadowing the leftmost segment makes it a real
+                // value-projection (mirrors `check_field_access`'s qualified-const guard).
+                let leftmost_is_local = leftmost_segment(recv).is_some_and(|l| self.name_in_scope(l));
+                if !leftmost_is_local
+                    && let Some(modpath) = flatten_module_path(recv)
+                    && modpath != self.cur_module
+                    && self.user_imports.contains(&modpath)
+                {
+                    return (e, Vec::new());
+                }
                 let (src, mut stages) = self.collect_pipeline(recv);
                 stages.push(RawStage::Project(field.clone()));
                 (src, stages)
@@ -13468,6 +13776,9 @@ impl<'a, 't> Checker<'a, 't> {
                 format!("cannot write into immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                 dst_arg.span,
             );
+            return err;
+        }
+        if self.reject_readonly_dst(dst_id, dst_arg.span, "write into") {
             return err;
         }
         // Type-check the pipeline; a stageless inline literal source infers its element from `dst`.
@@ -14853,6 +15164,19 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
             return err;
         }
+        // A constant index into an aggregate constant folds to the element literal at compile time
+        // (no rodata load): `TABLE[3]` becomes the folded value of element 3. An out-of-range constant
+        // index is a compile error. A dynamic index falls through to the normal slice-index path
+        // against the rodata `{ptr,len}` view below.
+        if let ExprKind::ConstArray { elems, len, .. } = &r.kind
+            && let ExprKind::Int(v) = i.kind
+        {
+            if v < 0 || v as u128 >= *len as u128 {
+                self.diags.error(format!("index {v} is out of bounds for a length-{len} array constant"), span);
+                return err;
+            }
+            return elems[v as usize].clone();
+        }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
@@ -16212,6 +16536,9 @@ impl<'a, 't> Checker<'a, 't> {
                         format!("cannot shuffle immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                         xs_arg.span,
                     );
+                    return err;
+                }
+                if self.reject_readonly_dst(xid, xs_arg.span, "shuffle") {
                     return err;
                 }
                 Expr { kind: ExprKind::RandShuffle { rng: Box::new(recv_expr), xs: Box::new(xs), elem: scalar_to_ty(es) }, ty: Ty::Unit, span }
@@ -18838,6 +19165,13 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.finalize_expr(c);
+                }
+            }
+            // An aggregate constant's elements are folded literals; finalize each so an out-of-range
+            // element under an annotation (`slice<u8> := [300]`) is rejected like a scalar constant.
+            ExprKind::ConstArray { elems, .. } => {
+                for el in elems {
+                    self.finalize_expr(el);
                 }
             }
             // A bare (non-negated) integer literal: reject it if its value provably overflows the

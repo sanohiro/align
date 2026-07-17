@@ -478,6 +478,12 @@ pub enum Rvalue {
     SubSlice { base: Operand, start: Operand, len: Operand, elem: Ty },
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
+    /// A top-level **aggregate constant** — a `slice<elem>` view `{ &rodata, len }` over a per-unit
+    /// private read-only global holding the folded elements. `elem` is the element scalar type; a
+    /// `Ty::Str` element array lays out as `[N x {ptr,len}]` (each pointing into the string pool),
+    /// any other scalar as `[N x elem]`. The array-literal analogue of [`Rvalue::StrLit`]: it borrows
+    /// nothing, is `Static`, and is never moved or dropped.
+    ConstArray { elems: Vec<ConstElem>, elem: Ty },
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
@@ -993,6 +999,17 @@ pub enum Const {
     Bool(bool),
     /// The unit value `()`.
     Unit,
+}
+
+/// One folded element of an aggregate constant ([`Rvalue::ConstArray`]). The element type is carried
+/// once by the `Rvalue`, so an element only needs its value (no per-element type tag).
+#[derive(Clone, Debug)]
+pub enum ConstElem {
+    Int(i128),
+    Float(f64),
+    Char(u32),
+    Bool(bool),
+    Str(String),
 }
 
 #[derive(Clone, Debug)]
@@ -2598,6 +2615,24 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Str(s) => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ConstArray { elems, elem, len: _ } => {
+            // Each element is a folded scalar/str literal (built by sema's `const_literal`);
+            // collect them into the MIR aggregate and let codegen materialize the rodata global.
+            let cvals: Vec<ConstElem> = elems
+                .iter()
+                .map(|el| match &el.kind {
+                    hir::ExprKind::Int(v) => ConstElem::Int(*v),
+                    hir::ExprKind::Float(v) => ConstElem::Float(*v),
+                    hir::ExprKind::Bool(bl) => ConstElem::Bool(*bl),
+                    hir::ExprKind::Char(c) => ConstElem::Char(*c),
+                    hir::ExprKind::Str(s) => ConstElem::Str(s.clone()),
+                    _ => unreachable!("aggregate-constant element is a folded scalar/str literal"),
+                })
+                .collect();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ConstArray { elems: cvals, elem: align_sema::scalar_to_ty(*elem) }));
             Operand::Value(v)
         }
         hir::ExprKind::Template(parts) => {

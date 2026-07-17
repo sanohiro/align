@@ -343,6 +343,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("subslice({}, +{}, len={} : {})", operand_str(base), operand_str(start), operand_str(len), ty_name(*elem))
         }
         Rvalue::StrLit(s) => format!("{s:?}"),
+        Rvalue::ConstArray { elems, elem } => format!("const_array[{}] : {}", elems.len(), ty_name(*elem)),
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
         Rvalue::StrPredicate { kind, haystack, needle } => {
             let name = match kind {
