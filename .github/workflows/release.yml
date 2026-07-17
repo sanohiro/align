@@ -99,9 +99,9 @@ jobs:
           mkdir -p package
           cp target/release/alignc package/
           cp target/release/libalign_runtime.a package/
-          cp LICENSE README.md README.ja.md package/
+          cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md package/
           tar -C package -czf "$ARTIFACT.tar.gz" \
-            alignc libalign_runtime.a LICENSE README.md README.ja.md
+            alignc libalign_runtime.a LICENSE-APACHE LICENSE-MIT README.md README.ja.md
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -165,7 +165,7 @@ jobs:
           exec /usr/lib/align/alignc "$@"
           EOF
             chmod 0755 "$ROOT/usr/bin/alignc"
-            cp LICENSE README.md README.ja.md "$ROOT/usr/share/doc/alignc/"
+            cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md "$ROOT/usr/share/doc/alignc/"
             cat > "$ROOT/DEBIAN/control" <<EOF
           Package: alignc
           Version: $VERSION
