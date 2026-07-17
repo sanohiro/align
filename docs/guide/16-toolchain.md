@@ -87,4 +87,4 @@ These are the performance model speaking at the source line, not style rules. Fi
 
 ## What's deliberately missing
 
-There is no package manager, project manifest, general test runner, or debugger integration yet. The `pkg` layer is intended to remain outside core and std. The current contract is deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.
+There is no Align language-package registry/resolver, project manifest, general test runner, or debugger integration yet. Homebrew and apt can distribute the compiler itself; source dependencies remain the future `pkg` layer outside core and std. The current contract is deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.

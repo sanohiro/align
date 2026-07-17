@@ -52,9 +52,9 @@ cargo run --bin alignc -- run examples/arena.align     # arena + heap box; exits
 cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; exits 24
 ```
 
-`alignc` の主なサブコマンド: `check`, `fmt`, `emit-mir`, `emit-llvm`, `emit-obj`, `build`, `run`, `size`。
+日常的に使うコマンドは `check`、`fmt`、`build`、`run` です。検査・ビルド制御用には `check-per-unit`、`emit-interface`、`emit-mir`、`emit-llvm`、`emit-obj`、`explain-opt`、`size`、`cache clear` があり、`alignc --version` でコンパイラのバージョンを確認できます。複数ファイルの codegen は既定で並列かつ cache され、production build では `--rt-lto`、`--thin-lto`、instrumented PGO を明示的に選べます。
 
-**ソースからビルドする場合の必要環境:** Rust 1.96 以上、LLVM 22 (`llvm-config-22` が `PATH` 上にあること)、リンク用の C コンパイラ(`cc`)。圧縮、暗号、HTTP を使うプログラムには zlib、zstd、OpenSSL の開発ライブラリも必要です。
+**ソースからビルドする場合の必要環境:** Rust 1.96 以上、LLVM 22 (`llvm-config-22` が `PATH` 上にあること)、リンク用の C コンパイラ(`cc`)。圧縮、暗号、HTTP を使うプログラムには zlib、zstd、OpenSSL の開発ライブラリも必要です。暗号機能の大半は OpenSSL 3.0 で動きますが、`crypto.argon2id` には OpenSSL 3.2 以上が必要で、その provider がない環境では engine error を返します。
 
 ## リリース版のインストール
 
@@ -74,7 +74,7 @@ curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
 sudo apt install alignc
 ```
 
-各 GitHub リリースにはアーカイブと `.deb` も添付されます。`alignc` は LLVM 22 を動的に利用し、システムの C リンカーを呼び出すため、完全な静的バイナリではなく、ツールチェーン依存を明示したネイティブパッケージとして配布します。
+各 GitHub リリースにはアーカイブと `.deb` も添付されます。生のアーカイブを使う場合は、`alignc` と対応する `libalign_runtime.a` を同じ場所に保つ必要があります。`alignc` は LLVM 22 を動的に利用し、システムの C リンカーを呼び出すため、完全な静的バイナリではなく、ツールチェーン依存を明示したネイティブパッケージとして配布します。
 
 ## ステータス
 
@@ -87,7 +87,7 @@ sudo apt install alignc
 ## レイアウト
 
 - `draft.md` —— 言語仕様の正典
-- `docs/guide/` —— 実践的なチュートリアル、全18章(英語 + 日本語)
+- `docs/guide/` —— 実践的なチュートリアル、全19章(`00`〜`18`、英語 + 日本語)
 - `docs/little-aligner/` —— *The Little Schemer* スタイルの Q&A ドリル・ワークブック(英語 + 日本語)
 - `docs/` —— 設計の根拠、経緯、非目標、未解決の論点
 - `docs/impl/` —— コンパイラ実装計画 + 標準ライブラリのモジュール設計仕様

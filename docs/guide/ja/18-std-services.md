@@ -74,7 +74,7 @@ pub fn main() -> Result<(), Error> {
 
 `gzip_*` と `zstd_*` は同じ byte-to-owned-buffer の形です。不正または大きすぎる圧縮入力は、上限なしの確保ではなく error になります。
 
-`std.crypto` は OS random byte、SHA-256/512、HMAC-SHA256、HKDF-SHA256、Argon2id、AES-256-GCM、ChaCha20-Poly1305、constant-time equality を提供します。独自暗号を発明せず OpenSSL を wrap します。AEAD open は all-or-nothing で、認証失敗時に plaintext を一切渡しません。`constant_time_equal` は同じ長さの内容に対して constant-time です。入力長は公開情報として扱います。BLAKE3 は適切な監査済み system engine が得られるまで公開しません。
+`std.crypto` は OS random byte、SHA-256/512、HMAC-SHA256、HKDF-SHA256、Argon2id、AES-256-GCM、ChaCha20-Poly1305、constant-time equality を提供します。独自暗号を発明せず OpenSSL を wrap します。Argon2id には OpenSSL 3.2 で追加された provider が必要で、古い engine では出力を渡さず `Error.Code` を返します。AEAD open は all-or-nothing で、認証失敗時に plaintext を一切渡しません。`constant_time_equal` は同じ長さの内容に対して constant-time です。入力長は公開情報として扱います。BLAKE3 は適切な監査済み system engine が得られるまで公開しません。
 
 ## high-throughput の building block
 

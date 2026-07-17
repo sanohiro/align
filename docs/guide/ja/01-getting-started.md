@@ -35,6 +35,8 @@ cargo build
 
 これでコンパイラは `./target/debug/alignc` に置かれます。`PATH` は通っていないので、パスを指定して呼ぶか、エイリアスを張ってください。(`--release` ビルドなら `./target/release/alignc` ができます。コンパイラ自体の実行は速くなりますが、生成されるコードは同じです。) `alignc` は LLVM 22 を動的に利用し、生成するプログラムのリンクに `cc` を呼び出すため、実行ファイルだけを置いてもネイティブツールチェーンへの依存はなくなりません。
 
+Ubuntu 24.04 標準の OpenSSL 3.0 で TLS、hash、HMAC、HKDF、AEAD は利用できます。`crypto.argon2id` の provider は OpenSSL 3.2 で追加されたため、この操作が必要なら新しい OpenSSL を入れてください。それ以外の環境では実行時に engine error を返します。
+
 ## Hello, Align
 
 次の内容を `hello.align` として保存します。
@@ -60,13 +62,19 @@ hello, align
 ## サブコマンド
 
 ```text
-alignc check     file.align          型検査のみ、診断を表示
-alignc build     file.align          ネイティブ実行ファイルを生成(./file)
-alignc run       file.align [args…]  ビルド + 実行、末尾の引数は main(args) へ渡る
-alignc fmt       file.align [--write] 整形(標準出力へ表示、--write でその場で書き換え)
-alignc emit-mir  file.align          中間 IR をダンプ(興味のある人向け)
-alignc emit-llvm file.align          LLVM IR をダンプ(自分のコードが何になったか正確に確認)
-alignc emit-obj  file.align [out.o]  オブジェクトファイルのみ、リンクなし
+alignc check          file.align          型検査と lint
+alignc check-per-unit file.align          各 import unit を interface 経由で検査
+alignc emit-interface file.align          public interface と hash を表示
+alignc build          file.align          ネイティブ実行ファイルを生成(./file)
+alignc run            file.align [args…]  build + run、末尾の引数は main(args) へ渡る
+alignc fmt            file.align [--write] 整形(表示、--write でその場で書き換え)
+alignc emit-mir       file.align          中間 IR をダンプ
+alignc emit-llvm      file.align          最適化前後の LLVM IR をダンプ
+alignc emit-obj       file.align [out.o]  object file のみ、link なし
+alignc explain-opt    file.align          optimizer の判断を source line 上で説明
+alignc size           file.align          build して executable の size を報告
+alignc cache clear                        解決した codegen cache を消去
+alignc --version                          compiler version を表示
 ```
 
 日々のループは、編集中は `check`、試すときは `run` です。`emit-llvm` は早めに知っておく価値があります。Align の設計は、素直なコードが引き締まった機械語へ落ちることを約束しています。その約束を自分の目で確かめる手段が `emit-llvm` です。
