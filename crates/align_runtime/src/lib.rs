@@ -3537,7 +3537,7 @@ unsafe fn rep_bytes<'a>(p: *const AlignStr) -> &'a [u8] {
 /// would exceed it the remaining rows promote to the map, so a high-cardinality key column can never
 /// degrade to O(rows × groups). The value is **measured, not the §8.3 hypothesis of 8/16**: on a
 /// Ryzen 9 5950X (`group_short_n_probe`) the linear/hash crossover for adversarial same-length keys is
-/// ~4; at 8 the cardinality-6/8 cases regress up to 0.68x. Four wins 1.3-2.0x at cardinality 1-4
+/// ~4; at 8 the cardinality-6/8 cases regress up to 0.68x. Four wins 1.07-2.31x at cardinality 1-4
 /// (the common low-cardinality OLAP shape) and stays neutral (≤1-2%) above via promotion.
 const GROUP_LINEAR_MAX: usize = 4;
 
@@ -16275,7 +16275,8 @@ mod tests {
             .map(|k| AlignStr { ptr: if k.is_empty() { std::ptr::null() } else { k.as_ptr() }, len: k.len() as i64 })
             .collect();
         let n = rk.len();
-        // cap below the 8-group linear crossover → overflow detected inside the linear phase.
+        // cap=3 sits below GROUP_LINEAR_MAX (4) → the ONLY case pinning cap overflow inside the
+        // linear phase; caps 5/8/9 promote at the 5th distinct key and pin overflow in phase 2.
         for cap in [3usize, 5, 8, 9] {
             let mut ok = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; n];
             let mut ov = vec![0i64; n];
