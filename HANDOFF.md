@@ -8,7 +8,37 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (sixth update this day), **INSTRUMENT-PGO SV IS SHIPPED AND THE PGO ARC
+_Last updated: 2026-07-17 (seventh update this day), **REPEATED-NEEDLE PLAN HOISTING IS SHIPPED —
+MERGED as #503** (`b59d65e`; doc-13 P3 item 3, gate 1 of 4). `xs.where(fn s {
+s.contains(NEEDLE) })` with an invariant needle now builds ONE memchr plan in the loop preheader
+(`align_rt_str_finder_new/find/free`; the plan owns its needle copy) and reuses it per element —
+LLVM structurally cannot do this (search entries withhold `memory(...)` for the ifunc dispatch
+cache; the Finder build lives inside the FFI call). Recognition (sema, WhereField precedent →
+`StageKind::WhereStrContains`) is restricted to a **bare free-variable path or string literal
+only** — the /code-review pass PROVED the original parameter-free-expression walker changed
+observable semantics (an impure needle call ran once instead of per-element; a trapping index
+aborted before an empty loop; a `?`-needle flipped program legality) — non-atom needles keep the
+per-call path, pinned by gates. The plan is a synthetic-owned Move resource (`Ty::StrFinder`,
+`Rvalue::StrFinderNew/Find`) wired exhaustively through every analysis pass; freed exactly once on
+every exit path; a real feature-gated leak gate (finder new==free counters) lives in
+bench/needle_hoist. `finder_find` keeps the `feature_detect_reader` contract — the argmem-read
+upgrade was falsified for 1-byte needles against the memchr 2.8.2 source (one-byte searcher hits
+the AtomicPtr dispatch cache at find time). The honest identical-pipeline measurement (the
+`ALIGN_NEEDLE_HOIST=off` MIR toggle, ALIGN_SORT_ADAPTIVE precedent incl. the cache force-off
+guard) holds the adoption gate: **≤128 B geomean 1.95x** (1.42–3.37x), 1 KiB 1.09–1.19x, 16 KiB
+1.00–1.01x neutral. Deferrals recorded in §6.6: map(find/rfind), explicit-loop shapes,
+replace/split, owned-`string` needle borrow-once, field-of-path atoms; no public Pattern type
+(settled). Gates: differential vs the one-shot oracle (fuzz edges + seeded 3000), IR-shape
+preheader/body mutation-checked, negative controls (element-derived/impure/indexed/`?` needles),
+drop/double-free, run-parity, the toggle pin. Workspace green; clippy clean all feature states
+(the one full-suite flake was the pre-existing gate_sv4 PGO timing gate — passes in isolation,
+re-verified). **Next: doc-13 P3 gate 2 of 4 — the JSON escape SIMD classifier** (P1-promoted,
+scalar <32 crossover; adoption gate = end-to-end builder benchmark on x86 baseline/v3 +
+differential tails + every control-byte class; the arm64 half stays recorded-pending native
+hardware), then unique-buffer donation, then the short-N group strategy gate, then the
+owner-approved top-level aggregate constants arc (language surface + doc-13 §8.4 pooling), then
+STOP per the owner's instruction. Previous update: 2026-07-17 (sixth update this day),
+**INSTRUMENT-PGO SV IS SHIPPED AND THE PGO ARC
 IS CLOSED — MERGED as #502** (`0355782`; the full arc: S0 #499 spike → S1 #500 serial → S2 #501
 cache → SV #502 verification + payoff). The SV bundle (`crates/align_driver/tests/pgo_sv.rs`, 7
 gates): build-twice byte-identity for instrument AND use modes (separate cold roots, coldness via
