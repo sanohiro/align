@@ -1,0 +1,12 @@
+This PR prepares the repository for the v0.1.0 release.
+
+## Changes
+- **LICENSE**: Added Apache-2.0 / MIT dual licensing (`LICENSE-APACHE` + `LICENSE-MIT`) and updated `Cargo.toml` and `README`s.
+- **README**: Revamped the README with a one-paragraph intro, source build installation instructions (Rust 1.96 + LLVM 22 + clang-22 @ apt.llvm.org), platform support (Linux x86-64, macOS aarch64; Windows unsupported), and a "Hello world" example.
+- **Release Notes**: Created `RELEASE_NOTES_0.1.0.md` summarizing M0–M15+M14 waves, backward compatibility warnings, and known intentional limitations.
+
+## Release Gate Validation
+Ran `cargo build --workspace && cargo test --workspace` sequentially to avoid the known runtime archive divergence issue.
+
+- **Exit code**: `0` (Success)
+- All workspace tests passed.
