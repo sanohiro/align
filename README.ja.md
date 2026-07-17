@@ -52,13 +52,33 @@ cargo run --bin alignc -- run examples/arena.align     # arena + heap box; exits
 cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; exits 24
 ```
 
-`alignc` のサブコマンド: `check`, `emit-mir`, `emit-llvm`, `build`, `run`。
+`alignc` の主なサブコマンド: `check`, `fmt`, `emit-mir`, `emit-llvm`, `emit-obj`, `build`, `run`, `size`。
 
-**必要環境:** Rust(stable)、LLVM 19(`llvm-config` が `PATH` 上にあること)、リンク用の C コンパイラ(`cc`)。
+**ソースからビルドする場合の必要環境:** Rust 1.96 以上、LLVM 22 (`llvm-config-22` が `PATH` 上にあること)、リンク用の C コンパイラ(`cc`)。圧縮、暗号、HTTP を使うプログラムには zlib、zstd、OpenSSL の開発ライブラリも必要です。
+
+## リリース版のインストール
+
+以下のコマンドは、最初の配布リリースとリポジトリ設定が完了した後に利用できます。それまではソースからビルドしてください。
+
+macOS Apple Silicon (Homebrew):
+
+```sh
+brew tap sanohiro/align
+brew install align
+```
+
+Ubuntu 24.04、x86_64 または ARM64 (署名付き apt リポジトリ):
+
+```sh
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+
+各 GitHub リリースにはアーカイブと `.deb` も添付されます。`alignc` は LLVM 22 を動的に利用し、システムの C リンカーを呼び出すため、完全な静的バイナリではなく、ツールチェーン依存を明示したネイティブパッケージとして配布します。
 
 ## ステータス
 
-まだ初期段階ですが、パイプラインは端から端まで動きます(`lexer → parser → sema → MIR → LLVM → native`)。関数と制御フロー、構造体、プリミティブ型のフルセット、`?` を伴う `Option`/`Result`、move・エスケープチェック付きの `arena`/`box`、融合された配列パイプライン、文字列と `json`、SIMD(`vecN`/`soa`/`group_by`)、実スレッド上の `par_map`/`task_group`、`unsafe`/FFI、そして拡充中の標準ライブラリ(`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`、`http` は実装中)まで揃っています。マイルストーンの詳細は `docs/impl/07-roadmap.md` を参照してください。
+まだ初期段階ですが、パイプラインは端から端まで動きます(`lexer → parser → sema → MIR → LLVM → native`)。関数と制御フロー、構造体、プリミティブ型のフルセット、`?` を伴う `Option`/`Result`、move・エスケープチェック付きの `arena`/`box`、融合された配列パイプライン、文字列と `json`、SIMD(`vecN`/`soa`/`group_by`)、実スレッド上の `par_map`/`task_group`、`unsafe`/FFI、そして拡充中の標準ライブラリ(`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`/`http`)まで揃っています。マイルストーンの詳細は `docs/impl/07-roadmap.md` を参照してください。
 
 ## パフォーマンスと移植性
 
