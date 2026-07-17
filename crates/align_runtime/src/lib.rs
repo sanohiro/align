@@ -1943,10 +1943,17 @@ fn write_json_str_scalar(buf: &mut BuilderBuf, bytes: &[u8]) {
 #[cfg(target_arch = "x86_64")]
 const JSON_ESCAPE_SIMD_MIN: usize = 32;
 
-/// Dispatch the JSON-string body writer. Runtime-detected: AVX2 when present and above the measured
-/// crossover, else the x86-64 baseline SSE2 path; scalar below the crossover and on other targets.
-/// The retained NEON candidate stays test-only pending a native aarch64 no-regression measurement
-/// (the Base64/UTF-8 precedent — a length-only threshold has not been proven on real ARM hardware).
+// aarch64: the NEON escape body is a 16-byte block, and a forced NEON-vs-scalar sweep on native
+// Apple Silicon (median-of-9, 2026-07-18) placed the no-regression crossover at the first full
+// 16-byte block: `< 16` favors scalar (8 B 0.95x, 12 B 0.74x — no vector work runs), while `>= 16`
+// wins from the first block up (16 B 1.70x, 32 B 3.03x, 1 KiB 9.77x). NEON is baseline on armv8-a,
+// so no runtime feature detection is needed.
+#[cfg(target_arch = "aarch64")]
+const JSON_ESCAPE_SIMD_MIN: usize = 16;
+
+/// Dispatch the JSON-string body writer. On x86-64: AVX2 when present and above the measured
+/// crossover, else the baseline SSE2 path. On aarch64: the baseline NEON path above its measured
+/// crossover. Scalar below the crossover and on other targets.
 #[inline]
 fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
     #[cfg(target_arch = "x86_64")]
@@ -1959,14 +1966,23 @@ fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
             return unsafe { write_json_str_sse2(buf, bytes) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bytes.len() >= JSON_ESCAPE_SIMD_MIN {
+            // NEON is mandatory in the armv8-a base ISA; no feature detection required.
+            return unsafe { write_json_str_neon(buf, bytes) };
+        }
+    }
     write_json_str_scalar(buf, bytes);
 }
 
 // --- SIMD escape classifiers -------------------------------------------------------------------
 //
-// Each classifier reads one fixed-width block and returns a bitmask whose bit `k` is set iff byte `k`
-// needs a JSON escape. The "control byte" test `c < 0x20` is branchless on hardware without an
-// unsigned compare via the saturating-subtract identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
+// Each classifier reads one fixed-width block and returns a per-byte "needs escape" map: the x86
+// paths pack it as a bitmask (one bit per byte), the NEON path as a nibble lane map (4 bits per byte
+// — see `json_escape_map_neon`), each consumed by its own body writer. The "control byte" test
+// `c < 0x20` is branchless on hardware without an unsigned compare via the saturating-subtract
+// identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
 //
 // SAFETY / tail strategy: the block writers only load a full vector while `i + BLOCK <= len`, so no
 // read ever crosses the end of `bytes`. The `< BLOCK` remainder is finished by the scalar oracle,
@@ -2057,7 +2073,7 @@ unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
 ///
 /// # Safety
 /// `start <= i <= bytes.len()`.
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", test)))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: usize) {
     let mut j = i;
@@ -2078,10 +2094,9 @@ fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: 
 }
 
 /// NEON: classify 16 bytes → a 64-bit lane map (nibble `k` nonzero iff byte `k` needs escaping),
-/// using the `shrn`-by-4 narrowing trick in place of x86 `movemask`. The candidate for a future
-/// native-ARM measurement; production aarch64 stays scalar until the no-regression gate is proven on
-/// real hardware (the Base64/UTF-8 precedent). Test-only.
-#[cfg(all(target_arch = "aarch64", test))]
+/// using the `shrn`-by-4 narrowing trick in place of x86 `movemask`. Active in production above the
+/// measured 16-byte crossover (see [`JSON_ESCAPE_SIMD_MIN`]); NEON is baseline on armv8-a.
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn json_escape_map_neon(block: *const u8) -> u64 {
@@ -2097,8 +2112,9 @@ unsafe fn json_escape_map_neon(block: *const u8) -> u64 {
     vget_lane_u64(vreinterpret_u64_u8(narrowed), 0)
 }
 
-/// NEON body writer candidate — 16-byte blocks + scalar tail. Test-only; see [`json_escape_map_neon`].
-#[cfg(all(target_arch = "aarch64", test))]
+/// NEON body writer — 16-byte blocks with a bulk clean-run copy, then a scalar tail. Mirrors the
+/// x86 body writers; see [`json_escape_map_neon`].
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn write_json_str_neon(buf: &mut BuilderBuf, bytes: &[u8]) {
     let n = bytes.len();
@@ -15520,8 +15536,10 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         let simd_kind = if is_x86_feature_detected!("avx2") { "AVX2" } else { "SSE2" };
-        #[cfg(not(target_arch = "x86_64"))]
-        let simd_kind = "scalar (no x86 SIMD)";
+        #[cfg(target_arch = "aarch64")]
+        let simd_kind = "NEON";
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let simd_kind = "scalar (no SIMD)";
         println!("\n== JSON escape classifier probe ({simd_kind}) ==");
 
         // --- Part 1: forced-SIMD crossover sweep on clean ASCII ---
@@ -15553,6 +15571,54 @@ mod tests {
             }
             println!("forced AVX2 vs scalar, clean ASCII (median of 9, ns/op):");
             println!(" len | scalar | avx2   | scalar/avx2");
+            for n in [4usize, 8, 12, 16, 20, 24, 28, 31, 32, 36, 40, 48, 56, 64, 96, 128, 256, 1024] {
+                let data = vec![b'a'; n];
+                let iters = 200_000;
+                let (mut sc, mut si) = (Vec::new(), Vec::new());
+                for t in 0..9 {
+                    if t % 2 == 0 {
+                        sc.push(time_forced(&data, false, iters));
+                        si.push(time_forced(&data, true, iters));
+                    } else {
+                        si.push(time_forced(&data, true, iters));
+                        sc.push(time_forced(&data, false, iters));
+                    }
+                }
+                let (sc, si) = (median(sc), median(si));
+                println!("{n:>4} | {sc:>6.2} | {si:>6.2} | {:>6.2}x", sc / si);
+            }
+        }
+
+        // --- Part 1 (aarch64): forced-NEON crossover sweep on clean ASCII ---
+        // NEON is baseline on armv8-a, so no feature detection. Force the 16-byte NEON body even
+        // below any production gate to locate the scalar→NEON crossover, mirroring the x86 method.
+        #[cfg(target_arch = "aarch64")]
+        {
+            fn time_forced(data: &[u8], simd: bool, iters: usize) -> f64 {
+                let mut b = builder_value(core::ptr::null_mut(), 0);
+                let run = |buf: &mut BuilderBuf| -> u64 {
+                    buf.len = 0;
+                    buf.push(b'"');
+                    if !data.is_empty() {
+                        if simd {
+                            unsafe { write_json_str_neon(buf, data) };
+                        } else {
+                            write_json_str_scalar(buf, data);
+                        }
+                    }
+                    buf.len() as u64
+                };
+                run(&mut b.buf); // warm
+                let start = std::time::Instant::now();
+                let mut c = 0u64;
+                for _ in 0..iters {
+                    c ^= black_box(run(black_box(&mut b.buf)));
+                }
+                black_box(c);
+                start.elapsed().as_nanos() as f64 / iters as f64
+            }
+            println!("forced NEON vs scalar, clean ASCII (median of 9, ns/op):");
+            println!(" len | scalar | neon   | scalar/neon");
             for n in [4usize, 8, 12, 16, 20, 24, 28, 31, 32, 36, 40, 48, 56, 64, 96, 128, 256, 1024] {
                 let data = vec![b'a'; n];
                 let iters = 200_000;
