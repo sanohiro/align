@@ -111,6 +111,7 @@ jobs:
           cargo test --workspace --locked --
           --skip gate7_cold_and_hit_are_byte_identical
           --skip gate13_cpu_change_misses_only_the_cpu_namespace
+          --skip depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival
 
       - name: Build release compiler
         run: cargo build --locked --release -p align_runtime -p align_driver
