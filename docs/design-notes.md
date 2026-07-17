@@ -221,6 +221,21 @@ hardware-aligned choice: predictable allocation beats convenience, and an in-are
 bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
 reason exceptions and GC were — it hides cost.)
 
+**An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
+A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would
+contradict the model: ownership is decided by the *type*, and a compile-time table owns nothing. It is
+the exact analogue of a `str` literal — `GREETING := "hello"` is a `str` view of static bytes, not an
+owned `string`; so `PRIMES` is a `slice<i64>` view of a static table, not an owned array. This falls
+out of the region lattice for free: the elements are one **per-unit read-only data** table and the
+constant is a `Static` `{ptr,len}` view of it, so it is shared (never copied), returnable from any
+function, and never dropped — with no new mechanism. It also keeps **one way**: indexing, `.len()`,
+slicing, and pipelines reach it through the existing borrowed-`slice<T>` paths, so there is no
+array-constant-as-value seam and no allocation. Per-unit (not whole-program) rodata is the settled
+storage: each importing unit rematerializes the constant from its exported initializer source, which
+is exactly what makes cross-unit edits invalidate dependents through the interface hash for free. An
+`array<T>` annotation is therefore rejected, not accepted-and-coerced — the type would be a lie about
+ownership.
+
 ---
 
 ## The lambda philosophy

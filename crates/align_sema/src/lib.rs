@@ -1713,6 +1713,30 @@ enum ConstVal {
     Bool(bool),
     Char(u32),
     Str(String),
+    /// A folded aggregate constant `[e0, e1, …]` — the elements (each a scalar `ConstVal`) plus
+    /// their shared scalar element type. Substituted as a static `slice<elem>` view (see
+    /// [`hir::ExprKind::ConstArray`]).
+    Array(Vec<ConstVal>, Scalar),
+}
+
+/// Whether a scalar may be an aggregate-constant element (S1): an integer / float / bool / char /
+/// `str`. Struct (and every owned / handle) element is a recorded S1.5 deferral — restricting this
+/// also keeps a `pub` aggregate constant from naming a private element type.
+fn is_aggregate_const_elem(s: Scalar) -> bool {
+    matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)
+}
+
+/// Build the HIR literal `ExprKind` for a folded **scalar** constant value. Shared by scalar-constant
+/// substitution and per-element aggregate-constant substitution.
+fn const_scalar_kind(val: &ConstVal) -> ExprKind {
+    match val {
+        ConstVal::Int(v) => ExprKind::Int(*v),
+        ConstVal::Float(v) => ExprKind::Float(*v),
+        ConstVal::Bool(b) => ExprKind::Bool(*b),
+        ConstVal::Char(c) => ExprKind::Char(*c),
+        ConstVal::Str(s) => ExprKind::Str(s.clone()),
+        ConstVal::Array(..) => unreachable!("an aggregate constant may not be an array element (rejected during folding)"),
+    }
 }
 
 /// A constant's declaration facts, collected before evaluation (keyed by canonical name).
@@ -1890,9 +1914,21 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     return None;
                 };
                 let (ty, val) = self.value(&canonical)?;
+                // An aggregate constant may not be referenced from another constant's initializer
+                // (v1 fail-closed, recorded deferral): neither aliased whole (`B := A`) nor used as an
+                // element (`B := [A, …]`). Each aggregate constant materializes its own per-unit
+                // rodata; composing them needs a shared-storage design not settled for S1.
+                if matches!(val, ConstVal::Array(..)) {
+                    self.diags.error(
+                        format!("aggregate constant `{name}` cannot be referenced from another constant's initializer (not supported in v1)"),
+                        e.span,
+                    );
+                    return None;
+                }
                 self.check_const_type(ty, expected, e.span)?;
                 Some((ty, val))
             }
+            K::ArrayLit(elems) => self.array(elems, expected, module, e.span),
             _ => {
                 self.diags.error(
                     "a constant initializer must be a literal, a unary/binary expression, or another constant".to_string(),
@@ -1906,6 +1942,66 @@ impl<'a, 'd> ConstEval<'a, 'd> {
     fn expect_scalar(&mut self, ty: Ty, val: ConstVal, expected: Option<Ty>, span: Span) -> Option<(Ty, ConstVal)> {
         self.check_const_type(ty, expected, span)?;
         Some((ty, val))
+    }
+
+    /// Fold an array-literal constant `[e0, e1, …]` into a [`ConstVal::Array`] typed `slice<elem>`.
+    /// The element type comes from a `slice<T>` annotation (`expected`) or is inferred from the first
+    /// element (unconstrained-literal defaults — `[1, 2, 3]` → `slice<i64>`). Every element folds via
+    /// the same const-eval as a scalar constant; elements must be scalars / `str` (nested arrays and
+    /// references to other aggregate constants are rejected — fail-closed, recorded S1 deferrals).
+    fn array(&mut self, elems: &[ast::Expr], expected: Option<Ty>, module: &str, span: Span) -> Option<(Ty, ConstVal)> {
+        // An annotation constrains the element type; a non-slice annotation is a type mismatch.
+        let mut elem_ty: Option<Ty> = match expected {
+            Some(Ty::Slice(s)) => Some(scalar_to_ty(s)),
+            Some(Ty::Error) | None => None,
+            Some(other) => {
+                self.diags.error(format!("expected {}, found an array literal", ty_name(other)), span);
+                return None;
+            }
+        };
+        if elems.is_empty() {
+            let Some(ty) = elem_ty else {
+                self.diags.error(
+                    "cannot infer the element type of an empty array constant (add a `slice<T>` annotation)".to_string(),
+                    span,
+                );
+                return None;
+            };
+            let es = ty_to_scalar(ty)?;
+            if !is_aggregate_const_elem(es) {
+                self.diags.error(
+                    format!("an aggregate constant's element type must be a scalar or `str`, got {}", ty_name(ty)),
+                    span,
+                );
+                return None;
+            }
+            return Some((Ty::Slice(es), ConstVal::Array(Vec::new(), es)));
+        }
+        let mut vals = Vec::with_capacity(elems.len());
+        for el in elems {
+            let (ty, val) = self.expr(el, elem_ty, module)?;
+            if ty == Ty::Error {
+                return None; // an element failed to fold; do not cascade
+            }
+            if matches!(val, ConstVal::Array(..)) {
+                self.diags.error(
+                    "an array constant's elements must be scalars or `str` (nested arrays are not supported)".to_string(),
+                    el.span,
+                );
+                return None;
+            }
+            // The first concrete element fixes the shared element type; later ones must match.
+            if elem_ty.is_none() {
+                elem_ty = Some(ty);
+            }
+            vals.push(val);
+        }
+        let ty = elem_ty.expect("non-empty array has a fixed element type");
+        let Some(es) = ty_to_scalar(ty) else {
+            self.diags.error(format!("`{}` cannot be an array-constant element type", ty_name(ty)), span);
+            return None;
+        };
+        Some((Ty::Slice(es), ConstVal::Array(vals, es)))
     }
 
     /// A constant has a fixed type; `Some(())` if it matches `expected` (or there is none), else a
@@ -2657,11 +2753,34 @@ pub fn check_program_with_effects(
                 let canonical = mangle_fn(&m.path, m.is_entry, bare);
                 let ann_ty = c.ty.as_ref().map(|t| {
                     let ty = resolve_type(t, tcx!(m.path.as_str(), &no_imports), &[], diags);
-                    if matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error) {
-                        ty
-                    } else {
-                        diags.error(format!("a constant's type must be a scalar or `str`, got {}", ty_name(ty)), t.span());
-                        Ty::Error // suppress a cascading mismatch when folding the initializer
+                    match ty {
+                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error => ty,
+                        // A top-level aggregate constant is a **static `slice<T>` view** of per-unit
+                        // rodata (ownership is a property of the type — like a `str` literal), so the
+                        // only aggregate annotation is `slice<T>`; an owned `array<T>` annotation is
+                        // rejected with guidance. The element must be an S1 scalar / `str` — a
+                        // `slice<Struct>` (etc.) is rejected here, which also closes the pub-exposure
+                        // hole of a `pub` const naming a private element type (struct elements are a
+                        // recorded S1.5 deferral).
+                        Ty::Slice(elem) if is_aggregate_const_elem(elem) => ty,
+                        Ty::Slice(elem) => {
+                            diags.error(
+                                format!("an aggregate constant's element type must be a scalar or `str`, got {}", scalar_name(elem)),
+                                t.span(),
+                            );
+                            Ty::Error
+                        }
+                        Ty::Array(..) | Ty::DynArray(_) | Ty::StructArray(..) | Ty::DynStructArray(..) => {
+                            diags.error(
+                                "a top-level array constant is a static slice<T> view; write `slice<T>` or omit the annotation".to_string(),
+                                t.span(),
+                            );
+                            Ty::Error // suppress a cascading mismatch when folding the initializer
+                        }
+                        _ => {
+                            diags.error(format!("a constant's type must be a scalar, `str`, or `slice<T>`, got {}", ty_name(ty)), t.span());
+                            Ty::Error
+                        }
                     }
                 });
                 by.insert(bare.clone(), (canonical.clone(), matches!(c.vis, ast::Vis::Pub)));
@@ -4169,9 +4288,10 @@ impl EffectScan<'_> {
                     self.expr(c);
                 }
             }
-            // Leaves.
+            // Leaves. A `ConstArray`'s elements are already-folded pure literals — no effects.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
+            | ExprKind::ConstArray { .. }
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
@@ -5072,6 +5192,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(..)
             | ExprKind::Char(..)
             | ExprKind::Str(..)
+            // An aggregate constant is a view of process-lifetime rodata — `Static`, like a `str`
+            // literal (its elements borrow nothing; a `str` element views its own static bytes).
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(..)
             | ExprKind::Unary { .. }
             | ExprKind::Cast(..)
@@ -5294,6 +5417,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(..)
             | ExprKind::Char(..)
             | ExprKind::Str(..)
+            // An aggregate constant views process-lifetime rodata, never a function-local slot.
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(..)
             | ExprKind::Unary { .. }
             | ExprKind::Cast(..)
@@ -6337,6 +6462,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            // An aggregate constant is a static rodata view — no borrow provenance to propagate.
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
@@ -6911,11 +7038,13 @@ impl UnnecessaryHeapScan {
             }
             // Leaves and nodes whose only local references (a `Field`/`SoaColumn`/`IndexField` /
             // group-agg base) are never a box local — a box has no fields, columns, or indexing.
+            // A `ConstArray`'s elements are folded literals, never a box local.
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone
             | ExprKind::WriterStd { .. }
@@ -8335,11 +8464,13 @@ impl<'a> MoveCheck<'a> {
                     _ => self.expr(recv, moved, false, false),
                 }
             }
+            // An aggregate constant is a Copy `{ptr,len}` view of rodata — reading it moves nothing.
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
+            | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone => {}
         }
@@ -9755,14 +9886,21 @@ impl<'a, 't> Checker<'a, 't> {
     /// the expected type — a constant has a fixed type, so a mismatch is a normal type error).
     fn const_literal(&mut self, ty: Ty, val: &ConstVal, expected: Option<Ty>, span: Span) -> Expr {
         self.constrain(ty, expected, span);
-        let kind = match val {
-            ConstVal::Int(v) => ExprKind::Int(*v),
-            ConstVal::Float(v) => ExprKind::Float(*v),
-            ConstVal::Bool(b) => ExprKind::Bool(*b),
-            ConstVal::Char(c) => ExprKind::Char(*c),
-            ConstVal::Str(s) => ExprKind::Str(s.clone()),
-        };
-        Expr { kind, ty, span }
+        if let ConstVal::Array(elems, elem) = val {
+            // Substitute as a static `slice<elem>` view of per-unit rodata: each element is folded
+            // to its scalar literal, materialized as a read-only global in codegen.
+            let elem_ty = scalar_to_ty(*elem);
+            let hir_elems: Vec<Expr> = elems
+                .iter()
+                .map(|v| Expr { kind: const_scalar_kind(v), ty: elem_ty, span })
+                .collect();
+            return Expr {
+                kind: ExprKind::ConstArray { elems: hir_elems, elem: *elem, len: elems.len() as u32 },
+                ty,
+                span,
+            };
+        }
+        Expr { kind: const_scalar_kind(val), ty, span }
     }
 
     /// Build a first-class value for an already-resolved top-level function. Bare and qualified
@@ -12745,6 +12883,18 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `.field` projection on an array.
             ast::ExprKind::FieldAccess { recv, field } => {
+                // `mod.CONST` — a qualified reference to an imported module's constant (e.g. an
+                // aggregate constant `cfg.TABLE.sum()`) is the pipeline *source*, not a `.field`
+                // projection over `mod`. A local shadowing the leftmost segment makes it a real
+                // value-projection (mirrors `check_field_access`'s qualified-const guard).
+                let leftmost_is_local = leftmost_segment(recv).is_some_and(|l| self.name_in_scope(l));
+                if !leftmost_is_local
+                    && let Some(modpath) = flatten_module_path(recv)
+                    && modpath != self.cur_module
+                    && self.user_imports.contains(&modpath)
+                {
+                    return (e, Vec::new());
+                }
                 let (src, mut stages) = self.collect_pipeline(recv);
                 stages.push(RawStage::Project(field.clone()));
                 (src, stages)
@@ -14852,6 +15002,19 @@ impl<'a, 't> Checker<'a, 't> {
         if !i.ty.is_int_like() {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
             return err;
+        }
+        // A constant index into an aggregate constant folds to the element literal at compile time
+        // (no rodata load): `TABLE[3]` becomes the folded value of element 3. An out-of-range constant
+        // index is a compile error. A dynamic index falls through to the normal slice-index path
+        // against the rodata `{ptr,len}` view below.
+        if let ExprKind::ConstArray { elems, len, .. } = &r.kind
+            && let ExprKind::Int(v) = i.kind
+        {
+            if v < 0 || v as u128 >= *len as u128 {
+                self.diags.error(format!("index {v} is out of bounds for a length-{len} array constant"), span);
+                return err;
+            }
+            return elems[v as usize].clone();
         }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -18838,6 +19001,13 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.finalize_expr(c);
+                }
+            }
+            // An aggregate constant's elements are folded literals; finalize each so an out-of-range
+            // element under an annotation (`slice<u8> := [300]`) is rejected like a scalar constant.
+            ExprKind::ConstArray { elems, .. } => {
+                for el in elems {
+                    self.finalize_expr(el);
                 }
             }
             // A bare (non-negated) integer literal: reject it if its value provably overflows the

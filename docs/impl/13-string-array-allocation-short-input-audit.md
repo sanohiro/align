@@ -764,9 +764,16 @@ A 256-element immutable local i64 literal read through a runtime index still pro
 `[256 x i64]` entry alloca and 128 vector stores after O2. The literal lowering stores each element
 individually ([MIR](../../crates/align_mir/src/lib.rs#L3758)).
 
-Prefer the already-recorded top-level aggregate-constant feature first. Its backend mechanism can
-emit `private unnamed_addr constant` storage. Then measure an extension for local all-constant
-literals:
+**S1 LANDED 2026-07-17 — top-level aggregate constants.** The prerequisite backend mechanism now
+exists: a top-level array constant (`TABLE := [ … ]`) folds to `ConstVal::Array`, lowers through the
+new `hir::ExprKind::ConstArray` → `mir::Rvalue::ConstArray`, and emits exactly the wanted
+`private unnamed_addr constant [N x T]` global with a static `slice<T>` view — no alloca, no O(N)
+stores (verified in `tests/constants_aggregate.rs`, IR gate). A constant index folds to the element.
+This is the storage mechanism §8.4 was waiting on.
+
+**S3 is next — the local-literal pooling probe.** With S1 done, measure the extension for
+function-local all-constant literals (hoist to the same rodata when the local never escapes and is
+never mutated):
 
 - immutable/non-address-mutated local: read the pooled constant directly;
 - mutable large local: one memcpy from a constant template;

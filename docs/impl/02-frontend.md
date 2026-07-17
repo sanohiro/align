@@ -206,6 +206,10 @@ const_decl = ident (":" type)? ":=" expr END
 
 A top-level `:=` is a compile-time constant (immutable). `mut` is not allowed. One of the sources feeding the const string pool (`draft.md` §12).
 
+**Const-eval (Pass 0d).** Constants are collected and folded before the checker runs: `ConstEval` (in `align_sema`) evaluates each initializer to a `ConstVal` (memoized, order-independent, with cycle detection) and `ConstTable` maps each `module.NAME` to its `(Ty, ConstVal)`. A use site substitutes the folded value as a literal HIR node via `const_literal` (`check_path` / `check_field_access`), so a *scalar* constant never reaches MIR/codegen.
+
+**Aggregate (array) constants (S1, 2026-07-17).** An initializer may be an array literal. `ConstEval::array` folds each element with the same evaluation as a scalar (element type inferred from the elements, or pushed down from a `slice<T>` annotation), yielding `ConstVal::Array(elems, elem)`. Unlike a scalar constant this *does* reach the backend: `const_literal` substitutes it as `hir::ExprKind::ConstArray { elems, elem, len }` typed **`slice<elem>` / `Region::Static`** (not a synthesized `ArrayLit` — that would reproduce the §8.4 alloca+stores), lowered to `mir::Rvalue::ConstArray` and then to a `[N x T]` (or `[N x {ptr,len}]` for `str`) `private unnamed_addr constant` global with a static `{ptr,len}` view. A **constant index folds to the element** in sema (`check_index`, no load); a dynamic index / `.len()` / pipeline flows through the existing borrowed-slice paths. The type gate accepts only a `slice<T>` annotation of a scalar / `str` element (an `array<T>` annotation, or a `slice<Struct>`, is rejected); struct constants / elements and non-scalar element positions (calls, `as`, nested arrays, aggregate-const refs) stay deferred. The new `ExprKind::ConstArray` / `Rvalue::ConstArray` are wired through every exhaustive HIR/MIR analysis arm (effect scan, `region_of`, escape/`slice_is_local`, `MoveCheck`, `finalize_expr`, `print`) as an inert, Copy, `Static` leaf.
+
 ---
 
 ## 4. Types (Type)

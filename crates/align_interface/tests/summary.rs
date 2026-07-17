@@ -177,6 +177,31 @@ fn split_e_private_fn_edit_does_not_change_interface() {
     assert_ne!(find(&v1, "lib").impl_hash, find(&v2, "lib").impl_hash, "impl hash still changes");
 }
 
+// ---- 2b. aggregate constants (S1) ---------------------------------------------------------------
+
+#[test]
+fn an_aggregate_constant_exports_its_literal_source() {
+    // A `pub` aggregate constant is part of the exported surface; its value is carried as the array
+    // literal's source text (consumers rematerialize the slice against their own per-unit rodata).
+    let sums = one("pub TABLE: slice<i64> := [1, 2, 3]\nfn main() -> i32 = 0\n");
+    let c = &find(&sums, "main").consts[0];
+    assert_eq!(c.name, "TABLE");
+    assert_eq!(c.value_src, "[1, 2, 3]");
+}
+
+#[test]
+fn editing_an_aggregate_constant_value_changes_the_interface_hash() {
+    // The initializer source is folded into the interface hash (`IConst.value_src`), so changing an
+    // element invalidates every dependent unit — the M15 cross-unit cache gate, no FORMAT_VERSION bump.
+    let v1 = one("pub TABLE := [1, 2, 3]\nfn main() -> i32 = 0\n");
+    let v2 = one("pub TABLE := [1, 2, 4]\nfn main() -> i32 = 0\n");
+    assert_ne!(
+        find(&v1, "main").interface_hash,
+        find(&v2, "main").interface_hash,
+        "editing an aggregate constant's value must change the interface hash"
+    );
+}
+
 // ---- 3. round-trip + fail-closed version --------------------------------------------------------
 
 #[test]

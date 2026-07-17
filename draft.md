@@ -156,6 +156,31 @@ and a float to `f64`, so annotate when another width is wanted. `pub` exports a 
 importing modules, where it is named qualified — `mod.NAME` — exactly like a `pub` function or
 type. Division by zero, a cyclic definition, or a type mismatch is a compile-time error.
 
+An initializer may also be an **array literal** — an *aggregate constant*:
+
+```align
+PRIMES := [2, 3, 5, 7, 11]              // slice<i64>
+SCALE: slice<f64> := [0.5, 1.0, 2.0]    // annotated element type
+DAYS := ["Mon", "Tue", "Wed"]           // slice<str>
+```
+
+Its type is **`slice<T>`, not `array<T>`** — ownership is a property of the type, and a top-level
+constant owns nothing: exactly as `GREETING := "hello"` is a `str` view of static bytes (not an
+owned `string`), `PRIMES` is a `slice<i64>` view of a compile-time table. The elements live in a
+per-unit read-only data section and the constant is a borrowed `{ptr, len}` view of them, so it is
+shared (never copied) at every use and lives for the whole program. Because it is a `slice<T>`,
+indexing, `.len()`, slicing, and pipelines (`map`/`where`/`reduce`/…) all flow through the normal
+borrowed-view paths with no allocation. An `array<T>` annotation is rejected — write `slice<T>` or
+omit the annotation.
+
+The element type is inferred from the elements (an unannotated `[1, 2, 3]` is `slice<i64>`) or
+taken from a `slice<T>` annotation; every element must share it. Elements are scalars or `str`,
+each folded by the same compile-time evaluation as a scalar constant (literals, unary/binary
+operators, and references to *scalar* constants). A **constant index** folds to the element itself
+(`PRIMES[2]` is `5`, with no load); a dynamic index reads the table. What is *not* yet allowed in an
+element position is a function call, an `as` cast, a nested array, or a reference to another
+aggregate constant; struct constants and struct elements are likewise deferred.
+
 ### Function
 
 ```align
@@ -1240,6 +1265,11 @@ operation that produces a `str` preserves it (a range slice that would split a s
 The byte types `bytes` / `buffer` carry **no** UTF-8 obligation and are where arbitrary-byte work
 lives (`s.bytes()` views a `str`'s bytes without the invariant).
 
+A `str` **literal** is a `{ptr, len}` view of bytes placed in the program's read-only data section
+(rodata) — shared, never copied, process-lifetime (`Static`). The same mechanism backs an aggregate
+`slice<T>` constant (§3 Constants): its elements are one rodata table and the constant is a borrowed
+view of it, so a top-level array constant is a `slice<T>`, exactly as a string literal is a `str`.
+
 ### Binary decode and encode
 
 Binary formats (GGUF headers, `alignpack`/`alignidx`, any packed record) are read from a `bytes`
@@ -1710,7 +1740,7 @@ fn main() -> i32 {
 
 `import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name.
 
-A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is scalar / `str`-only) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
+A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is a scalar, `str`, or a `slice<T>` of one — so its element type is transitively `pub` by construction) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
 
 The module import graph must be a DAG: a cycle of `import`s — direct (`a` imports `b`, `b` imports `a`), transitive, or a module importing itself — is a compile error. Mutual dependency means the two modules are one unit of meaning: merge them, or extract the shared part into a third module both import. The restriction keeps every module's interface computable bottom-up (each module is checked against the already-checked interfaces of its imports), which is what makes per-module compilation and caching possible.
 
