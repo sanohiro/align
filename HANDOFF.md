@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (seventh update this day), **REPEATED-NEEDLE PLAN HOISTING IS SHIPPED —
+_Last updated: 2026-07-17 (eighth update this day), **THE SIMD JSON ESCAPE CLASSIFIER IS SHIPPED —
+MERGED as #504** (`63d64bf`; doc-13 P3 item 3, gate 2 of 4). `align_rt_builder_write_json_str`'s
+scalar per-byte escape scan is replaced above the empirically confirmed 32-byte crossover by a
+dispatched block classifier (AVX2 32-byte / SSE2 16-byte, one movemask per block, branchless
+`subs_epu8(c,0x1F)` — DEL 0x7F untouched, 0x80–0xFF clean) with bulk copies across clean spans;
+full-vector loads only while `i+BLOCK<=len`, scalar tail, no over-read. End-to-end through the
+real builder (median-of-9, AB/BA): mostly-clean **5.80x/5.69x** (baseline/v3), escape-dense
+**1.51x faster**, short 1.10x neutral. The differential oracle pins every path (incl. forced SSE2
+on an AVX2 host) byte-for-byte across every C0 class, quote/backslash, straddling multibyte,
+lengths through 4096. The aarch64 NEON candidate (shrn-by-4) compiles test-only; production
+aarch64 stays scalar recorded-pending native hardware (the Base64 #487 precedent). /code-review:
+zero correctness findings; one quality fix applied (an overstated `unsafe` marker dropped).
+Workspace green, clippy clean all feature states; doc-13 §6.6/§11/§12 updated. **Next: doc-13 P3
+gate 3 of 4 — unique-buffer donation** (doc-10 §8.1 ownership proof; measure-first), then the
+short-N group strategy gate, then the top-level aggregate constants arc, then STOP per the
+owner's instruction. Previous update: 2026-07-17 (seventh update this day), **REPEATED-NEEDLE
+PLAN HOISTING IS SHIPPED —
 MERGED as #503** (`b59d65e`; doc-13 P3 item 3, gate 1 of 4). `xs.where(fn s {
 s.contains(NEEDLE) })` with an invariant needle now builds ONE memchr plan in the loop preheader
 (`align_rt_str_finder_new/find/free`; the plan owns its needle copy) and reuses it per element —
