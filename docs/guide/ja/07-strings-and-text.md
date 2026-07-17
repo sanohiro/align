@@ -46,7 +46,7 @@ fn main() -> i32 {
 }
 ```
 
-`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` ― 現時点のメソッドはこれで全部です。いずれもバイト単位で動作し、検索系は内部で SIMD を使っています(`contains` はナイーブなループではなくベクトル化されたスキャンです)。`find` / `rfind` は `Option<i64>` ― 最初/最後に一致した位置のバイトインデックス、なければ `None` ― を返し、文字列にも使える範囲スライスと組み合わせられます。
+`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` ― 現時点のメソッドはこれで全部です。いずれもバイト単位で動作し、検索系はSIMD化できるscanを使います。実際にvectorizeされるか、何laneになるかはtarget、profile、入力の形に依存します。`find` / `rfind` は `Option<i64>` ― 最初/最後に一致した位置のバイトインデックス、なければ `None` ― を返し、文字列にも使える範囲スライスと組み合わせられます。
 
 ```align
 fn main() -> i32 {
@@ -58,6 +58,8 @@ fn main() -> i32 {
 ```
 
 (`path[i]` のような単一バイトへのアクセスはありません ― バイトインデックスはスライスのためのものであって、1 バイトずつ辿るためのものではありません。)`split` はまだ存在しません(実装中)。今は `find` / `rfind` に `[a..b]` を組み合わせて手動の分割を組み立てるか、本物のパーサーを書いてください。
+
+> **Cost:** `str` のコピー、slice、`trim*` は O(1) のviewで、確保もbyte copyもありません。`.clone()` は O(n) で、結果領域を最大1回確保し、n byteを所有する `string` へコピーします。検索は最悪 O(n) です。
 
 ## 連結 ― builder が唯一の方法
 

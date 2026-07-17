@@ -46,7 +46,7 @@ fn main() -> i32 {
 }
 ```
 
-`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` — that is the current set. All byte-oriented, and the searching ones are SIMD under the hood (`contains` is a vectorized scan, not a naive loop). `find`/`rfind` return `Option<i64>` — a byte index, or `None` — and pair with range slicing, which works on strings too:
+`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` — that is the current set. All are byte-oriented, and the searches use SIMD-capable scans; whether and how widely they vectorize depends on the target, profile, and input shape. `find`/`rfind` return `Option<i64>` — a byte index, or `None` — and pair with range slicing, which works on strings too:
 
 ```align
 fn main() -> i32 {
@@ -58,6 +58,8 @@ fn main() -> i32 {
 ```
 
 (There is no `path[i]` single-byte access — a byte index is for slicing, not for walking.) A `split` does not exist yet (implementation in progress); today `find`/`rfind` + `[a..b]` compose the manual split, or you write a real parser.
+
+> **Cost:** Copying a `str`, slicing it, and `trim*` are O(1) views with no allocation or byte copy. `.clone()` is O(n), makes at most one result allocation, and copies n bytes into an owned `string`. Searches are O(n) in the worst case.
 
 ## Concatenation: builder is the one way
 

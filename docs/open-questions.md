@@ -2398,18 +2398,17 @@ codegen-key field was removed outright rather than populated. The genuinely-open
 stay findable as a slim "Separate compilation / ThinLTO — remaining deferrals" entry in the Open
 section, alongside the parallel/pipeline/cache companion-audit records.
 
+### `sort_by_key` key effects and evaluation count — SETTLED 2026-07-17
+
+`sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure and is evaluated
+exactly once per surviving element, in input order, before any reordering. The implementation's
+decorate step records those keys; comparisons never invoke the callable again. This makes the
+shipped behavior normative without fixing the internal sorting algorithm. Full context:
+`impl/12-pipeline-closure-memory-io-simd-audit.md` §3.2.
+
 ## Open (to be decided)
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
-
-### `sort_by_key` key effects and evaluation count — OPEN
-
-Ordinary sequential stage/reducer effects are settled above, but comparison sorting is a distinct
-contract. The shipped decorate-sort-undecorate implementation calls the key exactly once per
-surviving element in input order; that implementation behavior still needs to become the explicit
-language contract (or be restricted to Pure keys). The effect graph now fails closed for unknown
-higher-order targets, but that mechanism does not choose the language contract; do not add a
-rejection until this item settles. Full context: `impl/12` §3.2.
 
 ### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 
@@ -3948,6 +3947,12 @@ rule; aliasing BLAKE2b under the name is forbidden). The AEAD wrapper's mandator
 shape under EVP (internal buffer, SET_TAG before Final, `OPENSSL_cleanse` on failure, single
 opaque error) is specified in `impl/std-design/crypto.md` P2. Slice 1 (`constant_time_equal` +
 `crypto.random`, engine-independent) started the same day.
+
+**Status update (2026-07-11, M13 capability linking):** the linking and version-floor portions of
+the engine decision above are superseded. The driver now adds `-lcrypto` only when a used Crypto or
+TLS capability requires it; engine-independent `crypto.random` and `constant_time_equal` do not
+request it. Most EVP-backed operations work with OpenSSL 3.0. Only `crypto.argon2id` requires the
+`ARGON2ID` provider added in OpenSSL 3.2, and reports its absence as `Error.Code`.
 
 **Status update (2026-07-07, evening): std.crypto COMPLETE (PRs #384–#388)** — and the hard
 requirement above was met as *verification*, not specification: `constant_time_equal`'s

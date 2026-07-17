@@ -47,8 +47,9 @@ come before further SIMD or parallel widening:
    on rejected elements.~~ **FIXED 2026-07-13:** general callable suffixes are guarded; safe field +
    builtin reducer suffixes retain mask/select.
 2. ~~The ordinary sequential effect contract conflicted across normative and implementation docs.~~
-   **SETTLED 2026-07-13:** Impure is allowed with exact guarded input/stage order; `par_map` remains
-   Pure-required. `sort_by_key` key evaluation stays separately open.
+    **SETTLED 2026-07-13:** Impure is allowed with exact guarded input/stage order; `par_map` remains
+    Pure-required. **The separate `sort_by_key` contract was SETTLED 2026-07-17:** stable sorting,
+    with exactly-once input-order key evaluation before reordering.
 3. ~~`spawn` could retain a view backed by an inner arena until after that arena was freed.~~
    **FIXED 2026-07-13**, including wrapped and nested-closure captures. The related first-class
    closure-result escape is also fixed by including the callee environment's region in an indirect
@@ -199,13 +200,12 @@ each element that reaches them; a false `where` suppresses the suffix. `any`/`al
 short-circuit. Inferred effects restrict transformations rather than source acceptance. Explicit
 `par_map` remains Pure-required.
 
-`sort_by_key` is separated into its own Open item. The implementation now decorates in input order
-and calls the key exactly N times, but the source contract has not yet made that behavior normative.
-The effect graph can fail closed at Pure boundaries, but no rejection lands before the key-evaluation
-contract itself settles.
+`sort_by_key` is stable and permits an Impure key callable. The implementation decorates in input
+order and calls the key exactly N times before reordering; the source contract now makes that
+behavior normative. Comparisons consume the recorded keys and never re-evaluate the callable.
 
-Section 3.1 is independent: even after choosing Pure-only, a Pure callable may abort and cannot be
-speculated without the stronger inactive-lane proof.
+Section 3.1 is independent: even when a callable is Pure, it may abort and cannot be speculated
+without the stronger inactive-lane proof.
 
 The document-11 lifted-closure edge and the higher-order unknown-target case are fixed. The latter
 reproduction was:

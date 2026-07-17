@@ -27,10 +27,12 @@ crypto-grade).
 **Engine: OpenSSL libcrypto (EVP), decided 2026-07-07** (recorded in `open-questions.md` Settled;
 supersedes this doc's original "libsodium recommended"). Rationale, converged from independent
 security and dependency reviews: libcrypto natively covers *every* required primitive — including
-HKDF and Argon2id via `EVP_KDF` (**OpenSSL ≥ 3.2**, the documented floor) — in one trust surface
-with no engine mixing and no self-hosted-HKDF seam; it is a universal system lib in the same
-always-link class as libz/libzstd (`-lcrypto` joins the driver's base link set, the compress
-precedent); and its AES-GCM is constant-time on supported targets (AES-NI/PCLMULQDQ hardware path,
+HKDF and Argon2id via `EVP_KDF` — in one trust surface with no engine mixing and no
+self-hosted-HKDF seam. Most of this surface works with **OpenSSL ≥ 3.0**; Argon2id requires the
+`ARGON2ID` provider added in **OpenSSL ≥ 3.2**, and its absence is reported as `Error.Code`.
+The driver adds `-lcrypto` only when a used Crypto or TLS capability requires it; within this module,
+`crypto.random` and `constant_time_equal` do not request it. AES-GCM is constant-time on supported targets
+(AES-NI/PCLMULQDQ hardware path,
 constant-time vpaes fallback — never T-table AES on x86-64/aarch64) and is not API-gated on
 hardware, unlike libsodium's `crypto_aead_aes256gcm_*`. libsodium remains a fine engine in the
 abstract but loses on whole-system seams (no HKDF in 1.0.18-class releases, hardware-gated
@@ -87,8 +89,9 @@ opaque error.
 
 ## New machinery required
 
-FFI link to **OpenSSL libcrypto** (`-lcrypto` always-linked, floor ≥ 3.2 — see Overview); ~6
-runtime wrappers over EVP: a shared one-shot digest (`EVP_Q_digest`, param-swapped by
+Capability-gated FFI link to **OpenSSL libcrypto** (this module requests `-lcrypto` only for used
+EVP-backed operations; OpenSSL ≥ 3.0 generally, ≥ 3.2 for Argon2id — see Overview); ~6 runtime wrappers over EVP: a shared
+one-shot digest (`EVP_Q_digest`, param-swapped by
 `EVP_sha256/512`), HMAC (`EVP_MAC` "HMAC"), HKDF (`EVP_KDF_fetch("HKDF")` + `OSSL_PARAM`
 salt/key/info), Argon2id (`EVP_KDF_fetch("ARGON2ID")` + `OSSL_KDF_PARAM_ARGON2_*`), and a shared
 AEAD seal/open pair (`EVP_CIPHER`, param-swapped AES-256-GCM / ChaCha20-Poly1305) with the P2
@@ -150,4 +153,5 @@ all-or-nothing shape. Plus the `constant_time_equal` self-host (branchless, no e
 - `crypto.random` fills distinct bytes
 - argon2id known-answer
 - import-required
-- (FFI slices assume libcrypto present — the compress always-link precedent; no feature-gating.)
+- capability-linking tests prove that EVP-backed crypto retains libcrypto and programs with no
+  Crypto/TLS capability do not link it
