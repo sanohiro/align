@@ -13,6 +13,9 @@
     },
     {
       "include": "#numbers"
+    },
+    {
+      "include": "#operators"
     }
   ],
   "repository": {
@@ -20,11 +23,15 @@
       "patterns": [
         {
           "name": "keyword.control.align",
-          "match": "\\b(fn|return|mut|pub|module|import|if|else|arena|box|task_group|match|template|unsafe|extern|as|out)\\b"
+          "match": "\\b(fn|return|mut|pub|module|import|if|else|arena|task_group|match|loop|break|template|unsafe|extern|as|out)\\b"
+        },
+        {
+          "name": "storage.modifier.align",
+          "match": "\\b(align|layout|link)(?=\\s*\\()"
         },
         {
           "name": "support.type.align",
-          "match": "\\b(i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|bool|char|str|string|array|slice|raw|writer|reader|buffer|rng|tcp_conn|tcp_listener|udp_socket|child|soa|Option|Result|vec[248]|vec16|mask[248]|mask16)\\b"
+          "match": "\\b(i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|bool|char|str|string|array|slice|soa|box|raw|builder|writer|reader|buffer|array_builder|file|rng|tcp_conn|tcp_listener|udp_socket|child|Option|Result|Error|Num|Ord|Eq|vec[248]|vec16|mask[248]|mask16)\\b"
         },
         {
           "name": "constant.language.boolean.align",
@@ -32,7 +39,7 @@
         },
         {
           "name": "support.function.builtin.align",
-          "match": "\\b(map|par_map|where|reduce|scan|partition|group_by|sort|sort_by_key|chunks|sum|min|max|count|any|all|dot)\\b"
+          "match": "\\b(map|par_map|where|reduce|scan|partition|group_by|agg|sort|sort_by_key|chunks|zip|to_array|map_into|to_soa|dict_encode|sum|min|max|count|any|all|dot|sum_where|select|fma|abs|sqrt|floor|ceil|round|trunc|pow|Some|None|Ok|Err|error|map_err|spawn|wait|print)\\b"
         }
       ]
     },
@@ -41,10 +48,14 @@
         {
           "name": "string.quoted.double.align",
           "begin": "\"",
-          "end": "\"",
+          "end": "\"|$",
           "patterns": [
             {
               "name": "constant.character.escape.align",
+              "match": "\\\\(?:[ntr0\\\\\"']|u\\{[0-9A-Fa-f]{1,6}\\})"
+            },
+            {
+              "name": "invalid.illegal.escape.align",
               "match": "\\\\."
             }
           ]
@@ -52,10 +63,14 @@
         {
           "name": "string.quoted.single.align",
           "begin": "'",
-          "end": "'",
+          "end": "'|$",
           "patterns": [
             {
               "name": "constant.character.escape.align",
+              "match": "\\\\(?:[ntr0\\\\\"']|u\\{[0-9A-Fa-f]{1,6}\\})"
+            },
+            {
+              "name": "invalid.illegal.escape.align",
               "match": "\\\\."
             }
           ]
@@ -67,8 +82,32 @@
       "match": "//.*$"
     },
     "numbers": {
-      "name": "constant.numeric.align",
-      "match": "\\b[0-9_]+(\\.[0-9_]+)?([eE][+-]?[0-9_]+)?\\b"
+      "patterns": [
+        {
+          "name": "constant.numeric.integer.hexadecimal.align",
+          "match": "\\b0[xX][0-9A-Fa-f_]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.octal.align",
+          "match": "\\b0[oO][0-7_]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.binary.align",
+          "match": "\\b0[bB][01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.align",
+          "match": "\\b[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9][0-9_]*)\\b|\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b"
+        },
+        {
+          "name": "constant.numeric.integer.decimal.align",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "name": "keyword.operator.align",
+      "match": ":=|->|=>|==|!=|<=|>=|&&|\\|\\||<<|>>|\\.\\.|[=+\\-*/%<>!&|^~?]"
     }
   },
   "scopeName": "source.align"
