@@ -185,7 +185,7 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
                 }
             }
 
-            if cfg!(target_arch = "x86_64") {
+            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 for family in VECTORIZABLE_FAMILIES {
                     for depth in DEPTHS {
                         let name = format!("{family}_{depth}");

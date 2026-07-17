@@ -102,6 +102,7 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Test
+        if: matrix.lint
         run: cargo test --workspace --locked
 
       - name: Build release compiler

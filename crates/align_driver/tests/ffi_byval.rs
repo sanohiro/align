@@ -1,5 +1,3 @@
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
-
 //! `extern "C"` by-value struct passing/returning — SysV AMD64 only (draft.md §15). A `layout(C)`
 //! struct (declaration-order, natural-alignment, scalar int/float fields) crosses the C boundary in
 //! registers using the System V AMD64 classification: each eightbyte is INTEGER (→ a GP register /

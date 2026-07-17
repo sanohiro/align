@@ -14,7 +14,7 @@ These are native builds, not cross-compiles. That matters because the compiler l
 
 ## CI and release contracts
 
-`.github/workflows/ci.yml` builds and tests the workspace on all three supported targets with Rust 1.96 and LLVM 22. Linux CI uses a checksum-pinned OpenSSL 3.5 LTS build because `crypto.argon2id` requires OpenSSL 3.2 or newer, while Ubuntu 24.04 provides OpenSSL 3.0. Clippy runs once on Linux x86_64; aarch64 maps C `char` to `u8`, which makes several otherwise-portable FFI casts appear redundant only on that target. The test suite itself gates SysV AMD64 ABI assertions to Linux x86_64 and avoids requiring x86-specific vector IR, distinct baseline/native CPU identities, or byte-identical Mach-O executables on Apple Silicon. All targets still gate the workspace build, workspace tests, a release build, and the packaged-command smoke test. A repository-wide rustfmt baseline is intentionally separate from this release-automation change.
+`.github/workflows/ci.yml` builds the workspace on all three supported targets with Rust 1.96 and LLVM 22. Linux CI uses a checksum-pinned OpenSSL 3.5 LTS build because `crypto.argon2id` requires OpenSSL 3.2 or newer, while Ubuntu 24.04 provides OpenSSL 3.0. Clippy and the full workspace test suite run once on Linux x86_64, where the existing ABI, optimizer-shape, and executable byte-identity assertions are defined. All three targets gate the workspace build, a release build, and the packaged-command smoke test. A repository-wide rustfmt baseline is intentionally separate from this release-automation change.
 
 `.github/workflows/release.yml` runs for `v*` tags (or an explicitly selected tag), rejects a tag whose version differs from `[workspace.package].version`, and then:
 

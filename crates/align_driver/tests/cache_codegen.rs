@@ -346,7 +346,7 @@ fn gate7_cold_and_hit_are_byte_identical() {
     let hot_objs: Vec<Vec<u8>> = hot.objs.iter().map(|p| std::fs::read(p).unwrap()).collect();
     assert_eq!(cold_objs, hot_objs, "hit object bytes must equal cold object bytes");
 
-    if cc_available() && !cfg!(target_os = "macos") {
+    if cc_available() {
         let cold_exe = cold.exe_bytes(&proj, Profile::Release);
         let hot_exe = hot.exe_bytes(&proj, Profile::Release);
         assert_eq!(cold_exe, hot_exe, "the executable must be byte-identical between a cold and a fully-hit build");
@@ -626,7 +626,7 @@ fn gate12_orphaned_private_stage_is_never_a_hit() {
 
 #[test]
 fn gate13_cpu_change_misses_only_the_cpu_namespace() {
-    if !backend() || cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+    if !backend() {
         return;
     }
     let proj = Project::new("cpu-key", &[("main.align", "fn main() {\n  print(42)\n}\n")], "main.align");
