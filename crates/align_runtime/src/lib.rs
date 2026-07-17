@@ -1978,9 +1978,11 @@ fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
 
 // --- SIMD escape classifiers -------------------------------------------------------------------
 //
-// Each classifier reads one fixed-width block and returns a bitmask whose bit `k` is set iff byte `k`
-// needs a JSON escape. The "control byte" test `c < 0x20` is branchless on hardware without an
-// unsigned compare via the saturating-subtract identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
+// Each classifier reads one fixed-width block and returns a per-byte "needs escape" map: the x86
+// paths pack it as a bitmask (one bit per byte), the NEON path as a nibble lane map (4 bits per byte
+// — see `json_escape_map_neon`), each consumed by its own body writer. The "control byte" test
+// `c < 0x20` is branchless on hardware without an unsigned compare via the saturating-subtract
+// identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
 //
 // SAFETY / tail strategy: the block writers only load a full vector while `i + BLOCK <= len`, so no
 // read ever crosses the end of `bytes`. The `< BLOCK` remainder is finished by the scalar oracle,
