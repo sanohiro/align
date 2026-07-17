@@ -18,7 +18,17 @@
     ],
     "description": "Define a new function"
   },
-  "Struct Definition": {
+  "Module Declaration": {
+    "prefix": "module",
+    "body": "module ${1:name}",
+    "description": "Declare the current module"
+  },
+  "Import Module": {
+    "prefix": "import",
+    "body": "import ${1:module}",
+    "description": "Import a module"
+  },
+  "Struct Type Declaration": {
     "prefix": "struct",
     "body": [
       "${1:Name} {",
@@ -26,7 +36,18 @@
       "\t$0",
       "}"
     ],
-    "description": "Define a new struct"
+    "description": "Define a keyword-less struct type"
+  },
+  "Sum Type Declaration": {
+    "prefix": "sum",
+    "body": [
+      "${1:Name} {",
+      "\t${2:Variant},",
+      "\t${3:VariantWithValue}(${4:type}),",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a keyword-less sum type"
   },
   "Match Statement": {
     "prefix": "match",
@@ -46,6 +67,34 @@
     ],
     "description": "If statement"
   },
+  "Loop Expression": {
+    "prefix": "loop",
+    "body": [
+      "loop {",
+      "\t$0",
+      "\tif ${1:done} { break }",
+      "}"
+    ],
+    "description": "Create a loop expression with its break condition"
+  },
+  "Lambda Expression": {
+    "prefix": "lambda",
+    "body": [
+      "fn ${1:x} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Create an inline lambda"
+  },
+  "Arena Block": {
+    "prefix": "arena",
+    "body": [
+      "arena {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Create an arena allocation scope"
+  },
   "Task Group": {
     "prefix": "task_group",
     "body": [
@@ -53,7 +102,7 @@
       "\t$0",
       "}"
     ],
-    "description": "Spawn a task group"
+    "description": "Create a structured task scope"
   },
   "Array map": {
     "prefix": "map",
@@ -104,6 +153,21 @@
     "prefix": "chunks",
     "body": "chunks(${1:size})",
     "description": "Array chunks"
+  },
+  "Array materialize": {
+    "prefix": "to_array",
+    "body": "to_array()",
+    "description": "Materialize a pipeline into an owned array"
+  },
+  "Array map_into": {
+    "prefix": "map_into",
+    "body": "map_into(${1:destination})",
+    "description": "Write a length-preserving pipeline into caller storage"
+  },
+  "Array zip": {
+    "prefix": "zip",
+    "body": "zip(${1:first}, ${2:second})",
+    "description": "Start a lazy equal-length multi-source pipeline"
   },
   "Array sum": {
     "prefix": "sum",
