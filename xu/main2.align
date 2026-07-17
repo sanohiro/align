@@ -1,0 +1,2 @@
+import cfg2
+fn main() -> i32 { return cfg2.A as i32 }

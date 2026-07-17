@@ -86,6 +86,39 @@ fn cross_module_const_accepts() {
 }
 
 #[test]
+fn cross_module_aggregate_const_accepts() {
+    // A `pub` aggregate constant is used qualified across a unit boundary; per-unit reconstruction
+    // rematerializes it from `value_src`, so the verdict matches whole-program.
+    let cfg = "module cfg\npub WEIGHTS := [2, 3, 5]\n";
+    let main = "module main\nimport cfg\nfn main() -> i32 = cfg.WEIGHTS.sum() as i32\n";
+    let r = assert_same_verdict("s1b-cross-agg-const", &[("cfg.align", cfg), ("main.align", main)], "main.align");
+    assert!(!r.diags.has_errors());
+    assert_eq!(r.summaries.len(), 2);
+}
+
+#[test]
+fn pub_aggregate_const_referencing_a_private_const_is_rejected_same_verdict() {
+    // The D1 divergence for constants: `pub TABLE := [SECRET, 2]` with private SECRET must be
+    // rejected at the DEFINING unit (its value ships in the interface), so whole-program and per-unit
+    // reach the SAME reject verdict — before the producer-side check, whole-program accepted while the
+    // per-unit build failed with an <interface:…>-located error.
+    let cfg = "module cfg\nSECRET := 7\npub TABLE := [SECRET, 2]\n";
+    let main = "module main\nimport cfg\nfn main() -> i32 = cfg.TABLE.sum() as i32\n";
+    let r = assert_same_verdict("s1b-pub-agg-private-ref", &[("cfg.align", cfg), ("main.align", main)], "main.align");
+    assert!(r.diags.has_errors(), "a pub const referencing a private const must be rejected");
+}
+
+#[test]
+fn pub_scalar_const_referencing_a_private_const_is_rejected_same_verdict() {
+    // The same producer-side rule applies to the pre-existing scalar shape (it too was broken under
+    // per-unit): `pub A := SECRET + 1` with private SECRET is rejected at the defining unit.
+    let cfg = "module cfg\nSECRET := 7\npub A := SECRET + 1\n";
+    let main = "module main\nimport cfg\nfn main() -> i32 = cfg.A as i32\n";
+    let r = assert_same_verdict("s1b-pub-scalar-private-ref", &[("cfg.align", cfg), ("main.align", main)], "main.align");
+    assert!(r.diags.has_errors());
+}
+
+#[test]
 fn diamond_import_accepts() {
     // main imports b and c; both import base. Legal reconvergence; base checked once, first.
     let base = "module base\npub fn one() -> i64 = 1\n";

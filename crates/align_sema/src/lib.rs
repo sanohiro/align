@@ -1726,6 +1726,43 @@ fn is_aggregate_const_elem(s: Scalar) -> bool {
     matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)
 }
 
+/// Producer-side check that a `pub` constant's initializer references only `pub` same-module
+/// constants. A `pub` constant's value is part of the exported interface (its source is shipped in
+/// the interface summary and re-folded in every importing unit, where the defining module's PRIVATE
+/// items do not exist), so a reference to a private constant would type-check whole-program yet fail
+/// the per-unit build. `by` is the defining module's `bare → (canonical, is_pub)` const map. Walks
+/// the restricted constant-initializer grammar (literals, `Path`, unary/binary, array literals).
+fn check_pub_const_refs(
+    e: &ast::Expr,
+    by: Option<&HashMap<String, (String, bool)>>,
+    diags: &mut Diagnostics,
+) {
+    match &e.kind {
+        ast::ExprKind::Path(p) => {
+            if let Some(name) = single_name(p)
+                && let Some((_, is_pub)) = by.and_then(|b| b.get(name))
+                && !*is_pub
+            {
+                diags.error(
+                    format!("a `pub` constant's initializer references the private constant `{name}` — its value is part of the exported interface, so it may reference only `pub` constants (mark `{name}` `pub`, or inline its value)"),
+                    e.span,
+                );
+            }
+        }
+        ast::ExprKind::Unary { expr, .. } => check_pub_const_refs(expr, by, diags),
+        ast::ExprKind::Binary { lhs, rhs, .. } => {
+            check_pub_const_refs(lhs, by, diags);
+            check_pub_const_refs(rhs, by, diags);
+        }
+        ast::ExprKind::ArrayLit(elems) => {
+            for el in elems {
+                check_pub_const_refs(el, by, diags);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build the HIR literal `ExprKind` for a folded **scalar** constant value. Shared by scalar-constant
 /// substitution and per-element aggregate-constant substitution.
 fn const_scalar_kind(val: &ConstVal) -> ExprKind {
@@ -1920,7 +1957,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                 // rodata; composing them needs a shared-storage design not settled for S1.
                 if matches!(val, ConstVal::Array(..)) {
                     self.diags.error(
-                        format!("aggregate constant `{name}` cannot be referenced from another constant's initializer (not supported in v1)"),
+                        format!("aggregate constant `{name}` cannot be referenced from another constant's initializer yet"),
                         e.span,
                     );
                     return None;
@@ -2772,7 +2809,7 @@ pub fn check_program_with_effects(
                         }
                         Ty::Array(..) | Ty::DynArray(_) | Ty::StructArray(..) | Ty::DynStructArray(..) => {
                             diags.error(
-                                "a top-level array constant is a static slice<T> view; write `slice<T>` or omit the annotation".to_string(),
+                                format!("a top-level array constant is a static `slice<T>` view, got `{}`; write `slice<T>` or omit the annotation", ty_name(ty)),
                                 t.span(),
                             );
                             Ty::Error // suppress a cascading mismatch when folding the initializer
@@ -2800,6 +2837,27 @@ pub fn check_program_with_effects(
             eval.value(canonical);
         }
         const_table.values = eval.values;
+    }
+
+    // Pass 0d-2 (producer-side pub-const surface, the D1 divergence for constants): a `pub`
+    // constant's initializer ships as source in the interface summary and is re-folded in every
+    // importing unit, where the defining module's PRIVATE constants do not exist. So a `pub` constant
+    // may reference only `pub` same-module constants — enforced here at the defining unit so
+    // whole-program and per-unit builds reach the same verdict (a `pub A := SECRET` no longer
+    // type-checks whole-program only to fail per-unit with an <interface:…>-located error). Runs for
+    // every real module in both build paths; interface-only dependencies were checked at their own
+    // production time.
+    for m in modules {
+        if m.interface_only {
+            continue;
+        }
+        let by = const_table.by_module.get(&m.path);
+        for item in &m.file.items {
+            let ast::Item::Const(c) = item else { continue };
+            if matches!(c.vis, ast::Vis::Pub) {
+                check_pub_const_refs(&c.value, by, diags);
+            }
+        }
     }
 
     // Pass 0e (M15 S1b, gate finding D1): a generic `pub` fn's BODY is part of its interface — the
@@ -8548,6 +8606,15 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
+    /// Slice/bytes locals that (transitively) view **read-only** storage — a constant table
+    /// (`ExprKind::ConstArray`, in per-unit rodata) or a string literal's bytes (`"lit".bytes()`).
+    /// Such a view owns nothing *and* its backing storage is not writable, so writing through it
+    /// (`s[i] = v`, or passing it to an `out slice<T>` parameter) would store into the `constant`
+    /// global — a SIGSEGV at `-O0` and a silently-dropped write at `-O2`. Populated at binding (and a
+    /// slice reassignment) and **only ever grown** (insert-only, so a value read-only on any reaching
+    /// path stays flagged — sound-conservative), then checked at the two write sites. The mutable
+    /// backing-buffer analogue for an arena `mmap` view is a pre-existing follow-up (open-questions).
+    readonly_locals: std::collections::HashSet<LocalId>,
     /// Reader locals bound from `r.buffered()` (or `?`/block tails thereof). `read_line` requires a
     /// buffered receiver; since a buffered and an unbuffered reader share [`Ty::Reader`] (mirroring
     /// the buffered *writer* — one type, many constructors), this per-local provenance set is what
@@ -8672,6 +8739,7 @@ impl<'a, 't> Checker<'a, 't> {
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
+            readonly_locals: std::collections::HashSet::new(),
             buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
             cur_fn: String::new(),
@@ -9125,6 +9193,14 @@ impl<'a, 't> Checker<'a, 't> {
                     if local_ty == Ty::Reader && init_is_buffered_reader(&init) {
                         self.buffered_readers.insert(local);
                     }
+                    // Record read-only-view provenance (`s := TABLE`, `b := "x".bytes()`, a sub-slice
+                    // of either) so a later `s[i] = v` / `out`-argument write to constant rodata is
+                    // rejected. Insert-only (monotone): once read-only, a later reassignment cannot
+                    // clear it (a straight-line overwrite could, but a branch join could not — keeping
+                    // it conservative avoids a false-negative soundness hole).
+                    if self.hir_is_readonly_view(&init) {
+                        self.readonly_locals.insert(local);
+                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -9220,6 +9296,12 @@ impl<'a, 't> Checker<'a, 't> {
                                 Ty::Str => self.check_str_init(value),
                                 _ => self.check_expr(value, Some(ty)),
                             };
+                            // Reassigning a read-only view (`s = TABLE`) taints the slice local
+                            // read-only too. Insert-only: a later `s = writable` cannot clear it, so a
+                            // write reachable from the read-only assignment on any path is rejected.
+                            if matches!(ty, Ty::Slice(_)) && self.hir_is_readonly_view(&v) {
+                                self.readonly_locals.insert(id);
+                            }
                             stmts.push(Stmt::Assign {
                                 local: id,
                                 value: v,
@@ -9328,6 +9410,12 @@ impl<'a, 't> Checker<'a, 't> {
                     format!("cannot assign to an element of immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                     place.span,
                 );
+            }
+            // A `mut` binding does not make a **read-only view** writable: a slice viewing a constant
+            // table (or a string literal's bytes) points at the `constant` rodata global, so a store
+            // through it faults / is dropped. Reject the element write (soundness).
+            if self.reject_readonly_dst(id, place.span, "write to an element of") {
+                return Place::Err;
             }
             // `v[lane] = x` — write one lane of a `mut` vector (a constant lane in `0..N`, M6).
             if let Ty::Vec(s, n) = local_ty {
@@ -10140,6 +10228,56 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
     /// array→slice borrow). Used to record slice provenance for the `out` no-alias check.
+    /// Reject a write to a **read-only view** destination `id` (a local viewing a constant table or a
+    /// string literal's bytes). Returns `true` (after reporting) when the write must be rejected. The
+    /// single guard shared by every slice-write entry point (`s[i] = v`, `s.store(i, v)`,
+    /// `pipeline.map_into(s)`), so a new write site cannot silently miss the read-only check.
+    fn reject_readonly_dst(&mut self, id: LocalId, span: Span, verb: &str) -> bool {
+        if self.readonly_locals.contains(&id) || self.readonly_locals.contains(&self.root_local(id)) {
+            let name = self.locals[id as usize].name.clone();
+            self.diags.error(
+                format!("cannot {verb} '{name}': it is a read-only view of a constant table (a constant table is read-only; copy it into an owned array — `mut a := ...` over its elements — to modify)"),
+                span,
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Whether a checked expression is a **read-only view** — it (transitively) borrows constant
+    /// rodata (a `ConstArray` table, or a string-literal's bytes) rather than writable storage.
+    /// Writing through such a view stores into a `constant` global, so the two write sites
+    /// (`check_place` element assignment, and an `out slice<T>` argument) reject it. A control-flow
+    /// value is read-only if *any* reaching arm is (a write must be rejected if any path could target
+    /// rodata).
+    fn hir_is_readonly_view(&self, e: &Expr) -> bool {
+        match &e.kind {
+            // A constant table lives in per-unit read-only rodata.
+            ExprKind::ConstArray { .. } => true,
+            // `"literal".bytes()` (a `str` constant substitutes to a `str` literal) views the
+            // literal's rodata; a runtime `string`'s bytes are writable and out of scope.
+            ExprKind::StrBytes { inner } => matches!(inner.kind, ExprKind::Str(_)) || self.hir_is_readonly_view(inner),
+            // A bound local carries the provenance recorded at its binding (and any root it borrows).
+            ExprKind::Local(id) => {
+                self.readonly_locals.contains(id) || self.readonly_locals.contains(&self.root_local(*id))
+            }
+            // A borrow / sub-slice of a read-only view is itself read-only.
+            ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv) => self.hir_is_readonly_view(recv),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::Unsafe(b) => {
+                b.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+            }
+            ExprKind::If { then, els, .. } => {
+                then.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+                    || els.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.hir_is_readonly_view(&a.body)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.hir_is_readonly_view(opt) || self.hir_is_readonly_view(fallback)
+            }
+            _ => false,
+        }
+    }
+
     fn expr_root_local(&self, e: &Expr) -> Option<LocalId> {
         match &e.kind {
             ExprKind::Local(id) => Some(self.root_local(*id)),
@@ -11049,11 +11187,28 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        let checked = args
+        let checked: Vec<Expr> = args
             .iter()
             .enumerate()
             .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
             .collect();
+        // An `out slice<T>` parameter is written by the callee, so its argument must be writable
+        // storage. A read-only view of a constant table (or a string literal's bytes) points at the
+        // `constant` rodata global — passing it as `out` would have the callee store into read-only
+        // memory. Reject it (the call-site half of the read-only-view rule; the element-write half is
+        // in `check_place`).
+        for (i, &is_out) in out.iter().enumerate() {
+            if is_out
+                && matches!(param_tys.get(i).map(|t| self.resolve(*t)), Some(Ty::Slice(_)))
+                && checked.get(i).is_some_and(|a| self.hir_is_readonly_view(a))
+            {
+                let sp = args.get(i).map(|a| a.span).unwrap_or(span);
+                self.diags.error(
+                    format!("cannot pass a read-only view of a constant table as the `out` argument to '{name}': an `out` buffer is written by the callee (copy the constant into an owned array first)"),
+                    sp,
+                );
+            }
+        }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
     }
 
@@ -12340,6 +12495,9 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("cannot store into immutable '{name}' (declare with `mut`, or use an `out` parameter)"), recv.span);
             return err;
         }
+        if self.reject_readonly_dst(id, recv.span, "store into") {
+            return err;
+        }
         let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
         if !idx.ty.is_int_like() && idx.ty != Ty::Error {
             self.diags.error(format!("a store index must be an integer, got {}", ty_name(idx.ty)), i.span);
@@ -13618,6 +13776,9 @@ impl<'a, 't> Checker<'a, 't> {
                 format!("cannot write into immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                 dst_arg.span,
             );
+            return err;
+        }
+        if self.reject_readonly_dst(dst_id, dst_arg.span, "write into") {
             return err;
         }
         // Type-check the pipeline; a stageless inline literal source infers its element from `dst`.
@@ -16375,6 +16536,9 @@ impl<'a, 't> Checker<'a, 't> {
                         format!("cannot shuffle immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                         xs_arg.span,
                     );
+                    return err;
+                }
+                if self.reject_readonly_dst(xid, xs_arg.span, "shuffle") {
                     return err;
                 }
                 Expr { kind: ExprKind::RandShuffle { rng: Box::new(recv_expr), xs: Box::new(xs), elem: scalar_to_ty(es) }, ty: Ty::Unit, span }

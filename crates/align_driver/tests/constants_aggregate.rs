@@ -265,8 +265,8 @@ fn a_lookup_table_program_prints_hand_computed_values() {
 fn an_array_annotation_is_rejected_with_guidance() {
     let d = check_diagnostics("agg-array-ann", "TABLE: array<i64> := [1, 2, 3]\nfn main() -> i32 = 0\n");
     assert!(
-        d.contains("static slice<T> view") && d.contains("write `slice<T>`"),
-        "expected the slice<T> guidance, got:\n{d}"
+        d.contains("static `slice<T>` view") && d.contains("got `array<i64>`") && d.contains("write `slice<T>`"),
+        "expected the slice<T> guidance naming the annotation, got:\n{d}"
     );
 }
 
@@ -371,5 +371,205 @@ fn an_out_of_range_element_under_an_annotation_is_rejected() {
     assert!(check_errs(
         "agg-elem-range",
         "TABLE: slice<u8> := [1, 300, 3]\nfn at(i: i64) -> u8 = TABLE[i]\nfn main() -> i32 { return at(0) as i32 }\n",
+    ));
+}
+
+// --- read-only-view soundness (a constant table is rodata; writing through it must be rejected) ---
+
+#[test]
+fn writing_an_element_of_a_constant_view_is_rejected() {
+    // `mut s := TABLE` copies the slice *header*; it still points at the `constant` rodata global, so
+    // `s[0] = 9` would SIGSEGV at -O0 / silently drop the write at -O2. A `mut` binding does not make
+    // read-only storage writable.
+    assert!(check_errs(
+        "agg-write-elem",
+        "TABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  s[0] = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn the_read_only_write_diagnostic_names_the_fix() {
+    let d = check_diagnostics(
+        "agg-write-msg",
+        "TABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  s[0] = 9\n  return 0\n}\n",
+    );
+    assert!(d.contains("read-only view of a constant table") && d.contains("copy it into an owned array"), "got:\n{d}");
+}
+
+#[test]
+fn writing_a_constant_view_propagated_through_a_rebind_is_rejected() {
+    // Provenance propagates: `mut t := s` carries `s`'s read-only origin.
+    assert!(check_errs(
+        "agg-write-rebind",
+        "TABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  mut t := s\n  t[0] = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn writing_a_sub_slice_of_a_constant_is_rejected() {
+    assert!(check_errs(
+        "agg-write-subslice",
+        "TABLE := [1, 2, 3, 4]\nfn main() -> i32 {\n  mut s := TABLE[1..3]\n  s[0] = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn reassigning_a_slice_to_a_constant_then_writing_is_rejected() {
+    // A slice local tainted read-only by a later `s = TABLE` cannot be written afterward.
+    assert!(check_errs(
+        "agg-write-reassign",
+        "TABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut ys := [4, 5, 6]\n  mut s : slice<i64> := ys\n  s = TABLE\n  s[0] = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn passing_a_constant_as_an_out_slice_argument_is_rejected() {
+    // An `out slice<T>` parameter is written by the callee; passing constant rodata would store into
+    // the read-only global. The call site rejects it (with no `mut` anywhere in the program).
+    assert!(check_errs(
+        "agg-out-arg",
+        "TABLE := [1, 2, 3]\nfn set(out s: slice<i64>) { s[0] = 9 }\nfn main() -> i32 {\n  set(TABLE)\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn writing_a_string_literals_bytes_view_is_rejected() {
+    // The same rule closes the static `"...".bytes()` hole — the bytes view is also rodata.
+    assert!(check_errs(
+        "agg-str-bytes",
+        "fn main() -> i32 {\n  mut b := \"hello\".bytes()\n  b[0] = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn writing_an_owned_array_backed_slice_stays_legal() {
+    // The gate must not over-reject: a slice viewing a *writable* stack array is still writable.
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  mut ys := [1, 2, 3]\n",
+        "  mut s : slice<i64> := ys\n",
+        "  s[0] = 9\n",
+        "  return ys[0] as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("agg-legit-write", src).status.code(), Some(9));
+}
+
+#[test]
+fn a_legit_out_slice_write_stays_legal() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn fill(out s: slice<i64>) { s[0] = 9 }\n",
+        "fn main() -> i32 {\n",
+        "  mut ys := [1, 2, 3]\n",
+        "  mut d : slice<i64> := ys\n",
+        "  fill(d)\n",
+        "  return ys[0] as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("agg-legit-out", src).status.code(), Some(9));
+}
+
+// --- producer-side pub-constant initializer check (the D1 divergence) -----------------------------
+
+#[test]
+fn a_pub_aggregate_const_referencing_a_private_const_is_rejected() {
+    let d = check_diagnostics(
+        "agg-pub-priv",
+        "SECRET := 7\npub TABLE := [SECRET, 2]\nfn main() -> i32 = 0\n",
+    );
+    assert!(d.contains("private constant `SECRET`") && d.contains("may reference only `pub` constants"), "got:\n{d}");
+}
+
+#[test]
+fn a_pub_scalar_const_referencing_a_private_const_is_rejected() {
+    // The producer-side rule applies to scalars too (also broken under per-unit before this).
+    assert!(check_errs(
+        "agg-pub-priv-scalar",
+        "SECRET := 7\npub A := SECRET + 1\nfn main() -> i32 = 0\n",
+    ));
+}
+
+#[test]
+fn a_pub_const_referencing_a_pub_const_is_allowed() {
+    if !backend_available() {
+        return;
+    }
+    let src = "pub BASE := 7\npub A := BASE + 1\nfn main() -> i32 = A as i32\n";
+    assert_eq!(build_and_run("agg-pub-pub", src).status.code(), Some(8));
+}
+
+// --- pipeline-source dispatch guards (a local shadowing a module must not reroute) ----------------
+
+#[test]
+fn a_plain_field_projection_over_a_local_value_still_works() {
+    // Guards the `collect_pipeline` field-projection path against the qualified-const-source change.
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Rec { x: i64, y: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  recs := [Rec{x:1, y:2}, Rec{x:3, y:4}]\n",
+        "  return recs.x.sum() as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("agg-proj-plain", src).status.code(), Some(4));
+}
+
+#[test]
+fn a_local_shadowing_an_imported_module_projects_the_local() {
+    // A local named like an imported module wins: `cfg.x.sum()` projects the LOCAL struct array's `x`
+    // column, and the module `cfg` stays reachable elsewhere (`cfg.BASE`).
+    if !backend_available() {
+        return;
+    }
+    let cfg = "module cfg\npub BASE := 10\n";
+    let main = concat!(
+        "module main\n",
+        "import cfg\n",
+        "Rec { x: i64, y: i64 }\n",
+        "fn use_local() -> i64 {\n",
+        "  cfg := [Rec{x:1, y:2}, Rec{x:3, y:4}]\n",
+        "  return cfg.x.sum()\n",
+        "}\n",
+        "fn main() -> i32 = (use_local() + cfg.BASE) as i32\n",
+    );
+    let out = build_and_run_multi("agg-shadow", &[("cfg.align", cfg), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(14));
+}
+
+// --- sibling slice-write paths (all must reject a constant view, not just element assignment) ------
+
+#[test]
+fn a_simd_store_into_a_constant_view_is_rejected() {
+    // `s.store(i, vec)` writes N lanes into a slice in place — a constant view must reject it.
+    assert!(check_errs(
+        "agg-store",
+        "TABLE := [1, 2, 3, 4]\nfn main() -> i32 {\n  mut s := TABLE\n  v : vec2<i64> := [9, 9]\n  s.store(0, v)\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn a_shuffle_of_a_constant_view_is_rejected() {
+    // `r.shuffle(xs)` rearranges a slice in place (Fisher-Yates) — a constant view must reject it.
+    let d = check_diagnostics(
+        "agg-shuffle",
+        "import std.rand\nTABLE := [1, 2, 3, 4]\nfn main() -> i32 {\n  mut r := rand.seed_with(1)\n  mut s := TABLE\n  r.shuffle(s)\n  return 0\n}\n",
+    );
+    assert!(d.contains("read-only view of a constant table"), "got:\n{d}");
+}
+
+#[test]
+fn a_map_into_a_constant_view_is_rejected() {
+    // `pipeline.map_into(dst)` materializes into a slice — a constant destination must reject it.
+    assert!(check_errs(
+        "agg-mapinto",
+        "fn dbl(x: i64) -> i64 = x * 2\nTABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  [1, 2, 3].map(dbl).map_into(s)\n  return 0\n}\n",
     ));
 }

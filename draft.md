@@ -173,6 +173,14 @@ indexing, `.len()`, slicing, and pipelines (`map`/`where`/`reduce`/…) all flow
 borrowed-view paths with no allocation. An `array<T>` annotation is rejected — write `slice<T>` or
 omit the annotation.
 
+A constant table is **read-only**: because it views the read-only data section, writing through it —
+`TABLE[i] = v`, or passing it to an `out slice<T>` parameter (which the callee writes) — is a compile
+error, even through a `mut` binding or a sub-slice (a `mut` binding rebinds the *view*, it does not
+make the underlying storage writable). Copy it into an owned array first to modify. The same rule
+covers a string literal's byte view (`"…".bytes()`). When a constant is `pub`, its value is part of
+the exported interface (the initializer is shipped and re-folded in importing modules), so a `pub`
+constant's initializer may reference only `pub` constants.
+
 The element type is inferred from the elements (an unannotated `[1, 2, 3]` is `slice<i64>`) or
 taken from a `slice<T>` annotation; every element must share it. Elements are scalars or `str`,
 each folded by the same compile-time evaluation as a scalar constant (literals, unary/binary

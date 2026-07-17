@@ -253,6 +253,41 @@ fn gate3_transitive_invalidation() {
     assert!(hot.outcome("main").hit, "A's interface inputs unchanged → A hits");
 }
 
+// ---- Gate 3b: a pub aggregate-constant value edit re-keys dependents -----------------------------
+
+#[test]
+fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
+    if !backend() {
+        return;
+    }
+    // A `pub` aggregate constant's value (its initializer source) is part of the exported interface
+    // hash, so editing one element must miss the defining unit AND every dependent that reads it —
+    // the real cross-unit cache proof (not just an interface-hash inequality).
+    let cfg_v1 = "module cfg\npub WEIGHTS := [2, 3, 5]\n";
+    let cfg_v2 = "module cfg\npub WEIGHTS := [2, 3, 6]\n"; // one element edited
+    let main = "import cfg\nfn main() {\n  print(cfg.WEIGHTS.sum())\n}\n";
+    let proj = Project::new("agg-const-edit", &[("cfg.align", cfg_v1), ("main.align", main)], "main.align");
+    let cache = proj.cache();
+
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    if cc_available() {
+        assert_eq!(cold.run(&proj, Profile::Release), "10\n"); // 2 + 3 + 5
+    }
+
+    // Edit one element of the pub aggregate constant.
+    proj.write("cfg.align", cfg_v2);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hot.outcome("cfg").hit, "the edited defining unit must miss");
+    assert!(
+        !hot.outcome("main").hit,
+        "a dependent keying on cfg's interface hash must miss when a pub constant's value changes"
+    );
+    if cc_available() {
+        assert_eq!(hot.run(&proj, Profile::Release), "11\n"); // 2 + 3 + 6, proves the rebuild took effect
+    }
+}
+
 // ---- Gate 4: comment-only edit → hit ------------------------------------------------------------
 
 #[test]

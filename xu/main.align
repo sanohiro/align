@@ -1,0 +1,2 @@
+import cfg
+fn main() -> i32 { return cfg.TABLE.sum() as i32 }
