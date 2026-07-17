@@ -368,6 +368,18 @@ pub enum Ty {
     /// realloc can never invalidate a borrow. Never rides an aggregate (no `Scalar::ArrayBuilder`):
     /// bound to one local, like `builder`/`buffer`.
     ArrayBuilder(Scalar),
+    /// `str_finder` — a **compiler-internal** prepared substring-search plan (doc-13 §6.6 / §11 P3).
+    /// It has **no surface syntax**: it is emitted only by MIR when it recognises the loop-invariant
+    /// repeated-needle where-pipeline (`xs.where(fn(s) = s.contains(NEEDLE)).…`), where MIR builds the
+    /// plan once before the loop (`align_rt_str_finder_new`) and reuses it per element
+    /// (`align_rt_str_finder_find`). An opaque owned **Move** handle (a boxed `memchr::memmem::Finder`
+    /// owning a `'static` needle copy) laid out as a bare `ptr`, like [`Ty::Builder`] — owned, never
+    /// region-tracked (it borrows nothing; it copied the needle bytes). Bound to a synthetic
+    /// path-local owner slot and freed exactly once on every exit path by the drop-flag machinery
+    /// (`align_rt_str_finder_free`). Because it never appears on the surface, the flow analyses
+    /// (`MoveCheck`/`EscapeCheck`/`region_of`) never see it as an expression type; it exists only as
+    /// a MIR slot type and reaches codegen for `Drop`/zero-init.
+    StrFinder,
     /// A `file` (`std.fs`/`std.io`) — the random-access block read+write handle (align-LLM runway
     /// A4). An opaque owned **Move** handle to a heap object owning a read+write fd, produced by
     /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist).
@@ -697,6 +709,8 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        // The compiler-internal `str_finder` plan is an opaque owned handle; it holds no slice.
+        | Ty::StrFinder
         | Ty::DictEncoded(..)
         | Ty::Enum(_)
         | Ty::Task(_)
@@ -763,7 +777,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -795,7 +809,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -944,7 +958,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -971,10 +985,29 @@ fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
     }
 }
 
+/// Whether `e` is a **loop-invariant pure atom** usable as a hoisted needle (doc-13 §6.6): a bare
+/// free-variable name (a single-segment `Path` other than the lambda parameter `param`) or a string
+/// literal. Deliberately NARROW — a call, index, field chain, template, `?`, or arithmetic needle is
+/// rejected here, so it keeps the per-call `str.contains` path with its original per-element
+/// semantics (effect count/order, trapping, `?` legality). Recognising only atoms means hoisting can
+/// never move an impure/trapping/effect-ordered evaluation out of the loop or change what type-checks.
+/// (A field-of-path needle `cfg.prefix` is a possible future extension, deliberately not accepted.)
+fn needle_is_invariant_atom(e: &ast::Expr, param: &str) -> bool {
+    match &e.kind {
+        ast::ExprKind::Str(_) => true,
+        ast::ExprKind::Path(p) => p.segments.len() == 1 && p.segments[0].name != param,
+        _ => false,
+    }
+}
+
 /// The capture operands carried by a pipeline's stages (a lifted lambda's captured values).
 fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
     stages.iter().flat_map(|s| match &s.kind {
         StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => captures.as_slice(),
+        // The hoisted needle is a free-variable read of the enclosing scope — the same role as a
+        // lifted lambda's capture — so `MoveCheck`/`EscapeCheck` must walk it (it may borrow or move
+        // an enclosing local). Exposed here as a one-element capture list.
+        StageKind::WhereStrContains { needle } => std::slice::from_ref(needle),
         StageKind::Project { .. } | StageKind::WhereField { .. } => &[][..],
     })
 }
@@ -1016,7 +1049,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -3377,6 +3410,9 @@ impl EffectScan<'_> {
                         self.expr(c);
                     }
                 }
+                // No lifted function (the whole point of hoisting): the needle is an expression
+                // evaluated once before the loop, so walk it for any call edge / effect it contains.
+                StageKind::WhereStrContains { needle } => self.expr(needle),
                 StageKind::Project { .. } | StageKind::WhereField { .. } => {}
             }
         }
@@ -4590,6 +4626,9 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Builder
             | Ty::Buffer
             | Ty::ArrayBuilder(_)
+            // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
+            // bytes) — it borrows nothing, so it carries no inferred region.
+            | Ty::StrFinder
             | Ty::File
             | Ty::Rng
             | Ty::CliCommand
@@ -12866,6 +12905,47 @@ impl<'a, 't> Checker<'a, 't> {
                         self.diags.error("a whole-struct `map`/`where` over `soa<T>` is not supported (it would gather every column); filter a field with `where(.field)`".to_string(), span);
                         return None;
                     }
+                    // doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. Recognise
+                    // `where(fn s { s.contains(NEEDLE) })` over a `str` element where NEEDLE is a
+                    // bare free variable or a string literal (a loop-invariant pure atom). MIR then
+                    // builds one hoisted `str_finder` plan before the loop instead of reconstructing
+                    // a `memchr` searcher per element. Anything richer than an atom — an
+                    // element-derived needle (`s.contains(s[0..3])`), an impure/trapping call
+                    // (`s.contains(get())` / `s.contains(xs[j])`), a `?` (`s.contains(f()?)`), a
+                    // field chain, or a template — is NOT recognised and keeps the per-call `Where`
+                    // path with its original semantics. Whole-struct/soa predicates never reach here
+                    // (element is not `str`).
+                    if elem == Ty::Str
+                        && let StageFn::Lambda { params, body, .. } = &sf
+                        && params.len() == 1
+                        && body.stmts.is_empty()
+                        && let Some(tail) = &body.tail
+                        && let ast::ExprKind::Call { callee, args } = &tail.kind
+                        && args.len() == 1
+                        && let ast::ExprKind::FieldAccess { recv, field } = &callee.kind
+                        && field.name == "contains"
+                        && let ast::ExprKind::Path(p) = &recv.kind
+                        && p.segments.len() == 1
+                        && p.segments[0].name == params[0].name.name
+                        && needle_is_invariant_atom(&args[0], &params[0].name.name)
+                    {
+                        // Type-check the invariant needle in the enclosing scope. NO type hint
+                        // (Gate 5 #244): a hinted `Some(Ty::Str)` check would speculatively unify —
+                        // and `truncate` rolls back diagnostics, NOT tyvar bindings, corrupting the
+                        // enclosing inference if we then fall through. A genuine `str` needle (a
+                        // captured `str` local or a literal) already resolves to `Ty::Str` from its
+                        // own constraints. Commit only then; otherwise (an owned `string` needle, or
+                        // a type error) drop the speculative diagnostics and fall through to the
+                        // per-call path, which re-checks in the lifted lambda's own fresh inference
+                        // context (so no binding leaks) and reports any error exactly once.
+                        let cp = self.diags.len();
+                        let needle = self.check_expr(&args[0], None);
+                        if needle.ty == Ty::Str {
+                            stages.push(Stage { kind: StageKind::WhereStrContains { needle }, out_ty: elem });
+                            continue;
+                        }
+                        self.diags.truncate(cp);
+                    }
                     let (func, _, captures) = self.resolve_stage_fn(&sf, elem, true)?;
                     stages.push(Stage { kind: StageKind::Where { func, captures }, out_ty: elem });
                 }
@@ -13395,7 +13475,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         // v1: length-preserving stages only — a filtering `where` (a dynamic survivor count) is deferred.
-        if stages.iter().any(|s| matches!(s.kind, StageKind::Where { .. } | StageKind::WhereField { .. })) {
+        if stages.iter().any(|s| matches!(s.kind, StageKind::Where { .. } | StageKind::WhereField { .. } | StageKind::WhereStrContains { .. })) {
             self.diags.error(
                 "'map_into' v1 supports only length-preserving stages (`map` / `.field`); a filtering `where` before `map_into` (which would write a variable prefix and return a count) is deferred".to_string(),
                 span,
@@ -19184,6 +19264,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Builder => "builder".to_string(),
+        // Compiler-internal (no surface syntax); named only for diagnostics/debug completeness.
+        Ty::StrFinder => "str_finder".to_string(),
         // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),

@@ -1128,6 +1128,31 @@ fn build_module<'c>(
             None,
         ),
     );
+    // doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. `str_finder_new(nptr, nlen) -> plan` is
+    // allocator-class (like `builder_new`/`array_builder_new`: `noalias`/`nounwind`/`nofree`, NOT
+    // `willreturn` — a `Box` allocation aborts on OOM). `str_finder_find(plan, hptr, hlen) -> i64`
+    // gets `memory(argmem: read)` + `readonly captures(none)` on both pointers via `rt_contract`
+    // (verified: no CPU-feature detect at find time). `str_finder_free(plan)` is a plain null-safe
+    // deallocator declare (mirrors `builder_free`/`array_builder_free` — free fns take no attrs).
+    let str_finder_new = module.add_function(
+        "align_rt_str_finder_new",
+        ctx.ptr_type(AddressSpace::default()).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
+        None,
+    );
+    mark_alloc_like(ctx, str_finder_new);
+    funcs.insert("str_finder_new".to_string(), str_finder_new);
+    funcs.insert(
+        "str_finder_find".to_string(),
+        module.add_function(
+            "align_rt_str_finder_find",
+            ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "str_finder_free".to_string(),
+        module.add_function("align_rt_str_finder_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // String builder (M5: `template` desugaring).
     let i64t2 = ctx.i64_type();
     let builder_new =
@@ -2764,7 +2789,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -3539,6 +3564,18 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
         "align_rt_str_contains" | "align_rt_str_find" | "align_rt_str_rfind" => {
             Some(feature_detect_reader(&[0, 2]))
         }
+        // `str_finder_find` (doc-13 §6.6): searches a prepared plan. For a *multi-byte* needle the
+        // vector/Two-Way setup and feature detection all happened in `str_finder_new`
+        // (`is_available()` → `with_pair()` → `Searcher::new`), so `Finder::find` would touch only
+        // argument memory. BUT for a **one-byte** needle `memchr 2.8.2` routes `Finder::find` through
+        // `searcher_kind_one_byte` → `crate::memchr(byte, haystack)`, whose `unsafe_ifunc!` reads —
+        // and on the first call writes — a process-global `static FN: AtomicPtr<()>` dispatch cache
+        // (non-argument memory). That is the SAME feature-detect-at-find-time lie this file forbids
+        // for the one-shot `str_contains`/`str_find`. So `memory(...)` is WITHHELD: `finder_find` gets
+        // the `feature_detect_reader` contract (pure-finite flags + `readonly captures(none)` on both
+        // pointers, no memory-effects attribute) — identical to `str_find`. The plan-reuse win is the
+        // point of hoisting; the memory-effects upgrade was an optional extra and is falsified here.
+        "align_rt_str_finder_find" => Some(feature_detect_reader(&[0, 1])),
         // The abort family (`align_rt_bounds_fail`/`len_mismatch_fail`/`range_fail`/`div_fail`/
         // `process_exit`/`process_abort`): each is `-> !` in the runtime — it prints then calls
         // `std::process::abort()` / `_exit` / `std::process::exit`, none of which return. MIR already
@@ -3961,6 +3998,18 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                             for op in args {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
                             }
+                        }
+                        // A hoisted `str_finder` plan (doc-13 §6.6) never holds a builder header; its
+                        // needle/plan/haystack operands are `str` views / an opaque plan pointer.
+                        // Audit them anyway (a header can never be one, so this only ever passes) so
+                        // these do not hit the fail-closed wildcard and needlessly reject unrelated
+                        // stack-header candidates in the same function.
+                        Rvalue::StrFinderNew { needle } => {
+                            reject_header_operand(needle, &load_defs, &owner, &mut bad);
+                        }
+                        Rvalue::StrFinderFind { plan, haystack } => {
+                            reject_header_operand(plan, &load_defs, &owner, &mut bad);
+                            reject_header_operand(haystack, &load_defs, &owner, &mut bad);
                         }
                         Rvalue::CallIndirect { callee, args, .. } => {
                             reject_header_operand(callee, &load_defs, &owner, &mut bad);
@@ -4630,7 +4679,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -4692,6 +4741,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         };
                         self.builder
                             .build_call(self.funcs[free], &[p.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else if ty == Ty::StrFinder {
+                        // A hoisted repeated-needle plan (doc-13 §6.6): free the boxed searcher
+                        // (null-safe — a never-initialised synthetic-owner slot reads null). The
+                        // drop-flag machinery guards this so it runs exactly once on every exit path.
+                        let p = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropf")
+                            .map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["str_finder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if let Ty::ArrayBuilder(elem) = ty {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
@@ -6199,6 +6259,35 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
             }
+            Rvalue::StrFinderNew { needle } => {
+                // Split the needle `{ptr,len}` and build the hoisted plan (doc-13 §6.6). Allocator-
+                // class call (`align_rt_str_finder_new`); the returned handle is a bare `ptr`.
+                let ne = self.operand(needle).into_struct_value();
+                let np = self.builder.build_extract_value(ne, 0, "fnp").map_err(|e| self.err(e))?;
+                let nl = self.builder.build_extract_value(ne, 1, "fnl").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["str_finder_new"], &[np.into(), nl.into()], "finder")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str_finder_new returns a pointer")
+            }
+            Rvalue::StrFinderFind { plan, haystack } => {
+                // Search `haystack` with a prepared plan: `align_rt_str_finder_find(plan, hptr, hlen)`
+                // returns an `i64` index or `-1` (MIR compares `>= 0`). The plan handle is a bare
+                // `ptr`; split the haystack `{ptr,len}` view. No CPU-feature detection here (it
+                // happened in `finder_new`), so the declaration carries `memory(argmem: read)`.
+                let plan_ptr = self.operand(plan);
+                let ha = self.operand(haystack).into_struct_value();
+                let hp = self.builder.build_extract_value(ha, 0, "fhp").map_err(|e| self.err(e))?;
+                let hl = self.builder.build_extract_value(ha, 1, "fhl").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["str_finder_find"], &[plan_ptr.into(), hp.into(), hl.into()], "finderfind")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str_finder_find returns i64")
+            }
             Rvalue::BuilderNew { capacity } => {
                 // Open a builder with a null arena: the finished `string` is heap-owned
                 // (`into_string` copies into a fresh malloc'd buffer), not arena-tied. `capacity`
@@ -7591,7 +7680,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
@@ -9542,6 +9631,41 @@ mod tests {
         );
         let sf = attr_group_of(&out, "align_rt_str_find");
         assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");
+
+        // (3b) The hoisted repeated-needle plan (doc-13 §6.6). LIKE the one-shot `str_find`,
+        // `str_finder_find` keeps the pure-finite flags + `readonly captures(none)` on BOTH pointers
+        // (the plan at param 0, the haystack at param 1) but WITHHOLDS `memory(...)`: a one-byte
+        // needle routes `Finder::find` through `crate::memchr`'s `unsafe_ifunc!` global dispatch
+        // cache (non-argument memory), so an `argmem: read` claim would be a lie. A regression that
+        // re-adds a memory-effects attribute here fails loudly.
+        assert!(
+            out.contains(
+                "declare i64 @align_rt_str_finder_find(ptr readonly captures(none), ptr readonly captures(none), i64)"
+            ),
+            "want readonly + captures(none) on both str_finder_find pointers:\n{out}"
+        );
+        let ff = attr_group_of(&out, "align_rt_str_finder_find");
+        assert!(
+            !ff.contains("memory("),
+            "str_finder_find must NOT claim a memory effect (one-byte needle hits memchr's dispatch cache):\n{ff}"
+        );
+        for a in ["willreturn", "nofree", "nosync"] {
+            assert!(ff.contains(a), "str_finder_find must carry {a}:\n{ff}");
+        }
+        // `finder_new` is allocator-class: `noalias` return + `nounwind` + `nofree`, but NOT
+        // `willreturn` (a `Box` allocation aborts on OOM). Same treatment as `array_builder_new`.
+        assert!(
+            out.contains("declare noalias ptr @align_rt_str_finder_new("),
+            "finder_new must return noalias (allocator-class):\n{out}"
+        );
+        let fnew = attr_group_of(&out, "align_rt_str_finder_new");
+        assert!(fnew.contains("nofree") && fnew.contains("nounwind"), "finder_new must be nofree+nounwind:\n{fnew}");
+        assert!(!fnew.contains("willreturn"), "finder_new must NOT be willreturn (OOM aborts):\n{fnew}");
+        // `finder_free` is a bare null-safe deallocator declare (free fns take no curated attrs).
+        assert!(
+            out.contains("declare void @align_rt_str_finder_free(ptr)\n"),
+            "finder_free must be an attribute-free declare:\n{out}"
+        );
 
         // (4) The abort family: `noreturn`, nothing else. Never `willreturn` (they diverge).
         for sym in [

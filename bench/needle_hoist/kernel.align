@@ -1,0 +1,39 @@
+// doc-13 §6.6 — repeated-needle plan hoisting leak/double-free oracle (bench/needle_hoist).
+// Exported entry points, driven from the Rust harness which reads the runtime's
+// `align_rt_str_finder_new_count` / `align_rt_str_finder_free_count` around each call. The needle is
+// a literal (the plan lifetime is size/value-independent), so the ABI is just i64 in / i64 out.
+
+// Run the hoisted where-pipeline `reps` times. Each invocation builds one `str_finder` plan and must
+// free it exactly once, so after the loop `finder_new_count` and `finder_free_count` both advance by
+// exactly `reps`.
+pub fn count_reps(reps: i64) -> i64 {
+  xs := ["alpha", "beta", "alfalfa", "gamma", "delta"]
+  n := "al"
+  mut acc := 0
+  mut i := 0
+  r := loop {
+    if i >= reps { break acc }
+    acc = acc + xs.where(fn s { s.contains(n) }).count()
+    i = i + 1
+  }
+  return r
+}
+
+// A pipeline whose invocation is followed by a `?` that may propagate an error. The plan is built
+// before the `?`, so it must be freed on BOTH the error-propagating and the normal exit path —
+// `finder_new_count` and `finder_free_count` advance by exactly 1 regardless of `flag`.
+fn gate(flag: i64) -> Result<i64, i64> {
+  if flag == 0 { return Err(3) }
+  return Ok(flag)
+}
+fn inner(flag: i64) -> Result<i64, i64> {
+  xs := ["ab", "abc", "xy"]
+  n := "ab"
+  c := xs.where(fn s { s.contains(n) }).count()
+  v := gate(flag)?
+  return Ok(c + v)
+}
+pub fn count_try(flag: i64) -> i64 {
+  r := inner(flag)
+  return r else -1
+}

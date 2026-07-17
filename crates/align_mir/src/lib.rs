@@ -485,6 +485,20 @@ pub enum Rvalue {
     /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
     /// `memchr`-class scan. Pure read, no allocation.
     StrPredicate { kind: hir::StrPredKind, haystack: Operand, needle: Operand },
+    /// Build a repeated-needle substring-search plan from an invariant `needle` `str` `{ptr,len}`
+    /// (doc-13 §6.6 / §11 P3). Emitted **once before** a recognised where-pipeline loop
+    /// (`xs.where(fn(s) = s.contains(NEEDLE)).…`); yields an owned [`Ty::StrFinder`] handle stored in a
+    /// synthetic path-local owner slot (freed once on every exit path via the drop-flag machinery).
+    /// Codegen splits the `{ptr,len}` and calls the allocator-class `align_rt_str_finder_new`. The
+    /// needle bytes are copied into the plan, so the plan outlives the needle view.
+    StrFinderNew { needle: Operand },
+    /// Search `haystack` (a `str` `{ptr,len}` element) with a prepared [`Ty::StrFinder`] `plan`,
+    /// yielding an `i64` byte index or `-1` (doc-13 §6.6). The per-element counterpart of
+    /// [`Self::StrFinderNew`]; MIR compares the result `>= 0` to reproduce the `contains` predicate
+    /// bit-identically. Codegen calls `align_rt_str_finder_find` (declared `memory(argmem: read)` —
+    /// the search does no CPU-feature detection, which happened in `finder_new`). Pure read, no
+    /// allocation.
+    StrFinderFind { plan: Operand, haystack: Operand },
     /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — yield a borrowed sub-`str` `{ptr,len}` of
     /// the receiver with ASCII whitespace stripped from one or both ends. Pure read, no allocation;
     /// the result aliases the receiver's bytes.
@@ -4892,6 +4906,87 @@ fn lower_struct_elem(
     v
 }
 
+/// How a recognised `WhereStrContains` stage lowers its per-element predicate. Chosen once in the
+/// preheader by [`hoist_str_finder_plans`] from the `ALIGN_NEEDLE_HOIST` toggle (doc-13 §6.6). Both
+/// variants lower the needle **once** before the loop, so the two pipelines are byte-for-byte
+/// identical except for searcher reuse — the honest before/after the adoption probe compiles.
+enum NeedleLower {
+    /// Default (toggle on): a hoisted `str_finder` plan owner slot; the body reuses it via
+    /// `finder_find(plan, s) >= 0`.
+    Plan(Slot),
+    /// Toggle off (`ALIGN_NEEDLE_HOIST=off`): the invariant needle operand, lowered once; the body
+    /// reconstructs the searcher per element via `str_contains(s, needle)` — the unhoisted baseline.
+    PerCall(Operand),
+}
+
+/// doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. For each `WhereStrContains` stage, lower the
+/// loop-invariant needle **once** in the loop preheader and decide how the body evaluates the
+/// predicate (`None` for any other stage). Default: build a `str_finder` plan (the invariant needle's
+/// `memchr` searcher is constructed once and reused per element) into a synthetic path-local owner —
+/// its init is prepended to entry, the drop flag is set live here, and the drop-flag machinery frees
+/// it exactly once on every exit path (fall-through, `break`, `?`, early return). With
+/// `ALIGN_NEEDLE_HOIST=off` (the measurement/regression toggle, mirroring `ALIGN_SORT_ADAPTIVE`;
+/// read HERE at MIR-lowering time so the per-unit `impl_hash` fingerprints the two shapes distinctly,
+/// and `CacheContext::from_env` force-disables the object cache when it is set) the plan is NOT built
+/// and the body reconstructs the searcher per element — same fused loop, differing only in reuse.
+/// Must be called after `setup_source` and before the loop header is emitted.
+fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<NeedleLower>> {
+    // Read the toggle at MIR lowering (never in codegen): the object cache key fingerprints the
+    // lowered MIR text, so reading it here makes the two shapes cache-distinct, and
+    // `CacheContext::from_env` additionally forces the cache off whenever this var is set.
+    let hoist = std::env::var("ALIGN_NEEDLE_HOIST").ok().as_deref() != Some("off");
+    stages
+        .iter()
+        .map(|stage| match &stage.kind {
+            hir::StageKind::WhereStrContains { needle } => {
+                let needle_val = lower_expr(b, needle);
+                if hoist {
+                    let owner = b.new_synthetic_owner(Ty::StrFinder);
+                    let plan = b.fresh_value(Ty::StrFinder);
+                    b.push(Stmt::Let(plan, Rvalue::StrFinderNew { needle: needle_val }));
+                    b.push(Stmt::Store(owner, Operand::Value(plan)));
+                    b.set_drop_flag(owner, true);
+                    Some(NeedleLower::Plan(owner))
+                } else {
+                    Some(NeedleLower::PerCall(needle_val))
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Lower a `WhereStrContains` predicate inside a pipeline loop body over the current `str` element
+/// `elem`, per the preheader decision `nl` (from [`hoist_str_finder_plans`]). Returns the `bool`
+/// predicate value — the branchless/maskable counterpart of a `str.contains`, reproducing `contains`
+/// (index `>= 0`) bit-identically. The hoisted form reuses the plan; the toggle-off form emits the
+/// same per-element `str_contains` the unhoisted pipeline would.
+fn lower_where_str_contains_pred(b: &mut Builder, nl: &NeedleLower, elem: Operand) -> ValueId {
+    match nl {
+        NeedleLower::Plan(plan_slot) => {
+            let plan = b.fresh_value(Ty::StrFinder);
+            b.push(Stmt::Let(plan, Rvalue::Load(*plan_slot)));
+            let idx = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(idx, Rvalue::StrFinderFind { plan: Operand::Value(plan), haystack: elem }));
+            let pred = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(pred, Rvalue::Bin(BinOp::Ge, Operand::Value(idx), index_const(0))));
+            pred
+        }
+        NeedleLower::PerCall(needle) => {
+            let pred = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                pred,
+                Rvalue::StrPredicate {
+                    kind: hir::StrPredKind::Contains,
+                    haystack: elem,
+                    needle: needle.clone(),
+                },
+            ));
+            pred
+        }
+    }
+}
+
 fn lower_array_reduce(
     b: &mut Builder,
     source: &hir::Expr,
@@ -4902,6 +4997,8 @@ fn lower_array_reduce(
 ) -> Operand {
     let elem_ty = acc_ty;
     let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
+    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
+    let finder_plans = hoist_str_finder_plans(b, stages);
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -4925,7 +5022,10 @@ fn lower_array_reduce(
             guard_rejected = true;
             break;
         }
-        if matches!(&stage.kind, hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. }) {
+        // `WhereStrContains` is a filtering `where` (it marks `seen_where`) but, like `WhereField`,
+        // its predicate is a total/non-trapping builtin, so it is NOT a guard trigger above — it
+        // stays maskable/branchless.
+        if matches!(&stage.kind, hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. }) {
             seen_where = true;
         }
     }
@@ -4979,7 +5079,7 @@ fn lower_array_reduce(
     // predicate, so `mask` stays `None` and rejected elements jump directly to `cont`.
     let mut mask: Option<Operand> = None;
 
-    for stage in stages {
+    for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
@@ -5020,6 +5120,22 @@ fn lower_array_reduce(
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                if guard_rejected {
+                    let accepted = b.new_block();
+                    b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                    b.cur = accepted;
+                } else {
+                    mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
+                }
+            }
+            hir::StageKind::WhereStrContains { .. } => {
+                // Hoisted repeated-needle predicate (doc-13 §6.6): `finder_find(plan, s) >= 0` over
+                // the current `str` element, reusing the plan built once before the loop. Total and
+                // non-trapping, so it masks branchlessly like `WhereField` (or branches under a
+                // guarded suffix). `where` keeps the element, so `cur` is unchanged.
+                let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem);
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -5177,6 +5293,8 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // new output buffer, so free that source temporary at the exit (the result is a separate
     // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
     let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
+    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
+    let finder_plans = hoist_str_finder_plans(b, stages);
 
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
@@ -5250,7 +5368,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         None
     };
 
-    for stage in stages {
+    for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
@@ -5291,6 +5409,16 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+            hir::StageKind::WhereStrContains { .. } => {
+                // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
+                // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
+                let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -5474,7 +5602,7 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                 b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } => {
+            hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. } => {
                 unreachable!("map_into rejects filtering `where` stages in sema")
             }
         }
@@ -5932,6 +6060,8 @@ fn lower_array_partition(
 ) -> Operand {
     let arena = b.arenas.last().copied();
     let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip } = setup_source(b, source);
+    // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
+    let finder_plans = hoist_str_finder_plans(b, stages);
 
     // Two output buffers, each an upper-bound `bound` elements (a split never grows the count).
     let alloc_buf = |b: &mut Builder| {
@@ -5999,7 +6129,7 @@ fn lower_array_partition(
         None
     };
 
-    for stage in stages {
+    for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
@@ -6035,6 +6165,16 @@ fn lower_array_partition(
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+            hir::StageKind::WhereStrContains { .. } => {
+                // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
+                // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
+                let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -8899,6 +9039,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
+        Ty::StrFinder => "str_finder".to_string(),
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
