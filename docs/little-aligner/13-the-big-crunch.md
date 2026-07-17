@@ -35,14 +35,14 @@ This is an OS-level memory map (`mmap`). The file is mapped directly into your a
 **A5.** We decode it sideways, directly into an arena:
 ```align
 arena {
-    logs: soa<Log> := json.decode_many(view)?
+    logs: soa<Log> := json.decode(view)?
     ...
 }
 ```
 
 ---
 
-**Q6.** Does `decode_many` allocate a string on the heap for every URL in the logs?
+**Q6.** Does `json.decode` allocate a string on the heap for every URL in the logs?
 
 **A6.** No. Strings in Align are `slice<u8>`. The parser simply points those slices into the `view` we already have. Zero copies.
 
@@ -79,7 +79,9 @@ results := valid_logs.user_id.group_by().count()
 view := fs.read_bytes_view("access.log")
 
 arena {
-    results := json.decode_many::<Log>(view)?
+    logs: soa<Log> := json.decode(view)?
+    
+    results := logs
         .where(fn l { l.status == 200 })
         .user_id
         .group_by()

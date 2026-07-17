@@ -41,19 +41,17 @@ In Align, we write this as a pipeline over the component arrays.
 ```align
 fn physics_system(world: mut World, dt: f32) {
     // We only want entities that have BOTH a Position and a Velocity.
-    // `zip` combines two arrays.
-    world.positions.zip(world.velocities).map_in_place(
-        fn (opt_pos, opt_vel) {
-            match (opt_pos, opt_vel) {
-                (Some(mut p), Some(v)) => {
-                    p.x = p.x + v.dx * dt
-                    p.y = p.y + v.dy * dt
-                    Some(p)
-                },
-                _ => opt_pos // Leave unchanged
-            }
+    // We iterate over the SoA columns directly.
+    loop i in 0..world.positions.len() {
+        match (world.positions[i], world.velocities[i]) {
+            (Some(mut p), Some(v)) => {
+                p.x = p.x + v.dx * dt
+                p.y = p.y + v.dy * dt
+                world.positions[i] = Some(p)
+            },
+            _ => {} // Leave unchanged if either is missing
         }
-    )
+    }
 }
 ```
 

@@ -64,10 +64,10 @@ Pool {
 
 Now, the timeline looks like this:
 1. Alice joins. Slot 4 is at generation 1. Alice is given `Entity { index: 4, generation: 1 }`.
-2. Bob saves `target = Entity(4, 1)`.
+2. Bob saves `target = Entity { index: 4, generation: 1 }`.
 3. Alice disconnects. Slot 4's value becomes `None`, and **we increment Slot 4's generation to 2**.
 4. Charlie joins. He is placed in Slot 4, and is given `Entity { index: 4, generation: 2 }`.
-5. Bob tries to heal `Entity(4, 1)`. The Pool looks at Slot 4, sees that its current generation is `2`, which does not match Bob's ticket (`1`). The Pool safely rejects the heal.
+5. Bob tries to heal `Entity { index: 4, generation: 1 }`. The Pool looks at Slot 4, sees that its current generation is `2`, which does not match Bob's ticket (`1`). The Pool safely rejects the heal.
 
 ## Why this is the Align way
 

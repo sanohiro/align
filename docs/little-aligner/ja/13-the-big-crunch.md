@@ -35,14 +35,14 @@ view := fs.read_bytes_view("access.log")
 **A5.** Arenaの中に、直接「横倒し（SoA）」でデコードします：
 ```align
 arena {
-    logs: soa<Log> := json.decode_many(view)?
+    logs: soa<Log> := json.decode(view)?
     ...
 }
 ```
 
 ---
 
-**Q6.** `decode_many` は、ログ内のすべてのURLに対してヒープ上に文字列（String）をアロケーションするのですか？
+**Q6.** `json.decode` は、ログ内のすべてのURLに対してヒープ上に文字列（String）をアロケーションするのですか？
 
 **A6.** いいえ。Align の文字列は単なる `slice<u8>` です。パーサーは、すでに手元にある `view`（メモリマップされたファイル）の一部を指し示すスライスを作るだけです。コピーはゼロです。
 
@@ -79,7 +79,9 @@ results := valid_logs.user_id.group_by().count()
 view := fs.read_bytes_view("access.log")
 
 arena {
-    results := json.decode_many::<Log>(view)?
+    logs: soa<Log> := json.decode(view)?
+    
+    results := logs
         .where(fn l { l.status == 200 })
         .user_id
         .group_by()
