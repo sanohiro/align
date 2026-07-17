@@ -30,3 +30,4 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 - [15 — The edges: unsafe and C FFI](15-unsafe-and-ffi.md)
 - [16 — The toolchain: alignc, the formatter, the lints](16-toolchain.md)
 - [17 — The Align way](17-the-align-way.md)
+- [18 — std services: network, HTTP, processes, compression, crypto](18-std-services.md)

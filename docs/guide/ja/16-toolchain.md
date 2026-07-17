@@ -1,56 +1,90 @@
-# ツールチェーン: alignc、フォーマッタ、リント
+# ツールチェーン: alignc、フォーマッタ、lint
 
 > 🌐 [English](../16-toolchain.md) · **日本語**
 
-1 つのバイナリ `alignc` が、ツールチェーン全体を担います。コンパイラ、ランナー、フォーマッタ、そして自分が得ている機械語コードを監査させてくれる IR ダンプです。まだ学ぶべきビルドファイルの方言はありません。ビルドの単位はファイルとそのインポートです。
+1 つの `alignc` binary に compiler、runner、formatter、cache control、inspection tool がまとまっています。multi-file program は 1 つの entry file から始まり、import が build graph を作るため、別の build-file dialect はありません。
 
 ## 実際に使うコマンド
 
 ```text
-alignc check file.align         # fast: parse + typecheck + lints, no codegen
-alignc run   file.align [args…] # build + execute; trailing args → main(args)
-alignc build file.align         # emit a native executable next to you
-alignc fmt   file.align --write # normalize formatting in place
+alignc check file.align         # whole-program の parse + typecheck + lint
+alignc run   file.align [args…] # build + execute。後続引数は main(args) へ
+alignc build file.align         # current directory に <stem> という executable
+alignc fmt   file.align --write # formatting をその場で正規化
 ```
 
-編集ループは `check`(サブ秒、すべての診断を表示)と `run` です。`build` はデプロイ可能な成果物、つまりただのネイティブ実行ファイルを渡します。同梱すべきランタイムはありません。複数ファイルのプログラムはエントリファイルからビルドされ、インポートはそこからの相対で見つかります(第 [09](09-generics-and-modules.md) 章)。
+編集ループは `check` と `run` です。multi-file build は `.align` file ごとに 1 module を compile し、明示的な interface に対して import を検査し、到達可能な DAG を link します。`check-per-unit` は interface-based checker を公開し、`emit-interface` は各 unit の public surface と interface/implementation hash を表示します。
+
+codegen は既定で有効な content-addressed object cache と parallel worker を使います。要求しない限り表示はしません。
+
+```text
+alignc build app.align --cache-stats -j 4
+alignc cache clear
+```
+
+`-j` は `ALIGNC_JOBS` より優先されます。`ALIGNC_CACHE=off` で cache を無効化し、`ALIGNC_CACHE=<path>` で移動できます。cache identity には source/interface content、compiler と LLVM identity、target、profile、export、runtime bitcode、PGO mode が含まれます。したがって hit は単に timestamp が新しいという意味ではなく、byte を再利用できるという意味です。
 
 ## コンパイラが見たものを見る
 
 ```text
-alignc emit-mir  file.align     # the mid-level IR: what your code means
-alignc emit-llvm file.align     # LLVM IR: what your code became
-alignc emit-obj  file.align     # object file only (link it yourself)
+alignc emit-mir  file.align
+alignc emit-llvm file.align --stage raw
+alignc emit-llvm file.align --stage optimized
+alignc emit-obj  file.align
+alignc explain-opt file.align --verbose
+alignc size file.align --profile tiny
 ```
 
-`emit-llvm` は習慣にする価値があります。本書はパイプラインが融合しベクトル化されると繰り返し主張してきました。それを鵜呑みにしないでください。パイプラインの IR をダンプし、ループが 1 つであることと `<4 x i64>` のようなベクトル型を探してください。パフォーマンスの疑問が生じたら、答えはコマンド 1 つの先にあります。これが「四者同時最適化」の実践的な意味です。あなたのプログラムに対するハードウェアの視点は、伝聞ではなく検査可能なのです。
+`emit-mir` は意味の lens です。raw LLVM IR は最適化前の lowering を、optimized IR は LLVM が実際に作った形を示します。`explain-opt` は vectorization などの optimization remark を source line へ戻して説明します。`size` は選択 profile で `build` と同じ artifact を作り、byte の内訳を報告します。standalone object/IR では `--export name` を繰り返し、entry unit の選択した関数を外部公開できます。
+
+## profile、target、whole-program optimization
+
+```text
+--profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
+--target-cpu baseline|native|<LLVM CPU>
+--rt-lto                               # 選択した runtime bitcode を inline
+--thin-lto                             # cross-unit ThinLTO
+```
+
+既定は portable な `baseline` と `release` です。`native` は現在の machine 用、`x86-64-v3` のような名前付き LLVM CPU は既知の deployment fleet に向きます。`--rt-lto` と `--thin-lto` は compile cost と optimization scope を変えるため明示的です。どちらも `release` または `fast` が必要です。ThinLTO は link する `build` / `run` / `size` に適用され、parallel かつ cached で、runtime LTO と組み合わせられます。
+
+代表的な production workload には instrumented PGO が使えます。
+
+```text
+alignc build app.align --profile fast --pgo-instrument
+./app                                      # 表示された .profraw file を書く
+llvm-profdata-22 merge default.profraw -o app.profdata
+alignc build app.align --profile fast --pgo-use app.profdata
+```
+
+compiler は実際の raw profile 出力先を表示します。instrument と use mode は排他的で別々に cache され、現在 `--thin-lto` とは組み合わせられません。`--rt-lto` とは組み合わせられます。存在しない、読めない、壊れた、version 不整合の profile は hard error です。古い、または別 program の readable な profile は目立つ warning を出して build を続けます。profile mismatch が変えるのは performance であり program semantics ではないからです。
 
 ## フォーマッタ
 
-`alignc fmt` は正規化された形を表示し、`--write` はファイルを書き換えます。その哲学はほとんどのフォーマッタより意図的に狭いものです。正規化するのは**無意味なばらつきだけ**、すなわちスペーシング、`;` の配置、末尾のカンマ、アラインメントです。改行を折り直したり、1 行対複数行を強制したりは**しません**。パイプラインが 1 行として読みやすいか 5 行として読みやすいかは、*あなたが*選んだ情報であり、フォーマッタはそれを保ちます。(パースできないファイルのフォーマットも拒否します。理解できないコードを「修正」することは決してありません。)常に走らせてください。差分は意味的なものだけになります。
+`alignc fmt` は正規形を出力し、`--write` は file を書き換えます。spacing、`;` の配置、末尾 comma、alignment という意味のない差だけを正規化し、改行は保持します。parse できない file は format しません。diff を意味上の変更だけにするため、日常的に実行してください。
 
-## リント
+## lint
 
-`check`(そしてすべてのビルド)はリントスイートを走らせます。設定も `#[allow]` もありません。スイートは小さく意図的で、深刻度で分かれ方が普通ではありません。
+すべての check と build が lint suite を実行します。file ごとの suppression surface はありません。
 
-**ハードエラー** — リントの服を着た正しさのルールです。
-
-```text
-unhandled Result        a discarded Result<_, _> — handle it with ? / match / a binding
-```
-
-**警告** — パフォーマンスの正直さです。ビルドをブロックすることは決してありません。
+**hard error** は correctness を守ります。
 
 ```text
-lossy conversion        an `as` that truncates (defined behavior, but flagged)
-huge struct copy        by-value copy past ~2 cache lines — take a view or restructure
-unnecessary heap        a box that never escapes — use a plain value
-wasteful default        a large literal array defaulting to a wider element than it needs
-unused import           an import no code in the file uses
+unhandled Result        ?、match、else、binding のいずれかで処理する
 ```
 
-これらの多くは前の章で出会っています。実際の初心者コードで発火するからです。第 [05](05-memory.md) 章でヒープが不要だったボックス、第 [02](02-language-basics.md) 章の `i64 as i8` です。それが意図された体験です。リントは、あなたが書き終えたまさにその行で、言語のパフォーマンスモデルがあなたに語りかけるものであって、スタイルの取り締まりではありません。警告が発火したら、直し方はほぼ常に本書が教えるイディオムです。警告に同意できないときは、そのまま出荷できます(警告はビルドを失敗させません)。ただし先に測定してください。これらはそれぞれ、言語が他の手段では可視化できないコストを指しているからです。
+**warning** は build を止めず、決定的な cost を見えるようにします。
 
-## 意図的に欠けているもの(今のところ)
+```text
+lossy conversion        情報を捨てうる `as`
+huge struct copy        およそ 2 cache line を超える by-value copy
+unnecessary heap        allocate して直ちに読む狭い形
+wasteful default        大きな literal array が必要以上に広い推論 element を使う
+unused import           その file で使われない imported capability
+```
 
-パッケージマネージャも、ビルドシステムも、テストランナーも、デバッガ統合もありません。プレリリースの段階では、単一バイナリのツールチェーンこそが要点です。上記のすべては今日動作し、腐敗しうる設定を持ちません。`pkg` レイヤ(フレームワーク、エコシステム)は core と std の*外*に住むよう設計されているので、言語が必須のビルド儀式を育てることは決してありません。ツールの表面は広がると見込んでください。そして哲学 — 1 つのバイナリ、ゼロ設定、要求に応じた IR — は変わらないと見込んでください。
+これらは style rule ではなく、source line で話す performance model です。まず data shape を直します。意図的に warning を残すなら `explain-opt`、`size`、代表的 benchmark で artifact を測ってください。
+
+## 意図的に欠けているもの
+
+package manager、project manifest、general test runner、debugger integration はまだありません。`pkg` layer は core と std の外に残す設計です。現在の contract は意図的に小さく、1 binary、import-discovered build、content-identified artifact、inspectable optimization です。

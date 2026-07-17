@@ -2,55 +2,89 @@
 
 > 🌐 **English** · [Japanese](./ja/16-toolchain.md)
 
-One binary, `alignc`, carries the whole toolchain — compiler, runner, formatter, and the IR dumps that let you audit the machine code you're getting. No build-file dialect to learn yet: the unit of building is a file and its imports.
+One binary, `alignc`, carries the compiler, runner, formatter, cache controls, and inspection tools. A multi-file program starts at one entry file; imports form the build graph, so there is still no separate build-file dialect.
 
 ## The commands you'll actually use
 
 ```text
-alignc check file.align         # fast: parse + typecheck + lints, no codegen
+alignc check file.align         # whole-program parse + typecheck + lints
 alignc run   file.align [args…] # build + execute; trailing args → main(args)
-alignc build file.align         # emit a native executable next to you
+alignc build file.align         # executable named <stem> in the current directory
 alignc fmt   file.align --write # normalize formatting in place
 ```
 
-The edit loop is `check` (subsecond, prints every diagnostic) and `run`. `build` gives you the deployable artifact — a plain native executable, no runtime to ship. Multi-file programs build from the entry file; imports are found relative to it (chapter [09](09-generics-and-modules.md)).
+The edit loop is `check` and `run`. Multi-file builds compile one module per `.align` file, check imports against explicit interfaces, and link the reachable DAG. `check-per-unit` exposes that interface-based checker; `emit-interface` prints each unit's public surface and interface/implementation hashes.
+
+Codegen uses a default-on content-addressed object cache and parallel workers. It is silent unless asked:
+
+```text
+alignc build app.align --cache-stats -j 4
+alignc cache clear
+```
+
+`-j` overrides `ALIGNC_JOBS`. `ALIGNC_CACHE=off` disables caching; `ALIGNC_CACHE=<path>` relocates it. Cache identity includes source/interface content, compiler and LLVM identity, target, profile, exports, runtime bitcode, and PGO mode. A hit therefore means reusable bytes, not merely a newer timestamp.
 
 ## Seeing what the compiler saw
 
 ```text
-alignc emit-mir  file.align     # the mid-level IR: what your code means
-alignc emit-llvm file.align     # LLVM IR: what your code became
-alignc emit-obj  file.align     # object file only (link it yourself)
+alignc emit-mir  file.align
+alignc emit-llvm file.align --stage raw
+alignc emit-llvm file.align --stage optimized
+alignc emit-obj  file.align
+alignc explain-opt file.align --verbose
+alignc size file.align --profile tiny
 ```
 
-`emit-llvm` deserves a habit. This book has claimed repeatedly that pipelines fuse and vectorize — don't take its word: dump a pipeline's IR and look for one loop and `<4 x i64>`-style vector types. When a perf question comes up, the answer is one command away, which is the practical meaning of "four-way alignment": the hardware's view of your program is inspectable, not folklore.
+`emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` translates vectorization and other optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
+
+## Profiles, targets, and whole-program optimization
+
+```text
+--profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
+--target-cpu baseline|native|<LLVM CPU>
+--rt-lto                               # inline selected runtime bitcode
+--thin-lto                             # cross-unit ThinLTO
+```
+
+The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. `--rt-lto` and `--thin-lto` are explicit because they change compile cost and optimization scope. Both require `release` or `fast`; ThinLTO applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
+
+For a representative production workload, instrumented PGO is available:
+
+```text
+alignc build app.align --profile fast --pgo-instrument
+./app                                      # writes the announced .profraw file
+llvm-profdata-22 merge default.profraw -o app.profdata
+alignc build app.align --profile fast --pgo-use app.profdata
+```
+
+The compiler prints the actual raw-profile destination. Instrument and use modes are mutually exclusive, cached independently, and currently cannot be combined with `--thin-lto`; `--rt-lto` does compose. A missing, unreadable, corrupt, or version-invalid profile is a hard error. A stale or wrong-but-readable profile produces a prominent warning and still builds because profile mismatch affects performance, not program semantics.
 
 ## The formatter
 
-`alignc fmt` prints the normalized form; `--write` rewrites the file. Its philosophy is deliberately narrower than most: it normalizes **only meaningless variation** — spacing, `;` placement, trailing commas, alignment. It does **not** reflow your line breaks or force one-line versus multi-line: whether a pipeline reads better as one line or five is information *you* chose, and the formatter preserves it. (It also refuses to format a file that doesn't parse — it never "fixes" code it doesn't understand.) Run it always; diffs stay semantic.
+`alignc fmt` prints the normalized form; `--write` rewrites the file. It normalizes only meaningless variation — spacing, `;` placement, trailing commas, alignment — and preserves your line breaks. It refuses to format a file that does not parse. Run it routinely so diffs stay semantic.
 
 ## The lints
 
-`check` (and every build) runs the lint suite. There is no configuration and no `#[allow]` — the suite is small and deliberate, and it splits by severity in an unusual way:
+Every check and build runs the lint suite. There is no per-file suppression surface.
 
-**Hard errors** — correctness rules wearing lint clothing:
-
-```text
-unhandled Result        a discarded Result<_, _> — handle it with ? / match / a binding
-```
-
-**Warnings** — performance honesty; they never block a build:
+**Hard errors** enforce correctness:
 
 ```text
-lossy conversion        an `as` that truncates (defined behavior, but flagged)
-huge struct copy        by-value copy past ~2 cache lines — take a view or restructure
-unnecessary heap        a box that never escapes — use a plain value
-wasteful default        a large literal array defaulting to a wider element than it needs
-unused import           an import no code in the file uses
+unhandled Result        handle it with ?, match, else, or a binding
 ```
 
-You have met most of these in earlier chapters, because they fire on real beginner code: the box in chapter [05](05-memory.md) that didn't need the heap, the `i64 as i8` in chapter [02](02-language-basics.md). That is the intended experience — the lints are the language's performance model talking to you at the exact line where you left it, not a style cop. When a warning fires, the fix is almost always the idiom this book teaches; when you disagree with one, you can ship anyway (warnings don't fail builds) — but measure first, because each of these flags a cost the language otherwise has no way to make visible.
+**Warnings** expose deterministic costs without blocking a build:
 
-## What's deliberately missing (for now)
+```text
+lossy conversion        an `as` that can discard information
+huge struct copy        a by-value copy larger than about two cache lines
+unnecessary heap        a narrow allocate-then-immediately-read shape
+wasteful default        a large literal array using a wider inferred element than needed
+unused import           an imported capability unused by that file
+```
 
-No package manager, no build system, no test runner, no debugger integration — pre-release, the single-binary toolchain is the point: everything above works today and has no configuration to bitrot. The `pkg` layer (frameworks, ecosystem) is designed to live *outside* core and std, so the language never grows a mandatory build ritual. Expect the tool surface to widen; expect the philosophy — one binary, zero config, IR on demand — to stay.
+These are the performance model speaking at the source line, not style rules. Fix the data shape first; when you intentionally keep a warning, measure the artifact with `explain-opt`, `size`, and a representative benchmark.
+
+## What's deliberately missing
+
+There is no package manager, project manifest, general test runner, or debugger integration yet. The `pkg` layer is intended to remain outside core and std. The current contract is deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.

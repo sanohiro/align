@@ -30,3 +30,4 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 - [15 — 境界: unsafe と C FFI](15-unsafe-and-ffi.md)
 - [16 — ツールチェーン: alignc、フォーマッタ、lint](16-toolchain.md)
 - [17 — Align の流儀](17-the-align-way.md)
+- [18 — std services: network、HTTP、process、圧縮、暗号](18-std-services.md)

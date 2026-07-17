@@ -97,7 +97,7 @@ Two body forms, nothing else: a block with `return`, or `= expr` for single-expr
 
 Align has no `for` and no `while`. This is not an omission — it is the language's center of gravity. Iteration over data is a **pipeline** (`xs.map(f).where(p).sum()`, chapter [06](06-pipelines.md)), which the compiler fuses into a single vectorizable loop. If you are about to walk a collection by hand, stop: name the transformation instead.
 
-What remains — iteration whose trip count is decided *by the iteration itself*, like reading until EOF or retrying until success — has exactly one construct: the **`loop` expression** (**implementation in progress**). It repeats its block until a `break` runs; `break value` ends the loop with that value, so `loop`, like `if` and `match`, is an expression:
+What remains — iteration whose trip count is decided *by the iteration itself*, like reading until EOF or retrying until success — has exactly one construct: the **`loop` expression**. It repeats its block until a `break` runs; `break value` ends the loop with that value, so `loop`, like `if` and `match`, is an expression:
 
 ```align
 mut total := 0

@@ -1,6 +1,6 @@
 # Compiler Pipeline
 
-Defines the stages from `source.align` to executable, and the boundaries of the IR flowing between stages. **IR boundary = crate boundary** (`00-overview.md`). Each stage depends only on the previous stage's output and knows nothing of later stages.
+Defines the stages from `source.align` to executable, and the boundaries of the IR flowing between stages. **IR boundary = crate boundary** (`00-overview.md`). Each compiler stage depends only on earlier IR. The current driver runs this pipeline per reachable module, exchanges canonical `align_interface` summaries across unit boundaries, caches content-identified objects, and links them in import-DAG order.
 
 ## Overall Diagram
 
@@ -30,7 +30,10 @@ MIR (optimized)
   │  align_codegen_llvm
   ▼
 LLVM IR → object
-  │  align_driver  link (+ align_runtime)
+  │  align_driver  content-addressed object cache / parallel unit codegen
+  ▼
+per-unit objects             interfaces checked; deterministic DAG order
+  │  align_driver  link (+ capability-selected align_runtime components)
   ▼
 executable
 ```
@@ -44,7 +47,7 @@ executable
 
 ### Parser (`align_parser`)
 - Token stream → AST. With error recovery (reports multiple errors within one file).
-- Absorbs syntax such as `:=` / `mut` / the `fn ... = expr` short form / struct literals / `?` / `else` / `arena {}` / `template` / `html` / `json` strings here.
+- Absorbs syntax such as `:=` / `mut` / the `fn ... = expr` short form / struct literals / `?` / `else` / `loop` / `arena {}` / `task_group {}` / `unsafe {}` / plain `template` strings here. The spec's `html` / `raw` / JSON-template variants remain deferred.
 - **No desugaring.** Expansion of `?` and `template` is the MIR stage. The AST is kept as written (the lint uses the AST; the formatter is token-driven with AST *assist* — it re-emits the original token text and recovers comments/newlines from source spans, consulting the AST only to disambiguate `<>`/unary spacing; see `open-questions.md` "Formatter").
 
 ### Sema (1) Name Resolution (`align_sema`)
@@ -67,29 +70,37 @@ executable
 ### MIR Generation (`align_mir`)
 - This is where **desugaring** first happens. Details in `04-mir.md`.
   - `?` → early return + cold error path branch.
-  - `template` / `html` / `json` strings → `write_static` / `write_value` sequences (§13).
+  - plain `template` strings → `write_static` / `write_value` sequences (§13).
   - Array expression `a = (b+c)*d` → a fused loop that creates no temporary array (§9).
   - `map`/`where`/`sum` chains → fusion into a single loop.
   - `arena {}` → arena allocator allocate / bulk-free calls.
-  - struct → SoA/AoS layout decision, field table generation (§14).
+  - explicit `to_soa` / SoA and grouped operations → column layout and aggregation nodes (§14).
 - allocation / error path / parallel unit (chunk) are held as **explicit nodes** in MIR (nothing hidden).
 
 ### MIR Optimization (`align_mir`)
-- loop fusion, branchless lowering of `mask`, elimination of unnecessary clone/heap, const string pooling.
-- Many lints (`draft.md` §16) reuse the results of this analysis for diagnostics.
+- pipeline fusion, branchless mask/select lowering, explicit SIMD shapes, and constant/string pooling.
+- Structural performance lints run in sema; LLVM optimization remarks are exposed separately by `alignc explain-opt`.
 
 ### Codegen (`align_codegen_llvm`)
 - MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM's vector type / select and emits vector instructions deterministically.
 - Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
 
 ### Driver (`align_driver`)
-- CLI. Calls the stages in order, links the object with `align_runtime`, and produces an executable.
-- Subcommands (planned): `alignc build` / `alignc run` / `alignc check` (up to sema) / `alignc emit-mir` / `alignc emit-llvm`.
+- CLI. Discovers the import DAG, builds/verifies unit interfaces, runs per-unit codegen through the
+  default-on object cache (parallel by default), selects runtime capabilities, links, and atomically
+  publishes the executable.
+- Shipped subcommands: `check`, `check-per-unit`, `emit-interface`, `emit-mir`, `emit-llvm`,
+  `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
+  profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, and instrumented PGO.
 
 ## Cross-cutting Crates
 
 - `align_span`: file ID + byte offset range. Every IR node carries a span, and diagnostics point back into the original source.
 - `align_diag`: types, display, and aggregation of multiple errors/warnings. Each stage continues as far as possible even on failure, accumulating diagnostics.
+- `align_ast`: syntax shared without making sema depend on parser internals.
+- `align_interface`: canonical public type/function/effect summaries and fail-closed decoding.
+- `align_hash`: one deterministic hash implementation for language operations and artifact identity.
+- `align_fmt`: formatting over source tokens with AST assistance; it preserves deliberate line layout.
 
 ## The Path Driven First by the Skeleton (walking skeleton)
 

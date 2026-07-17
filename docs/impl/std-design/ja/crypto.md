@@ -5,6 +5,8 @@
 
 > 🌐 [English](../crypto.md) · **日本語**
 
+> **ステータス:** M11 v1 surface は完了済みです。文書に記載した BLAKE3 の例外だけが保留です。
+
 ## Overview
 
 crypto.random、sha256/sha512、blake3、hmac、hkdf、argon2id、aes_gcm、chacha20_poly1305、

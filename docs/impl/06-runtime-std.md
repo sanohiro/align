@@ -180,7 +180,7 @@ i32 align_rt_start(i32 argc, char** argv):
     Err(e)  => report(e); return non-zero
 ```
 
-Maps `main`'s return (`draft.md` §17) to the exit code. The display format of `Error` is settled in the error type design (`03`/M2). In M0, start from the minimal form wired directly to `fn main() -> i32`, and connect the Result version in M2 (`07-roadmap.md`).
+Maps `main`'s return (`draft.md` §17) to the exit code. The display format of `Error` is settled in the error type design (`03`/M2). Both `fn main() -> i32` and the `Result`/argv entry forms are shipped; the M0→M2 sequence below is retained as bootstrap history.
 
 ---
 
@@ -199,7 +199,7 @@ std   the OS boundary (draft.md §18.2)
 - **Write core in Align itself as much as possible**. To make MIR's fusion (`04 §3`) work for `map`/`where`/`reduce`, the direction is to define them not as specially-handled builtins but as **normal Align generic functions + intrinsic hooks**. The lowest layer (SIMD scan, the core of hash) drops to runtime intrinsics.
 - **Write std as a thin wrapper** over the runtime + OS syscalls, in Align. `fs.read_file` etc. call the runtime's I/O primitives.
 
-### Bootstrap order (consistent with M, 07)
+### Bootstrap order (historical; all listed milestones completed)
 ```text
 M0-M1  minimal runtime (start/arena/panic) + builtin print only. almost no core/std
 M2     core.option / core.result. std.fs.read_file (a concrete example of ?)
@@ -211,7 +211,9 @@ M7     parallel (par_map on the core side / task on std)
 M8+    std expansion (path/env/time/net/...). pkg is out of scope (draft.md §18.3)
 ```
 
-`// OPEN:` until the minimal generics needed to write core in Align (`03 §9`, M4) are resolved, where to draw the line on what stays a provisional builtin implementation.
+The current builtin/runtime boundary is documented by the core-design inventories and the shipped
+M4–M12 records in `07-roadmap.md`; consumer-driven intrinsics remain preferable to speculative
+self-hosting work.
 
 ---
 

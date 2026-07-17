@@ -55,24 +55,28 @@ The design bets:
 - Since drawing a number is visibly impure, an rng-using closure is **rejected by `par_map`** at compile time — the classic non-reproducible-parallel-simulation bug is unrepresentable. (Per-task generators via `task_group`, or pre-generate a column of randoms and pipeline over it.)
 - `range` is half-open `[lo, hi)` and bias-free; `range(1, 7)` is a die. Nonsense arguments (`lo >= hi`, `sample` with `k > len`) abort loudly rather than return something plausible.
 
-## `std.cli` — implementation in progress
+## `std.cli`
 
-Command-line parsing is designed but **not yet implemented** — today you read `main(args: array<str>)` by hand (chapters [04](04-errors.md), [13](13-std-os.md)), which honestly covers the small-tool case:
+For more than a positional argument or two, register flags on a command and parse the one argv source, `main(args: array<str>)`:
 
 ```align
+import std.cli
+
 pub fn main(args: array<str>) -> Result<(), Error> {
-    if args.count() < 2 {
-        print("usage: tool <input>")
-        return Err(Error.Invalid)
-    }
-    input := args[1]
-    // ...
+    c := cli.command("tool")
+    c.flag_bool("verbose")
+    c.flag_str("input", "input.json")
+    c.flag_i64("count", 1)
+
+    p := c.parse(args)?
+    if p.get_bool("verbose") { print(p.get_str("input")) }
+    print(p.get_i64("count"))
     return Ok(())
 }
 ```
 
-The designed shape (for orientation; check the spec when it ships): declare flags on a `cli.command`, parse `args` into a typed result — unknown or malformed flags are `Error.Invalid`, and reading a flag you never declared is a hard programming error, not a silent default. No derive macros, no attribute DSL: flags are declared in ordinary code, One-way style.
+`flag_bool` defaults to `false`; `flag_str` and `flag_i64` take explicit defaults. The accepted spelling is `--name value` (and `--name` for a bool). Unknown, duplicate, or malformed flags return `Error.Invalid`. After a successful parse, getters are total; asking for an undeclared name or the wrong type aborts as a programming error. `p.get_str` is a view into `p`, so clone it if the text must outlive the parsed handle.
 
----
+Both the command and parsed result are Move handles. Bind them before calling methods; chained calls on unnamed owning receivers remain a separate v1 surface restriction even though general expression temporaries now clean up correctly. `c.usage()` returns generated usage text and remains available after either parse outcome. There are no derive macros or attribute DSLs: registration is ordinary code and visible at the call site.
 
-Also designed at full depth and queued behind `cli` (all implementation in progress): `std.net` (TCP), `std.http` (a plaintext-v1 client), `std.process` (spawn/exec), `std.compress` (deflate/gzip), and `std.crypto` (hashes/HMAC, borrowing a constant-time-audited engine). Their designs are settled in `docs/impl/std-design/`; this book will grow their chapters as they land.
+The next wave — networking, HTTP/TLS, processes, compression, and cryptography — is also shipped. Chapter [18](18-std-services.md) introduces it.

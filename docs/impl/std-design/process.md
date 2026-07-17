@@ -6,6 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/process.md)
 
+> **Status:** complete in M11. Exit/abort, spawn/wait/kill, and exec are shipped.
+
 ## Overview
 
 spawn, exec, exit (draft §18.2). Fork/exec/waitpid + a child Move handle. **This module settles

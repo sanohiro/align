@@ -502,15 +502,19 @@ enum Expr {
     Match { scrut: Box<Expr>, arms: Vec<Arm> },
     Else { lhs: Box<Expr>, rhs: ElseBody },     // unwrap-or-else
     Block(Block),
+    Loop(Block),
     Arena(Block),
     Unsafe(Block),
+    TaskGroup(Block),
     Lambda { params: Vec<Ident>, body: Block },
-    StrPrefixed { kind: StrKind, lit: StringLit },  // template/html/json
+    Template(Vec<TemplatePart>),
     Raw(Box<Expr>),
 }
 ```
 
-`// OPEN:` operator associativity details, holding generic actual arguments in `Path`, representing error nodes (for recovery).
+This is a compact architectural sketch, not the exhaustive current Rust enum. The implemented
+`align_ast::ExprKind` also carries arrays/slices, tuples, casts, field shorthand, and other concrete
+forms; `Stmt` includes `break`. Generic actual arguments at expression position were settled away.
 
 ---
 
@@ -523,15 +527,15 @@ enum Expr {
 
 ---
 
-## 11. Open items (to be settled)
+## 11. Settled boundaries and remaining tooling work
 
 ```text
-- Whether to allow named fields in a variant (Rect { w, h })
-- match guards / | multiple patterns / exhaustiveness checking
-- Explicit generic-type-argument syntax at expression position (need turbofish or not)
-- Type notation for function types (closures)
-- String-interpolation grammar details (allow {expr}, or {ident} only)
-- The collection target and form for doc comments (///)
+- Sum variants use the one positional payload model; structs carry named fields.
+- match is exhaustive; guards and `|` pattern alternatives are not part of the current surface.
+- There are no expression-position generic arguments (no turbofish); context/annotations infer them.
+- Lambda parameter types are inferred at a typed use site and written when a lambda is a value.
+- Plain `template` holes contain full expressions. html/raw/JSON-template variants remain deferred.
+- `///` collection for generated API documentation remains future tooling work.
 ```
 
-These will be settled at the related milestones (`07-roadmap.md`), and reflected into `draft.md` and this document as they are decided.
+The normative syntax remains `draft.md`; this file records the frontend representation choices.

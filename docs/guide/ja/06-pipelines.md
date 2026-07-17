@@ -32,7 +32,9 @@ xs.scan(0, add)    // running accumulation — a stage, not a terminal
 
 ```align
 fn combine(a: slice<f32>, b: slice<f32>, c: slice<f32>, out dst: slice<f32>) {
-    zip(a, b, c).map(fn v { v.0 + v.1 * v.2 }).map_into(dst)
+    zip(a, b, c)
+        .map(fn v { v.0 + v.1 * v.2 })
+        .map_into(dst)
 }
 ```
 

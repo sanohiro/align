@@ -2,9 +2,6 @@
 
 > 🌐 **English** · [Japanese](./ja/11-do-it-until.md)
 
-> *The `loop` expression in this chapter is designed and specified, but the compiler is still
-> catching up — **implementation in progress**. Be the compiler yourself for a few more weeks.*
-
 **Q1.** Where is Align's `for`?
 
 **A1.** There isn't one. No `while` either. You have lived ten chapters without noticing — the pipelines were the loops.

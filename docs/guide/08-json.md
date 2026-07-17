@@ -41,7 +41,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-There is no `json.decode<User>(...)` call form yet (implementation in progress) — today the annotation carries the type, which reads naturally through `?`.
+There is deliberately no `json.decode<User>(...)` call form: Align has no expression-position type arguments. The annotation carries the type, which reads naturally through `?`.
 
 Malformed input, a missing field, a type mismatch, an out-of-range number — all are an `Err`, never a panic and never a silently-wrong value:
 

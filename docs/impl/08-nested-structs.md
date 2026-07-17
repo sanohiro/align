@@ -1,10 +1,17 @@
-# Nested struct / enum fields — implementation plan
+# Nested struct / enum fields — implementation record
 
-The one remaining **language** gap (casts, modules, constants, bitwise are all done). Today a struct
-field must be a primitive scalar or `str`, and field access is depth-1 (`local.field`). This plan
-lifts both restrictions so structs can model composite data.
+> **Current status.** The core plan shipped: plain-data nesting, whole inner-struct values,
+> string-owning nested fields with Drop, nested array element access/update, Move-struct arrays,
+> and cross-module field types are implemented. The sections below preserve the original walls and
+> slice rationale as an implementation record. Remaining limits are called out in their individual
+> bullets: partial moves through nested paths, owned collection fields, nested SoA columns, and a
+> few owned-field/element mutation forms.
 
-## Current limitation (the three walls)
+This was the last broad language-modeling gap when the plan was written. At that time a struct
+field had to be a primitive scalar or `str`, and field access was depth-1 (`local.field`). The plan
+below lifted both restrictions so structs can model composite data.
+
+## Original limitation (the three walls)
 
 ```align
 Point { x: i64, y: i64 }

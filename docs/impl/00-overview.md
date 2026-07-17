@@ -48,7 +48,7 @@ The danger is in axis B. Therefore:
 
 First complete a skeleton in which an `x := 1`-level program flows through lexer → parser → typecheck → MIR → LLVM → executable. Once the skeleton is through, `map` / `where` / arena / JSON become a matter of just **plugging** into the same pipeline, and no stage gets rewritten.
 
-## Crate Structure (proposal)
+## Crate Structure (current)
 
 A Rust workspace. Split crates per stage, matching IR boundaries to crate boundaries.
 
@@ -57,15 +57,18 @@ alignc/                  workspace root
   crates/
     align_span/          source positions / file management (depended on by all stages)
     align_diag/          shared foundation for diagnostics (errors/warnings)
+    align_ast/           syntax tree shared by parser, sema, and formatter
     align_lexer/         source → tokens
     align_parser/        tokens → AST
-    align_ast/           AST definitions
     align_sema/          name resolution + type inference/checking + move/arena checking → typed HIR
     align_mir/           HIR → MIR conversion + MIR optimization (fusion etc.)
     align_codegen_llvm/  MIR → LLVM IR → object
     align_runtime/       minimal runtime (arena allocator etc.). Linked into output
-    align_driver/        CLI: alignc build / run. Connects the stages
-  tests/                 end to end (.align → run → output comparison)
+    align_interface/     canonical per-unit public interfaces + hashes/codecs
+    align_hash/          canonical hashing shared by language/runtime/cache identity
+    align_fmt/           token-preserving source formatter
+    align_driver/        CLI, import DAG, object cache, parallel codegen, link
+                        (end-to-end tests live under this crate)
 ```
 
 Stage responsibilities and IR-boundary details in `01-pipeline.md`.
@@ -88,6 +91,7 @@ Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 11-parallel-execution-optimization.md  parallel correctness, low-lock runtime, and range-IR audit
 12-pipeline-closure-memory-io-simd-audit.md  pipeline legality, closure ABI/lifetime, allocation, I/O, and SIMD audit
 13-string-array-allocation-short-input-audit.md  text/array ownership, copy counts, and short-input audit
+14-llm-inference-focus-audit.md  measured model-loading/layout/routing/profiling priorities
 source-correctness-fixes-2026-07-13.md  implemented correctness fixes and their permanent regression gates
 ```
 

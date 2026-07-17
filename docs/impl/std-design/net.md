@@ -6,6 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/net.md)
 
+> **Status:** complete in M11. DNS, TCP client/server, and UDP are shipped.
+
 ## Overview
 
 Low-level sockets: tcp, udp, dns, socket. Syscall-backed. The keystone reuse: a connected
