@@ -4,7 +4,7 @@
 
 **Q1.** You have two arrays: `[1, 2, 3, 4]` and `[10, 20, 30, 40]`. Add them pairwise.
 
-**A1.** `a.zip(b).map(fn (x, y) { x + y })`. The pipeline handles it.
+**A1.** `zip(a, b).map(fn v { v.0 + v.1 }).to_array()`. `zip` is a pipeline source that walks both arrays in lockstep, handing each stage one pair.
 
 ---
 
@@ -24,11 +24,11 @@
 
 **A4.** 
 ```align
-v1 := vec4<i32>(1, 2, 3, 4)
-v2 := vec4<i32>(10, 20, 30, 40)
+v1: vec4<i32> := [1, 2, 3, 4]
+v2: vec4<i32> := [10, 0, 30, 40]
 v3 := v1 + v2
 ```
-`v3` is now `vec4<i32>(11, 22, 33, 44)`. One instruction, four results.
+The annotation turns the literal into a vector — there is no separate constructor. `v3` now holds `[11, 2, 33, 44]`. One instruction, four results. (`v2` carries a zero on purpose — we will need it.)
 
 ---
 
@@ -40,7 +40,7 @@ v3 := v1 + v2
 
 **Q6.** What is a mask?
 
-**A6.** A vector of booleans. `m := v2 != vec4<i32>(0)` gives us `mask4(true, true, true, true)`. 
+**A6.** A vector of lane-wise booleans. `m := v2 != 0` compares every lane against the broadcast scalar `0` at once, and gives us a `mask4<i32>` — true in every lane except the second, where `v2` is `0`. A mask is only ever born from a comparison — you never write one by hand.
 
 ---
 
@@ -48,10 +48,11 @@ v3 := v1 + v2
 
 **A7.** We `select`.
 ```align
-safe_v2 := m.select(v2, vec4<i32>(1)) 
+ones: vec4<i32> := [1, 1, 1, 1]
+safe_v2 := select(m, v2, ones)
 ans := v1 / safe_v2
 ```
-If the mask is true, it picks from `v2`. If false, it picks `1`. The division never traps, and the CPU never branched.
+Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divided by the substituted `1` instead of trapping on `v2`'s `0`. The division never traps, and the CPU never branched.
 
 ---
 

@@ -15,36 +15,42 @@
 データと振る舞いは完全に分離します。さらに言えば、個別の `Player` 1つ1つは、多くの場合「正しい抽象化の単位」ではありません。あなたは「ある1人のプレイヤーを更新する」のではなく、「すべての座標を更新する」のです。
 
 ```align
-// Player { health, x, y } という「個体」で考えるのをやめる
+Player { x: f64, velocity_x: f64, health: i64 }
+
+// Player オブジェクトを1つずつ更新するのをやめる:
 arena {
-    players: soa<Player> = load_players()
-    
-    // すべての座標を、キャッシュフレンドリーな1回のパスで一括更新する
-    players.x.zip(players.velocity_x).map(fn (x, v) { x + v }).to_array()
+    rows := [
+        Player { x: 0.0, velocity_x: 1.0, health: 100 },
+        Player { x: 5.0, velocity_x: -1.0, health: 80 },
+    ]
+    players := rows.to_soa()
+
+    // すべての「次の座標」を、キャッシュフレンドリーな1回のパスで一括計算する
+    xs := players.x
+    vxs := players.velocity_x
+    next_x := zip(xs, vxs).map(fn v { v.0 + v.1 }).to_array()
 }
 ```
 
 ## 2. 「ポリモーフィックなリスト」というアンチパターン
 
 **OOP のアプローチ:** 
-`Shape` インターフェースのリストに、`Circle` や `Rectangle` といったオブジェクトを混ぜて格納します。ループを回し、各要素に対して `shape.draw()` を呼び出します。これにより、ループのたびに仮想メソッドディスパッチ（そしてキャッシュミス）が発生します。
+`Shape` インターフェースのリストに、`Circle` や `Rectangle` といったオブジェクトを混ぜて格納します。ループを回し、各要素に対して `shape.area()` を呼び出します。これにより、ループのたびに仮想メソッドディスパッチ（そしてキャッシュミス）が発生します。
 
 **Align のアプローチ:**
-要素の数が少なく種類が混ざっているなら、直和型（`enum`）を使います。あるいは処理速度を最優先するなら、配列そのものを型ごとに分離します。
+要素の数が少なく種類が混ざっているなら、直和型（Sum Type）を使います。あるいは処理速度を最優先するなら、配列そのものを型ごとに分離します。
 
 もし混ぜて保持する必要があるなら：
 ```align
-enum Shape {
-    Circle { radius: f32 },
-    Rect { w: f32, h: f32 },
-}
+Shape { Circle(f64), Rect(f64, f64) }
 
-shapes.map(fn s {
+shapes := [Shape.Circle(2.0), Shape.Rect(3.0, 4.0)]
+areas := shapes.map(fn s {
     match s {
-        Circle { radius } => draw_circle(radius),
-        Rect { w, h } => draw_rect(w, h),
+        Circle(r) => 3.14159 * r * r,
+        Rect(w, h) => w * h,
     }
-})
+}).to_array()
 ```
 しかし、真のデータ指向のアプローチは、すべての Circle を1つの `soa<Circle>` に、すべての Rect を `soa<Rect>` に保存し、**一切の分岐を持たない2つの独立した爆速のパイプラインで一気に処理する**ことです。
 
@@ -54,15 +60,18 @@ shapes.map(fn s {
 ループの中でリストに要素を `append` していきます。リストは自動的に自身のサイズを拡張し、予測不可能なタイミングでヒープメモリを確保（アロケーション）します。
 
 **Align のアプローチ:**
-Align にも `heap.alloc` はありますが、それが自然に使われることは稀です。動的なメモリが必要なときは `arena` を使います。arena ブロックが終了した瞬間、すべてのメモリは一瞬で解放されます。ホットループの中で個々のオブジェクトを `new` したり `delete` したりすることは決してありません。
+Align にも `heap.new` はありますが、それが自然に使われることは稀です。動的なメモリが必要なときは `arena` を使います。arena ブロックが終了した瞬間、すべてのメモリは一瞬で解放されます。ホットループの中で個々のオブジェクトを `new` したり `delete` したりすることは決してありません。そして、ホットループの中でコレクションを副作用で育てることもありません — 蓄積はパイプライン自身が行い、確保はパイプラインの終端にただ1つ、目に見える形で置かれます：
 
 ```align
+threshold := 100
 arena {
-    // 途中で個別に free することなく、arena に結果を蓄積していく
-    mut results := []
-    lines.where(.is_error).map(fn l { results.push(l.msg) })
+    readings := [42, 150, 88, 203]
+    // 確保はパイプラインの終端に1つだけ — 隠れた成長はない
+    spikes := readings.where(fn r { r > threshold }).to_array()
 } // ズドン。すべて消え去る。
 ```
+
+（パイプラインではどうしても形を表現できない場合 — 長さが未知のストリーミング入力を蓄積するような場面 — には、`array_builder<T>` が副作用による `.push()` を許された正式な逃げ道です。18章を参照してください。これは稀なケースのための例外であり、パイプラインの代わりではありません。）
 
 ## 4. 「Getter/Setter」というアンチパターン
 

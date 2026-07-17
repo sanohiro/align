@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/22-building-a-system.md)
 
-You have unlearned objects (Chapter 19). You know how to manage long-lived memory with pools (Chapter 20). You know how to model state with enums (Chapter 21).
+You have unlearned objects (Chapter 19). You know how to manage long-lived memory with pools (Chapter 20). You know how to model state with sum types (Chapter 21).
 
 How do you put this all together to build an entire application? Let's build a miniature Entity-Component-System (ECS) architecture, the quintessential Data-Oriented Design pattern.
 
@@ -10,80 +10,71 @@ How do you put this all together to build an entire application? Let's build a m
 
 In OOP, a game entity is a class with fields and methods. In ECS:
 - **Entities** are just IDs (e.g., `i64`). They contain no data.
-- **Components** are plain data. They are stored in SoA (Struct of Arrays) columns.
+- **Components** are plain data, stored as flat, parallel columns — the same field-per-column shape [chapter 11](11-data-oriented.md) taught as `soa<T>`, though here they are bare top-level arrays rather than an actual `soa<T>` value: `soa<T>` is arena-bound (chapter 20), while these components must outlive any single frame's arena.
 - **Systems** are functions that iterate over components using pipelines.
 
-Let's model a 2D world where things have Positions, Velocities, and Renderable sprites.
+Let's model a tiny 1D world where things have positions and velocities.
 
 ## The Components
 
-Instead of a `GameObject` class, we define flat arrays of components.
+Instead of a `GameObject` class, we define columns. The entity is nothing but the row index shared by all of them:
 
 ```align
-Position { x: f32, y: f32 }
-Velocity { dx: f32, dy: f32 }
-
-World {
-    // Entities are implicit; the index in these arrays is the Entity ID.
-    // Option allows us to have sparse components (not every entity has every component).
-    positions: array<Option<Position>>,
-    velocities: array<Option<Velocity>>,
-    sprites: array<Option<string>>,
-}
+// Row i across all columns = entity i.
+mut xs  := [0.0, 10.0, 20.0].to_array()   // position component
+vxs     := [1.0, 1.0, -1.0].to_array()    // velocity component
 ```
+
+A real world would carry more columns — health, sprite ids — and, for components not every entity has, an `alive`-style `bool` column plus the generational tickets of Chapter 20. The shape stays the same: one column per field, one row per entity.
 
 ## The System
 
-A System is a function that operates on components. It does not belong to any class. Let's write a Physics System that updates positions based on velocities.
+A System is a function that operates on components. It does not belong to any class. Let's write a Physics System that computes the next positions from the velocities.
 
-In Align, we write this as a pipeline over the component arrays.
+In Align, a system is a pipeline over the component columns, writing into a caller-owned destination with `map_into` ([Little Aligner 05](../little-aligner/05-chains.md)) instead of allocating a fresh array every call:
 
 ```align
-fn physics_system(world: mut World, dt: f32) {
-    // We only want entities that have BOTH a Position and a Velocity.
-    // We iterate over the SoA columns directly.
-    loop i in 0..world.positions.len() {
-        match (world.positions[i], world.velocities[i]) {
-            (Some(mut p), Some(v)) => {
-                p.x = p.x + v.dx * dt
-                p.y = p.y + v.dy * dt
-                world.positions[i] = Some(p)
-            },
-            _ => {} // Leave unchanged if either is missing
-        }
-    }
+fn physics(xs: slice<f64>, vxs: slice<f64>, dt: f64, out next_xs: slice<f64>) {
+    zip(xs, vxs).map(fn v { v.0 + v.1 * dt }).map_into(next_xs)
 }
 ```
+
+Data in, data out. No hidden state, and — because the closure is pure — nothing stops the compiler from vectorizing the whole pass.
 
 ## The Game Loop
 
-Now we wrap it all in a `loop` (Chapter 11).
+Now we wrap it all in a `loop` (Chapter 11 of [The Little Aligner](../little-aligner/11-do-it-until.md)). A real game loop runs for as long as the process is alive, so it cannot spend a fresh allocation every frame the way a one-shot pipeline can — that would grow the arena forever. Instead we allocate two column buffers once, outside the loop, and each frame writes into whichever buffer the previous frame did *not* just read from:
 
 ```align
 fn main() -> i32 {
-    mut world := spawn_initial_world()
-    
-    loop {
-        dt := time.delta()
-        
-        // 1. Process Input (System)
-        input_system(world)
-        
-        // 2. Update Physics (System)
-        physics_system(world, dt)
-        
-        // 3. Render (System)
-        render_system(world)
-        
-        if window.should_close() { break 0 }
+    arena {
+        mut buf_a := [0.0, 10.0, 20.0].to_array()
+        mut buf_b := [0.0, 0.0, 0.0].to_array()
+        vxs := [1.0, 1.0, -1.0].to_array()
+
+        mut frame := 0
+        loop {
+            if frame % 2 == 0 {
+                physics(buf_a[..], vxs[..], 0.016, buf_b[..])
+            } else {
+                physics(buf_b[..], vxs[..], 0.016, buf_a[..])
+            }
+            // ...input system, render system: more functions over the same columns...
+            frame = frame + 1
+            if frame == 600 { break }
+        }
+        print(buf_a.len())
     }
+    return 0
 }
 ```
 
+(A real game would ask the OS for the elapsed time and the window state — that is `std.time` and, for the window, an FFI binding (Chapter 15); here we run 600 fixed frames.) The world is not an object: it is the arena plus its columns, and every system is just a function you call on them, in an order you can read top to bottom — and because `physics` writes in place, running it for a million frames costs the same two buffers as running it for one.
+
 ## Why this scales
 
-1. **Decoupling:** `physics_system` does not care about sprites. `render_system` does not care about velocities. You can add a `Health` component tomorrow without touching the physics code.
+1. **Decoupling:** `physics` does not care about sprites. A render system does not care about velocities. You can add a `health` column tomorrow without touching the physics code.
 2. **Predictability:** Everything flows from top to bottom. There are no hidden `Update()` methods calling other methods implicitly.
-3. **Performance:** Because components are contiguous arrays, the CPU prefetcher streams them perfectly. When you run `alignc emit-llvm`, you will see that `physics_system` compiles to a tightly packed SIMD vector loop.
+3. **Performance:** Because components are contiguous columns, the CPU prefetcher streams them perfectly. Run `alignc emit-llvm` and you will see `physics` compile to a tightly packed SIMD vector loop.
 
 Data goes in. Data gets transformed. Data comes out. That is Align.
