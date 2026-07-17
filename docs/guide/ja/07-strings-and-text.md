@@ -52,7 +52,7 @@ fn main() -> i32 {
 fn main() -> i32 {
     path := "align/docs/guide.md"
     j := path.rfind("/") else -1
-    print(path[j + 1..path.len()])      // guide.md — a zero-copy view
+    print(path[j + 1..path.len()])      // guide.md — ゼロコピーのビュー
     return 0
 }
 ```

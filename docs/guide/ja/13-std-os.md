@@ -51,7 +51,7 @@ import std.io
 
 pub fn main(args: array<str>) -> Result<(), Error> {
     arena {
-        raw := fs.read_bytes_view(args[1])?   // binary mmap — no validation, zero copy
+        raw := fs.read_bytes_view(args[1])?   // バイナリ mmap — 検証なし、ゼロコピー
         print(raw.len())
         io.stdout.write(raw)?
     }
