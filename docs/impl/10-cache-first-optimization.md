@@ -438,12 +438,56 @@ These are **MEASURE-FIRST** candidates. Each changes implementation only; none c
 surface. Write the gate before prototyping and pin both a positive workload and a non-regression
 control.
 
-### 8.1 Donate a uniquely owned temporary buffer to a materializing pipeline
+### 8.1 SHIPPED 2026-07-17 — donate a uniquely owned temporary buffer to a materializing pipeline
 
-Current MIR explicitly recognizes a fresh unbound owned-array source as uniquely owned by the
-consumer. For `make().map(f).to_array()`, `setup_source` returns `temp_free`; `lower_array_collect`
-allocates a fresh output buffer, copies/filters into it, then frees the source
-([collect lowering](../../crates/align_mir/src/lib.rs#L4234-L4418)).
+**Status: SHIPPED default-on (measured win). The measure-first gate below is met.** The first slice —
+scalar `map`/`where`/`scan` materialization over a fresh unbound owned heap source with an identical
+element layout, outside any arena — donates the source buffer as the result storage. Design record
+retained below.
+
+Implementation: `lower_array_collect` computes `donate` right after `setup_source`
+([`crates/align_mir/src/lib.rs`](../../crates/align_mir/src/lib.rs), the `slice_ptr(source)` output +
+skipped source `drop_value`). Eligibility: `temp_free` present (the collect is the source's *sole*
+free — the source was lowered with a plain `lower_expr`, so no synthetic owner or other drop exists),
+`arena.is_none()`, no `zip`/struct-view, a scalar source/result of identical byte layout
+(`donation_scalar_bytes`), and only `map`/`where` stages. Ownership transfers to the result array (its
+own drop is then the single free); the collect emits no source `drop_value`, removing one `align_rt_alloc`
+call, one `align_rt_free`, one element copy, and one buffer's peak RSS per donation. Fail-closed: any
+other shape (borrowed source, arena value, `chunks`/struct/`str` element, mismatched layout, a value
+still used after the call — which keeps `temp_free` clear) allocates and frees as before.
+
+The `ALIGN_BUFFER_DONATE=off` measurement/regression toggle (mirrors `ALIGN_SORT_ADAPTIVE`/
+`ALIGN_NEEDLE_HOIST`; `CacheContext::from_env` force-disables the object cache when it is set) reverts
+to allocate+free. Gates: `crates/align_driver/tests/buffer_donate.rs` (MIR shape: fires on the positive
+shape, not on the five negatives; toggle reverts; donation-on vs off byte-identical results for
+map/where/scan/chain, incl. escaping and bound results — catches double-free/use-after-donate),
+`cache_codegen.rs::gate13c` (toggle never poisons the shared cache), and the manual
+`bench/buffer_donate` alloc-count + AB/BA harness.
+
+**Measured (Ryzen 9 5950X, LLVM 22, `--target-cpu native`, `bench/buffer_donate`, min of 7 balanced
+AB/BA rounds; a 3-donation chain over an owned temporary of length `n`):**
+
+| n | bytes/buffer | working set | donate off | donate on | speedup |
+|---:|---:|---|---:|---:|---:|
+| 512 | 4 KiB | L1 | 8.57 ms | 8.27 ms | 1.04x |
+| 4096 | 32 KiB | L1/L2 | 42.5 ms | 39.8 ms | 1.07x |
+| 65 536 | 512 KiB | L2/LLC | 674 ms | 325 ms | 2.07x |
+| 1 048 576 | 8 MiB | LLC/DRAM | 2396 ms | 1066 ms | 2.25x |
+| 8 388 608 | 64 MiB | DRAM | 6374 ms | 3134 ms | 2.03x |
+
+The alloc-count gate confirmed exact balance (alloc == free — no leak, no double-free) for both
+variants and that donation-on allocates exactly `reps` fewer buffers. Small (cache-resident) cases are
+a modest win (≥1.04x, never a regression — the saved alloc/copy/free still helps); large working sets
+win ~2x because the freed alloc+copy+free is real memory traffic and the donated buffer stays hot
+(the just-read source becomes the just-written output). Adoption gate met: material win on the positive
+case, no negative regression.
+
+---
+
+Design record (as written before the ship): current MIR explicitly recognizes a fresh unbound
+owned-array source as uniquely owned by the consumer. For `make().map(f).to_array()`, `setup_source`
+returns `temp_free`; `lower_array_collect` allocated a fresh output buffer, copied/filtered into it,
+then freed the source.
 
 For a heap-owned scalar source with compatible element size/alignment, the source buffer can become
 the result buffer:
@@ -720,7 +764,7 @@ invalidate the right reverse dependencies; no missing summary is treated optimis
 
 After benchmark export roots and balanced measurement work:
 
-1. uniquely owned buffer donation;
+1. ~~uniquely owned buffer donation~~ **SHIPPED default-on 2026-07-17 (§8.1) — measured 1.04–2.25x, alloc==free balance proven;**
 2. wide AoS→SoA blocked construction;
 3. `task_group` batch claiming/completion;
 4. stack lifetimes only after MIR liveness.

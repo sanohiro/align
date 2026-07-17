@@ -1,0 +1,59 @@
+// doc-10 §8.1 / doc-13 §8.5 — unique-buffer donation leak/double-free + AB timing oracle
+// (bench/buffer_donate). Exported entry points, driven from the Rust harness. `run.sh` compiles this
+// file TWICE with the current alignc — once with donation ON (default) and once with
+// `ALIGN_BUFFER_DONATE=off` — into two objects whose entry symbols are renamed apart (`*_off`), so
+// the harness holds both variants in one process for a balanced AB/BA comparison and reads the
+// runtime's `align_rt_alloc_count` / `align_rt_free_count` around each. ABI is i64 in / i64 out.
+
+// A fresh, uniquely owned heap array of 8 elements via a fixed-literal `.to_array()` — one counted
+// `align_rt_alloc` (HeapAllocBuf), never donated (its own source is a stack literal). It is the
+// donatable temporary the outer pipeline consumes.
+fn base() -> array<i64> = [0, 1, 2, 3, 4, 5, 6, 7].to_array()
+
+fn inc(x: i64) -> i64 = x + 1
+
+// ALLOC GATE: run `base().map(inc).to_array().sum()` `reps` times. Per invocation:
+//   donation ON : base() allocs 1 buffer, the outer `.to_array()` DONATES it (no new alloc, no free),
+//                 `.sum()` frees it once            → +reps alloc, +reps free.
+//   donation OFF: base() allocs 1, the outer `.to_array()` allocs a 2nd + frees base's, `.sum()`
+//                 frees the 2nd                     → +2*reps alloc, +2*reps free.
+// Both are perfectly balanced (no leak, no double-free); ON allocates exactly `reps` fewer buffers.
+pub fn alloc_probe(reps: i64) -> i64 {
+  mut acc := 0
+  mut i := 0
+  r := loop {
+    if i >= reps { break acc }
+    acc = acc + base().map(inc).to_array().sum()
+    i = i + 1
+  }
+  return r
+}
+
+// A fresh owned array `0..n` (grown via array_builder — realloc growth is uncounted, so this entry
+// is used only for TIMING, not the alloc gate).
+fn gen(n: i64) -> array<i64> {
+  mut b: array_builder<i64> := array_builder()
+  mut i := 0
+  loop { if i >= n { break 0 }; b.push(i); i = i + 1 }
+  return b.build()
+}
+
+fn f(x: i64) -> i64 = x + 1
+fn g(x: i64) -> i64 = x * 2
+fn h(x: i64) -> i64 = x - 3
+
+// TIMING: a 3-materialization chain over an owned temporary of length `n`, repeated `reps` times.
+// Each `.to_array()` after the first consumes a fresh owned temporary, so donation ON reuses the
+// buffer in place three times (0 extra allocs, 0 copies, 0 frees per rep beyond gen+sum), while OFF
+// allocates + copies + frees three n-element buffers per rep. Returns a data-dependent checksum so
+// the whole pipeline stays live.
+pub fn time_probe(reps: i64, n: i64) -> i64 {
+  mut acc := 0
+  mut i := 0
+  r := loop {
+    if i >= reps { break acc }
+    acc = acc + gen(n).map(f).to_array().map(g).to_array().map(h).to_array().sum()
+    i = i + 1
+  }
+  return r
+}

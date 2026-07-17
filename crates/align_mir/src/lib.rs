@@ -5296,15 +5296,44 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // Hoist any loop-invariant `where(str.contains)` search plan before the loop (doc-13 §6.6).
     let finder_plans = hoist_str_finder_plans(b, stages);
 
+    // Unique-buffer donation (doc-10 §8.1 / doc-13 §8.5): when the source is a uniquely owned,
+    // provably-dead heap temporary (`temp_free` present ⇒ this collect is its *sole* free — the
+    // source was lowered with a plain `lower_expr`, so no synthetic owner or other drop exists),
+    // sitting outside any arena, over a scalar `{ptr,len}` buffer whose element layout is identical
+    // to the result's, and running only donation-safe stages, its storage is DONATED as the output
+    // instead of allocating a fresh buffer + freeing the source. Ownership transfers to the result
+    // array (its own drop is then the single free); the collect emits no source `drop_value`. This
+    // removes one allocator call + one free and one buffer's worth of peak RSS. Fail-closed: any
+    // other shape (borrowed source, arena value, `chunks`/struct/`str` element, mismatched layout,
+    // value used after the call — which would keep `temp_free` clear) allocates and frees as before.
+    // The `ALIGN_BUFFER_DONATE=off` measurement/regression toggle (mirrors `ALIGN_SORT_ADAPTIVE`;
+    // `CacheContext::from_env` force-disables the object cache when it is set) reverts to allocate+free.
+    let donate = std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref() != Some("off")
+        && arena.is_none()
+        && temp_free.is_some()
+        && struct_view.is_none()
+        && zip.is_none()
+        && donation_layouts_match(source.ty, elem)
+        && donation_stages_ok(stages);
+
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
     let out_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
-    let alloc = match arena {
-        Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
-        // Outside an arena the returned buffer is individually owned. A binding gets its ordinary
-        // drop slot; an unbound consumer gets the path-local synthetic owner installed by
-        // `lower_borrowed_owned`. Arena mode remains bulk-freed.
-        None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+    let alloc = if donate {
+        // Reuse the donated source buffer's base pointer as the output storage. Reads
+        // (`SliceIndex(sv, i)`) and writes (`PtrStore(out_ptr, out_idx, ...)`) share this memory;
+        // both stay plain (non-`noalias`) so the vectorizer keeps its in-place read-before-write
+        // guarantee. `out_idx <= i` (compaction) and identical element size keep every store within
+        // the allocation and behind the already-loaded element.
+        Rvalue::SlicePtr(slice_val.clone().expect("a donatable scalar source has a {ptr,len} value"))
+    } else {
+        match arena {
+            Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+            // Outside an arena the returned buffer is individually owned. A binding gets its ordinary
+            // drop slot; an unbound consumer gets the path-local synthetic owner installed by
+            // `lower_borrowed_owned`. Arena mode remains bulk-freed.
+            None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+        }
     };
     b.push(Stmt::Let(out_ptr, alloc));
 
@@ -5473,8 +5502,10 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Let(len, Rvalue::Load(acc)));
     let arr = b.fresh_value(Ty::DynArray(scalar_of(elem)));
     b.push(Stmt::Let(arr, Rvalue::MakeDynArray { ptr: Operand::Value(out_ptr), len: Operand::Value(len) }));
-    // Free the source temporary now its elements have been copied into the new buffer.
-    if let Some(tmp) = temp_free {
+    // Free the source temporary now its elements have been copied into the new buffer — UNLESS its
+    // storage was donated to `arr` above, in which case the result array now owns that buffer and is
+    // its single free (dropping the source here would be a double-free of the donated allocation).
+    if let Some(tmp) = temp_free.filter(|_| !donate) {
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
@@ -7018,6 +7049,50 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
 /// sema-restricted to scalar elements).
 fn scalar_of(ty: Ty) -> align_sema::Scalar {
     align_sema::ty_to_scalar(ty).expect("to_array element must be a scalar (sema-checked)")
+}
+
+/// Byte size of a Copy scalar eligible for unique-buffer donation (doc-10 §8.1). `None` for Move
+/// payloads (`string`/owned arrays) and every non-uniform scalar, which are never donated. Natural
+/// alignment equals the size across this set, so an equal-size source/result pair is layout-identical:
+/// an in-place store never straddles a not-yet-read element, and the size-less C free stays
+/// allocation-compatible when the donated buffer becomes the result array.
+fn donation_scalar_bytes(s: align_sema::Scalar) -> Option<i64> {
+    use align_sema::Scalar;
+    match s {
+        Scalar::Int(it) => Some((it.bits / 8).max(1) as i64),
+        Scalar::Float(ft) => Some((ft.bits / 8).max(1) as i64),
+        Scalar::Bool => Some(1),
+        Scalar::Char => Some(4),
+        // `string`, owned/struct/response arrays, `Unit`, and struct payloads are Move or non-uniform:
+        // never donate their storage in place.
+        _ => None,
+    }
+}
+
+/// Whether the source `{ptr,len}` buffer and the collect's result element share an identical scalar
+/// layout — the size/alignment prerequisite for donating the source storage as the result buffer.
+/// Only a scalar owned-array/slice source qualifies (a `chunks` element is a `slice`, excluded).
+fn donation_layouts_match(src: Ty, out_elem: Ty) -> bool {
+    let src_scalar = match src {
+        Ty::DynArray(s) | Ty::Slice(s) => s,
+        _ => return false,
+    };
+    matches!(
+        (donation_scalar_bytes(src_scalar), donation_scalar_bytes(scalar_of(out_elem))),
+        (Some(a), Some(b)) if a == b,
+    )
+}
+
+/// Whether every pipeline stage is donation-safe: only `map` and `where` may run over a donated
+/// in-place buffer. `map` is `out[i] = f(src[i])` (out index == source index); `where` is stable
+/// compaction (`out_index <= source_index`, and the element is loaded before its slot can be
+/// overwritten). `scan` (an accumulator fold, out index == source index) is safe by the same rule.
+/// `WhereStrContains` (a `str` element) and `Project`/`WhereField` (a struct source) are excluded —
+/// the latter cannot even reach a scalar donated source, but the check fails closed regardless.
+fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
+    stages
+        .iter()
+        .all(|s| matches!(s.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }))
 }
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
