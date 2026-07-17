@@ -51,13 +51,33 @@ cargo run --bin alignc -- run examples/arena.align     # arena + heap box; exits
 cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; exits 24
 ```
 
-`alignc` subcommands: `check`, `emit-mir`, `emit-llvm`, `build`, `run`.
+`alignc` subcommands include `check`, `fmt`, `emit-mir`, `emit-llvm`, `emit-obj`, `build`, `run`, and `size`.
 
-**Requirements:** Rust (stable), LLVM 19 (`llvm-config` on `PATH`), and a C compiler (`cc`) for linking.
+**Requirements for a source build:** Rust 1.96+, LLVM 22 (`llvm-config-22` on `PATH`), and a C compiler (`cc`) for linking. Programs that use compression or crypto/HTTP also need the zlib, zstd, and OpenSSL development libraries.
+
+## Install a release
+
+The commands below become available after the first distribution release and repository setup. Until then, build from source.
+
+macOS Apple Silicon (Homebrew):
+
+```sh
+brew tap sanohiro/align
+brew install align
+```
+
+Ubuntu 24.04, x86_64 or ARM64 (signed apt repository):
+
+```sh
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+
+Release archives and `.deb` files are also attached to each GitHub release. `alignc` dynamically uses LLVM 22 and invokes the system C linker, so these are native packages with declared toolchain dependencies rather than fully static binaries.
 
 ## Status
 
-Early-stage, but the pipeline runs end to end (`lexer → parser → sema → MIR → LLVM → native`): functions and control flow, structs, the full primitive set, `Option`/`Result` with `?`, `arena`/`box` with move & escape checking, fused array pipelines, strings + `json`, SIMD (`vecN`/`soa`/`group_by`), `par_map`/`task_group` on real threads, `unsafe`/FFI, and a growing std library (`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`, with `http` in progress). See `docs/impl/07-roadmap.md` for the milestone detail.
+Early-stage, but the pipeline runs end to end (`lexer → parser → sema → MIR → LLVM → native`): functions and control flow, structs, the full primitive set, `Option`/`Result` with `?`, `arena`/`box` with move & escape checking, fused array pipelines, strings + `json`, SIMD (`vecN`/`soa`/`group_by`), `par_map`/`task_group` on real threads, `unsafe`/FFI, and a growing std library (`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`/`http`). See `docs/impl/07-roadmap.md` for the milestone detail.
 
 ## Performance & portability
 

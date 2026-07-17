@@ -2,20 +2,38 @@
 
 > 🌐 [English](../01-getting-started.md) · **日本語**
 
-Align はまだリリース前です。バイナリ配布はまだないので、コンパイラを一度ソースからビルドし、そのビルドディレクトリから使います。
+Align はまだリリース前です。リリース自動化は、タグ付きビルドを macOS Apple Silicon と Ubuntu 24.04 (x86_64 / ARM64)向けにパッケージ化します。インストール先は、最初の配布リリースとリポジトリ設定が完了した後に利用できます。それまではコンパイラをソースからビルドしてください。
+
+## パッケージ版をインストールする
+
+macOS Apple Silicon では次のようにします。
+
+```text
+brew tap sanohiro/align
+brew install align
+```
+
+Ubuntu 24.04 では次のようにします。
+
+```text
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+
+セットアップスクリプトが追加するのは、署名付きの Align リポジトリと公式 LLVM 22 リポジトリです。2つ目のコマンドを実行するまで `alignc` 自体はインストールしません。対応する GitHub リリースから、アーカイブや `.deb` を直接取得することもできます。
 
 ## コンパイラをビルドする
 
 必要なのは **Rust 1.96 以上**と **LLVM 22** です。Debian/Ubuntu なら次のようにします（apt.llvm.org 経由）。
 
 ```text
-apt install llvm-22 llvm-22-dev
+apt install llvm-22 llvm-22-dev clang-22 libclang-rt-22-dev libssl-dev zlib1g-dev libzstd-dev
 git clone https://github.com/sanohiro/align
 cd align
 cargo build
 ```
 
-これでコンパイラは `./target/debug/alignc` に置かれます。`PATH` は通っていないので、パスを指定して呼ぶか、エイリアスを張ってください。(`--release` ビルドなら `./target/release/alignc` ができます。コンパイラ自体の実行は速くなりますが、生成されるコードは同じです。)
+これでコンパイラは `./target/debug/alignc` に置かれます。`PATH` は通っていないので、パスを指定して呼ぶか、エイリアスを張ってください。(`--release` ビルドなら `./target/release/alignc` ができます。コンパイラ自体の実行は速くなりますが、生成されるコードは同じです。) `alignc` は LLVM 22 を動的に利用し、生成するプログラムのリンクに `cc` を呼び出すため、実行ファイルだけを置いてもネイティブツールチェーンへの依存はなくなりません。
 
 ## Hello, Align
 

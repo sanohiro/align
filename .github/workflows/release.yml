@@ -1,0 +1,273 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (for example v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: 1.96.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: alignc-linux-x86_64
+          - os: ubuntu-24.04-arm
+            artifact: alignc-linux-aarch64
+          - os: macos-15
+            artifact: alignc-macos-aarch64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Validate release version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test "$TAG" = "v$VERSION"
+          test "$VERSION" = "$CARGO_VERSION" || {
+            echo "tag version $VERSION does not match Cargo workspace version $CARGO_VERSION" >&2
+            exit 1
+          }
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install LLVM and native libraries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
+            libssl-dev zlib1g-dev libzstd-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM and native libraries (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install llvm@22 openssl@3 zstd
+          LLVM_PREFIX="$(brew --prefix llvm@22)"
+          echo "LLVM_SYS_221_PREFIX=$LLVM_PREFIX" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=$LLVM_PREFIX/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+
+      - name: Build compiler
+        run: cargo build --locked --release -p align_runtime -p align_driver
+
+      - name: Smoke test compiler
+        shell: bash
+        run: |
+          ./target/release/alignc --version
+          ./target/release/alignc build examples/hello.align
+          ./hello
+
+      - name: Create archive
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p package
+          cp target/release/alignc package/
+          cp target/release/libalign_runtime.a package/
+          cp LICENSE README.md README.ja.md package/
+          tar -C package -czf "$ARTIFACT.tar.gz" \
+            alignc libalign_runtime.a LICENSE README.md README.ja.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Package and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      HAS_HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY != '' }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect release archives
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec cp '{}' release/ \;
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Debian packages
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
+          for SPEC in "amd64:x86_64" "arm64:aarch64"; do
+            DEB_ARCH="${SPEC%%:*}"
+            ARCHIVE_ARCH="${SPEC##*:}"
+            ROOT="deb-$DEB_ARCH"
+            mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/align" \
+              "$ROOT/usr/share/doc/alignc"
+            tar -xzf "release/alignc-linux-$ARCHIVE_ARCH.tar.gz" \
+              -C "$ROOT/usr/lib/align" alignc libalign_runtime.a
+            cat > "$ROOT/usr/bin/alignc" <<'EOF'
+          #!/bin/sh
+          exec /usr/lib/align/alignc "$@"
+          EOF
+            chmod 0755 "$ROOT/usr/bin/alignc"
+            cp LICENSE README.md README.ja.md "$ROOT/usr/share/doc/alignc/"
+            cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: alignc
+          Version: $VERSION
+          Section: devel
+          Priority: optional
+          Architecture: $DEB_ARCH
+          Maintainer: sanohiro
+          Depends: llvm-22, clang-22, libclang-rt-22-dev, libssl-dev, zlib1g-dev, libzstd-dev
+          Description: AOT compiler for the Align programming language
+           Align is a data-oriented language with predictable native performance.
+          EOF
+            dpkg-deb --root-owner-group --build "$ROOT" "release/alignc_${VERSION}_${DEB_ARCH}.deb"
+          done
+
+      - name: Generate Homebrew formula
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SHA_MACOS_ARM="$(sha256sum release/alignc-macos-aarch64.tar.gz | cut -d' ' -f1)"
+          sed -e "s/{{VERSION}}/$VERSION/g" \
+              -e "s/{{SHA_MACOS_ARM}}/$SHA_MACOS_ARM/g" \
+              .github/align.rb.template > release/align.rb
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release
+          sha256sum *.tar.gz *.deb > checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: release/*
+          generate_release_notes: true
+
+      - name: Update Homebrew tap
+        if: env.HAS_HOMEBREW_TAP_TOKEN == 'true'
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/sanohiro/homebrew-align.git"
+          mkdir -p homebrew-align/Formula
+          cp release/align.rb homebrew-align/Formula/align.rb
+          cd homebrew-align
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/align.rb
+          git diff --cached --quiet || git commit -m "Update Align to $VERSION"
+          git push
+
+      - name: Build signed apt repository
+        if: env.HAS_APT_GPG_PRIVATE_KEY == 'true'
+        shell: bash
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_FPR="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test -n "$KEY_FPR"
+
+          mkdir -p apt-repo/pool/main/a/alignc
+          mkdir -p apt-repo/dists/stable/main/binary-amd64
+          mkdir -p apt-repo/dists/stable/main/binary-arm64
+          cp release/*.deb apt-repo/pool/main/a/alignc/
+
+          cd apt-repo
+          dpkg-scanpackages --arch amd64 pool/ > dists/stable/main/binary-amd64/Packages
+          dpkg-scanpackages --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
+          gzip -9 -k dists/stable/main/binary-amd64/Packages
+          gzip -9 -k dists/stable/main/binary-arm64/Packages
+
+          cd dists/stable
+          {
+            echo "Origin: Align"
+            echo "Label: Align"
+            echo "Suite: stable"
+            echo "Codename: stable"
+            echo "Date: $(date -Ru)"
+            echo "Architectures: amd64 arm64"
+            echo "Components: main"
+            echo "Description: Align compiler apt repository"
+            echo "SHA256:"
+            for FILE in main/binary-*/Packages*; do
+              echo " $(sha256sum "$FILE" | cut -d' ' -f1) $(wc -c < "$FILE") $FILE"
+            done
+          } > Release
+          gpg --batch --yes --local-user "$KEY_FPR" --armor --detach-sign -o Release.gpg Release
+          gpg --batch --yes --local-user "$KEY_FPR" --armor --clearsign -o InRelease Release
+
+          cd ../..
+          gpg --batch --armor --export "$KEY_FPR" > align.gpg
+          cp ../.github/install.sh .
+
+      - name: Deploy apt repository to GitHub Pages
+        if: env.HAS_APT_GPG_PRIVATE_KEY == 'true'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./apt-repo
+          publish_branch: gh-pages
+          force_orphan: true

@@ -36,6 +36,13 @@ mod size;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().collect();
+    // Package-manager smoke tests and bug reports need a cheap, source-free way to identify the
+    // compiler. Keep this before flag parsing: `--version` is a complete invocation, not a build
+    // flag, and must not be mistaken for a subcommand.
+    if raw.len() == 2 && matches!(raw[1].as_str(), "--version" | "-V") {
+        println!("alignc {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     // Pull the instrument-PGO flags FIRST (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1):
     // mutually exclusive; a bare `--pgo-use` is a hard error. It must run before the other flag
     // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
@@ -528,7 +535,8 @@ fn parse_profile(args: &[String]) -> Result<(Profile, Vec<String>), String> {
 
 fn usage() {
     eprintln!(
-        "usage: alignc <command> <file.align> [--target-cpu baseline|native]\n\
+        "usage: alignc <command> <file.align> [--target-cpu baseline|native]\n  \
+                alignc --version\n\
          \n\
          commands:\n  \
            check      check through lexer/parser/sema\n  \

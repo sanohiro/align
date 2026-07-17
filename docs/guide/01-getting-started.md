@@ -2,20 +2,38 @@
 
 > 🌐 **English** · [Japanese](./ja/01-getting-started.md)
 
-Align is pre-release: there are no binary downloads yet, so you build the compiler from source once, and use it from the build directory.
+Align is pre-release. The release automation packages tagged builds for macOS Apple Silicon and Ubuntu 24.04 (x86_64 and ARM64); those install endpoints become available after the first distribution release and repository setup. Until then, build the compiler from source.
+
+## Installing a packaged build
+
+On macOS Apple Silicon:
+
+```text
+brew tap sanohiro/align
+brew install align
+```
+
+On Ubuntu 24.04:
+
+```text
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+
+The setup script adds both the signed Align repository and the official LLVM 22 repository. It does not install `alignc` until you run the second command. Release archives and `.deb` files are also available directly from the corresponding GitHub release.
 
 ## Building the compiler
 
 You need **Rust 1.96+** and **LLVM 22**. On Debian/Ubuntu (via apt.llvm.org):
 
 ```text
-apt install llvm-22 llvm-22-dev
+apt install llvm-22 llvm-22-dev clang-22 libclang-rt-22-dev libssl-dev zlib1g-dev libzstd-dev
 git clone https://github.com/sanohiro/align
 cd align
 cargo build
 ```
 
-The compiler is now at `./target/debug/alignc`. It is not on `PATH`; either call it by path or add an alias. (A `--release` build produces `./target/release/alignc` — the compiler itself runs faster, the generated code is the same.)
+The compiler is now at `./target/debug/alignc`. It is not on `PATH`; either call it by path or add an alias. (A `--release` build produces `./target/release/alignc` — the compiler itself runs faster, the generated code is the same.) `alignc` dynamically uses LLVM 22 and invokes `cc` to link the programs it builds, so installing the executable alone does not remove those native toolchain requirements.
 
 ## Hello, Align
 
