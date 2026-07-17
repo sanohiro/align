@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **LOCAL CONSTANT-ARRAY POOLING IS SHIPPED — MERGED as #517**
+_Last updated: 2026-07-18, **NEON JSON STRING-ESCAPE CLASSIFIER ACTIVATED ON aarch64 — PR #520**
+(owner-directed after the #517 stop: "the ARM speed investigation, x64 already done"). #504 shipped
+the AVX2/SSE2 escape classifier for `align_rt_builder_write_json_str` on x86-64; its NEON kernel
+(`json_escape_map_neon` / `write_json_str_neon`, shrn-by-4 lane map) was written + differentially
+tested but left `#[cfg(all(aarch64, test))]` — production aarch64 stayed scalar pending a native-ARM
+no-regression measurement. This session ran that measurement on **this Apple Silicon Mac** (the
+native hardware the deferral waited for). Forced NEON-vs-scalar sweep (median-of-9) placed the
+crossover at the first full 16-byte block (8 B 0.95x / 12 B 0.74x → 16 B 1.70x / 32 B 3.03x / 1 KiB
+9.77x); activated `JSON_ESCAPE_SIMD_MIN=16` (aarch64) + a NEON dispatch arm + promoted the two
+kernels & `write_json_str_tail` to production cfg. End-to-end adoption gate through the real builder:
+mostly-clean **6.04x** (WIN), escape-dense 2.10x, short 1.11x — all pass doc-13 §6.6; the existing
+byte-for-byte differential oracle (already covering the NEON path) passes on this hardware, so
+production NEON output is identical to scalar. Clippy clean, non-test build clean. Refreshed the
+stale open-questions note (Base64 @48 B / hex @16 B were already M1-measured & active; this lands the
+escape classifier). CI has no ARM runner, so the NEON path is hardware-validated here, matching the
+existing json_decode_index/utf8/base64/hex NEON precedent. Remaining aarch64 SIMD item = the separate
+UTF-8 portability run. Previous update: 2026-07-18, **LOCAL CONSTANT-ARRAY POOLING IS SHIPPED — MERGED as #517**
 (`dc34e19`) — **and with it the owner-directed work program of 2026-07-16/17 is COMPLETE.** A
 qualifying local `xs := [const…]` (non-mut, non-align(N), fixed scalar array, all-constant
 elements, **length ≥ 32** — the empirical cutoff) lowers to one `llvm.memcpy` from the #514
