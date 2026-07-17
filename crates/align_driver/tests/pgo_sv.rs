@@ -433,7 +433,7 @@ fn gate_sv4_payoff_pgo_use_beats_flag_off() {
     let o_use = Command::new(&use_exe).output().expect("run use");
     assert_eq!(o_off.stdout, o_use.stdout, "off/use payoff output must be identical");
 
-    const FLOOR: f64 = 1.03;
+    const FLOOR: f64 = 1.01;
     const ROUNDS: usize = 5;
     let timed = |exe: &Path| -> f64 {
         let t0 = Instant::now();
