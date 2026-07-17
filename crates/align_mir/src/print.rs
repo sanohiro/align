@@ -55,6 +55,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::StoreIndex(slot, idx, val) => {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
             }
+            Stmt::StoreConstArray { slot, elems, elem } => {
+                let _ = writeln!(out, "    _{slot} <- const_array[{}] : {}", elems.len(), ty_name(*elem));
+            }
             Stmt::StoreElemField(slot, idx, path, val) => {
                 let _ = writeln!(out, "    _{slot}[{}]{} <- {}", operand_str(idx), path_str(path), operand_str(val));
             }

@@ -521,7 +521,14 @@ pub enum ExprKind {
     BuilderToString(Box<Expr>),
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
-    ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
+    /// `pooled` (doc-13 §8.4, S3) is set only at a qualifying `let` binding whose every element
+    /// folds to a compile-time constant scalar: the local stays a fixed `Ty::Array` (Copy — the
+    /// type is unchanged), but MIR lowers the binding to a single memcpy from a per-unit read-only
+    /// global (the #514 rodata mechanism) instead of `n` element stores. Read-only bindings then
+    /// collapse to a direct rodata read (LLVM eliminates the alloca+memcpy). `false` everywhere
+    /// else — a temporary, a `mut`/`align(N)` binding, a runtime-valued element, or a `str`/struct
+    /// element keeps the ordinary per-element store path.
+    ArrayLit { elems: Vec<Expr>, elem: crate::Ty, pooled: bool },
     /// A substituted top-level **aggregate constant** — the array-literal analogue of
     /// [`ExprKind::Str`]. `NAME := [1, 2, 3]` folds to a `ConstVal::Array` and is substituted at
     /// each use as this node, typed `slice<elem>` with `Region::Static`: the elements live in a

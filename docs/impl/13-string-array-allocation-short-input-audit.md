@@ -62,7 +62,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
 | short-N str group | ≤4 distinct groups aggregate by linear scan over the written reps, else promote to the map | **SHIPPED 2026-07-17** (§8.3); 1.1–2.3x low-cardinality, neutral above, no map alloc / per-row hash |
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
-| large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
+| large constant local arrays | entry alloca plus O(N) stores remains after O2 | **SHIPPED 2026-07-17** (§8.4): a non-`mut`/non-`align(N)`, fixed `array<T>`, all-constant-scalar literal ≥32 elems pools into the #514 rodata via one memcpy (LLVM elides it to a direct rodata read); measured 1.40x/2.45x/9.3x/36x/288x at 32/64/256/1024/4096, exactly zero regression below the N=32 cutoff, type unchanged |
 | Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 bytes | **SHIPPED** in document 12 |
 | JSON escape scan | scalar `< 32`, else AVX2/SSE2 block classifier; long clean spans bulk-copied | **SHIPPED 2026-07-17** (§6.6); mostly-clean 5.8x, dense 1.5x, short neutral; arm64 NEON test-only |
 | sorting | stable O(n log n); adaptive total-order path (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy from pass 2, `width>=64`) | **SHIPPED 2026-07-16** (document 12 §4.1, `w64` shape); ordered-input wins, plain-sort negatives within ≈ 2% (drift-immune control-corrected); one keyed low-cardinality-100k workload at ≈ 3.5% accepted as a bounded measured exception (document 12 §4.1); insertion base case kept |
@@ -758,11 +758,11 @@ cardinalities 0..64, several row counts, round-robin/random/late-clustered patte
 key widths, plus cap-overflow in both phases. The `#[ignore]`d adoption probe is `group_short_n_probe`
 (`ALIGN_GROUP_LINEAR_MAX` / `ALIGN_GROUP_SAMELEN` sweep the crossover and key shape).
 
-### 8.4 MEASURE FIRST — pool large constant array literals
+### 8.4 SHIPPED / MEASURED 2026-07-17 — pool large constant array literals
 
 A 256-element immutable local i64 literal read through a runtime index still produced a
-`[256 x i64]` entry alloca and 128 vector stores after O2. The literal lowering stores each element
-individually ([MIR](../../crates/align_mir/src/lib.rs#L3758)).
+`[256 x i64]` entry alloca and 128 vector stores after O2. The baseline literal lowering stores each
+element individually (`store_array_elems`, `align_mir`).
 
 **S1 LANDED 2026-07-17 — top-level aggregate constants.** The prerequisite backend mechanism now
 exists: a top-level array constant (`TABLE := [ … ]`) folds to `ConstVal::Array`, lowers through the
@@ -771,18 +771,72 @@ new `hir::ExprKind::ConstArray` → `mir::Rvalue::ConstArray`, and emits exactly
 stores (verified in `tests/constants_aggregate.rs`, IR gate). A constant index folds to the element.
 This is the storage mechanism §8.4 was waiting on.
 
-**S3 is next — the local-literal pooling probe.** With S1 done, measure the extension for
-function-local all-constant literals (hoist to the same rodata when the local never escapes and is
-never mutated):
+**S3 SHIPPED 2026-07-17 — local all-constant array literal pooling.** A function-local array literal
+binding is pooled into the S1 rodata mechanism when, at the `let` site, **all** of these hold: it is
+**not `mut`**, has **no `align(N)`** prefix, the binding's type is a **fixed `array<T>`** (`Ty::Array`,
+Copy — *not* an owned `array<T>`/`DynArray`) with a **scalar** element (`int`/`float`/`bool`/`char`),
+**every element folds to a compile-time constant scalar** (a literal, a substituted scalar-constant
+reference, or the negation of a numeric literal), and the length is **≥ the measured cutoff**. MIR
+lowers such a binding to one `Stmt::StoreConstArray` — a single `llvm.memcpy` from the per-unit
+`[N x elem]` rodata global (the #514 `const_array_global`) in place of the `n` element stores; for a
+read-only binding LLVM's MemCpyOpt then replaces the slot with the constant global directly,
+eliminating **both** the alloca and the copy so a runtime-indexed read becomes
+`getelementptr @const_arr, %i` (verified). The binding **keeps its fixed `array<T>` type** — the type
+is unchanged, so no downstream use is re-typed or rejected. This is the load-bearing design choice:
+rewriting to a `slice<T>` static view (the tempting shape) would change the observable type, and a
+single-pass checker cannot prove every downstream use is slice-compatible (a fixed `array<T>` coerces
+to an owned `array<T>`; a `slice<T>` does not), so it would risk rejecting valid programs. The
+memcpy-from-rodata lowering is correct for **every** use (read, copy, coercion, even a `mut`/aligned
+copy), so the gates above are purely the win/size cutoff, not correctness — every negative case is
+therefore *natural*:
 
-- immutable/non-address-mutated local: read the pooled constant directly;
-- mutable large local: one memcpy from a constant template;
-- short local: retain inline stores when they are smaller/faster;
-- runtime-valued, Move-element, explicitly aligned, or address-sensitive cases remain on the
-  existing path.
+- `mut xs := […]` keeps writable stack storage (gated off);
+- `align(N) xs := […]` keeps its over-aligned stack storage for vector loads (gated off);
+- a runtime-valued element (`[n, n+1, …]`) does not fold (not poolable);
+- `[…].to_array()` / any owned `array<T>` binding is a Move heap value, not a fixed `array<T>` — the
+  literal is moved into an owned consumer and never pooled (a Static rodata view can never be freed);
+- a `str`/struct element is excluded from v1 (its rodata is `[N x {ptr,len}]` / an aggregate);
+- a below-cutoff literal keeps inline stores.
 
-Sweep 1..4096 elements around L1/code-size/frame thresholds. Require at least 15% on the positive
-large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
+**#506 donation non-interaction:** a pooled binding stays a fixed `Ty::Array` (Copy, no drop, no
+`temp_free`), so it is structurally excluded from unique-buffer donation (which fires only on a fresh
+**unbound owned `DynArray`** temporary). A pooled table used as a materializing-pipeline source is
+read from rodata and its output is a fresh owned array — rodata is never donated or freed (pinned).
+
+**Measured cutoff (2026-07-17, Ryzen 9 5950X / Zen 3, WSL2, release, balanced AB/BA, min-of-9,
+`ALIGN_CONST_POOL` toggle on vs off).** A `hot(seed)` function holding the local table and reading it
+through a data-dependent runtime index in a reps loop — LLVM keeps the unpooled init in the loop body
+(the stores stay under the backedge, not hoisted, verified), so the duel isolates per-call init:
+pooled reads rodata, unpooled rebuilds the table.
+
+| N (elems) | pool/nopool speedup | verdict |
+|---:|---:|---|
+| 1 | 1.00x | neutral (timer-noise input) |
+| 4 | 1.09x | neutral |
+| 8 | 1.00x | neutral |
+| 16 | 0.97x | **2.7% regression if pooled** |
+| 32 | 1.40x | WIN |
+| 64 | 2.45x | WIN |
+| 256 | 9.28x | WIN |
+| 1024 | 36.4x | WIN |
+| 4096 | 288x | WIN |
+
+The crossover is **N=32**, so **`CONST_POOL_MIN_ELEMS = 32`**: N=16 pooled regresses ~2.7% (a small
+table stays in registers / L1 and a rodata read only adds a load dependency), while at N=32 the store
+chain is costly enough that rodata wins clearly. Below the cutoff nothing is pooled, so both toggle
+states emit identical code and the regression under the cutoff is **exactly zero** — the ≤3% gate is
+met with margin, and the large positive case clears the 15% gate by 287x at 4096. LLVM does **not**
+auto-convert the store chain to a memcpy-from-constant for the runtime-indexed shape (the 256-store
+baseline survives O2, verified), so the win is real and not already captured — the compaction-style
+negative did not apply. The `#[ignore]`d sweep is `tests/const_pool_probe.rs`; the toggle is read at
+sema (`const_pool_enabled`), keys the MIR/object-cache fingerprint, and `CacheContext::from_env`
+force-disables the object cache when it is set.
+
+Deferred (recorded, all sound future extensions, none blocking): a `mut`/`align(N)` binding
+(memcpy-from-template is correct but its win is smaller — the alloca always survives — and it is left
+on the store path to keep the negative controls crisp); a `str`/struct-element table; and a
+folded-*expression* element (`[W*7, …]`, an unfolded `Bin` node) — recognizing only literal/negated
+scalars keeps detection local and fail-closed.
 
 ### 8.5 SHIPPED / ALREADY PLANNED — keep one owner
 
@@ -909,7 +963,13 @@ AoS/SoA conversion, or a second substring-search algorithm.
    and the ordered-boundary straight-copy applied only from pass 2 (`width>=64`), total-order keys
    only. A drift-immune control-corrected sweep localized the first cut's ≈ 7% random/reverse
    regression to the pass-1 boundary check; the fix keeps every negative workload within ≈ 2%.
-2. Pool large constant array literals after the top-level aggregate-constant surface exists.
+2. ~~Pool large constant array literals after the top-level aggregate-constant surface exists.~~
+   **SHIPPED 2026-07-17** (§8.4): a non-`mut`/non-`align(N)`, fixed `array<T>`, all-constant-scalar
+   local literal of ≥32 elements lowers to one memcpy from the #514 rodata global (LLVM elides it to
+   a direct read-only rodata read, eliminating the alloca and the copy), keeping the fixed `array<T>`
+   type unchanged. Measured crossover N=32 (1.40x→288x at 32→4096, zero regression below the cutoff);
+   `ALIGN_CONST_POOL=off` reverts. The slice-rewrite alternative was rejected (it would change the
+   observable type and risk rejecting valid programs).
 3. Run unique-buffer donation, ~~repeated-needle plan~~, ~~JSON escape scan~~, and short-N group
    strategy gates independently. **Repeated-needle plan hoisting SHIPPED 2026-07-17** (§6.6): the
    `xs.where(fn s { s.contains(NEEDLE) }).…` atom-needle shape (bare path / string literal) hoists one
@@ -963,8 +1023,20 @@ IR gates:
   `group_short_n_probe` is the adoption measurement (`ALIGN_GROUP_LINEAR_MAX` / `ALIGN_GROUP_SAMELEN`
   sweep the crossover / key shape);
 - mapped materializers retain `min.iters.check` and a scalar short path;
-- large constant-array positive case uses a private constant and direct read/one memcpy, while the
-  short control retains the winning inline shape;
+- **local const-array pooling (shipped and regression-pinned 2026-07-17, §8.4):** a non-`mut`/
+  non-`align(N)`, fixed `array<T>`, all-constant-scalar local literal of ≥`CONST_POOL_MIN_ELEMS`
+  (32) elements lowers to one memcpy from a `private unnamed_addr constant [N x elem]` global (the
+  #514 `const_array_global`) and, after O2, a runtime-indexed read reads that global directly with
+  **no** slot alloca and **no** element store chain. The mutation checks are the negative controls —
+  a `mut` binding, an `align(N)` binding, a runtime-valued element, a `[…].to_array()`/owned
+  `array<T>` binding (moved into an owned consumer), a below-cutoff (16-element) literal, and a
+  `str`-element literal each emit **no** rodata global and keep the per-element stores; a pooled
+  binding stays a fixed `Ty::Array` and issues **no** free of its rodata (no #506 donation). The
+  `ALIGN_CONST_POOL=off` toggle reverts the pooled binding to the element-store shape (read at sema,
+  fingerprinted into the object-cache key; `CacheContext::from_env` force-disables the cache when
+  set). Gates: `crates/align_driver/tests/const_pool.rs` (optimized rodata-read shape, the six
+  negative controls, run-parity through indexing and a materializing pipeline, never-freed rodata,
+  toggle revert) + the `#[ignore]`d adoption/cutoff sweep `const_pool_probe.rs`;
 - **guarded ping-alloc for sorting (shipped 2026-07-16):** the merge ping buffer (`tmp`/keyed
   `ktmp`) `HeapAllocBuf` sits behind the `len > 32` gate — it must not appear before it, so a
   `len <= 32` sort allocates only the materialize buffer(s); an int-key sort's adaptive

@@ -4524,6 +4524,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
+                Stmt::StoreConstArray { slot, elems, elem } => {
+                    // Pooled all-constant array binding (doc-13 §8.4, S3): materialize the folded
+                    // elements once as a `private unnamed_addr constant [N x elem]` (the #514 rodata
+                    // global) and copy it into the fixed `array<T>` slot with a single `llvm.memcpy`,
+                    // in place of `n` element stores. For a read-only binding LLVM's MemCpyOpt then
+                    // replaces the slot with the constant global directly, eliminating the alloca and
+                    // the copy; a `mut` binding (excluded by sema) would keep the writable copy.
+                    let dest = self.slots[slot];
+                    let (src, _len) = self.const_array_global(elems, *elem);
+                    let arr_ty = self.llvm_type(self.f.slots[*slot as usize]).into_array_type();
+                    let size = self.target_data.get_store_size(&arr_ty);
+                    let align = self.target_data.get_abi_alignment(&arr_ty);
+                    self.builder
+                        .build_memcpy(dest, align, src, align, self.ctx.i64_type().const_int(size, false))
+                        .map_err(|e| self.err(e))?;
+                }
                 Stmt::DropElem(slot, idx, sid) => {
                     // Free the owned fields of element `idx` before it is overwritten (Slice 4b).
                     let ep = self.elem_ptr(*slot, idx)?;
