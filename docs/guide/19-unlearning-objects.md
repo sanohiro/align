@@ -44,6 +44,7 @@ If you must mix them:
 ```align
 Shape { Circle(f64), Rect(f64, f64) }
 
+shapes := [Shape.Circle(2.0), Shape.Rect(3.0, 4.0)]
 areas := shapes.map(fn s {
     match s {
         Circle(r) => 3.14159 * r * r,
@@ -59,14 +60,18 @@ However, the true data-oriented approach is to store all Circles in one `soa<Cir
 You append to a list inside a loop. The list resizes itself automatically, allocating heap memory unpredictably. 
 
 **The Align Way:**
-Align has `heap.new`, but its idiomatic use is rare. If you need dynamic memory, you use an `arena`. When the arena block ends, all memory is freed instantly. You never `new` or `delete` individual objects inside a hot loop. And you never grow a collection by side effect — the pipeline itself accumulates, with exactly one visible allocation at the end:
+Align has `heap.new`, but its idiomatic use is rare. If you need dynamic memory, you use an `arena`. When the arena block ends, all memory is freed instantly. You never `new` or `delete` individual objects inside a hot loop, and in a hot loop you never grow a collection by side effect either — the pipeline itself accumulates, with exactly one visible allocation at the end:
 
 ```align
+threshold := 100
 arena {
+    readings := [42, 150, 88, 203]
     // One visible allocation, at the end of the pipeline — no hidden growth
     spikes := readings.where(fn r { r > threshold }).to_array()
 } // Boom. Gone.
 ```
+
+(When a pipeline genuinely can't express the shape — say, accumulating results while streaming input of unknown length — `array_builder<T>` is the sanctioned side-effecting `.push()` alternative; see chapter 18. It is the escape hatch for the rare case, not a substitute for the pipeline.)
 
 ## 4. The "Getter/Setter" Anti-Pattern
 

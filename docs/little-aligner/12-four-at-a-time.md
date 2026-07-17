@@ -25,10 +25,10 @@
 **A4.** 
 ```align
 v1: vec4<i32> := [1, 2, 3, 4]
-v2: vec4<i32> := [10, 20, 30, 40]
+v2: vec4<i32> := [10, 0, 30, 40]
 v3 := v1 + v2
 ```
-The annotation turns the literal into a vector — there is no separate constructor. `v3` now holds `[11, 22, 33, 44]`. One instruction, four results.
+The annotation turns the literal into a vector — there is no separate constructor. `v3` now holds `[11, 2, 33, 44]`. One instruction, four results. (`v2` carries a zero on purpose — we will need it.)
 
 ---
 
@@ -40,7 +40,7 @@ The annotation turns the literal into a vector — there is no separate construc
 
 **Q6.** What is a mask?
 
-**A6.** A vector of lane-wise booleans. `m := v2 != 0` compares every lane against the broadcast scalar `0` at once, and gives us a `mask4<i32>` with all four lanes true. A mask is only ever born from a comparison — you never write one by hand.
+**A6.** A vector of lane-wise booleans. `m := v2 != 0` compares every lane against the broadcast scalar `0` at once, and gives us a `mask4<i32>` — true in every lane except the second, where `v2` is `0`. A mask is only ever born from a comparison — you never write one by hand.
 
 ---
 
@@ -52,7 +52,7 @@ ones: vec4<i32> := [1, 1, 1, 1]
 safe_v2 := select(m, v2, ones)
 ans := v1 / safe_v2
 ```
-Where the mask is true, it picks the lane from `v2`; where false, from `ones`. The division never traps, and the CPU never branched.
+Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divided by the substituted `1` instead of trapping on `v2`'s `0`. The division never traps, and the CPU never branched.
 
 ---
 

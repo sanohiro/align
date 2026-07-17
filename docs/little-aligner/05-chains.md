@@ -48,7 +48,7 @@ xs.where(fn x { x > 0 }).map(fn x { x - 10 }).count()
 
 **Q6.** In other languages, chaining `map` and `where` creates temporary intermediate arrays for every step, chewing up memory. Does Align?
 
-**A6.** No. Align pipelines are lazy until the final collapse. The compiler fuses all five stages—`map`–`where`–`map`–`scan`–`sum`—into exactly one loop, intermediates in registers. It is as if you wrote a painstakingly hand-optimized C loop, but you didn't have to. You may check: `alignc emit-llvm yourfile.align`.
+**A6.** No. Align pipelines are lazy until the final collapse. However many stages you chain—`map`, `where`, another `map`, a `scan`, a `sum`, ten more if you like—the compiler fuses all of them into exactly one loop, intermediates in registers. It is as if you wrote a painstakingly hand-optimized C loop, but you didn't have to. You may check any chain you write: `alignc emit-llvm yourfile.align`.
 
 ---
 

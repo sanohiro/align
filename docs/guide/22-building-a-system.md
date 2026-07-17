@@ -10,7 +10,7 @@ How do you put this all together to build an entire application? Let's build a m
 
 In OOP, a game entity is a class with fields and methods. In ECS:
 - **Entities** are just IDs (e.g., `i64`). They contain no data.
-- **Components** are plain data, stored as flat, parallel columns (the SoA layout of Chapter 11).
+- **Components** are plain data, stored as flat, parallel columns — the same field-per-column shape [chapter 11](11-data-oriented.md) taught as `soa<T>`, though here they are bare top-level arrays rather than an actual `soa<T>` value: `soa<T>` is arena-bound (chapter 20), while these components must outlive any single frame's arena.
 - **Systems** are functions that iterate over components using pipelines.
 
 Let's model a tiny 1D world where things have positions and velocities.
@@ -31,39 +31,45 @@ A real world would carry more columns — health, sprite ids — and, for compon
 
 A System is a function that operates on components. It does not belong to any class. Let's write a Physics System that computes the next positions from the velocities.
 
-In Align, a system is a pipeline over the component columns:
+In Align, a system is a pipeline over the component columns, writing into a caller-owned destination with `map_into` ([Little Aligner 05](../little-aligner/05-chains.md)) instead of allocating a fresh array every call:
 
 ```align
-fn physics(xs: slice<f64>, vxs: slice<f64>, dt: f64) -> array<f64> =
-    zip(xs, vxs).map(fn v { v.0 + v.1 * dt }).to_array()
+fn physics(xs: slice<f64>, vxs: slice<f64>, dt: f64, out next_xs: slice<f64>) {
+    zip(xs, vxs).map(fn v { v.0 + v.1 * dt }).map_into(next_xs)
+}
 ```
 
 Data in, data out. No hidden state, and — because the closure is pure — nothing stops the compiler from vectorizing the whole pass.
 
 ## The Game Loop
 
-Now we wrap it all in a `loop` (Chapter 11 of [The Little Aligner](../little-aligner/11-do-it-until.md)): each frame consumes the old columns and rebinds the new ones.
+Now we wrap it all in a `loop` (Chapter 11 of [The Little Aligner](../little-aligner/11-do-it-until.md)). A real game loop runs for as long as the process is alive, so it cannot spend a fresh allocation every frame the way a one-shot pipeline can — that would grow the arena forever. Instead we allocate two column buffers once, outside the loop, and each frame writes into whichever buffer the previous frame did *not* just read from:
 
 ```align
 fn main() -> i32 {
     arena {
-        mut xs := [0.0, 10.0, 20.0].to_array()
+        mut buf_a := [0.0, 10.0, 20.0].to_array()
+        mut buf_b := [0.0, 0.0, 0.0].to_array()
         vxs := [1.0, 1.0, -1.0].to_array()
 
         mut frame := 0
         loop {
-            xs = physics(xs[..], vxs[..], 0.016)
+            if frame % 2 == 0 {
+                physics(buf_a[..], vxs[..], 0.016, buf_b[..])
+            } else {
+                physics(buf_b[..], vxs[..], 0.016, buf_a[..])
+            }
             // ...input system, render system: more functions over the same columns...
             frame = frame + 1
             if frame == 600 { break }
         }
-        print(xs.len())
+        print(buf_a.len())
     }
     return 0
 }
 ```
 
-(A real game would ask the OS for the elapsed time and the window state — that is `std.time` and, for the window, an FFI binding (Chapter 15); here we run 600 fixed frames.) The world is not an object: it is the arena plus its columns, and every system is just a function you call on them, in an order you can read top to bottom.
+(A real game would ask the OS for the elapsed time and the window state — that is `std.time` and, for the window, an FFI binding (Chapter 15); here we run 600 fixed frames.) The world is not an object: it is the arena plus its columns, and every system is just a function you call on them, in an order you can read top to bottom — and because `physics` writes in place, running it for a million frames costs the same two buffers as running it for one.
 
 ## Why this scales
 

@@ -12,7 +12,7 @@ In an Object-Oriented language, you would `new Player()` and let the Garbage Col
 
 ## The Pool
 
-A Pool is just a pre-allocated block of parallel columns (chapter 11's layout) that reuses slots. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column:
+A Pool is just a pre-allocated block of parallel columns that reuses slots — the same column-per-field shape [chapter 11](11-data-oriented.md) taught as `soa<T>`. It cannot literally *be* a `soa<T>`, though: those columns are arena-resident (`to_soa` must be called inside an `arena`, and the columns die with it), while a Pool's whole point is data that outlives any single arena. So here the columns are bare top-level bindings instead, kept alive for as long as the server runs. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column:
 
 ```align
 mut alive := [false, false, false, false].to_array()
@@ -58,7 +58,7 @@ Now, the timeline looks like this:
 2. Bob saves `target = Entity { index: 2, generation: 1 }`.
 3. Alice disconnects. `alive[2]` becomes `false`, and **we increment `generation[2]` to 2**.
 4. Charlie joins. He is placed in slot 2, and is given `Entity { index: 2, generation: 2 }`.
-5. Bob tries to heal `Entity { index: 2, generation: 1 }`. The Pool checks slot 2, sees that its current generation is `2`, which does not match Bob's ticket (`1`). `is_live` returns `false`, and the heal is safely rejected.
+5. Bob tries to heal `Entity { index: 2, generation: 1 }`. `is_live(alive, generation, ticket)` checks slot 2, sees that its current generation is `2`, which does not match Bob's ticket (`1`), and returns `false` — the heal is safely rejected.
 
 ## Why this is the Align way
 

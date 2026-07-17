@@ -60,6 +60,7 @@ fn next(state: ConnectionState, event: Event) -> ConnectionState {
     return match state {
         Disconnected => match event {
             Start => ConnectionState.Connecting,
+            Failure(code) => ConnectionState.Failed(code),
             _ => state,
         },
         Connecting => match event {
