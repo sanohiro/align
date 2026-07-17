@@ -215,6 +215,22 @@ pub fn emit_llvm_with_exports(src: &str, exports: &[&str]) -> String {
     align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &exports, false).expect("emit llvm ir")
 }
 
+/// [`emit_llvm_with_exports`] but after the `-O2` pipeline (what LLVM actually left) — for gates
+/// that assert on the *optimized* shape (e.g. an alloca/store chain eliminated, a read forwarded to
+/// a constant global).
+pub fn emit_llvm_optimized(src: &str, exports: &[&str]) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "ir", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, true, &exports, false).expect("emit optimized llvm ir")
+}
+
 /// Whether checking `src` produces any error (for negative tests).
 pub fn check_errs(name: &str, src: &str) -> bool {
     let mut sm = SourceMap::new();

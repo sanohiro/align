@@ -1726,6 +1726,40 @@ fn is_aggregate_const_elem(s: Scalar) -> bool {
     matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)
 }
 
+/// The minimum element count at which a local all-constant array literal is pooled into rodata
+/// (doc-13 §8.4, S3). Below this the per-element inline stores are at parity or faster (a small
+/// table stays in registers / L1 and a rodata read only adds a load dependency), so the binding
+/// keeps them; at or above it the single memcpy-from-rodata — which LLVM elides to a direct
+/// read-only rodata access for a non-mutated binding — wins. **Measured crossover** (§8.4 adoption
+/// table, Ryzen 9 5950X release): N=16 pooled regresses ~2.7%, N=32 wins 1.40x and the win grows
+/// (2.5x/9.3x/36x/288x at 64/256/1024/4096). At 32 the per-call store chain is costly enough that
+/// reading rodata is the clear win; below it, nothing is pooled (both toggle states emit identical
+/// code, so there is exactly zero regression under the cutoff).
+const CONST_POOL_MIN_ELEMS: usize = 32;
+
+/// `ALIGN_CONST_POOL=off` disables local const-array pooling (doc-13 §8.4 measurement/regression
+/// toggle, mirroring `ALIGN_BUFFER_DONATE` / `ALIGN_NEEDLE_HOIST`; `CacheContext::from_env`
+/// force-disables the object cache whenever it is set, so an A/B build is never served a cached
+/// object lowered under the other setting). Default (unset) pools.
+fn const_pool_enabled() -> bool {
+    std::env::var("ALIGN_CONST_POOL").ok().as_deref() != Some("off")
+}
+
+/// Whether a checked array-literal element folds to a compile-time constant scalar that can be
+/// materialized directly into a pooled rodata global (doc-13 §8.4, S3): a scalar literal, a
+/// substituted scalar-constant reference (already a literal node), or the negation of either. A
+/// `str` element, a runtime value, or any other expression (e.g. an unfolded `W * 7`) is not
+/// poolable and keeps the per-element store path (fail-closed; recorded deferral).
+fn hir_is_const_scalar_elem(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Char(_) => true,
+        ExprKind::Unary { op: UnOp::Neg, expr } => {
+            matches!(expr.kind, ExprKind::Int(_) | ExprKind::Float(_))
+        }
+        _ => false,
+    }
+}
+
 /// Producer-side check that a `pub` constant's initializer references only `pub` same-module
 /// constants. A `pub` constant's value is part of the exported interface (its source is shipped in
 /// the interface summary and re-folded in every importing unit, where the defining module's PRIVATE
@@ -9201,6 +9235,38 @@ impl<'a, 't> Checker<'a, 't> {
                     if self.hir_is_readonly_view(&init) {
                         self.readonly_locals.insert(local);
                     }
+                    // doc-13 §8.4 (S3): pool an all-constant local array literal into per-unit rodata
+                    // (the #514 mechanism), so a lookup table costs one memcpy — which LLVM elides to
+                    // a direct rodata read for a non-mutated binding — instead of `n` element stores
+                    // rebuilt on every call. The local KEEPS its fixed `array<T>` type (Copy): only
+                    // the initialization lowering changes, so no downstream use is re-typed or
+                    // rejected. Fail-closed — a `mut` binding (needs writable storage), an `align(N)`
+                    // binding (needs its own over-aligned stack storage for vector loads), a
+                    // runtime-valued or `str`/struct element, or an array below the measured size
+                    // cutoff all keep the per-element store path.
+                    let pool = !*is_mut
+                        && align.is_none()
+                        && const_pool_enabled()
+                        && matches!(
+                            self.resolve(local_ty),
+                            Ty::Array(s, n)
+                                if (n as usize) >= CONST_POOL_MIN_ELEMS
+                                    && matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)
+                        )
+                        && matches!(&init.kind, ExprKind::ArrayLit { elems, pooled: false, .. }
+                            if elems.iter().all(hir_is_const_scalar_elem));
+                    let init = if pool {
+                        match init.kind {
+                            ExprKind::ArrayLit { elems, elem, .. } => Expr {
+                                kind: ExprKind::ArrayLit { elems, elem, pooled: true },
+                                ty: init.ty,
+                                span: init.span,
+                            },
+                            _ => unreachable!("pool implies an ArrayLit initializer"),
+                        }
+                    } else {
+                        init
+                    };
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -12687,7 +12753,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // element's stride keeps the alignment. (A *dynamic* `array<align(N)Struct>` stays
                 // rejected — its heap buffer over-alignment is a separate, still-deferred concern.)
                 Some(id) => Expr {
-                    kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
+                    kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id), pooled: false },
                     ty: Ty::StructArray(id, n),
                     span,
                 },
@@ -12746,7 +12812,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         let scalar = self.payload_scalar(elem_ty, span);
-        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar) }, ty: Ty::Array(scalar, n), span }
+        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar), pooled: false }, ty: Ty::Array(scalar, n), span }
     }
 
     /// Collect a pipeline `src.map(f).where(p)…` from the AST: the innermost receiver is

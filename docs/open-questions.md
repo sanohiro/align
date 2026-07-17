@@ -64,9 +64,16 @@ interface, so its initializer may reference only `pub` constants — enforced **
 defining unit (Pass 0d-2) so whole-program and per-unit builds reach the same verdict (this fixed a
 pre-existing D1 divergence for the scalar `pub A := SECRET` shape too). **Deferred (recorded S1.5):**
 struct constants and struct elements; in an element position — function calls, `as` casts, nested
-arrays, and references to other aggregate constants (all fail-closed). **S3 (next):** a
-local-array-literal pooling probe (hoist a function-local `[…]` literal to the same rodata when it
-never escapes / is never mutated).
+arrays, and references to other aggregate constants (all fail-closed). **S3 SHIPPED 2026-07-17
+(implementation-only, no language surface):** a function-local all-constant array literal binding is
+pooled into the same S1 rodata via one memcpy (LLVM elides it to a direct rodata read) when it is
+non-`mut`, non-`align(N)`, a fixed `array<T>` of a scalar, all elements fold to constants, and its
+length is ≥32 (measured crossover). The binding **keeps its fixed `array<T>` type** — the observable
+type is unchanged, so no program is re-typed or rejected (the tempting `slice<T>`-rewrite was
+rejected precisely because it would change the type and a single-pass checker cannot prove every use
+is slice-compatible). `ALIGN_CONST_POOL=off` reverts. Deferred: `mut`/`align(N)` bindings (memcpy
+template is sound but a smaller win), `str`/struct elements, and folded-*expression* elements
+(fail-closed). See `impl/13-…` §8.4 for the measured cutoff table and gates.
 Record: `draft.md` §3 (Constants) / §12, `docs/language-spec.md`, `docs/design-notes.md` (Memory model v2),
 `impl/02-frontend.md` §3, `impl/13-…` §8.4, `tests/constants_aggregate.rs`, `tests/per_unit.rs`, `tests/cache_codegen.rs`, `align_interface/tests/summary.rs`
 
@@ -2580,7 +2587,8 @@ owners and static-only folding, and known-null destructor calls were eliminated.
 remaining avoidable path/builder/chunks/group staging. It also records the
 good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
 later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,
-JSON escape SIMD, and large constant-local pooling are measurement-gated. The document's language-
+and JSON escape SIMD were measurement-gated and shipped; large constant-local pooling shipped
+2026-07-17 at a measured N=32 cutoff (§8.4, memcpy-from-rodata, type-preserving). The document's language-
 surface items are deliberately **questions for Claude Code only**: this ledger adopts no new syntax,
 type, capacity argument, eager/lazy guarantee, or template ownership rule from the audit.
 

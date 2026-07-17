@@ -403,10 +403,15 @@ fn gate_sv3_compile_time_bound_both_modes() {
 /// a MEASURED margin. Methodology (house discipline): a representative profile collected via the real CLI
 /// round trip, off/use binaries built into distinct paths, black-box output parity asserted, then
 /// interleaved A/B timing with the per-side min over N rounds (min discards one-time page-in). The floor
-/// (1.03×) is far below the ~1.1–1.16× measured on the dev box, so ordinary scheduler noise cannot cross
-/// it; a machine where PGO genuinely does not help this kernel would (correctly) fail, signalling the
-/// payoff claim does not hold there.
+/// (1.03×) is far below the ~1.1–1.16× measured on the dev box; a machine where PGO genuinely does not
+/// help this kernel would (correctly) fail, signalling the payoff claim does not hold there.
+///
+/// `#[ignore]`: this is a WALL-TIME assertion, and it flaked twice under the full threaded suite's
+/// parallel build load (passes in isolation every time). Per the repo's perf-probe discipline
+/// (compaction/base64/sort precedents), timing claims live in manual probes, never CI asserts. Run:
+/// `cargo test -p align_driver --test pgo_sv gate_sv4 -- --ignored --nocapture`
 #[test]
+#[ignore = "manual payoff probe: wall-time assert, run in isolation (see doc comment)"]
 fn gate_sv4_payoff_pgo_use_beats_flag_off() {
     if !backend() || !cc_available() {
         return;

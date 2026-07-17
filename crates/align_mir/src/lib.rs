@@ -157,6 +157,14 @@ pub enum Stmt {
     StoreField(Slot, Vec<u32>, Operand),
     /// `slot[index] <- value` (array element store).
     StoreIndex(Slot, Operand, Operand),
+    /// Initialize a fixed `array<T>` slot from a per-unit read-only global holding the folded
+    /// constant `elems` — the pooled analogue of a run of [`Stmt::StoreIndex`] (doc-13 §8.4, S3).
+    /// Codegen materializes the elements once as a `private unnamed_addr constant [N x elem]`
+    /// (the #514 [`Rvalue::ConstArray`] global) and emits a single `llvm.memcpy` into the slot;
+    /// for a read-only binding LLVM then forwards the constant and eliminates both the alloca and
+    /// the copy. The slot keeps its fixed `array<T>` type (Copy) — this only replaces the `n`
+    /// per-element stores, so it participates in no ownership/drop bookkeeping.
+    StoreConstArray { slot: Slot, elems: Vec<ConstElem>, elem: Ty },
     /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
     /// `array<T>` being filled). The element type comes from `value`.
     PtrStore(Operand, Operand, Operand),
@@ -2306,8 +2314,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // bind. A nested struct-literal field is expanded in place (its leaves stored at the
                 // extended path), so no intermediate struct value is materialized.
                 hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
-                // An array literal stores its elements into the slot.
-                hir::ExprKind::ArrayLit { elems, elem } => store_array_elems(b, *local, elems, *elem),
+                // An array literal stores its elements into the slot. A pooled all-constant literal
+                // (doc-13 §8.4, S3) instead copies once from a per-unit rodata global (the #514
+                // mechanism) — sema sets `pooled` only for a non-`mut`, non-`align(N)`, fixed
+                // `array<T>` binding whose every element folds to a constant scalar.
+                hir::ExprKind::ArrayLit { elems, elem, pooled: true } => {
+                    store_const_array_pooled(b, *local, elems, *elem)
+                }
+                hir::ExprKind::ArrayLit { elems, elem, pooled: false } => store_array_elems(b, *local, elems, *elem),
                 _ => {
                     let op = lower_expr(b, init);
                     if b.is_terminated() {
@@ -4600,7 +4614,9 @@ fn extreme_of(ty: Ty, is_max: bool) -> Operand {
 /// literal), returning `(slot, length)`.
 fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
     match &source.kind {
-        hir::ExprKind::ArrayLit { elems, elem } => {
+        hir::ExprKind::ArrayLit { elems, elem, .. } => {
+            // A pipeline/reduce source literal is a fresh temporary, never a `pooled` binding
+            // (sema sets `pooled` only at a `let`), so it always takes the per-element store path.
             let slot = b.new_slot(source.ty);
             store_array_elems(b, slot, elems, *elem);
             (slot, elems.len() as i128)
@@ -4650,6 +4666,30 @@ fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir:
             b.push(Stmt::StoreField(slot, path.clone(), op));
         }
     }
+}
+
+/// Fold a pooled all-constant array literal's elements (doc-13 §8.4, S3) into MIR [`ConstElem`]s and
+/// emit one [`Stmt::StoreConstArray`] initializing the slot from a rodata global, instead of `n`
+/// [`Stmt::StoreIndex`]. Sema (`hir_is_const_scalar_elem`) has already proven every element is a
+/// scalar literal or the negation of one, so a non-constant element is unreachable here.
+fn store_const_array_pooled(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty) {
+    fn fold(el: &hir::Expr) -> ConstElem {
+        match &el.kind {
+            hir::ExprKind::Int(v) => ConstElem::Int(*v),
+            hir::ExprKind::Float(v) => ConstElem::Float(*v),
+            hir::ExprKind::Bool(bl) => ConstElem::Bool(*bl),
+            hir::ExprKind::Char(c) => ConstElem::Char(*c),
+            // A negated numeric literal (`-5`, `-1.5`) — sema restricts the operand to Int/Float.
+            hir::ExprKind::Unary { op: align_ast::UnOp::Neg, expr } => match &expr.kind {
+                hir::ExprKind::Int(v) => ConstElem::Int(v.wrapping_neg()),
+                hir::ExprKind::Float(v) => ConstElem::Float(-*v),
+                _ => unreachable!("pooled negated element is a numeric literal (sema-checked)"),
+            },
+            _ => unreachable!("pooled array element is a folded constant scalar (sema-checked)"),
+        }
+    }
+    let cvals: Vec<ConstElem> = elems.iter().map(fold).collect();
+    b.push(Stmt::StoreConstArray { slot, elems: cvals, elem });
 }
 
 fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty) {
