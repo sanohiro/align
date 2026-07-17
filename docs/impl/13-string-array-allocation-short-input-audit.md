@@ -60,6 +60,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
 | `chunks(n)` | direct `.len()` / `[i]` are virtual; stored and pipeline values materialize | **SHIPPED 2026-07-16** for direct consumers |
 | str-key group/dictionary | single aggregates/dictionary write caller outputs directly | **SHIPPED 2026-07-16**; staging Vecs/copies removed |
+| short-N str group | ≤4 distinct groups aggregate by linear scan over the written reps, else promote to the map | **SHIPPED 2026-07-17** (§8.3); 1.1–2.3x low-cardinality, neutral above, no map alloc / per-row hash |
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 bytes | **SHIPPED** in document 12 |
@@ -713,8 +714,49 @@ Multi-aggregate group-by deliberately keeps a row-major accumulator for update l
 scatter it into K output streams without measurement. It can still avoid allocating `ops`/`val_offs`
 Vecs from the call's already-present specs.
 
-Add a small-N strategy probe: for `n <= 8/16`, a linear scan over the caller output may beat a heap
-HashMap. This remains measure-first and must include duplicate-heavy and all-distinct inputs.
+**Short-N group strategy SHIPPED 2026-07-17 (P3 gate 4 of 4).** The remaining str-key group-by fixed
+cost after the direct-write work above is the `std::collections::HashMap<WyKey,id>` itself: one heap
+allocation plus a `wyhash` of every row's key *before* the probe. (The int-key core has no such map —
+it already picks a dense direct-index array or its own open-addressing table, and a low-cardinality
+int column is almost always dense — so this gate is str-key only.) `group_agg_str` is now **adaptive**:
+while the distinct-group count stays at or below a measured crossover it aggregates by a **linear scan
+over the representatives already written to `out_keys[0..count]`** (a byte compare with a length
+fast-reject), with **no map allocation and no per-row `wyhash`**; the instant a *new* group would
+exceed the crossover the remaining rows **promote** to the same seeded `HashMap` path, so a
+high-cardinality column can never degrade to O(rows × groups). The output contract is bit-identical in
+both phases — first-occurrence order, dense ids, direct result writes — so the group order any consumer
+sees is unchanged. `group_agg_str_thresh(0, …)` is exactly the old pure-`HashMap` path and is retained
+as the differential oracle / A/B baseline.
+
+The crossover is **measured, not the hypothesis of 8/16 above**. On a Ryzen 9 5950X (WSL2,
+release/native, balanced AB/BA, median of nine, runtime-generated keys, driving the shipped
+`group_agg_str_thresh` — the exact code `align_rt_group_*_str[_cols]` runs) a threshold of 8 regresses
+the cardinality-6/8 same-length case to 0.68–0.76x, because 3–4 full `memcmp`s per row lose to one
+`wyhash`+probe. The linear/hash crossover is ~4, so **`GROUP_LINEAR_MAX = 4`**. Candidate speedup vs
+the pure-`HashMap` baseline (ns/row; ≥1000 rows are the stable measurements, rows=8/64 are timer-noise
+dominated on ~15 ns total inputs):
+
+| distinct groups | mixed-length keys | same-length keys (adversarial) |
+|---:|---:|---:|
+| 1 | 1.80–1.84x | 1.98–2.31x |
+| 2 | 1.86–2.00x | 1.61–1.86x |
+| 3 | 1.53–1.62x | 1.24–1.53x |
+| 4 | 1.12–1.29x | 1.07–1.12x |
+| 5 | 1.00x | 1.00x |
+| 6–8 | 1.00x | 0.99–1.01x |
+| 16–1024 | 1.00–1.01x | 0.99–1.02x |
+
+The win is the common low-cardinality OLAP shape (group by status / category / country / type — a
+handful of groups over many rows): 1.1–2.3x with one fewer heap allocation and no per-row hash.
+Cardinality ≥5 promotes to the unchanged map and stays neutral (≤1–2% at scale) — the promotion tax
+(re-seeding ≤4 reps) is only visible on degenerate tiny inputs (rows=8) where the whole operation is
+noise-dominated anyway, and such inputs almost always have cardinality ≤ rows, i.e. land in the win
+region. Differential correctness (`group_str_adaptive_matches_hash_only_bit_identical`,
+`group_str_adaptive_cap_and_promotion_edges`) proves every threshold — including the shipped 4 and the
+pure-hash 0 — agrees bit-for-bit on count, first-occurrence key order, and per-group values across
+cardinalities 0..64, several row counts, round-robin/random/late-clustered patterns, and same/mixed
+key widths, plus cap-overflow in both phases. The `#[ignore]`d adoption probe is `group_short_n_probe`
+(`ALIGN_GROUP_LINEAR_MAX` / `ALIGN_GROUP_SAMELEN` sweep the crossover and key shape).
 
 ### 8.4 MEASURE FIRST — pool large constant array literals
 
@@ -874,8 +916,13 @@ AoS/SoA conversion, or a second substring-search algorithm.
    layout, outside an arena, donates the source buffer as the result storage instead of
    allocating+copying+freeing; the balanced AB/BA + alloc-count gate (`bench/buffer_donate`) measured
    1.04–2.25x across the L1→DRAM sweep with exact alloc==free balance (no leak/double-free) and one
-   fewer allocation per donation; `ALIGN_BUFFER_DONATE=off` reverts. Short-N group strategy remains an
-   independent gate.
+   fewer allocation per donation; `ALIGN_BUFFER_DONATE=off` reverts. **Short-N group strategy SHIPPED
+   2026-07-17** (§8.3): the str-key group core (`group_agg_str`) aggregates a ≤`GROUP_LINEAR_MAX`
+   (measured 4) cardinality column by a linear scan over the written representatives — no heap
+   `HashMap` and no per-row `wyhash` — and promotes to the seeded map above the crossover, bit-identical
+   output (count / first-occurrence order / values) proven at every threshold; the real-group-core
+   adoption probe measured 1.1–2.3x at cardinality 1–4 with neutral behavior above. **All four P3 item-3
+   gates are now dispositioned.**
 
 ## 12. Regression and IR gates
 
@@ -899,6 +946,15 @@ IR gates:
 - bulk/direct array builder contains no per-element push call;
 - str-group single aggregate and `dict_encode` contain no accumulator/representative staging copies
   (**shipped and regression-pinned 2026-07-16**);
+- **short-N str group strategy (shipped and regression-pinned 2026-07-17):** the adaptive
+  `group_agg_str` (linear scan below `GROUP_LINEAR_MAX == 4` distinct groups, promote to the seeded
+  `HashMap` above) must stay byte-identical to the pure-`HashMap` path in group count, first-occurrence
+  key order, and per-group values. `group_str_adaptive_matches_hash_only_bit_identical` (`align_runtime`)
+  pins every threshold — including 0 (pure hash) and the shipped 4 — over cardinalities 0..64, several
+  row counts, round-robin/random/late-clustered patterns, and same/mixed key widths;
+  `group_str_adaptive_cap_and_promotion_edges` pins cap-overflow `-1` in both phases. The `#[ignore]`d
+  `group_short_n_probe` is the adoption measurement (`ALIGN_GROUP_LINEAR_MAX` / `ALIGN_GROUP_SAMELEN`
+  sweep the crossover / key shape);
 - mapped materializers retain `min.iters.check` and a scalar short path;
 - large constant-array positive case uses a private constant and direct read/one memcpy, while the
   short control retains the winning inline shape;

@@ -3514,14 +3514,72 @@ unsafe fn read_key_slice<'a>(row: *const u8, key_off: usize) -> (&'a [u8], Align
     (bytes, ks)
 }
 
+/// Reconstruct the byte view of a representative `AlignStr` already written to `out_keys` (the same
+/// `{null,0}`/`len<=0` ⇒ empty rule as [`read_key_slice`]), so the short-N linear phase can compare a
+/// candidate key against the reps without re-hashing.
+///
+/// # Safety
+/// `p` must point at a valid `AlignStr` whose `{ptr,len}` describe a live byte range (they borrow the
+/// source key column, exactly as written by [`group_agg_str_thresh`]).
+#[inline]
+unsafe fn rep_bytes<'a>(p: *const AlignStr) -> &'a [u8] {
+    let s = unsafe { &*p };
+    if s.ptr.is_null() || s.len <= 0 {
+        &[]
+    } else {
+        unsafe { safe_slice(s.ptr, s.len) }
+    }
+}
+
+/// The short-N group-by crossover (§8.3 / doc-13 P3 gate 4): a key column with at most this many
+/// distinct groups aggregates by a linear scan over the already-written representatives instead of a
+/// heap `HashMap` — no map allocation and, crucially, no per-row `wyhash`. The instant a *new* group
+/// would exceed it the remaining rows promote to the map, so a high-cardinality key column can never
+/// degrade to O(rows × groups). The value is **measured, not the §8.3 hypothesis of 8/16**: on a
+/// Ryzen 9 5950X (`group_short_n_probe`) the linear/hash crossover for adversarial same-length keys is
+/// ~4; at 8 the cardinality-6/8 cases regress up to 0.68x. Four wins 1.07-2.31x at cardinality 1-4
+/// (the common low-cardinality OLAP shape) and stays neutral (≤1-2%) above via promotion.
+const GROUP_LINEAR_MAX: usize = 4;
+
 /// Core of the str-key group-by: intern each row's `str` key to a dense id in **first-occurrence
-/// order** (a `HashMap<&[u8], id>`), seed the caller's result slots on a vacant entry, then update
-/// `out_vals[id]` in place with `combine`. Key and value are **index closures** over `0..n`, so the
-/// same core serves both a strided AoS record
-/// (`align_rt_group_*_str`, key+value in one row) and two separate contiguous soa columns
+/// order**, seed the caller's result slots on a vacant entry, then update `out_vals[id]` in place with
+/// `combine`. Key and value are **index closures** over `0..n`, so the same core serves both a strided
+/// AoS record (`align_rt_group_*_str`, key+value in one row) and two separate contiguous soa columns
 /// (`align_rt_group_*_str_cols`). Returns the group count, or -1 on a null/cap error. `out_keys` /
 /// `out_vals` must hold at least `cap` elements. (Callers validate their own input pointers + `n`.)
+///
+/// Dispatches through [`group_agg_str_thresh`] with the measured [`GROUP_LINEAR_MAX`] crossover.
 unsafe fn group_agg_str<'a>(
+    n: usize,
+    out_keys: *mut AlignStr,
+    out_vals: *mut i64,
+    cap: i64,
+    key_at: impl Fn(usize) -> (&'a [u8], AlignStr),
+    value_at: impl Fn(usize) -> i64,
+    combine: impl Fn(i64, i64) -> i64,
+) -> i64 {
+    unsafe { group_agg_str_thresh(GROUP_LINEAR_MAX, n, out_keys, out_vals, cap, key_at, value_at, combine) }
+}
+
+/// Adaptive str-key group core. Two phases with one bit-identical output contract (first-occurrence
+/// order, dense ids, direct result writes):
+///
+/// - **Phase 1 (linear)** — while fewer than `linear_max` distinct groups exist, each row scans the
+///   representatives already written to `out_keys[0..count]` (byte compare, length fast-reject). No map
+///   allocation and, crucially, no `wyhash` per row: for a low-cardinality / duplicate-heavy column
+///   this is the whole win. A matched key folds into `out_vals[id]`; a new key appends a group.
+/// - **Phase 2 (hash)** — the moment a *new* group would exceed `linear_max`, the remaining rows switch
+///   to the open-addressing `HashMap<WyKey,id>` path, seeded with the reps found so far, so ordering
+///   and ids continue unbroken and a wide key column can never go O(rows × groups).
+///
+/// `linear_max == 0` skips phase 1 entirely, i.e. the pure-`HashMap` path — used as the differential
+/// oracle and the A/B baseline in `group_short_n_probe`.
+///
+/// # Safety
+/// As [`group_agg_str`].
+#[allow(clippy::too_many_arguments)] // mirrors group_agg_str + the measured crossover parameter
+unsafe fn group_agg_str_thresh<'a>(
+    linear_max: usize,
     n: usize,
     out_keys: *mut AlignStr,
     out_vals: *mut i64,
@@ -3535,12 +3593,58 @@ unsafe fn group_agg_str<'a>(
         return -1;
     }
     let Ok(cap) = safe_len(cap) else { return -1 };
-    // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
-    // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
+    let mut count = 0usize;
+    let mut start = 0usize;
+
+    // Phase 1 — linear scan over the written reps while the group count stays small.
+    if linear_max > 0 {
+        while start < n {
+            let (bytes, ks) = key_at(start);
+            let v = value_at(start);
+            let mut hit = usize::MAX;
+            for id in 0..count {
+                // SAFETY: out_keys[0..count] were written in this loop below.
+                if unsafe { rep_bytes(out_keys.add(id)) } == bytes {
+                    hit = id;
+                    break;
+                }
+            }
+            if hit != usize::MAX {
+                unsafe {
+                    let slot = out_vals.add(hit);
+                    *slot = combine(*slot, v);
+                }
+            } else {
+                if count >= linear_max {
+                    break; // promote to phase 2; row `start` is left unprocessed on purpose.
+                }
+                if count >= cap {
+                    return -1;
+                }
+                unsafe {
+                    out_keys.add(count).write(ks);
+                    out_vals.add(count).write(v);
+                }
+                count += 1;
+            }
+            start += 1;
+        }
+        if start == n {
+            return i64::try_from(count).unwrap_or(-1);
+        }
+    }
+
+    // Phase 2 — hash map, seeded with the reps discovered in phase 1 so ids/order continue unbroken.
+    // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap at
+    // a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
     let initial = n.min(cap).min(1024);
     let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
-    let mut count = 0usize;
-    for i in 0..n {
+    for id in 0..count {
+        // SAFETY: reps written in phase 1 borrow the live source key column.
+        let rep = unsafe { rep_bytes(out_keys.add(id)) };
+        ids.insert(WyKey::new(rep), id);
+    }
+    for i in start..n {
         let (bytes, ks) = key_at(i);
         let v = value_at(i);
         let key = WyKey::new(bytes);
@@ -16037,6 +16141,229 @@ mod tests {
         // Degenerate: empty input and a null key column both yield zero groups (not -1).
         assert_eq!(unsafe { align_rt_group_sum_str_cols(key_col.as_ptr(), val_col.as_ptr(), 0, ok.as_mut_ptr(), ov.as_mut_ptr(), 0) }, 0);
         assert_eq!(unsafe { align_rt_group_sum_str_cols(std::ptr::null(), val_col.as_ptr(), n, ok.as_mut_ptr(), ov.as_mut_ptr(), n) }, 0);
+    }
+
+    // ---- short-N group strategy (doc-13 §8.3 / P3 gate 4): the adaptive linear-then-hash str-key
+    // core must produce a bit-identical result (group count, first-occurrence key order, and per-group
+    // values) at every crossover threshold, including the pure-hash baseline `linear_max == 0`. ----
+
+    /// Deterministic key-column generator: `cardinality` distinct keys over `rows` rows, in one of
+    /// several first-occurrence / clustering patterns and key-length shapes that stress the linear
+    /// compare (same-length keys, mixed-length keys, empty key). Returns the owned key bytes (kept
+    /// alive), the `AlignStr` column borrowing them, and the value column.
+    #[cfg(test)]
+    fn gen_str_group_input(cardinality: usize, rows: usize, pattern: u8, samelen: bool) -> (Vec<Vec<u8>>, Vec<i64>) {
+        // Distinct key byte strings. `samelen` makes every key the same width (worst case for the
+        // linear byte compare: no length fast-reject); otherwise widths vary and an empty key appears.
+        let keys: Vec<Vec<u8>> = (0..cardinality)
+            .map(|j| {
+                if samelen {
+                    format!("k{j:07}").into_bytes()
+                } else if j == 0 {
+                    Vec::new() // a real, distinct empty key
+                } else {
+                    format!("group_{j}").into_bytes()
+                }
+            })
+            .collect();
+        // Assign each row to a distinct-key index by pattern, then materialize the row's key bytes.
+        let mut state = 0x9e37_79b9_u64 ^ ((cardinality as u64) << 20) ^ ((pattern as u64) << 40);
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut row_keys = Vec::with_capacity(rows);
+        let mut vals = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let j = if cardinality == 0 {
+                0
+            } else {
+                match pattern {
+                    0 => r % cardinality,                 // round-robin (first-occurrence 0,1,2,…)
+                    1 => (next() as usize) % cardinality, // random
+                    2 => {
+                        // clustered: the LAST distinct key appears only in the final rows, so a
+                        // just-above-threshold cardinality stays linear for most of the input.
+                        if r + cardinality >= rows && cardinality > 1 {
+                            cardinality - 1
+                        } else {
+                            r % (cardinality.max(2) - 1).max(1)
+                        }
+                    }
+                    _ => r % cardinality,
+                }
+            };
+            row_keys.push(if keys.is_empty() { Vec::new() } else { keys[j].clone() });
+            vals.push((r as i64) & 0x3ff);
+        }
+        (row_keys, vals)
+    }
+
+    /// Run the str-key group-sum core over separate columns at a given `linear_max`, returning the
+    /// emitted groups in first-occurrence order as `(key_bytes, sum)` pairs plus the returned count.
+    #[cfg(test)]
+    fn run_group_sum_str_thresh(linear_max: usize, row_keys: &[Vec<u8>], vals: &[i64]) -> (i64, Vec<(Vec<u8>, i64)>) {
+        let key_col: Vec<AlignStr> = row_keys
+            .iter()
+            .map(|k| AlignStr { ptr: if k.is_empty() { std::ptr::null() } else { k.as_ptr() }, len: k.len() as i64 })
+            .collect();
+        let n = row_keys.len();
+        let mut ok = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; n.max(1)];
+        let mut ov = vec![0i64; n.max(1)];
+        let count = unsafe {
+            group_agg_str_thresh(
+                linear_max,
+                n,
+                ok.as_mut_ptr(),
+                ov.as_mut_ptr(),
+                n as i64,
+                soa_key_at(key_col.as_ptr()),
+                soa_value_at(vals.as_ptr()),
+                |a, b| a.wrapping_add(b),
+            )
+        };
+        let groups = (0..count.max(0) as usize)
+            .map(|g| {
+                let s = &ok[g];
+                let bytes = if s.ptr.is_null() || s.len <= 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) }.to_vec() };
+                (bytes, ov[g])
+            })
+            .collect();
+        (count, groups)
+    }
+
+    #[test]
+    fn group_str_adaptive_matches_hash_only_bit_identical() {
+        // Sweep cardinalities across the crossover and several row counts / patterns / key widths.
+        // For each, the candidate threshold (and every other threshold) must match the pure-hash
+        // baseline (`linear_max == 0`) bit for bit: group count, first-occurrence order, and sums.
+        let thresholds = [0usize, 1, 4, 8, 16, GROUP_LINEAR_MAX];
+        for &cardinality in &[0usize, 1, 2, 4, 7, 8, 9, 16, 33, 64] {
+            for &rows in &[0usize, 1, 5, 8, 9, 64, 500] {
+                if cardinality > rows && rows != 0 {
+                    continue; // can't have more distinct groups than rows
+                }
+                for pattern in 0u8..3 {
+                    for samelen in [false, true] {
+                        let (rk, vals) = gen_str_group_input(cardinality, rows, pattern, samelen);
+                        let (base_count, base) = run_group_sum_str_thresh(0, &rk, &vals);
+                        for &t in &thresholds {
+                            let (c, g) = run_group_sum_str_thresh(t, &rk, &vals);
+                            assert_eq!(
+                                c, base_count,
+                                "count mismatch: card={cardinality} rows={rows} pat={pattern} samelen={samelen} t={t}"
+                            );
+                            assert_eq!(
+                                g, base,
+                                "group order/values mismatch: card={cardinality} rows={rows} pat={pattern} samelen={samelen} t={t}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_str_adaptive_cap_and_promotion_edges() {
+        // Exceeding cap returns -1 whether the overflow happens in the linear phase or after promotion.
+        let (rk, vals) = gen_str_group_input(10, 40, 0, false);
+        let key_col: Vec<AlignStr> = rk
+            .iter()
+            .map(|k| AlignStr { ptr: if k.is_empty() { std::ptr::null() } else { k.as_ptr() }, len: k.len() as i64 })
+            .collect();
+        let n = rk.len();
+        // cap=3 sits below GROUP_LINEAR_MAX (4) → the ONLY case pinning cap overflow inside the
+        // linear phase; caps 5/8/9 promote at the 5th distinct key and pin overflow in phase 2.
+        for cap in [3usize, 5, 8, 9] {
+            let mut ok = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; n];
+            let mut ov = vec![0i64; n];
+            let got = unsafe {
+                group_agg_str_thresh(GROUP_LINEAR_MAX, n, ok.as_mut_ptr(), ov.as_mut_ptr(), cap as i64, soa_key_at(key_col.as_ptr()), soa_value_at(vals.as_ptr()), |a, b| a.wrapping_add(b))
+            };
+            assert_eq!(got, -1, "cap={cap} (< 10 groups) must return -1");
+        }
+        // cap == exactly the group count succeeds; cap above too.
+        for cap in [10usize, 40] {
+            let mut ok = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; n];
+            let mut ov = vec![0i64; n];
+            let got = unsafe {
+                group_agg_str_thresh(GROUP_LINEAR_MAX, n, ok.as_mut_ptr(), ov.as_mut_ptr(), cap as i64, soa_key_at(key_col.as_ptr()), soa_value_at(vals.as_ptr()), |a, b| a.wrapping_add(b))
+            };
+            assert_eq!(got, 10, "cap={cap} (>= 10 groups) must return the group count");
+        }
+    }
+
+    /// Short-N group strategy adoption probe (doc-13 §8.3 / P3 gate 4), `#[ignore]`d — run manually:
+    /// `cargo test -p align_runtime --release group_short_n_probe -- --ignored --nocapture`.
+    ///
+    /// Drives the SHIPPED str-key group core (`group_agg_str_thresh`, the exact code
+    /// `align_rt_group_sum_str_cols` runs) with the candidate crossover vs the pure-`HashMap` baseline
+    /// (`linear_max == 0`), over a cardinality × rows matrix with duplicate-heavy and all-distinct
+    /// inputs, balanced AB/BA, median of nine, runtime-generated same-length keys (the linear-compare
+    /// worst case — no length fast-reject). Reports candidate speedup vs baseline.
+    #[test]
+    #[ignore = "manual adoption probe (short-N group strategy)"]
+    fn group_short_n_probe() {
+        use std::time::Instant;
+        fn median(mut v: Vec<f64>) -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        }
+        // One timed pass = the full group-sum over the whole column at `linear_max`.
+        fn time_pass(linear_max: usize, key_col: &[AlignStr], vals: &[i64]) -> f64 {
+            let n = key_col.len();
+            let mut ok = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; n];
+            let mut ov = vec![0i64; n];
+            let t = Instant::now();
+            let c = unsafe {
+                group_agg_str_thresh(linear_max, n, ok.as_mut_ptr(), ov.as_mut_ptr(), n as i64, soa_key_at(key_col.as_ptr()), soa_value_at(vals.as_ptr()), |a, b| a.wrapping_add(b))
+            };
+            let dt = t.elapsed().as_secs_f64();
+            std::hint::black_box(c);
+            std::hint::black_box(ov.as_ptr());
+            dt
+        }
+
+        // Candidate crossover overridable so the gate can sweep it: ALIGN_GROUP_LINEAR_MAX=<n>.
+        let cand_t: usize = std::env::var("ALIGN_GROUP_LINEAR_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(GROUP_LINEAR_MAX);
+        // Key-width shape overridable: ALIGN_GROUP_SAMELEN=0 → mixed widths (length fast-reject).
+        let samelen: bool = std::env::var("ALIGN_GROUP_SAMELEN").ok().map(|v| v != "0").unwrap_or(true);
+        eprintln!("\nshort-N group strategy probe (samelen={samelen}; candidate linear_max={cand_t})");
+        eprintln!("{:>6} {:>8} {:>14} {:>14} {:>10}", "card", "rows", "baseline(ns)", "candidate(ns)", "speedup");
+        // Matrix: cardinality crossing the threshold × row counts (small total input and large).
+        for &rows in &[8usize, 64, 1_000, 100_000, 1_000_000] {
+            for &card in &[1usize, 2, 3, 4, 5, 6, 8, 12, 16, 32, 128, 1024] {
+                if card > rows {
+                    continue;
+                }
+                let (rk, vals) = gen_str_group_input(card, rows, 0, samelen);
+                let key_col: Vec<AlignStr> = rk
+                    .iter()
+                    .map(|k| AlignStr { ptr: if k.is_empty() { std::ptr::null() } else { k.as_ptr() }, len: k.len() as i64 })
+                    .collect();
+                // warm up both paths.
+                std::hint::black_box(time_pass(0, &key_col, &vals));
+                std::hint::black_box(time_pass(cand_t, &key_col, &vals));
+                let reps = 9;
+                let (mut base, mut cand) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
+                for i in 0..reps {
+                    // balanced AB / BA to cancel drift.
+                    if i % 2 == 0 {
+                        base.push(time_pass(0, &key_col, &vals));
+                        cand.push(time_pass(cand_t, &key_col, &vals));
+                    } else {
+                        cand.push(time_pass(cand_t, &key_col, &vals));
+                        base.push(time_pass(0, &key_col, &vals));
+                    }
+                }
+                let (b, c) = (median(base), median(cand));
+                let per = |t: f64| t / rows as f64 * 1e9;
+                eprintln!("{card:>6} {rows:>8} {:>14.3} {:>14.3} {:>9.2}x", per(b), per(c), b / c);
+            }
+        }
     }
 
     #[test]
