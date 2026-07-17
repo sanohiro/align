@@ -30,6 +30,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -458,9 +459,27 @@ extern "C" int align_thinlto_backend(
 // (existence/readability/magic) BEFORE this call and install a context
 // diagnostic handler to observe use-phase degradation; the S1 driver owns that
 // fail-loud policy (roadmap "Instrument-PGO design SETTLED").
+//
+// `out_matched` / `out_total` (either may be null) report the PROFILE-MATCH signal
+// after the pipeline: `total` = defined (non-declaration) functions in the module,
+// `matched` = how many of those carry a PGO entry count (`Function::getEntryCount`).
+// A function is given an entry count iff the USE pass FOUND it in the profile with a
+// matching structural hash; a hash mismatch or an absent record leaves it unset. So
+// `matched == 0 && total > 0` after a USE run means NONE of this module's functions
+// matched the profile — the "0%-match" wrong-program/incompatible-profile signal the
+// driver turns into a hard error (the settled fail-loud policy). For a GEN run the
+// pass sets no entry counts, so `matched` is 0 and the driver ignores it (GEN reads
+// no profile). The count is taken AFTER the default pipeline; inlining/DCE can drop a
+// matched callee, but the ZERO-vs-NONZERO boundary the driver keys on is robust
+// (`main` is never inlined away and keeps its entry count on any real match).
 extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
                                       LLVMTargetMachineRef tm_ref, int opt_level,
-                                      int kind, const char *profdata_path) {
+                                      int kind, const char *profdata_path,
+                                      int *out_matched, int *out_total) {
+  if (out_matched)
+    *out_matched = 0;
+  if (out_total)
+    *out_total = 0;
   Module *M = unwrap(Mref);
   if (!M || !tm_ref)
     return 40;
@@ -501,5 +520,33 @@ extern "C" int align_pgo_run_pipeline(LLVMModuleRef Mref,
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel(opt_level));
   MPM.run(*M, MAM);
+
+  // Profile-match tally (see the contract note above): of the OPTIMIZED module's defined
+  // functions, how many carry a PGO entry count (`matched`) — i.e. were found in the profile
+  // and given profile data that survived to the final IR — out of the total defined (`total`).
+  // Measured AFTER the pipeline deliberately: the USE pass's function hashes are computed on
+  // the SIMPLIFIED CFG (post the early passes that precede `addPGOInstrPasses`), so the only
+  // faithful match check is inside the real pipeline — a separate un-simplified measurement
+  // mis-hashes and matches nothing. `matched == 0 && total > 0` after a USE run therefore means
+  // 0% of the optimized module got profile data: the profile is for a different program, or
+  // every function it could have applied to changed shape since it was collected — either way
+  // it contributes nothing to this build, which the driver escalates to a hard error. A build
+  // with any surviving matched function (`matched > 0`) is at most partially stale and proceeds.
+  // For a GEN run the pass sets no entry counts (`matched == 0`) and the driver ignores it.
+  if (out_matched || out_total) {
+    int matched = 0;
+    int total = 0;
+    for (Function &F : M->functions()) {
+      if (F.isDeclaration())
+        continue;
+      ++total;
+      if (F.getEntryCount().has_value())
+        ++matched;
+    }
+    if (out_matched)
+      *out_matched = matched;
+    if (out_total)
+      *out_total = total;
+  }
   return 0;
 }

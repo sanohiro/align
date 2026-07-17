@@ -819,7 +819,11 @@ pub fn codegen_units_parallel(
     }
 
     // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
-    // reads `units`/`obj_paths`/`keys` and appends any error (or PGO-use warning) under a short-held lock.
+    // reads `units`/`obj_paths`/`keys` and appends any error (or PGO-use result) under a short-held lock.
+    // Publishing to the CAS is DEFERRED to after the scope + the aggregate 0%-match check, so a
+    // wrong-program `--pgo-use` profile (rejected below) never poisons the cache with objects the build
+    // then refuses — a later rebuild with that same profile would otherwise HIT the poisoned blobs and
+    // silently proceed, contradicting this build's hard error.
     let mut pgo_warnings: Vec<String> = Vec::new();
     if !misses.is_empty() {
         use std::sync::atomic::AtomicBool;
@@ -827,9 +831,10 @@ pub fn codegen_units_parallel(
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
-        // Per-unit PGO-use warnings, kept index-tagged so the aggregate is DAG-ordered (not scheduling-
-        // dependent). Empty for Off/Instrument and for every all-hit unit.
-        let warnings = std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new());
+        // Per-unit PGO-use results (warnings + match tally), index-tagged so the aggregate is
+        // DAG-ordered (not scheduling-dependent). Empty/zero for Off/Instrument and for every all-hit
+        // unit.
+        let results = std::sync::Mutex::new(Vec::<(usize, UnitPgoRun)>::new());
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| loop {
@@ -851,21 +856,17 @@ pub fn codegen_units_parallel(
                     let unit = &units[i];
                     // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
                     // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-rejected
-                    // profile into an `Err` here (hard fail); its staleness warnings ride the return.
+                    // profile into an `Err` here (hard fail); its staleness warnings + match tally ride
+                    // the return.
                     match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
                         Err(e) => {
                             errors.lock().expect("codegen error lock").push((i, e));
                             failed.store(true, Ordering::Relaxed);
                             continue;
                         }
-                        Ok(warns) => {
-                            if !warns.is_empty() {
-                                warnings.lock().expect("pgo warning lock").push((i, warns));
-                            }
+                        Ok(run) => {
+                            results.lock().expect("pgo result lock").push((i, run));
                         }
-                    }
-                    if let Some(key) = &keys[i] {
-                        cache.publish_after_miss(key, &obj_paths[i]);
                     }
                 });
             }
@@ -880,11 +881,41 @@ pub fn codegen_units_parallel(
             let (i, e) = &errs[0];
             return Err(format!("codegen failed for unit `{}`: {e}", units[*i].unit));
         }
-        // Flatten the PGO-use warnings in DAG (unit) index order for a stable aggregate report.
-        let mut warns = warnings.into_inner().expect("pgo warning lock");
-        warns.sort_by_key(|(i, _)| *i);
-        for (_, mut w) in warns {
-            pgo_warnings.append(&mut w);
+        // DAG-order the per-unit results for a stable warning aggregate + a deterministic match tally.
+        let mut runs = results.into_inner().expect("pgo result lock");
+        runs.sort_by_key(|(i, _)| *i);
+
+        // 0%-MATCH HARD ERROR (settled fail-loud policy, `--pgo-use` only). Each rebuilt unit's PGO run
+        // reports (matched, total) = how many of its OPTIMIZED functions carry profile data out of the
+        // total defined (the shim's `Function::getEntryCount` tally; see its contract note). If ZERO of
+        // the functions across every rebuilt unit received profile data (`matched == 0`, `total > 0`),
+        // the profile contributes nothing to this build — it was collected from a different program or an
+        // incompatible build — a hard error, raised BEFORE any object is published (deferred below) so a
+        // rejected build never poisons the cache. A build with any matched function is at most partially
+        // stale and proceeds (the aggregated warning below). Guarded by `!any_hit`: a cache HIT under this
+        // profile's key means the profile already matched this program on an earlier build, so a rebuild
+        // whose (changed) units all happen to miss is partial staleness, not a wrong profile. Off /
+        // Instrument never read a profile, so the check does not apply.
+        if matches!(effective_pgo, PgoMode::Use(_)) {
+            let any_hit = outcomes.iter().flatten().any(|o| o.hit);
+            let matched: u32 = runs.iter().map(|(_, r)| r.matched_fns).sum();
+            let total: u32 = runs.iter().map(|(_, r)| r.total_fns).sum();
+            if !any_hit && total > 0 && matched == 0 {
+                return Err(format!(
+                    "--pgo-use: the profile matches NONE of this program — 0 of {total} rebuilt \
+                     function(s) were found in the profile. It was collected from a different program \
+                     or an incompatible build; re-profile with `--pgo-instrument`."
+                ));
+            }
+        }
+
+        // Cleared the 0%-match gate: publish each successfully-emitted miss to the CAS (deterministic
+        // DAG order), then flatten the PGO-use warnings for a stable aggregate report.
+        for (i, run) in runs {
+            if let Some(key) = &keys[i] {
+                cache.publish_after_miss(key, &obj_paths[i]);
+            }
+            pgo_warnings.extend(run.warnings);
         }
     }
 
@@ -898,11 +929,21 @@ pub fn codegen_units_parallel(
     })
 }
 
+/// One unit's PGO-pipeline result, returned by [`emit_unit_object`]: the profile-use staleness
+/// warnings plus the profile-match tally (`matched`/`total` defined functions). Empty/zero for the
+/// `Off` (stock) and `Instrument` (GEN) paths — only a `Use` run reads a profile.
+struct UnitPgoRun {
+    warnings: Vec<String>,
+    matched_fns: u32,
+    total_fns: u32,
+}
+
 /// Emit one per-unit object, swapping in the instrument-PGO pipeline when `pgo` is active. `Off` is the
 /// stock, byte-identical [`emit_object_file`]; `Instrument`/`Use` route through
 /// [`align_codegen_llvm::emit_object_pgo`] (GEN counters / USE `!prof` weights) and return that run's
-/// profile-use staleness warnings (empty for GEN). Called from the parallel miss producer — each call
-/// builds its own LLVM `Context`, so the USE diagnostic handler is per-thread and never races.
+/// profile-use staleness warnings + match tally (empty/zero for GEN). Called from the parallel miss
+/// producer — each call builds its own LLVM `Context`, so the USE diagnostic handler is per-thread and
+/// never races.
 fn emit_unit_object(
     mir: &align_mir::Program,
     obj: &std::path::Path,
@@ -910,11 +951,11 @@ fn emit_unit_object(
     profile: Profile,
     rt_lto: bool,
     pgo: &PgoMode,
-) -> Result<Vec<String>, String> {
+) -> Result<UnitPgoRun, String> {
     let action = match pgo {
         PgoMode::Off => {
             emit_object_file(mir, obj, target.clone(), profile, &[], rt_lto)?;
-            return Ok(Vec::new());
+            return Ok(UnitPgoRun { warnings: Vec::new(), matched_fns: 0, total_fns: 0 });
         }
         PgoMode::Instrument => align_codegen_llvm::pgo::PgoAction::Instrument,
         PgoMode::Use(p) => align_codegen_llvm::pgo::PgoAction::Use(p.as_path()),
@@ -923,7 +964,7 @@ fn emit_unit_object(
         mir, obj, target, profile, &[], rt_lto_bytes(rt_lto), action,
     )
     .map_err(|e| e.to_string())?;
-    Ok(report.warnings)
+    Ok(UnitPgoRun { warnings: report.warnings, matched_fns: report.matched_fns, total_fns: report.total_fns })
 }
 
 // ---- instrument-PGO surface (`--pgo-instrument` / `--pgo-use`) ----------------

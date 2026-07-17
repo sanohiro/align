@@ -2582,6 +2582,57 @@ reports normal). The S1 gate suite + `cache_codegen`/`cache_parallel`/`thin_lto_
 green unchanged (the version-const bumps flow through the exported consts). Next = **SV** (build-twice
 determinism both modes, stale/wrong-profile mutation gates, the compile-time bound, and the PAYOFF GATE).
 
+**Instrument-PGO SV SHIPPED (2026-07-17): the verification bundle — the instrument-PGO arc is CLOSED.**
+The bundle lives in `crates/align_driver/tests/pgo_sv.rs` (7 gates, all green), with `thin_lto_sv.rs` as
+the structural template. **(1) Build-twice determinism, both modes** — two independent COLD builds with
+SEPARATE cache roots produce a byte-identical executable, for `--pgo-instrument` AND `--pgo-use` with the
+same profdata (exe deleted between builds; coldness asserted via `--cache-stats` `0 hit, 1 miss`). **(2)
+Stale/wrong-profile mutation matrix** — (2a) a profile from a DIFFERENT program hard-errors; (2b) a
+profile from an OLDER source version (edit `tag`, keep the recursive `fib` that survives O2 as its own
+function) reports the aggregated staleness warning on stderr, PROCEEDS, and links a correct exe (stdout ==
+a flag-off build of the edited source); (2c) a profdata whose VERSION field is flipped PAST the intact
+8-byte magic (so it slips `validate_profdata`'s magic pre-check but libLLVM's reader rejects it) hits the
+Error-severity diagnostic-handler HARD ERROR path. **(3) Compile-time bound** — cold `--pgo-instrument`
+and cold `--pgo-use` each stay under a 3.0× cap vs the flag-off cold build (interleaved per round,
+best-of-N min; the `gate_sv3` shape). **(4) The PAYOFF GATE** — a MEASURED runtime win: a hot loop whose
+body PGO lays out from the profile (~90%-taken `if r < 58` guarding a medium straight-line `step`; `step`
+is internalized+inlined in BOTH builds, so the win is branch-weight-driven block LAYOUT of the hot loop,
+not inlining). Measured on the dev box: **off/use ≈ 1.16× at N=40M (1.11× at N=60M), stable to ±0.005×
+across 5 interleaved min-of-N trials**; the gate asserts a conservative **1.03× floor** (≈4× margin, can't
+flake on scheduler noise). Methodology = house discipline (representative profile via the real CLI round
+trip, off/use binaries into distinct paths, black-box output parity, interleaved A/B min-of-N subprocess
+runs). So the payoff is a real POSITIVE, not the compaction-style recorded negative.
+
+**GAP FOUND + FIXED at SV (2a — settled-policy vs implementation).** The settled fail-loud policy (design
+(f)) is "0%-match profdata = hard error". Pre-SV, a wrong-program `--pgo-use` build PROCEEDED (exit 0, one
+hash-mismatch warning) — a REAL gap. Fix: the shim's `align_pgo_run_pipeline` now returns a profile-match
+tally via two `int*` out-params — `matched` = defined functions of the OPTIMIZED module that carry a PGO
+entry count (`Function::getEntryCount`), `total` = defined functions — threaded through `PgoRunReport`
+(`matched_fns`/`total_fns`) → `emit_object_pgo` → the driver's per-unit `UnitPgoRun`. `codegen_units_parallel`
+aggregates over the rebuilt (cache-MISS) units and hard-errors (`--pgo-use: the profile matches NONE of
+this program …`) when `matched == 0 && total > 0`, guarded by `!any_hit` (a HIT under this profile's key
+means it already matched this program earlier → at most partial staleness, not a wrong profile). CAS
+publish is DEFERRED until after this check so a rejected wrong-program build never poisons the cache with
+objects a later same-profile build would HIT and silently proceed on. **Signal semantics (documented,
+load-bearing):** the tally is measured AFTER the pipeline because the USE pass hashes the SIMPLIFIED CFG,
+so an isolated pre-optimization re-measurement mis-hashes and matches nothing; a clone-then-standalone-pass
+measurement was tried and rejected for exactly this reason. Consequence: the rule is "0% of the OPTIMIZED
+module got profile data" — a wrong program (or one where every profiled function's compiled shape changed)
+errors; a program with ANY surviving matched function (e.g. an un-edited recursive `fib`) is partial
+staleness and proceeds. On a tiny program whose functions all inline into a single hash-changed `main`,
+any hot-function edit reads as 0% and errors — a defensible consequence of that definition, not a bug (the
+profile genuinely applies to nothing in the final binary). **Version-skew nuance:** `validate_profdata`
+checks existence/readability/non-emptiness/magic, NOT the profile version; an unsupported version is caught
+one layer deeper as a libLLVM Error → the same hard error (2c proves it), so the settled "version-skewed =
+hard error" holds without duplicating LLVM's version table in the driver.
+
+**The instrument-PGO arc (S0 #499 → S1 #500 → S2 #501 → SV) is CLOSED.** Deferred (unchanged from design
+(h)): **sample PGO / BOLT** evaluation (later in the wave, a driver-managed external pipeline — the wave
+tail); **CSPGO** (context-sensitive PGO); **PGO × `--thin-lto` composition** (rejected loudly in v1;
+correct ThinLTO+PGO needs `PGOOptions` threaded through all three ThinLTO phases + profile-aware import —
+its own later slice); value-profiling / ICP surface; coverage reporting; hotness-gated multiversioning.
+`--rt-lto` × `--pgo-use` composition stays supported (S2 key gate).
+
 **M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
 the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
 hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,
