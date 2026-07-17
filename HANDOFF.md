@@ -8,7 +8,37 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (tenth update this day), **THE ADAPTIVE SHORT-N STRING GROUP STRATEGY IS
+_Last updated: 2026-07-17 (eleventh update this day), **TOP-LEVEL AGGREGATE CONSTANTS ARE SHIPPED —
+THE LANGUAGE SURFACE, MERGED as #514** (`11e0f26`; stray scratch files removed in `960a753`). A
+top-level constant initializer may now be an array literal: `PRIMES := [2,3,5,7,11]` /
+`SCALE: slice<f64> := [...]` / `DAYS := ["Mon","Tue","Wed"]`. The type is **`slice<T>` with
+`Region::Static`, never `array<T>`** (ownership is a property of the type; the
+`GREETING := "hello"` → `str` analogy; an `array<T>` annotation is rejected with guidance), backed
+by per-unit `[N x T] private unnamed_addr constant` rodata (str elements = {ptr,len} pairs into
+the string pool); a constant index folds to the element (no load); pipelines/indexing flow through
+the existing borrowed-view paths allocation-free. Initializers v1 fail-closed: elements fold via
+the existing ConstEval (literals/operators/scalar-const refs); Int/Float/Bool/Char/str; struct
+constants deferred to S1.5 (recorded). Cross-unit invalidation is free via IConst.value_src →
+interface hash, now pinned by a real CacheOutcome gate. The /code-review pass caught a REAL
+soundness hole before merge (both reviewers independently proved it with running programs): writes
+through a constant's slice view compiled into rodata stores (dev SIGSEGV / O2 silently deleted
+store) via `mut` rebind AND `out slice<T>` args — fixed at the right altitude with a readonly-view
+provenance set gating EVERY slice-write entry point (element assign, .store, .map_into, .shuffle,
+out-args) through one shared rejection; static `.bytes()` closed by the same rule; the
+arena/mmap-view analogue recorded as a pre-existing open follow-up. Also: the producer-side
+pub-const initializer check (a pub const may reference only pub consts — closes the
+whole-vs-per-unit D1 divergence, applied outright to the pre-existing scalar shape), per-unit
+same-verdict coverage, diagnostic-voice fixes, the tutorial's aggregate-constant section (EN +
+natural-JA mirror), and pipeline-guard regression pins (a local named like an imported module).
+Spec sync per CLAUDE.md: draft.md §Constants + §12 + the relaxed pub rule, language-spec mirror,
+design-notes rationale, open-questions §27 Settled + the deferred-clause removal. Workspace green
+(**2332 tests**, exit-checked), clippy clean all feature states. **Next (the final work item
+before the owner-directed STOP): S3 — the doc-13 §8.4 local all-constant array literal pooling
+probe** reusing the S1 rodata mechanism (immutable non-escaping local `[...]` literals redirect to
+the pooled constant instead of alloca + O(N) stores; gates: ≥15% on the large positive case, no
+O(N) store sequence in IR, ≤3% below the empirical cutoff), then the FINAL SUMMARY and stop.
+Previous update: 2026-07-17 (tenth update this day), **THE ADAPTIVE SHORT-N STRING GROUP STRATEGY
+IS
 SHIPPED — MERGED as #510** (`afbd1e6`) — **and with it doc-13 §11 P3 item 3 is FULLY DISPOSITIONED
 (all four measure-first gates: repeated-needle #503, JSON escape SIMD #504, unique-buffer donation
 #506, short-N group #510).** The str-key single-aggregate group core is adaptive: distinct-group
