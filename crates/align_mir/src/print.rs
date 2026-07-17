@@ -56,7 +56,17 @@ fn block_to_string(out: &mut String, b: &Block) {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
             }
             Stmt::StoreConstArray { slot, elems, elem } => {
-                let _ = writeln!(out, "    _{slot} <- const_array[{}] : {}", elems.len(), ty_name(*elem));
+                // The element VALUES must be printed: `impl_hash` (the incremental
+                // object-cache body fingerprint) hashes this text, so omitting them
+                // makes value-only edits of a pooled table cache-invisible — a
+                // stale-object miscompile.
+                let _ = writeln!(
+                    out,
+                    "    _{slot} <- const_array[{}] : {} = {}",
+                    elems.len(),
+                    ty_name(*elem),
+                    const_elems_str(elems)
+                );
             }
             Stmt::StoreElemField(slot, idx, path, val) => {
                 let _ = writeln!(out, "    _{slot}[{}]{} <- {}", operand_str(idx), path_str(path), operand_str(val));
@@ -346,7 +356,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("subslice({}, +{}, len={} : {})", operand_str(base), operand_str(start), operand_str(len), ty_name(*elem))
         }
         Rvalue::StrLit(s) => format!("{s:?}"),
-        Rvalue::ConstArray { elems, elem } => format!("const_array[{}] : {}", elems.len(), ty_name(*elem)),
+        Rvalue::ConstArray { elems, elem } => {
+            // Values included for the same impl_hash reason as Stmt::StoreConstArray.
+            format!("const_array[{}] : {} = {}", elems.len(), ty_name(*elem), const_elems_str(elems))
+        }
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
         Rvalue::StrPredicate { kind, haystack, needle } => {
             let name = match kind {
@@ -590,6 +603,24 @@ fn rvalue_str(rv: &Rvalue) -> String {
 /// A field path (`[0, 2]`) rendered as a dotted suffix (`.0.2`) for a place display.
 fn path_str(path: &[u32]) -> String {
     path.iter().map(|i| format!(".{i}")).collect::<String>()
+}
+
+/// Constant-array elements rendered value-exactly. `impl_hash` hashes the printed
+/// MIR, so this rendering is load-bearing for cache identity: two tables with
+/// different values must never print identically. Floats use `{:?}` (shortest
+/// round-trip, distinguishes 1.0 from 1.5 and -0.0 from 0.0).
+fn const_elems_str(elems: &[crate::ConstElem]) -> String {
+    let parts: Vec<String> = elems
+        .iter()
+        .map(|e| match e {
+            crate::ConstElem::Int(v) => v.to_string(),
+            crate::ConstElem::Float(v) => format!("{v:?}"),
+            crate::ConstElem::Char(c) => format!("c{c}"),
+            crate::ConstElem::Bool(b) => b.to_string(),
+            crate::ConstElem::Str(s) => format!("{s:?}"),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 fn operand_str(op: &Operand) -> String {

@@ -2611,8 +2611,12 @@ best-of-N min; the `gate_sv3` shape). **(4) The PAYOFF GATE** — a MEASURED run
 body PGO lays out from the profile (~90%-taken `if r < 58` guarding a medium straight-line `step`; `step`
 is internalized+inlined in BOTH builds, so the win is branch-weight-driven block LAYOUT of the hot loop,
 not inlining). Measured on the dev box: **off/use ≈ 1.16× at N=40M (1.11× at N=60M), stable to ±0.005×
-across 5 interleaved min-of-N trials**; the gate asserts a conservative **1.03× floor** (≈4× margin, can't
-flake on scheduler noise). Methodology = house discipline (representative profile via the real CLI round
+across 5 interleaved min-of-N trials**; the gate asserts a conservative **1.03× floor** (≈4× margin).
+[Correction 2026-07-18: "can't flake on scheduler noise" was falsified — the gate flaked twice under
+the full threaded suite's parallel build load while passing in isolation every time, so it is now an
+`#[ignore]` manual probe per the repo's perf-probe discipline (timing claims never live in CI
+asserts); run it in isolation to verify the payoff on a given host.]
+Methodology = house discipline (representative profile via the real CLI round
 trip, off/use binaries into distinct paths, black-box output parity, interleaved A/B min-of-N subprocess
 runs). So the payoff is a real POSITIVE, not the compaction-style recorded negative. **Discarded-kernel
 negative (recorded so sample-PGO/BOLT does not re-measure it):** two multi-arm match/if-chain DISPATCH

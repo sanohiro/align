@@ -238,3 +238,71 @@ fn pooled_table_rodata_is_never_freed() {
         "a pooled rodata table must never be freed:\n{ir}"
     );
 }
+
+/// The review's reproduced stale-cache miscompile, pinned: a VALUE-ONLY edit of a pooled table
+/// must change the printed MIR (impl_hash's input) and therefore miss the incremental object
+/// cache. Two subprocess builds against one warm cache root: edit `999` -> `111`, and the rerun
+/// must print the new value — never the stale cached object's.
+#[test]
+fn value_only_edit_of_pooled_table_misses_the_cache() {
+    let _g = pool_guard();
+    let dir = std::env::temp_dir().join(format!("align_pool_cache_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cache = dir.join("cache");
+    let src = |last: i64| {
+        let mut elems: Vec<String> = (0..63).map(|i| i.to_string()).collect();
+        elems.push(last.to_string());
+        format!("fn main() -> i32 {{\n  xs := [{}]\n  print(xs[63])\n  return 0\n}}\n", elems.join(", "))
+    };
+    let path = dir.join("t.align");
+    let run = |v: i64| {
+        std::fs::write(&path, src(v)).expect("write source");
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+            .arg("run")
+            .arg(&path)
+            .env("ALIGNC_CACHE", &cache)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn alignc run");
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(run(999), "999");
+    assert_eq!(run(111), "111", "a value-only edit must miss the warm cache, never serve stale rodata");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The impl_hash input itself: value-differing tables must never print identical MIR. Covers both
+/// the pooled local (Stmt::StoreConstArray) and the #514 aggregate constant (Rvalue::ConstArray).
+#[test]
+fn const_array_values_are_part_of_printed_mir() {
+    let a = mir_text_of("pool_print_a", &program_with_last(999));
+    let b = mir_text_of("pool_print_b", &program_with_last(111));
+    assert_ne!(a, b, "value-only table edits must change the printed MIR (impl_hash input)");
+    assert!(a.contains("999") && b.contains("111"), "elements are printed value-exactly");
+
+    // A dynamic index keeps the Rvalue::ConstArray in MIR (a constant index folds it away).
+    let ca = mir_text_of(
+        "const_print_a",
+        "T := [7, 8, 9]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i64 = pick(2)\n",
+    );
+    let cb = mir_text_of(
+        "const_print_b",
+        "T := [7, 8, 42]\nfn pick(i: i64) -> i64 = T[i]\nfn main() -> i64 = pick(2)\n",
+    );
+    assert_ne!(ca, cb, "aggregate-constant value edits must change the printed MIR");
+}
+
+fn program_with_last(last: i64) -> String {
+    let mut elems: Vec<String> = (0..63).map(|i| i.to_string()).collect();
+    elems.push(last.to_string());
+    format!("fn main() -> i32 {{\n  xs := [{}]\n  print(xs[63])\n  return 0\n}}\n", elems.join(", "))
+}
+
+fn mir_text_of(name: &str, src: &str) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    assert!(!checked.diags.has_errors(), "unexpected errors in {name}");
+    align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
+}
