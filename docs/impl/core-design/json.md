@@ -64,6 +64,10 @@ point (clone out to keep).
   form is the one way.
 - Nested-struct / Option-field / enum-payload decode targets — not in the verified matrix;
   extending the target grammar is design work (field tables, null policy) before code.
+  **Filed 2026-07-18:** `open-questions.md` Open → "REST-gateway runway" holds the slice plan
+  (nested → Option → array fields), the null policy proposal, and the language-side field-type
+  prerequisites (`is_field_ok` today rejects `Option<T>`/`array<T>` fields). Enum-payload
+  targets stay deferred there too.
 
 ## Pitfalls
 

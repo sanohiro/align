@@ -3521,6 +3521,76 @@ evidence: `impl/14-llm-inference-focus-audit.md` §7.
 - **`bool` / `char` as FFI types** — use the integer types (C `_Bool` = `u8`, `char` = `i8`/`u8`, `char32_t` = `u32`; a `wchar_t` is platform-sized — pick the matching integer width). Align `char` is a 32-bit Unicode scalar (**not** a C `char`), so admitting it would invite the wrong mapping; `bool` stays out for the same one-unambiguous-way reason (and dodges the `i1`-`zeroext` ABI subtlety). Note: there is no `bool as int` cast today, so a `bool` reaches C as `if b { 1 } else { 0 }`.
 - **`raw.ptr_cast<T>`** — a *typed* reinterpret has nothing to reinterpret to while `raw` (opaque bytes) is the only pointer type; it earns meaning once FFI grows typed/external pointers.
 
+### REST-gateway runway — `Option<T>`/`array<T>` struct fields + `core.json` nested/optional targets (filed 2026-07-18)
+
+**Target: the first post-M15 core/std consumer wave. Consumer: the OpenAI-compatible REST gateway
+(the align-LLM runway A5 surface — `std.http` serve + SSE shipped in M11/M12 and waiting on exactly
+this).** An OpenAI `chat/completions` exchange is nested and optional-heavy on both sides:
+
+```text
+request:   { model: str, messages: array<Message>, temperature?: f64, stream?: bool, ... }
+response:  { id: str, choices: array<Choice>, usage: Usage }   // Choice { message: Message, ... }
+SSE delta: { choices: array<DeltaChoice> }                     // DeltaChoice { delta: Delta, ... }
+```
+
+Two independent gaps block declaring/decoding/encoding these today, in different layers:
+
+1. **Language: the struct field-type whitelist.** `is_field_ok` (`align_sema`) admits only
+   `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct` as struct fields — `Option<T>` and
+   `array<T>` fields are rejected at declaration. The OpenAI shapes cannot even be *declared*,
+   regardless of what `json.decode` supports.
+2. **`core.json`: the decode-target whitelist.** The verified matrix (`impl/core-design/json.md`)
+   covers flat structs and top-level arrays only; nested-struct / Option-field / array-field
+   targets are recorded there as "design work before code". `encode` is flat-struct-only.
+
+**Plan — three slices, each shippable and ideal-form on its own:**
+
+- **A. Nested-struct fields in `core.json` (json-only; no language change).** Nested `Struct`
+  fields are already legal, so recursive field-descriptor tables on decode + recursive `encode`
+  through the builder path are pure `core.json` work. Pitfall discipline is json.md P1/P2
+  verbatim: extend the Mison speculative path and the strict fallback **together**, re-fuzz both
+  (the differential oracle), keep the exactly-once field contract per nesting level. Decoded
+  `str` fields at any depth stay zero-copy views region-tied to the input.
+- **B. `Option<T>` struct fields (language) + optional-field decode (json).**
+  - Field support: extend `is_field_ok` + the layout pair (`ty_size_align` / `field_abi_align`
+    — `layout_parity` pins their agreement) + MoveCheck/escape field tracking; `struct_is_move`
+    already answers the moveness question (`payload_is_move`: an `Option<string>` field makes
+    the struct Move). The known bug class is a sibling type-class skipping an analysis pass —
+    sweep with the `/align-self-review` checklist.
+  - **Null policy (the design decision to settle here): missing key → `None`; JSON `null` →
+    `None`; type mismatch → `Err`. `encode` omits a `None` field entirely (never `"k": null`).**
+    One absence representation — JSON's two spellings of absence collapse into the one `Option`
+    (One way); `decode(encode(x))` round-trips by construction. A non-`Option` declared field
+    keeps today's strict exactly-once contract (missing → `Err`) — optionality is declared in
+    the type, never inferred leniency.
+- **C. `array<T>` struct fields (language) + array-field decode/encode (json).** The Move
+  machinery generalizes (`struct_is_move` already walks owned fields; recursive Drop extends to
+  the array payload; MoveCheck's per-field moves exist from tuples). This is the
+  `messages: array<Message>` shape — the request side's hard requirement. `soa<T>` keeps
+  excluding Move-fielded structs (the settled owned-columns deferral stands).
+
+**Acceptance (the consumer is the test):** decode a real `chat/completions` request (messages +
+optional params), encode a real response and an SSE `delta` chunk through `respond_stream`, in an
+`examples/` OpenAI-compatible server. Deferred out of this runway: enum-payload targets (the
+string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
+`json.scan`/`json.token` streaming, `validate<T>`.
+
+**Direction notes recorded with this filing (not slice work; framing for later):**
+- **Server form:** the gateway is a `match (method, path)` dispatch app — for a fixed-path API
+  this is the ideal form (every route visible in source and to the compiler; 405/404 are explicit
+  arms), not a stopgap awaiting a router. No router is on this runway's critical path.
+- **`std.http` protocol floor, consumer-gated:** query-string parse + percent-decode
+  (`ctx.query(name) -> Option<str>` — RFC 3986 has one correct answer → std, the sibling of
+  `ctx.header`) and an SSE event-framing helper (WHATWG-defined) join `std.http` when the
+  gateway or a successor actually needs them; server keepalive lands invisibly per the existing
+  plan. The boundary rule: protocol (spec-defined, one correct answer) may enter std;
+  convention/policy may not.
+- **`pkg.router`/`pkg.web` stay pkg and stay deferred** (draft §18.3: DB drivers and web
+  frameworks are not core/std; `:id` segment conventions, middleware chains, `ctx.json()` sugar
+  are policy, not protocol). Double-gated on (a) fully-escaping fn values (storing handlers in
+  structs/arrays) and (b) the build-system / package-layout / dependency-resolution design
+  above. Re-evaluate on real reuse pressure from shipped apps — extraction over invention.
+
 ### Details (settled during implementation)
 ```text
 - default-type lint (warn when the i64 default is wasteful in large arrays; no literal *suffix* — `as` covers expression-position typing, see "Numeric literal typing" Settled)
