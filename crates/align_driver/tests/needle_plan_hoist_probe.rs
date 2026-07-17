@@ -1,25 +1,23 @@
 //! doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting: REAL-PIPELINE adoption probe.
 //!
 //! `#[ignore]` (run with `cargo test -p align_driver --test needle_plan_hoist_probe -- --ignored
-//! --nocapture`). This is the adoption gate: the win the doc-13 §6.6 runtime kernels measured
-//! (2.5–6.1× at 32–128 B, ~1.0× at 16 KiB) must reproduce through the REAL alignc-compiled pipeline,
-//! not just a Rust micro-kernel.
+//! --nocapture`). This is the adoption gate: the win the doc-13 §6.6 runtime kernels measured must
+//! reproduce through the REAL alignc-compiled pipeline.
 //!
-//! Method. For each (needle bytes, haystack bytes, element count) config, two Align programs are
-//! compiled by the current alignc and linked against the runtime. HOISTED =
-//! `xs.where(fn s { s.contains(n) }).count()` → one `finder_new` per invocation, reused across the
-//! `count` elements (`finder_find`). PER-CALL = a hand-written `loop { if xs[i].contains(n) … }` →
-//! `str_contains` per element, i.e. it reconstructs the `memchr` searcher for every element (the
-//! unhoisted shape). Both are the real compiled pipeline; they differ only in searcher reuse. Each kernel times an
-//! internal `REPS` loop with `time.instant()` and prints the best (min) reps-loop nanoseconds over
-//! `TRIALS` internal trials; the harness runs the two executables interleaved and takes the min.
-//! `finder_new` returns a fresh opaque allocation each invocation, so neither the searcher build nor
-//! the per-element search can be hoisted/CSE'd across reps (no measurement collapse). The needle is a
-//! no-match string (worst case: the full haystack is scanned).
+//! Method. For each (needle bytes, haystack bytes, element count) config, ONE Align program
+//! (`xs.where(fn s { s.contains(n) }).count()` in a timed reps loop) is compiled twice by the current
+//! alignc, differing ONLY in the `ALIGN_NEEDLE_HOIST` MIR toggle: ON (default) hoists one
+//! `str_finder` plan per invocation and reuses it across the `count` elements; OFF lowers the same
+//! fused loop but reconstructs the `memchr` searcher per element (`str_contains`). Because both come
+//! from the identical source and the toggle only flips the per-element search, the comparison
+//! isolates searcher reuse — no loop-shape / bounds-check / fusion confound. Each kernel times an
+//! internal reps loop with `time.instant()` and prints the best (min) nanoseconds over TRIALS; the
+//! harness runs the two executables interleaved and takes the min. The needle is a no-match string
+//! (worst case: the full haystack is scanned).
 //!
-//! Adoption gate (reported, and softly asserted): a material speedup in the 32–128 B region and
-//! roughly neutral (~1.0×) at 16 KiB. Counts sweep the amortization boundary (1 element = plan build
-//! not yet amortized; growing counts amortize it).
+//! Adoption gate (reported, softly asserted): a material speedup in the 32–128 B region and roughly
+//! neutral (~1.0×) at 16 KiB. The toggle is read at MIR lowering (the object-cache key fingerprints
+//! it and `CacheContext::from_env` force-disables the cache when it is set).
 
 mod common;
 use common::*;
@@ -28,14 +26,11 @@ use std::time::Duration;
 const TRIALS: u32 = 7; // internal min-of-N trials per kernel run
 const PROC_RUNS: u32 = 5; // interleaved process runs per kernel (min taken)
 
-/// Distinct `hsize`-byte strings, none containing the needle (needle is all 'z'; content is 'a'..'y'
-/// plus a per-index varying prefix so no two elements are identical and none matches).
+/// Distinct `hsize`-byte strings, none containing the all-'z' needle (content is 'a'..'y').
 fn haystacks(count: usize, hsize: usize) -> Vec<String> {
     (0..count)
         .map(|i| {
             let mut s = String::with_capacity(hsize);
-            // A short distinct prefix (base-25 of i over 'a'..'y'), then fill with a rotating
-            // 'a'..'y' pattern. 'z' never appears, so an all-'z' needle never matches.
             let mut n = i;
             for _ in 0..4 {
                 s.push((b'a' + (n % 25) as u8) as char);
@@ -57,7 +52,7 @@ fn array_literal(hs: &[String]) -> String {
             out.push_str(", ");
         }
         out.push('"');
-        out.push_str(s); // content is ASCII 'a'..'y' — no escaping needed
+        out.push_str(s); // 'a'..'y' only — no escaping needed
         out.push('"');
     }
     out.push(']');
@@ -65,14 +60,12 @@ fn array_literal(hs: &[String]) -> String {
 }
 
 fn reps_for(count: usize, hsize: usize) -> u64 {
-    // Target ~3 ms per reps-loop on the SLOW (per-call) path so timing is stable but the matrix
-    // finishes fast. Per pipeline the per-call path pays, per element, a searcher reconstruction
-    // (~100 ns) plus a scan (~1 ns/byte); bound reps by that estimate.
     let per_ns = (count as u64) * (100 + hsize as u64);
     (3_000_000 / per_ns.max(1)).clamp(20, 20_000)
 }
 
-fn hoisted_src(hs: &[String], needle: &str, reps: u64) -> String {
+/// The single hoisted where-pipeline kernel — compiled twice, once per toggle state.
+fn pipeline_src(hs: &[String], needle: &str, reps: u64) -> String {
     format!(
         r#"import std.time
 pub fn main() -> Result<(), Error> {{
@@ -109,50 +102,6 @@ pub fn main() -> Result<(), Error> {{
     )
 }
 
-fn percall_src(hs: &[String], needle: &str, reps: u64) -> String {
-    format!(
-        r#"import std.time
-pub fn main() -> Result<(), Error> {{
-  xs := {arr}
-  n := "{needle}"
-  total := xs.len()
-  mut best := 9223372036854775807
-  mut grand := 0
-  mut trial := 0
-  best = loop {{
-    if trial >= {trials} {{ break best }}
-    t0 := time.instant()
-    mut acc := 0
-    mut r := 0
-    acc = loop {{
-      if r >= {reps} {{ break acc }}
-      mut i := 0
-      c := loop {{
-        if i >= total {{ break acc }}
-        if xs[i].contains(n) {{ acc = acc + 1 }}
-        i = i + 1
-      }}
-      acc = c
-      r = r + 1
-    }}
-    t1 := time.instant()
-    grand = grand + acc
-    dt := t1 - t0
-    if dt < best {{ best = dt }}
-    trial = trial + 1
-  }}
-  print(best)
-  print(grand)
-  return Ok(())
-}}
-"#,
-        arr = array_literal(hs),
-        needle = needle,
-        trials = TRIALS,
-        reps = reps,
-    )
-}
-
 fn run_best_ns(exe: &std::path::Path) -> u64 {
     let out = std::process::Command::new(exe).output().expect("run probe exe");
     assert!(out.status.success(), "probe exe failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -161,6 +110,24 @@ fn run_best_ns(exe: &std::path::Path) -> u64 {
         .next()
         .and_then(|l| l.trim().parse::<u64>().ok())
         .unwrap_or_else(|| panic!("probe printed no ns: {txt:?}"))
+}
+
+/// Build the given source with `ALIGN_NEEDLE_HOIST` forced to a state (`hoist_on` leaves it unset).
+/// The toggle is read in-process at MIR lowering, so set it around the synchronous `build_exe`.
+/// SAFETY: this `#[ignore]` probe runs serially and alone; no other thread reads the env here.
+fn build_with_toggle(name: &str, src: &str, hoist_on: bool) -> BuiltExe {
+    unsafe {
+        if hoist_on {
+            std::env::remove_var("ALIGN_NEEDLE_HOIST");
+        } else {
+            std::env::set_var("ALIGN_NEEDLE_HOIST", "off");
+        }
+    }
+    let exe = build_exe(name, src);
+    unsafe {
+        std::env::remove_var("ALIGN_NEEDLE_HOIST");
+    }
+    exe
 }
 
 #[test]
@@ -172,15 +139,10 @@ fn real_pipeline_adoption_probe() {
     }
     let needles: [(&str, usize); 2] = [("zzzz", 4), ("zzzzzzzzzzzzzzzz", 16)];
     let hsizes = [32usize, 64, 128, 1024, 16384];
-    // Fixed at the amortized regime (16 elements per plan) — the core adoption claim. The count=1
-    // boundary is exercised by the runtime kernels in doc-13 §6.6; here we keep the compiled-source
-    // size bounded (16 * 16 KiB ≈ 256 KiB max) so the matrix compiles in a sane time.
-    let counts = [16usize];
+    let counts = [16usize]; // amortized regime — the core adoption claim; bounds embedded source size
 
-    println!("\nneedle  hay    count   reps   hoisted_ns  percall_ns  speedup(percall/hoisted)");
-    println!("--------------------------------------------------------------------------------");
-
-    // Track the short-region and large-region behavior for the soft adoption assertion.
+    println!("\nneedle  hay    count   reps    hoist_ns   percall_ns  speedup(off/on)");
+    println!("--------------------------------------------------------------------------");
     let mut short_speedups: Vec<f64> = Vec::new();
     let mut large_speedups: Vec<f64> = Vec::new();
 
@@ -189,20 +151,21 @@ fn real_pipeline_adoption_probe() {
             for &count in &counts {
                 let reps = reps_for(count, hsize);
                 let hs = haystacks(count, hsize);
-                let h_exe = build_exe(&format!("nphp-h-{nb}-{hsize}-{count}"), &hoisted_src(&hs, needle, reps));
-                let p_exe = build_exe(&format!("nphp-p-{nb}-{hsize}-{count}"), &percall_src(&hs, needle, reps));
+                let src = pipeline_src(&hs, needle, reps);
+                // Identical source, two toggle states.
+                let on_exe = build_with_toggle(&format!("nphp-on-{nb}-{hsize}-{count}"), &src, true);
+                let off_exe = build_with_toggle(&format!("nphp-off-{nb}-{hsize}-{count}"), &src, false);
 
-                // Interleave the two executables to average out any slow frequency drift.
-                let mut hbest = u64::MAX;
-                let mut pbest = u64::MAX;
+                let mut on_best = u64::MAX;
+                let mut off_best = u64::MAX;
                 for _ in 0..PROC_RUNS {
-                    hbest = hbest.min(run_best_ns(&h_exe.exe));
-                    pbest = pbest.min(run_best_ns(&p_exe.exe));
+                    on_best = on_best.min(run_best_ns(&on_exe.exe));
+                    off_best = off_best.min(run_best_ns(&off_exe.exe));
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                let speedup = pbest as f64 / hbest.max(1) as f64;
+                let speedup = off_best as f64 / on_best.max(1) as f64;
                 println!(
-                    "{nb:>4}B  {hsize:>5}  {count:>5}  {reps:>6}  {hbest:>10}  {pbest:>10}  {speedup:>8.2}x"
+                    "{nb:>4}B  {hsize:>5}  {count:>5}  {reps:>6}  {on_best:>10}  {off_best:>11}  {speedup:>8.2}x"
                 );
                 if hsize <= 128 {
                     short_speedups.push(speedup);
@@ -232,13 +195,9 @@ fn real_pipeline_adoption_probe() {
         }
     );
 
-    // Soft gate: the short region must show a real win; the large region must not regress badly.
     assert!(
         short >= 1.10,
-        "short-input (<=128B) win did not reproduce through the real pipeline: geomean {short:.2}x"
+        "short-input (<=128B) win did not reproduce through the identical-pipeline toggle: geomean {short:.2}x"
     );
-    assert!(
-        large >= 0.90,
-        "16KiB region regressed beyond noise: geomean {large:.2}x"
-    );
+    assert!(large >= 0.90, "16KiB region regressed beyond noise: geomean {large:.2}x");
 }

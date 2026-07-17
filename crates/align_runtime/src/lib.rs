@@ -6901,7 +6901,33 @@ pub struct FinderPlan {
 pub unsafe extern "C" fn align_rt_str_finder_new(nptr: *const u8, nlen: i64) -> *mut FinderPlan {
     let needle = unsafe { safe_slice(nptr, nlen) };
     let finder = memchr::memmem::Finder::new(needle).into_owned();
-    Box::into_raw(Box::new(FinderPlan { finder, nlen }))
+    let plan = Box::into_raw(Box::new(FinderPlan { finder, nlen }));
+    #[cfg(feature = "alloc-count")]
+    FINDER_NEW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    plan
+}
+
+/// Test-only `str_finder` plan counters (feature `alloc-count`, off by default) — the leak/double-free
+/// oracle for doc-13 §6.6 plan hoisting. `FINDER_NEW_CALLS` counts every plan built; `FINDER_FREE_CALLS`
+/// counts every non-null plan freed. After a hoisted where-pipeline loop (including an early-`?` exit)
+/// the two must be equal — a leak leaves `new > free`, a double free `free > new`. Zero cost when off.
+#[cfg(feature = "alloc-count")]
+static FINDER_NEW_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(feature = "alloc-count")]
+static FINDER_FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Count of `str_finder` plans built since process start (feature `alloc-count` only).
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_str_finder_new_count() -> i64 {
+    FINDER_NEW_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count of non-null `str_finder` plans freed since process start (feature `alloc-count` only).
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_str_finder_free_count() -> i64 {
+    FINDER_FREE_CALLS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Search `haystack` with a prepared [`FinderPlan`]: the byte index of the needle's first occurrence,
@@ -6909,11 +6935,11 @@ pub unsafe extern "C" fn align_rt_str_finder_new(nptr: *const u8, nlen: i64) -> 
 /// `contains` predicate. The guards are reproduced bit-identically from the stored `nlen`: an empty
 /// needle (`nlen <= 0`) matches at `0`; a needle longer than the haystack (`nlen > hlen`) is `-1`;
 /// a null/empty/negative-length haystack degrades to an empty operand via `safe_slice` (no UB). The
-/// feature detection and Two-Way/prefilter setup already happened in `finder_new`, so this call
-/// touches only argument memory — no process-global feature-cache read/write (verified against
-/// `memchr 2.8.2`: `Finder::find` takes `&self`, allocates a stack-local `PrefilterState`, and never
-/// re-runs `is_x86_feature_detected!`). That is why its codegen declaration carries
-/// `memory(argmem: read)`.
+/// vector/Two-Way setup and feature detection happened in `finder_new` for a multi-byte needle, but
+/// a **one-byte** needle routes `Finder::find` through `memchr 2.8.2`'s `searcher_kind_one_byte` →
+/// `crate::memchr`, whose `unsafe_ifunc!` reads/writes a process-global dispatch cache — so this call
+/// is NOT argument-memory-only in general, and its codegen declaration deliberately withholds
+/// `memory(...)` (the `feature_detect_reader` contract, same as `str_find`).
 ///
 /// # Safety
 /// `plan` must be a live pointer from [`align_rt_str_finder_new`]; `hptr`/`hlen` must describe a
@@ -6949,6 +6975,8 @@ pub unsafe extern "C" fn align_rt_str_finder_find(plan: *const FinderPlan, hptr:
 pub unsafe extern "C" fn align_rt_str_finder_free(plan: *mut FinderPlan) {
     if !plan.is_null() {
         drop(unsafe { Box::from_raw(plan) });
+        #[cfg(feature = "alloc-count")]
+        FINDER_FREE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

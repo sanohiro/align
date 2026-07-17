@@ -3564,15 +3564,18 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
         "align_rt_str_contains" | "align_rt_str_find" | "align_rt_str_rfind" => {
             Some(feature_detect_reader(&[0, 2]))
         }
-        // `str_finder_find` (doc-13 §6.6): searches a prepared plan. UNLIKE the one-shot
-        // `str_contains`/`find`, the CPU-feature detection and Two-Way/prefilter setup already ran in
-        // `str_finder_new` — verified against `memchr 2.8.2`: `Finder::find` takes `&self`, builds a
-        // stack-local `PrefilterState`, and never re-runs `is_x86_feature_detected!` (detection is in
-        // `is_available()` → `with_pair()` → `Searcher::new`, i.e. construction only). So `find`
-        // touches ONLY argument memory (the plan struct at param 0 and the haystack at param 1) — it
-        // gets `memory(argmem: read)` + pure-finite + `readonly captures(none)` on both pointers, the
-        // same treatment as the `memcmp`-class readers. `rt_finder_find_attrs_pin` locks this set.
-        "align_rt_str_finder_find" => Some(memcmp_class(&[0, 1])),
+        // `str_finder_find` (doc-13 §6.6): searches a prepared plan. For a *multi-byte* needle the
+        // vector/Two-Way setup and feature detection all happened in `str_finder_new`
+        // (`is_available()` → `with_pair()` → `Searcher::new`), so `Finder::find` would touch only
+        // argument memory. BUT for a **one-byte** needle `memchr 2.8.2` routes `Finder::find` through
+        // `searcher_kind_one_byte` → `crate::memchr(byte, haystack)`, whose `unsafe_ifunc!` reads —
+        // and on the first call writes — a process-global `static FN: AtomicPtr<()>` dispatch cache
+        // (non-argument memory). That is the SAME feature-detect-at-find-time lie this file forbids
+        // for the one-shot `str_contains`/`str_find`. So `memory(...)` is WITHHELD: `finder_find` gets
+        // the `feature_detect_reader` contract (pure-finite flags + `readonly captures(none)` on both
+        // pointers, no memory-effects attribute) — identical to `str_find`. The plan-reuse win is the
+        // point of hoisting; the memory-effects upgrade was an optional extra and is falsified here.
+        "align_rt_str_finder_find" => Some(feature_detect_reader(&[0, 1])),
         // The abort family (`align_rt_bounds_fail`/`len_mismatch_fail`/`range_fail`/`div_fail`/
         // `process_exit`/`process_abort`): each is `-> !` in the runtime — it prints then calls
         // `std::process::abort()` / `_exit` / `std::process::exit`, none of which return. MIR already
@@ -9629,11 +9632,12 @@ mod tests {
         let sf = attr_group_of(&out, "align_rt_str_find");
         assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");
 
-        // (3b) The hoisted repeated-needle plan (doc-13 §6.6). UNLIKE the one-shot `str_find`,
-        // `str_finder_find` does NO feature detection at find time (it happened in `finder_new`), so
-        // it DOES claim `memory(argmem: read)` + `readonly captures(none)` on BOTH pointers (the plan
-        // at param 0, the haystack at param 1) — the `memcmp`-class treatment. A drift here (e.g. an
-        // accidental `feature_detect_reader` classification, or a wrong param index) fails loudly.
+        // (3b) The hoisted repeated-needle plan (doc-13 §6.6). LIKE the one-shot `str_find`,
+        // `str_finder_find` keeps the pure-finite flags + `readonly captures(none)` on BOTH pointers
+        // (the plan at param 0, the haystack at param 1) but WITHHOLDS `memory(...)`: a one-byte
+        // needle routes `Finder::find` through `crate::memchr`'s `unsafe_ifunc!` global dispatch
+        // cache (non-argument memory), so an `argmem: read` claim would be a lie. A regression that
+        // re-adds a memory-effects attribute here fails loudly.
         assert!(
             out.contains(
                 "declare i64 @align_rt_str_finder_find(ptr readonly captures(none), ptr readonly captures(none), i64)"
@@ -9641,7 +9645,10 @@ mod tests {
             "want readonly + captures(none) on both str_finder_find pointers:\n{out}"
         );
         let ff = attr_group_of(&out, "align_rt_str_finder_find");
-        assert!(ff.contains("memory(argmem: read)"), "str_finder_find must claim argmem-read (no feature detect):\n{ff}");
+        assert!(
+            !ff.contains("memory("),
+            "str_finder_find must NOT claim a memory effect (one-byte needle hits memchr's dispatch cache):\n{ff}"
+        );
         for a in ["willreturn", "nofree", "nosync"] {
             assert!(ff.contains(a), "str_finder_find must carry {a}:\n{ff}");
         }

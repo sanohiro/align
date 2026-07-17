@@ -985,30 +985,18 @@ fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
     }
 }
 
-/// Whether the value name `name` appears anywhere in `e` (doc-13 §6.6 needle-invariance check).
-/// **Fail-closed:** any expression shape not explicitly recursed into returns `true` ("might mention
-/// it"), so an unrecognised needle keeps the per-call predicate path rather than being wrongly
-/// hoisted. Used only to reject an element-derived needle (`s.contains(s[0..3])`) before recognising
-/// the loop-invariant repeated-needle where-pipeline — never to accept one, so over-approximating
-/// "mentions" only costs a missed optimisation, never soundness.
-fn ast_expr_mentions_name(e: &ast::Expr, name: &str) -> bool {
-    use ast::ExprKind as K;
+/// Whether `e` is a **loop-invariant pure atom** usable as a hoisted needle (doc-13 §6.6): a bare
+/// free-variable name (a single-segment `Path` other than the lambda parameter `param`) or a string
+/// literal. Deliberately NARROW — a call, index, field chain, template, `?`, or arithmetic needle is
+/// rejected here, so it keeps the per-call `str.contains` path with its original per-element
+/// semantics (effect count/order, trapping, `?` legality). Recognising only atoms means hoisting can
+/// never move an impure/trapping/effect-ordered evaluation out of the loop or change what type-checks.
+/// (A field-of-path needle `cfg.prefix` is a possible future extension, deliberately not accepted.)
+fn needle_is_invariant_atom(e: &ast::Expr, param: &str) -> bool {
     match &e.kind {
-        K::Unit | K::Int(_) | K::Float(_) | K::Char(_) | K::Str(_) | K::Bool(_) | K::FieldShorthand(_) => false,
-        // A single bare name is the parameter iff it equals `name`; a qualified path's leading
-        // segment coinciding with `name` is conservatively treated as a mention (fail-closed).
-        K::Path(p) => p.segments.iter().any(|s| s.name == name),
-        K::Unary { expr, .. } | K::Cast { expr, .. } | K::Try(expr) => ast_expr_mentions_name(expr, name),
-        K::Binary { lhs, rhs, .. } => ast_expr_mentions_name(lhs, name) || ast_expr_mentions_name(rhs, name),
-        K::FieldAccess { recv, .. } => ast_expr_mentions_name(recv, name),
-        K::Call { callee, args } => {
-            ast_expr_mentions_name(callee, name) || args.iter().any(|a| ast_expr_mentions_name(a, name))
-        }
-        K::Index { recv, index } => ast_expr_mentions_name(recv, name) || ast_expr_mentions_name(index, name),
-        K::ArrayLit(elems) => elems.iter().any(|el| ast_expr_mentions_name(el, name)),
-        // Everything else (lambda, block, if, struct literal, ranges, else-unwrap, …) is treated as
-        // possibly referencing the parameter — the fail-closed default keeps the per-call path.
-        _ => true,
+        ast::ExprKind::Str(_) => true,
+        ast::ExprKind::Path(p) => p.segments.len() == 1 && p.segments[0].name != param,
+        _ => false,
     }
 }
 
@@ -12918,12 +12906,15 @@ impl<'a, 't> Checker<'a, 't> {
                         return None;
                     }
                     // doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. Recognise
-                    // `where(fn(s) = s.contains(NEEDLE))` over a `str` element where NEEDLE is
-                    // free of the parameter `s` (loop-invariant). MIR then builds one hoisted
-                    // `str_finder` plan before the loop instead of reconstructing a `memchr`
-                    // searcher per element. An element-derived needle (`s.contains(s[0..3])`) fails
-                    // the invariance check and keeps the per-call `Where` path. Whole-struct/soa
-                    // predicates never reach here (element is not `str`).
+                    // `where(fn s { s.contains(NEEDLE) })` over a `str` element where NEEDLE is a
+                    // bare free variable or a string literal (a loop-invariant pure atom). MIR then
+                    // builds one hoisted `str_finder` plan before the loop instead of reconstructing
+                    // a `memchr` searcher per element. Anything richer than an atom — an
+                    // element-derived needle (`s.contains(s[0..3])`), an impure/trapping call
+                    // (`s.contains(get())` / `s.contains(xs[j])`), a `?` (`s.contains(f()?)`), a
+                    // field chain, or a template — is NOT recognised and keeps the per-call `Where`
+                    // path with its original semantics. Whole-struct/soa predicates never reach here
+                    // (element is not `str`).
                     if elem == Ty::Str
                         && let StageFn::Lambda { params, body, .. } = &sf
                         && params.len() == 1
@@ -12936,7 +12927,7 @@ impl<'a, 't> Checker<'a, 't> {
                         && let ast::ExprKind::Path(p) = &recv.kind
                         && p.segments.len() == 1
                         && p.segments[0].name == params[0].name.name
-                        && !ast_expr_mentions_name(&args[0], &params[0].name.name)
+                        && needle_is_invariant_atom(&args[0], &params[0].name.name)
                     {
                         // Type-check the invariant needle in the enclosing scope. NO type hint
                         // (Gate 5 #244): a hinted `Some(Ty::Str)` check would speculatively unify —

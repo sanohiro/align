@@ -4906,44 +4906,85 @@ fn lower_struct_elem(
     v
 }
 
-/// doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. Build one `str_finder` plan per
-/// `WhereStrContains` stage in the loop **preheader** (the invariant needle's `memchr` searcher is
-/// constructed once and reused per element) and return a per-stage slot table (`None` for any other
-/// stage). Each plan is a synthetic path-local owner: its initialisation is prepended to entry, the
-/// drop flag is set live here, and the drop-flag machinery frees it exactly once on every exit path
-/// (fall-through, `break`, `?`, early return). Must be called after `setup_source` and before the
-/// loop header is emitted, so the plan is built once before the loop, not per element.
-fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<Slot>> {
+/// How a recognised `WhereStrContains` stage lowers its per-element predicate. Chosen once in the
+/// preheader by [`hoist_str_finder_plans`] from the `ALIGN_NEEDLE_HOIST` toggle (doc-13 §6.6). Both
+/// variants lower the needle **once** before the loop, so the two pipelines are byte-for-byte
+/// identical except for searcher reuse — the honest before/after the adoption probe compiles.
+enum NeedleLower {
+    /// Default (toggle on): a hoisted `str_finder` plan owner slot; the body reuses it via
+    /// `finder_find(plan, s) >= 0`.
+    Plan(Slot),
+    /// Toggle off (`ALIGN_NEEDLE_HOIST=off`): the invariant needle operand, lowered once; the body
+    /// reconstructs the searcher per element via `str_contains(s, needle)` — the unhoisted baseline.
+    PerCall(Operand),
+}
+
+/// doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. For each `WhereStrContains` stage, lower the
+/// loop-invariant needle **once** in the loop preheader and decide how the body evaluates the
+/// predicate (`None` for any other stage). Default: build a `str_finder` plan (the invariant needle's
+/// `memchr` searcher is constructed once and reused per element) into a synthetic path-local owner —
+/// its init is prepended to entry, the drop flag is set live here, and the drop-flag machinery frees
+/// it exactly once on every exit path (fall-through, `break`, `?`, early return). With
+/// `ALIGN_NEEDLE_HOIST=off` (the measurement/regression toggle, mirroring `ALIGN_SORT_ADAPTIVE`;
+/// read HERE at MIR-lowering time so the per-unit `impl_hash` fingerprints the two shapes distinctly,
+/// and `CacheContext::from_env` force-disables the object cache when it is set) the plan is NOT built
+/// and the body reconstructs the searcher per element — same fused loop, differing only in reuse.
+/// Must be called after `setup_source` and before the loop header is emitted.
+fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<NeedleLower>> {
+    // Read the toggle at MIR lowering (never in codegen): the object cache key fingerprints the
+    // lowered MIR text, so reading it here makes the two shapes cache-distinct, and
+    // `CacheContext::from_env` additionally forces the cache off whenever this var is set.
+    let hoist = std::env::var("ALIGN_NEEDLE_HOIST").ok().as_deref() != Some("off");
     stages
         .iter()
         .map(|stage| match &stage.kind {
             hir::StageKind::WhereStrContains { needle } => {
                 let needle_val = lower_expr(b, needle);
-                let owner = b.new_synthetic_owner(Ty::StrFinder);
-                let plan = b.fresh_value(Ty::StrFinder);
-                b.push(Stmt::Let(plan, Rvalue::StrFinderNew { needle: needle_val }));
-                b.push(Stmt::Store(owner, Operand::Value(plan)));
-                b.set_drop_flag(owner, true);
-                Some(owner)
+                if hoist {
+                    let owner = b.new_synthetic_owner(Ty::StrFinder);
+                    let plan = b.fresh_value(Ty::StrFinder);
+                    b.push(Stmt::Let(plan, Rvalue::StrFinderNew { needle: needle_val }));
+                    b.push(Stmt::Store(owner, Operand::Value(plan)));
+                    b.set_drop_flag(owner, true);
+                    Some(NeedleLower::Plan(owner))
+                } else {
+                    Some(NeedleLower::PerCall(needle_val))
+                }
             }
             _ => None,
         })
         .collect()
 }
 
-/// Lower a `WhereStrContains` predicate inside a pipeline loop body: `finder_find(plan, s) >= 0`,
-/// where `plan_slot` is this stage's hoisted `str_finder` owner (from [`hoist_str_finder_plans`])
-/// and `elem` is the current `str` element. Returns the `bool` predicate value — the branchless/
-/// maskable counterpart of a lifted `str.contains` call, reproducing `contains` (index `>= 0`)
-/// bit-identically. The finder does no CPU-feature detection (that happened in `finder_new`).
-fn lower_where_str_contains_pred(b: &mut Builder, plan_slot: Slot, elem: Operand) -> ValueId {
-    let plan = b.fresh_value(Ty::StrFinder);
-    b.push(Stmt::Let(plan, Rvalue::Load(plan_slot)));
-    let idx = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(idx, Rvalue::StrFinderFind { plan: Operand::Value(plan), haystack: elem }));
-    let pred = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(pred, Rvalue::Bin(BinOp::Ge, Operand::Value(idx), index_const(0))));
-    pred
+/// Lower a `WhereStrContains` predicate inside a pipeline loop body over the current `str` element
+/// `elem`, per the preheader decision `nl` (from [`hoist_str_finder_plans`]). Returns the `bool`
+/// predicate value — the branchless/maskable counterpart of a `str.contains`, reproducing `contains`
+/// (index `>= 0`) bit-identically. The hoisted form reuses the plan; the toggle-off form emits the
+/// same per-element `str_contains` the unhoisted pipeline would.
+fn lower_where_str_contains_pred(b: &mut Builder, nl: &NeedleLower, elem: Operand) -> ValueId {
+    match nl {
+        NeedleLower::Plan(plan_slot) => {
+            let plan = b.fresh_value(Ty::StrFinder);
+            b.push(Stmt::Let(plan, Rvalue::Load(*plan_slot)));
+            let idx = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(idx, Rvalue::StrFinderFind { plan: Operand::Value(plan), haystack: elem }));
+            let pred = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(pred, Rvalue::Bin(BinOp::Ge, Operand::Value(idx), index_const(0))));
+            pred
+        }
+        NeedleLower::PerCall(needle) => {
+            let pred = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                pred,
+                Rvalue::StrPredicate {
+                    kind: hir::StrPredKind::Contains,
+                    haystack: elem,
+                    needle: needle.clone(),
+                },
+            ));
+            pred
+        }
+    }
 }
 
 fn lower_array_reduce(
@@ -5093,8 +5134,8 @@ fn lower_array_reduce(
                 // non-trapping, so it masks branchlessly like `WhereField` (or branches under a
                 // guarded suffix). `where` keeps the element, so `cur` is unchanged.
                 let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let plan_slot = finder_plans[stage_idx].expect("a WhereStrContains stage has a hoisted plan");
-                let pred = lower_where_str_contains_pred(b, plan_slot, elem);
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem);
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -5376,8 +5417,8 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
                 let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let plan_slot = finder_plans[stage_idx].expect("a WhereStrContains stage has a hoisted plan");
-                let pred = lower_where_str_contains_pred(b, plan_slot, elem_op);
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -6132,8 +6173,8 @@ fn lower_array_partition(
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
                 let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let plan_slot = finder_plans[stage_idx].expect("a WhereStrContains stage has a hoisted plan");
-                let pred = lower_where_str_contains_pred(b, plan_slot, elem_op);
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;

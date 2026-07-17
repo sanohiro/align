@@ -445,20 +445,33 @@ plan hoisting first; do not add a public Pattern type unless a real dynamic cons
 compiler hoisting.
 
 **Repeated-needle plan hoisting SHIPPED 2026-07-17 (P3 item 3).** Scope: `xs.where(fn s {
-s.contains(NEEDLE) }).…` only — `s` the lambda parameter, `NEEDLE` a free variable (loop-invariant by
-construction; capture-derived). Sema recognises this exact shape in `collect_pipeline` and emits a
-specialised `StageKind::WhereStrContains { needle }`, bypassing lambda lifting; an element-derived
-needle (`s.contains(s[0..3])`) is not a capture, so it is not recognised and keeps the per-call
-`str.contains` path (negative control by exclusion). MIR builds one `str_finder` plan before the loop
-(`align_rt_str_finder_new`, into a synthetic path-local owner freed exactly once on every exit path —
-fall-through, `break`, `?`, early return — by the drop-flag machinery) and the loop body emits
-`align_rt_str_finder_find(plan, s) >= 0` instead of `str_contains`. No public `Pattern` type. The
-three runtime entries own a boxed `memchr::memmem::Finder` (a `'static` needle copy) with the one-shot
-guards reproduced bit-identically; the differential test proves plan == one-shot over the fuzz edge
-corpus. `finder_new` is allocator-class; `finder_find` carries `memory(argmem: read)` +
-`readonly captures(none)` (verified against `memchr 2.8.2`: `Finder::find` re-runs no CPU-feature
-detection — that happens at construction in `Searcher::new`). `map(find/rfind)`, explicit-loop shapes,
-and `replace`/`split` are recorded deferrals.
+s.contains(NEEDLE) }).…` only, where `NEEDLE` is a **loop-invariant pure atom** — a bare
+free-variable name (a single-segment path other than the lambda parameter `s`) **or** a string
+literal. Nothing richer is recognised: an impure or trapping call (`s.contains(get())`,
+`s.contains(xs[j])`), a `?` (`s.contains(f()?)`), a field chain (`s.contains(cfg.prefix)`), a
+template, or an element-derived needle (`s.contains(s[0..3])`) is NOT recognised and keeps the
+per-call `str.contains` path with its original per-element semantics (effect count/order, trapping,
+and `?` legality). This narrowness is deliberate and load-bearing: recognising only atoms guarantees
+hoisting can never move an impure/trapping evaluation out of the loop, and can never make a program
+type-check that would not otherwise (a `?`-needle is legal in the enclosing scope but illegal in the
+lifted bool predicate — recognising it would leak that legality into the type system). A
+field-of-path needle is a recorded possible future extension. Sema recognises the shape in
+`collect_pipeline` and emits a specialised `StageKind::WhereStrContains { needle }`, bypassing lambda
+lifting; the atom is type-checked without a hint (no speculative unification) and only committed if it
+is `Ty::Str`. MIR builds one `str_finder` plan before the loop (`align_rt_str_finder_new`, into a
+synthetic path-local owner freed exactly once on every exit path — fall-through, `break`, `?`, early
+return — by the drop-flag machinery) and the loop body emits `align_rt_str_finder_find(plan, s) >= 0`
+instead of `str_contains`. No public `Pattern` type. The three runtime entries own a boxed
+`memchr::memmem::Finder` (a `'static` needle copy) with the one-shot guards reproduced bit-identically;
+the differential test proves plan == one-shot over the fuzz edge corpus. `finder_new` is
+allocator-class. `finder_find` uses the **`feature_detect_reader`** contract — pure-finite flags +
+`readonly captures(none)`, but memory-effects **WITHHELD**: a one-byte needle routes `Finder::find`
+through `memchr 2.8.2`'s `searcher_kind_one_byte` → `crate::memchr`, whose `unsafe_ifunc!`
+reads/writes a process-global dispatch cache (non-argument memory), so an `argmem: read` claim would
+be a lie (the same lie this document forbids for the one-shot `str_find`). Deferrals: `map(find/rfind)`,
+explicit-loop shapes, `replace`/`split`, an **owned `string` needle** (its type is `string`, not
+`str`, so it is not recognised and falls through to the existing lambda path — a borrow-once
+extension is possible but out of scope), and the field-of-path needle above.
 
 `builder_write_json_str` still scans escape-free long content byte by byte. A scalar prefix followed
 by a block classifier for quote, backslash, or `<0x20` helps long strings, but per-write ABI and
@@ -473,16 +486,21 @@ same-needle/many-strings shape, not a replacement for one-shot `find` and not a 
 type.
 
 **Real-pipeline adoption gate REPRODUCED (2026-07-17, Ryzen 9 5950X, WSL2, baseline target, min of
-7 internal trials × 5 process runs, needle no-match, 16 elements/plan).** Two alignc-compiled
-executables that differ only in searcher reuse — the hoisted `where(str.contains)` pipeline vs a
-hand-written per-element `str.contains` loop (which reconstructs the searcher each element) — timed an
-internal reps loop with `time.instant()`. Speedup (per-call / hoisted): 1.41x/1.99x/1.53x at
-32/64/128 B for a 4-byte needle, 1.78x/3.34x/2.24x for a 16-byte needle; 1.08–1.18x at 1 KiB; and
-1.00–1.02x at 16 KiB (neutral, scan-bound). Short-region (≤128 B) geomean 1.96x, 16 KiB geomean 1.01x.
-The compiler wiring is kept: the win survives the full compiled pipeline (array iteration + count
-bookkeeping + a real boxed plan allocation), attenuated from the pure-kernel ratios but clearly
-material where searcher construction dominates and neutral where scanning does. The `#[ignore]`d probe
-is `crates/align_driver/tests/needle_plan_hoist_probe.rs`.
+7 internal trials × 5 process runs, needle no-match, 16 elements/plan).** The probe compiles ONE
+Align source (`xs.where(fn s { s.contains(n) }).count()` in a timed reps loop) **twice**, differing
+only in the `ALIGN_NEEDLE_HOIST` MIR toggle: ON hoists one plan and reuses it across the 16 elements;
+OFF lowers the identical fused loop but reconstructs the searcher per element (`str_contains`). Same
+loop shape, bounds checks, and fusion — the comparison isolates searcher reuse (no hand-written-loop
+confound). Timed with `time.instant()`. Speedup (off / on): 1.42x/2.09x/1.53x at 32/64/128 B for a
+4-byte needle, 1.55x/3.37x/2.35x for a 16-byte needle; 1.09–1.19x at 1 KiB; and 1.00–1.01x at 16 KiB
+(neutral, scan-bound). Short-region (≤128 B) geomean 1.95x, 16 KiB geomean 1.01x. The compiler wiring
+is kept: the win survives the full compiled pipeline (array iteration + count bookkeeping + a real
+boxed plan allocation), attenuated from the pure-kernel ratios but clearly material where searcher
+construction dominates and neutral where scanning does. The `#[ignore]`d probe is
+`crates/align_driver/tests/needle_plan_hoist_probe.rs`; the toggle read at MIR lowering keys the
+object cache and `CacheContext::from_env` force-disables it when the var is set. The **leak /
+double-free** oracle (plan freed exactly once per invocation, after a reps loop and after an early
+`?`) is `bench/needle_hoist` (feature `alloc-count`; `finder_new_count == finder_free_count`).
 
 For JSON encoding, a single-pass AVX2 32-byte classifier was compared with the current scalar scan
 while reusing the same sufficiently-sized output Vec (allocation excluded). It produced identical
@@ -798,10 +816,10 @@ AoS/SoA conversion, or a second substring-search algorithm.
 2. Pool large constant array literals after the top-level aggregate-constant surface exists.
 3. Run unique-buffer donation, ~~repeated-needle plan~~, JSON escape scan, and short-N group strategy
    gates independently. **Repeated-needle plan hoisting SHIPPED 2026-07-17** (§6.6): the
-   `xs.where(fn s { s.contains(NEEDLE) }).…` capture-needle shape hoists one `str_finder` plan before
-   the loop; the real-pipeline adoption gate reproduced the short-input win (≤128 B geomean 1.96x,
-   16 KiB neutral 1.01x). Unique-buffer donation, the JSON escape-scan classifier, and short-N group
-   strategy remain independent gates.
+   `xs.where(fn s { s.contains(NEEDLE) }).…` atom-needle shape (bare path / string literal) hoists one
+   `str_finder` plan before the loop; the toggle-based real-pipeline adoption gate reproduced the
+   short-input win (≤128 B geomean 1.95x, 16 KiB neutral 1.01x). Unique-buffer donation, the JSON
+   escape-scan classifier, and short-N group strategy remain independent gates.
 
 ## 12. Regression and IR gates
 
@@ -834,16 +852,22 @@ IR gates:
   ordered-boundary negate (`= !`) and its `w64` width gate (`>= 64_i64`) are present in MIR and a
   float-key sort's are absent (`sort_adaptive.rs`).
 - **repeated-needle plan hoisting preheader/body shape (shipped and regression-pinned 2026-07-17):**
-  a recognised `xs.where(fn s { s.contains(NEEDLE) }).…` emits exactly one
-  `call ptr @align_rt_str_finder_new` (in the loop preheader, textually before the body) and the loop
-  body calls `align_rt_str_finder_find`, with **no** `call i32 @align_rt_str_contains`; the plan is
-  freed by `align_rt_str_finder_free`. The mutation check is the negative control — an element-derived
-  needle (`s.contains(s[0..3])`) emits **no** `finder_new`/`finder_find` and retains `str_contains`.
-  `finder_find` carries `memory(argmem: read)` + `readonly captures(none)` on both pointers while
-  `finder_new` is allocator-class (`noalias`/`nofree`/`nounwind`, NOT `willreturn`). Gates:
-  `crates/align_driver/tests/needle_plan_hoist.rs`,
-  `rt_contract_attrs_pin_encoding_and_curation` (`align_codegen_llvm`), and the runtime differential
-  `str_finder_matches_one_shot_oracle` (`align_runtime`).
+  a recognised `xs.where(fn s { s.contains(NEEDLE) }).…` (NEEDLE a bare free-variable path or a
+  string literal) emits exactly one `call ptr @align_rt_str_finder_new` (in the loop preheader,
+  textually before the body) and the loop body calls `align_rt_str_finder_find`, with **no**
+  `call i32 @align_rt_str_contains`; the plan is freed by `align_rt_str_finder_free`. The mutation
+  checks are the negative controls — an element-derived (`s.contains(s[0..3])`), impure/indexed-call
+  (`s.contains(get())` / `s.contains(xs[j])`), or `?` (`s.contains(f()?)`) needle emits **no**
+  `finder_new`/`finder_find` and retains `str_contains`; a `?`-needle is additionally rejected with
+  the ordinary `?`-context error (recognition never changes what type-checks). `finder_new` is
+  allocator-class (`noalias`/`nofree`/`nounwind`, NOT `willreturn`); `finder_find` uses the
+  `feature_detect_reader` contract — `readonly captures(none)` on both pointers but **no** memory
+  attribute (a one-byte needle hits `memchr`'s global dispatch cache). The `ALIGN_NEEDLE_HOIST=off`
+  toggle lowers the same recognised pipeline to the per-call `str_contains` shape (identical loop, no
+  plan). Gates: `crates/align_driver/tests/needle_plan_hoist.rs` +
+  `needle_plan_hoist_toggle.rs`, `rt_contract_attrs_pin_encoding_and_curation`
+  (`align_codegen_llvm`), the runtime differential `str_finder_matches_one_shot_oracle`
+  (`align_runtime`), and the `bench/needle_hoist` alloc-count leak gate.
 
 Benchmark adoption requires the matrix in §4.2, balanced AB/BA, allocation/copy counters, optimized
 IR, and a negative workload. Large-input throughput never excuses a short-input regression, and a

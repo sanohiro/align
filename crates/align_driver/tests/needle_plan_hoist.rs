@@ -102,6 +102,84 @@ fn main() -> i32 {
     assert_eq!(out.status.code(), Some(3));
 }
 
+// Finding 1: recognition is restricted to a bare free-variable / string-literal atom. An impure or
+// trapping *call/index* needle is NOT an atom, so it is NOT hoisted — its per-element effect
+// count/order and trapping behavior are preserved (it keeps the per-call `str_contains` path).
+#[test]
+fn non_atom_needle_call_or_index_not_hoisted() {
+    if !backend_available() {
+        return;
+    }
+    // An impure call needle: `get()` prints once per element under the per-call path. It must not be
+    // hoisted (which would call it once, changing the effect count).
+    let call_src = r#"
+fn get() -> str {
+  print(1)
+  return "x"
+}
+fn main() -> i32 {
+  xs := ["xa", "bx", "cc"]
+  return xs.where(fn s { s.contains(get()) }).count() as i32
+}
+"#;
+    let ir = emit_llvm(call_src);
+    assert_eq!(
+        ir.matches("call ptr @align_rt_str_finder_new(").count(),
+        0,
+        "an impure call needle must not be hoisted:\n{ir}"
+    );
+    assert!(ir.contains("call i32 @align_rt_str_contains("), "call needle keeps the per-call path:\n{ir}");
+    // `get` prints once per element (3) — the effect count the hoist would have collapsed to 1.
+    let out = build_and_run("nph-call", call_src);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n1\n1\n");
+
+    // A trapping indexed needle: `needles[j]` with an out-of-range constant must NOT abort before the
+    // loop (hoisting the index out) — it stays per-element (and here the array is non-empty so the
+    // index runs; the point is it is not lifted to a pre-loop plan build).
+    let idx_src = r#"
+fn main() -> i32 {
+  needles := ["a", "b"]
+  xs := ["ax", "by", "cz"]
+  return xs.where(fn s { s.contains(needles[0]) }).count() as i32
+}
+"#;
+    let ir2 = emit_llvm(idx_src);
+    assert_eq!(
+        ir2.matches("call ptr @align_rt_str_finder_new(").count(),
+        0,
+        "an indexed needle must not be hoisted:\n{ir2}"
+    );
+    assert!(ir2.contains("call i32 @align_rt_str_contains("), "indexed needle keeps the per-call path:\n{ir2}");
+}
+
+// Finding 2: a `?`-needle is NOT recognized (it is not an atom), so it flows to the lifted
+// bool-returning lambda where `?` is illegal — the SAME diagnostic as any other unrecognized form.
+// Recognition must never leak `?` legality into the type system (a one-token edit must not flip it).
+#[test]
+fn try_needle_not_recognized_and_rejected() {
+    if !backend_available() {
+        return;
+    }
+    // Enclosing fn returns Result, so `?` WOULD be legal there if the needle were checked in the
+    // enclosing scope (the old over-broad recognition). Under the atom restriction it is not, so the
+    // lifted predicate rejects `?`.
+    let try_src = r#"
+fn fallible() -> Result<str, i64> = Ok("x")
+fn run() -> Result<i64, i64> {
+  xs := ["ax", "bx"]
+  return Ok(xs.where(fn s { s.contains(fallible()?) }).count())
+}
+fn main() -> i32 = 0
+"#;
+    assert!(check_errs("nph-try-needle", try_src), "a `?`-needle must be rejected, not silently recognized");
+    let diags = check_diagnostics("nph-try-needle", try_src);
+    // The error is about `?` in a non-Result-returning (bool) context — not about needle recognition.
+    assert!(
+        diags.contains('?') || diags.to_lowercase().contains("result") || diags.to_lowercase().contains("propagat"),
+        "the `?`-needle diagnostic should be the ordinary `?`-context error:\n{diags}"
+    );
+}
+
 // Run-parity: the hoisted count must equal a hand-written per-element loop count for the same
 // needle, across ordinary, empty, and too-long needles. `diff` is hoisted − manual and must be 0.
 #[test]
@@ -138,9 +216,13 @@ fn main() -> i32 {
     assert_eq!(out.status.code(), Some(0));
 }
 
-// Cleanup / leak: build the plan-bearing pipeline 20_000 times; the plan must be freed each time.
+// Double-free / corruption resilience over many iterations: build+drop the plan 20_000 times and
+// require a stable correct total. This catches a double free or use-after-free (which would crash or
+// drift the count) but CANNOT detect a pure leak (a leaked plan neither crashes nor changes the
+// count). The real leak assertion — `finder_new_count == finder_free_count` after the loop and after
+// an early `?` — is `bench/needle_hoist` (feature `alloc-count`).
 #[test]
-fn plan_freed_no_leak_over_many_iterations() {
+fn plan_reuse_stable_over_many_iterations_no_double_free() {
     if !backend_available() {
         return;
     }
@@ -157,7 +239,7 @@ fn main() -> i32 {
     acc = acc + run_once("needle")
     i = i + 1
   }
-  // Each call finds 2 → 40000; 40000 % 7 = 2. A leak/double-free would crash or drift the total.
+  // Each call finds 2 → 40000; 40000 % 7 = 2. A double free / UAF would crash or drift the total.
   return (r % 7) as i32
 }
 "#;
