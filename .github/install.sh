@@ -22,13 +22,17 @@ apt-get update
 apt-get install -y ca-certificates curl gpg
 install -d -m 0755 /etc/apt/keyrings
 
-curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-  | gpg --dearmor --yes -o /etc/apt/keyrings/apt.llvm.org.gpg
+TMP_LLVM_KEY=$(mktemp)
+curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$TMP_LLVM_KEY"
+gpg --dearmor --yes -o /etc/apt/keyrings/apt.llvm.org.gpg "$TMP_LLVM_KEY"
+rm -f "$TMP_LLVM_KEY"
 echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
   > /etc/apt/sources.list.d/llvm-22.list
 
-curl -fsSL https://sanohiro.github.io/align/align.gpg \
-  | gpg --dearmor --yes -o /etc/apt/keyrings/align.gpg
+TMP_ALIGN_KEY=$(mktemp)
+curl -fsSL https://sanohiro.github.io/align/align.gpg -o "$TMP_ALIGN_KEY"
+gpg --dearmor --yes -o /etc/apt/keyrings/align.gpg "$TMP_ALIGN_KEY"
+rm -f "$TMP_ALIGN_KEY"
 echo "deb [signed-by=/etc/apt/keyrings/align.gpg] https://sanohiro.github.io/align stable main" \
   > /etc/apt/sources.list.d/align.list
 
