@@ -355,6 +355,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             };
             format!("{name}({}, {})", operand_str(haystack), operand_str(needle))
         }
+        Rvalue::StrFinderNew { needle } => format!("str_finder_new({})", operand_str(needle)),
+        Rvalue::StrFinderFind { plan, haystack } => {
+            format!("str_finder_find({}, {})", operand_str(plan), operand_str(haystack))
+        }
         Rvalue::StrTrim { kind, recv } => {
             let name = match kind {
                 align_sema::hir::StrTrimKind::Both => "str_trim",

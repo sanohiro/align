@@ -6874,6 +6874,84 @@ pub unsafe extern "C" fn align_rt_str_rfind(hptr: *const u8, hlen: i64, nptr: *c
     }
 }
 
+/// A prepared substring-search plan for the compiler-hoisted repeated-needle shape
+/// (`xs.where(fn(s) = s.contains(NEEDLE)).…`, doc-13 §6.6 / §11 P3). The one-shot
+/// `align_rt_str_contains`/`find` rebuild a `memchr::memmem::Finder` (CPU-feature detection +
+/// Two-Way/prefilter setup) on every call; when the same loop-invariant needle is applied to many
+/// strings, MIR builds this plan once before the loop and reuses it per element. The `Finder` owns a
+/// `'static` copy of the needle bytes (`into_owned`), so the plan outlives the caller's needle view.
+/// `nlen` is kept so `find` reproduces the one-shot guards bit-identically (see
+/// [`align_rt_str_finder_find`]).
+pub struct FinderPlan {
+    finder: memchr::memmem::Finder<'static>,
+    nlen: i64,
+}
+
+/// Build a repeated-needle search plan from a needle `{ptr,len}` view (doc-13 §6.6). Returns an owned
+/// `*mut FinderPlan` (a `Box`) the caller frees exactly once with [`align_rt_str_finder_free`]. An
+/// allocator-class entry: like `align_rt_builder_new`/`array_builder_new` it is `noalias`/`nounwind`/
+/// `nofree` but **not** `willreturn` (a `Box` allocation aborts on OOM). A non-positive `nlen`
+/// degrades to an empty needle via `safe_slice`; the stored `nlen` then drives the empty-needle guard
+/// in `find` so the plan matches `align_rt_str_find` regardless of memchr's empty-needle convention.
+///
+/// # Safety
+/// `nptr`/`nlen` must describe a valid byte range for the call. The bytes are copied
+/// (`Finder::into_owned`), so they need not outlive this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_finder_new(nptr: *const u8, nlen: i64) -> *mut FinderPlan {
+    let needle = unsafe { safe_slice(nptr, nlen) };
+    let finder = memchr::memmem::Finder::new(needle).into_owned();
+    Box::into_raw(Box::new(FinderPlan { finder, nlen }))
+}
+
+/// Search `haystack` with a prepared [`FinderPlan`]: the byte index of the needle's first occurrence,
+/// or `-1` if absent — the same sentinel as `align_rt_str_find`, so codegen compares `>= 0` for the
+/// `contains` predicate. The guards are reproduced bit-identically from the stored `nlen`: an empty
+/// needle (`nlen <= 0`) matches at `0`; a needle longer than the haystack (`nlen > hlen`) is `-1`;
+/// a null/empty/negative-length haystack degrades to an empty operand via `safe_slice` (no UB). The
+/// feature detection and Two-Way/prefilter setup already happened in `finder_new`, so this call
+/// touches only argument memory — no process-global feature-cache read/write (verified against
+/// `memchr 2.8.2`: `Finder::find` takes `&self`, allocates a stack-local `PrefilterState`, and never
+/// re-runs `is_x86_feature_detected!`). That is why its codegen declaration carries
+/// `memory(argmem: read)`.
+///
+/// # Safety
+/// `plan` must be a live pointer from [`align_rt_str_finder_new`]; `hptr`/`hlen` must describe a
+/// valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_finder_find(plan: *const FinderPlan, hptr: *const u8, hlen: i64) -> i64 {
+    // A null plan cannot occur on a live path (MIR sets the drop flag only after a successful
+    // `finder_new`), but stay defensive: treat it as an empty-needle plan (match at 0).
+    let Some(plan) = (unsafe { plan.as_ref() }) else {
+        return 0;
+    };
+    if plan.nlen <= 0 {
+        return 0;
+    }
+    if plan.nlen > hlen {
+        return -1;
+    }
+    let hay = unsafe { safe_slice(hptr, hlen) };
+    match plan.finder.find(hay) {
+        Some(i) => i as i64,
+        None => -1,
+    }
+}
+
+/// Free a [`FinderPlan`] built by [`align_rt_str_finder_new`]. Null-safe (a never-initialised /
+/// already-freed synthetic-owner slot drops harmlessly), so MIR's drop-flag machinery can call it on
+/// every exit path (fall-through, `break`, `?`, early return) without a branch on the pointer itself.
+///
+/// # Safety
+/// `plan` must be null or a pointer returned by [`align_rt_str_finder_new`] that has not already been
+/// freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_finder_free(plan: *mut FinderPlan) {
+    if !plan.is_null() {
+        drop(unsafe { Box::from_raw(plan) });
+    }
+}
+
 /// Wrap a `&[u8]` sub-slice of an already-valid `str` buffer as an `AlignStr` view. The slice
 /// aliases the original bytes (no allocation); an empty slice may carry a dangling/one-past pointer,
 /// which is fine for a zero-length view (the generated code never dereferences it).
@@ -16574,6 +16652,116 @@ mod tests {
             let n: Vec<u8> = (0..nlen).map(|_| b'a' + (rng() % 3) as u8).collect();
             check(&h, &n);
         }
+    }
+
+    /// The hoisted repeated-needle plan (`finder_new` → many `finder_find`) must return, for every
+    /// haystack, exactly what the one-shot `align_rt_str_find` returns for the same needle — the
+    /// adoption invariant for doc-13 §6.6 plan hoisting (a where-pipeline with a captured needle
+    /// must produce identical survivors to the unhoisted per-call path). Driven across the same edge
+    /// corpus as `str_search_simd_matches_scalar_oracle`: empty needle, needle longer than the
+    /// haystack, needles straddling the 64-byte SIMD block boundary, prefilter decoys, multibyte
+    /// UTF-8, overlapping repeats, tail matches, a multi-KB haystack, and a randomized cross-check.
+    #[test]
+    fn str_finder_matches_one_shot_oracle() {
+        // One-shot oracle, driven exactly as codegen drives `str.contains`/`find`.
+        let one_shot = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_find(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        // The plan path: build once per needle, apply to the haystack via `finder_find`.
+        let via_plan = |h: &[u8], n: &[u8]| unsafe {
+            let plan = align_rt_str_finder_new(n.as_ptr(), n.len() as i64);
+            let r = align_rt_str_finder_find(plan, h.as_ptr(), h.len() as i64);
+            align_rt_str_finder_free(plan);
+            r
+        };
+        let check = |h: &[u8], n: &[u8]| {
+            assert_eq!(
+                via_plan(h, n),
+                one_shot(h, n),
+                "finder(hlen {}, needle {:?}) must equal one-shot find",
+                h.len(),
+                n
+            );
+        };
+
+        // (1) Boundary-padding sweep (needle at every offset 40..96 of a 160-byte buffer, first-byte
+        // prefilter decoys before it) — the same construction as the SIMD oracle test.
+        for needle_len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17] {
+            let needle: Vec<u8> = (0..needle_len).map(|k| b'A' + (k as u8 % 23)).collect();
+            let mut buf = vec![b'.'; 160];
+            for off in 40..96 {
+                buf.fill(b'.');
+                for j in (0..off).step_by(5) {
+                    buf[j] = needle[0];
+                }
+                buf[off..off + needle_len].copy_from_slice(&needle);
+                check(&buf, &needle);
+            }
+        }
+
+        // (2) Degenerate lengths: empty needle, needle longer than haystack, whole-string, single byte.
+        check(b"", b"");
+        check(b"abc", b"");
+        check(b"abc", b"abcd");
+        check(b"abc", b"abc");
+        check(b"a", b"a");
+        check(b"a", b"b");
+
+        // (3) Multibyte UTF-8 (repeat to cross 64B blocks) — a plan built once per needle must still
+        // agree with the one-shot path on every element.
+        let s = "café みかん 🍎 résumé ｱｲｳｴｵ ".repeat(6);
+        for n in ["みかん", "🍎", "é", "café", "ｳｴ", "résumé", "🍏 nope", " "] {
+            // Reuse one plan across several haystacks (the real hoisted shape): the plan for needle
+            // `n` searches both the full string and each disjoint tail slice.
+            let hs = s.as_bytes();
+            let plan = unsafe { align_rt_str_finder_new(n.as_bytes().as_ptr(), n.len() as i64) };
+            for start in [0usize, 3, 7, hs.len().saturating_sub(4), hs.len()] {
+                let sub = &hs[start.min(hs.len())..];
+                let r = unsafe { align_rt_str_finder_find(plan, sub.as_ptr(), sub.len() as i64) };
+                assert_eq!(r, one_shot(sub, n.as_bytes()), "reused plan needle {n:?} start {start}");
+            }
+            unsafe { align_rt_str_finder_free(plan) };
+        }
+
+        // (4) Overlapping repeats and tail matches.
+        let run = vec![b'a'; 200];
+        check(&run, b"aa");
+        check(&run, b"aaa");
+        check(&run, &run);
+        let mut tail = vec![b'x'; 300];
+        tail[297..300].copy_from_slice(b"END");
+        check(&tail, b"END");
+        check(&tail, b"ND");
+        check(&tail, b"D");
+
+        // (5) Multi-KB haystack: single late match, a miss, and a dense single byte.
+        let mut long = vec![b'z'; 8192];
+        long[8000..8005].copy_from_slice(b"MATCH");
+        check(&long, b"MATCH");
+        check(&long, b"ABSENT");
+        check(&long, b"z");
+
+        // (6) Deterministic randomized cross-check over a 3-symbol alphabet.
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3000 {
+            let hlen = (rng() % 130) as usize;
+            let nlen = (rng() % 6) as usize;
+            let h: Vec<u8> = (0..hlen).map(|_| b'a' + (rng() % 3) as u8).collect();
+            let n: Vec<u8> = (0..nlen).map(|_| b'a' + (rng() % 3) as u8).collect();
+            check(&h, &n);
+        }
+        // (7) Null/zero haystack against a real needle (defensive FFI degradation → absent).
+        assert_eq!(via_plan(&[], b"x"), -1);
+        // Null plan → empty-needle convention (match at 0).
+        assert_eq!(unsafe { align_rt_str_finder_find(core::ptr::null(), b"abc".as_ptr(), 3) }, 0);
+        // Null-safe free.
+        unsafe { align_rt_str_finder_free(core::ptr::null_mut()) };
     }
 
     #[test]

@@ -1448,6 +1448,15 @@ pub enum StageKind {
     Where { func: String, captures: Vec<Expr> },
     /// `.where(.field)` — keep only elements whose (bool) `field` is true.
     WhereField { field: u32 },
+    /// `.where(fn(s) = s.contains(NEEDLE))` where `NEEDLE` is a **loop-invariant** `str` expression
+    /// free of the lambda parameter (doc-13 §6.6 / §11 P3). Recognised in `collect_pipeline` and
+    /// lowered specially — bypassing lambda lifting — so MIR builds one hoisted `str_finder` plan
+    /// from `needle` before the loop and reuses it per element (`finder_find(plan, s) >= 0`) instead
+    /// of reconstructing a `memchr` searcher on every `str.contains`. The `needle` is type-checked as
+    /// a `str` in the enclosing scope; because it is free of the parameter, evaluating it once before
+    /// the loop is sound. An element-derived needle (e.g. `s.contains(s[0..3])`) is **not** invariant,
+    /// so it is never recognised here and keeps the per-call `Where` path.
+    WhereStrContains { needle: Expr },
     /// `.field` — project a struct field out of each element (struct array → scalar).
     Project { field: u32 },
 }
