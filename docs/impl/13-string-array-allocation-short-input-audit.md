@@ -63,6 +63,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 | `path.normalize` | one exact-upper-bound final buffer, filled in place | **SHIPPED 2026-07-16**; no staging/final copy |
 | large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
 | Base64/hex encode | exact final allocation; ARM Base64 NEON from 48 bytes, ARM hex from 16 bytes | **SHIPPED** in document 12 |
+| JSON escape scan | scalar `< 32`, else AVX2/SSE2 block classifier; long clean spans bulk-copied | **SHIPPED 2026-07-17** (§6.6); mostly-clean 5.8x, dense 1.5x, short neutral; arm64 NEON test-only |
 | sorting | stable O(n log n); adaptive total-order path (delayed `len>32` scratch + ordered early exit + ordered-boundary straight-copy from pass 2, `width>=64`) | **SHIPPED 2026-07-16** (document 12 §4.1, `w64` shape); ordered-input wins, plain-sort negatives within ≈ 2% (drift-immune control-corrected); one keyed low-cardinality-100k workload at ≈ 3.5% accepted as a bounded measured exception (document 12 §4.1); insertion base case kept |
 
 Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
@@ -473,10 +474,38 @@ explicit-loop shapes, `replace`/`split`, an **owned `string` needle** (its type 
 `str`, so it is not recognised and falls through to the existing lambda path — a borrow-once
 extension is possible but out of scope), and the field-of-path needle above.
 
-`builder_write_json_str` still scans escape-free long content byte by byte. A scalar prefix followed
-by a block classifier for quote, backslash, or `<0x20` helps long strings, but per-write ABI and
-allocation dominate short records. A short scalar path is mandatory, and the existing scalar
-encoder remains the differential oracle.
+**JSON escape scan SIMD classifier SHIPPED 2026-07-17 (P3 gate 2 of 4).** At the audit baseline,
+`builder_write_json_str` scanned escape-free content byte by byte, bulk-copying each clean run. The
+shipped runtime now dispatches a block classifier that finds the next byte needing escape (`"`,
+`\`, or `< 0x20`) with one movemask per block; long clean spans copy in bulk across all-clean
+blocks. The control-byte test is the branchless saturating-subtract identity
+`subs_epu8(c, 0x1F) == 0 ⟺ c <= 0x1F` (no unsigned compare needed). On x86-64 the path is AVX2
+(32-byte block) when the CPU reports it, else the unconditional-baseline SSE2 (16-byte block);
+scalar handles `< 32` bytes. The `< 32` **crossover is measured, not assumed**: at every length
+below 32 the forced-SIMD body equals scalar (0.97-1.00x baseline) because no full block runs, and a
+full block first appears at 32 with a clean jump to 2.60x (baseline) / 4.24x (v3). This matches the
+UTF-8 validator's 32-byte crossover. A short scalar path is mandatory — per-write ABI and allocation
+dominate short records regardless — and the scalar encoder remains the differential oracle.
+
+**Tail safety.** The block writers load a full vector only while `i + BLOCK <= len`; the `< BLOCK`
+remainder is finished by the scalar oracle one in-bounds byte at a time. There is no zero-padded
+staging block and no over-read — unlike UTF-8 validation, the escape scan needs no lookahead past
+the final byte.
+
+**Differential gate.** `write_json_str_all_paths_match_byte_by_byte_oracle` checks the shipped
+dispatch, the scalar body, and every SIMD body the host provides (SSE2 always, AVX2 when detected,
+NEON on an aarch64 test build) against the byte-by-byte oracle over: every length `0..=300` plus the
+383/384/385/511/512/513/1023/1024/1025/2047/2048/4095/4096/4097 block boundaries; clean, all-escape
+(quote + backslash + every control `0x00..=0x1F`), sparse-hit, random, and multibyte-fill (é/本/emoji
+so UTF-8 continuations straddle the 16/32-byte edges) content; and a single-hit-at-every-position
+sweep pinning block-boundary alignment of a hit.
+
+**aarch64.** A NEON candidate (16-byte block, the `shrn`-by-4 narrowing trick in place of `movemask`)
+is implemented and cross-compiles, but is **test-only**; production aarch64 dispatch stays scalar
+pending a native no-regression measurement, exactly as Base64/UTF-8 record — a length-only threshold
+has not been proven on real ARM hardware here. The SSE2 body's own independent crossover is likewise
+not host-measurable (no non-AVX2 x86-64 host available); it shares the AVX2 32-byte gate, the same
+single-threshold discipline Base64 uses.
 
 **Measured kernels (2026-07-14, Ryzen 9 5950X, release/native, median of nine):** reusing one
 `memchr::memmem::Finder` for a no-match repeated search was 2.5-6.1x faster than reconstructing the
@@ -502,13 +531,28 @@ object cache and `CacheContext::from_env` force-disables it when the var is set.
 double-free** oracle (plan freed exactly once per invocation, after a reps loop and after an early
 `?`) is `bench/needle_hoist` (feature `alloc-count`; `finder_new_count == finder_free_count`).
 
-For JSON encoding, a single-pass AVX2 32-byte classifier was compared with the current scalar scan
-while reusing the same sufficiently-sized output Vec (allocation excluded). It produced identical
-bytes for clean, sparse-escape (one per 97 bytes), and dense-escape (one per 8 bytes) inputs. At 32
-bytes and above it was 3.1-17.1x faster on clean input, 3.6-5.7x at 256 bytes through 16 KiB on sparse
-input, and 1.3-1.5x on dense input. At 8 bytes SIMD setup was 22-29% slower. Promote the long-string
-classifier to **P1 with a scalar `<32` crossover**; the adoption gate remains an end-to-end builder
-benchmark on x86 baseline/v3 and arm64 plus differential tails and every control-byte class.
+**Measured adoption gate (2026-07-17, Ryzen 9 5950X / Zen 3, WSL2, release, median of nine,
+balanced AB/BA).** The `#[ignore]`d probe `json_escape_simd_probe`
+(`crates/align_runtime/src/lib.rs`) drives the **real** builder path — the shipped dispatched entry
+`write_json_str_body` vs the pure-scalar body, one reused builder cleared between strings, the way
+generated `json.encode` writes each `str` field — over the document mix, and is re-run under
+`-C target-cpu=x86-64` (baseline) and `-C target-cpu=x86-64-v3`. Every corpus is oracle-checked for
+byte-identical output before timing. Results (scalar / dispatched, ns per string):
+
+| corpus | baseline | v3 |
+|---|---:|---:|
+| mostly-clean (12-1024 B fields) | 5.80x **WIN** | 5.69x **WIN** |
+| escape-dense (one escape / 8 B) | 1.51x (faster) | 1.50x (faster) |
+| short (1-31 B, sub-crossover) | 1.10x (neutral) | 1.11x (neutral) |
+
+The forced-AVX2 crossover sweep (SIMD run below its production gate to locate the crossover) shows
+no win below 32 bytes (0.97-1.00x baseline — the sub-block body is just the scalar tail) and a clean
+jump to 2.60x baseline / 4.24x v3 at exactly 32, confirming the `< 32` scalar crossover empirically.
+The mostly-clean case clears the ~5% adoption bar by a wide margin on both targets; escape-dense is
+*faster*, not the tolerated ≤3% regression, because a movemask beats the per-byte branch even when
+escapes are frequent; short is neutral (both paths are scalar below the crossover). The classifier is
+**SHIPPED with a scalar `< 32` crossover**; arm64 stays scalar in production (NEON candidate
+test-only) pending native hardware.
 
 ### 6.7 ALREADY PLANNED — do not duplicate
 
@@ -814,12 +858,16 @@ AoS/SoA conversion, or a second substring-search algorithm.
    only. A drift-immune control-corrected sweep localized the first cut's ≈ 7% random/reverse
    regression to the pass-1 boundary check; the fix keeps every negative workload within ≈ 2%.
 2. Pool large constant array literals after the top-level aggregate-constant surface exists.
-3. Run unique-buffer donation, ~~repeated-needle plan~~, JSON escape scan, and short-N group strategy
-   gates independently. **Repeated-needle plan hoisting SHIPPED 2026-07-17** (§6.6): the
+3. Run unique-buffer donation, ~~repeated-needle plan~~, ~~JSON escape scan~~, and short-N group
+   strategy gates independently. **Repeated-needle plan hoisting SHIPPED 2026-07-17** (§6.6): the
    `xs.where(fn s { s.contains(NEEDLE) }).…` atom-needle shape (bare path / string literal) hoists one
    `str_finder` plan before the loop; the toggle-based real-pipeline adoption gate reproduced the
-   short-input win (≤128 B geomean 1.95x, 16 KiB neutral 1.01x). Unique-buffer donation, the JSON
-   escape-scan classifier, and short-N group strategy remain independent gates.
+   short-input win (≤128 B geomean 1.95x, 16 KiB neutral 1.01x). **JSON escape-scan classifier SHIPPED
+   2026-07-17** (§6.6): AVX2/SSE2 block classifier with a measured scalar `< 32` crossover; the real
+   builder-path adoption gate won 5.8x on mostly-clean fields (baseline and v3), stayed *faster* than
+   scalar on escape-dense input, and was neutral below the crossover; arm64 NEON candidate is
+   test-only pending native hardware. Unique-buffer donation and short-N group strategy remain
+   independent gates.
 
 ## 12. Regression and IR gates
 
@@ -851,6 +899,14 @@ IR gates:
   `len <= 32` sort allocates only the materialize buffer(s); an int-key sort's adaptive
   ordered-boundary negate (`= !`) and its `w64` width gate (`>= 64_i64`) are present in MIR and a
   float-key sort's are absent (`sort_adaptive.rs`).
+- **JSON escape-scan classifier (shipped and regression-pinned 2026-07-17):** the SIMD bodies must
+  stay byte-identical to the scalar oracle. `write_json_str_all_paths_match_byte_by_byte_oracle`
+  (`align_runtime`) pins the shipped dispatch, the scalar body, and every host SIMD body (SSE2 always,
+  AVX2 when detected, aarch64 NEON on a test build) over every length `0..=300` plus the named block
+  boundaries through 4097, and the clean/all-escape/sparse/random/multibyte-fill content classes with
+  a single-hit-at-every-position sweep. The block writers must load a full vector only while
+  `i + BLOCK <= len` (scalar tail, no padded staging, no over-read). Production aarch64 stays scalar;
+  the NEON candidate is compiled only under `cfg(test)`.
 - **repeated-needle plan hoisting preheader/body shape (shipped and regression-pinned 2026-07-17):**
   a recognised `xs.where(fn s { s.contains(NEEDLE) }).…` (NEEDLE a bare free-variable path or a
   string literal) emits exactly one `call ptr @align_rt_str_finder_new` (in the loop preheader,

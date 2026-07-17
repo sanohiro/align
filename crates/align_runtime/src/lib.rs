@@ -1903,26 +1903,224 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
     b.buf.push(b'"');
     if len > 0 {
         let bytes = unsafe { safe_slice(ptr, len) };
-        // Only `"`, `\`, and the C0 control set need escaping; every other byte (including all
-        // multi-byte UTF-8 continuations) passes through verbatim. Copy each clean run in bulk
-        // (`extend_from_slice`) instead of pushing byte by byte — ~1.9–3× on typical text
-        // (`work/json_str_simd_probe.rs`), with byte-identical output.
-        let mut start = 0;
-        for (i, &c) in bytes.iter().enumerate() {
-            if c == b'"' || c == b'\\' || c < 0x20 {
-                if start < i {
-                    // Skip an empty copy when escapes are adjacent (e.g. `\r\n`).
-                    b.buf.extend_from_slice(&bytes[start..i]);
-                }
-                write_json_escape(&mut b.buf, c);
-                start = i + 1;
-            }
-        }
-        if start < bytes.len() {
-            b.buf.extend_from_slice(&bytes[start..]);
-        }
+        write_json_str_body(&mut b.buf, bytes);
     }
     b.buf.push(b'"');
+}
+
+/// The byte needs a JSON escape: `"` (0x22), `\` (0x5C), or any C0 control (`< 0x20`). Every other
+/// byte — including all multi-byte UTF-8 continuations — passes through verbatim.
+#[inline(always)]
+fn json_needs_escape(c: u8) -> bool {
+    c == b'"' || c == b'\\' || c < 0x20
+}
+
+/// Scalar JSON-string body writer, and the differential oracle for the SIMD paths. Copies each clean
+/// run in bulk (`extend_from_slice`) instead of pushing byte by byte, escaping the rare bytes.
+fn write_json_str_scalar(buf: &mut BuilderBuf, bytes: &[u8]) {
+    let mut start = 0;
+    for (i, &c) in bytes.iter().enumerate() {
+        if json_needs_escape(c) {
+            if start < i {
+                // Skip an empty copy when escapes are adjacent (e.g. `\r\n`).
+                buf.extend_from_slice(&bytes[start..i]);
+            }
+            write_json_escape(buf, c);
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        buf.extend_from_slice(&bytes[start..]);
+    }
+}
+
+// The measured scalar→SIMD crossover for the escape classifier on x86-64 (Zen 3, 2026-07-17): below
+// one full AVX2 vector the three broadcasts + movemask setup lose to the byte loop, and per-write ABI
+// plus allocation dominate short JSON records regardless (document 13 §6.6). This matches the UTF-8
+// validator's measured 32-byte crossover. Scalar handles `< 32`; SIMD handles `>= 32` blockwise with
+// a scalar tail. AVX2 (32-byte block) is preferred when present; SSE2 (16-byte block) is the x86-64
+// baseline fallback for a host without AVX2 at the same length gate.
+#[cfg(target_arch = "x86_64")]
+const JSON_ESCAPE_SIMD_MIN: usize = 32;
+
+/// Dispatch the JSON-string body writer. Runtime-detected: AVX2 when present and above the measured
+/// crossover, else the x86-64 baseline SSE2 path; scalar below the crossover and on other targets.
+/// The retained NEON candidate stays test-only pending a native aarch64 no-regression measurement
+/// (the Base64/UTF-8 precedent — a length-only threshold has not been proven on real ARM hardware).
+#[inline]
+fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if bytes.len() >= JSON_ESCAPE_SIMD_MIN {
+            if is_x86_feature_detected!("avx2") {
+                return unsafe { write_json_str_avx2(buf, bytes) };
+            }
+            // SSE2 is unconditionally present on x86-64; no feature detection required.
+            return unsafe { write_json_str_sse2(buf, bytes) };
+        }
+    }
+    write_json_str_scalar(buf, bytes);
+}
+
+// --- SIMD escape classifiers -------------------------------------------------------------------
+//
+// Each classifier reads one fixed-width block and returns a bitmask whose bit `k` is set iff byte `k`
+// needs a JSON escape. The "control byte" test `c < 0x20` is branchless on hardware without an
+// unsigned compare via the saturating-subtract identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
+//
+// SAFETY / tail strategy: the block writers only load a full vector while `i + BLOCK <= len`, so no
+// read ever crosses the end of `bytes`. The `< BLOCK` remainder is finished by the scalar oracle,
+// which reads one in-bounds byte at a time. There is no zero-padded staging block and therefore no
+// over-read — the escape scan, unlike UTF-8 validation, needs no lookahead past the final byte.
+
+/// AVX2: classify 32 bytes → escape bitmask (`u32`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn json_escape_mask_avx2(block: *const u8) -> u32 {
+    use core::arch::x86_64::*;
+    let v = unsafe { _mm256_loadu_si256(block as *const __m256i) };
+    let quote = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8));
+    let bslash = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\\' as i8));
+    // subs_epu8(v, 0x1F) is 0 exactly for the control bytes 0x00..=0x1F; cmpeq(_, 0) lifts to 0xFF.
+    let ctrl = _mm256_cmpeq_epi8(_mm256_subs_epu8(v, _mm256_set1_epi8(0x1f)), _mm256_setzero_si256());
+    let hit = _mm256_or_si256(_mm256_or_si256(quote, bslash), ctrl);
+    _mm256_movemask_epi8(hit) as u32
+}
+
+/// SSE2: classify 16 bytes → escape bitmask (`u16`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn json_escape_mask_sse2(block: *const u8) -> u16 {
+    use core::arch::x86_64::*;
+    let v = unsafe { _mm_loadu_si128(block as *const __m128i) };
+    let quote = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
+    let bslash = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\\' as i8));
+    let ctrl = _mm_cmpeq_epi8(_mm_subs_epu8(v, _mm_set1_epi8(0x1f)), _mm_setzero_si128());
+    let hit = _mm_or_si128(_mm_or_si128(quote, bslash), ctrl);
+    _mm_movemask_epi8(hit) as u16
+}
+
+/// AVX2 body writer: 32-byte blocks with a bulk clean-run copy, then a scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn write_json_str_avx2(buf: &mut BuilderBuf, bytes: &[u8]) {
+    let n = bytes.len();
+    let ptr = bytes.as_ptr();
+    // `start` is the first byte of the current clean run not yet flushed. It advances only at an
+    // escape, so a run of all-clean blocks is copied once in bulk — the long-string win.
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let mut mask = unsafe { json_escape_mask_avx2(ptr.add(i)) };
+        while mask != 0 {
+            let p = i + mask.trailing_zeros() as usize;
+            if start < p {
+                buf.extend_from_slice(&bytes[start..p]);
+            }
+            write_json_escape(buf, bytes[p]);
+            start = p + 1;
+            mask &= mask - 1; // clear the lowest set bit
+        }
+        i += 32;
+    }
+    unsafe { write_json_str_tail(buf, bytes, start, i) };
+}
+
+/// SSE2 body writer: 16-byte blocks with a bulk clean-run copy, then a scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
+    let n = bytes.len();
+    let ptr = bytes.as_ptr();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let mut mask = unsafe { json_escape_mask_sse2(ptr.add(i)) };
+        while mask != 0 {
+            let p = i + mask.trailing_zeros() as usize;
+            if start < p {
+                buf.extend_from_slice(&bytes[start..p]);
+            }
+            write_json_escape(buf, bytes[p]);
+            start = p + 1;
+            mask &= mask - 1;
+        }
+        i += 16;
+    }
+    unsafe { write_json_str_tail(buf, bytes, start, i) };
+}
+
+/// Finish the `< BLOCK` remainder `bytes[i..]` scalar-wise, flushing the open clean run from `start`.
+/// Shared by every SIMD body writer so the tail logic has exactly one implementation.
+///
+/// # Safety
+/// `start <= i <= bytes.len()`.
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", test)))]
+#[inline]
+unsafe fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: usize) {
+    let mut j = i;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if json_needs_escape(c) {
+            if start < j {
+                buf.extend_from_slice(&bytes[start..j]);
+            }
+            write_json_escape(buf, c);
+            start = j + 1;
+        }
+        j += 1;
+    }
+    if start < bytes.len() {
+        buf.extend_from_slice(&bytes[start..]);
+    }
+}
+
+/// NEON: classify 16 bytes → a 64-bit lane map (nibble `k` nonzero iff byte `k` needs escaping),
+/// using the `shrn`-by-4 narrowing trick in place of x86 `movemask`. The candidate for a future
+/// native-ARM measurement; production aarch64 stays scalar until the no-regression gate is proven on
+/// real hardware (the Base64/UTF-8 precedent). Test-only.
+#[cfg(all(target_arch = "aarch64", test))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn json_escape_map_neon(block: *const u8) -> u64 {
+    use core::arch::aarch64::*;
+    let v = unsafe { vld1q_u8(block) };
+    let quote = vceqq_u8(v, vdupq_n_u8(b'"'));
+    let bslash = vceqq_u8(v, vdupq_n_u8(b'\\'));
+    // vcltq is a signed/unsigned compare; for c < 0x20 use the saturating-subtract identity.
+    let ctrl = vceqq_u8(vqsubq_u8(v, vdupq_n_u8(0x1f)), vdupq_n_u8(0));
+    let hit = vorrq_u8(vorrq_u8(quote, bslash), ctrl);
+    // Narrow each 8-bit lane to a nibble, then read the 16 nibbles as one u64 (simdjson's trick).
+    let narrowed = vshrn_n_u16(vreinterpretq_u16_u8(hit), 4);
+    vget_lane_u64(vreinterpret_u64_u8(narrowed), 0)
+}
+
+/// NEON body writer candidate — 16-byte blocks + scalar tail. Test-only; see [`json_escape_map_neon`].
+#[cfg(all(target_arch = "aarch64", test))]
+#[target_feature(enable = "neon")]
+unsafe fn write_json_str_neon(buf: &mut BuilderBuf, bytes: &[u8]) {
+    let n = bytes.len();
+    let ptr = bytes.as_ptr();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let mut map = unsafe { json_escape_map_neon(ptr.add(i)) };
+        while map != 0 {
+            // Each escaping lane is a 0xF nibble; trailing_zeros/4 is its index in the block.
+            let lane = map.trailing_zeros() as usize >> 2;
+            let p = i + lane;
+            if start < p {
+                buf.extend_from_slice(&bytes[start..p]);
+            }
+            write_json_escape(buf, bytes[p]);
+            start = p + 1;
+            map &= !(0xfu64 << (lane << 2)); // clear this lane's whole nibble
+        }
+        i += 16;
+    }
+    unsafe { write_json_str_tail(buf, bytes, start, i) };
 }
 
 /// Append the JSON escape for one byte that needs escaping (`"`, `\`, or a C0 control), per
@@ -15009,58 +15207,339 @@ mod tests {
         }
     }
 
-    #[test]
-    fn write_json_str_bulk_copy_matches_byte_by_byte_reference() {
-        // The old per-byte implementation, used as the oracle: the bulk-copy rewrite must produce
-        // byte-identical output for every input.
-        fn reference(s: &[u8]) -> Vec<u8> {
-            let mut out = vec![b'"'];
-            for &c in s {
-                match c {
-                    b'"' => out.extend_from_slice(b"\\\""),
-                    b'\\' => out.extend_from_slice(b"\\\\"),
-                    0x08 => out.extend_from_slice(b"\\b"),
-                    0x0c => out.extend_from_slice(b"\\f"),
-                    b'\n' => out.extend_from_slice(b"\\n"),
-                    b'\r' => out.extend_from_slice(b"\\r"),
-                    b'\t' => out.extend_from_slice(b"\\t"),
-                    c if c < 0x20 => {
-                        const HEX: &[u8; 16] = b"0123456789abcdef";
-                        out.extend_from_slice(b"\\u00");
-                        out.push(HEX[(c >> 4) as usize]);
-                        out.push(HEX[(c & 0xf) as usize]);
-                    }
-                    c => out.push(c),
+    /// The byte-by-byte oracle for JSON string escaping (RFC 8259): the SIMD/scalar bodies must be
+    /// byte-identical to this for every input. Includes the framing quotes.
+    fn json_encode_reference(s: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'"'];
+        for &c in s {
+            match c {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                c if c < 0x20 => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.extend_from_slice(b"\\u00");
+                    out.push(HEX[(c >> 4) as usize]);
+                    out.push(HEX[(c & 0xf) as usize]);
                 }
+                c => out.push(c),
             }
-            out.push(b'"');
-            out
         }
-        let encode = |s: &[u8]| -> Vec<u8> {
-            let mut b = builder_value(core::ptr::null_mut(), 0);
-            unsafe { align_rt_builder_write_json_str(&mut b, s.as_ptr(), s.len() as i64) };
-            b.buf.as_slice().to_vec()
+        out.push(b'"');
+        out
+    }
+
+    /// Run a body writer through the same framing the extern entry uses (leading/trailing quote,
+    /// empty short-circuit), returning the full encoded bytes.
+    fn json_body_encode(body: impl Fn(&mut BuilderBuf, &[u8]), s: &[u8]) -> Vec<u8> {
+        let mut b = builder_value(core::ptr::null_mut(), 0);
+        b.buf.push(b'"');
+        if !s.is_empty() {
+            body(&mut b.buf, s);
+        }
+        b.buf.push(b'"');
+        b.buf.as_slice().to_vec()
+    }
+
+    /// The full differential corpus for the escape classifier: every length `0..=max`, each with
+    /// clean / all-escape / sparse-hit / multibyte-fill / random content, plus the single-hit-at-every
+    /// -position sweep that pins block-boundary alignment of a hit. Every case is checked against
+    /// [`json_encode_reference`] for whichever body writers the running target/host provides.
+    fn json_escape_differential_corpus() -> Vec<Vec<u8>> {
+        // Bytes that pass through verbatim (>= 0x20, not `"` or `\`), including UTF-8 continuations.
+        let clean = |i: usize| -> u8 {
+            let t = [b'a', b'Z', b' ', 0x7f, 0xc3, 0xa9, 0xe6, 0x9c, 0xac, 0xf0, 0x9f, 0x98, 0x80];
+            t[i % t.len()]
+        };
+        // Bytes that must be escaped: quote, backslash, and every C0 control 0x00..=0x1f.
+        let esc = |i: usize| -> u8 {
+            let mut t = vec![b'"', b'\\'];
+            t.extend(0u8..0x20);
+            t[i % t.len()]
+        };
+        // A cheap deterministic PRNG (xorshift) for the random pattern — no external dep.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut rand = move |_: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
         };
 
-        let mut cases: Vec<Vec<u8>> = vec![
-            b"".to_vec(),
-            b"plain ascii text".to_vec(),
-            b"with \"quotes\" and \\ backslash".to_vec(),
-            b"tabs\tnewlines\nand\rreturns".to_vec(),
-            "UTF-8: \u{e9} \u{672c} \u{1f600} mixed".as_bytes().to_vec(),
-            b"trailing quote\"".to_vec(),
-            b"\"leading quote".to_vec(),
-            vec![b'a'; 1000], // long clean run
-        ];
-        // Every C0 control byte (0x00..=0x1f), each surrounded by clean bytes.
-        for c in 0u8..0x20 {
-            cases.push(vec![b'x', c, b'y']);
+        let mut cases = Vec::new();
+        // Lengths: exhaustive through 300 (covers all sub-/single-/multi-block sizes incl. every
+        // in-block hit alignment via the position sweep below) then boundary sizes up to 4096+.
+        let mut lengths: Vec<usize> = (0..=300).collect();
+        for &n in &[
+            383, 384, 385, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 4095, 4096, 4097,
+        ] {
+            lengths.push(n);
         }
-        // One string containing all control bytes in a row.
-        cases.push((0u8..0x20).collect());
+        for &n in &lengths {
+            cases.push((0..n).map(clean).collect()); // all clean
+            cases.push((0..n).map(esc).collect()); // all escape
+            cases.push((0..n).map(&mut rand).collect()); // random
+            // Multibyte fill straddling block boundaries: a repeating é/本/emoji stream so
+            // continuation bytes land at 16/32-byte edges and must pass through.
+            let mb = "é本\u{1f600}".as_bytes();
+            cases.push((0..n).map(|i| mb[i % mb.len()]).collect());
+            // Sparse: clean with one escape byte near the middle.
+            if n > 0 {
+                let mut v: Vec<u8> = (0..n).map(clean).collect();
+                v[n / 2] = esc(n);
+                cases.push(v);
+            }
+        }
+        // Single-hit-at-every-position sweep for a length that spans several full blocks: the hit
+        // must be found at every offset, including exactly on and across the 16/32-byte boundaries.
+        for pos in 0..96usize {
+            let mut v = vec![b'x'; 96];
+            v[pos] = if pos % 2 == 0 { b'"' } else { 0x00 };
+            cases.push(v);
+        }
+        cases
+    }
 
-        for s in &cases {
-            assert_eq!(encode(s), reference(s), "mismatch encoding {s:?}");
+    #[test]
+    fn write_json_str_all_paths_match_byte_by_byte_oracle() {
+        let corpus = json_escape_differential_corpus();
+        for s in &corpus {
+            let want = json_encode_reference(s);
+            // The shipped, runtime-dispatched entry point.
+            let got_dispatch = {
+                let mut b = builder_value(core::ptr::null_mut(), 0);
+                unsafe { align_rt_builder_write_json_str(&mut b, s.as_ptr(), s.len() as i64) };
+                b.buf.as_slice().to_vec()
+            };
+            assert_eq!(got_dispatch, want, "dispatch mismatch (len {})", s.len());
+            // The scalar oracle path itself (used < crossover and as fallback).
+            assert_eq!(
+                json_body_encode(write_json_str_scalar, s),
+                want,
+                "scalar mismatch (len {})",
+                s.len()
+            );
+            // Every SIMD body writer the host provides, driven directly (not only via dispatch) so a
+            // path is covered even when the host would not select it at this length.
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(
+                    json_body_encode(|b, x| unsafe { write_json_str_sse2(b, x) }, s),
+                    want,
+                    "sse2 mismatch (len {})",
+                    s.len()
+                );
+                if is_x86_feature_detected!("avx2") {
+                    assert_eq!(
+                        json_body_encode(|b, x| unsafe { write_json_str_avx2(b, x) }, s),
+                        want,
+                        "avx2 mismatch (len {})",
+                        s.len()
+                    );
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(
+                    json_body_encode(|b, x| unsafe { write_json_str_neon(b, x) }, s),
+                    want,
+                    "neon mismatch (len {})",
+                    s.len()
+                );
+            }
+        }
+    }
+
+    /// JSON escape-scan classifier probe (document 13 §6.6, P3 gate 2). Two parts:
+    ///   1. a forced-SIMD crossover sweep on clean content (scalar vs the AVX2 body at every length,
+    ///      ignoring the production `< 32` gate) to locate the actual scalar→SIMD crossover on this
+    ///      host, mirroring the UTF-8 crossover method;
+    ///   2. the end-to-end adoption gate through the real builder path — the shipped dispatched entry
+    ///      vs the pure-scalar body, over the document mix (mostly-clean, escape-dense, short), one
+    ///      reused builder cleared between strings (the way generated `json.encode` writes each str
+    ///      field). Balanced AB/BA, median of nine.
+    ///
+    /// Run baseline vs v3 as:
+    ///   `RUSTFLAGS='-C target-cpu=x86-64'    cargo test -p align_runtime --release \
+    ///        json_escape_simd_probe -- --ignored --nocapture --test-threads=1`
+    ///   `RUSTFLAGS='-C target-cpu=x86-64-v3' cargo test -p align_runtime --release \
+    ///        json_escape_simd_probe -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn json_escape_simd_probe() {
+        use std::hint::black_box;
+
+        fn median(mut s: Vec<f64>) -> f64 {
+            s.sort_by(f64::total_cmp);
+            s[s.len() / 2]
+        }
+
+        // Encode `s` into a reused builder buffer (cleared first), returning a checksum so the work
+        // is not elided. `simd` selects the shipped dispatched body; else the pure-scalar oracle.
+        #[inline(never)]
+        fn encode_into(buf: &mut BuilderBuf, s: &[u8], simd: bool) -> u64 {
+            buf.len = 0;
+            buf.push(b'"');
+            if !s.is_empty() {
+                if simd {
+                    write_json_str_body(buf, s);
+                } else {
+                    write_json_str_scalar(buf, s);
+                }
+            }
+            buf.push(b'"');
+            buf.len() as u64 ^ u64::from(buf.as_slice()[0])
+        }
+
+        // Time one full pass over `corpus` `iters` times, reusing one warmed builder (allocation
+        // excluded after the first grow — matches a builder reused across a document's str fields).
+        fn time(corpus: &[Vec<u8>], simd: bool, iters: usize) -> f64 {
+            let mut b = builder_value(core::ptr::null_mut(), 0);
+            for s in corpus {
+                black_box(encode_into(&mut b.buf, s, simd)); // warm capacity
+            }
+            let strings = corpus.len().max(1);
+            let start = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for _ in 0..iters {
+                for s in corpus {
+                    checksum ^= black_box(encode_into(black_box(&mut b.buf), black_box(s), black_box(simd)));
+                }
+            }
+            black_box(checksum);
+            start.elapsed().as_nanos() as f64 / (iters * strings) as f64
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let simd_kind = if is_x86_feature_detected!("avx2") { "AVX2" } else { "SSE2" };
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd_kind = "scalar (no x86 SIMD)";
+        println!("\n== JSON escape classifier probe ({simd_kind}) ==");
+
+        // --- Part 1: forced-SIMD crossover sweep on clean ASCII ---
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            // Force the AVX2 body even below the production gate to see where it starts to win.
+            fn time_forced(data: &[u8], simd: bool, iters: usize) -> f64 {
+                let mut b = builder_value(core::ptr::null_mut(), 0);
+                let run = |buf: &mut BuilderBuf| -> u64 {
+                    buf.len = 0;
+                    buf.push(b'"');
+                    if !data.is_empty() {
+                        if simd {
+                            unsafe { write_json_str_avx2(buf, data) };
+                        } else {
+                            write_json_str_scalar(buf, data);
+                        }
+                    }
+                    buf.len() as u64
+                };
+                run(&mut b.buf); // warm
+                let start = std::time::Instant::now();
+                let mut c = 0u64;
+                for _ in 0..iters {
+                    c ^= black_box(run(black_box(&mut b.buf)));
+                }
+                black_box(c);
+                start.elapsed().as_nanos() as f64 / iters as f64
+            }
+            println!("forced AVX2 vs scalar, clean ASCII (median of 9, ns/op):");
+            println!(" len | scalar | avx2   | scalar/avx2");
+            for n in [4usize, 8, 12, 16, 20, 24, 28, 31, 32, 36, 40, 48, 56, 64, 96, 128, 256, 1024] {
+                let data = vec![b'a'; n];
+                let iters = 200_000;
+                let (mut sc, mut si) = (Vec::new(), Vec::new());
+                for t in 0..9 {
+                    if t % 2 == 0 {
+                        sc.push(time_forced(&data, false, iters));
+                        si.push(time_forced(&data, true, iters));
+                    } else {
+                        si.push(time_forced(&data, true, iters));
+                        sc.push(time_forced(&data, false, iters));
+                    }
+                }
+                let (sc, si) = (median(sc), median(si));
+                println!("{n:>4} | {sc:>6.2} | {si:>6.2} | {:>6.2}x", sc / si);
+            }
+        }
+
+        // --- Part 2: end-to-end adoption gate over the document mix ---
+        // A deterministic clean-ASCII filler that looks like real field text.
+        let clean_text = |n: usize| -> Vec<u8> {
+            let lorem = b"the quick brown fox jumps over the lazy dog while 12 birds fly south ";
+            (0..n).map(|i| lorem[i % lorem.len()]).collect()
+        };
+        // Mostly-clean: a spread of realistic field lengths, each all-clean (the common case: names,
+        // sentences, URLs, ids — escapes are rare).
+        let mostly_clean: Vec<Vec<u8>> =
+            [12usize, 20, 24, 32, 40, 48, 64, 96, 128, 160, 200, 256, 384, 512, 768, 1024]
+                .iter()
+                .map(|&n| clean_text(n))
+                .collect();
+        // Escape-dense: one escape byte roughly every 8 bytes (document 13's dense definition), same
+        // length spread. No regression beyond ~3% is the discipline here.
+        let dense: Vec<Vec<u8>> = mostly_clean
+            .iter()
+            .map(|base| {
+                let mut v = base.clone();
+                let mut i = 4;
+                while i < v.len() {
+                    v[i] = if (i / 8) % 2 == 0 { b'"' } else { b'\n' };
+                    i += 8;
+                }
+                v
+            })
+            .collect();
+        // Short: below the 32-byte crossover, mostly clean (must not regress).
+        let short: Vec<Vec<u8>> =
+            [1usize, 2, 4, 7, 8, 12, 15, 16, 20, 24, 28, 31].iter().map(|&n| clean_text(n)).collect();
+
+        println!("\nend-to-end builder path, scalar vs dispatched (median of 9, ns/string):");
+        println!(" corpus       | scalar | simd   | scalar/simd | verdict");
+        for (name, corpus) in [("mostly-clean", &mostly_clean), ("escape-dense", &dense), ("short", &short)]
+        {
+            // Oracle equality across the whole corpus before timing.
+            for s in corpus {
+                let (mut a, mut c) =
+                    (builder_value(core::ptr::null_mut(), 0), builder_value(core::ptr::null_mut(), 0));
+                encode_into(&mut a.buf, s, true);
+                encode_into(&mut c.buf, s, false);
+                assert_eq!(a.buf.as_slice(), c.buf.as_slice(), "probe oracle mismatch");
+            }
+            let iters = 40_000;
+            let (mut sc, mut si) = (Vec::new(), Vec::new());
+            for t in 0..9 {
+                if t % 2 == 0 {
+                    sc.push(time(corpus, false, iters));
+                    si.push(time(corpus, true, iters));
+                } else {
+                    si.push(time(corpus, true, iters));
+                    sc.push(time(corpus, false, iters));
+                }
+            }
+            let (sc, si) = (median(sc), median(si));
+            let ratio = sc / si;
+            let verdict = match name {
+                "mostly-clean" => {
+                    if ratio >= 1.05 {
+                        "WIN (adopt)"
+                    } else {
+                        "no material win"
+                    }
+                }
+                _ => {
+                    if si <= sc * 1.03 {
+                        "within discipline"
+                    } else {
+                        "REGRESSION"
+                    }
+                }
+            };
+            println!("{name:>13} | {sc:>6.2} | {si:>6.2} | {ratio:>10.2}x | {verdict}");
         }
     }
 
