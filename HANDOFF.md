@@ -8,7 +8,28 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (eighth update this day), **THE SIMD JSON ESCAPE CLASSIFIER IS SHIPPED —
+_Last updated: 2026-07-17 (ninth update this day), **UNIQUE-BUFFER DONATION IS SHIPPED — MERGED as
+#506** (`2aa3357`; doc-13 P3 item 3, gate 3 of 4; doc-10 §8.1 is the owner record). A materializing
+pipeline whose source is a fresh unbound owned array (`temp_free`) now donates the source buffer
+as the result instead of allocate+copy+free — exactly the record's mechanically safe subset (heap
+only, identical scalar layouts, map/where/scan; no arena/views/zip/struct-view/Move payloads),
+with NO new IR variant (output ptr = `SlicePtr(source)`, the exit `DropValue` skipped — ownership
+transfers). Behind `ALIGN_BUFFER_DONATE=off` (toggle precedent incl. the cache force-off guard,
+gate13c). Measured (bench/buffer_donate, AB/BA min-of-7): 1.04–1.07x in L1/L2, **2.03–2.25x from
+512 KiB through 64 MiB**; alloc==free balance pinned both ways. /code-review found the mechanism
+sound on every axis (single-free invariant, fail-closed predicate, in-place ordering) with one
+finding applied: the doc-claimed donation-on/off EXECUTION differential now actually runs
+(subprocess `alignc run` pair over bound + escaping + scan donated results, byte-identical stdout
++ hand-computed references). Suite 10/10; workspace green with properly checked exit codes.
+**Also diagnosed this session: the recurring `per_unit_surface` byte-identity failure was the
+known stale-runtime-archive papercut** (target/debug vs deps divergence after feature-flag builds
+— alloc-count etc. leave a different-feature archive under deps) — environmental, fixed by
+`cargo build --workspace`, unrelated to any merged PR; AND the verification lesson that piped
+`cargo test | grep | awk` masks exit codes — full-suite checks must assert the exit status
+separately. **Next: doc-13 P3 gate 4 of 4 — the short-N group strategy gate** (measure-first,
+independent), then the owner-approved top-level aggregate constants arc (language surface +
+doc-13 §8.4 pooling), then STOP per the owner's instruction. Previous update: 2026-07-17 (eighth
+update this day), **THE SIMD JSON ESCAPE CLASSIFIER IS SHIPPED —
 MERGED as #504** (`63d64bf`; doc-13 P3 item 3, gate 2 of 4). `align_rt_builder_write_json_str`'s
 scalar per-byte escape scan is replaced above the empirically confirmed 32-byte crossover by a
 dispatched block classifier (AVX2 32-byte / SSE2 16-byte, one movemask per block, branchless
