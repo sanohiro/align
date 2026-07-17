@@ -2025,7 +2025,7 @@ unsafe fn write_json_str_avx2(buf: &mut BuilderBuf, bytes: &[u8]) {
         }
         i += 32;
     }
-    unsafe { write_json_str_tail(buf, bytes, start, i) };
+    write_json_str_tail(buf, bytes, start, i);
 }
 
 /// SSE2 body writer: 16-byte blocks with a bulk clean-run copy, then a scalar tail.
@@ -2049,7 +2049,7 @@ unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
         }
         i += 16;
     }
-    unsafe { write_json_str_tail(buf, bytes, start, i) };
+    write_json_str_tail(buf, bytes, start, i);
 }
 
 /// Finish the `< BLOCK` remainder `bytes[i..]` scalar-wise, flushing the open clean run from `start`.
@@ -2059,7 +2059,7 @@ unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
 /// `start <= i <= bytes.len()`.
 #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", test)))]
 #[inline]
-unsafe fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: usize) {
+fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: usize) {
     let mut j = i;
     while j < bytes.len() {
         let c = bytes[j];
@@ -2120,7 +2120,7 @@ unsafe fn write_json_str_neon(buf: &mut BuilderBuf, bytes: &[u8]) {
         }
         i += 16;
     }
-    unsafe { write_json_str_tail(buf, bytes, start, i) };
+    write_json_str_tail(buf, bytes, start, i);
 }
 
 /// Append the JSON escape for one byte that needs escaping (`"`, `\`, or a C0 control), per
