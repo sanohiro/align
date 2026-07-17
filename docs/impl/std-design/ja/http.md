@@ -1,6 +1,6 @@
-このディレクトリには、ロードマップの本文だけでは足りない std モジュールについて、Opus がそのまま実装に
-移せる粒度の設計仕様を収めている。執筆はメインループ (Fable) が担当しており、各モジュールを実装する際は
-これが source of truth となる。
+このディレクトリには、ロードマップの本文ではカバーしきれない `std` モジュールについて、Opus がそのまま実装に
+着手できる粒度の設計仕様を収めている。執筆はメインループ (Fable) が担当しており、各モジュールを実装する際は
+これが信頼できる情報源（source of truth）となる。
 
 # std.http — implementation design (M11)
 
@@ -8,19 +8,19 @@
 
 ## Overview
 
-HTTP/1.1 のプリミティブであって、フレームワークではない(draft §18.2)。std.net のソケットの上に構築す
+HTTP/1.1 のプリミティブであり、フレームワークではない(draft §18.2)。std.net のソケットの上に構築す
 る。メンバーは request、response、header、method、status、client、server プリミティブ。コネクション再利用
-は net のレールに従う。**クライアント側の HTTPS/TLS は出荷済み**(スライス 5):`https://` は
+は net の基盤（レール）に従う。**クライアント側の HTTPS/TLS は出荷済み**(スライス 5):`https://` は
 `cl.get/post/request` + `cl.get_many` を通じてそのまま動作し、OpenSSL libssl 上で(システム信頼ストアに
 対する必須の検証 + ホスト名バインディングを伴って)crypto の libcrypto と並んで動的リンクされる。サーバ側
 TLS はクライアント優先で先送り。HTTP/3、ルーティング、ミドルウェアは std ではなく pkg である。
 
-**モジュール状態:COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。サーバ側 TLS、
+**モジュール状態: COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。サーバ側 TLS、
 クライアント証明書、カスタム CA、セッション再開、失効確認は記録済みの v1 後バックログ。
 
 ## Signatures
 
-v1 案で、Fable が確定させた形:
+v1 案として、Fable が確定させた形式:
 
 ```text
 // Client
@@ -61,7 +61,7 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
   は、パース済みの読み取りビューである `response` とはあえて別の型にしている: build(ヘッダーリスト →
   シリアライズ)と parse(オフセットテーブル → ビュー)が同じ利用箇所を共有することは決してないので、
   1 つの型に多重定義するとすべてのゲッターに内部の Parsed|Built 分岐を足すだけで、収束の利得はゼロになる。
-  意味のある対称性は方向によるものであり、それは保たれている: `response_builder` ≅ `request`(ビルダー)、
+  設計上の対称性はデータの向きに基づいており、それは以下のように保たれている: `response_builder` ≅ `request`(ビルダー)、
   `http_request_ctx` の読み取り ≅ `response` の読み取り(ビュー)。
 - `ctx.method()/path()/header()/body()` は **ctx にリージョン束縛されたビュー** を返す(#297 の分岐)。
   これらは `resp.status()/header()/body()` のちょうど読み取り側の双対である。
@@ -85,7 +85,7 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 
 ## Performance requirements (owner directive, 2026-07-07 — requirements, not aspirations)
 
-オーナーは std.http を **速く** したいと考えている。`open-questions.md` に記録された計測済みのレール
+オーナーは std.http を **高速** にしたいと考えている。`open-questions.md` に記録された計測済みの基盤（レール）
 (外部の design-note レビュー: keepalive 1.48×、pipeline 化した write-then-read 19.1×、並行数を絞った
 `get_many` は 64 リクエストで 12.8×)は、std の残りがすでに従っているゼロコピーの規律に加えて、v1 の
 エンジニアリング要件である。具体的には次のとおり。
@@ -97,7 +97,7 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - **R2 — 初日から SIMD 裏打ちのスキャン**: ヘッダー/行のスキャンは、ランタイム既存の memchr レイヤー
   (#310: AVX2+NEON+scalar、`str` 検索向けにすでに出荷済み)に乗せる — CRLF / `:` は memchr で見つけ、
   1 バイトずつのスカラーループは決して使わない。simdjson 流の完全な構造的スキャン(JSON と共有する
-  バイト分類器)は後日の最適化として記録にとどめる。memchr は今日ただで使える。
+  バイト分類器)は後日の最適化として記録にとどめる。memchr は現時点で追加コストなしに利用可能である。
 - **R3 — デフォルトでコネクション再利用**: プール(Slice 3)はオプションではなく要件である —
   同じ host:port への `cl.get()` は、オプトイン無しで生きているコネクションを再利用する(keepalive)。
   計測された 1.48× は下限であり、pipeline 化した 19.1× の形は `get_many` のバッチ処理がその上に築くもの
@@ -112,13 +112,13 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - **R6 — ベンチマークで完了をゲートする**: `bench/http_client` のハーネス(ローカルの平文サーバ。
   keepalive GET のレイテンシ/スループット + `get_many` のスケーリング)を Rust ベースラインに照らして
   計測する — このリポジトリの「主張の前に計測」ルールに従い、数値が README に載るまでモジュールは
-  「速く仕上がった」とは言わない。**R6 はスライス 3 の時点で満たされた:** `bench/http_client` は出荷済みで
+  「高速に仕上がった」とは見なさない。**R6 はスライス 3 の時点で満たされた:** `bench/http_client` は出荷済みで
   (出荷したプールをその C-ABI エントリポイント経由でインプロセスの localhost サーバに対して駆動する)、
   **keepalive で 2.86× 高速化**(下限 1.48× — 達成)と、再利用パスでの **手書き Rust `std::net` と同等**を
   記録している(`bench/http_client/README.md` を参照)。**`get_many` のスケーリング部分も今や達成された
   (2026-07-10、R5 のスライス):** 12 ms のレイテンシを注入した状態で degree 16 の 64 GETs — **15.4× の
-  オーバーラップ**(理想 ≈ degree)、**同 degree の Rust スレッドプールの 1.01×**(同等)。正直な報告のための
-  但し書きはベンチの README にある(degree とコア数を添えて引用すること)。R6 はこれで完全に満たされた。
+  オーバーラップ**(理想 ≈ degree)、**同 degree の Rust スレッドプールの 1.01×**(同等)。正確な報告のための
+  但し書き（caveat）はベンチマークの README に記載されている(degree とコア数を添えて引用すること)。R6 はこれで完全に満たされた。
 
 ## New machinery required
 
@@ -161,7 +161,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    必要」と「不正」を 1 つの共通デコーダで区別できるよう、`Incomplete`/`Invalid` の 2 分岐にリファクタした。
    プールはまだなし(各リクエストは新規接続して閉じる — keepalive の再利用はスライス 3)。`get_many` /
    server / HTTPS は残る。
-3. コネクションプールの再利用(レール — keepalive、デフォルトで再利用)。**完了**(ブランチ
+3. コネクションプールの再利用(基盤（レール） — keepalive、デフォルトで再利用)。**完了**(ブランチ
    `http-slice3-pool`)。`http.client()` はもう ZST ではなく、変わらない言語表面・FFI ABI の裏で
    **keepalive のコネクションプール**(`Mutex<HashMap<(host, port), Vec<IdleConn>>>`)を所有する
    (コンパイラは `HttpClient` を不透明なハンドルポインタとして扱っているため、このスライスは純粋な
@@ -244,7 +244,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      すでに → `Error.Invalid`、CL のみのフレーミング)。(4)明示的な target 形式 — origin-form(`/path`)は
      受理し、absolute-/authority-/asterisk-form は `Error.Invalid` で拒否する(v1)。(5)シリアライズ側の
      メソッドトークン + CR/LF/NUL のガードを inbound の行にも鏡像適用する。
-   - **並行性: v1 は逐次の accept→respond ループである。** `spawn` のキャプチャは今日 Copy/スカラーのみなので、
+   - **並行性: v1 は逐次の accept→respond ループである。** `spawn` のキャプチャは現時点では Copy / スカラーのみに制限されているため、
      Move の ctx はタスクへ渡せない — **Move-capture-into-spawn は並行サービングの記録済み前提条件である**
      (その消費者に紐づく。スライス 4 のブロッカーではない — A5 の単一 GPU ゲートウェイはいずれにせよ推論を
      直列化する)。
@@ -330,7 +330,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      スタール再試行の判定はきれいに移植できる(ハンドシェイク失敗は新規パスでしか起きないので、誤って再試行
      されない)。Drop/期限切れ: ベストエフォートの一方向 `SSL_shutdown`(ピアを待たない)、`SSL_free`、`close`
      — Content-Length フレーミングにより truncation 攻撃は無意味になる(短いボディはすでに `Error.Invalid`)。
-   - **サーバ側 TLS はそのまま先送り** — 半端に出荷するのではなく一貫性を保つ: サーバプリミティブは記録済みの
+   - **サーバ側 TLS はそのまま先送り** — 不完全な状態で出荷するのではなく、一貫性を保つ: サーバプリミティブは記録済みの
      信頼済みネットワークの caveat を負う。クライアント優先は align-LLM A5 の消費者と一致する。
 6. **`cl.get_many(urls, max_concurrency)`(R5)— 設計確定 + 出荷済み 2026-07-10**(同じ 2 レンズの
    レビュー。実装はブランチ `http-get-many`)。下の確定どおりそのまま出荷した — 前提となる
@@ -343,7 +343,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      配列の要素は `Scalar` である)— all-or-Err が唯一の正直な形であり、将来への指し示しとともに記録する
      (スロットごとのエラーは、もしあれば `Scalar::Result` クラスの機能を待つ)。4xx/5xx は `Ok` のデータの
      まま。空の `urls` → `Ok` の空配列。GET のみ(`request_many` は消費者が現れるまで先送り — R5 の本質は
-     レールであって動詞の集合ではない)。`max_concurrency <= 0` は **abort**(プログラマのバグ、`rand.range`
+     基盤（レール）であって動詞の集合ではない)。`max_concurrency <= 0` は **abort**(プログラマのバグ、`rand.range`
      と同じクラス)。
    - **完走する、短絡なし:** キャンセルのプリミティブは無く、ブロッキング read は中断できないので、失敗時は
      残りのワーカーが完走してその結果は破棄され、最初(最小インデックス)のエラーが報告される。したがって
@@ -356,9 +356,9 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      `min(max_concurrency, urls.len())` 個のスコープ付きブロッキングワーカーを spawn し、共有カウンタから
      URL のインデックスを claim して結果を入力順にスロットする。これはまさに確定済みの「async = task_group +
      ブロッキングワーカー」の立場である。生きた fd はワーカー数(+ 完了時にホストあたり ≤8 プール)で
-     縛られる。pipeline 化した 19.1× のレールは get_many の成果物では **ない**(スライス 3 の再利用判定が
+     縛られる。pipeline 化した 19.1× の基盤（レール）は get_many の成果物では **ない**(スライス 3 の再利用判定が
      未ドレインコネクションの再利用を禁じる)— 12.8× のマルチコネクションのオーバーラップの形がそれである。
-   - **前提となる機能(コンパイラ): `array<response>` — 不透明な Move ハンドルの動的配列。** 今日 `response`
+   - **前提となる機能(コンパイラ): `array<response>` — 不透明な Move ハンドルの動的配列。** 現時点では `response`
      は配列要素として拒否される(所有ハンドルの除外)ので、凍結済みの戻り型には狭い新機能が必要であり、その
      消費者である get_many と **ともに** 出荷する(#399 の `Scalar::Slice` + 消費者の前例): 構築は
      **ランタイムのみ**(ユーザー側の `[resp1, resp2]` リテラルは拒否のまま)。レシーバ位置の `rs[i]` は
@@ -368,14 +368,14 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      完全な twin-mirror スイープが必要である。
    - **ベンチ(R6 の get_many 部分を閉じる):** インプロセスの localhost サーバに対する 64 URLs に
      **リクエストごとのレイテンシを注入**(localhost の RTT ≈ 0 だとオーバーラップの利得が見えなくなる)、
-     同 degree の固定スレッドプールを使う Rust ベースラインと比較する。正直な報告: 計測されたオーバーラップ
+     同 degree の固定スレッドプールを使う Rust ベースラインと比較する。正確な報告: 計測されたオーバーラップ
      係数 + マシンのコア数 + 同 degree での Rust との同等性 — ハードウェア非依存の 12.8× という主張ではない。
 
 ## Known v1 limitations (Slice 2/3/5)
 
 - **HTTPS はクライアント側のみ(スライス 5)。** サーバ側 TLS は先送り — `http.serve` は平文であり、その
   記録済みの信頼済みネットワークの caveat(下記)が残る。クライアント優先は align-LLM A5 の消費者と一致する。
-  サーバ TLS は半端な出荷ではなく、一貫した v1 後の作業である。
+  サーバ TLS は不完全な出荷ではなく、一貫した v1 後の作業である。
 - **証明書の失効確認は無い(スライス 5)。** 検証はシステム信頼ストアに対する chain + ホスト名であり、
   CRL / OCSP / OCSP-stapling の確認は無い。失効しているが未期限切れで、なお信頼されたルートまで chain する
   証明書は受理される。失効確認は記録済みの v1 後バックログである(クライアント証明書、カスタム CA、セッション
@@ -397,19 +397,19 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
   TCP のハンドシェイクを完了させた後に停止するサーバ — 何も送らない、上限より少ないバイトをちびちび
   送る、`Content-Length` より少なく送ってソケットを握り続ける — は、呼び出しスレッドを**無期限に**
   ブロックする。バイト上限(head 256 KiB / body 1 GiB)が縛るのは*メモリ*であって*時間*ではない。これは
-  net のレールが文書化している no-timeout の挙動(`align_rt_tcp_connect`)を、http クライアントが connect
+  net の基盤（レール）が文書化している no-timeout の挙動(`align_rt_tcp_connect`)を、http クライアントが connect
   **と** read の両方で継承したものである。**スライス 3 での判断(記録のみ、未実装):** スライス 2 の注記は
   タイムアウトのフォローアップを「プールが per-conn のデッドライン管理を必要とするスライス 3 のプール作業と
   ともに」入れると書いていた。だがスライス 3 を実装してみると、その言い回しは別物を混同していた。プールの
   デッドライン管理とは **idle 期限切れ**(90 秒より古いコネクションを再利用しない)であり — これはスライス 3
   が**実装している** — connect/read の **I/O デッドライン**ではない。本物の I/O タイムアウトの追加は
   分離可能でより大きな変更であり、http ローカルな理想形を持たない:(1)**connect** タイムアウトの理想的な
-  置き場は net レール(non-blocking `connect` + `poll` の基盤 — net.md が後日のバックエンドとして既に挙げて
+  置き場は net 基盤（レール）(non-blocking `connect` + `poll` の基盤 — net.md が後日のバックエンドとして既に挙げて
   いる)であり、http に半分だけ入れれば二つ目の部分的な機構になる。(2)**read** タイムアウトは数行
   (`SO_RCVTIMEO`)だが、*固定値*は正当な低速/大容量転送を黙って壊し、v1 には凍結済みの
   `get`/`post`/`request` シグネチャを広げずにリクエスト単位で設定する**設定面が無い**(別の設計判断)。
   「理想形か、さもなくば先送り」に従い、スライス 3 はプールの idle 期限切れと SIGPIPE 安全/スタール再試行の
-  堅牢性を出荷し、**I/O タイムアウトは net レールの non-blocking/deadline 基盤へ先送り**する
+  堅牢性を出荷し、**I/O タイムアウトは net 基盤（レール）の non-blocking/deadline 基盤へ先送り**する
   (セマンティクス上は不変)。半端な実装を入れる代わりに、v1 の既知の制約としてここに記録する。
   - **サブケース — HEAD / 304 のフレーミング(スライス 1/2 から継承)。** `HEAD` レスポンスや
     `304 Not Modified` は、正当に `Content-Length` ヘッダを持つが**ボディを持たない**。v1 の読み取り

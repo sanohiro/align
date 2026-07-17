@@ -25,5 +25,7 @@ Some answers are one word. Some questions look identical to the one before — t
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: data as columns
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`, `agg`, `dict_encode`
 11. [Do It Until](11-do-it-until.md) — the `loop` expression, when a pipeline can't say it
+12. [Four at a Time](12-four-at-a-time.md) — explicit SIMD, vectors, and masks
+13. [The Big Crunch](13-the-big-crunch.md) — mmap, zero-allocation pipelines, and putting it all together
 
 Everything here runs with today's `alignc`. Bon appétit.

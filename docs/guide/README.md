@@ -31,3 +31,10 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 - [16 — The toolchain: alignc, the formatter, the lints](16-toolchain.md)
 - [17 — The Align way](17-the-align-way.md)
 - [18 — std services: network, HTTP, processes, compression, crypto](18-std-services.md)
+
+## Part IV — Designing Systems without Objects
+
+- [19 — Unlearning objects](19-unlearning-objects.md)
+- [20 — Beyond arenas: pools and lifetimes](20-beyond-arenas.md)
+- [21 — State machines](21-state-machines.md)
+- [22 — Building a system: ECS](22-building-a-system.md)

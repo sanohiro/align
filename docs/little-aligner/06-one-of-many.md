@@ -60,9 +60,15 @@ Shape { Circle(i64), Rect(i64, i64), Dot }
 
 ---
 
-**Q8.** How does the payload come back out?
+**Q8.** In other languages, I would use class inheritance and a virtual `draw()` method to handle different shapes. Why does Align use `enum` and `match`?
 
-**A8.** The match arm names it:
+**A8.** Inheritance scatters the logic across many files, and dynamic dispatch (virtual methods) hides what code actually runs from the CPU's branch predictor, destroying performance. `enum` and `match` gather the logic into one place and guarantee at compile-time that every case is handled. The CPU loves a clear path, and the reader loves the whole truth in one place.
+
+---
+
+**Q9.** How does the payload come back out?
+
+**A9.** The match arm names it:
 
 ```align
 fn area(s: Shape) -> i64 = match s {
@@ -76,27 +82,27 @@ fn area(s: Shape) -> i64 = match s {
 
 ---
 
-**Q9.** What is `match` — a statement or an expression?
+**Q10.** What is `match` — a statement or an expression?
 
-**A9.** An expression. Q8's whole function body *is* one. Bind it, return it, pass it: `verdict := match s { ... }`.
-
----
-
-**Q10.** May we match on a number? `match n { 0 => ..., _ => ... }`
-
-**A10.** No. `match` is for one-of-many types; numbers take `if`. Two tools, each whole; no half-overlap to memorize.
+**A10.** An expression. Q9's whole function body *is* one. Bind it, return it, pass it: `verdict := match s { ... }`.
 
 ---
 
-**Q11.** What may a payload be?
+**Q11.** May we match on a number? `match n { 0 => ..., _ => ... }`
 
-**A11.** Scalars and plain structs — `Wrap(Point)` is fine, and the arm `Wrap(p) => p.x + p.y` reaches inside. (An owning payload like `string` is not accepted today.)
+**A11.** No. `match` is for one-of-many types; numbers take `if`. Two tools, each whole; no half-overlap to memorize.
 
 ---
 
-**Q12.** Model this: a fetched page is *loading*, *ready with a size*, or *failed with a code*.
+**Q12.** What may a payload be?
 
-**A12.**
+**A12.** Scalars and plain structs — `Wrap(Point)` is fine, and the arm `Wrap(p) => p.x + p.y` reaches inside. (An owning payload like `string` is not accepted today.)
+
+---
+
+**Q13.** Model this: a fetched page is *loading*, *ready with a size*, or *failed with a code*.
+
+**A13.**
 
 ```align
 Page { Loading, Ready(i64), Failed(i64) }

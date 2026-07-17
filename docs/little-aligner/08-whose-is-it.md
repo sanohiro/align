@@ -87,9 +87,21 @@ print(shout("align"))
 
 ---
 
-**Q11.** So the whole decision, for any new data?
+**Q11.** In other languages, a garbage collector finds what I dropped and cleans it up. Why not use that instead of an `arena`?
 
-**A11.** One question — *how long does it live?*
+**A11.** A garbage collector is a janitor that follows your program around, inspecting and picking up individual pieces of trash. An `arena` is a building. When the work is done, you demolish the building. It is not about cleaning up mistakes; it is about planning lifetimes in bulk from the start.
+
+---
+
+**Q12.** If I create 10,000 temporary strings in a loop and free them one by one, what is the cost?
+
+**A12.** In other languages, 10,000 trips to the OS allocator, 10,000 thread locks, and 10,000 cache misses to track memory metadata. In an `arena`, 10,000 strings cost exactly one pointer addition each. You bypass the OS completely. The arena is not just about cleanup; it is about *blinding allocation speed*.
+
+---
+
+**Q13.** So the whole decision, for any new data?
+
+**A13.** One question — *how long does it live?*
 
 - this scope → a plain value, done
 - this phase → the arena, `.clone()` the survivors
@@ -98,9 +110,9 @@ print(shout("align"))
 
 ---
 
-**Q12.** Whose is it, then — this very buffer, at this line?
+**Q14.** Whose is it, then — this very buffer, at this line?
 
-**A12.** Read the source: the last binding it moved into. Ownership in Align is not a runtime mystery; it is written down, and the compiler already checked your reading.
+**A14.** Read the source: the last binding it moved into. Ownership in Align is not a runtime mystery; it is written down, and the compiler already checked your reading.
 
 ---
 

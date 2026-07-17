@@ -2,7 +2,7 @@
 
 > 🌐 [English](../16-toolchain.md) · **日本語**
 
-1 つの `alignc` binary に compiler、runner、formatter、cache control、inspection tool がまとまっています。multi-file program は 1 つの entry file から始まり、import が build graph を作るため、別の build-file dialect はありません。
+単一の `alignc` バイナリの中に、コンパイラ、ランナー、フォーマッタ、キャッシュ制御、そしてコード検査ツールがすべて統合されています。複数ファイルで構成されるプログラム（マルチファイル・プログラム）は常に1つのエントリファイルから始まり、ファイル内の `import` 宣言が自動的にビルドグラフを構築するため、Makefile のような独自のビルドスクリプト言語（dialect）は必要ありません。
 
 ## 実際に使うコマンド
 
@@ -13,16 +13,16 @@ alignc build file.align         # current directory に <stem> という executa
 alignc fmt   file.align --write # formatting をその場で正規化
 ```
 
-編集ループは `check` と `run` です。multi-file build は `.align` file ごとに 1 module を compile し、明示的な interface に対して import を検査し、到達可能な DAG を link します。`check-per-unit` は interface-based checker を公開し、`emit-interface` は各 unit の public surface と interface/implementation hash を表示します。
+日常的なコーディングにおける編集ループは `check` と `run` の繰り返しになります。マルチファイル・ビルドでは、`.align` ファイルごとに1つのモジュールとしてコンパイルが行われます。コンパイラは明示的なインターフェースに基づいて `import` の整合性を検査し、到達可能なモジュールの依存関係（DAG）をリンクします。`check-per-unit` コマンドを使用するとインターフェースベースのチェッカーを利用でき、`emit-interface` コマンドを使用すると各コンパイル単位の公開サーフェス（API）と、インターフェースおよび実装のハッシュ値を確認できます。
 
-codegen は既定で有効な content-addressed object cache と parallel worker を使います。要求しない限り表示はしません。
+コード生成（codegen）フェーズでは、デフォルトで「コンテンツアドレス方式のオブジェクトキャッシュ」と「並列ワーカー」が有効になっています。明示的に要求しない限り、これらが動作している様子が標準出力に表示されることはありません。
 
 ```text
 alignc build app.align --cache-stats -j 4
 alignc cache clear
 ```
 
-`-j` は `ALIGNC_JOBS` より優先されます。`ALIGNC_CACHE=off` で cache を無効化し、`ALIGNC_CACHE=<path>` で移動できます。cache identity には source/interface content、compiler と LLVM identity、target、profile、export、runtime bitcode、PGO mode が含まれます。したがって hit は単に timestamp が新しいという意味ではなく、byte を再利用できるという意味です。
+コマンドラインの `-j` オプションは、環境変数 `ALIGNC_JOBS` よりも優先されます。`ALIGNC_CACHE=off` を設定することでキャッシュを無効化でき、`ALIGNC_CACHE=<path>` でキャッシュの保存先ディレクトリを変更できます。キャッシュの同一性判定（キャッシュアイデンティティ）には、ソースコードやインターフェースのコンテンツ、コンパイラや LLVM のバージョン識別子、ターゲットアーキテクチャ、プロファイル、エクスポート指定、ランタイムのビットコード、および PGO のモードなど、結果に影響を与えるすべての要素が含まれます。したがって、キャッシュの「ヒット」は単にファイルタイムスタンプが新しいという意味ではなく、過去に生成したオブジェクトのバイト列を安全に「再利用できる」という厳密な意味を持ちます。
 
 ## コンパイラが見たものを見る
 
@@ -35,7 +35,7 @@ alignc explain-opt file.align --verbose
 alignc size file.align --profile tiny
 ```
 
-`emit-mir` は意味の lens です。raw LLVM IR は最適化前の lowering を、optimized IR は LLVM が実際に作った形を示します。`explain-opt` は vectorization などの optimization remark を source line へ戻して説明します。`size` は選択 profile で `build` と同じ artifact を作り、byte の内訳を報告します。standalone object/IR では `--export name` を繰り返し、entry unit の選択した関数を外部公開できます。
+`emit-mir` コマンドは、プログラムの意味論（セマンティクス）を確認するためのレンズの役割を果たします。`raw` ステージの LLVM IR は最適化前のローリング（低レベル化）結果を示し、`optimized` ステージの IR は LLVM が実際に生成した最終的な形を示します。`explain-opt` コマンドは、自動ベクトル化などの「最適化に関する備考（optimization remark）」を元のソースコードの行に対応づけて説明します。`size` コマンドは、選択したプロファイルで `build` と全く同じ実行ファイル（アーティファクト）を作成し、そのファイルサイズ（バイト数）の内訳を報告します。スタンドアロンのオブジェクトファイルや IR を出力する際は、`--export name` オプションを複数回指定することで、エントリ単位の特定の関数を選択して外部へ公開（エクスポート）することができます。
 
 ## profile、target、whole-program optimization
 
@@ -46,7 +46,8 @@ alignc size file.align --profile tiny
 --thin-lto                             # cross-unit ThinLTO
 ```
 
-既定は portable な `baseline` と `release` です。`native` は現在の machine 用、`x86-64-v3` のような名前付き LLVM CPU は既知の deployment fleet に向きます。`--rt-lto` と `--thin-lto` は compile cost と optimization scope を変えるため明示的です。どちらも `release` または `fast` が必要です。ThinLTO は link する `build` / `run` / `size` に適用され、parallel かつ cached で、runtime LTO と組み合わせられます。
+デフォルトのターゲットとプロファイルは、ポータブルな `baseline` および `release` です。`native` はコンパイルを実行している現在のマシンに最適化されたターゲットであり、`x86-64-v3` のような名前付きの LLVM CPU アーキテクチャ指定は、デプロイ先のハードウェア環境（フリート）が既知の場合に推奨されます。
+`--rt-lto`（ランタイムの LTO）と `--thin-lto`（クロスモジュールの ThinLTO）は、コンパイル時間（コスト）と最適化の適用範囲を大きく変えるため、デフォルトでは無効になっており明示的な指定が必要です。どちらも `release` または `fast` プロファイルでのみ機能します。ThinLTO はリンク処理を伴う `build`、`run`、`size` コマンドに適用され、並列処理やキャッシュ機構の恩恵を受けながら、ランタイム LTO と組み合わせることが可能です。
 
 代表的な production workload には instrumented PGO が使えます。
 
@@ -57,34 +58,32 @@ llvm-profdata-22 merge default.profraw -o app.profdata
 alignc build app.align --profile fast --pgo-use app.profdata
 ```
 
-compiler は実際の raw profile 出力先を表示します。instrument と use mode は排他的で別々に cache され、現在 `--thin-lto` とは組み合わせられません。`--rt-lto` とは組み合わせられます。存在しない、読めない、壊れた、version 不整合の profile は hard error です。古い、または別 program の readable な profile は目立つ warning を出して build を続けます。profile mismatch が変えるのは performance であり program semantics ではないからです。
+コンパイラは、実際の生のプロファイルデータ（`.profraw`）の出力先パスを表示します。プロファイリング用の計測（instrument）モードと、そのデータの利用（use）モードは排他的であり、キャッシュもそれぞれ独立して管理されます。現時点では `--thin-lto` と組み合わせることはできませんが、`--rt-lto` との組み合わせは可能です。
+
+指定されたプロファイルファイルが存在しない、読み取れない、破損している、あるいはバージョンが不整合である場合は、「ハードエラー（コンパイル失敗）」になります。一方で、ファイル自体は正常に読み取れるが、ソースコードの変更によって内容が古くなっていたり、あるいは全く別のプログラムのプロファイルデータを渡したりした場合は、目立つ警告（warning）を出した上でコンパイルを続行します。なぜなら、プロファイルデータの不一致が影響を与えるのはプログラムの「パフォーマンス」のみであり、プログラムの「意味論（セマンティクスや正しい動作）」を壊すことはないからです。
 
 ## フォーマッタ
 
-`alignc fmt` は正規形を出力し、`--write` は file を書き換えます。spacing、`;` の配置、末尾 comma、alignment という意味のない差だけを正規化し、改行は保持します。parse できない file は format しません。diff を意味上の変更だけにするため、日常的に実行してください。
+`alignc fmt` はソースコードを標準的なフォーマット（正規形）に整形して出力し、`--write` オプションを付けるとファイル自体を書き換えます。このフォーマッタは、スペースの数、セミコロン `;` の配置、末尾のカンマ、インデントの揃え方といった「意味を持たない構文の差」だけを正規化し、プログラマが意図した改行位置はそのまま保持します。文法エラーがありパースできないファイルはフォーマットされません。Git などのバージョン管理システム上の diff（差分）を「プログラムの意味上の変更」だけにするために、日常的なコーディングの習慣として実行してください。
 
 ## lint
 
-すべての check と build が lint suite を実行します。file ごとの suppression surface はありません。
+すべての `check` コマンドおよび `build` コマンドの実行時に、組み込みの Lint スイートが自動的に走ります。特定のファイルや行単位で Lint 警告を抑制（suppress）する機能はありません。
 
-**hard error** は correctness を守ります。
+**ハードエラー（コンパイル失敗）** はプログラムの正当性（correctness）を守るためのものです。
+- `unhandled Result`： 返された `Result` 型を `?` 演算子、`match`、`else` ブロック、または変数への束縛のいずれかで適切に処理していない場合に発生します。
 
-```text
-unhandled Result        ?、match、else、binding のいずれかで処理する
-```
+**警告（warning）** はビルド自体を止めませんが、パフォーマンス上の「決定的なコスト」を可視化するためのものです。
+- `lossy conversion`： `as` キャストによってデータが失われる（切り捨てられる）可能性がある変換。
+- `huge struct copy`： およそ 2 キャッシュライン（128 バイト）を超えるような巨大な構造体の値渡し（コピー）。
+- `unnecessary heap`： ヒープ領域にアロケートした直後に、すぐに値を読み取って捨てるような非効率な処理パターン。
+- `wasteful default`： 巨大なリテラル配列において、コンパイラが推論した要素の型が必要以上に広い（メモリの無駄遣いになっている）状態。
+- `unused import`： そのファイル内で一度も使用されていないインポート（無駄なケイパビリティの要求）。
 
-**warning** は build を止めず、決定的な cost を見えるようにします。
-
-```text
-lossy conversion        情報を捨てうる `as`
-huge struct copy        およそ 2 cache line を超える by-value copy
-unnecessary heap        allocate して直ちに読む狭い形
-wasteful default        大きな literal array が必要以上に広い推論 element を使う
-unused import           その file で使われない imported capability
-```
-
-これらは style rule ではなく、source line で話す performance model です。まず data shape を直します。意図的に warning を残すなら `explain-opt`、`size`、代表的 benchmark で artifact を測ってください。
+これらの警告は単なる「コーディングスタイルのルール」ではなく、ソースコードの行単位で語りかけてくる「パフォーマンスモデルからのフィードバック」です。警告が出た場合は、まずデータ構造（データシェイプ）を修正することを検討してください。もし正当な理由があって意図的に警告を残すのであれば、`explain-opt` や `size` コマンド、あるいは代表的なベンチマークテストを用いて、最終的なアーティファクトの性能を必ず計測してください。
 
 ## 意図的に欠けているもの
 
-Align 言語用 package registry/resolver、project manifest、general test runner、debugger integration はまだありません。Homebrew と apt が配布するのはコンパイラ本体であり、source dependency は将来の `pkg` layer として core と std の外に残します。現在の contract は意図的に小さく、1 binary、import-discovered build、content-identified artifact、inspectable optimization です。
+現時点の Align には、専用のパッケージレジストリやリゾルバ、プロジェクトのマニフェストファイル（`Cargo.toml` や `package.json` のようなもの）、汎用的なテストランナー、高度なデバッガ統合などはまだ用意されていません。Homebrew や apt などのパッケージマネージャが配布するのはあくまで「コンパイラ本体」のみであり、外部ソースコードの依存関係管理は将来的に `pkg` レイヤーとして言語コアや標準ライブラリの外側に実装される予定です。
+
+現在のツールチェーンのスコープ（契約）は意図的に小さく保たれており、「単一のバイナリ」、「`import` 宣言から自動発見されるビルド」、「コンテンツベースのハッシュで識別されるアーティファクト」、そして「内部が検査可能な最適化プロセス」の4点を中核としています。

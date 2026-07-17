@@ -31,3 +31,10 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 - [16 — ツールチェーン: alignc、フォーマッタ、lint](16-toolchain.md)
 - [17 — Align の流儀](17-the-align-way.md)
 - [18 — std services: network、HTTP、process、圧縮、暗号](18-std-services.md)
+
+## 第 IV 部 —— オブジェクトを持たないシステム設計
+
+- [19 — オブジェクト指向のアンラーニング](19-unlearning-objects.md)
+- [20 — Arena の先へ: プールとライフタイム](20-beyond-arenas.md)
+- [21 — ステートマシン](21-state-machines.md)
+- [22 — システムの構築: ECS](22-building-a-system.md)
