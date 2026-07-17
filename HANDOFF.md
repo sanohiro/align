@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (eleventh update this day), **TOP-LEVEL AGGREGATE CONSTANTS ARE SHIPPED —
+_Last updated: 2026-07-18, **LOCAL CONSTANT-ARRAY POOLING IS SHIPPED — MERGED as #517**
+(`dc34e19`) — **and with it the owner-directed work program of 2026-07-16/17 is COMPLETE.** A
+qualifying local `xs := [const…]` (non-mut, non-align(N), fixed scalar array, all-constant
+elements, **length ≥ 32** — the empirical cutoff) lowers to one `llvm.memcpy` from the #514
+rodata global; MemCpyOpt then folds the read-only slot into the constant (runtime-indexed reads
+become `gep @const_arr`). Type-preserving by design (NOT the slice rewrite — correct for every
+downstream use). Measured: 1.40x at N=32 rising to **288x at N=4096**; below the cutoff both
+toggle states emit identical code. Negative controls IR-pinned; #506 donation structurally cannot
+fire; `ALIGN_CONST_POOL=off` toggle + cache guard. The /code-review pass caught a CRITICAL
+stale-cache miscompile before merge (reproduced end-to-end): the MIR printer omitted const-array
+ELEMENT VALUES while `impl_hash` hashes that text, so a value-only table edit (999→111) served the
+stale cached object under the warm default-on cache — fixed by value-exact element rendering in
+BOTH print arms (also covering #514's private aggregate constants), pinned by a subprocess
+warm-cache repro gate and a printed-MIR inequality gate. Suite hygiene: the pre-existing
+`gate_sv4` PGO wall-time payoff assert flaked twice under parallel suite load (passes in
+isolation) — converted to an `#[ignore]` manual probe per the perf-probe discipline, roadmap claim
+corrected. Workspace fully green (WORKSPACE_EXIT=0 checked), clippy clean. **Session totals
+(2026-07-16 → 07-18): 12 merged PRs** — adaptive stable-sort #494; the ThinLTO arc #495–#498
+(CLOSED); the instrument-PGO arc #499–#502 (CLOSED, settled policy amended on review evidence);
+doc-13 P3 item 3's four gates #503/#504/#506/#510 (all dispositioned); the aggregate-constants
+language surface #514 (+ the rodata-write soundness hole fixed pre-merge); this pooling probe
+#517. The owner's release-prep agent landed #507–#509 + LICENSE in parallel; v0.1.0 tagging is
+the owner's step. **Remaining queue: EMPTY by owner direction — the loop STOPS here.** The next
+fork is the owner's: the align-LLM engine (unblocks doc-14 and the consumer-gated deferrals) or
+further language surface. Deferred items live in open-questions (mmap-view write provenance
+follow-up, struct constants S1.5, PGO×ThinLTO, sample-PGO/BOLT — blocked on perf-less WSL2,
+aarch64 SIMD activations pending native hardware). Previous update: 2026-07-17 (eleventh update
+this day), **TOP-LEVEL AGGREGATE CONSTANTS ARE SHIPPED —
 THE LANGUAGE SURFACE, MERGED as #514** (`11e0f26`; stray scratch files removed in `960a753`). A
 top-level constant initializer may now be an array literal: `PRIMES := [2,3,5,7,11]` /
 `SCALE: slice<f64> := [...]` / `DAYS := ["Mon","Tue","Wed"]`. The type is **`slice<T>` with
