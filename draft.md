@@ -884,8 +884,9 @@ Fusion may preserve this order, but effect inference restricts transformations: 
 reordered, erased, duplicated, speculated, or parallelized only when its inferred effect and the
 specific operation make that transformation legal. Pure alone does not mean non-trapping or total.
 `par_map` remains different: every callable moved into its parallel range must be Pure (§11).
-`sort_by_key` is not covered by this rule because comparison sorting has a separate key-evaluation
-contract, still open.
+`sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
+for each surviving element, in input-index order, before any reordering. Sorting compares the
+recorded keys and never calls the key callable again.
 
 ### Core Array Functions
 
@@ -1947,9 +1948,11 @@ std.http
 
 ### Error mapping (all of std)
 
-Every `std` fn returns `Result<T, Error>` (the builtin `Error` sum type, §5/`open-questions.md`
-"Error type design"). A failing syscall maps its `errno` through **one fixed table**, the same
-everywhere — not a per-module ad hoc mapping ("one way"):
+Recoverably fallible `std` functions return `Result<T, Error>` (the builtin `Error` sum type,
+§5/`open-questions.md` "Error type design"). An absence-only query may return `Option<T>`, and an
+operation specified as total returns its value directly. Programmer errors abort rather than
+returning `Error`. A failing syscall in a `Result`-returning operation maps its `errno` through
+**one fixed table**, the same everywhere — not a per-module ad hoc mapping ("one way"):
 
 ```text
 ENOENT           -> Error.NotFound
@@ -2220,10 +2223,12 @@ impossible.
 
 ### std.crypto
 
-Cryptographic use. The engine is OpenSSL libcrypto (EVP, floor ≥ 3.2, always-linked) — see
-`docs/impl/std-design/crypto.md` for the full design; `constant_time_equal` is the one
-self-hosted primitive and its branchless (constant-time) property is verified against the
-compiled machine code, not just the source.
+Cryptographic use. EVP-backed operations use OpenSSL libcrypto, which the compiler links only when
+a used capability requires it. Most operations work with OpenSSL ≥ 3.0; `argon2id` requires the
+`ARGON2ID` provider added in OpenSSL 3.2 and returns `Error.Code` when that provider is unavailable.
+See `docs/impl/std-design/crypto.md` for the full design. `constant_time_equal` is the one
+self-hosted primitive and its branchless (constant-time) property is verified against the compiled
+machine code, not just the source.
 
 ```text
 crypto.random(out: mut buffer)                                  // OS CSPRNG fill

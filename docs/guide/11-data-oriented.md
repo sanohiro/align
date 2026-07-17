@@ -74,6 +74,8 @@ arena {
 
 `group_by(.key)` must be completed by an aggregate — `.sum(.f)`, `.min(.f)`, `.max(.f)`, `.count()` — and returns a pair of columns: `g.0` the keys, `g.1` the aggregated values. (A bare `group_by` with no aggregate is a compile error: an unmaterialized "grouped thing" would be a hidden cost.)
 
+> **Cost:** For a fixed aggregate list, grouping is expected O(n) and uses O(n) additional storage in the worst case. A compact integer-key range takes a direct-index path; other shapes use hashing. `.agg(...)` scans the rows once, while its per-row work grows with the number of listed accumulators.
+
 Over a `str` key on a decoded array, with **several aggregates in one pass**:
 
 ```align

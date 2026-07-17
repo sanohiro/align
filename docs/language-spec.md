@@ -261,7 +261,9 @@ Impure. They run in input-index and stage order, exactly once for each element t
 false `where` suppresses every later stage and reducer for that element. `any` / `all` do not
 short-circuit. Effects restrict optimization legality, while explicit `par_map` still requires
 Pure callables. Pure alone does not make a trapping or nonterminating call safe to speculate.
-`sort_by_key` key evaluation remains a separate open contract.
+`sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
+for each surviving element, in input-index order, before any reordering, and sorting never calls it
+again.
 
 A pipeline **materializes** either into a fresh owned `array<T>` (`.to_array()`) or into a
 caller-provided `out`/`mut` slice (`.map_into(dst)` — the caller-storage counterpart). `map_into` is
@@ -496,9 +498,11 @@ arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the
 without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy). `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.env`: `get`/`set` only — `args` comes solely from `main(args: array<str>)`,
 there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no `Duration` type — `now()`
-(wall), `instant()` (monotonic), `sleep(ns)`. Every `std` fn returns `Result<T, Error>`; a failing
-syscall maps through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`,
-`EINVAL`→`Invalid`, else `Code(errno)`). (`draft.md` §18.2, M9.)
+(wall), `instant()` (monotonic), `sleep(ns)`. Recoverably fallible `std` functions return
+`Result<T, Error>`; absence-only queries may return `Option<T>`, total operations return their value
+directly, and programmer errors abort. A failing syscall in a `Result`-returning operation maps
+through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`, `EINVAL`→`Invalid`,
+else `Code(errno)`). (`draft.md` §18.2, M9.)
 
 `std.encoding`: `base64`/`base64url`/`hex` encode+decode (decode returns an owned `buffer` — no
 UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
@@ -506,6 +510,9 @@ UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`.
 fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`
 take a `mut` receiver, OS-seeded via `getrandom`/`urandom`; `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
+`std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
+requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
+and returns `Error.Code` when it is unavailable.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every

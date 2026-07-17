@@ -14,6 +14,8 @@ Read left to right: take `prices`, transform each, keep some, collapse to one va
 
 A pipeline must **end** — in a reduction (`sum`, `count`, `reduce`, …) or a materialization (`to_array`, `map_into`). A dangling `xs.map(f)` with no terminal is a compile error, because a lazy value you can pass around would be a hidden cost.
 
+> **Cost:** A fused reduction is O(n) and allocates no intermediate collection. `to_array` makes at most one result allocation (sized to the source upper bound when filtering); `map_into` writes caller-provided storage and allocates nothing.
+
 ## Transform stages
 
 ```align
@@ -79,6 +81,8 @@ fn main() -> i32 {
 ```
 
 `sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
+
+> **Cost:** Both sorts are stable, have O(n log n) worst-case time, and materialize an owned result. Additional working storage is O(n) in the worst case. `sort_by_key` evaluates its key function exactly once per element, in input order. The current merge strategy may change without changing these guarantees.
 
 ## Chunking
 

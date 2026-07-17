@@ -298,9 +298,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 
    **Settled design (as ratified):** Zero new user-facing surface — `https://` simply starts working
    through `cl.get/post/request` (the URL scheme is the only input that should change behavior).
-   - **Engine = OpenSSL libssl** (same package + ≥3.2 floor as crypto's settled libcrypto,
-     dynamically linked like `-lcrypto`). The *linkage* reuses crypto's settlement; the **trust
-     decision is a genuinely new semantic and gets its own record (this one)**: certificates are
+   - **Engine = OpenSSL libssl** (the same package as libcrypto; OpenSSL ≥3.0 for TLS), capability-
+     linked together with `-lcrypto` when HTTPS is used. The *linkage* reuses crypto's settlement;
+     the **trust decision is a genuinely new semantic and gets its own record (this one)**: certificates are
      **always verified** against the **system trust store** (`SSL_CTX_set_default_verify_paths()`,
      never a hardcoded path; deployment note: the `ca-certificates` package must be present or
      every handshake fails closed). No disable/custom-CA/client-cert/resumption surface in v1 (no

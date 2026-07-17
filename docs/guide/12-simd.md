@@ -66,7 +66,9 @@ fn main() -> i32 {
 
 ## The two-tier rule
 
-- **Tier 1 (default): pipelines.** `xs.map(f).where(p).sum()`, soa columns, `group_by`. Width-agnostic — the compiler picks lane counts per target, and the same source vectorizes on AVX2, NEON, or a scalable ISA. This tier follows your data.
+- **Tier 1 (default): pipelines.** `xs.map(f).where(p).sum()`, soa columns, `group_by`. Width-agnostic — the compiler picks lane counts per target, and the same source can vectorize on AVX2, NEON, or a scalable ISA. This tier follows your data.
 - **Tier 2 (escape hatch): `vecN`/`maskN`.** For the dot-product / FIR / blend kernel where you want to dictate the exact register dance at a fixed width you chose.
+
+> **Optimization:** Tier-1 vectorization is target- and profile-dependent, not a semantic guarantee or a fixed byte threshold. Loop legality and input shape also matter. Use `alignc explain-opt` for the decision and `emit-llvm --stage optimized` for the resulting vector width.
 
 If you reach for tier 2, keep it in one small function with slices at the boundary, like `scale_add` above — callers shouldn't know a kernel is hand-vectorized. And audit tier 1 before abandoning it: `alignc emit-llvm` shows you the `<4 x i64>` types in the IR the pipeline already produced. The most common outcome of that audit is deleting the hand-written kernel.
