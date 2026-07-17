@@ -8,7 +8,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-17 (ninth update this day), **UNIQUE-BUFFER DONATION IS SHIPPED — MERGED as
+_Last updated: 2026-07-17 (tenth update this day), **THE ADAPTIVE SHORT-N STRING GROUP STRATEGY IS
+SHIPPED — MERGED as #510** (`afbd1e6`) — **and with it doc-13 §11 P3 item 3 is FULLY DISPOSITIONED
+(all four measure-first gates: repeated-needle #503, JSON escape SIMD #504, unique-buffer donation
+#506, short-N group #510).** The str-key single-aggregate group core is adaptive: distinct-group
+count ≤ `GROUP_LINEAR_MAX = 4` aggregates by linear scan over the caller's already-written
+representatives (no map allocation, no per-row wyhash; byte compare + length fast-reject),
+promoting to the identical seeded HashMap at the 5th distinct key with ids and first-occurrence
+order continuing unbroken and the triggering row processed exactly once. Measured (AB/BA,
+median-of-9, real core): cardinality 1–4 wins 1.07–2.31x in both mixed- and same-length keys, ≥5
+neutral at scale; the record's hypothesized 8/16 crossover was empirically corrected to 4
+(threshold 8 regressed same-length cardinality 6–8 to 0.68x). dict_encode/group_multi stay on
+their own path (scoped honestly). /code-review: functional audit clean on all six axes; two
+comment-accuracy fixes applied pre-merge. Differential gates pin bit-identical results incl.
+first-occurrence order across cardinalities/orders/widths and cap-overflow in both phases.
+Workspace green (exit-checked), clippy clean incl. --all-features. **In parallel, the owner's
+release-prep agent landed #507 (build/release automation), #508 (README/toolchain docs), #509
+(spec/guide updates) + LICENSE on main — v0.1.0 tagging is the owner's post-merge step.** **Next
+(the final arc before the owner-directed STOP): top-level aggregate constants** — the language
+surface (two-lens design settlement: static-region slice-view ownership per the string-literal
+precedent; v1 initializers = literals + simple folding, fail-closed), implementation (~2-3 PRs),
+then the doc-13 §8.4 local-constant pooling probe (≥15% large positive, ≤3% below cutoff), with
+draft.md/language-spec/design-notes/open-questions updated per CLAUDE.md. Previous update:
+2026-07-17 (ninth update this day), **UNIQUE-BUFFER DONATION IS SHIPPED — MERGED as
 #506** (`2aa3357`; doc-13 P3 item 3, gate 3 of 4; doc-10 §8.1 is the owner record). A materializing
 pipeline whose source is a fresh unbound owned array (`temp_free`) now donates the source buffer
 as the result instead of allocate+copy+free — exactly the record's mechanically safe subset (heap
