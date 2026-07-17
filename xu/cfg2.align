@@ -1,3 +1,0 @@
-module cfg2
-SECRET := 5
-pub A := SECRET + 1
