@@ -740,7 +740,10 @@ large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
 - stable O(n log n) sort/sort_by_key with a tiny insertion base and once-decorated keys is shipped;
   document 12 adds the measured ordered-run/tiny-scratch refinement;
 - donate a uniquely owned unbound temporary buffer to compatible map/where/scan materialization:
-  document 10 §8.1; extend to sort only through the same ownership proof;
+  **SHIPPED default-on 2026-07-17** (document 10 §8.1 owns the record: scalar `map`/`where`/`scan`
+  over a fresh owned heap source of identical element layout, outside an arena, donates the source
+  buffer as the result storage — measured 1.04–2.25x, alloc==free balance proven, `ALIGN_BUFFER_DONATE`
+  toggle); extend to sort only through the same ownership proof (still deferred);
 - SIMD stable compaction for selective materializers: document 12, measure first;
 - redundant `.to_array().sum()` lint/legality-aware elision: document 12;
 - whole-range `par_map` and explicit-parallel terminal elision: document 11;
@@ -866,8 +869,13 @@ AoS/SoA conversion, or a second substring-search algorithm.
    2026-07-17** (§6.6): AVX2/SSE2 block classifier with a measured scalar `< 32` crossover; the real
    builder-path adoption gate won 5.8x on mostly-clean fields (baseline and v3), stayed *faster* than
    scalar on escape-dense input, and was neutral below the crossover; arm64 NEON candidate is
-   test-only pending native hardware. Unique-buffer donation and short-N group strategy remain
-   independent gates.
+   test-only pending native hardware. **Unique-buffer donation SHIPPED default-on 2026-07-17**
+   (document 10 §8.1): scalar `map`/`where`/`scan` over a fresh owned heap source of identical element
+   layout, outside an arena, donates the source buffer as the result storage instead of
+   allocating+copying+freeing; the balanced AB/BA + alloc-count gate (`bench/buffer_donate`) measured
+   1.04–2.25x across the L1→DRAM sweep with exact alloc==free balance (no leak/double-free) and one
+   fewer allocation per donation; `ALIGN_BUFFER_DONATE=off` reverts. Short-N group strategy remains an
+   independent gate.
 
 ## 12. Regression and IR gates
 
@@ -924,6 +932,19 @@ IR gates:
   `needle_plan_hoist_toggle.rs`, `rt_contract_attrs_pin_encoding_and_curation`
   (`align_codegen_llvm`), the runtime differential `str_finder_matches_one_shot_oracle`
   (`align_runtime`), and the `bench/needle_hoist` alloc-count leak gate.
+- **unique-buffer donation shape (shipped and regression-pinned 2026-07-17, document 10 §8.1):** a
+  `make().map(f).to_array()` / `.where` / `.scan` collect whose source is a fresh unbound owned
+  scalar heap array of identical element layout, outside an arena, emits its output storage as
+  `slice_ptr(source)` with **no** fresh `heap_alloc` and **no** source `drop_value` (ownership
+  transfers to the result array, whose own drop is the single free). The mutation checks are the
+  negative controls — a borrowed named source, an arena collect, a `str`-element source, and a
+  mismatched element layout (`i64 -> i32`) all keep the `heap_alloc` (+ `drop_value` where the source
+  is a fresh temp) allocate-then-copy-then-free shape and emit **no** `slice_ptr` output. The
+  `ALIGN_BUFFER_DONATE=off` toggle reverts the positive shape to allocate+free. Gates:
+  `crates/align_driver/tests/buffer_donate.rs` (MIR shape + donation-on/off byte-identical results for
+  map/where/scan/chain incl. escaping and bound results — catches double-free/use-after-donate),
+  `cache_codegen.rs::gate13c` (toggle never poisons the shared cache), and the manual
+  `bench/buffer_donate` alloc-count (alloc==free, one fewer alloc per donation) + AB/BA timing gate.
 
 Benchmark adoption requires the matrix in §4.2, balanced AB/BA, allocation/copy counters, optimized
 IR, and a negative workload. Large-input throughput never excuses a short-input regression, and a

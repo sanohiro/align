@@ -1,0 +1,13 @@
+[package]
+name = "buffer-donate-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the parent Align workspace (its own deps stay isolated from the compiler crates).
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

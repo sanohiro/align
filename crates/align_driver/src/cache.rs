@@ -342,16 +342,18 @@ impl CacheContext {
     /// versions). If the default root cannot be resolved (no `HOME`/`XDG_CACHE_HOME`), the on/unset
     /// case degrades to disabled rather than guessing a root.
     pub fn from_env() -> CacheContext {
-        // Fail-closed measurement guard: the `ALIGN_SORT_ADAPTIVE` (doc-12 §4.1) and
-        // `ALIGN_NEEDLE_HOIST` (doc-13 §6.6) toggles change emitted codegen for `.sort()`/
-        // `.sort_by_key()` and `where(str.contains)` units respectively. Each effect already flows
-        // into the per-unit `impl_hash` (both are read only in MIR lowering, so the MIR fingerprint
+        // Fail-closed measurement guard: the `ALIGN_SORT_ADAPTIVE` (doc-12 §4.1),
+        // `ALIGN_NEEDLE_HOIST` (doc-13 §6.6), and `ALIGN_BUFFER_DONATE` (doc-10 §8.1) toggles change
+        // emitted codegen for `.sort()`/`.sort_by_key()`, `where(str.contains)`, and donated
+        // materialization (`make().map(f).to_array()`) units respectively. Each effect already flows
+        // into the per-unit `impl_hash` (all are read only in MIR lowering, so the MIR fingerprint
         // captures them and the object-cache key differs — verified), but force the cache **off**
-        // whenever either is set so a probe/baseline build can never read or publish a cross-toggle
+        // whenever any is set so a probe/baseline build can never read or publish a cross-toggle
         // object into the shared cache under any future refactor. Zero effect on normal builds
         // (toggles unset).
         if std::env::var_os("ALIGN_SORT_ADAPTIVE").is_some()
             || std::env::var_os("ALIGN_NEEDLE_HOIST").is_some()
+            || std::env::var_os("ALIGN_BUFFER_DONATE").is_some()
         {
             return CacheContext::Disabled;
         }
