@@ -523,15 +523,16 @@ pub fn profile_rt_available() -> bool {
     align_driver::profile_runtime_archive(&BuildTarget::Baseline).is_ok()
 }
 
-/// Produce a real merged `.profdata` for [`BRANCHY`] via the CLI round trip (gen build → run → merge)
-/// into `dir`, writing `dir/prog.align` first. Returns `None` when a required tool (`llvm-profdata`,
-/// the clang profile runtime, or the backend) is absent — the caller then skips (tool-gated).
-pub fn make_profdata(dir: &Path) -> Option<PathBuf> {
+/// Produce a real merged `.profdata` for `src` via the CLI round trip (gen build → run → merge) into
+/// `dir`, writing `dir/prog.align` (stem `prog`) first. Returns `None` when a required tool
+/// (`llvm-profdata`, the clang profile runtime, or the backend) is absent — the caller then skips
+/// (tool-gated). Shared by the S2 cache-composition gates ([`BRANCHY`]) and the SV bundle (its own kernels).
+pub fn make_profdata(dir: &Path, src: &str) -> Option<PathBuf> {
     let profdata_tool = align_driver::llvm_tool("llvm-profdata")?;
     if !backend_available() || !profile_rt_available() {
         return None;
     }
-    std::fs::write(dir.join("prog.align"), BRANCHY).ok()?;
+    std::fs::write(dir.join("prog.align"), src).ok()?;
     let gen_build = Command::new(env!("CARGO_BIN_EXE_alignc"))
         .env("ALIGNC_CACHE", "off")
         .current_dir(dir)

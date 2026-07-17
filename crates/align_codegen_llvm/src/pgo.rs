@@ -39,6 +39,8 @@ unsafe extern "C" {
         opt_level: c_int,
         kind: c_int,
         profdata_path: *const c_char,
+        out_matched: *mut c_int,
+        out_total: *mut c_int,
     ) -> c_int;
 }
 
@@ -71,6 +73,17 @@ impl PgoAction<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct PgoRunReport {
     pub warnings: Vec<String>,
+    /// The profile-match tally from the shim (see `align_pgo_run_pipeline`'s contract):
+    /// `matched` = defined functions this run gave a PGO entry count (found in the profile
+    /// with a matching structural hash), `total` = defined functions in the module. For a
+    /// [`PgoAction::Use`] run `matched == 0 && total > 0` is the "0%-match" signal — the
+    /// profile matched NONE of this module's functions (a likely wrong-program / incompatible
+    /// profile) — which the driver surfaces as a prominent WARNING (the tally is approximate
+    /// and a mismatched profile is performance-only; never a hard error). For
+    /// [`PgoAction::Instrument`] the pass sets no entry counts, so `matched` is 0 and the
+    /// value is meaningless (GEN reads no profile).
+    pub matched_fns: u32,
+    pub total_fns: u32,
 }
 
 // ---- in-process diagnostic capture (USE runs) ----------------------------
@@ -162,8 +175,19 @@ pub unsafe fn run_pgo_pipeline(
         }
     }
 
-    let rc =
-        unsafe { align_pgo_run_pipeline(module, tm, opt_level, action.kind(), path_ptr) };
+    let mut matched: c_int = 0;
+    let mut total: c_int = 0;
+    let rc = unsafe {
+        align_pgo_run_pipeline(
+            module,
+            tm,
+            opt_level,
+            action.kind(),
+            path_ptr,
+            &mut matched,
+            &mut total,
+        )
+    };
 
     // Clear the handler BEFORE `sink` drops — any later diagnostic on this context (e.g.
     // during object emission) must not dereference the freed sink pointer.
@@ -201,7 +225,11 @@ pub unsafe fn run_pgo_pipeline(
             errors.join("; ")
         )));
     }
-    Ok(PgoRunReport { warnings })
+    Ok(PgoRunReport {
+        warnings,
+        matched_fns: matched.max(0) as u32,
+        total_fns: total.max(0) as u32,
+    })
 }
 
 #[cfg(test)]

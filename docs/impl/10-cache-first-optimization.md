@@ -305,6 +305,15 @@ resolve it differently.
 > profile-use build no LLVM runs, so no staleness diagnostics are (re)emitted — correct, because the
 > staleness was already reported when each object was first built and is intrinsic to the cached
 > bytes. See `docs/impl/07-roadmap.md` "Instrument-PGO S2".
+>
+> **Publish semantics (SV, 2026-07-17):** a produced object is published to the CAS IMMEDIATELY on
+> success, in the codegen worker — publish is INDEPENDENT of any PGO profile-match ratio. Because the
+> key already carries the profile-content digest (`PgoKey::Use`), a published object is only ever served
+> to a build with the identical profile+source, so correctness never depended on how well the profile
+> matched; a 0%/partial-match profile-use build is a WARNING, not a rejected build, and there is nothing
+> to withhold from the cache. (An SV attempt to defer publish behind a 0%-match gate was reverted: it had
+> no reliable signal and regressed all modes — a build where one unit fails codegen must still leave its
+> succeeded siblings published. Full record = roadmap "Instrument-PGO SV SHIPPED".)
 
 ### 6.3 Runtime and link key
 

@@ -2818,6 +2818,14 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   "Instrument-PGO design SETTLED"): ONE new `align_pgo_run_pipeline` shim entry (llvm-sys 221 has
   no PGO surface), opt-in `--pgo-instrument` / `--pgo-use`, a `PgoMode` cache-key component; ELF
   needs `-Wl,--undefined=__llvm_profile_runtime` + the `clang_rt.profile` archive on instrument links.
+  **Instrument-PGO arc CLOSED 2026-07-17** (S0 #499 → S1 #500 → S2 #501 → SV; SV record = roadmap
+  "Instrument-PGO SV SHIPPED"): SV verification bundle green (determinism both modes, stale/wrong-profile
+  matrix, compile-time bound, and a MEASURED ~1.16× payoff on a branch-layout kernel). Settled (f)
+  AMENDED at SV: "0%-match = hard error" was falsified (no reliable match signal — tally undercounts via
+  inline+DCE, overcounts via `--rt-lto` baked primitives, per-unit cache bypasses a build-level gate), so
+  0%/partial match ships as a prominent WARNING (clang parity: performance-only); hard errors stay at the
+  reliable layer (bad-magic profdata + Error-severity libLLVM diagnostics). Deferred: sample PGO / BOLT,
+  CSPGO, PGO × `--thin-lto` composition.
   **Amended 2026-07-12 (post-#425 two-lens review; full record = roadmap "Post-upgrade wave"):**
   ThinLTO-across-Align-modules is MOOT (one `Program` → one module; the only boundary is the
   runtime FFI), the version wall DISSOLVED (rustc 1.96 = LLVM 22.1.2, same major as the 22.1.8

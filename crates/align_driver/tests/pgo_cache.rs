@@ -371,7 +371,7 @@ fn use_exe_is_byte_identical_cold_vs_hit() {
     let d = std::env::temp_dir().join(format!("align_pgo_s2_exe_use_{}_{}", std::process::id(), thin_nonce()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    let Some(profdata) = make_profdata(&d) else {
+    let Some(profdata) = make_profdata(&d, BRANCHY) else {
         let _ = std::fs::remove_dir_all(&d);
         return;
     };

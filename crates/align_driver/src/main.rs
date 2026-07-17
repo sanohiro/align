@@ -988,17 +988,32 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     if cache_stats {
         render_cache_stats(&build.outcomes, cache.is_enabled());
     }
-    // One aggregated Align-voice report for the `--pgo-use` staleness warnings the pipeline raised on the
-    // units that actually ran (cache MISSES), then proceed — the settled partially-stale policy (report,
-    // don't abort; no `--pgo-strict` knob). An all-hit build ran no LLVM, so has no warnings to surface:
-    // any staleness was reported when each object was first built and is intrinsic to the cached bytes.
-    if !build.pgo_warnings.is_empty() {
-        eprintln!(
-            "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across the rebuilt \
-             unit(s) (usually functions changed since the profile was collected); first: {}",
-            build.pgo_warnings.len(),
-            build.pgo_warnings[0]
-        );
+    // One aggregated Align-voice `--pgo-use` report over the units that actually ran (cache MISSES), then
+    // proceed — a mismatched profile is a PERFORMANCE concern, never a correctness one (clang parity), so
+    // it is a WARNING, never an abort. A `matched == 0` build (the profile applied to NOTHING) gets a
+    // prominent "is this the right profile?" line; a partial match rides the per-unit staleness warnings.
+    // Hard fails stay at the reliable layer (missing/bad-magic profdata; an Error-severity libLLVM
+    // diagnostic), handled before/inside codegen. An all-hit build ran no LLVM, so has a `0/0` tally and no
+    // warnings: any staleness was reported when each object was first built and is intrinsic to the bytes.
+    if matches!(pgo, align_driver::PgoMode::Use(_)) {
+        if build.pgo_total > 0 && build.pgo_matched == 0 {
+            eprintln!(
+                "alignc: --pgo-use: the profile matched 0 of {} rebuilt function(s) — is this profile \
+                 from this program? Proceeding without profile guidance (this affects performance only, \
+                 never correctness).",
+                build.pgo_total
+            );
+        } else if !build.pgo_warnings.is_empty() {
+            eprintln!(
+                "alignc: --pgo-use: proceeding despite {} PGO profile-use warning(s) across the rebuilt \
+                 unit(s) ({} of {} function(s) matched the profile; the rest changed since it was \
+                 collected); first: {}",
+                build.pgo_warnings.len(),
+                build.pgo_matched,
+                build.pgo_total,
+                build.pgo_warnings[0]
+            );
+        }
     }
     finish_link(&walk, &obj_paths, exe, profile, &target, pgo)
 }
