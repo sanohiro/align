@@ -13,16 +13,33 @@ Align は AOT コンパイル方式のデータ指向プログラミング言語
 
 ## インストール
 
-現状はソースからのビルドのみ提供しています。コンパイラのビルドには **Rust 1.96 以上** と **LLVM 22**（Cコンパイラ/リンカーとして対応する **clang**）が必要です。
+### Homebrew (macOS Apple Silicon)
 
-### Linux (Ubuntu 24.04)
+```sh
+brew tap sanohiro/align
+brew install align
+```
+
+### apt (Ubuntu 24.04)
+
+```sh
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+インストールスクリプトが LLVM 22 と Align の apt リポジトリを設定し、`apt install alignc` でコンパイラとランタイムが導入されます。
+
+### ソースからのビルド
+
+コンパイラのビルドには **Rust 1.96 以上** と **LLVM 22**（Cコンパイラ/リンカーとして対応する **clang**）が必要です。
+
+#### Linux (Ubuntu 24.04)
 
 公式リポジトリ (`apt.llvm.org`) から LLVM ツールチェーンをインストールします。`llvm-config-22` が `PATH` 上にある必要があります：
 ```sh
 sudo apt install llvm-22 llvm-22-dev clang-22
 ```
 
-### macOS (Apple Silicon)
+#### macOS (Apple Silicon)
 
 Homebrew で依存関係をインストールします：
 ```sh
@@ -34,7 +51,7 @@ export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
 export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
 ```
 
-### ビルド
+#### ビルド
 
 ```sh
 cargo build --release

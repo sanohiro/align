@@ -8,7 +8,22 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **NEON JSON STRING-ESCAPE CLASSIFIER ACTIVATED ON aarch64 — PR #520**
+_Last updated: 2026-07-18, **v0.1.0 RELEASED + brew/apt DISTRIBUTION LIVE**
+(owner-directed release). Tagged `v0.1.0` (annotated) + GitHub release with curated notes and the
+CI-built artifacts (3 tarballs, amd64/arm64 `.deb`, `align.rb`, checksums). Fixed the release
+workflow's `cp LICENSE` bug (repo is dual-licensed `LICENSE-APACHE`+`LICENSE-MIT`, no bare `LICENSE`
+— PR #523) and re-ran it via `workflow_dispatch --ref main -f tag=v0.1.0` (fixed logic against the
+tag tree, no tag move). **Homebrew**: created the `sanohiro/homebrew-align` tap, seeded
+`Formula/align.rb` manually, cleaned the formula + `.github/align.rb.template` (dual license, dep
+order — PR #524); `brew tap sanohiro/align && brew install align` verified end-to-end on this Mac
+(compiles+runs). **apt**: generated an align-specific GPG signing key (`align apt signing key`,
+`rsa4096/6981E7F9B2BCCBE7`, in local keyring + the `APT_GPG_PRIVATE_KEY` repo secret), enabled
+GitHub Pages on gh-pages; the signed repo serves at https://sanohiro.github.io/align/ (InRelease
+verifies, amd64+arm64 debs + `install.sh` live). READMEs now document brew/apt install (EN+JA).
+**ONE remaining optional step** (needs the owner's credential I can't set): add the
+`HOMEBREW_TAP_TOKEN` repo secret (the same PAT used for `ze`/`bcon`) so future releases auto-update
+the tap — until then the tap formula is seeded manually per release (apt auto-updates already, its
+secret is set). Previous update: 2026-07-18, **NEON JSON STRING-ESCAPE CLASSIFIER ACTIVATED ON aarch64 — PR #520**
 (owner-directed after the #517 stop: "the ARM speed investigation, x64 already done"). #504 shipped
 the AVX2/SSE2 escape classifier for `align_rt_builder_write_json_str` on x86-64; its NEON kernel
 (`json_escape_map_neon` / `write_json_str_neon`, shrn-by-4 lane map) was written + differentially

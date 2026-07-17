@@ -13,16 +13,33 @@ Currently supported platforms:
 
 ## Installation
 
-Align is currently distributed as source only. Building the compiler needs **Rust 1.96+** and **LLVM 22** (with a matching **clang** as the C compiler/linker).
+### Homebrew (macOS Apple Silicon)
 
-### Linux (Ubuntu 24.04)
+```sh
+brew tap sanohiro/align
+brew install align
+```
+
+### apt (Ubuntu 24.04)
+
+```sh
+curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
+sudo apt install alignc
+```
+The install script configures the LLVM 22 and Align apt repositories, then `apt install alignc` pulls the compiler and its runtime.
+
+### Build from source
+
+Building the compiler needs **Rust 1.96+** and **LLVM 22** (with a matching **clang** as the C compiler/linker).
+
+#### Linux (Ubuntu 24.04)
 
 Install the LLVM toolchain from the official `apt.llvm.org` repository; `llvm-config-22` must be on your `PATH`:
 ```sh
 sudo apt install llvm-22 llvm-22-dev clang-22
 ```
 
-### macOS (Apple Silicon)
+#### macOS (Apple Silicon)
 
 Install the dependencies with Homebrew:
 ```sh
@@ -34,7 +51,7 @@ export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
 export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
 ```
 
-### Build
+#### Build
 
 ```sh
 cargo build --release
