@@ -6,6 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/crypto.md)
 
+> **Status:** complete for the M11 v1 surface. The documented BLAKE3 exception remains deferred.
+
 ## Overview
 
 crypto.random, sha256/sha512, blake3, hmac, hkdf, argon2id, aes_gcm, chacha20_poly1305,

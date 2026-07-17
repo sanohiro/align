@@ -6,6 +6,8 @@
 
 > 🌐 [English](../net.md) · **日本語**
 
+> **ステータス:** M11 で完了済みです。DNS、TCP client/server、UDP は実装済みです。
+
 ## Overview
 
 低レベルのソケット群である: tcp、udp、dns、socket。いずれも syscall に裏打ちされる。設計の要は再利用に

@@ -6,6 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/cli.md)
 
+> **Status:** shipped in M10. This file is the implemented contract plus its historical slice plan.
+
 ## Overview
 
 A parser over `main(args: array<str>)`'s `array<str>` (§17) — the one argv source (no

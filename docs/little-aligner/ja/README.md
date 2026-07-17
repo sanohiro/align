@@ -26,4 +26,4 @@
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`、`agg`、`dict_encode`
 11. [Do It Until](11-do-it-until.md) — `loop` 式、pipeline で言い表せないとき
 
-ここにあるものはすべて、いまの `alignc` で動きます(11章の `loop` を除く。これは設計済みですがまだ実装中で、その旨は該当箇所に書いてあります)。では、召し上がれ。
+ここにあるものはすべて、いまの `alignc` で動きます。では、召し上がれ。

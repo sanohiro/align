@@ -5,6 +5,8 @@
 
 > 🌐 [English](../process.md) · **日本語**
 
+> **ステータス:** M11 で完了済みです。exit/abort、spawn/wait/kill、exec は実装済みです。
+
 ## Overview
 
 spawn / exec / exit(draft §18.2)。fork/exec/waitpid と、子プロセスを表す child Move ハンドルで構成する。

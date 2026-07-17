@@ -91,7 +91,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`.agg(...)` interns each key once and folds all the accumulators in a single pass — the shape a hand-written analytics loop takes, generated from a declaration. (First cut: `str`-key AoS sources; soa-source `.agg` is implementation in progress.)
+`.agg(...)` interns each key once and folds all the accumulators in a single pass — the shape a hand-written analytics loop takes, generated from a declaration. It accepts `str`-key AoS and SoA sources. Numeric-key SoA supports the individual grouped reducers; its multi-aggregate `.agg(...)` form remains deferred.
 
 ## `dict_encode` — pay for the key once
 

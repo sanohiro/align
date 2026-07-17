@@ -338,11 +338,11 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    `Block`/`If`/`match`/`else`/`?` paths, so a fresh selected arm is dropped while a bound selected arm
    remains borrowed. Value-carrying owned moves also carry their ordinary runtime ownership bit and
    null the selected source, removing the older branch-move restriction without blanket frees.
-5. **More terminals (in progress).** `min`/`max` reductions **[done]** — fused-loop reducers
+5. **More terminals (complete for this slice; later additions noted).** `min`/`max` reductions **[done]** — fused-loop reducers
    (`Reducer::MinMax`) that keep an element only when it beats the running best (a conditional
    update branching to the loop `cont`), seeded with the element type's extreme so an empty
    pipeline yields that extreme (the fold identity, like `sum → 0`). Completes the common
-   reduction set (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`). `scan(f, init)` **[done]** —
+   reduction set (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`). `scan(init, f)` **[done]** —
    a *materializing prefix fold* on the `to_array` collect loop (`CollectKind::Scan`): threads an
    accumulator seeded with `init` and appends the running `acc = f(acc, element)` per survivor,
    yielding an owned `array<A>` (freed as a free-standing temporary / arena-bulk-freed like
@@ -355,9 +355,10 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    `array<T>` (the `to_array` collect loop) then sorts that buffer ascending in place with
    insertion sort (`lower_array_sort`): reads via `SliceIndex`, writes via `PtrStore` through the
    buffer pointer (new `SlicePtr` rvalue). First cut: numeric scalar elements, no comparator
-   argument (a `sort(cmp)` overload and a faster-than-O(n²) sort are follow-ups). **Remaining:**
-   `partition` (needs a 2-array product/tuple result — no tuple type yet) and `chunks` (needs a
-   nested `array<slice<T>>` type) — each its own follow-up, gated on new type machinery.
+   argument (a `sort(cmp)` overload and a faster-than-O(n²) sort are follow-ups). The original
+   remaining items, `partition` and `chunks`, shipped after tuples and the required nested view
+   machinery landed; see the M6/M7 records in `07-roadmap.md`. Runtime-length `dot` and richer sort
+   policies remain follow-ups.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
    - **[done] 6a — `str` field decode.** `json.decode` now accepts `str` fields: each decodes

@@ -63,7 +63,7 @@ Same arena rule (the `bytes` view can't outlive the arena), same v1 limitations 
 
 ## Streams: `reader`, `writer`, `buffer`
 
-The streaming tier, for data bigger than memory. The shape is the `loop` expression from chapter [02](02-language-basics.md) (**implementation in progress** — today this pump lives inside `io.copy` below):
+The streaming tier, for data bigger than memory. Its control shape is the `loop` expression from chapter [02](02-language-basics.md):
 
 ```align
 import std.fs

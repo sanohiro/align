@@ -6,6 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/compress.md)
 
+> **Status:** complete in M11. gzip and zstd compression/decompression are shipped.
+
 ## Overview
 
 gzip, zstd (draft §18.2). The keystone library strategy: **own the memory wrappers, borrow the

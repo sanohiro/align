@@ -16,11 +16,13 @@ but read the order from here.
 - **No backward compatibility** (pre-release) — change APIs outright; no aliases / shims / dual paths.
 - **Finish all of `core` + the language before `std`** — the OS-boundary layer (`std`/`pkg`) waits.
 
-**Current (2026-07-15): M0–M15 are complete.** M11–M13, the LLVM 19→22 checkpoint,
-M14's LTO ceiling/runtime-bitcode slices, and M15 separate compilation (unit interfaces,
+**Current (2026-07-17): M0–M15 are complete; the post-M15 ThinLTO and instrument-PGO arcs are
+also closed.** M11–M13, the LLVM 19→22 checkpoint, M14's LTO ceiling/runtime-bitcode slices,
+and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. The workspace is 2137 green (2136 passed + one ignored manual
-probe) and clippy-clean. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
+verification bundle) are complete. Cached/parallel cross-unit ThinLTO and instrumented PGO through
+their verification/payoff gates are also complete. The workspace is 2272 total (2254 passed + 18
+ignored) and clippy-clean in the recorded feature states. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns
 are rejected as #459, and shared intra-frame borrow-liveness dataflow shipped as #460. The first
 broader escape-analysis structural gate shipped as #461: expression provenance, local-slice
@@ -43,7 +45,9 @@ composition and owned move/drop behavior for block / `if` / `match` / `else`-unw
 carrying the selected arm's individual-vs-arena bit through the same MIR join as its value. No
 mandatory implementation slice or receiver-specific borrow patch remains queued. Fully-escaping
 function values remain deliberately deferred pending a settled heap-owned environment/drop model
-and a consumer.
+and a consumer. Remaining optimization candidates are explicitly measure-first: sample PGO/BOLT,
+PGO × ThinLTO, the doc-13 P3 gates, and deferred ThinLTO tooling/internalization refinements; none
+is a correctness blocker.
 
 **Historical snapshot (2026-07-10; superseded by the current line above):** **M0–M10 are complete
 and formally closed** — the language core
@@ -406,7 +410,8 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   one fused loop.
 - [done] `slice<T>` views (function parameters, array→slice borrow, pipelines over
   slices with runtime length).
-- [done] `reduce(f, init)` terminal (generalizes `sum`; shares the fused loop).
+- [done] `reduce(init, f)` terminal (generalizes `sum`; shares the fused loop; current init-first
+  order after the pre-release hard cutover).
 - [done] `count()` terminal — counts the elements surviving the stages (`i64`). Shares the
   fused loop (`acc + 1` per kept element); needs no scalar element, so it works on a struct
   array with only a `where(.field)` filter (`[...].where(.active).count()`).
@@ -615,7 +620,8 @@ later slices (struct arrays, M5 strings/JSON).
   is static, reading each element field via the new HIR `IndexField`). `str` fields are
   emitted as JSON string literals (quoted + escaped per RFC 8259) by the runtime
   `align_rt_builder_write_json_str`. Nested structs, dynamic arrays/options, and
-  `json.decode` are not implemented yet.
+  `json.decode` were not implemented at this intermediate M5 slice; the later completed entries
+  below supersede that limitation.
 - [done] `.len()` on `str`/`slice<T>` (the `len` field of the `{ ptr, len }` view; for
   `str` this is the **byte** length) and on a fixed array/struct-array (the static element
   count). Returns `i64`. Reuses the MIR `SliceLen` rvalue.
@@ -647,7 +653,8 @@ later slices (struct arrays, M5 strings/JSON).
   is the `draft.md` §19 headline. Field tables are emitted as compile-time constant globals.
   Still deferred: nested-struct fields and SIMD scan. (`<T>` generic-call syntax is not deferred
   but **settled away** — the binding annotation infers the target through `?`; no turbofish.)
-- [todo] owned `string` / `bytes`, const string pool, `html`/`json` template variants.
+- [done] owned `string` / `bytes` and the const string pool. The `html` / `raw` / JSON-template
+  variants remain deferred; only plain `template "…"` is shipped.
 
 Status (M5-A): `str` is a Copy view, lexed with the common escapes; literals lower to a
 private constant + `{ ptr, len }`. `print` accepts `str` or an integer. `examples/strings.align` runs.
@@ -1065,9 +1072,8 @@ false-positive: unhandled-`Result` (#138), huge-struct-copy (#234), lossy-cast +
 wasteful-default-element (#313), unnecessary-heap narrow form (#323). **Not blockers, tracked as
 post-M8 backlog** (own section below): the frequency-dependent lints (allocation-in-loop, the
 broader unnecessary-clone/unnecessary-heap forms, branch-in-hot-loop, string re-scan, implicit
-copy), `prefer-pipeline-over-vecN` (no firing surface — Align has no loop construct to convert) (Update
-2026-07-09: a `loop` expression is now design-settled — `open-questions.md` Settled → "Sequential
-control" — so this lint gains its firing surface once `loop` is implemented.),
+copy), `prefer-pipeline-over-vecN` (originally had no firing surface; the `loop` expression shipped
+2026-07-10, so the lint now has a surface but its frequency model and diagnostic remain deferred),
 and the hot/cold field-split suggestion (needs heuristic design).
 
 - the official formatter (mandatory, `draft.md` §16). — **DONE** (`alignc fmt`, the `align_fmt`

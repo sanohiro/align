@@ -26,4 +26,4 @@ Some answers are one word. Some questions look identical to the one before — t
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`, `agg`, `dict_encode`
 11. [Do It Until](11-do-it-until.md) — the `loop` expression, when a pipeline can't say it
 
-Everything here runs with today's `alignc` (except chapter 11's `loop`, which is designed but still being built — it says so there). Bon appétit.
+Everything here runs with today's `alignc`. Bon appétit.

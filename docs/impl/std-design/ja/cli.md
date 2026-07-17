@@ -6,6 +6,8 @@
 
 > 🌐 [English](../cli.md) · **日本語**
 
+> **ステータス:** M10 で実装済みです。この文書は実装済み contract と歴史的な slice plan を併記します。
+
 ## Overview
 
 `main(args: array<str>)` が受け取る `array<str>`(§17)をパースするモジュールである。argv の入手経路は

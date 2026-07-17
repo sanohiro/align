@@ -63,7 +63,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 ## ストリーム: `reader`、`writer`、`buffer`
 
-メモリより大きなデータのためのストリーミング階層です。その形は、第 [02](02-language-basics.md) 章の `loop` 式です(**implementation in progress** — 現時点では、このポンプ処理は下の `io.copy` の中に収められています)。
+メモリより大きなデータのためのストリーミング階層です。その制御の形は、第 [02](02-language-basics.md) 章の `loop` 式です。
 
 ```align
 import std.fs
@@ -98,7 +98,7 @@ pub fn main() -> Result<(), Error> {
 
 `io.stdin` / `io.stdout` / `io.stderr` は借用された標準ストリームです。出力の多い処理では `w := io.stdout.buffered()` … `w.flush()?` のようにラップします。
 
-**一度は必ずつまずく v1 のルール:** *所有された*ハンドルは、使う前に**ローカル変数へ束縛**しなければなりません。`fs.create(p)?.write(d)?` は拒否されます。名前のない一時値はクリーンアップを実行しないままドロップされてしまう(今のところ)ため、コンパイラが名前を付けることを強制するのです。借用された標準ストリームは例外です(`io.stdout.write("ok\n")?` は問題ありません)。ただし `.buffered()` したライターは例外ではありません(最後の flush はドロップ時に走るので、名前を付ける必要があります)。この制限は、Move 一時値がドロップを得れば解除されます(実装中)。
+**一度は必ずつまずく v1 のルール:** *所有された*ハンドルは、method を使う前に**ローカル変数へ束縛**しなければなりません。`fs.create(p)?.write(d)?` は拒否されるので、先に handle に名前を付けます。借用された標準ストリームは例外です(`io.stdout.write("ok\n")?` は問題ありません)。`.buffered()` writer は所有するため名前が必要です。一般の無名 Move 値には 2026-07-15 から cleanup がありますが、この receiver surface を緩めるには mutating/consuming handle method 用の安定した address も必要で、別の制限として残っています。
 
 ## `std.path`、`std.env`、`std.time`
 
