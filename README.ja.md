@@ -13,18 +13,29 @@ Align は AOT コンパイル方式のデータ指向プログラミング言語
 
 ## インストール
 
-現状はソースからのビルドのみ提供しています。コンパイラをビルドするには以下が必要です：
+現状はソースからのビルドのみ提供しています。コンパイラのビルドには **Rust 1.96 以上** と **LLVM 22**（Cコンパイラ/リンカーとして対応する **clang**）が必要です。
 
-- **Rust 1.96 以上**
-- **LLVM 22** (`llvm-config-22` が `PATH` 上にある必要があります)
-- **clang-22** (Cコンパイラ/リンカーとして使用します)
+### Linux (Ubuntu 24.04)
 
-Ubuntu 24.04 の場合は、公式リポジトリ (`apt.llvm.org`) から LLVM 依存関係をインストールできます：
+公式リポジトリ (`apt.llvm.org`) から LLVM ツールチェーンをインストールします。`llvm-config-22` が `PATH` 上にある必要があります：
 ```sh
 sudo apt install llvm-22 llvm-22-dev clang-22
 ```
 
-ビルド手順：
+### macOS (Apple Silicon)
+
+Homebrew で依存関係をインストールします：
+```sh
+brew install llvm openssl@3 zstd
+```
+現在 `llvm` formula は LLVM 22 を提供します。Homebrew の `llvm` が 22 より先に進んでいる場合は、バージョン固定の `llvm@22` formula を代わりにインストールしてください。Homebrew の LLVM は keg-only（`llvm-config` が `PATH` に載りません）なので、ビルドがそれを参照できるようにし、ランタイムのネイティブライブラリ（`zstd`、`openssl@3`）のリンカ検索パスを追加します。以下をシェルのプロファイルに追加するか、`cargo` / `alignc` の各コマンドの先頭に付けてください（`alignc` でビルドしたプログラムがこれらのライブラリをリンクして実行する際にも、同じ `LIBRARY_PATH` が必要です）：
+```sh
+export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
+export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
+```
+
+### ビルド
+
 ```sh
 cargo build --release
 # コンパイラは target/release/alignc に生成されます

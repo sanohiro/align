@@ -13,18 +13,29 @@ Currently supported platforms:
 
 ## Installation
 
-Align is currently distributed as source only. To build the compiler from source, you need:
+Align is currently distributed as source only. Building the compiler needs **Rust 1.96+** and **LLVM 22** (with a matching **clang** as the C compiler/linker).
 
-- **Rust 1.96+**
-- **LLVM 22** (Must be on your `PATH` as `llvm-config-22`)
-- **clang-22** (Used as the C compiler/linker)
+### Linux (Ubuntu 24.04)
 
-On Ubuntu 24.04, you can install the LLVM dependencies via the official repository (`apt.llvm.org`):
+Install the LLVM toolchain from the official `apt.llvm.org` repository; `llvm-config-22` must be on your `PATH`:
 ```sh
 sudo apt install llvm-22 llvm-22-dev clang-22
 ```
 
-Build the compiler:
+### macOS (Apple Silicon)
+
+Install the dependencies with Homebrew:
+```sh
+brew install llvm openssl@3 zstd
+```
+The `llvm` formula currently provides LLVM 22; if Homebrew has since moved it past 22, install the versioned `llvm@22` formula instead. Homebrew's LLVM is keg-only (its `llvm-config` is not on your `PATH`), so point the build at it and add the linker search paths for the runtime's native libraries (`zstd`, `openssl@3`). Add these to your shell profile, or prefix each `cargo` / `alignc` command with them (the same `LIBRARY_PATH` is needed when running an `alignc`-built program that links those libraries):
+```sh
+export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
+export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
+```
+
+### Build
+
 ```sh
 cargo build --release
 # The compiler binary will be at target/release/alignc
