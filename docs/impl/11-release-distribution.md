@@ -14,7 +14,7 @@ These are native builds, not cross-compiles. That matters because the compiler l
 
 ## CI and release contracts
 
-`.github/workflows/ci.yml` builds and tests the workspace on all three supported targets with Rust 1.96 and LLVM 22. Clippy, the workspace tests, a release build, and `alignc --version` are gates. A repository-wide rustfmt baseline is intentionally separate from this release-automation change.
+`.github/workflows/ci.yml` builds and tests the workspace on all three supported targets with Rust 1.96 and LLVM 22. Linux CI uses a checksum-pinned OpenSSL 3.5 LTS build because `crypto.argon2id` requires OpenSSL 3.2 or newer, while Ubuntu 24.04 provides OpenSSL 3.0. Clippy runs once on Linux x86_64; aarch64 maps C `char` to `u8`, which makes several otherwise-portable FFI casts appear redundant only on that target. The macOS job skips two cache tests whose assertions require a distinct baseline/native CPU identity and byte-identical linked executables; neither condition is portable to Apple Silicon and the Mach-O linker. All targets still gate the workspace build, the remaining workspace tests, a release build, and the packaged-command smoke test. A repository-wide rustfmt baseline is intentionally separate from this release-automation change.
 
 `.github/workflows/release.yml` runs for `v*` tags (or an explicitly selected tag), rejects a tag whose version differs from `[workspace.package].version`, and then:
 
@@ -33,7 +33,7 @@ The distributed compiler is not self-contained:
 - LLVM 22 is dynamically linked into `alignc`.
 - `cc` links every executable produced by `alignc`.
 - `clang-22` and compiler-rt are used by instrumented PGO.
-- zlib, zstd, and OpenSSL are linked only when the source program uses the corresponding standard-library capability.
+- zlib, zstd, and OpenSSL are linked only when the source program uses the corresponding standard-library capability. `crypto.argon2id` specifically requires OpenSSL 3.2 or newer.
 
 The Debian package therefore depends on LLVM/Clang 22 and the development packages that provide the capability-library linker names. It installs the real compiler and runtime archive together under `/usr/lib/align`, with `/usr/bin/alignc` as a small launcher. The apt installer configures apt.llvm.org before the Align repository. The Homebrew formula likewise installs both artifacts under `libexec`, and its launcher exposes the keg-only OpenSSL and zstd library directories through `LIBRARY_PATH` for the system linker.
 

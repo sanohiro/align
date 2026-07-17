@@ -8,6 +8,10 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+if [ ! -f /etc/os-release ]; then
+  echo "alignc packages currently support Ubuntu 24.04 (noble) only" >&2
+  exit 1
+fi
 . /etc/os-release
 if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_CODENAME:-}" != "noble" ]; then
   echo "alignc packages currently support Ubuntu 24.04 (noble) only" >&2
