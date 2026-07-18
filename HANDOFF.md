@@ -8,7 +8,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY COMPLETE — SLICE C (`array<Struct>` struct fields
+_Last updated: 2026-07-18, **JSON-COMPLETENESS DESIGN SETTLED — MERGED as #530** (`50b3865`;
+owner-directed "design before implementation"). Three forks settled with the owner: (1) **unions =
+shape-directed sum-type mapping** — a JSON `oneOf` maps to a sum type discriminated by the value's
+shape class (Str/Number/Bool/Object/Array; pairwise-distinct compile-checked; O(1) first-byte
+dispatch; `null` is not a class — absence stays `Option`'s; encode writes the live payload bare);
+language prerequisite = enum `str` payloads (region tracking) + owned payloads (`array<Struct>`,
+tag-switched drop) — enums are today neither region-tracked nor dropped (`enum_payload_ok`). (2)
+**dynamic JSON = `json.doc` lazy view; serde-style value tree REJECTED** (per-node alloc +
+pointer-chasing vs Nothing hidden/data-oriented; would drag recursive enums + a map type in);
+simdjson on-demand over the existing SIMD index, arena tape, zero-copy views; **navigation is total
+and Missing-propagating** (design-review catch: `?` is Result-only, so Option-returning `get/at`
+would be unusable — absence surfaces once as `None` from a leaf `as_*`); keys-as-data via ordered
+`key(i)`+`at(i)` — NO map type enters the language. (3) **catalog trimmed**: `validate<T>` /
+`token` / `field_table<T>` DELETED (not left dangling); `core.json` = `decode`/`encode`/`doc`/
+`scan` exactly; the no-turbofish schema-selector residual is CLOSED. Recorded across
+open-questions ("JSON completeness — DESIGN SETTLED", the implementation source of truth), draft
+§14 (Union Mapping / Document View / Streaming sections) + §18.1, design-notes (three rejections'
+rationale), history (rejected alternatives), language-spec digest, core-design/json.md (+ja).
+**Implementation slices: J1** enum `str` payloads + shape-directed unions (str/number/bool/object)
+→ **J2** enum owned payloads → the gateway's `content` union closes → **J3** matrix fill
+(`Option<struct>` encode, `array<scalar>` fields, top-level scalars, compositions) → **J4**
+`json.doc` → **J5** `json.scan` → **J6** spec sync. **NEXT: J1.** Previous update: 2026-07-18,
+**REST-GATEWAY RUNWAY COMPLETE — SLICE C (`array<Struct>` struct fields
 + array decode/encode) SHIPPED, MERGED as #529** (`9a40d60`). A struct field may now be an owned
 `array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; **the full OpenAI
 chat-completions request/response now round-trips byte-identically through `core.json`** (Slices
