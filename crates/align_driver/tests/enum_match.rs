@@ -525,3 +525,195 @@ fn struct_recursive_through_enum_field_rejected() {
          fn main() -> i32 = 0\n"
     ));
 }
+
+// ---- J2: enum owned `array<T>` payloads + tag-switched drop (the enum becomes Move) --------------
+// Standalone (non-JSON) coverage uses an `array<i64>` payload — the only owned array constructible
+// outside `json.decode` (`.to_array()` over structs is deferred). The owned `array<Struct>` payload
+// (`Parts(array<Part>)`, the multimodal `Content` union) is covered end-to-end in `m5.rs` (J2b).
+
+#[test]
+fn enum_owned_array_payload_construct_match_drop() {
+    if !backend_available() {
+        return;
+    }
+    // Construct a Move sum type from a bound owned array (moved into the variant — its source slot is
+    // nulled so the exit tag-switched `Drop` frees the buffer exactly once). Match distinguishes the
+    // variants; the owned variant is covered by a top-level `_` (its payload is never extracted, so
+    // the enum owns it until its scope-end drop). A clean exit proves no double-free / leak (the
+    // runtime aborts on allocator corruption).
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn main() -> i32 {\n  \
+        ns := [10, 20, 5].to_array()\n  \
+        c := Content.Nums(ns)\n  \
+        return match c {\n    Text(t) => t.len() as i32\n    _       => 0\n  }\n}\n";
+    let out = build_and_run("enum-owned-arr", src);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn move_enum_returned_and_consumed() {
+    if !backend_available() {
+        return;
+    }
+    // A Move sum type is freely returnable (it owns its buffer — `region_of` Static, like `array`
+    // itself), passed by value into a consumer that drops it, on both a scalar-array and a `str`
+    // branch joined through an `if`. Exercises return-move, param-move-consume, and the if drop-flag
+    // join; a clean exit + correct total proves single-free on every path.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn make(k: i64) -> Content {\n  \
+        if k == 0 { return Content.Text(\"zero\") }\n  \
+        return Content.Nums([k, k * 2, k * 3].to_array())\n}\n\
+        fn size(c: Content) -> i64 = match c {\n  Text(t) => t.len() as i64\n  _       => 100\n}\n\
+        fn main() -> i32 {\n  \
+        a := make(0)\n  b := make(7)\n  return (size(a) + size(b)) as i32\n}\n";
+    let out = build_and_run("move-enum-ret", src);
+    assert_eq!(out.status.code(), Some(104)); // 4 ("zero") + 100
+}
+
+#[test]
+fn move_enum_if_join_scalar_and_str_variant() {
+    if !backend_available() {
+        return;
+    }
+    // The two `if` arms install *different* Move-enum variants (an owned-array `Nums` and a borrowed
+    // `str` `Text`) into one slot; the drop-flag join + tag-switched drop free whichever variant is
+    // live on the taken path (an unconstructed path frees nothing). No leak / double-free either way.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn pick(k: i64) -> i32 {\n  \
+        c := if k > 0 { Content.Nums([k].to_array()) } else { Content.Text(\"neg\") }\n  \
+        return match c {\n    Text(t) => t.len() as i32\n    _       => 42\n  }\n}\n\
+        fn main() -> i32 = pick(3) + pick(-1)\n";
+    let out = build_and_run("move-enum-ifjoin", src);
+    assert_eq!(out.status.code(), Some(45)); // 42 (Nums) + 3 ("neg")
+}
+
+#[test]
+fn scalar_only_and_str_enum_stay_non_move() {
+    if !backend_available() {
+        return;
+    }
+    // Precision guard: adding the Move arm must not over-classify. A scalar-only enum and a `str`-view
+    // enum own no buffer, so they stay Copy (freely constructed/matched with no drop) — verified by a
+    // clean run distinguishing both.
+    let src = "Tag { A(i64), B }\n\
+        Name { N(str), Empty }\n\
+        fn main() -> i32 {\n  \
+        t := Tag.A(3)\n  n := Name.N(\"hi\")\n  \
+        x := match t { A(v) => v, B => 0 }\n  \
+        y := match n { N(s) => s.len() as i64, Empty => 0 }\n  \
+        return (x + y) as i32\n}\n";
+    let out = build_and_run("enum-nonmove", src);
+    assert_eq!(out.status.code(), Some(5)); // 3 + 2
+}
+
+#[test]
+fn binding_owned_enum_payload_in_match_moves_it_out() {
+    if !backend_available() {
+        return;
+    }
+    // Binding a Move (owned `array`) payload in a match arm moves the buffer out of the scrutinee:
+    // `lower_match_enum` nulls the scrutinee on a bound arm (so its exit `Drop` frees null) and the
+    // binding local owns the buffer, dropped once at scope end — the same path `Result`/`Option`
+    // already use for their Move payloads. A clean run proves single-free.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn take(c: Content) -> i64 = match c {\n  Text(t)  => t.len() as i64\n  Nums(ns) => ns.sum()\n}\n\
+        fn main() -> i32 {\n  \
+        return (take(Content.Nums([3, 4, 5].to_array())) + take(Content.Text(\"hi\"))) as i32\n}\n";
+    let out = build_and_run("enum-bind-owned", src);
+    assert_eq!(out.status.code(), Some(14)); // 12 (3+4+5) + 2 ("hi")
+}
+
+#[test]
+fn move_enum_struct_field_rejected() {
+    // A Move sum-type field (an owned-array payload variant) is deferred — an owned enum struct
+    // field's drop-as-a-field has no consumer yet. (A non-Move enum field stays allowed, J1b.)
+    assert!(check_errs(
+        "enum-movefield",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         Msg { c: Content }\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn array_string_and_move_struct_enum_payloads_rejected() {
+    // The owned-array payload element must be non-owned (one flat free): `array<string>` (a
+    // per-element deep free) and `array<Move-struct>` are deferred, rejected cleanly rather than
+    // leaked per element — the exact Slice-C rule, now for enum payloads.
+    assert!(check_errs(
+        "enum-arrstring",
+        "E { V(array<string>), Z }\nfn main() -> i32 = 0\n"
+    ));
+    assert!(check_errs(
+        "enum-arrmovestruct",
+        "Owned { s: string }\nE { V(array<Owned>), Z }\nfn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn move_enum_option_result_payload_rejected() {
+    // A Move sum type as an `Option`/`Result` payload is deferred (the drop machinery frees a flat
+    // `{ptr,len}` for a payload, not a tag-switched enum drop; `payload_is_move` is table-free and
+    // cannot see the Move enum, so admitting it would leak). Rejected at the `Some`/`Ok`/`Err` wrap
+    // site — the sole origin of such a value. (A scalar-only enum payload stays allowed.)
+    assert!(check_errs(
+        "moveenum-some",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         fn main() -> i32 {\n  o := Some(Content.Nums([1].to_array()))\n  return match o { Some(_) => 0, None => 1 }\n}\n"
+    ));
+    assert!(check_errs(
+        "moveenum-err",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         fn f() -> Result<i64, Content> = Err(Content.Nums([1].to_array()))\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn move_enum_array_element_rejected() {
+    // A fixed array of a Move sum type is deferred — its per-element tag-switched drop has no
+    // consumer, and a fixed `array<Enum>` is not a droppable struct-array, so it would leak each
+    // element's buffer. (An owned `array<Enum>` isn't even expressible — enums are not array elements.)
+    assert!(check_errs(
+        "moveenum-arrelem",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         fn main() -> i32 {\n  xs := [Content.Nums([1].to_array()), Content.Text(\"a\")]\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn move_enum_lambda_capture_rejected() {
+    // Capturing a Move sum type by value into a lambda would copy-capture and double-drop it —
+    // rejected like any owned capture (`ty_capture_is_move`).
+    assert!(check_errs(
+        "moveenum-capture",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         fn main() -> i32 {\n  c := Content.Nums([1].to_array())\n  ys := [1, 2, 3].par_map(fn s { match c { Text(t) => s, _ => s + 1 } })\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn nested_array_and_soa_enum_payload_rejected_not_panic() {
+    // A non-representable owned-array element — a nested `array<array<T>>` (no payload `Scalar`) — is
+    // rejected with a clean diagnostic, never a compiler panic (Gate 3: diagnose, don't crash).
+    assert!(check_errs(
+        "enum-nestedarr",
+        "E { V(array<array<i64>>), Z }\nfn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn owned_enum_payload_moves_out_of_match_as_return() {
+    if !backend_available() {
+        return;
+    }
+    // The strongest binding case: the bound owned `array` is moved OUT of the match arm as the
+    // function's return value (ownership transfer across a boundary). The scrutinee is nulled, the
+    // caller's returned array owns the buffer and frees it once — a clean run + correct sum proves it.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn extract(c: Content) -> array<i64> = match c {\n  Nums(ns) => ns\n  Text(t)  => [0].to_array()\n}\n\
+        fn main() -> i32 {\n  \
+        xs := extract(Content.Nums([7, 8, 9].to_array()))\n  return xs.sum() as i32\n}\n";
+    let out = build_and_run("enum-bind-moveout", src);
+    assert_eq!(out.status.code(), Some(24)); // 7 + 8 + 9
+}

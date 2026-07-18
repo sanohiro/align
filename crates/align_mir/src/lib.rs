@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, enum_is_move, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -2034,6 +2034,9 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                         // A Move struct (owns a `string`/owned field) moved away must be nulled too,
                         // so its exit `Drop` frees null, not the buffers the new owner took.
                         || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs))
+                        // A Move enum (owns an `array<Struct>` payload, J2) moved away must be nulled
+                        // so its exit tag-switched `Drop` frees null, not the buffer the new owner took.
+                        || matches!(ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums))
                 }
                 None => false,
             };
@@ -2055,6 +2058,14 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // local's exit `Drop` double-frees the buffer now owned by the aggregate.
         hir::ExprKind::ResultOk(inner) | hir::ExprKind::ResultErr(inner) | hir::ExprKind::OptionSome(inner) => {
             null_moved_source(b, inner);
+        }
+        // A bound owned local moved into a sum-type variant (`Content.Parts(xs)`, J2) is consumed by
+        // the construction — null each payload source slot, else the local's exit `Drop` and the
+        // enum's tag-switched `Drop` both free the same buffer.
+        hir::ExprKind::EnumValue { payload, .. } => {
+            for p in payload {
+                null_moved_source(b, p);
+            }
         }
         // A tuple literal moves each owned-local element into the tuple (its consumer — a
         // destructure target, or the returned tuple's caller — now owns the buffer), so null those
@@ -2173,7 +2184,7 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
 /// producers can extend it and scalar consumers can end it immediately.
 fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
-    if !needs_drop_flag(e.ty, &b.structs, &b.tuples) || !may_need_synthetic_owner(e) {
+    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums) || !may_need_synthetic_owner(e) {
         return lower_expr(b, e);
     }
     // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
@@ -2221,7 +2232,7 @@ fn control_result_slots(b: &mut Builder, ty: Ty) -> (Option<Slot>, Option<Slot>,
         return (None, None, None);
     }
     let value = b.new_slot(ty);
-    let flag = needs_drop_flag(ty, &b.structs, &b.tuples).then(|| b.new_slot(Ty::Bool));
+    let flag = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums).then(|| b.new_slot(Ty::Bool));
     let temp_flag = flag.map(|_| b.new_slot(Ty::Bool));
     (Some(value), flag, temp_flag)
 }
@@ -8869,7 +8880,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
-    if needs_drop_flag(ok_ty, &b.structs, &b.tuples)
+    if needs_drop_flag(ok_ty, &b.structs, &b.tuples, &b.enums)
         && let Some(flag) = inner_flag
     {
         b.attach_value_drop_flag(v, flag.clone());

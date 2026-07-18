@@ -4764,10 +4764,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // element's owned fields read {null,0} until constructed — its per-element
                         // `Drop` then frees nulls on an unwritten element (no-op). (Slice 4a.)
                         self.llvm_type(ty).into_array_type().const_zero().into()
-                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::DictEncoded(..)) {
+                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..)) {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
-                        // unconstructed / moved-out path (no-op) — see `drop_struct_fields`.
+                        // unconstructed / moved-out path (no-op) — see `drop_struct_fields`. A Move enum
+                        // (J2) zeroes to tag 0 + null payloads, so its tag-switched `Drop` frees null
+                        // (no-op) on an unconstructed / moved-out path — see `drop_enum`.
                         self.llvm_type(ty).into_struct_type().const_zero().into()
                     } else {
                         slice_struct_type(self.ctx).const_zero().into()
@@ -5033,6 +5035,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
                             .map_err(|e| self.err(e))?;
+                    } else if let Ty::Enum(eid) = ty {
+                        // A Move sum type (J2): tag-switched drop — free the live variant's owned
+                        // `array<Struct>` payload buffer (null-safe on a moved-out / unconstructed slot).
+                        self.drop_enum(self.slots[slot], eid)?;
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -7961,6 +7967,67 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Tag-switched drop of a **Move** sum type (J2): load the i32 tag, switch on it, and for each
+    /// variant carrying an owned payload free that payload's buffer. A variant whose payload is a
+    /// scalar / `str` / plain-struct owns nothing and falls through (the `else` continue block). Every
+    /// owned enum payload today is an owned `array<T>` — a `{ptr,len}` freed by its field-0 pointer,
+    /// one flat free (the element is non-owned, pass 0c). Null-safe: an unconstructed / moved-out enum
+    /// was zeroed by `DropFlagInit`, so the tag reads 0 and a variant-0 owned payload frees `null`.
+    /// `base` is the pointer to the in-memory enum aggregate (`{ i32 tag, payloads… }`).
+    fn drop_enum(&self, base: inkwell::values::PointerValue<'c>, enum_id: u32) -> Result<(), CodegenError> {
+        let ety = self.enum_types[enum_id as usize];
+        // (variant tag, LLVM field indices of its owned payloads) for every variant that owns a buffer.
+        // A variant's payload `k` lives at flat field index `field_base + k` (`field_base` includes the
+        // tag slot — see `MakeEnum`). Snapshot into owned `Vec`s so no borrow of `self.enums` is held
+        // across the builder calls below.
+        let owned: Vec<(u64, Vec<u32>)> = self.enums[enum_id as usize]
+            .variants
+            .iter()
+            .enumerate()
+            .filter_map(|(vi, v)| {
+                let fields: Vec<u32> = v
+                    .payload
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_move())
+                    .map(|(k, _)| v.field_base + k as u32)
+                    .collect();
+                (!fields.is_empty()).then_some((vi as u64, fields))
+            })
+            .collect();
+        if owned.is_empty() {
+            return Ok(()); // a non-Move enum reached here only defensively — nothing to free.
+        }
+        let tag_ptr = self.builder.build_struct_gep(ety, base, 0, "droptag").map_err(|e| self.err(e))?;
+        let tag = self
+            .builder
+            .build_load(self.ctx.i32_type(), tag_ptr, "droptagv")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let cont = self.ctx.append_basic_block(self.func, "drop.enum.cont");
+        let cases: Vec<_> = owned
+            .iter()
+            .map(|(vi, _)| (self.ctx.i32_type().const_int(*vi, false), self.ctx.append_basic_block(self.func, "drop.enum.v")))
+            .collect();
+        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
+        for ((_, fields), (_, bb)) in owned.iter().zip(cases.iter()) {
+            self.builder.position_at_end(*bb);
+            for &fi in fields {
+                let fp = self.builder.build_struct_gep(ety, base, fi, "dropev").map_err(|e| self.err(e))?;
+                let agg = self
+                    .builder
+                    .build_load(slice_struct_type(self.ctx), fp, "dropevv")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "dropevptr").map_err(|e| self.err(e))?;
+                self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+            }
+            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
+        }
+        self.builder.position_at_end(cont);
         Ok(())
     }
 

@@ -780,12 +780,15 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
-fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
+        // A Move enum (owns an `array<Struct>` payload, J2) captured by value into a closure would be
+        // copy-captured and double-dropped — reject it like any other owned capture.
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, or a nested
@@ -808,11 +811,31 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
     res
 }
 
+/// Whether sum type `id` is a **Move** type — any variant carries an owned (Move) payload, so its
+/// `Drop` must free the live payload (an owned `array<Struct>`, J2). The `Drop` switches on the tag
+/// and frees exactly the active variant's owned payload (`drop_enum` in codegen). An enum whose every
+/// payload is a scalar / `str` view / non-Move struct owns nothing and stays **Copy** (region-tracked
+/// iff a `str` payload — see `tracks_region` / `region_of`).
+///
+/// Keyed on `Scalar::is_move()` alone — the SAME predicate `drop_enum` uses to pick which payload
+/// fields to free — so the classifier and the drop stay in lockstep. Pass 0c admits only owned
+/// `array<T>` (a flat-freeable `{ptr,len}`) as a Move payload; a Move *struct* payload is rejected
+/// there (it would need a recursive `drop_struct_fields`, which `drop_enum` does not do), so this
+/// never sees one.
+pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
+    enums.get(id as usize).is_some_and(|e| e.variants.iter().flat_map(|v| v.payload.iter()).any(|s| s.is_move()))
+}
+
 /// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
 /// field makes its enclosing struct a Move type. A free-standing owned collection/string/builder, an
 /// `Option`/`Result` with a Move payload, or a nested Move struct. (Tuples can't be struct fields, so
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
+///
+/// **Enum fields (J2):** a sum-type field is NOT consulted here — pass 0b-2 rejects a *Move* enum
+/// field (an owned enum field's drop-as-a-struct-field has no consumer yet, and this table-free walk
+/// cannot see through an enum without the `enums` table), so any enum field reaching this walk owns
+/// nothing and correctly leaves its struct non-Move.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
         || payload_is_move(ty)
@@ -1004,11 +1027,13 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
         || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
 }
 
-fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
+        // A Move sum type (owns an `array<Struct>` payload, J2).
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -1093,7 +1118,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
-fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
+fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
@@ -1103,13 +1128,16 @@ fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
         // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs))
+        // A Move sum type (owns an `array<Struct>` payload, J2) — its `Drop` switches on the tag and
+        // frees the live variant's owned payload (`drop_enum`).
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
 /// sema/MIR boundary predicate: free-standing owned values and Move tuples get path-local cleanup;
 /// arena-only `box`/`Task` values do not.
-pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    is_owned_droppable(ty, structs) || ty_tuple_is_move(ty, tuples)
+pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
+    is_owned_droppable(ty, structs, enums) || ty_tuple_is_move(ty, tuples)
 }
 
 impl Ty {
@@ -2787,9 +2815,33 @@ pub fn check_program_with_effects(
                     Ty::Struct(id) => {
                         payload.push(Scalar::Struct(id));
                     }
+                    // An owned `array<T>` payload (J2) — the union `Parts(array<Part>)` shape. The
+                    // enum becomes a **Move** type: its tag-switched `Drop` frees this variant's single
+                    // heap buffer. The element must be **non-owned** (Slice C rule) so that is one flat
+                    // free — `array<string>` / `array<Move-struct>` (a per-element deep free) are
+                    // deferred, rejected cleanly rather than leaked per element.
+                    Ty::DynArray(Scalar::String) => diags.error(
+                        "an `array<string>` sum-type payload is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
+                        t.span(),
+                    ),
+                    Ty::DynStructArray(eid, _) if struct_is_move(eid, &structs) => diags.error(
+                        format!("an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice", structs[eid as usize].name),
+                        t.span(),
+                    ),
+                    // Every other owned `array<T>` — a scalar / `str` / plain-data-struct element (one
+                    // flat free). A non-representable element (a nested `array<array<T>>`, an `soa`
+                    // column) has no payload `Scalar`, so `ty_to_scalar` is `None` — reject it cleanly
+                    // rather than panic (Gate 3: the compiler must diagnose, never crash on bad input).
+                    Ty::DynArray(_) | Ty::DynStructArray(_, _) => match ty_to_scalar(ty) {
+                        Some(s) => payload.push(s),
+                        None => diags.error(
+                            format!("an owned-array sum-type payload must have a scalar / `str` / plain-struct element for now, got {}", ty_name(ty)),
+                            t.span(),
+                        ),
+                    },
                     Ty::Error => {}
                     other => diags.error(
-                        format!("variant payloads must be a primitive scalar or plain struct for now, got {}", ty_name(other)),
+                        format!("variant payloads must be a primitive scalar, plain struct, or owned `array<T>` for now, got {}", ty_name(other)),
                         t.span(),
                     ),
                 }
@@ -2816,6 +2868,23 @@ pub fn check_program_with_effects(
                 format!("struct field '{}' is recursive through a sum type — a struct cannot contain itself without a `box` indirection", enum_field.name),
                 span,
             );
+        }
+        // A **Move** enum field (an owned `array<Struct>` payload variant, J2) is deferred: an owned
+        // enum field's drop-as-a-struct-field has no consumer yet, and the table-free `struct_is_move`
+        // walk cannot see through an enum field without the `enums` table (it deliberately treats every
+        // enum field as owning nothing — see `ty_owns_buffer_rec`). Admitting a Move enum field here
+        // would silently mis-classify the struct as non-Move and leak the buffer, so reject it cleanly.
+        // (A non-Move enum field — scalar / `str` / plain-struct payloads — stays allowed, J1b.)
+        for f in &structs[i].fields {
+            if let Ty::Enum(eid) = f.ty
+                && enum_is_move(eid, &enums)
+            {
+                let span = decl.2.fields.iter().find(|sf| sf.name.name == f.name).map_or(decl.2.span, |sf| sf.span);
+                diags.error(
+                    format!("a Move sum-type field ('{}': an owned `array` payload variant) is not supported yet — an owned enum struct field's drop is a later slice", f.name),
+                    span,
+                );
+            }
         }
     }
 
@@ -3398,7 +3467,7 @@ pub fn check_program_with_effects(
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| is_owned_droppable(l.ty, structs) || ty_tuple_is_move(l.ty, tuples))
+            .filter(|l| is_owned_droppable(l.ty, structs, enums) || ty_tuple_is_move(l.ty, tuples))
             .map(|l| l.id)
             .collect();
         let individual: Vec<LocalId> = drops
@@ -5087,7 +5156,7 @@ impl<'a> EscapeCheck<'a> {
     /// control-flow expression that may select one are frame-capped so a derived view cannot escape
     /// and dangle when the hidden owner is dropped.
     fn unbound_owned_temporary(&self, e: &Expr) -> bool {
-        if !needs_drop_flag(e.ty, self.structs, self.tuples) {
+        if !needs_drop_flag(e.ty, self.structs, self.tuples, self.enums) {
             return false;
         }
         match &e.kind {
@@ -5916,7 +5985,7 @@ impl<'a> EscapeCheck<'a> {
         match s {
             Stmt::Let { local, init } => {
                 self.decl_depth.insert(*local, depth);
-                if is_owned_droppable(init.ty, self.structs)
+                if is_owned_droppable(init.ty, self.structs, self.enums)
                     || ty_tuple_is_move(init.ty, self.tuples)
                 {
                     let individual = self.drop_is_individual(init, depth);
@@ -5969,7 +6038,7 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Assign { local, value, drop_new, .. } => {
                 // Record allocation provenance separately from escape Region: region-free Move
                 // resources and owned call results are individual, while arena allocations are not.
-                if is_owned_droppable(value.ty, self.structs)
+                if is_owned_droppable(value.ty, self.structs, self.enums)
                     || ty_tuple_is_move(value.ty, self.tuples)
                 {
                     drop_new.set(self.drop_is_individual(value, depth));
@@ -6041,7 +6110,7 @@ impl<'a> EscapeCheck<'a> {
                         .locals
                         .get(*local as usize)
                         .is_some_and(|l| {
-                            is_owned_droppable(l.ty, self.structs)
+                            is_owned_droppable(l.ty, self.structs, self.enums)
                                 || ty_tuple_is_move(l.ty, self.tuples)
                         })
                     {
@@ -6096,7 +6165,7 @@ impl<'a> EscapeCheck<'a> {
                 .locals
                 .get(*binding as usize)
                 .is_some_and(|local| {
-                    is_owned_droppable(local.ty, self.structs)
+                    is_owned_droppable(local.ty, self.structs, self.enums)
                         || ty_tuple_is_move(local.ty, self.tuples)
                 })
             {
@@ -6755,7 +6824,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
-        if needs_drop_flag(e.ty, self.structs, self.tuples) {
+        if needs_drop_flag(e.ty, self.structs, self.tuples, self.enums) {
             self.push_flow_op(EscapeFlowOp::DropProvenance(e, depth));
         }
     }
@@ -7523,7 +7592,7 @@ impl<'a> MoveCheck<'a> {
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple
     /// or Move struct.
     fn is_move_ty(&self, ty: Ty) -> bool {
-        ty_is_move(ty, self.structs, self.tuples)
+        ty_is_move(ty, self.structs, self.tuples, self.enums)
     }
 
     fn is_move(&self, id: LocalId) -> bool {
@@ -8366,9 +8435,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(value, moved, false, false);
             }
             ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
+            // A sum-type construction moves each payload into the variant, exactly like a struct
+            // literal — an owned `array<Struct>` payload (J2) is consumed here (and its source slot
+            // nulled in MIR `null_moved_source`), a scalar / `str` / plain-struct payload is Copy so
+            // "consuming" it is a no-op.
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
-                    self.expr(p, moved, false, false);
+                    self.expr(p, moved, true, true);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
@@ -8420,7 +8493,7 @@ impl<'a> MoveCheck<'a> {
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
-                let consuming = is_owned_droppable(e.ty, self.structs);
+                let consuming = is_owned_droppable(e.ty, self.structs, self.enums);
                 self.expr(inner, moved, consuming, consuming);
             }
             ExprKind::Wait => {}
@@ -9498,7 +9571,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bind it to a fresh hidden local so it joins the normal drop path
                                 // (freed once at scope exit, or bulk-freed if arena-regioned). A
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
-                                None if is_owned_droppable(ety, self.structs) => {
+                                None if is_owned_droppable(ety, self.structs, self.enums) => {
                                     locals.push(Some(self.declare(&format!("_drop{i}"), ety, false)));
                                 }
                                 None => locals.push(None),
@@ -11751,10 +11824,30 @@ impl<'a, 't> Checker<'a, 't> {
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
+        self.reject_move_enum_payload(arg.ty, "Some", args[0].span);
         let scalar = self.payload_scalar(arg.ty, args[0].span);
         let ty = Ty::Option(scalar);
         self.constrain(ty, expected, span);
         Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty, span }
+    }
+
+    /// A **Move** sum type (owns an `array<Struct>` payload, J2) is deferred as an `Option`/`Result`
+    /// payload. The drop machinery's `payload_is_move` arm frees a flat `{ptr,len}`, but a Move-enum
+    /// payload would need a *tag-switched* drop of the nested enum (no consumer yet); worse,
+    /// `payload_is_move` is table-free so it cannot even see the Move enum, so admitting it would
+    /// silently leak. Reject at the wrap site (`Some`/`Ok`/`Err`) — this is the sole origin of a
+    /// Move-enum-in-`Option`/`Result` *value*, so no leaking value can survive. Nullable/fallible
+    /// owned unions (`Option<Content>`) are a later slice (J3 matrix fill).
+    fn reject_move_enum_payload(&mut self, ty: Ty, wrapper: &str, span: Span) {
+        let ty = self.resolve(ty);
+        if let Ty::Enum(id) = ty
+            && enum_is_move(id, self.enums)
+        {
+            self.diags.error(
+                format!("a Move sum type ({}) cannot be a `{wrapper}` payload yet — a nullable/fallible owned union is a later slice; use the value whole for now", self.ty_display(ty)),
+                span,
+            );
+        }
     }
 
     /// Resolve a type to a concrete payload [`Scalar`], defaulting inference vars and
@@ -12991,6 +13084,19 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
+        // A fixed array of a **Move** sum type (an owned-array payload variant, J2) is deferred: its
+        // per-element tag-switched drop has no consumer yet, and a fixed `array<Enum>` is not a
+        // droppable `StructArray`, so admitting it would leak each element's buffer. Reject cleanly —
+        // a Move enum is used as a single value for now.
+        if let Ty::Enum(id) = self.resolve(elem_ty)
+            && enum_is_move(id, self.enums)
+        {
+            self.diags.error(
+                format!("`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value", self.ty_display(elem_ty)),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let mut checked = vec![first];
         for e in &elems[1..] {
             checked.push(self.check_expr(e, Some(elem_ty)));
@@ -13152,7 +13258,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut capture_ops = Vec::new();
         for (cname, pid, enc_id) in &captured {
             let ty = locals[*pid as usize].ty;
-            if ty_capture_is_move(ty, self.structs, self.tuples) {
+            if ty_capture_is_move(ty, self.structs, self.tuples, self.enums) {
                 self.diags.error(
                     format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)"),
                     span,
@@ -18520,6 +18626,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let is_ok = name == "Ok";
         let arg = self.check_expr(&args[0], if is_ok { ok_exp } else { err_exp });
+        self.reject_move_enum_payload(arg.ty, name, args[0].span);
         let arg_scalar = self.payload_scalar(arg.ty, args[0].span);
 
         // The other arm's scalar must be known from context; otherwise we cannot form
@@ -18886,6 +18993,13 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bindings (intra-pattern dupes are the branch above).
                                 self.check_shadow(&b.name, b.span, scope_mark);
                             }
+                            // Binding a Move (owned) payload — an owned `array<T>` variant (J2), or a
+                            // pre-existing Move scalar like `cli parsed` in a `Result`/`Option` — moves
+                            // the buffer out of the scrutinee: `lower_match_enum` calls
+                            // `null_moved_source(scrutinee)` on a bound arm so the scrutinee's exit
+                            // `Drop` frees null, and the binding local owns the buffer (dropped once at
+                            // scope end). No special sema handling — the same path Result/Option already
+                            // use for their Move payloads.
                             let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
                             self.declare(&b.name, ty, false)
                         })
@@ -20939,6 +21053,12 @@ fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
     match s {
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs)),
+        // An owned `array<T>` payload (J2) — the enum becomes Move (tag-switched drop). The element
+        // must be non-owned so the drop is one flat free: `array<string>` (a per-element deep free) is
+        // deferred, `array<Move-struct>` likewise.
+        Scalar::DynArray(PrimScalar::String) => false,
+        Scalar::DynArray(_) => true,
+        Scalar::DynStructArray(id) => structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs)),
         _ => false,
     }
 }

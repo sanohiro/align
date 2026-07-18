@@ -3754,10 +3754,31 @@ grew a kind-6 arm; sema `decode_struct_fields_ok`/`json_object_parts` grew enum-
 union-decodability so `emit_json_union` never sees a bad enum); `json_schema_sig_into` expands a union
 field (cycle-safe). Composes with nested / `Option` / `array<Struct>` fields — the full
 `Chat { messages: array<Message> }` shape round-trips. Tests: `m5.rs` J1b-2b (field decode/encode,
-object-payload + Option coexist, array<Message>, non-union-enum-field rejected).
-→ **J2** enum owned payloads (`array<Struct>`, tag-switched drop) → the full multimodal `Content`
-union → **the gateway is closed** → **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan`
-→ **J6** spec sync
+object-payload + Option coexist, array<Message>, non-union-enum-field rejected). **J2a — SHIPPED: enum
+owned `array<T>` payloads + tag-switched drop (the language prerequisite for the multimodal union).**
+A sum type may now carry an owned `array<T>` payload (`Content { Text(str), Parts(array<Part>) }`),
+which makes the **enum a Move type**: its `Drop` switches on the tag and frees the live variant's
+owned buffer (`drop_enum` in codegen; `DropFlagInit` zeroes the aggregate → null-safe on a moved-out /
+unconstructed path). `enum_is_move` (any payload `is_move()`) is the new classifier; it is threaded
+into `is_owned_droppable` / `needs_drop_flag` / `ty_is_move` / `ty_capture_is_move` (the enum arm) —
+NOT into `struct_is_move` (22 sites); instead a **Move enum struct field is rejected** (a non-Move enum
+field stays allowed, J1b). Pass 0c admits `array<scalar>`/`array<str>`/`array<plain-struct>` (one flat
+free — the Slice-C element rule: `array<string>` / `array<Move-struct>` deferred; a non-representable
+element like `array<array<T>>` is a clean error, never a panic). `enum_payload_ok` (generic enums)
+grew the same arm. MoveCheck consumes an owned payload at construction (like a struct literal) and
+`null_moved_source` nulls the source slot (no double-free); the region/escape arms (`region_of` folds
+to `Static` for an owned-array payload → freely returnable; `str`-payload enums stay arena-bound) are
+J1a's, unchanged. **v1 confinement (fail-closed):** a Move enum is a bare local / param / return only —
+rejected as a struct field, `Option`/`Result` payload (the wrap site), fixed-`array` element, lambda
+capture, box/tuple/task payload (some pre-existing) — each with a clean "later slice" diagnostic, so no
+owned enum leaks past a drop mechanism that can't tag-switch it. **Match-binding an owned payload
+works** — `lower_match_enum` already nulls the scrutinee on a bound arm (`null_moved_source`, extended
+with the enum arm), so the binding moves the buffer out and the scrutinee's drop frees null, the same
+path `Result`/`Option` use for their Move payloads (no special sema handling). The owned `array<Struct>`
+payload is exercised end-to-end in J2b (JSON). Tests: `enum_match.rs` J2 section (construct/move/return/if-join drop-clean, 7 deferral
+rejections, the nested-array non-panic). → **J2b** the union **Array** shape-class arm (decode/encode
+the `array<Struct>` variant) → the full multimodal `Content` union → **the gateway is closed** →
+**J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

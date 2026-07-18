@@ -8,7 +8,44 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-2b SHIPPED — shape-directed union as a struct
+_Last updated: 2026-07-18, **JSON COMPLETENESS J2a SHIPPED — enum owned `array<T>` payloads +
+tag-switched drop (the multimodal-union language prerequisite), PR #535**. A sum type may now carry an
+owned `array<T>` payload (`Content { Text(str), Parts(array<Part>) }`), which makes the **enum a Move
+type**: its `Drop` switches on the tag and frees the live variant's owned buffer. **Classifier:**
+`enum_is_move(id, enums)` = any variant payload `is_move()` — the SAME predicate codegen `drop_enum`
+uses to pick fields, so classifier + drop stay in lockstep. Threaded into `is_owned_droppable` /
+`needs_drop_flag` / `ty_is_move` / `ty_capture_is_move` (the enum arm) — deliberately NOT into
+`struct_is_move` (22 sites); instead a **Move enum struct field is rejected** (a non-Move enum field
+stays allowed, J1b). **Drop:** codegen `drop_enum` loads the i32 tag, switches, frees each owned
+variant's `{ptr,len}` field-0 ptr (one flat free — element non-owned, pass 0c; verified in IR).
+`DropFlagInit` zeroes the aggregate + MIR `null_moved_source` (enum arm + `EnumValue`-wrapper case)
+nulls a moved-away enum → null-safe, single-free every path. **Pass 0c** admits
+`array<scalar>`/`array<str>`/`array<plain-struct>`; `array<string>` / `array<Move-struct>` deferred; a
+non-representable element (`array<array<T>>`, `soa`) is a **clean diagnostic, never a panic** (Gate 3 —
+`/align-self-review` caught the original `ty_to_scalar().expect()` panic). `enum_payload_ok` (generic
+enums) grew the same arm. MoveCheck consumes an owned payload at construction (`EnumValue` → `(true,
+true)`, like a struct literal). **Region/escape** arms are J1a's, unchanged (`region_of` folds an
+owned-array payload to `Static` → freely returnable; `str`-payload enums stay arena-bound). **v1
+confinement (fail-closed):** a Move enum is a bare local / param / return only — rejected as a struct
+field, `Option`/`Result` payload (the `Some`/`Ok`/`Err` wrap site, `reject_move_enum_payload`),
+fixed-`array` element, and lambda capture (`ty_capture_is_move`), each with a "later slice" diagnostic
+(tuple/box/task were already rejected). **Match-binding an owned payload works** — `lower_match_enum`
+already nulls the scrutinee on a bound arm (`null_moved_source`), so the binding moves the buffer out
+(the same path `Result`/`Option` use for Move payloads); an over-broad sema rejection was removed after
+CI caught it breaking `match c.parse() { Ok(p) => … }` (`p: cli parsed`, a Move scalar). `/code-review`
+high run: 2 self-findings (enum_is_move↔drop_enum divergence via a dead defensive struct arm; Gate-5
+resolve-once) applied. Tests: `enum_match.rs` J2 section (13 —
+construct/move/return/if-join drop-clean, scalar-vs-str precision, 9 deferral rejections incl. the
+nested-array non-panic). Workspace green (only the known macOS `gate7` LC_UUID cache flake fails, as on
+`main`); clippy clean. **NEXT: J2b — the union Array shape-class arm** (`union_shape_class`
+`Scalar::DynStructArray => Some(4)`; `check_union_decodable`'s `class_owner: [_;4]` → `[_;5]`; the
+runtime `json_shape_class` already reserves Array=4 and `decode_union_value` reads `class_to_arm[4]`
+generically; `emit_json_union` fills the arm; encode writes the live `array<Struct>` payload bare) →
+decode/encode the `array<Part>` variant → the **full multimodal `Content` union closes the REST
+gateway** → then J3 matrix fill / J4 `json.doc` / J5 `json.scan` / J6 spec sync. **The owned
+`array<Struct>` enum payload is only constructible via `json.decode` today (`.to_array()` over structs
+is deferred), so J2a is tested standalone with `array<i64>` payloads; the `array<Struct>` case lands
+end-to-end in J2b.** Previous update: 2026-07-18, **JSON COMPLETENESS J1b-2b SHIPPED — shape-directed union as a struct
 field, MERGED as #534**. A struct field may now be a union (`Message { content: Content }`); with the
 earlier slices, the full **`Chat { messages: array<Message> }`** OpenAI chat request round-trips
 byte-identically (union field composes with nested / `Option` / `array<Struct>` fields, incl. an
