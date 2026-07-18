@@ -8,7 +8,32 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J2a SHIPPED — enum owned `array<T>` payloads +
+_Last updated: 2026-07-18, **JSON COMPLETENESS J2b SHIPPED — union Array shape-class arm (the owned
+`array<Struct>` union variant), MERGED as #536 (`e16a132`)**. A JSON `[` now dispatches to a
+shape-directed union's owned `array<Struct>` variant (shape class Array=4, O(1) first-byte), so the
+full multimodal **`Content { Text(str), Parts(array<Part>) }`** union decodes both shapes
+(`"hi"`→Text, `[{…}]`→Parts) and encodes the live payload **bare** — `decode(encode(x))` round-trips
+byte-identically. The whole decode/encode/drop-cleanup pipeline was ALREADY kind-5-aware from Slice C
+(`json_payload_tag_sub`→`emit_json_union` arm; runtime `json_shape_class('[')`=4,
+`decode_union_value`/`write_value`/`field_width`, `encode_union_at`/`json_encode_value`), so the change
+was minimal: sema `union_shape_class` `Scalar::DynStructArray => Some(4)`; `check_union_decodable`'s
+class table `[_;4]`→`[_; JSON_SHAPE_CLASSES]` (an Array arm would else index OOB and panic) + recurse
+into the array ELEMENT struct; MIR `json_union_schema_sig_into` expands the element struct's schema
+(`[]{…}`, cache invalidation — `cache_codegen` gate 2c); runtime `drop_decoded_union` frees the
+materialized AoS on the trailing-garbage error path (the ONE new leak surface — `alloc-count`
+new==free gate). `/code-review` high run (1 minor duplication finding, rejected — bodies differ,
+mirrors `encode_union_at`). Tests: `m5.rs` J2b (decode-by-shape, encode-bare+round-trip,
+trailing-garbage no-leak, two-Array clash, Move-element rejected). Docs: open-questions runway,
+json.md (+ja); draft §14 / language-spec already carried the design. CI green all 3 platforms.
+**v1 boundary: `array<scalar>` union payloads stay rejected (no descriptor arm) → J3.** **The union
+itself closes here; the multimodal `Content` union decodes/encodes standalone. NEXT: J3 — matrix fill
+(T1b), which INCLUDES the two remaining gateway compositions the union can't yet compose into:
+`Message { content: Content }` (a **Move-enum struct field** — J2a deferred it, needs threading
+`struct_is_move`/`ty_owns_buffer_rec` + `drop_struct_fields`'s kind-6-owned arm + `drop_decoded_owned`
+kind-6) and `Chat { messages: array<Message> }` (an **`array<Move-struct>`** — owned array element,
+deferred by Slice C). Plus the T1b scalar targets, `array<scalar>` fields, `Option<struct>` encode,
+and supported-constructor compositions.** Then J4 `json.doc` / J5 `json.scan` / J6 spec sync.
+Previous update: 2026-07-18, **JSON COMPLETENESS J2a SHIPPED — enum owned `array<T>` payloads +
 tag-switched drop (the multimodal-union language prerequisite), MERGED as #535 (`de8a405`)**. A sum type may now carry an
 owned `array<T>` payload (`Content { Text(str), Parts(array<Part>) }`), which makes the **enum a Move
 type**: its `Drop` switches on the tag and frees the live variant's owned buffer. **Classifier:**
