@@ -372,6 +372,36 @@ fn json_option_field_decode_encode_roundtrip() {
 }
 
 #[test]
+fn json_encode_nested_struct_and_option_compose() {
+    if !backend_available() {
+        return;
+    }
+    // The two encode layouts compose across nesting (code-review follow-up): a static-layout parent
+    // holding a nested struct that has an `Option` field (trailing-comma nested object), and an
+    // Option-bearing parent holding a required nested struct. Both close the nested object's commas
+    // independently of the parent's.
+    let src = "import core.json\n\
+        Inner { a: i64, b: Option<i64> }\n\
+        Plain { a: i64 }\n\
+        StaticParent { id: i64, inner: Inner }\n\
+        OptParent { id: i64, opt: Option<i64>, inner: Plain }\n\
+        fn main() -> i32 {\n  \
+        a := StaticParent{id: 1, inner: Inner{a: 2, b: Some(3)}}\n  print(json.encode(a))\n  \
+        b := StaticParent{id: 4, inner: Inner{a: 5, b: None}}\n  print(json.encode(b))\n  \
+        c := OptParent{id: 6, opt: Some(9), inner: Plain{a: 7}}\n  print(json.encode(c))\n  \
+        d := OptParent{id: 8, opt: None, inner: Plain{a: 7}}\n  print(json.encode(d))\n  return 0\n}\n";
+    let out = build_and_run("json-nested-option-compose", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"id\":1,\"inner\":{\"a\":2,\"b\":3}}\n\
+         {\"id\":4,\"inner\":{\"a\":5}}\n\
+         {\"id\":6,\"opt\":9,\"inner\":{\"a\":7}}\n\
+         {\"id\":8,\"inner\":{\"a\":7}}\n"
+    );
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;
