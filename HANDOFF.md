@@ -8,7 +8,40 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY SLICE B SHIPPED — `Option<T>` struct fields +
+_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY COMPLETE — SLICE C (`array<Struct>` struct fields
++ array decode/encode) SHIPPED, MERGED as #529** (`9a40d60`). A struct field may now be an owned
+`array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; **the full OpenAI
+chat-completions request/response now round-trips byte-identically through `core.json`** (Slices
+A+B+C composed, `json_full_openai_response_shape_roundtrip`). Language: `is_field_ok` admits
+`array<T>`; the field owns ONE heap AoS buffer freed by the struct's `Drop` (`drop_struct_fields`
+array arm; `ty_size_align` {ptr,len} 16/8, layout_parity pinned). `struct_acyclic` does NOT recurse
+through `array<Struct>` (heap indirection → `Node { children: array<Node> }` trees legal). v1 element
+restriction (non-owned, like B): scalar / `str`-view / plain-data struct — `array<string>` /
+`array<Move-struct>` rejected at declaration. Decode: descriptor kind 5 (sub = element schema); the
+runtime `decode_struct_array_value` parses the JSON sub-array into an owned AoS via `parse_object`
+per element (nested/Option element fields recurse), writing {ptr,len}. Encode: a dynamic length
+can't unroll, so a `StructArrayField` template piece calls the runtime **descriptor-driven encoder**
+`json_encode_struct_array`/`json_encode_object` — reusing the DECODE descriptors (symmetric, handles
+nested/Option/str/scalar), swept through every HIR-template pass. **Memory-safety:** the decode
+`Err` path frees AoS buffers already written into the partial struct (`drop_decoded_owned`, runtime
+dual of `drop_struct_fields`); `/code-review` caught + fixed a nested-Move DOUBLE-FREE (null the
+`{ptr,len}` slot after freeing → cleanup idempotent; pinned by
+`json_nested_move_struct_array_failure_no_double_free`, alloc==free). **Known constraint:** a Move
+struct (owns an array) can't be a `Result`/`Option` Ok payload across a function boundary
+(pre-existing) — decode + use in-scope. Deferred: `array<scalar>` field decode, owned-element
+arrays. `/align-self-review` + `/code-review` high (1 critical double-free found+fixed) both run;
+clippy clean; m5 (119) + runtime (incl. alloc-count leak/double-free) + layout_parity +
+fuzz_differential (10, on a `cargo build --workspace`-refreshed archive) green. **⚠️ Two process
+lessons this session: (1) NEVER run `cargo fmt` on this repo — it is NOT rustfmt-clean, so `cargo
+fmt -p <crate>` reformats thousands of unrelated (committed) lines; if it happens, `git show
+HEAD:<file> > <file>` per file reverts, then re-apply functional edits by hand. (2) `cargo test
+--features alloc-count` leaves a different-feature runtime archive under `target/debug/deps` — a
+later default-feature link (e.g. fuzz_differential) then FAILS at link; `cargo build --workspace`
+refreshes it (the known stale-runtime-archive papercut).** **NEXT: the owner-directed
+JSON-completeness push** (open-questions "JSON completeness"): enum/union payloads (the OpenAI
+multimodal `content` union — finishes the gateway), then settle `JsonValue`/map + streaming/validate
+— so no "this JSON shape works, that one doesn't" gap persists. Previous update: 2026-07-18,
+**REST-GATEWAY RUNWAY SLICE B SHIPPED — `Option<T>` struct fields +
 optional decode/encode, MERGED as #528** (`a45ea5d`; owner chose "implement encode now"). A struct
 field may now be `Option<T>` (payload scalar / `str` / nested struct), decoded + encoded with the
 settled **null policy**: missing key → None, JSON `null` → None, type mismatch → Err, required field
