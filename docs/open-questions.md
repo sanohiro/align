@@ -3795,9 +3795,39 @@ trailing-garbage error path (the one new leak surface — the Align side has no 
 Move-element rejected). **The union itself closes here; the remaining gateway shapes —
 `Message { content: Content }` (a Move-enum struct field) and `Chat { messages: array<Message> }` (an
 `array<Move-struct>`) — are J3 compositions** (both need the deferred owned-enum-struct-field / owned
-array element, not new union work). →
-**J3** matrix fill (T1b — incl. the Move-enum-struct-field + owned array element that compose the union
-into `Message`/`Chat`) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
+array element, not new union work). **J3a — SHIPPED: the multimodal union as a Move-enum struct
+field** (`Message { content: Content }`). A Move enum (an owned `array<Struct>` payload variant) is now
+a legal struct field — it makes the enclosing struct **Move**, so the full multimodal
+`content: str | array<Part>` union composes into a record and decodes/encodes both shapes, round-tripping
+byte-identically. **Classifier:** `struct_is_move`/`struct_is_move_rec`/`ty_owns_buffer_rec` grew an
+`enums` param + a `Ty::Enum` arm (`enum_is_move`) — threaded through every caller (mir `Builder`,
+codegen, sema's `ty_is_move`/`is_owned_droppable`/`ty_capture_is_move`/`reject_move_struct_payload`/
+`enum_payload_ok`), so **every** Move-ness question (MoveCheck, drop-flag, escape, Result/Option-payload
+rejection) sees a struct-with-Move-enum-field as Move in lockstep. The pass-0c-2 rejection was lifted.
+**Drop:** `drop_struct_fields`'s new `Ty::Enum` arm frees the live variant via the tag-switched
+`drop_enum`; `DropFlagInit` zeroes the aggregate → null-safe on a moved-out / unconstructed path.
+**Match-move:** `match m.content { Parts(ps) => … }` moves the owned payload out of the field — extended
+`null_moved_source`'s depth-1 `Field` arm (a Move-enum field, mirroring the `string`-field case) + made
+`NullStructField` codegen type-aware (zero the whole `{tag,payloads}` enum aggregate, not just a 16-byte
+slice), so the struct's exit `Drop` frees null there — single-free (the same use-consumes-the-enum
+semantics a bare-local scrutinee already has). **JSON:** decode/encode were already kind-6-aware (J1b-2b);
+only the runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the union's
+owned payload on the trailing-garbage error path. **`array<Move-struct>` rejection relocated to a new
+post-0c pass (0c-3):** an element struct can be Move *only* through a not-yet-resolved enum field, so the
+0b-2 check (enums empty) would let `Chat { messages: array<Message> }` slip through with a leaking flat
+free — moved after 0c where `struct_is_move` is enum-accurate; `array<Message>` is now cleanly rejected
+(the `array<Move-struct>` deep-free is the next J3 slice). **v1 confinements (unchanged, now Move-enum
+accurate):** a Move struct (owns via its enum field) is confined exactly like any owned struct —
+rejected as a `Result`/`Option` Ok/Err payload across a function boundary (Slice-C constraint, so a
+decode target uses `?`), and reassigning a Move-enum field leaks the old buffer (only a direct `string`
+leaf is drop-of-old'd today — the SAME pre-existing gap `array<T>` fields have, not new). `/align-self-review`
+(Gate 1 Move-reason sweep; Gate 3 no-panic) + `/code-review` high run. Tests: `enum_match.rs`
+(construct/match-move/drop-clean), `m5.rs` J3 (both-shape decode/encode+round-trip, match-move no double-free,
+trailing-garbage no-leak, `array<Message>` rejected). **NEXT: J3b — `array<Move-struct>` struct fields
+(the owned-element deep free) to close `Chat { messages: array<Message> }`, then the T1b matrix fill.** →
+**J3** matrix fill (T1b — `array<Move-struct>` owned-element deep free that closes `Chat`, plus top-level
+scalars, `array<scalar>` fields, `Option<struct>` encode, supported-constructor compositions) →
+**J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

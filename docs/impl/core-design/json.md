@@ -49,14 +49,25 @@ element struct's sub-schema), decoding into an owned AoS the enum's tag-switched
 writes it as a bare JSON array. The full `Content { Text(str), Parts(array<Part>) }` round-trips. The
 element struct must be non-owned (Slice-C rule; `array<string>` / `array<Move-struct>` deferred), and
 an `array<scalar>` union payload has no descriptor arm yet (J3). `json.encode` of a top-level union
-needs a local binding (like struct encode). **Union as a struct field (J1b-2b, SHIPPED):** a struct field may be a union
+needs a local binding (like struct encode). **Union as a struct field (J1b-2b / J3a, SHIPPED):** a struct field may be a union
 (`Message { content: Content }`) — a descriptor **kind 6** whose `sub` is the `JsonUnion` (reused for
 both decode and encode); `field_width`/`write_value` (all decode paths — slow + Mison speculative +
 fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes with nested structs,
-`Option` fields (trailing-comma layout), and `array<Struct>` fields — the full
-`Chat { messages: array<Message> }` shape round-trips byte-identically. The union's variants are
-expanded into the enclosing struct's `json_union_schema_sig` so a variant change invalidates the
-decode/encode cache.
+`Option` fields (trailing-comma layout), and `array<Struct>` fields. **J3a** extends this to a **Move**
+union field — the full multimodal `content: str | array<Part>` (`Content { Text(str), Parts(array<Part>) }`)
+composes into `Message`, decoding/encoding both shapes and round-tripping byte-identically. A Move-enum
+field makes the enclosing struct **Move**: `struct_is_move`/`ty_owns_buffer_rec` became enum-aware (a
+`Ty::Enum` arm consulting `enum_is_move`, threaded through every Move-ness caller in lockstep), and
+`drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched `drop_enum`; the
+runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the union's owned
+payload on the decode error path. `match m.content { … }` moves the owned payload out and zeroes the
+field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggregate), so the struct's
+`Drop` frees null there (single-free). The union's variants are expanded into the enclosing struct's
+`json_union_schema_sig` so a variant change invalidates the decode/encode cache. **Boundary:** because a
+Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
+`Message` decode target binds with `?`; and `Chat { messages: array<Message> }` where `Message` is Move
+is an `array<Move-struct>` field, rejected until J3b's owned-element deep free (a non-Move-`Message`
+`array<Message>` — a union with only str/scalar/object variants — still round-trips).
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
 `array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; the full OpenAI
@@ -131,11 +142,13 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   encode writes the live payload bare). Language prerequisite: enum `str` payloads (region
   tracking) then owned payloads (`array<Struct>`, tag-switched drop). **SHIPPED so far:** enum `str`
   payloads + region tracking (J1a); enum as a struct field (J1b-1); top-level union decode/encode
-  over str/number/bool/object payloads (J1b-2a); union as a struct field (J1b-2b) — all documented
-  above. **Remaining:** enum owned `array<Struct>` payloads + tag-switched drop → the full multimodal
-  `Content` union closes the gateway (J2).
-- **Matrix fill (J3):** top-level scalar targets, `array<scalar>` fields, `Option<struct>`
-  encode, supported-constructor compositions.
+  over str/number/bool/object payloads (J1b-2a); union as a struct field (J1b-2b); enum owned
+  `array<Struct>` payloads + tag-switched drop (J2a); the union Array shape-class arm (J2b); the
+  multimodal union as a **Move-enum struct field** (`Message { content: Content }`, J3a) — all
+  documented above. **The `content` union now closes the gateway standalone and as a record field.**
+- **Matrix fill (J3):** `array<Move-struct>` owned-element deep free (closes
+  `Chat { messages: array<Message> }`, J3b), top-level scalar targets, `array<scalar>` fields,
+  `Option<struct>` encode, supported-constructor compositions.
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
   `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for

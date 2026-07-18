@@ -44,14 +44,26 @@ SHIPPED — OpenAI マルチモーダル `content: str | array<Part>` union）:*
 所有 AoS に decode、encode は bare な JSON 配列として出力。完全な `Content { Text(str), Parts(array<Part>) }`
 がラウンドトリップする。要素構造体は非所有でなければならない（Slice-C ルール。`array<string>` /
 `array<Move-struct>` は延期）。`array<scalar>` union payload はまだ descriptor アームがない（J3）。
-トップレベル union の `json.encode` はローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union（J1b-2b,
+トップレベル union の `json.encode` はローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union（J1b-2b / J3a,
 SHIPPED）:** 構造体フィールドは union であってよい（`Message { content: Content }`）— descriptor
 **kind 6**（`sub` は `JsonUnion`、decode/encode で共有）。`field_width`/`write_value`（全 decode パス
 = slow + Mison speculative + fallback）と `json_encode_value` に kind-6 アームが加わり、union
 フィールドは nested struct・`Option` フィールド（trailing-comma layout）・`array<Struct>` フィールドと
-合成される — 完全な `Chat { messages: array<Message> }` シェイプが byte-identical にラウンドトリップ。
+合成される。**J3a** はこれを **Move** union フィールドへ拡張する — 完全なマルチモーダル
+`content: str | array<Part>`（`Content { Text(str), Parts(array<Part>) }`）が `Message` に合成され、
+両シェイプを decode/encode して byte-identical にラウンドトリップする。Move-enum フィールドは外側 struct を
+**Move** にする: `struct_is_move`/`ty_owns_buffer_rec` が enum 対応（`enum_is_move` を参照する `Ty::Enum`
+アーム、全 Move 判定呼び出し箇所へ一括スレッド）になり、`drop_struct_fields` の `Ty::Enum` アームが
+tag-switched な `drop_enum` で生きているバリアントを解放する。ランタイム `drop_decoded_owned` には
+**kind-6** アーム（`→ drop_decoded_union`）が加わり、decode エラーパスで union の所有 payload を解放する。
+`match m.content { … }` は所有 payload をムーブアウトしフィールドをゼロ化する（`NullStructField` が型対応
+= `{tag,payloads}` 集約全体をゼロ化）ので、struct の `Drop` はそこで null を解放する（単一解放）。
 union のバリアントは外側 struct の `json_union_schema_sig` に展開されるので、バリアント変更で
-decode/encode キャッシュが無効化される。
+decode/encode キャッシュが無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
+payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。また `Message` が
+Move の場合 `Chat { messages: array<Message> }` は `array<Move-struct>` フィールドで、J3b の所有要素 deep
+free まで拒否される（str/scalar/object バリアントのみの非 Move な `Message` の `array<Message>` は
+引き続きラウンドトリップする）。
 
 **`array<Struct>` フィールド（REST-gateway runway, Slice C）。** 構造体フィールドは所有の `array<Struct>`
 であってよい — `messages: array<Message>` / `choices: array<Choice>` shape。フル OpenAI リクエスト/
@@ -114,8 +126,14 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
 - **union（J1–J2）:** JSON の `oneOf` は sum type に写像し、**shape class**（Str/Number/Bool/
   Object/Array、pairwise 相異をコンパイル時強制、先頭バイト O(1) ディスパッチ）で判別。encode は
   生きている variant の payload を裸で書く。言語側の前提: enum の `str` payload（region 追跡）→
-  所有 payload（`array<Struct>`、tag 分岐 drop）。
-- **行列残り（J3）:** top-level scalar ターゲット、`array<scalar>` フィールド、`Option<struct>`
+  所有 payload（`array<Struct>`、tag 分岐 drop）。**ここまで SHIPPED:** enum `str` payload + region
+  追跡（J1a）、構造体フィールドとしての enum（J1b-1）、トップレベル union decode/encode（J1b-2a）、
+  構造体フィールドとしての union（J1b-2b）、enum の所有 `array<Struct>` payload + tag 分岐 drop（J2a）、
+  union の Array shape-class アーム（J2b）、**Move-enum 構造体フィールド**としてのマルチモーダル union
+  （`Message { content: Content }`、J3a）— いずれも上記で文書化。**`content` union はスタンドアロンでも
+  レコードフィールドでもゲートウェイを閉じる。**
+- **行列残り（J3）:** `array<Move-struct>` 所有要素の deep free（`Chat { messages: array<Message> }`
+  を閉じる、J3b）、top-level scalar ターゲット、`array<scalar>` フィールド、`Option<struct>`
   encode、サポート済みコンストラクタの合成。
 - **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
   Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。

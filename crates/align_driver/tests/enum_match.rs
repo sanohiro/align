@@ -624,15 +624,24 @@ fn binding_owned_enum_payload_in_match_moves_it_out() {
 }
 
 #[test]
-fn move_enum_struct_field_rejected() {
-    // A Move sum-type field (an owned-array payload variant) is deferred — an owned enum struct
-    // field's drop-as-a-field has no consumer yet. (A non-Move enum field stays allowed, J1b.)
-    assert!(check_errs(
-        "enum-movefield",
-        "Content { Text(str), Nums(array<i64>) }\n\
-         Msg { c: Content }\n\
-         fn main() -> i32 = 0\n"
-    ));
+fn move_enum_struct_field_is_move_and_drops_clean() {
+    if !backend_available() {
+        return;
+    }
+    // J3: a Move sum-type field (an owned-array payload variant) is now supported — it makes the
+    // enclosing struct Move (`ty_owns_buffer_rec`'s enum arm), and `drop_struct_fields`'s `Ty::Enum`
+    // arm frees the live variant's buffer via the tag-switched `drop_enum`. Construct a struct holding
+    // a `Nums([...])` field, read the payload through a `match m.c`, and let the struct drop at scope
+    // end. A clean run proves single-free (the owned array is freed exactly once, by the struct's Drop
+    // via `drop_enum`; the `match` binding moves the buffer out and nulls the field so it is not freed
+    // twice).
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        Msg { tag: i64, c: Content }\n\
+        fn main() -> i32 {\n  \
+        m := Msg { tag: 7, c: Content.Nums([3, 4, 5].to_array()) }\n  \
+        return (m.tag + match m.c { Text(t) => t.len() as i64, Nums(ns) => ns.sum() }) as i32\n}\n";
+    let out = build_and_run("enum-movefield", src);
+    assert_eq!(out.status.code(), Some(19)); // tag 7 + (3+4+5)
 }
 
 #[test]

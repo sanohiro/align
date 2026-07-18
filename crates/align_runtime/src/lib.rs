@@ -2942,6 +2942,15 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
                 let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
                 unsafe { drop_decoded_owned(base.add(off), sub_descs, None) };
             }
+            // A shape-directed union field (JSON completeness J3): `sub` points at a [`JsonUnion`]. A
+            // **Move** union (an owned `array<Struct>` variant, J2) decoded into this struct must be
+            // freed on the error path, exactly like a kind-5 array field — `drop_decoded_union`
+            // tag-switches and frees the live owned payload, nulling its slot (idempotent). A non-Move
+            // union owns nothing, so the call is a safe no-op there.
+            6 if !d.sub.is_null() => {
+                let u = unsafe { &*(d.sub as *const JsonUnion) };
+                unsafe { drop_decoded_union(base.add(off), u) };
+            }
             _ => {}
         }
     }

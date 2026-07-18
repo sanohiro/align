@@ -25,7 +25,7 @@ pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
+use align_sema::{enum_is_move, payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -4791,8 +4791,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::NullStructField(slot, idx) => {
-                    // Null one owned `string` `{ptr,len}` field of a struct slot (after a partial
-                    // field move `n := u.name`), so the struct's recursive `Drop` frees null there.
+                    // Null one owned field of a struct slot after a partial field move: a `string`
+                    // `{ptr,len}` field (`n := u.name`), or a **Move**-enum field whose payload a
+                    // `match m.content { … }` moved out (J3). Zero the field's own type so the struct's
+                    // recursive `Drop` frees null there — a `{ptr,len}` slice for a `string`, the whole
+                    // `{ tag, payloads }` aggregate for an enum (tag → 0, every payload ptr null → the
+                    // tag-switched `drop_enum` frees null on every arm).
                     let Ty::Struct(sid) = self.f.slots[*slot as usize] else {
                         unreachable!("NullStructField on a non-struct slot");
                     };
@@ -4800,9 +4804,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_struct_gep(self.struct_types[sid as usize], self.slots[slot], self.pfield(sid, *idx), "nullstructfld")
                         .map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
-                        .map_err(|e| self.err(e))?;
+                    let zero: inkwell::values::BasicValueEnum = match self.structs[sid as usize].fields[*idx as usize].ty {
+                        Ty::Enum(eid) => self.enum_types[eid as usize].const_zero().into(),
+                        _ => slice_struct_type(self.ctx).const_zero().into(),
+                    };
+                    self.builder.build_store(field_ptr, zero).map_err(|e| self.err(e))?;
                 }
                 Stmt::Drop(slot) => {
                     let ty = self.f.slots[*slot as usize];
@@ -7930,9 +7936,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
                 // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
-                Ty::Struct(nid) if struct_is_move(nid, self.structs) => {
+                Ty::Struct(nid) if struct_is_move(nid, self.structs, self.enums) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropnest").map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
+                }
+                // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
+                // struct Move (`ty_owns_buffer_rec`'s enum arm). Tag-switch and free the live variant's
+                // owned buffer via `drop_enum` (a non-Move enum owns nothing → not a Move struct field →
+                // never reaches here). `DropFlagInit` zeroes the aggregate, so a moved-out / unconstructed
+                // enum field reads tag 0 and frees `null` — null-safe, single-free every path.
+                Ty::Enum(eid) if enum_is_move(eid, self.enums) => {
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropenumfld").map_err(|e| self.err(e))?;
+                    self.drop_enum(fp, eid)?;
                 }
                 // An owned `array<T>` field (REST-gateway runway Slice C) — free its single heap
                 // buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an empty array). The
@@ -7952,7 +7967,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A nested Move-struct *array* field — drop each element (defensive: struct fields
                 // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
                 // owned case here means a future array-valued field can't silently fail-open and leak).
-                Ty::StructArray(eid, n) if struct_is_move(eid, self.structs) => {
+                Ty::StructArray(eid, n) if struct_is_move(eid, self.structs, self.enums) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropnestarr").map_err(|e| self.err(e))?;
                     let arr_ty = self.struct_types[eid as usize].array_type(n);
                     let zero = self.ctx.i64_type().const_zero();

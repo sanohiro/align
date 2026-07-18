@@ -8,7 +8,43 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J2b SHIPPED — union Array shape-class arm (the owned
+_Last updated: 2026-07-19, **JSON COMPLETENESS J3a SHIPPED (branch `json-j3a-move-enum-struct-field`,
+not yet merged) — the multimodal union as a Move-enum struct field (`Message { content: Content }`)**.
+A **Move** enum (an owned `array<Struct>` payload variant) is now a legal struct field, which makes the
+enclosing struct **Move** — so the full multimodal `content: str | array<Part>` union composes into a
+record and decodes/encodes both shapes, round-tripping byte-identically. **Classifier:**
+`struct_is_move`/`struct_is_move_rec`/`ty_owns_buffer_rec` grew an `enums` param + a `Ty::Enum` arm
+(`enum_is_move`), threaded through EVERY caller (mir `Builder`, codegen, sema's `ty_is_move` /
+`is_owned_droppable` / `ty_capture_is_move` / `reject_move_struct_payload` / `enum_payload_ok`) so every
+Move-ness question — MoveCheck, drop-flag, escape, Result/Option-payload rejection — sees a
+struct-with-Move-enum-field as Move in lockstep. The pass-0c-2 rejection was lifted. **Drop:**
+`drop_struct_fields`'s new `Ty::Enum` arm frees the live variant via the tag-switched `drop_enum`;
+`DropFlagInit` zeroes the aggregate → null-safe on a moved-out / unconstructed path. **Match-move:**
+`match m.content { Parts(ps) => … }` moves the owned payload out of the field — `null_moved_source`'s
+depth-1 `Field` arm gained a Move-enum case (mirroring the `string`-field one), and `NullStructField`
+codegen became type-aware (zero the whole `{tag,payloads}` enum aggregate, not just a 16-byte slice), so
+the struct's exit `Drop` frees null there — single-free (same use-consumes-the-enum semantics a
+bare-local scrutinee already has; use-after-partial-move reads the nulled value, a pre-existing
+sema-completeness gap shared with bare locals, not new). **JSON:** decode/encode were already kind-6-aware
+(J1b-2b); only the runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the
+union's owned payload on the trailing-garbage error path. **`array<Move-struct>` rejection relocated to a
+new post-0c pass (0c-3):** an element struct can be Move only through a not-yet-resolved enum field, so
+the 0b-2 check (enums empty) let `Chat { messages: array<Message> }` slip through with a leaking flat
+free — moved after 0c where `struct_is_move` is enum-accurate; `array<Message>` is now cleanly rejected
+(its owned-element deep free is J3b). **v1 confinements (unchanged, now Move-enum accurate):** a Move
+struct is rejected as a `Result`/`Option` Ok/Err payload across a function boundary (Slice-C constraint,
+so a decode target uses `?`); reassigning a Move-enum field leaks the old buffer (only a direct `string`
+leaf is drop-of-old'd — the SAME pre-existing gap `array<T>` fields have, not new). `/align-self-review`
+(Gate 1 Move-reason sweep — every Move-ness pass verified enum-aware in lockstep; Gate 3 no-panic) +
+`/code-review` high both run. Tests: `enum_match.rs` (`move_enum_struct_field_is_move_and_drops_clean` —
+was the J2a negative test, flipped to acceptance), `m5.rs` J3 (both-shape decode/encode+round-trip,
+match-move no double-free, trailing-garbage no-leak, `array<Message>` rejected). Suites green: m5 137/137,
+sema 151, enum_match 58, layout_parity, cache_codegen (only the known macOS gate7 LC_UUID flake fails,
+as on `main`), runtime alloc-count (only the known network/fd sandbox tests fail); clippy clean. Docs:
+open-questions runway, json.md (+ja), HANDOFF. **NEXT: J3b — `array<Move-struct>` struct fields (the
+owned-element deep free) to close `Chat { messages: array<Message> }`, then the T1b matrix fill
+(top-level scalars, `array<scalar>` fields, `Option<struct>` encode, compositions) → J4 `json.doc` →
+J5 `json.scan` → J6 spec sync.** Previous update: 2026-07-18, **JSON COMPLETENESS J2b SHIPPED — union Array shape-class arm (the owned
 `array<Struct>` union variant), MERGED as #536 (`e16a132`)**. A JSON `[` now dispatches to a
 shape-directed union's owned `array<Struct>` variant (shape class Array=4, O(1) first-byte), so the
 full multimodal **`Content { Text(str), Parts(array<Part>) }`** union decodes both shapes
