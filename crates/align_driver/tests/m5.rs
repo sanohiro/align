@@ -1930,21 +1930,24 @@ fn json_union_field_in_struct_array_roundtrips() {
         return;
     }
     // The `messages: array<Message>` shape (the OpenAI chat request) where each element's `content` is
-    // a union — exercises the union field (kind 6) through the array-of-structs decode path AND the
-    // descriptor-driven array encoder. Round-trips byte-identically.
+    // a union — exercises the union field (kind 6) through the array-of-structs decode path (incl. the
+    // Mison speculative path) AND the descriptor-driven array encoder. The first element's content is
+    // an OBJECT-payload variant (a nested object inside a union inside an array element — the hardest
+    // composition); the second is a scalar. Round-trips byte-identically.
     let src = "import core.json\n\
-        Content { Text(str), Count(i64) }\n\
+        Img { url: str, w: i64 }\n\
+        Content { Text(str), Pic(Img) }\n\
         Message { role: str, content: Content }\n\
         Chat { messages: array<Message> }\n\
         fn main() -> Result<(), Error> {\n  \
         arena {\n    \
-        c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":\\\"hi\\\"},{\\\"role\\\":\\\"a\\\",\\\"content\\\":7}]}\")?\n    \
+        c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":{\\\"url\\\":\\\"z\\\",\\\"w\\\":9}},{\\\"role\\\":\\\"a\\\",\\\"content\\\":\\\"hi\\\"}]}\")?\n    \
         print(json.encode(c))\n    print(c.messages.len())\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-field-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "{\"messages\":[{\"role\":\"u\",\"content\":\"hi\"},{\"role\":\"a\",\"content\":7}]}\n2\n"
+        "{\"messages\":[{\"role\":\"u\",\"content\":{\"url\":\"z\",\"w\":9}},{\"role\":\"a\",\"content\":\"hi\"}]}\n2\n"
     );
 }
