@@ -8939,7 +8939,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::UnionValue { value, enum_id, .. } => {
                     let ety = self.enum_types[*enum_id as usize];
                     let v = self.operand(value);
-                    let slot = self.builder.build_alloca(ety, "junion_v").map_err(|e| self.err(e))?;
+                    // Hoist the scratch slot to the entry block so an `encode` inside a loop does not
+                    // grow the stack per iteration (the shared `alloca_at_entry` discipline).
+                    let slot = self.alloca_at_entry(ety.into(), "junion_v")?;
                     self.builder.build_store(slot, v).map_err(|e| self.err(e))?;
                     let union_desc = self.emit_json_union(*enum_id);
                     self.builder
