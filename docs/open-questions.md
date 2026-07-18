@@ -3736,8 +3736,20 @@ table is now threaded into `EscapeCheck` / `MoveCheck` / the MIR `Builder`, and 
 takes it as a param). A scalar-only enum stays Copy / freely returnable; a `str`-bearing enum
 cannot escape the region backing its view (construction, match-result, and match-binding escapes
 all caught). Never Move (a `str` borrows) — owned payloads are J2. Tests: `enum_match.rs` (J1
-section). **J1b (next): shape-directed union decode/encode** over str/number/bool/object payloads
-(the descriptor's shape-class table + first-byte dispatch; enum as a struct field / decode target).
+section). **J1b-1 — SHIPPED (#532): enum as a struct field** (`is_field_ok`/`struct_has_str`/
+`ty_size_align`/`struct_acyclic`/`field_abi_align` grew a `Ty::Enum` arm; `enum_types` build before
+struct bodies; `layout_parity` pins the enum-field layout). **J1b-2a — SHIPPED: top-level
+shape-directed union decode/encode** over str/number/bool/object payloads. A union-decodable enum =
+every variant one payload, each mapping to a shape class (Str/Number/Bool/Object), pairwise distinct
+(compile-checked — `check_union_decodable` + `union_shape_class`). Runtime `JsonUnion` descriptor
+(per-variant payload arm + shape-class→arm + arm→enum-tag tables) + first-byte dispatch
+(`decode_union_value`/`align_rt_json_decode_union`); encode writes the live payload bare
+(`json_encode_value` factored out of `json_encode_object`, `align_rt_json_encode_union`). New
+`Rvalue::JsonDecodeUnion` + `TemplatePiece::UnionValue` swept through every exhaustive HIR/MIR pass
+(region_of gives input-region for a str-bearing union, Static for scalar-only); `json_union_schema_sig`
+baked into the MIR for cache invalidation. Tests: `m5.rs` J1b section. **J1b-2b (next): union as a
+struct field** (`Message { content: Content }`) — a descriptor kind 6 into `write_value` /
+`json_object_parts` reusing `emit_json_union`.
 → **J2** enum owned payloads (`array<Struct>`, drop) → full `Content` union → **the gateway is
 closed** → **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice

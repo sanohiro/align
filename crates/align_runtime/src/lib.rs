@@ -1853,63 +1853,118 @@ unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonFiel
             continue;
         }
         let fp = unsafe { base.add(d.offset as usize) };
-        match kind {
-            1 => b.buf.extend_from_slice(if unsafe { *fp } != 0 { &b"true"[..] } else { &b"false"[..] }),
-            2 => {
-                let w = (d.tag & 0xff) as usize;
-                if w == 4 {
-                    let mut bytes = [0u8; 4];
-                    unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 4) };
-                    push_float(&mut b.buf, f32::from_le_bytes(bytes));
-                } else {
-                    let mut bytes = [0u8; 8];
-                    unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 8) };
-                    push_float(&mut b.buf, f64::from_le_bytes(bytes));
-                }
+        unsafe { json_encode_value(b, fp, d, kind) };
+    }
+    b.buf.push(b'}');
+}
+
+/// Encode a single JSON value at `fp` per its descriptor `kind` (the payload-kind dispatch shared by
+/// object-field encode [`json_encode_object`] and shape-directed union encode
+/// [`align_rt_json_encode_union`]): bool/float/`str`(escaped)/nested-object/`array<struct>`/integer.
+/// Writes the **bare** value (no key) into the builder — the caller emits any `"name":` prefix and
+/// the union path writes the live variant's payload with no wrapper.
+///
+/// # Safety
+/// `fp` must point at a value of the kind `d` describes; kind 4/5 require a valid `d.sub`.
+unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind: i32) {
+    match kind {
+        1 => b.buf.extend_from_slice(if unsafe { *fp } != 0 { &b"true"[..] } else { &b"false"[..] }),
+        2 => {
+            let w = (d.tag & 0xff) as usize;
+            if w == 4 {
+                let mut bytes = [0u8; 4];
+                unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 4) };
+                push_float(&mut b.buf, f32::from_le_bytes(bytes));
+            } else {
+                let mut bytes = [0u8; 8];
+                unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 8) };
+                push_float(&mut b.buf, f64::from_le_bytes(bytes));
             }
-            3 => {
-                // `str` field `{ptr,len}` → quoted + escaped.
-                let mut pb = [0u8; 8];
-                let mut lb = [0u8; 8];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(fp, pb.as_mut_ptr(), 8);
-                    core::ptr::copy_nonoverlapping(fp.add(8), lb.as_mut_ptr(), 8);
-                }
-                let sptr = usize::from_le_bytes(pb) as *const u8;
-                let slen = i64::from_le_bytes(lb);
-                b.buf.push(b'"');
-                if slen > 0 && !sptr.is_null() {
-                    write_json_str_body(&mut b.buf, unsafe { safe_slice(sptr, slen) });
-                }
-                b.buf.push(b'"');
+        }
+        3 => {
+            // `str` field `{ptr,len}` → quoted + escaped.
+            let mut pb = [0u8; 8];
+            let mut lb = [0u8; 8];
+            unsafe {
+                core::ptr::copy_nonoverlapping(fp, pb.as_mut_ptr(), 8);
+                core::ptr::copy_nonoverlapping(fp.add(8), lb.as_mut_ptr(), 8);
             }
-            4 => {
-                if d.sub.is_null() {
-                    b.buf.extend_from_slice(b"null");
-                } else {
-                    let sub = unsafe { &*d.sub };
-                    let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
-                    unsafe { json_encode_object(b, fp, sub_descs) };
-                }
+            let sptr = usize::from_le_bytes(pb) as *const u8;
+            let slen = i64::from_le_bytes(lb);
+            b.buf.push(b'"');
+            if slen > 0 && !sptr.is_null() {
+                write_json_str_body(&mut b.buf, unsafe { safe_slice(sptr, slen) });
             }
-            5 => unsafe { json_encode_struct_array_at(b, fp, d.sub) },
-            _ => {
-                // Integer: read per (width, sign).
-                let w = (d.tag & 0xff) as usize;
-                let signed = (d.tag & 0x1_0000) != 0;
-                let raw = unsafe { read_le_uint(fp, w) };
-                if signed {
-                    // Sign-extend the `w`-byte value to i64.
-                    let shift = 64 - (w as u32) * 8;
-                    let v = ((raw as i64) << shift) >> shift;
-                    builder_push_i64(&mut b.buf, v);
-                } else {
-                    builder_push_u64(&mut b.buf, raw);
-                }
+            b.buf.push(b'"');
+        }
+        4 => {
+            if d.sub.is_null() {
+                b.buf.extend_from_slice(b"null");
+            } else {
+                let sub = unsafe { &*d.sub };
+                let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+                unsafe { json_encode_object(b, fp, sub_descs) };
+            }
+        }
+        5 => unsafe { json_encode_struct_array_at(b, fp, d.sub) },
+        _ => {
+            // Integer: read per (width, sign).
+            let w = (d.tag & 0xff) as usize;
+            let signed = (d.tag & 0x1_0000) != 0;
+            let raw = unsafe { read_le_uint(fp, w) };
+            if signed {
+                // Sign-extend the `w`-byte value to i64.
+                let shift = 64 - (w as u32) * 8;
+                let v = ((raw as i64) << shift) >> shift;
+                builder_push_i64(&mut b.buf, v);
+            } else {
+                builder_push_u64(&mut b.buf, raw);
             }
         }
     }
-    b.buf.push(b'}');
+}
+
+/// `json.encode` of a shape-directed union (`enum`) value at `base` (JSON completeness J1b): read the
+/// enum tag (`i32` at `base`), find the arm whose `enum_tags` entry equals it, and write that
+/// variant's payload **bare** (no wrapper key) into the builder `b` via [`json_encode_value`] — so
+/// `decode(encode(x))` round-trips by construction. A tag with no matching arm (a mis-built
+/// descriptor) emits `null` defensively.
+///
+/// # Safety
+/// `union_desc` must be a valid [`JsonUnion`]; `base` must point at a live enum value of
+/// `union_desc.store_size` bytes; `b` must be a valid builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *const u8, union_desc: *const JsonUnion) {
+    if b.is_null() || base.is_null() || union_desc.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let u = unsafe { &*union_desc };
+    // Read the enum tag (i32 at offset 0).
+    let mut tag_bytes = [0u8; 4];
+    unsafe { core::ptr::copy_nonoverlapping(base, tag_bytes.as_mut_ptr(), 4) };
+    let tag = i32::from_le_bytes(tag_bytes);
+    let arms = unsafe { safe_slice(u.arms, u.n_arms) };
+    let enum_tags = unsafe { core::slice::from_raw_parts(u.enum_tags, arms.len()) };
+    // Find the arm whose variant index matches the live tag (`enum_tags` is parallel to `arms`).
+    let mut arm: Option<&JsonField> = None;
+    for (i, d) in arms.iter().enumerate() {
+        if enum_tags[i] == tag {
+            arm = Some(d);
+            break;
+        }
+    }
+    let Some(d) = arm else {
+        b.buf.extend_from_slice(b"null");
+        return;
+    };
+    if d.offset < 0 {
+        b.buf.extend_from_slice(b"null");
+        return;
+    }
+    let kind = (d.tag >> 8) & 0xff;
+    let fp = unsafe { base.add(d.offset as usize) };
+    unsafe { json_encode_value(b, fp, d, kind) };
 }
 
 /// Encode an owned `array<Struct>`'s `{ptr,len}` slot (at `slot`) into `[...]` — the element schema
@@ -2411,6 +2466,47 @@ pub struct JsonSubTable {
     pub phf_seed: i64,
 }
 
+/// A shape-directed **union** (sum-type) schema for `json.decode`/`json.encode` (JSON completeness
+/// J1b): a JSON `oneOf` mapped to an Align `enum` discriminated by the value's **shape class** —
+/// `Str`(0) / `Number`(1) / `Bool`(2) / `Object`(3) / `Array`(4), an O(1) dispatch on the first
+/// structural byte. `arms` is one [`JsonField`] per variant describing its single payload (the `tag`
+/// packs the payload kind/width/sign exactly as a struct field; `offset` is the payload's byte offset
+/// **within the enum** `{ i32 tag, payloads… }`; `sub` is the object payload's sub-schema; `opt_tag`
+/// is unused, `-1`). `class_to_arm[c]` maps a shape class `c` (0..5) to its arm index, or `-1` if the
+/// union has no variant of that shape; `enum_tags[arm]` is the enum tag value (variant index) to
+/// store. `store_size` is the enum's byte size (for the payload bounds check). Sema guarantees the
+/// shape classes are pairwise distinct (so the first-byte dispatch is unambiguous) and each payload
+/// maps to exactly one class.
+#[repr(C)]
+pub struct JsonUnion {
+    pub arms: *const JsonField,
+    pub class_to_arm: *const i32,
+    pub enum_tags: *const i32,
+    pub n_arms: i64,
+    pub store_size: i64,
+}
+
+/// The number of JSON shape classes (`Str`/`Number`/`Bool`/`Object`/`Array`) — the length of a
+/// [`JsonUnion::class_to_arm`] table. `null` is deliberately **not** a class (absence belongs to
+/// `Option`).
+const JSON_SHAPE_CLASSES: usize = 5;
+
+/// Classify a JSON value by its first structural byte into a shape class index (matching
+/// [`JsonUnion`]'s `class_to_arm` order): `"`→Str(0), `-`/digit→Number(1), `t`/`f`→Bool(2),
+/// `{`→Object(3), `[`→Array(4). A `null` (`n`) or anything else is `None` — not a union shape (a
+/// required union field rejects `null`; `Option<Union>` handles absence one layer up).
+#[inline]
+fn json_shape_class(first: u8) -> Option<i32> {
+    match first {
+        b'"' => Some(0),
+        b'-' | b'0'..=b'9' => Some(1),
+        b't' | b'f' => Some(2),
+        b'{' => Some(3),
+        b'[' => Some(4),
+        _ => None,
+    }
+}
+
 /// Whether the parsed `i64` value `v` fits the target integer field of `w` bytes with signedness
 /// `signed` — the range-check that keeps `json.decode` from silently truncating/sign-wrapping
 /// out-of-range input (`{"n": 300}` into `u8`, `{"n": -1}` into `u32`, `{"n": 200}` into `i8`).
@@ -2492,6 +2588,73 @@ pub unsafe extern "C" fn align_rt_json_decode(
     } else {
         1
     }
+}
+
+/// Decode one JSON value into a shape-directed union (`enum`) at `base` (JSON completeness J1b): the
+/// value's first structural byte selects the variant by shape class, the payload is written at
+/// `base + arm.offset` via the shared [`write_value`], and the enum tag (`i32` at `base`) is set to
+/// the arm's variant index. A JSON `null` / an array (no J1b arm) / a shape with no matching variant
+/// is a decode error (absence belongs to `Option`; array payloads are J2).
+///
+/// # Safety
+/// `u` must be a valid [`JsonUnion`]; `base` must address `u.store_size` writable, zeroed bytes.
+unsafe fn decode_union_value(p: &mut JsonParser, u: &JsonUnion, base: *mut u8) -> Option<()> {
+    p.ws();
+    let cls = json_shape_class(p.peek()?)?;
+    let class_to_arm = unsafe { core::slice::from_raw_parts(u.class_to_arm, JSON_SHAPE_CLASSES) };
+    let arm_idx = *class_to_arm.get(cls as usize)?;
+    if arm_idx < 0 {
+        return None; // the union has no variant of this shape class → type mismatch
+    }
+    let arms = unsafe { safe_slice(u.arms, u.n_arms) };
+    let d = arms.get(arm_idx as usize)?;
+    let kind = (d.tag >> 8) & 0xff;
+    let width = field_width(d, kind)?;
+    // The payload must fit inside the enum's storage (defense against a mis-built descriptor).
+    let off = usize::try_from(d.offset).ok()?;
+    let w = usize::try_from(width).ok()?;
+    let store = usize::try_from(u.store_size).ok()?;
+    if off.checked_add(w)? > store {
+        return None;
+    }
+    let dst = unsafe { base.add(off) };
+    unsafe { write_value(p, kind, width, d, dst)? };
+    // Set the enum tag (`i32` at offset 0) to the selected variant's index. `enum_tags` is parallel to
+    // `arms` (both `n_arms` long), so bound it identically rather than trusting an unchecked `add`.
+    let enum_tags = unsafe { core::slice::from_raw_parts(u.enum_tags, arms.len()) };
+    let tag_val = *enum_tags.get(arm_idx as usize)?;
+    let tag_bytes = tag_val.to_le_bytes();
+    unsafe { std::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), base, 4) };
+    Some(())
+}
+
+/// `json.decode` into a shape-directed union (`enum`) target (JSON completeness J1b): validate the
+/// input is UTF-8 (so a `str`-payload view is valid), decode one value by shape class into the
+/// caller-zeroed `out` enum, and reject trailing garbage. Returns `0` on success, `1` on any error.
+///
+/// # Safety
+/// `union_desc` must be a valid [`JsonUnion`]; `out` must address `union_desc.store_size` writable,
+/// zeroed bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_union(input: *const u8, input_len: i64, union_desc: *const JsonUnion, out: *mut u8) -> i32 {
+    if union_desc.is_null() || out.is_null() {
+        return 1;
+    }
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
+    if !validate_utf8(src) {
+        return 1;
+    }
+    let u = unsafe { &*union_desc };
+    let mut p = JsonParser { src, pos: 0 };
+    let ok = (|| -> Option<()> {
+        unsafe { decode_union_value(&mut p, u, out)? };
+        p.ws();
+        if p.pos != src.len() {
+            return None; // trailing garbage
+        }
+        Some(())
+    })();
+    if ok.is_some() { 0 } else { 1 }
 }
 
 /// Tracks which declared fields `parse_object` has seen, to reject duplicates and require all of

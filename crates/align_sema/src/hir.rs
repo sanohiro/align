@@ -687,6 +687,11 @@ pub enum ExprKind {
     /// Fields must be primitive scalars (the `soa<T>` rule, so no `str` columns / input region tie),
     /// and it needs an enclosing `arena {}`. The expression `ty` is `Result<soa<Struct>, Error>`.
     JsonDecodeSoa { struct_id: u32, input: Box<Expr> },
+    /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
+    /// one JSON value and select the variant by its shape class (Str/Number/Bool/Object). The `str`
+    /// payloads are zero-copy views into the input, so the result is region-tied to it (see
+    /// `region_of`). The expression `ty` is `Result<Enum, Error>`.
+    JsonDecodeUnion { enum_id: u32, input: Box<Expr> },
     /// `s.group_by(.key).{sum,min,max}(.value)` / `.count()` over a `soa<Struct>` local `base` —
     /// column-oriented grouped aggregate. Reads the `key_field` column (and `value_field` for
     /// sum/min/max — `None` for `count`) as `slice<i64>` via [`SoaColumn`] and folds per distinct
@@ -1470,6 +1475,11 @@ pub enum TemplatePart {
     /// `struct_id` is the element struct (its schema drives per-element encoding). Only produced by
     /// `json.encode` desugaring.
     StructArrayField { access: Expr, struct_id: u32 },
+    /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
+    /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
+    /// `decode(encode(x))` round-trips. `access` is the enum value; `enum_id` selects the descriptor.
+    /// Only produced by `json.encode` desugaring.
+    UnionValue { access: Expr, enum_id: u32 },
 }
 
 #[derive(Clone, Debug)]

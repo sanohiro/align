@@ -569,6 +569,13 @@ pub enum Rvalue {
     /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`. `schema`
     /// is the recursive schema fingerprint (see [`JsonDecode`]) baked in for cache invalidation.
     JsonDecodeSoa { struct_id: u32, schema: String, input: Operand, out: Slot, arena: Operand },
+    /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
+    /// one JSON value, select the variant by its shape class (Str/Number/Bool/Object; O(1) first-byte
+    /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
+    /// (0 = ok). codegen builds the [`JsonUnion`] descriptor (per-variant payload arms + the shape
+    /// class → arm table). `schema` is the union's fingerprint (variant names + payload types, struct
+    /// payloads expanded — see [`json_union_schema_sig`]) baked in for cache invalidation.
+    JsonDecodeUnion { enum_id: u32, schema: String, input: Operand, out: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -995,6 +1002,11 @@ pub enum TemplatePiece {
     /// `array` (`{ptr,len}`) as `[{...},...]` via the runtime descriptor-driven encoder. `struct_id`
     /// is the element struct (codegen emits its schema + element stride for the runtime call).
     StructArrayField { array: Operand, struct_id: u32 },
+    /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
+    /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
+    /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits;
+    /// `schema` is the union fingerprint baked in for cache invalidation (see [`json_union_schema_sig`]).
+    UnionValue { value: Operand, enum_id: u32, schema: String },
 }
 
 #[derive(Clone, Debug)]
@@ -2707,6 +2719,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         let op = lower_expr(b, access);
                         pieces.push(TemplatePiece::StructArrayField { array: op, struct_id: *struct_id });
                     }
+                    hir::TemplatePart::UnionValue { access, enum_id } => {
+                        let op = lower_expr(b, access);
+                        let schema = json_union_schema_sig(&b.enums, &b.structs, *enum_id);
+                        pieces.push(TemplatePiece::UnionValue { value: op, enum_id: *enum_id, schema });
+                    }
                 }
                 if b.is_terminated() {
                     return Operand::Value(b.fresh_value(e.ty));
@@ -2726,6 +2743,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
+        hir::ExprKind::JsonDecodeUnion { enum_id, input } => lower_json_decode_union(b, *enum_id, input, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
         // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
@@ -7247,6 +7265,75 @@ fn json_schema_sig_into(structs: &[hir::StructDef], struct_id: u32, visiting: &m
     }
     out.push('}');
     visiting.pop();
+}
+
+/// A stable fingerprint of a shape-directed union's decode/encode schema (JSON completeness J1b):
+/// `U{variant:payload,…}` in **variant (tag) order**, with a struct (object) payload expanded via
+/// [`json_schema_sig_into`] so a nested field change invalidates the cache. Baked into the
+/// `JsonDecodeUnion` rvalue / `UnionValue` template piece so the unit's `impl_hash` (hence the
+/// codegen cache key) tracks any change to a variant name, order, or payload type — none of which
+/// alters this function's other MIR (the stale-cache bug class of #514/#517).
+fn json_union_schema_sig(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32) -> String {
+    let mut s = String::from("U{");
+    if let Some(ed) = enums.get(enum_id as usize) {
+        for (i, v) in ed.variants.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&v.name);
+            s.push(':');
+            // A union variant carries exactly one payload (sema-checked); expand a struct payload.
+            match v.payload.first() {
+                Some(align_sema::Scalar::Struct(nid)) => json_schema_sig_into(structs, *nid, &mut Vec::new(), &mut s),
+                Some(sc) => s.push_str(&ty_name(align_sema::scalar_to_ty(*sc))),
+                None => s.push_str("()"),
+            }
+        }
+    }
+    s.push('}');
+    s
+}
+
+/// `json.decode(input)` into a shape-directed union (`enum`) target → decode one value into an out
+/// enum slot via the runtime (status `i32`), then branch into `Ok(<enum>)` / `Err(<code>)`. Mirrors
+/// [`lower_json_decode`]; the decoded enum's `str` payloads are zero-copy views into the input.
+fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let ety = Ty::Enum(enum_id);
+    let schema = json_union_schema_sig(&b.enums, &b.structs, enum_id);
+    let out = b.new_slot(ety);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, schema, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the filled enum and wrap it.
+    b.cur = ok_bb;
+    let s = b.fresh_value(ety);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code as the Error.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
 }
 
 fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {

@@ -22,7 +22,26 @@ json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: U
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
+//   enum (union)           (shape-directed: a JSON oneOf → a sum type; the variant is selected by the
+//                           value's shape class — str/number/bool/object; O(1) first-byte dispatch;
+//                           str payloads borrow the input; array-payload variants = J2)
 ```
+
+**Union（直和型）ターゲット（JSON completeness J1b）。** JSON `oneOf` は、値の **shape class** —
+`Str`（`"`）/ `Number`（数字・`-`）/ `Bool`（`t`/`f`）/ `Object`（`{`）— で判別される直和型にマップされる
+（先頭構造バイトでの O(1) ディスパッチ）。**コンパイル時検査（Align らしい設計）:** union-decodable な
+enum は各バリアントがちょうど 1 つの payload を持ち、各 payload が 1 つの shape class にマップされ、
+すべての class が **相互に排他** — `i64 | f64`（両方 Number）や 2 つの object payload は clash として
+コンパイルエラー、tag-only や shape を持たない（`char`）payload も拒否。`null` は class ではない
+（不在は `Option` の担当）。実行時に該当バリアントのない shape（配列や `null`）は decode `Err`。encode は
+生きているバリアントの payload を **そのまま（ラッパーキー無し）** 出力するので、`decode(encode(x))` は
+構成上ラウンドトリップする。ランタイム: `JsonUnion` descriptor（バリアントごとに 1 つの `JsonField`
+payload arm ＋ shape-class→arm テーブル ＋ arm→enum-tag テーブル）。decode は先頭バイトを分類し、共有
+`write_value` で payload を書き、tag を設定。encode は tag を読んで共有 `json_encode_value` で該当 arm を
+出力。**v1 の境界:** payload は str / number / bool / object（所有 `array<Struct>` payload — OpenAI
+マルチモーダル `content` union — は enum 所有 payload の drop が必要、J2）。union の `json.encode` は
+ローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union**（`Message { content:
+Content }`）は J1b-2b。
 
 **`array<Struct>` フィールド（REST-gateway runway, Slice C）。** 構造体フィールドは所有の `array<Struct>`
 であってよい — `messages: array<Message>` / `choices: array<Choice>` shape。フル OpenAI リクエスト/

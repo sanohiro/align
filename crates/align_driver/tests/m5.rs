@@ -1767,3 +1767,92 @@ fn str_eq_ignore_ascii_case() {
     let out = build_and_run("str-eq-ic", src);
     assert_eq!(out.status.code(), Some(3)); // a=1, b=1, c=0, d=0 → 1 + 2 = 3
 }
+
+// ---- JSON completeness J1b: shape-directed union (sum-type) decode/encode -----------------------
+
+#[test]
+fn json_union_decode_by_shape_class() {
+    if !backend_available() {
+        return;
+    }
+    // A JSON `oneOf` maps to a sum type discriminated by the value's shape class (Str/Number/Bool/
+    // Object) — an O(1) first-byte dispatch. `"hello"` → Text, `42` → Count, `true` → Flag.
+    let src = "import core.json\n\
+        Content { Text(str), Count(i64), Flag(bool) }\n\
+        fn main() -> Result<(), Error> {\n  \
+        a: Content := json.decode(\"\\\"hello\\\"\")?\n  \
+        b: Content := json.decode(\"42\")?\n  \
+        c: Content := json.decode(\"true\")?\n  \
+        print(match a { Text(s) => s.len() as i64, Count(n) => n, Flag(f) => -1 })\n  \
+        print(match b { Text(s) => s.len() as i64, Count(n) => n, Flag(f) => -1 })\n  \
+        print(match c { Text(s) => s.len() as i64, Count(n) => n, Flag(f) => if f { 100 } else { 0 } })\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-decode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n42\n100\n");
+}
+
+#[test]
+fn json_union_encode_bare_payload_and_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // Encode writes the live variant's payload BARE (no wrapper key), so `decode(encode(x))`
+    // round-trips. Covers str / number / bool / object payloads; the object payload decodes then
+    // re-encodes byte-identically.
+    let src = "import core.json\n\
+        Point { x: i64, y: i64 }\n\
+        Shape { Name(str), At(Point), N(i64), Yes(bool) }\n\
+        fn main() -> Result<(), Error> {\n  \
+        a := Shape.Name(\"hi\")\n  b := Shape.N(42)\n  c := Shape.Yes(true)\n  \
+        print(json.encode(a))\n  print(json.encode(b))\n  print(json.encode(c))\n  \
+        arena {\n    p: Shape := json.decode(\"{\\\"x\\\":3,\\\"y\\\":4}\")?\n    \
+        print(json.encode(p))\n    \
+        round := json.encode(p)\n    p2: Shape := json.decode(round)?\n    print(json.encode(p2))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-encode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\"hi\"\n42\ntrue\n{\"x\":3,\"y\":4}\n{\"x\":3,\"y\":4}\n");
+}
+
+#[test]
+fn json_union_runtime_shape_mismatch_is_err() {
+    if !backend_available() {
+        return;
+    }
+    // A JSON value whose shape class has no variant (here an array `[1,2]` — Array is not a J1b arm)
+    // is a decode Err, not a panic. `null` likewise (absence belongs to `Option`).
+    let src = "import core.json\n\
+        C { T(str), N(i64) }\n\
+        fn dec(s: str) -> i32 {\n  \
+        r: Result<C, Error> := json.decode(s)\n  \
+        return match r { Ok(v) => 1, Err(e) => 7 }\n}\n\
+        fn main() -> i32 = dec(\"[1,2]\") + dec(\"null\") * 10\n";
+    let out = build_and_run("json-union-mismatch", src);
+    assert_eq!(out.status.code(), Some(77)); // both Err → 7 + 70
+}
+
+#[test]
+fn json_union_str_bearing_cannot_escape_input_arena() {
+    // Soundness: a `str`-payload variant decoded from an arena-local input is a zero-copy view into
+    // that input, so the decoded union cannot escape the arena backing it (`region_of`).
+    assert!(check_errs(
+        "json-union-escape",
+        "import core.json\n\
+         C { T(str), N(i64) }\n\
+         fn make(x: i64) -> Result<C, Error> {\n  \
+         return arena {\n    src := template \"\\\"v{x}\\\"\"\n    d: C := json.decode(src)?\n    Ok(d)\n  }\n}\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn json_union_rejects_ambiguous_shape_classes() {
+    // Compile-time: a union-decodable sum type needs pairwise-distinct shape classes. `i64 | f64`
+    // (both Number) and two object payloads both clash; a tag-only or no-shape (`char`) payload is
+    // rejected too.
+    assert!(check_errs("json-union-number-clash", "import core.json\nBad { A(i64), B(f64) }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"1\")?\n  return Ok(())\n}\n"));
+    assert!(check_errs("json-union-tag-only", "import core.json\nBad { A(str), Empty }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"1\")?\n  return Ok(())\n}\n"));
+    assert!(check_errs("json-union-no-shape", "import core.json\nBad { A(char), B(i64) }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"1\")?\n  return Ok(())\n}\n"));
+    assert!(check_errs("json-union-obj-clash", "import core.json\nP{x:i64}\nQ{y:i64}\nBad { A(P), B(Q) }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"{}\")?\n  return Ok(())\n}\n"));
+}

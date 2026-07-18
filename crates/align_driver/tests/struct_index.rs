@@ -59,8 +59,10 @@ fn struct_with_owned_field() {
         "si-owned-string-arr",
         "U { name: string }\nfn main() -> i32 {\n  us := [U{name: \"a\".clone()}, U{name: \"b\".clone()}]\n  return 0\n}\n"
     ));
-    // An owned *collection* (`array<T>`) field is still rejected (only `string` owned fields so far).
-    assert!(check_errs("si-owned-array", "U { items: array<i64> }\nfn main() -> i32 = 0\n"));
+    // REST-gateway runway Slice C (#529) lifted the owned-collection-field restriction: an owned
+    // `array<T>` field is now allowed (the struct becomes a Move type with a recursive Drop that frees
+    // the array). Construct + index + drop round-trips (`items: array<i64>`).
+    assert!(!check_errs("si-owned-array", "U { items: array<i64> }\nfn main() -> i32 = 0\n"));
 }
 
 #[test]
