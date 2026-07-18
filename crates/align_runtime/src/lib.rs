@@ -2706,11 +2706,15 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
         let off = d.offset as usize;
         match (d.tag >> 8) & 0xff {
             5 => {
-                // Read the array `{ptr,len}` slot's pointer (first 8 bytes) and free the buffer.
+                // Read the array `{ptr,len}` slot's pointer (first 8 bytes), free the buffer, then
+                // NULL the slot — idempotent, so a nested struct freed by its OWN parse_object cleanup
+                // and then again by the outer struct's cleanup (a Move nested field whose decode failed
+                // after allocating an array) does not double-free (the second read sees null).
                 let mut pb = [0u8; 8];
                 unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
                 let ptr = usize::from_le_bytes(pb) as *mut u8;
                 unsafe { align_rt_free(ptr) };
+                unsafe { core::ptr::write_bytes(base.add(off), 0, 8) };
             }
             // A seen nested struct is complete → free all its owned fields (no seen gate).
             4 if !d.sub.is_null() => {
@@ -17887,6 +17891,39 @@ mod tests {
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert!(a1 > a0, "the array field allocated a buffer");
         assert_eq!(a1 - a0, f1 - f0, "the error path freed every buffer it allocated (no leak)");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_nested_move_struct_array_failure_no_double_free() {
+        // Memory-safety: a nested Move struct field (owns an `array<Struct>`) whose OWN decode fails
+        // after the array allocated must not be freed twice — once by its parse_object cleanup and
+        // again by the outer struct's cleanup. `drop_decoded_owned` nulls the slot after freeing, so
+        // the second pass is a no-op. Outer { inner: Inner @0, tail: i64 @24 }; Inner { items:
+        // array<X> @0, req: i64 @16 }; X { v: i64 @0 }. `inner.req` missing → inner fails after items.
+        let xv = b"v";
+        let x_descs = [JsonField { name_ptr: xv.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }];
+        let x_sub = JsonSubTable { descs: x_descs.as_ptr(), n_fields: 1, store_size: 8, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let (items, req) = (b"items", b"req");
+        let inner_descs = [
+            JsonField { name_ptr: items.as_ptr(), name_len: 5, tag: (5 << 8) | 16, offset: 0, sub: &x_sub, opt_tag: -1 },
+            JsonField { name_ptr: req.as_ptr(), name_len: 3, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let inner_sub = JsonSubTable { descs: inner_descs.as_ptr(), n_fields: 2, store_size: 24, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let (inner, tail) = (b"inner", b"tail");
+        let descs = [
+            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 0, sub: &inner_sub, opt_tag: -1 },
+            JsonField { name_ptr: tail.as_ptr(), name_len: 4, tag: 8, offset: 24, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"{"inner":{"items":[{"v":1},{"v":2}]},"tail":5}"#; // inner.req missing
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 32];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 32, core::ptr::null(), 0, 0) };
+        assert_ne!(rc, 0, "the missing nested required field must fail");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        // The inner `items` array allocated once; it must be freed EXACTLY once (no double-free).
+        assert_eq!(a1 - a0, 1, "one array buffer allocated");
+        assert_eq!(f1 - f0, 1, "freed exactly once — no double free, no leak");
     }
 
     #[test]

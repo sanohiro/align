@@ -469,6 +469,27 @@ fn json_empty_array_struct_field() {
 }
 
 #[test]
+fn json_array_element_with_option_field_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // The runtime descriptor-driven encoder (used for `array<Struct>` fields) handles an `Option`
+    // element field: `Some` emits `"note":...`, `None` is omitted — a distinct path from the
+    // template-based Option encode (code-review follow-up).
+    let json = r#"{"items":[{"x":1,"note":"hi"},{"x":2}]}"#;
+    let src = format!(
+        "import core.json\n\
+         Item {{ x: i64, note: Option<str> }}\n\
+         Bag {{ items: array<Item> }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  b: Bag := json.decode(s)?\n  print(json.encode(b))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-array-elem-option", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{json}\n"));
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;
