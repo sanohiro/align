@@ -253,6 +253,28 @@ fn json_decode_nested_struct_array_mison() {
 }
 
 #[test]
+fn json_encode_fixed_struct_array_with_nested() {
+    if !backend_available() {
+        return;
+    }
+    // `json.encode` over a fixed struct array whose element has a nested-struct field: the unrolled
+    // encode reads each nested leaf through the generalized `IndexField` path (`base[e].inner.x`),
+    // proving the `Vec<u32>` path (elem_field_ptr / phys_field_indices) handles nested element fields.
+    let src = "import core.json\n\
+        Inner { x: i64, name: str }\n\
+        Outer { id: i64, inner: Inner }\n\
+        fn main() -> i32 {\n  \
+        a := [Outer{id: 1, inner: Inner{x: 5, name: \"a\"}}, Outer{id: 2, inner: Inner{x: 6, name: \"b\"}}]\n  \
+        print(json.encode(a))\n  return 0\n}\n";
+    let out = build_and_run("json-encode-fixed-nested", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[{\"id\":1,\"inner\":{\"x\":5,\"name\":\"a\"}},{\"id\":2,\"inner\":{\"x\":6,\"name\":\"b\"}}]\n"
+    );
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;
