@@ -3776,9 +3776,28 @@ works** — `lower_match_enum` already nulls the scrutinee on a bound arm (`null
 with the enum arm), so the binding moves the buffer out and the scrutinee's drop frees null, the same
 path `Result`/`Option` use for their Move payloads (no special sema handling). The owned `array<Struct>`
 payload is exercised end-to-end in J2b (JSON). Tests: `enum_match.rs` J2 section (construct/move/return/if-join drop-clean, 7 deferral
-rejections, the nested-array non-panic). → **J2b** the union **Array** shape-class arm (decode/encode
-the `array<Struct>` variant) → the full multimodal `Content` union → **the gateway is closed** →
-**J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
+rejections, the nested-array non-panic). **J2b — SHIPPED: the union Array shape-class arm.** A JSON
+`[` now dispatches to a union's owned `array<Struct>` variant (shape class Array=4, O(1) first-byte),
+so the full multimodal **`Content { Text(str), Parts(array<Part>) }`** union decodes both shapes
+(`"hi"`→Text, `[{…}]`→Parts) and encodes the live payload **bare** — `decode(encode(x))` round-trips
+byte-identically. The whole decode/encode/drop-cleanup pipeline was **already** kind-5-aware from Slice
+C (`json_payload_tag_sub` → `emit_json_union` arm; runtime `json_shape_class('[')`=4,
+`decode_union_value`/`write_value`/`field_width`, `encode_union_at`/`json_encode_value`), so the change
+is minimal: sema `union_shape_class` `Scalar::DynStructArray => Some(4)`; `check_union_decodable`'s
+class table `[_;4]` → `[_; JSON_SHAPE_CLASSES]` (an Array arm would else panic OOB) + recurse into the
+array **element** struct (decodable check); MIR `json_union_schema_sig_into` expands the element
+struct's schema (`[]{…}`) so an element-field rename invalidates the cache (#514/#517 class, pinned by
+`cache_codegen` gate 2c); runtime `drop_decoded_union` frees the materialized AoS on the
+trailing-garbage error path (the one new leak surface — the Align side has no bound value to drop on an
+`Err`; pinned by an `alloc-count` new==free gate). v1 boundary: `array<scalar>` union payloads
+(`Scalar::DynArray`) stay rejected ("no shape class") — no descriptor arm yet, deferred to J3. Tests:
+`m5.rs` J2b (decode-by-shape, encode-bare + round-trip, trailing-garbage no-leak, two-Array clash,
+Move-element rejected). **The union itself closes here; the remaining gateway shapes —
+`Message { content: Content }` (a Move-enum struct field) and `Chat { messages: array<Message> }` (an
+`array<Move-struct>`) — are J3 compositions** (both need the deferred owned-enum-struct-field / owned
+array element, not new union work). →
+**J3** matrix fill (T1b — incl. the Move-enum-struct-field + owned array element that compose the union
+into `Message`/`Chat`) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

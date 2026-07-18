@@ -1820,8 +1820,8 @@ fn json_union_runtime_shape_mismatch_is_err() {
     if !backend_available() {
         return;
     }
-    // A JSON value whose shape class has no variant (here an array `[1,2]` — Array is not a J1b arm)
-    // is a decode Err, not a panic. `null` likewise (absence belongs to `Option`).
+    // A JSON value whose shape class no variant claims (here an array `[1,2]` — this union `C` has no
+    // Array-class variant) is a decode Err, not a panic. `null` likewise (absence belongs to `Option`).
     let src = "import core.json\n\
         C { T(str), N(i64) }\n\
         fn dec(s: str) -> i32 {\n  \
@@ -1950,4 +1950,103 @@ fn json_union_field_in_struct_array_roundtrips() {
         String::from_utf8_lossy(&out.stdout),
         "{\"messages\":[{\"role\":\"u\",\"content\":{\"url\":\"z\",\"w\":9}},{\"role\":\"a\",\"content\":\"hi\"}]}\n2\n"
     );
+}
+
+// ---- JSON completeness J2b: union Array shape-class arm (owned array<Struct> variant) ------------
+
+#[test]
+fn json_union_array_variant_decode_by_shape() {
+    if !backend_available() {
+        return;
+    }
+    // The full multimodal `Content { Text(str), Parts(array<Part>) }` union: a leading `"` → the
+    // `str` variant, a leading `[` → the owned `array<Struct>` variant (shape class Array=4, an O(1)
+    // first-byte dispatch). Decodes both shapes and reads the live payload; the owned array is dropped
+    // clean at arena end (a leak / double-free would abort the runtime).
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        a: Content := json.decode(\"\\\"hi\\\"\")?\n    \
+        b: Content := json.decode(\"[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"hello\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"x\\\"}]\")?\n    \
+        print(match a { Text(s) => s.len() as i64, Parts(ps) => -1 })\n    \
+        print(match b { Text(s) => -1, Parts(ps) => ps.len() })\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-arr-decode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n2\n"); // "hi".len(), 2 parts
+}
+
+#[test]
+fn json_union_array_variant_encode_bare_and_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // Encode writes the live variant's payload BARE: the `str` variant → a quoted string, the array
+    // variant → a bare JSON array of objects (no wrapper key). `decode(encode(x))` round-trips the full
+    // multimodal `Content` byte-identically — closing the REST gateway's `content` shape. (`json.encode`
+    // of a union takes a local binding, J1b-2a.)
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        fn main() -> Result<(), Error> {\n  \
+        a := Content.Text(\"hi\")\n  print(json.encode(a))\n  \
+        arena {\n    \
+        b: Content := json.decode(\"[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"hello\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"x\\\"}]\")?\n    \
+        print(json.encode(b))\n    \
+        round := json.encode(b)\n    b2: Content := json.decode(round)?\n    print(json.encode(b2))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-arr-encode", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "\"hi\"\n[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"img\",\"text\":\"x\"}]\n[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"img\",\"text\":\"x\"}]\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_union_array_trailing_garbage_is_err_no_leak() {
+    if !backend_available() {
+        return;
+    }
+    // A successful array-variant decode followed by trailing garbage is a decode `Err`, not a panic —
+    // and the owned AoS already materialized in the enum must be freed on that error path
+    // (`drop_decoded_union`), not leaked. A clean run (the runtime aborts on allocator corruption)
+    // covers the free; the `Err` covers the trailing-garbage rejection.
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        fn dec(s: str) -> i32 {\n  \
+        r: Result<Content, Error> := json.decode(s)\n  \
+        return match r { Ok(v) => 1, Err(e) => 0 }\n}\n\
+        fn main() -> i32 = dec(\"[{\\\"kind\\\":\\\"a\\\",\\\"text\\\":\\\"b\\\"}] xyz\")\n";
+    let out = build_and_run("json-union-arr-garbage", src);
+    assert_eq!(out.status.code(), Some(0)); // Err → 0
+}
+
+#[test]
+fn json_union_two_array_variants_rejected() {
+    // Two variants both mapping to the Array shape class (`array<P>` and `array<Q>`) cannot be
+    // discriminated by the first byte — a compile error naming the pairwise-distinct rule (J2b extends
+    // `check_union_decodable`'s class table to 5 classes so the Array arm indexes in bounds).
+    assert!(check_errs(
+        "json-union-arr-clash",
+        "import core.json\nP { k: str }\nQ { m: str }\n\
+         Bad { A(array<P>), B(array<Q>) }\n\
+         fn f(s: str) -> Result<Bad, Error> = json.decode(s)\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn json_union_array_move_element_rejected() {
+    // The array variant's element struct must be non-owned (one flat free): an `array<Move-struct>`
+    // (element owns a `string`) is rejected at declaration — the same Slice-C element rule, now for a
+    // union payload.
+    assert!(check_errs(
+        "json-union-arr-moveelem",
+        "import core.json\nP { s: string }\n\
+         Bad { T(str), Ps(array<P>) }\n\
+         fn f(s: str) -> Result<Bad, Error> = json.decode(s)\n\
+         fn main() -> i32 = 0\n"
+    ));
 }

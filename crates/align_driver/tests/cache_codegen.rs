@@ -268,6 +268,44 @@ fn gate2b_json_decode_field_rename_invalidates() {
     );
 }
 
+// ---- Gate 2c: a union's array<Struct> ELEMENT field rename invalidates the cache ----------------
+
+/// A shape-directed union's `array<Struct>` payload (J2b) reaches its element struct's fields only
+/// through the codegen descriptor, exactly like a nested-struct field — so an element field RENAME
+/// leaves every other MIR statement byte-identical. `json_union_schema_sig_into` must expand the
+/// element struct's schema (not just print its id via `ty_name`), else the warm cache serves a STALE
+/// object decoding the OLD element key (the #514/#517 class). This gate pins the miss.
+#[test]
+fn gate2c_json_union_array_element_rename_invalidates() {
+    if !backend() {
+        return;
+    }
+    // v1 element `Part { kind, text }`; v2 renames `text` → `txt` with the JSON literal keeping key
+    // "text". Every other line is byte-identical.
+    let v1 = "import core.json\nPart { kind: str, text: str }\nContent { Text(str), Parts(array<Part>) }\nfn main() -> Result<(), Error> {\n  arena {\n    c: Content := json.decode(\"[{\\\"kind\\\":\\\"a\\\",\\\"text\\\":\\\"b\\\"}]\")?\n    print(match c { Text(s) => -1, Parts(ps) => ps.len() })\n  }\n  return Ok(())\n}\n";
+    let v2 = "import core.json\nPart { kind: str, txt: str }\nContent { Text(str), Parts(array<Part>) }\nfn main() -> Result<(), Error> {\n  arena {\n    c: Content := json.decode(\"[{\\\"kind\\\":\\\"a\\\",\\\"text\\\":\\\"b\\\"}]\")?\n    print(match c { Text(s) => -1, Parts(ps) => ps.len() })\n  }\n  return Ok(())\n}\n";
+    let proj = Project::new("json-union-elem-rename", &[("main.align", v1)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    if cc_available() {
+        assert_eq!(cold.run(&proj, Profile::Release), "1\n"); // v1: key "text" matches → 1 part
+    }
+    proj.write("main.align", v2);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hot.outcome("main").hit, "a union array-element field rename must miss");
+    assert_eq!(
+        hot.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the element field feeds the union's recursive schema fingerprint → the unit's MIR digest"
+    );
+    if cc_available() {
+        // v2 requires key "txt" but the input carries "text" → strict decode fails, `?` propagates,
+        // nothing prints. A stale v1 hit would wrongly print "1\n".
+        assert_eq!(hot.run(&proj, Profile::Release), "", "the rebuilt v2 must fail decoding, not serve the stale v1 object");
+    }
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]
