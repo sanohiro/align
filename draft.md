@@ -1927,8 +1927,12 @@ scalar / `str` / nested struct): decode maps a missing key or JSON `null` to
 a `None` field entirely (never `"k": null`), so `decode(encode(x))` round-trips.
 A non-`Option` field still errors when its key is missing — optionality is
 declared in the type, never inferred. (An Option payload must be non-owned in v1,
-and `Option<struct>` encode is a pending follow-up.) `array<T>` fields are the
-next runway slice, and `soa<Struct>` columns stay primitive/`str`.
+and `Option<struct>` encode is a pending follow-up.) A field may also be an owned
+`array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
+array into an owned array-of-structs in the field (freed by the struct's drop),
+and encode renders it back — so a full nested/array/optional record round-trips.
+The array element struct must be non-owned in v1 (`array<string>` deferred), and a
+`soa<Struct>` stays primitive/`str` columns.
 
 ### core.template
 

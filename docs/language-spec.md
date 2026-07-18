@@ -306,8 +306,11 @@ position is re-checked against the declared set and rejected). A struct field ma
 round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
-`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). `array<T>` fields
-are the next slice; `soa<T>` columns stay primitive/`str`. See `draft.md` §9, §14.
+`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). A field may also
+be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
+array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
+OpenAI request/response round-trips; the element struct must be non-owned in v1. `soa<T>` columns
+stay primitive/`str`. See `draft.md` §9, §14.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

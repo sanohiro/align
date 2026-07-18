@@ -3543,9 +3543,11 @@ Two independent gaps block declaring/decoding/encoding these today, in different
    covers flat structs and top-level arrays only; nested-struct / Option-field / array-field
    targets are recorded there as "design work before code". `encode` is flat-struct-only.
 
-**Status (updated 2026-07-18): Slices A + B SHIPPED (B's `Option<struct>` ENCODE is the one
-follow-up). Slice C (`array<T>` fields) remains, then the owner-directed JSON-completeness push
-(enum/union payloads finish the gateway; `JsonValue`/map + streaming/validate close the rest).**
+**Status (updated 2026-07-18): Slices A + B + C SHIPPED — the full OpenAI chat-completions
+request/response round-trips through `core.json`. Follow-ups: B's `Option<struct>` ENCODE, C's
+`array<scalar>` field decode + owned-element arrays. NEXT: the owner-directed JSON-completeness push
+(enum/union payloads finish the gateway's `content` union; then `JsonValue`/map + streaming/validate
+close the rest — no "this JSON shape works, that one doesn't" gap).**
 
 **Plan — three slices, each shippable and ideal-form on its own:**
 
@@ -3602,16 +3604,29 @@ follow-up). Slice C (`array<T>` fields) remains, then the owner-directed JSON-co
     (`json_decode_option_fields_null_policy`, `json_decode_option_struct_field_in_array`,
     `json_encode_option_fields_omit_none`, `json_option_field_decode_encode_roundtrip`),
     `layout_parity` Option cases.
-- **C. `array<T>` struct fields (language) + array-field decode/encode (json).** The Move
-  machinery generalizes (`struct_is_move` already walks owned fields; recursive Drop extends to
-  the array payload; MoveCheck's per-field moves exist from tuples). This is the
-  `messages: array<Message>` shape — the request side's hard requirement. `soa<T>` keeps
-  excluding Move-fielded structs (the settled owned-columns deferral stands).
-- **C. `array<T>` struct fields (language) + array-field decode/encode (json).** The Move
-  machinery generalizes (`struct_is_move` already walks owned fields; recursive Drop extends to
-  the array payload; MoveCheck's per-field moves exist from tuples). This is the
-  `messages: array<Message>` shape — the request side's hard requirement. `soa<T>` keeps
-  excluding Move-fielded structs (the settled owned-columns deferral stands).
+- **C. `array<T>` struct fields (language) + `array<Struct>` decode/encode (json). — SHIPPED
+  2026-07-18.** The `messages: array<Message>` / `choices: array<Choice>` shape — the full OpenAI
+  request/response now round-trips (`json_full_openai_response_shape_roundtrip`). `is_field_ok`
+  admits `array<T>`; the field owns ONE heap AoS buffer freed by the struct's `Drop`
+  (`drop_struct_fields`'s new array arm). **v1 element restriction (non-owned, like Slice B): a
+  scalar / `str`-view / plain-data (non-Move) struct** — `array<string>` / `array<Move-struct>`
+  rejected at declaration (their per-element deep free is a later slice). `struct_acyclic` does NOT
+  recurse through `array<Struct>` (a heap indirection, so `Node { children: array<Node> }` trees
+  are legal). **Decode:** a new descriptor kind 5 (sub = element schema); the runtime
+  `decode_struct_array_value` parses the JSON sub-array into an owned AoS via `parse_object` per
+  element (nested/`Option` element fields recurse), writing `{ptr,len}` to the field. **Encode:** a
+  dynamic length can't unroll, so a `StructArrayField` template piece calls the runtime
+  descriptor-driven encoder `json_encode_struct_array`/`json_encode_object` (reusing the DECODE
+  descriptors — symmetric, handles nested/Option/str/scalar). **Memory-safety:** the decode `Err`
+  path frees any AoS buffers already written into the partial struct (`drop_decoded_owned`, the
+  runtime dual of `drop_struct_fields`) — pinned by `json_array_field_error_path_frees_buffer`
+  (alloc==free). **Known constraint:** a Move struct (owns an array) can't be a `Result`/`Option`
+  Ok payload that crosses a function boundary (pre-existing) — decode + use it in the same scope.
+  Deferred: `array<scalar>` field decode (`array<i64>`), `array<string>`/owned-element arrays.
+  `soa<T>` keeps excluding Move-fielded structs (the settled owned-columns deferral stands). Tests:
+  m5 (`json_array_struct_field_decode_read_and_roundtrip`, `json_full_openai_response_shape_roundtrip`,
+  `json_empty_array_struct_field`), runtime (`json_decode_array_struct_field_and_encode`,
+  `json_array_field_error_path_frees_buffer`).
 
 **Acceptance (the consumer is the test):** decode a real `chat/completions` request (messages +
 optional params), encode a real response and an SSE `delta` chunk through `respond_stream`, in an

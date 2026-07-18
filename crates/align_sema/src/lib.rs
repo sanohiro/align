@@ -2667,6 +2667,29 @@ pub fn check_program_with_effects(
                     );
                 }
             }
+            // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
+            // struct's `Drop` (`drop_struct_fields`). Its **element** must be non-owned in v1 so that
+            // buffer is a single flat free: a scalar / `str` view / plain-data (non-Move) struct.
+            // `array<string>` / `array<Move-struct>` would need a per-element deep free (a later
+            // slice), so reject them cleanly rather than leak each element.
+            match fty {
+                Ty::DynArray(Scalar::String) => {
+                    diags.error(
+                        "an `array<string>` field is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
+                        f.span,
+                    );
+                }
+                Ty::DynStructArray(eid, _) if struct_is_move(eid, &structs) => {
+                    diags.error(
+                        format!(
+                            "an `array<{}>` field needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
+                            structs[eid as usize].name
+                        ),
+                        f.span,
+                    );
+                }
+                _ => {}
+            }
             // The nested-struct checks apply to a direct `Struct` field AND an `Option<Struct>` field:
             // both embed the struct **inline**, so both need the acyclic + no-`align(N)` guarantees.
             let nested = match fty {
@@ -4405,7 +4428,7 @@ impl EffectScan<'_> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } => self.expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -6333,7 +6356,7 @@ impl<'a> EscapeCheck<'a> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } => self.walk(access, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -6947,7 +6970,7 @@ impl UnnecessaryHeapScan {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
-                        TemplatePart::OptionField { access, .. } => self.visit(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.visit(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -8329,7 +8352,7 @@ impl<'a> MoveCheck<'a> {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.expr(access, moved, false, false),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -12513,7 +12536,7 @@ impl<'a, 't> Checker<'a, 't> {
                 text.push_str(part);
                 Some(text)
             }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma => None,
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } => None,
         });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
@@ -15215,10 +15238,21 @@ impl<'a, 't> Checker<'a, 't> {
                         return false;
                     }
                 }
+                // An `array<Struct>` field (REST-gateway runway Slice C): decode a JSON array of
+                // objects into an owned AoS in the field. The element struct's fields must themselves
+                // be decodeable — recurse. The `stack` cycle guard rejects a recursive `array<Node>`
+                // (its descriptor table would be infinite), so codegen's `emit_json_subtable`
+                // recursion is bounded by construction. (`array<scalar>` field decode is a later slice.)
+                Ty::DynStructArray(eid, _) => {
+                    if !self.decode_struct_fields_ok_rec(eid, span, stack) {
+                        stack.pop();
+                        return false;
+                    }
+                }
                 _ => {
                     self.diags.error(
                         format!(
-                            "'json.decode' field '{}' has type {} (only int/float/bool/str/nested-struct/Option decode for now)",
+                            "'json.decode' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct> decode for now)",
                             f.name,
                             ty_name(f.ty)
                         ),
@@ -15313,6 +15347,10 @@ impl<'a, 't> Checker<'a, 't> {
             // path (`base.path…` or the struct-array element `base[elem].path…`).
             if let Ty::Struct(nid) = f.ty {
                 self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
+            } else if let Ty::DynStructArray(eid, _) = f.ty {
+                // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
+                // encoder (dynamic length → a runtime loop, not a static unroll).
+                parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
             } else {
                 match f.ty {
                     Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
@@ -15320,7 +15358,7 @@ impl<'a, 't> Checker<'a, 't> {
                     _ => {
                         self.diags.error(
                             format!(
-                                "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option only for now)",
+                                "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
                                 f.name,
                                 ty_name(f.ty)
                             ),
@@ -19154,7 +19192,7 @@ impl<'a, 't> Checker<'a, 't> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } => self.finalize_expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -20608,8 +20646,13 @@ fn is_field_ok(ty: Ty) -> bool {
     match ty {
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
-        // rejected until array fields land, matching the direct-field rule).
+        // rejected until array-in-Option lands, matching the direct-field rule).
         Ty::Option(s) => is_field_ok(scalar_to_ty(s)),
+        // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
+        // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
+        // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
+        // (pass 0b-2), where the struct table is populated; here we admit the array shape.
+        Ty::DynArray(_) | Ty::DynStructArray(..) => true,
         _ => false,
     }
 }
