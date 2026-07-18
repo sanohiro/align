@@ -8,7 +8,32 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-1 SHIPPED — enum as a struct field, PR #532**
+_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-2a SHIPPED — top-level shape-directed union
+decode/encode, MERGED as #533**. A JSON `oneOf` maps to a sum type discriminated by the value's
+**shape class** — Str (`"`) / Number (digit/`-`) / Bool (`t`/`f`) / Object (`{`), an O(1) first-byte
+dispatch; encode writes the live variant's payload **bare**, so `decode(encode(x))` round-trips.
+Compile-checked: a union-decodable enum has every variant carry one payload, each mapping to one
+shape class, all pairwise distinct (`check_union_decodable` + `union_shape_class`). Runtime `JsonUnion`
+descriptor (per-variant `JsonField` payload arm + shape-class→arm + arm→enum-tag tables);
+`decode_union_value`/`align_rt_json_decode_union` dispatch on the first byte and write via the shared
+`write_value`; encode reuses `json_encode_value` (factored out of `json_encode_object`) via
+`align_rt_json_encode_union`. New `Rvalue::JsonDecodeUnion` + `TemplatePiece::UnionValue` swept
+through EVERY exhaustive HIR/MIR analysis pass (region_of: input-region for a str-bearing union,
+Static for scalar-only); `json_union_schema_sig` baked into the MIR for cache invalidation. v1
+boundary: str/number/bool/object payloads (owned `array<Struct>` payload = J2); `json.encode` needs a
+local binding. Tests: `m5.rs` J1b section (decode-by-shape, encode-bare+round-trip, runtime mismatch
+→ Err, escape rejection, 4 compile-time clash/tag-only/no-shape rejections). `/align-self-review` +
+`/code-review` high (1 finding — mid-block alloca hoisted to entry) both run. **Also fixed 3
+pre-existing CI failures** (main had been red since #530): two stale negative tests whose rejection
+earlier slices had already lifted (`generic_enum_invalid_payload_rejected` from J1a #531,
+`struct_with_owned_field`'s `array<i64>`-field assertion from Slice C #529 — both flipped to
+acceptance), and an x86_64-only stack overflow in `within_limit_chain_compiles_and_runs` (the
+in-process test harness compiled a 40-deep expr on the 2 MB test-thread stack — `build_and_run` now
+compiles on a 32 MB worker thread). CI green on all three platforms. **NEXT: J1b-2b — union as a
+struct field** (`Message { content: Content }`): a new descriptor kind 6 wired into `write_value` /
+`json_object_parts`, reusing `emit_json_union`; then **J2** (enum owned `array<Struct>` payloads +
+tag-switched drop → the full multimodal `Content` union → the gateway closes). Previous update:
+2026-07-18, **JSON COMPLETENESS J1b-1 SHIPPED — enum as a struct field, PR #532**
 (the language prerequisite for shape-directed unions; the split first half of J1b). A struct field
 may now be a **sum type** — the `Message { content: Content }` shape union decode/encode needs. An
 enum is never Move today (`enum_payload_ok`: scalar / `str` / non-Move struct payloads), so an enum
