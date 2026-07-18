@@ -275,6 +275,103 @@ fn json_encode_fixed_struct_array_with_nested() {
 }
 
 #[test]
+fn json_decode_option_fields_null_policy() {
+    if !backend_available() {
+        return;
+    }
+    // REST-gateway runway Slice B: `Option<T>` decode fields with the settled null policy —
+    // present value → Some, JSON `null` → None, missing key → None, type mismatch → Err. This is the
+    // `temperature?`/`stream?` shape of an OpenAI request.
+    let json = r#"{"model":"gpt","temperature":0.5,"stream":null}"#;
+    let src = format!(
+        "import core.json\n\
+         Req {{ model: str, temperature: Option<f64>, stream: Option<bool>, tag: Option<str> }}\n\
+         fn parse(s: str) -> Result<Req, Error> {{\n  r: Req := json.decode(s)?\n  return Ok(r)\n}}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         r := parse({json:?})?\n  \
+         print(r.model)\n  \
+         match r.temperature {{ Some(t) => print(t) None => print(0.0 - 1.0) }}\n  \
+         match r.stream {{ Some(b) => {{ if b {{ print(1) }} else {{ print(2) }} }} None => print(9) }}\n  \
+         match r.tag {{ Some(s) => print(s) None => print(0 - 5) }}\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-option-nullpolicy", &src);
+    assert_eq!(out.status.code(), Some(0));
+    // temperature present (0.5), stream null → None (9), tag missing → None (-5).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "gpt\n0.5\n9\n-5\n");
+}
+
+#[test]
+fn json_decode_option_struct_field_in_array() {
+    if !backend_available() {
+        return;
+    }
+    // `Option<Struct>` fields decode through the Mison array path: present nested object → Some,
+    // missing → None. Varying optionality across records forces both speculate + fallback.
+    let json = r#"[{"id":1,"inner":{"x":7}},{"id":2},{"id":3,"inner":{"x":9}}]"#;
+    let src = format!(
+        "import core.json\n\
+         Inner {{ x: i64 }}\n\
+         Row {{ id: i64, inner: Option<Inner> }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  \
+         xs: array<Row> := json.decode(s)?\n  \
+         match xs[0].inner {{ Some(v) => print(v.x) None => print(0 - 1) }}\n  \
+         match xs[1].inner {{ Some(v) => print(v.x) None => print(0 - 1) }}\n  \
+         match xs[2].inner {{ Some(v) => print(v.x) None => print(0 - 1) }}\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-option-struct-array", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n-1\n9\n");
+}
+
+#[test]
+fn json_encode_option_fields_omit_none() {
+    if !backend_available() {
+        return;
+    }
+    // REST-gateway runway Slice B: `json.encode` omits a `None` `Option` field entirely (never
+    // `"k":null`), with correct commas — the trailing-comma + pop-comma scheme. Covers some-present,
+    // all-none (→ `{}`-tail), and all-present.
+    let src = "import core.json\n\
+        Req { model: str, temperature: Option<f64>, stream: Option<bool>, tag: Option<str> }\n\
+        fn main() -> i32 {\n  \
+        a := Req{model: \"gpt\", temperature: Some(0.5), stream: None, tag: Some(\"x\")}\n  \
+        print(json.encode(a))\n  \
+        b := Req{model: \"m\", temperature: None, stream: None, tag: None}\n  \
+        print(json.encode(b))\n  \
+        c := Req{model: \"z\", temperature: None, stream: Some(false), tag: None}\n  \
+        print(json.encode(c))\n  return 0\n}\n";
+    let out = build_and_run("json-option-encode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // a: stream omitted; b: all optionals omitted; c: only stream present.
+        "{\"model\":\"gpt\",\"temperature\":0.5,\"tag\":\"x\"}\n{\"model\":\"m\"}\n{\"model\":\"z\",\"stream\":false}\n"
+    );
+}
+
+#[test]
+fn json_option_field_decode_encode_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // Decode a payload with a present and an absent optional, then re-encode: the round trip is
+    // stable (the absent field stays absent — `decode(encode(x))` fixpoint by construction).
+    let json = r#"{"model":"gpt","temperature":0.7}"#;
+    let src = format!(
+        "import core.json\n\
+         Req {{ model: str, temperature: Option<f64>, stream: Option<bool> }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         r: Req := json.decode({json:?})?\n  \
+         print(json.encode(r))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-option-roundtrip", &src);
+    assert_eq!(out.status.code(), Some(0));
+    // stream was absent → stays omitted; temperature round-trips.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{json}\n"));
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;

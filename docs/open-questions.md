@@ -3543,7 +3543,9 @@ Two independent gaps block declaring/decoding/encoding these today, in different
    covers flat structs and top-level arrays only; nested-struct / Option-field / array-field
    targets are recorded there as "design work before code". `encode` is flat-struct-only.
 
-**Status (updated 2026-07-18): Slice A SHIPPED. Slices B, C remain.**
+**Status (updated 2026-07-18): Slices A + B SHIPPED (B's `Option<struct>` ENCODE is the one
+follow-up). Slice C (`array<T>` fields) remains, then the owner-directed JSON-completeness push
+(enum/union payloads finish the gateway; `JsonValue`/map + streaming/validate close the rest).**
 
 **Plan — three slices, each shippable and ideal-form on its own:**
 
@@ -3569,18 +3571,42 @@ Two independent gaps block declaring/decoding/encoding these today, in different
   descriptor-level (`json_decode_nested_struct_single`/`..._array_mison`), example
   `examples/json_nested.align`. (The broader `layout(C)`-toggle / field-reorder offset-cache concern
   for NON-json struct field access is untouched here and remains a separate pre-existing question.)
-- **B. `Option<T>` struct fields (language) + optional-field decode (json).**
-  - Field support: extend `is_field_ok` + the layout pair (`ty_size_align` / `field_abi_align`
-    — `layout_parity` pins their agreement) + MoveCheck/escape field tracking; `struct_is_move`
-    already answers the moveness question (`payload_is_move`: an `Option<string>` field makes
-    the struct Move). The known bug class is a sibling type-class skipping an analysis pass —
-    sweep with the `/align-self-review` checklist.
-  - **Null policy (the design decision to settle here): missing key → `None`; JSON `null` →
-    `None`; type mismatch → `Err`. `encode` omits a `None` field entirely (never `"k": null`).**
-    One absence representation — JSON's two spellings of absence collapse into the one `Option`
-    (One way); `decode(encode(x))` round-trips by construction. A non-`Option` declared field
-    keeps today's strict exactly-once contract (missing → `Err`) — optionality is declared in
-    the type, never inferred leniency.
+- **B. `Option<T>` struct fields (language) + optional-field decode/encode (json). — SHIPPED
+  2026-07-18 (decode + encode of scalar/str/nested-struct Options; `Option<struct>` ENCODE is the
+  one recorded follow-up).**
+  - Field support DONE: `is_field_ok` admits `Option<T>`; the layout pair `ty_size_align` (sema) ↔
+    `option_struct_type`/`field_abi_align` (codegen) agree on the `{ i8 tag, payload }` layout —
+    `layout_parity` extended with every payload kind + reorder + `layout(C)`. `struct_acyclic`
+    recurses through `Option<Struct>` (a `Node { next: Option<Node> }` is still rejected);
+    `struct_has_str`/`tracks_region`/`ty_may_borrow` recurse through Options (region soundness).
+    **v1 restriction (owner-directed clean boundary): an `Option` field's payload must be NON-OWNED**
+    (scalar / `str` view / plain-data struct). `Option<string>` and `Option<Move-struct>` are
+    rejected at declaration (pass 0b-2) — an owned Option payload needs a conditional "free iff Some"
+    drop-as-a-field path with no consumer yet, and `Scalar::Struct.is_move()` is table-free so it
+    would mis-classify the struct as non-Move and leak. This adds ZERO owned-drop surface (json only
+    ever fills view/scalar/plain-struct Options) and covers the whole consumer.
+  - **Null policy SHIPPED as settled: missing key → `None`; JSON `null` → `None`; type mismatch →
+    `Err`; a required (non-`Option`) field still `Err`s when missing.** `encode` omits a `None`
+    field entirely (never `"k": null`). One absence representation (One way); `decode(encode(x))`
+    round-trips by construction (pinned by `json_option_field_decode_encode_roundtrip`).
+  - **Decode mechanism:** the runtime `JsonField` gains `opt_tag` (`-1` = required, else the
+    `Option` tag byte offset); an optional field is not required by `all_required_seen`, and its
+    payload writer (the single-sourced `write_value`, shared by the slow + Mison paths) writes at the
+    payload slot then sets the `Some` tag — `null`/missing leave the zeroed `None`. **Encode
+    mechanism:** an `Option`-bearing object switches to a trailing-comma layout — every present field
+    emits `"name":value,` and one `align_rt_builder_pop_comma` before `}` drops the dangling comma
+    (`{"a":1}` / `{}`); the `TemplatePart::OptionField`/`PopComma` pieces carry it (a pure-required
+    object keeps the original static layout — zero regression). **Deferred (the one follow-up):**
+    `Option<struct>` ENCODE (a conditional nested object rendered from the payload value) — decode
+    supports it; scalar/str Option encode ships. Tests: `m5.rs`
+    (`json_decode_option_fields_null_policy`, `json_decode_option_struct_field_in_array`,
+    `json_encode_option_fields_omit_none`, `json_option_field_decode_encode_roundtrip`),
+    `layout_parity` Option cases.
+- **C. `array<T>` struct fields (language) + array-field decode/encode (json).** The Move
+  machinery generalizes (`struct_is_move` already walks owned fields; recursive Drop extends to
+  the array payload; MoveCheck's per-field moves exist from tuples). This is the
+  `messages: array<Message>` shape — the request side's hard requirement. `soa<T>` keeps
+  excluding Move-fielded structs (the settled owned-columns deferral stands).
 - **C. `array<T>` struct fields (language) + array-field decode/encode (json).** The Move
   machinery generalizes (`struct_is_move` already walks owned fields; recursive Drop extends to
   the array payload; MoveCheck's per-field moves exist from tuples). This is the
@@ -3608,6 +3634,55 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
   are policy, not protocol). Double-gated on (a) fully-escaping fn values (storing handlers in
   structs/arrays) and (b) the build-system / package-layout / dependency-resolution design
   above. Re-evaluate on real reuse pressure from shipped apps — extraction over invention.
+
+### JSON completeness — owner-directed priority AFTER the runway (filed 2026-07-18)
+
+**Owner directive (2026-07-18): once the REST-gateway runway (Slices A/B/C) lands, the very next
+priority is to make `core.json` *holistically complete* — no more piecemeal "this JSON shape is
+supported, that one isn't."** The runway closes the OpenAI-gateway shapes but leaves a residue of
+gaps; the owner does not want that fragmentation to persist. This item tracks the residue and
+sequences its closure directly after Slice C. Each sub-item is tagged **impl** (just build it, the
+design is clear) or **design** (a decision must be settled first — flagged because it may touch the
+"typed records over the text boundary" framing of draft §14).
+
+After A/B/C, `core.json` covers: struct targets (flat / nested / `Option` / `array` fields),
+`array<Struct>`, `soa<Struct>`, `array<scalar>`; field types Int/Float/Bool/Str/nested-Struct/
+`Option<T>`/`array<T>`. The remaining gaps to close for "complete JSON":
+
+1. **Enum / discriminated-union payloads (impl → design).** A sum-type field/target — the OpenAI
+   multimodal `content` (`str` **or** an array of parts) is exactly this (`oneOf`). The runway v1
+   restricts `content` to `str`; this is the LAST piece of the gateway itself. Needs a
+   tag-discrimination decode rule (which key / value shape selects the variant) — likely
+   internally-tagged or shape-directed; a genuine design decision (Align enums have no JSON-standard
+   discriminator convention). Encode is mechanical once decode's rule is settled.
+2. **Dynamic / untyped JSON — a `JsonValue` type (design, the big one).** `serde_json::Value`'s
+   analogue: parse arbitrary unknown-shape JSON into a recursive `Value { Null, Bool, Num, Str,
+   Array, Object }`. Align's json is deliberately **schema-driven** (draft §14 "typed records"), so
+   this is a philosophy call, not just code: does "complete JSON" require a dynamic value, or is
+   schema-required decoding the intended completeness? The owner's "no gaps" steer leans toward
+   providing it (real JSON in the wild is often shape-unknown at compile time — webhooks,
+   config, third-party APIs). If adopted it needs: the recursive `Value` type (owned, arena or heap;
+   `Map`/`Array` payloads → depends on array/map fields), accessors (`v.get("k")`, `v.as_i64()`),
+   and an encode path. This is the single largest design+impl item; settle its philosophy stance
+   FIRST (it may re-frame draft §14).
+3. **JSON object-as-map — dynamic string keys (design+impl).** `{"k1": v, "k2": v, …}` where the
+   keys are *data*, not schema fields → a `map<str, V>` decode target. Needs the `map`/dictionary
+   type (does Align have one? — none today; this may pull in a whole collection type) OR fold into
+   `JsonValue`'s `Object`. Decide together with #2.
+4. **`json.scan` / `json.token` — streaming / SAX tier (impl).** Incremental parse for documents too
+   large to materialize (NDJSON `json.scan` is already gestured at in the roadmap). API + a pull/push
+   token model; no new value shapes, so mostly mechanical once the streaming contract is set.
+5. **`json.validate<T>` — schema validation (impl, small).** Validate bytes conform to `T` without
+   materializing; the settled no-turbofish rule means its `<T>` surface must come from context or
+   fold into `decode` (open-questions §"no expression-position type-argument syntax" residual).
+6. **Top-level scalar / bool / null targets, and deep array/Option/array nesting combinations
+   (impl).** `x: i64 := json.decode(s)?`, `array<array<T>>`, `array<Option<T>>` — fill the matrix so
+   there is no "this combination isn't a target" surprise.
+
+**Sequencing:** Slice B → Slice C → **close #1 (enum/union — finishes the gateway)** → settle #2/#3
+philosophy (the `JsonValue`/map decision — the crux of "complete") → #4/#5/#6. Only after #1–#6 is
+`core.json` "complete" in the owner's sense. Record the settled framing in draft §14 +
+`impl/core-design/json.md` as each lands.
 
 ### Details (settled during implementation)
 ```text

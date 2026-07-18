@@ -16,13 +16,24 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct fields; field order free; unknown keys ignored)
+//   struct                 (flat OR with nested-struct / Option<T> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
-//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct fields recurse)
+//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 ```
+
+**`Option<T>` フィールド（REST-gateway runway, Slice B）。** 構造体フィールドは `Option<T>`（payload は
+scalar / `str` / ネスト構造体）であってよい。**null ポリシー:** decode はキー欠落→`None`、JSON `null`→
+`None`、型不一致→`Err`、必須（非 `Option`）フィールドは欠落で `Err`。**encode は `None` フィールドを
+完全省略**（`"k":null` にしない）ので `decode(encode(x))` はラウンドトリップする。ランタイム: `JsonField`
+に `opt_tag`（`-1`=必須、それ以外は `Option` の tag バイトオフセット）を追加。optional フィールドは
+`all_required_seen` の対象外で、共有の `write_value` が payload スロットに書いてから `Some` tag を立てる。
+encode は `Option` を含むオブジェクトを trailing-comma 方式に切替え、`}` の前で `align_rt_builder_pop_comma`
+を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**v1 境界:** Option payload は **非所有**
+（`Option<string>`/`Option<Move-struct>` は宣言時に拒否）。残る follow-up は `Option<struct>` の **encode**
+（decode は対応済み）。
 
 **ネストされた構造体フィールド（REST-gateway runway, Slice A）。** 構造体のフィールドはそれ自身が
 `Struct` であってよい。`decode` はネストされたオブジェクトへ再帰し、`encode` はそれを再構築するため、

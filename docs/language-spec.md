@@ -304,8 +304,10 @@ enforced on both the strict fallback and the Mison speculative fast path (a dupl
 position is re-checked against the declared set and rejected). A struct field may itself be a
 `Struct` — `decode` recurses into the nested object and `encode` renders it back (a nested record
 round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
-`Option<T>`/`array<T>` fields are not yet decode/encode targets, and `soa<T>` columns stay
-primitive/`str`. See `draft.md` §9, §14.
+A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
+→ `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
+`decode(encode(x))` round-trips (a non-`Option` field still errors when missing). `array<T>` fields
+are the next slice; `soa<T>` columns stay primitive/`str`. See `draft.md` §9, §14.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

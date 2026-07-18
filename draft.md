@@ -1921,9 +1921,14 @@ fold into `decode`).
 A struct field may itself be a `Struct`: `decode` recurses into the nested object
 and `encode` renders it back, so a nested record round-trips in declaration order
 (unknown keys are still skipped at every level, and nested `str` fields stay
-zero-copy views into the input). `Option<T>` and `array<T>` fields are not yet
-decode/encode targets (the REST-gateway runway's later slices), and `soa<Struct>`
-columns stay primitive/`str` (no nested columns).
+zero-copy views into the input). A field may also be an `Option<T>` (payload
+scalar / `str` / nested struct): decode maps a missing key or JSON `null` to
+`None`, a type mismatch to `Err`, and a present value to `Some`; encode **omits**
+a `None` field entirely (never `"k": null`), so `decode(encode(x))` round-trips.
+A non-`Option` field still errors when its key is missing — optionality is
+declared in the type, never inferred. (An Option payload must be non-owned in v1,
+and `Option<struct>` encode is a pending follow-up.) `array<T>` fields are the
+next runway slice, and `soa<Struct>` columns stay primitive/`str`.
 
 ### core.template
 
