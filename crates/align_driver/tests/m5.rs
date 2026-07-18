@@ -205,6 +205,54 @@ fn json_decode_long_str_field_via_simd_scan() {
 }
 
 #[test]
+fn json_decode_encode_nested_struct_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // REST-gateway runway, Slice A: a struct with a nested-struct field decodes recursively (the
+    // runtime kind-4 path), its fields read at any depth (`o.inner.x`, `o.inner.name`), and
+    // `json.encode` renders the nested object back — a byte-exact round trip in declaration order.
+    let json = r#"{"id":1,"inner":{"x":5,"name":"hi"},"count":9}"#;
+    let src = format!(
+        "import core.json\n\
+         Inner {{ x: i64, name: str }}\n\
+         Outer {{ id: i64, inner: Inner, count: i64 }}\n\
+         fn parse(s: str) -> Result<Outer, Error> {{\n  o: Outer := json.decode(s)?\n  return Ok(o)\n}}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         o := parse({json:?})?\n  \
+         print(o.id)\n  print(o.inner.x)\n  print(o.inner.name)\n  print(o.count)\n  \
+         print(json.encode(o))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-nested-roundtrip", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("1\n5\nhi\n9\n{json}\n"));
+}
+
+#[test]
+fn json_decode_nested_struct_array_mison() {
+    if !backend_available() {
+        return;
+    }
+    // The Mison speculative array path (`json_speculate`/`write_field_indexed`) recurses into each
+    // element's nested-struct field. Field order is shuffled across records to force key re-verify;
+    // nested `str` views stay zero-copy into the input.
+    let json = r#"[{"id":1,"inner":{"x":5,"name":"a"},"count":9},{"count":8,"inner":{"name":"bb","x":6},"id":2}]"#;
+    let src = format!(
+        "import core.json\n\
+         Inner {{ x: i64, name: str }}\n\
+         Outer {{ id: i64, inner: Inner, count: i64 }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  \
+         xs: array<Outer> := json.decode(s)?\n  \
+         print(xs[0].inner.name)\n  print(xs[0].count)\n  print(xs[1].inner.x)\n  print(xs[1].inner.name)\n  \
+         return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-nested-array", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n9\n6\nbb\n");
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;

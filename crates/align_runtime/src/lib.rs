@@ -2161,16 +2161,39 @@ fn write_json_escape(buf: &mut BuilderBuf, c: u8) {
 }
 
 /// One field descriptor for `json.decode` (matches the codegen layout):
-/// `{ name_ptr, name_len, tag, offset }`. `tag` packs `(signed << 16) | (kind << 8) | byte-width`:
-/// kind 0 = int, 1 = bool, 2 = float, 3 = str; the byte-width is 1/2/4/8 for scalars (16 for a
-/// `str` view); bit 16 is the int sign flag (1 = signed, 0 = unsigned), only meaningful for kind 0.
-/// The sign flag lets the decoder range-check a parsed integer before writing (see [`int_in_range`]).
+/// `{ name_ptr, name_len, tag, offset, sub }`. `tag` packs `(signed << 16) | (kind << 8) | byte-width`:
+/// kind 0 = int, 1 = bool, 2 = float, 3 = str, **4 = nested struct**; the byte-width is 1/2/4/8 for
+/// scalars (16 for a `str` view; the width byte is unused for a nested struct — its size comes from
+/// `sub.store_size`); bit 16 is the int sign flag (1 = signed, 0 = unsigned), only meaningful for
+/// kind 0. The sign flag lets the decoder range-check a parsed integer before writing (see
+/// [`int_in_range`]).
+///
+/// `sub` is null except for a nested-struct field (kind 4), where it points to the nested struct's
+/// own descriptor table ([`JsonSubTable`]) so the decoder recurses into [`parse_object`].
 #[repr(C)]
 pub struct JsonField {
     pub name_ptr: *const u8,
     pub name_len: i64,
     pub tag: i32,
     pub offset: i64,
+    pub sub: *const JsonSubTable,
+}
+
+/// A nested-struct field's sub-schema: the nested struct's own field descriptors, store size, and
+/// (optional) perfect-hash table — everything [`parse_object`] needs to decode the sub-object into
+/// the parent's field slot. Referenced by [`JsonField::sub`] for kind-4 fields; the codegen side
+/// (`decode_field_table`) emits one constant global per distinct nested struct type. `store_size`
+/// is the nested struct's byte width (for the parent's `offset + width <= out_size` bounds check);
+/// a null/empty `phf` means the runtime falls back to a linear key scan (a pure speedup, never a
+/// correctness dependency — like the top-level table).
+#[repr(C)]
+pub struct JsonSubTable {
+    pub descs: *const JsonField,
+    pub n_fields: i64,
+    pub store_size: i64,
+    pub phf: *const i32,
+    pub phf_len: i64,
+    pub phf_seed: i64,
 }
 
 /// Whether the parsed `i64` value `v` fits the target integer field of `w` bytes with signedness
@@ -2352,10 +2375,53 @@ unsafe fn find_field(descs: &[JsonField], key: &[u8], phf: Option<&[i32]>, phf_s
     }
 }
 
+/// Decode a nested-struct field's sub-object at `p` into the `store_size`-byte slot at `dst`, per the
+/// sub-schema `sub`. Shared by [`parse_object`] (slow path) and [`write_field_indexed`] (Mison path)
+/// so both stay observably identical — the strict all-fields-present contract recurses too. Returns
+/// `None` on any nested parse error or a null sub-table. The recursion depth is bounded by the
+/// **acyclic struct schema** (`struct_acyclic` rejects a self-referential struct), not the input, so
+/// it cannot run away. `dst`'s bytes are already zeroed as part of the parent struct's zeroing, so a
+/// missing nested field reads as 0/false exactly like a top-level one.
+///
+/// # Safety
+/// `dst` must point to `(*sub).store_size` writable, already-zeroed bytes; `p` must be positioned at
+/// (optional whitespace then) the nested object's `{`; `(*sub)`'s ranges must be valid when non-null.
+#[inline]
+unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut u8) -> Option<()> {
+    if sub.is_null() {
+        return None;
+    }
+    let sub = unsafe { &*sub };
+    let descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+    let phf = unsafe { phf_slice(sub.phf, sub.phf_len) };
+    unsafe { parse_object(p, descs, dst, sub.store_size, phf, sub.phf_seed as u64) }
+}
+
+/// The declared field's byte width and destination bounds. For every kind except a nested struct the
+/// width is the tag's low byte (1/2/4/8, or 16 for a `str` view); a nested struct (kind 4) takes its
+/// width from `sub.store_size` (the tag width byte is unused there). Returns `None` on a null nested
+/// sub-table so the two decode paths reject a miscompiled descriptor identically.
+#[inline]
+fn field_width(d: &JsonField, kind: i32) -> Option<i64> {
+    if kind == 4 {
+        if d.sub.is_null() {
+            return None;
+        }
+        // `store_size` is a compiler-emitted struct byte size (always ≥ 0); reject a negative one
+        // defensively so a mis-built descriptor can't slip a huge `width as usize` past the caller's
+        // `offset + width <= out_size` bounds check.
+        let sz = unsafe { (*d.sub).store_size };
+        (sz >= 0).then_some(sz)
+    } else {
+        Some((d.tag & 0xff) as i64)
+    }
+}
+
 /// Parse one JSON object from `p` into the (caller-zeroed) struct at `out` (`out_size` bytes) per
 /// the field `descs`, leaving `p` positioned just past the closing `}`. Returns `None` on a parse
 /// error, a missing or duplicate declared field, or an out-of-range descriptor. Shared by the
-/// single-struct decode and the `array<Struct>` AoS decode (MMv2 slice 8d).
+/// single-struct decode and the `array<Struct>` AoS decode (MMv2 slice 8d). Recurses for a
+/// nested-struct field (kind 4) via [`decode_nested`].
 ///
 /// # Safety
 /// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
@@ -2394,9 +2460,9 @@ unsafe fn parse_object(
                     }
                     let d = &descs[i];
                     // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
-                    // 2 = float, 3 = str; bit 16 = int sign flag.
+                    // 2 = float, 3 = str, 4 = nested struct; bit 16 = int sign flag.
                     let kind = (d.tag >> 8) & 0xff;
-                    let width = (d.tag & 0xff) as i64;
+                    let width = field_width(d, kind)?;
                     // Defense in depth: never write outside the out struct, even if a
                     // descriptor offset/width were wrong (checked_add avoids i64 overflow).
                     if d.offset < 0 || d.offset.checked_add(width).is_none_or(|end| end > out_size) {
@@ -2405,6 +2471,12 @@ unsafe fn parse_object(
                     let off = d.offset as usize;
                     let w = width as usize;
                     match kind {
+                        4 => {
+                            // Nested struct: recurse into the sub-object at this field's slot. `p` is
+                            // already at the value (past `:` + ws); `parse_object` re-skips ws and
+                            // consumes through the nested `}`, enforcing the strict contract recursively.
+                            unsafe { decode_nested(p, d.sub, out.add(off))? };
+                        }
                         1 => {
                             if w != 1 {
                                 return None;
@@ -2573,11 +2645,18 @@ struct DecodeCtx<'a, D: FieldDst> {
 #[inline]
 unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi: usize, d: &JsonField, dst: &D) -> Option<()> {
     let kind = (d.tag >> 8) & 0xff;
-    let width = (d.tag & 0xff) as i64;
+    let width = field_width(d, kind)?;
     let p = unsafe { dst.field_ptr(fi, d, width)? };
     let w = width as usize;
     let colon = idx[k] as usize;
     let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1) };
+    if kind == 4 {
+        // Nested struct: the record-splitting loop keeps only the *record-level* colons in
+        // `rec_cols` (nested colons sit at a deeper bracket depth), so a nested field is one
+        // record-level colon whose value is a `{...}`. Parse it with the slow recursive decoder from
+        // the value position; the outer Mison walk is index-driven, so `vp`'s final position is unused.
+        return unsafe { decode_nested(&mut vp, d.sub, p) };
+    }
     if kind == 3 {
         // str: a zero-copy `{ptr,len}` view. The lean index holds no value quotes, so scan the
         // string from the raw bytes via `string()` (which borrows the input and rejects escapes).
@@ -16804,7 +16883,7 @@ mod tests {
         // `tag = (signed << 16) | byte-width`). Returns (status, first 8 out bytes).
         fn decode(json: &[u8], tag: i32, out_size: i64) -> (i32, [u8; 8]) {
             let name = b"n";
-            let f = JsonField { name_ptr: name.as_ptr(), name_len: 1, tag, offset: 0 };
+            let f = JsonField { name_ptr: name.as_ptr(), name_len: 1, tag, offset: 0, sub: core::ptr::null() };
             let mut out = [0u8; 8];
             let rc = unsafe {
                 align_rt_json_decode(
@@ -16899,7 +16978,7 @@ mod tests {
         // accept the full u64 range and reject overflow / negatives — the third of the three integer
         // write sites (Gate 1: same parse routing everywhere).
         let n = b"n";
-        let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // u64
+        let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() }]; // u64
         let read_u64 = |ptr: *const u8, off: usize| -> u64 {
             let mut b = [0u8; 8];
             // `ptr` is the decoded-buffer source, `b` a distinct local array — disjoint.
@@ -16947,7 +17026,7 @@ mod tests {
         // both known keys and an unknown key (which both must report as absent → skipped).
         let names = [b"id".as_slice(), b"score", b"age"];
         let descs: Vec<JsonField> =
-            names.iter().map(|n| JsonField { name_ptr: n.as_ptr(), name_len: n.len() as i64, tag: 0, offset: 0 }).collect();
+            names.iter().map(|n| JsonField { name_ptr: n.as_ptr(), name_len: n.len() as i64, tag: 0, offset: 0, sub: core::ptr::null() }).collect();
         // A hand-built collision-free table (m=4, seed found by scanning) — mirrors `build_phf`.
         let m = 4usize;
         let mut seed = 0u64;
@@ -17215,8 +17294,8 @@ mod tests {
         let active = b"active";
         let pay = b"pay";
         let descs = [
-            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0 },
-            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0 },
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null() },
         ];
         let src = br#"[{"active":true,"pay":10},{"active":false,"pay":20}]"#;
         let arena = align_rt_arena_begin();
@@ -17247,8 +17326,8 @@ mod tests {
         let active = b"active";
         let pay = b"pay";
         let descs = [
-            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0 },
-            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0 },
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null() },
         ];
         let arena = align_rt_arena_begin();
         let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
@@ -17274,6 +17353,120 @@ mod tests {
         assert_eq!(out2.len, 0);
         assert!(out2.ptr.is_null());
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    /// Read a little-endian `i64` from `buf` at byte `off` (test helper for the packed struct out).
+    #[cfg(test)]
+    fn read_i64_at(buf: &[u8], off: usize) -> i64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[off..off + 8]);
+        i64::from_le_bytes(b)
+    }
+
+    /// Read a decoded `str` field `{ptr,len}` (16 bytes at `off`) back as bytes. The pointer is an
+    /// absolute address into the input buffer (a zero-copy view), so this reconstructs the slice.
+    #[cfg(test)]
+    unsafe fn read_str_at<'a>(buf: &[u8], off: usize) -> &'a [u8] {
+        let ptr = read_i64_at(buf, off) as usize as *const u8;
+        let len = read_i64_at(buf, off + 8) as usize;
+        if ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        }
+    }
+
+    // Layout used by both nested tests below.
+    //   Inner  { x: i64 @0, name: str @8 }            store_size 24
+    //   Outer  { id: i64 @0, inner: Inner @8, count: i64 @32 }   store_size 40
+    #[cfg(test)]
+    fn nested_inner_descs() -> ([&'static [u8]; 2], [JsonField; 2]) {
+        let names: [&[u8]; 2] = [b"x", b"name"];
+        let descs = [
+            JsonField { name_ptr: names[0].as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: names[1].as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 8, sub: core::ptr::null() },
+        ];
+        (names, descs)
+    }
+
+    #[test]
+    fn json_decode_nested_struct_single() {
+        // Slow-path (`parse_object`) recursion: a single struct with a nested-struct field.
+        let (_inner_names, inner_descs) = nested_inner_descs();
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 2,
+            store_size: 24,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let (id, inner, count) = (b"id", b"inner", b"count");
+        let descs = [
+            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null() },
+        ];
+        // Field order deliberately shuffled; whitespace inside the nested object.
+        let src = br#"{"count":9,"inner":{ "name":"hi", "x":5 },"id":1}"#;
+        let mut out = vec![0u8; 40];
+        let rc = unsafe {
+            align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, out.as_mut_ptr(), 40, core::ptr::null(), 0, 0)
+        };
+        assert_eq!(rc, 0, "valid nested input must decode");
+        assert_eq!(read_i64_at(&out, 0), 1, "id");
+        assert_eq!(read_i64_at(&out, 8), 5, "inner.x (absolute @8)");
+        assert_eq!(unsafe { read_str_at(&out, 16) }, b"hi", "inner.name (absolute @16)");
+        assert_eq!(read_i64_at(&out, 32), 9, "count");
+
+        // A missing nested field is a strict decode error (contract recurses).
+        let bad = br#"{"id":1,"inner":{"x":5},"count":9}"#;
+        let mut out2 = vec![0u8; 40];
+        assert_ne!(
+            unsafe { align_rt_json_decode(bad.as_ptr(), bad.len() as i64, descs.as_ptr(), 3, out2.as_mut_ptr(), 40, core::ptr::null(), 0, 0) },
+            0,
+            "a missing nested field must reject"
+        );
+    }
+
+    #[test]
+    fn json_decode_nested_struct_array_mison() {
+        // Mison speculative path (`json_speculate`/`write_field_indexed`) recursion: an array of
+        // structs each carrying a nested-struct field. The second+ records take the speculative path
+        // (matching the pattern learned from the first), so this exercises nested decode there too.
+        let (_inner_names, inner_descs) = nested_inner_descs();
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 2,
+            store_size: 24,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let (id, inner, count) = (b"id", b"inner", b"count");
+        let descs = [
+            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null() },
+        ];
+        let src = br#"[{"id":1,"inner":{"x":5,"name":"a"},"count":9},
+                       {"id":2,"inner":{"x":6,"name":"bb"},"count":8},
+                       {"id":3,"inner":{"x":7,"name":"ccc"},"count":7}]"#;
+        let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        let rc = unsafe {
+            align_rt_json_decode_struct_array(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, 40, &mut out, core::ptr::null(), 0, 0)
+        };
+        assert_eq!(rc, 0, "valid nested array must decode");
+        assert_eq!(out.len, 3, "three records");
+        let buf = unsafe { std::slice::from_raw_parts(out.ptr, 3 * 40) };
+        for (r, (x, name, c)) in [(5i64, &b"a"[..], 9i64), (6, b"bb", 8), (7, b"ccc", 7)].iter().enumerate() {
+            let base = r * 40;
+            assert_eq!(read_i64_at(buf, base), (r + 1) as i64, "id row {r}");
+            assert_eq!(read_i64_at(buf, base + 8), *x, "inner.x row {r}");
+            assert_eq!(unsafe { read_str_at(buf, base + 16) }, *name, "inner.name row {r}");
+            assert_eq!(read_i64_at(buf, base + 32), *c, "count row {r}");
+        }
+        unsafe { align_rt_free(out.ptr as *mut u8) };
     }
 
     #[test]
@@ -17319,7 +17512,7 @@ mod tests {
         };
 
         let a = b"a";
-        let one = [JsonField { name_ptr: a.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // a: u64
+        let one = [JsonField { name_ptr: a.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() }]; // a: u64
 
         // REPRODUCTION: record 1 (`{"a":1,"x":9}`) learns the pattern `[a, <unqueried x>]` (colon
         // count 2). Record 2 (`{"a":1,"a":2}`) also has 2 colons, so speculation runs; its second
@@ -17334,8 +17527,8 @@ mod tests {
         // A duplicate at a *queried* pattern position stays rejected too (the key verify at that
         // ordinal fails → fallback → duplicate error). Two declared fields so both colons are queried.
         let ab = [
-            JsonField { name_ptr: b"a".as_ptr(), name_len: 1, tag: 8, offset: 0 },
-            JsonField { name_ptr: b"b".as_ptr(), name_len: 1, tag: 8, offset: 8 },
+            JsonField { name_ptr: b"a".as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: b"b".as_ptr(), name_len: 1, tag: 8, offset: 8, sub: core::ptr::null() },
         ];
         assert_eq!(
             decode(br#"[{"a":1,"b":2},{"a":1,"a":2}]"#, &ab, 16).0,
@@ -18957,7 +19150,7 @@ mod tests {
     fn json_decode_rejects_non_utf8_input() {
         // A one-field struct `{ s: str }` — str field: kind 3, width 16, offset 0.
         let name = b"s";
-        let descs = [JsonField { name_ptr: name.as_ptr(), name_len: 1, tag: (3 << 8) | 16, offset: 0 }];
+        let descs = [JsonField { name_ptr: name.as_ptr(), name_len: 1, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null() }];
         let decode = |src: &[u8]| -> i32 {
             let mut out = [0u8; 16];
             unsafe {

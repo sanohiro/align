@@ -16,16 +16,26 @@ capability-header rule applies to core.json exactly like std modules).
 ## Signatures (verified)
 
 ```text
-json.encode(x)   -> str                      // x: flat struct; str fields JSON-escaped
+json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   flat struct            (field order free; unknown keys ignored)
+//   struct                 (flat OR with nested-struct fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
-//   array<Struct>          (AoS; str fields = zero-copy views into the input)
+//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
-//                           inside arena {}; str columns borrow the input text)
+//                           inside arena {}; str columns borrow the input text; primitive/str columns only,
+//                           NO nested columns — the owned-columns deferral stands)
 ```
+
+**Nested-struct fields (REST-gateway runway, Slice A).** A struct field may itself be a `Struct`;
+`decode` recurses into the nested object and `encode` renders it back, so a nested record round-trips.
+Runtime: the field descriptor carries kind 4 with a `JsonSubTable` pointer (the nested struct's own
+descriptors + PHF + store size), and `parse_object` / `write_field_indexed` recurse — so BOTH the slow
+path and the Mison speculative path handle nesting (a nested field is one record-level colon whose
+value the record-splitter leaves at a deeper bracket depth). Nested `str` fields stay zero-copy views
+into the input, so the whole value is region-tied to it recursively (`struct_has_str` recurses). Still
+deferred here: `Option<T>` fields (Slice B), `array<T>` fields (Slice C), enum-payload targets.
 
 ## Type & ownership classification
 
@@ -62,12 +72,12 @@ point (clone out to keep).
   may fold into `decode`". Settle that in `open-questions.md` before implementing anything here.
 - `json.decode<T>(...)` call syntax — permanently out (settled); the annotation-through-`?`
   form is the one way.
-- Nested-struct / Option-field / enum-payload decode targets — not in the verified matrix;
-  extending the target grammar is design work (field tables, null policy) before code.
-  **Filed 2026-07-18:** `open-questions.md` Open → "REST-gateway runway" holds the slice plan
-  (nested → Option → array fields), the null policy proposal, and the language-side field-type
-  prerequisites (`is_field_ok` today rejects `Option<T>`/`array<T>` fields). Enum-payload
-  targets stay deferred there too.
+- Option-field / `array<T>`-field / enum-payload decode targets — not in the verified matrix;
+  extending the target grammar is design work (field tables, null policy, language-side field-type
+  support) before code. **Nested-struct fields SHIPPED (REST-gateway runway, Slice A);**
+  `open-questions.md` Open → "REST-gateway runway" holds the remaining slice plan (Option → array
+  fields), the null policy proposal, and the language-side field-type prerequisites (`is_field_ok`
+  today rejects `Option<T>`/`array<T>` fields). Enum-payload targets stay deferred there too.
 
 ## Pitfalls
 
@@ -81,10 +91,22 @@ point (clone out to keep).
   extend it, not inline ad-hoc escaping.
 - P4 — the soa decode's performance contract (≈serde parity at 1M rows, `bench/json_soa`) is a
   regression tripwire: re-run the bench before landing parser changes.
+- P5 — **the decode target's field schema must feed the codegen cache key.** A decode target
+  struct's field names/types feed only the codegen descriptor table, not the surrounding MIR — a
+  field RENAME at the same slot (or a NESTED struct's field change) leaves every other MIR statement
+  byte-identical, so without a schema fingerprint the unit's `impl_hash` would be unchanged and the
+  warm cache would serve a STALE object still decoding the OLD key (reproduced end-to-end; the
+  #514/#517 stale-cache class). The `JsonDecode*` MIR rvalues bake a recursive `json_schema_sig`
+  (names + types + `layout(C)`/`align`, nested expanded) that is printed into the MIR — pinned by
+  `cache_codegen.rs` gate 2b. Any new schema-carrying decode surface must do the same.
 
 ## Test anchors
 
 `m5.rs` (decode matrix: struct/arrays/str-fields/order/unknown-keys/malformed/range #295 #311;
-encode escaping; duplicate-key #306), `soa.rs:317` (json→soa filtered aggregate), examples
-`json.align`, `json_decode.align`, `soa_json_str.align`; benches `bench/json_decode`,
-`bench/json_soa` (+ their READMEs for the measured model).
+encode escaping; duplicate-key #306; **nested** decode+encode round-trip
+`json_decode_encode_nested_struct_roundtrip` + Mison-path `json_decode_nested_struct_array_mison`),
+`soa.rs:317` (json→soa filtered aggregate), `cache_codegen.rs` gate 2b (schema-fingerprint cache
+invalidation, flat + nested), runtime `json_decode_nested_struct_single` / `..._array_mison`
+(descriptor-level slow + Mison recursion), examples `json.align`, `json_decode.align`,
+`json_nested.align`, `soa_json_str.align`; benches `bench/json_decode`, `bench/json_soa` (+ their
+READMEs for the measured model).

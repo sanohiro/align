@@ -336,7 +336,7 @@ pub enum Rvalue {
     /// `slot[index]` — load an array element.
     Index(Slot, Operand),
     /// `slot[index].field` — load a field of a struct-array element.
-    IndexField(Slot, Operand, u32),
+    IndexField(Slot, Operand, Vec<u32>),
     /// Build a `vecN<T>` register value `<n x elem>` from its lane operands — an `insertelement`
     /// chain over a poison vector (M6). `elem`/`n` give the vector type.
     MakeVec { elems: Vec<Operand>, elem: Ty, n: u32 },
@@ -544,7 +544,14 @@ pub enum Rvalue {
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
-    JsonDecode { struct_id: u32, input: Operand, out: Slot },
+    ///
+    /// `schema` is a stable textual fingerprint of the (recursive) decode schema — every field's
+    /// name and type, nested structs expanded, plus each level's `layout(C)`/`align`. It is printed
+    /// into the MIR so the unit's `impl_hash` (hence the codegen cache key) invalidates on any schema
+    /// change the surrounding MIR would otherwise hide — a field RENAME (same slot/type) or a NESTED
+    /// struct's field change, neither of which alters this function's other MIR (the stale-cache bug
+    /// class of #514/#517). See [`json_schema_sig`].
+    JsonDecode { struct_id: u32, schema: String, input: Operand, out: Slot },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
@@ -552,14 +559,16 @@ pub enum Rvalue {
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): parse a JSON array of objects
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
-    /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
-    JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot },
+    /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser. `schema` is the
+    /// recursive schema fingerprint (see [`JsonDecode`]) baked in for cache invalidation.
+    JsonDecodeStructArray { struct_id: u32, schema: String, input: Operand, out: Slot },
     /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
     /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
     /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
     /// status (0 = ok). `arena` is the enclosing arena handle the runtime bump-allocates the column
-    /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`.
-    JsonDecodeSoa { struct_id: u32, input: Operand, out: Slot, arena: Operand },
+    /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`. `schema`
+    /// is the recursive schema fingerprint (see [`JsonDecode`]) baked in for cache invalidation.
+    JsonDecodeSoa { struct_id: u32, schema: String, input: Operand, out: Slot, arena: Operand },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -3247,9 +3256,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: t, index: *index }));
             Operand::Value(v)
         }
-        hir::ExprKind::IndexField { base, index, field } => {
+        hir::ExprKind::IndexField { base, index, path } => {
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::IndexField(*base, index_const(*index as usize), *field)));
+            b.push(Stmt::Let(v, Rvalue::IndexField(*base, index_const(*index as usize), path.clone())));
             Operand::Value(v)
         }
         hir::ExprKind::Block(blk) => {
@@ -4942,7 +4951,7 @@ fn lower_field_access(
                 },
             )),
         },
-        None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), field))),
+        None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), vec![field]))),
     }
     v
 }
@@ -5818,13 +5827,14 @@ fn transpose_to_soa(
 /// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
 fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let soa_ty = Ty::Soa(struct_id);
+    let schema = json_schema_sig(&b.structs, struct_id);
     let out = b.new_slot(soa_ty);
     let inp = lower_expr(b, input);
     // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
     // so the runtime needs the innermost arena handle.
     let arena = *b.arenas.last().expect("json.decode → soa outside an arena (sema-checked)");
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, input: inp, out, arena: Operand::Value(arena) }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, schema, input: inp, out, arena: Operand::Value(arena) }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -7172,12 +7182,55 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
 /// branch into `Ok(<struct>)` on status 0 or `Err(<code>)` otherwise, yielding the Result.
+/// A stable textual fingerprint of the recursive `json.decode` schema for struct `struct_id`: each
+/// field's name and type, nested structs expanded in place, plus every level's `layout(C)`/`align`
+/// (both change physical offsets). Baked into the decode MIR rvalue and printed, so the unit's
+/// `impl_hash` — hence the codegen cache key — invalidates on any schema change the surrounding MIR
+/// would otherwise hide (a field RENAME at the same slot, or a NESTED struct's field change; the
+/// stale-cache bug class of #514/#517). The struct graph is acyclic (`struct_acyclic`), so the
+/// recursion terminates; a `visiting` guard is defense in depth against a mis-built graph.
+fn json_schema_sig(structs: &[hir::StructDef], struct_id: u32) -> String {
+    let mut s = String::new();
+    json_schema_sig_into(structs, struct_id, &mut Vec::new(), &mut s);
+    s
+}
+
+fn json_schema_sig_into(structs: &[hir::StructDef], struct_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
+    if visiting.contains(&struct_id) {
+        out.push_str("<cycle>");
+        return;
+    }
+    visiting.push(struct_id);
+    let sd = &structs[struct_id as usize];
+    out.push('{');
+    if sd.c_repr {
+        out.push('C');
+    }
+    if let Some(a) = sd.align {
+        out.push_str(&format!("a{a}"));
+    }
+    for (i, f) in sd.fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&f.name);
+        out.push(':');
+        match f.ty {
+            Ty::Struct(nid) => json_schema_sig_into(structs, nid, visiting, out),
+            other => out.push_str(&ty_name(other)),
+        }
+    }
+    out.push('}');
+    visiting.pop();
+}
+
 fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let sty = Ty::Struct(struct_id);
+    let schema = json_schema_sig(&b.structs, struct_id);
     let out = b.new_slot(sty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, schema, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -8613,10 +8666,11 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 /// `Drop`-frees it), while its elements' `str` fields remain views into the input.
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+    let schema = json_schema_sig(&b.structs, struct_id);
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, schema, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));

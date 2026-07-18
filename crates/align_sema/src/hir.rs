@@ -427,12 +427,14 @@ pub enum ExprKind {
         recv: Box<Expr>,
         index: u32,
     },
-    /// `base[index].field` — read `field` of element `index` of a struct-array local. Used
-    /// by `json.encode` over a fixed struct array (unrolled; `index` is a constant).
+    /// `base[index].field.sub…` — read the field `path` of element `index` of a struct-array local.
+    /// Used by `json.encode` over a fixed struct array (unrolled; `index` is a constant). `path` is
+    /// the chain of logical field indices (length ≥ 1); a length > 1 descends through nested-struct
+    /// element fields (encode recurses into them). Lowers to the GEP `[0, index, *path]`.
     IndexField {
         base: LocalId,
         index: u32,
-        field: u32,
+        path: Vec<u32>,
     },
     /// A block used in expression position; its value is the trailing expression (or
     /// `Unit`). Preserves statements (e.g. a diverging `{ return … }`).
