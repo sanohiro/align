@@ -9,7 +9,7 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-18, **JSON COMPLETENESS J2a SHIPPED — enum owned `array<T>` payloads +
-tag-switched drop (the multimodal-union language prerequisite), PR #535**. A sum type may now carry an
+tag-switched drop (the multimodal-union language prerequisite), MERGED as #535 (`de8a405`)**. A sum type may now carry an
 owned `array<T>` payload (`Content { Text(str), Parts(array<Part>) }`), which makes the **enum a Move
 type**: its `Drop` switches on the tag and frees the live variant's owned buffer. **Classifier:**
 `enum_is_move(id, enums)` = any variant payload `is_move()` — the SAME predicate codegen `drop_enum`
