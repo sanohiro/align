@@ -1265,6 +1265,27 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode into a shape-directed union (input, input_len, union_desc, out) -> i32 status
+        // (JSON completeness J1b): parse one JSON value, select the variant by shape class, write the
+        // payload + tag into `out`.
+        "json_decode_union".to_string(),
+        module.add_function(
+            "align_rt_json_decode_union",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // json.encode of a union value (builder, base, union_desc) -> void (JSON completeness J1b):
+        // write the live variant's payload bare into the builder.
+        "json_encode_union".to_string(),
+        module.add_function(
+            "align_rt_json_encode_union",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // json.decode into array (input, input_len, elem_tag, out: *{ptr,len}) -> i32 status.
         "json_decode_array".to_string(),
         module.add_function(
@@ -6502,6 +6523,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena, .. } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
+            Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => self.gen_json_decode_union(*enum_id, input, *out)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8366,6 +8388,118 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
+    /// The LLVM type of a shape-directed union descriptor, matching the runtime `JsonUnion`
+    /// `#[repr(C)]`: `{ arms: ptr, class_to_arm: ptr, enum_tags: ptr, n_arms: i64, store_size: i64 }`.
+    fn json_union_ty(&self) -> inkwell::types::StructType<'c> {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        self.ctx.struct_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i64t.into(), i64t.into()], false)
+    }
+
+    /// Emit the constant [`JsonUnion`] descriptor for shape-directed decode/encode of sum type
+    /// `enum_id` (JSON completeness J1b): one payload arm ([`JsonField`]) per variant, a `class_to_arm`
+    /// table (shape class → arm index, `-1` if absent), and an `enum_tags` table (arm → variant index
+    /// / enum tag). The payload's byte offset within the enum `{ i32 tag, payloads… }` comes from the
+    /// LLVM layout (`offset_of_element(ety, 1 + field_base)`), so it stays the exact dual of the
+    /// enum's codegen layout. Returns a pointer to the union global (a private constant → safe in a
+    /// loop). Sema (`check_union_decodable`) guarantees each variant has one payload and the shape
+    /// classes are pairwise distinct.
+    fn emit_json_union(&mut self, enum_id: u32) -> inkwell::values::PointerValue<'c> {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let desc_ty = self.json_desc_ty();
+        let null = ptr_ty.const_null();
+        let ety = self.enum_types[enum_id as usize];
+        let variants = self.enums[enum_id as usize].variants.clone();
+
+        // One arm per variant + the shape-class → arm and arm → enum-tag tables.
+        let mut arms: Vec<inkwell::values::StructValue> = Vec::with_capacity(variants.len());
+        let mut class_to_arm = [-1i32; align_sema::JSON_SHAPE_CLASSES];
+        let mut enum_tags: Vec<inkwell::values::IntValue> = Vec::with_capacity(variants.len());
+        for (tag_idx, v) in variants.iter().enumerate() {
+            // Sema guarantees exactly one payload per union variant; a missing one is a compiler bug.
+            let payload = *v.payload.first().expect("union variant carries exactly one payload");
+            let pty = scalar_to_ty(payload);
+            let (tag, sub_ptr) = self.json_payload_tag_sub(pty, null);
+            // The payload sits at enum LLVM element `field_base` (`field_base` is 1-based — it already
+            // accounts for the i32 tag at element 0; `MakeEnum` stores the payload at `field_base + j`,
+            // and a union variant has a single payload, j = 0).
+            let off = self.target_data.offset_of_element(&ety, v.field_base).expect("valid enum payload offset");
+            let arm_idx = arms.len() as i32;
+            arms.push(desc_ty.const_named_struct(&[
+                null.into(),                                    // name_ptr (unused for a union arm)
+                i64t.const_zero().into(),                       // name_len
+                i32t.const_int(tag, false).into(),              // packed payload kind/width/sign
+                i64t.const_int(off, false).into(),              // payload byte offset in the enum
+                sub_ptr.into(),                                 // object payload sub-schema (else null)
+                i64t.const_int((-1i64) as u64, true).into(),    // opt_tag = -1 (unused)
+            ]));
+            enum_tags.push(i32t.const_int(tag_idx as u64, false));
+            if let Some(cls) = align_sema::union_shape_class(payload) {
+                class_to_arm[cls as usize] = arm_idx;
+            }
+        }
+
+        let arms_val = desc_ty.const_array(&arms);
+        let arms_g = self.module.add_global(arms_val.get_type(), None, "junion_arms");
+        arms_g.set_initializer(&arms_val);
+        arms_g.set_constant(true);
+        mark_private_unnamed_addr(arms_g);
+
+        let cls_val = i32t.const_array(&class_to_arm.iter().map(|&c| i32t.const_int(c as u64, true)).collect::<Vec<_>>());
+        let cls_g = self.module.add_global(cls_val.get_type(), None, "junion_class");
+        cls_g.set_initializer(&cls_val);
+        cls_g.set_constant(true);
+        mark_private_unnamed_addr(cls_g);
+
+        let tags_val = i32t.const_array(&enum_tags);
+        let tags_g = self.module.add_global(tags_val.get_type(), None, "junion_tags");
+        tags_g.set_initializer(&tags_val);
+        tags_g.set_constant(true);
+        mark_private_unnamed_addr(tags_g);
+
+        let store_size = self.target_data.get_store_size(&ety);
+        let union_ty = self.json_union_ty();
+        let val = union_ty.const_named_struct(&[
+            arms_g.as_pointer_value().into(),
+            cls_g.as_pointer_value().into(),
+            tags_g.as_pointer_value().into(),
+            i64t.const_int(variants.len() as u64, false).into(),
+            i64t.const_int(store_size, false).into(),
+        ]);
+        let g = self.module.add_global(union_ty, None, "junion");
+        g.set_initializer(&val);
+        g.set_constant(true);
+        mark_private_unnamed_addr(g);
+        g.as_pointer_value()
+    }
+
+    /// `json.decode` into a shape-directed union (`enum`) target (JSON completeness J1b): zero the out
+    /// enum, then call the runtime union decoder with the emitted [`JsonUnion`] descriptor. Returns
+    /// the i32 status.
+    fn gen_json_decode_union(&mut self, enum_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let ety = self.enum_types[enum_id as usize];
+        let out_ptr = self.slots[&out];
+        // Zero the enum so an unset payload/tag reads as 0 (a failed decode leaves it zeroed).
+        self.builder.build_store(out_ptr, ety.const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+
+        let union_desc = self.emit_json_union(enum_id);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode_union"],
+                &[in_ptr.into(), in_len.into(), union_desc.into(), out_ptr.into()],
+                "jdecu",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode_union returns i32"))
+    }
+
     fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
         let sty = self.struct_types[struct_id as usize];
         let out_ptr = self.slots[&out];
@@ -8797,6 +8931,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             &[bptr.into(), ptr.into(), len.into(), t.descs.into(), n.into(), esz.into()],
                             "",
                         )
+                        .map_err(|e| self.err(e))?;
+                }
+                // `json.encode` of a shape-directed union: materialize the enum value in memory (the
+                // runtime encoder reads the tag + live payload at byte offsets), then emit its bare
+                // payload via the descriptor-driven union encoder.
+                align_mir::TemplatePiece::UnionValue { value, enum_id, .. } => {
+                    let ety = self.enum_types[*enum_id as usize];
+                    let v = self.operand(value);
+                    let slot = self.builder.build_alloca(ety, "junion_v").map_err(|e| self.err(e))?;
+                    self.builder.build_store(slot, v).map_err(|e| self.err(e))?;
+                    let union_desc = self.emit_json_union(*enum_id);
+                    self.builder
+                        .build_call(self.funcs["json_encode_union"], &[bptr.into(), slot.into(), union_desc.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }

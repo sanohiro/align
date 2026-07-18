@@ -415,6 +415,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
                     crate::TemplatePiece::PopComma => "pop_comma".to_string(),
                     crate::TemplatePiece::StructArrayField { array, struct_id } => format!("struct_array_field(struct#{struct_id}, {})", operand_str(array)),
+                    crate::TemplatePiece::UnionValue { value, enum_id, schema } => format!("union_value(enum#{enum_id} {schema}, {})", operand_str(value)),
                 })
                 .collect();
             format!("template[{}]", ps.join(", "))
@@ -430,6 +431,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::JsonDecodeSoa { struct_id, schema, input, out, arena } => {
             format!("json_decode_soa(struct#{struct_id} {schema}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
+        }
+        Rvalue::JsonDecodeUnion { enum_id, schema, input, out } => {
+            format!("json_decode_union(enum#{enum_id} {schema}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))

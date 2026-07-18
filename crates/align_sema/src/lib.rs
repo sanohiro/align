@@ -4489,13 +4489,13 @@ impl EffectScan<'_> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. }
-            | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input),
+            | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input),
             // `builder(capacity)` — the capacity expr may itself have effects.
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
@@ -5209,6 +5209,12 @@ impl<'a> EscapeCheck<'a> {
             // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
             // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
             ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
+            // A decoded shape-directed union (J1b): a `str`-payload variant is a zero-copy view into
+            // the input, so a `str`-bearing union carries the input's region; a scalar-only union
+            // borrows nothing and stays `Static` (freely returnable), mirroring `tracks_region`'s
+            // precision at the enum level (the region change is opt-in on a borrowing payload).
+            ExprKind::JsonDecodeUnion { input, enum_id } if self.tracks_region(Ty::Enum(*enum_id)) => self.region_of(input, depth),
+            ExprKind::JsonDecodeUnion { .. } => Region::Static,
             // `json.decode → soa`: the column buffer is arena-allocated, and a `str` column holds
             // zero-copy views into the JSON input (like the AoS decode). So a str-bearing soa is
             // bound to BOTH — the arena buffer and the input — i.e. the shorter of the two regions.
@@ -5751,6 +5757,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDecodeArray { .. }
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
+            | ExprKind::JsonDecodeUnion { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
@@ -6444,12 +6451,12 @@ impl<'a> EscapeCheck<'a> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.walk(access, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7058,12 +7065,12 @@ impl UnnecessaryHeapScan {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.visit(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7652,6 +7659,16 @@ impl<'a> MoveCheck<'a> {
                         .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums))
                 });
                 if borrows_input {
+                    self.borrow_sources(input)
+                } else {
+                    BorrowRoots::new()
+                }
+            }
+            // A decoded shape-directed union (J1b) borrows the input only if a variant payload is a
+            // `str` view (or a `str`-bearing object) — then its live view is rooted in the input;
+            // a scalar-only union borrows nothing.
+            ExprKind::JsonDecodeUnion { input, enum_id } => {
+                if ty_may_borrow(Ty::Enum(*enum_id), self.structs, self.tuples, self.enums) {
                     self.borrow_sources(input)
                 } else {
                     BorrowRoots::new()
@@ -8442,12 +8459,12 @@ impl<'a> MoveCheck<'a> {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -12627,7 +12644,7 @@ impl<'a, 't> Checker<'a, 't> {
                 text.push_str(part);
                 Some(text)
             }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } => None,
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::UnionValue { .. } => None,
         });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
@@ -15167,6 +15184,16 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
+            // A shape-directed **union** (`enum`) → the live variant's payload, **bare** (no wrapper
+            // key), so `decode(encode(x))` round-trips (JSON completeness J1b). One conditional runtime
+            // piece switches on the tag.
+            Ty::Enum(eid) => {
+                if !self.check_union_decodable(eid, args[0].span) {
+                    return err;
+                }
+                let access = Expr { kind: ExprKind::Local(base), ty, span: args[0].span };
+                parts.push(TemplatePart::UnionValue { access, enum_id: eid });
+            }
             _ => {
                 self.diags
                     .error(format!("'json.encode' expects a struct or struct-array, got {}", ty_name(ty)), args[0].span);
@@ -15268,6 +15295,20 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
+            // A shape-directed **union** (`enum`) target (JSON completeness J1b): parse one JSON value
+            // and select the variant by its shape class. The decoded enum's `str` payloads are
+            // zero-copy views into the input, so the input's region bounds the result (`region_of`).
+            Some(Ty::Result(Scalar::Enum(id), _)) => {
+                if !self.check_union_decodable(id, span) {
+                    return err;
+                }
+                let input = self.check_str_init(&args[0]);
+                return Expr {
+                    kind: ExprKind::JsonDecodeUnion { enum_id: id, input: Box::new(input) },
+                    ty: Ty::Result(Scalar::Enum(id), Scalar::Enum(self.error_enum_id)),
+                    span,
+                };
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
@@ -15356,6 +15397,61 @@ impl<'a, 't> Checker<'a, 't> {
         }
         stack.pop();
         true
+    }
+
+    /// Validate that sum type `enum_id` is **union-decodable** (JSON completeness J1b): every variant
+    /// carries exactly one payload, each payload maps to a JSON shape class (str/number/bool/object),
+    /// and the classes are **pairwise distinct** — so the value's first structural byte selects the
+    /// variant unambiguously (O(1) dispatch, no backtracking). An object (struct) payload must itself
+    /// be json-decodable (its fields recurse). Reports every offending variant and returns false.
+    /// `null` is deliberately not a class (absence belongs to `Option`); an owned `array` payload is
+    /// J2 (an enum cannot hold one yet, so it surfaces here as "no shape class").
+    fn check_union_decodable(&mut self, enum_id: u32, span: Span) -> bool {
+        let Some(ed) = self.enums.get(enum_id as usize) else { return false };
+        let name = ed.name.clone();
+        let variants = ed.variants.clone();
+        if variants.is_empty() {
+            self.diags.error(format!("'{name}' has no variants to decode as a JSON union"), span);
+            return false;
+        }
+        let mut ok = true;
+        // Each shape class (Str/Number/Bool/Object) may be claimed by at most one variant.
+        let mut class_owner: [Option<String>; 4] = Default::default();
+        for v in &variants {
+            if v.payload.len() != 1 {
+                self.diags.error(
+                    format!("union variant '{}' of '{name}' must carry exactly one payload to map to a JSON value (a tag-only or multi-payload variant has no shape class)", v.name),
+                    span,
+                );
+                ok = false;
+                continue;
+            }
+            let sc = v.payload[0];
+            let Some(cls) = union_shape_class(sc) else {
+                self.diags.error(
+                    format!("union variant '{}' of '{name}' has payload {}, which has no JSON shape class (str / number / bool / object)", v.name, ty_name(scalar_to_ty(sc))),
+                    span,
+                );
+                ok = false;
+                continue;
+            };
+            if let Some(prev) = &class_owner[cls as usize] {
+                self.diags.error(
+                    format!("union variants '{prev}' and '{}' of '{name}' map to the same JSON shape class — a shape-directed union needs pairwise-distinct classes", v.name),
+                    span,
+                );
+                ok = false;
+                continue;
+            }
+            class_owner[cls as usize] = Some(v.name.clone());
+            // An object (struct) payload must itself be json-decodable — recurse into its fields.
+            if let Scalar::Struct(sid) = sc
+                && !self.decode_struct_fields_ok(sid, span)
+            {
+                ok = false;
+            }
+        }
+        ok
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
@@ -19283,12 +19379,12 @@ impl<'a, 't> Checker<'a, 't> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } => self.finalize_expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -20799,6 +20895,26 @@ fn struct_acyclic(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiti
 /// region-tracked, never Move), or a **non-Move** struct (a `str`-bearing plain-data struct is now
 /// allowed — the enum tracks its region). A Move struct (owns a `string`/collection) is still
 /// rejected — an enum payload is not dropped recursively, so an owned field would leak (that is J2).
+/// The JSON **shape class** a union variant's single payload scalar maps to — `Str`(0) / `Number`(1)
+/// / `Bool`(2) / `Object`(3) — or `None` if it has none (a `char`, or an owned collection; an
+/// `array` payload is J2 and an enum cannot hold one yet). The index order matches the runtime
+/// `json_shape_class` first-byte dispatch (JSON completeness J1b). `pub` so codegen fills the
+/// [`JsonUnion`] `class_to_arm` table from the same one source of truth.
+/// The number of JSON shape classes a union's `class_to_arm` table indexes — `Str`/`Number`/`Bool`/
+/// `Object`/`Array` (5). Must equal the runtime `JSON_SHAPE_CLASSES`; `Array` (index 4) is J2 (an
+/// enum cannot hold an owned array payload yet), so it is always `-1` in a J1b descriptor.
+pub const JSON_SHAPE_CLASSES: usize = 5;
+
+pub fn union_shape_class(s: Scalar) -> Option<u8> {
+    match s {
+        Scalar::Str => Some(0),
+        Scalar::Int(_) | Scalar::Float(_) => Some(1),
+        Scalar::Bool => Some(2),
+        Scalar::Struct(_) => Some(3),
+        _ => None,
+    }
+}
+
 fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
     match s {
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str => true,
