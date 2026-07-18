@@ -2919,18 +2919,6 @@ unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable
     Some(AlignStr { ptr: dst, len: count })
 }
 
-/// Free the owned heap buffers a struct at `base` holds, per its `descs` — its `array<Struct>` field
-/// buffers (kind 5) and, recursively, those inside non-optional nested-struct fields (kind 4). The
-/// runtime dual of codegen's `drop_struct_fields`, used ONLY on the decode error path to release
-/// buffers already written into a partial struct before returning the decode `Err` (otherwise a
-/// sibling field failing after an `array` field decoded would leak that buffer). `only_seen` gates
-/// the top level to the fields actually written; a nested struct reached through a *seen* kind-4
-/// field is fully decoded (the strict contract), so its owned fields are freed unconditionally.
-/// Optional fields and `array<Struct>` element structs are non-owned by the field restrictions, so
-/// they are skipped. `align_rt_free(null)` is a no-op (an empty array / unwritten field).
-///
-/// # Safety
-/// `base`/`descs` must describe the struct actually being decoded; each kind-4 `sub` must be valid.
 /// Whether a decoded struct described by `descs` transitively owns any heap buffer that
 /// [`drop_decoded_owned`] would free — an `array<Struct>` field (kind 5), a union field (kind 6), or a
 /// nested struct (kind 4) that does. Used to decide whether an `array<Struct>` element needs a
@@ -2953,6 +2941,19 @@ unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
     })
 }
 
+/// Free the owned heap buffers a struct at `base` holds, per its `descs` — its `array<Struct>` field
+/// buffers (kind 5, deep-freeing each element if it is itself Move — `sub_owns_buffers`), a union
+/// field's owned payload (kind 6), and, recursively, those inside non-optional nested-struct fields
+/// (kind 4). The runtime dual of codegen's `drop_struct_fields`, used ONLY on the decode error path to
+/// release buffers already written into a partial struct before returning the decode `Err` (otherwise a
+/// sibling field failing after an `array` field decoded would leak that buffer). `only_seen` gates
+/// the top level to the fields actually written; a nested struct reached through a *seen* kind-4
+/// field is fully decoded (the strict contract), so its owned fields are freed unconditionally.
+/// Optional fields are non-owned by the field restrictions, so they are skipped. `align_rt_free(null)`
+/// is a no-op (an empty array / unwritten field).
+///
+/// # Safety
+/// `base`/`descs` must describe the struct actually being decoded; each kind-4/5/6 `sub` must be valid.
 unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Option<&SeenSet>) {
     for (i, d) in descs.iter().enumerate() {
         if only_seen.is_some_and(|s| !s.is_set(i)) {
