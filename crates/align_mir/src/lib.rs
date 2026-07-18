@@ -2033,7 +2033,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                         || matches!(ty, Ty::Tuple(tid) if b.tuples[tid as usize].elems.iter().any(|s| s.is_move()))
                         // A Move struct (owns a `string`/owned field) moved away must be nulled too,
                         // so its exit `Drop` frees null, not the buffers the new owner took.
-                        || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs))
+                        || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs, &b.enums))
                         // A Move enum (owns an `array<Struct>` payload, J2) moved away must be nulled
                         // so its exit tag-switched `Drop` frees null, not the buffer the new owner took.
                         || matches!(ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums))
@@ -2091,6 +2091,14 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // null there, not the buffer the new binding now owns. (Sema allows this only for a depth-1
         // `string` field; deeper paths / Move-struct fields stay rejected, so `path` is `[idx]`.)
         hir::ExprKind::Field { root, path } if path.len() == 1 && e.ty == Ty::String => {
+            b.push(Stmt::NullStructField(*root, path[0]));
+        }
+        // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
+        // moves the live variant's owned buffer out into `ps`; null that depth-1 enum field of the
+        // struct slot (the whole `{ tag, payloads }` aggregate) so the struct's exit `Drop` →
+        // `drop_enum` reads tag 0 and frees null, not the buffer `ps` now owns. Mirrors the `string`
+        // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
+        hir::ExprKind::Field { root, path } if path.len() == 1 && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums)) => {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
@@ -2577,7 +2585,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // A Move-struct element: free the *old* element's owned fields before overwriting it
                 // (else its buffers leak), and null the RHS's moved source so its own drop is a no-op
                 // (no double-free). A POD element needs neither. (Slice 4b.)
-                if struct_is_move(*struct_id, &b.structs) {
+                if struct_is_move(*struct_id, &b.structs, &b.enums) {
                     b.push(Stmt::DropElem(*base, idx.clone(), *struct_id));
                     null_moved_source(b, value);
                 }

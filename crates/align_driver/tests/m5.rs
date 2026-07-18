@@ -2050,3 +2050,154 @@ fn json_union_array_move_element_rejected() {
          fn main() -> i32 = 0\n"
     ));
 }
+
+// ---- JSON completeness J3: the multimodal union as a Move-enum struct field ----------------------
+// `Message { content: Content }` where `Content` has an owned `array<Part>` variant — the gateway's
+// full `content: str | array<Part>` shape composed into a record. The struct becomes Move (its enum
+// field owns a buffer), dropped by `drop_struct_fields`'s `Ty::Enum` arm via the tag-switched
+// `drop_enum`.
+
+#[test]
+fn json_move_union_field_decode_both_shapes_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // A `Message` whose `content` field is the multimodal `Content` union decodes both shapes (a
+    // leading `[` → the owned `array<Part>` variant, a leading `"` → the `str` variant), reads the
+    // live payload through `match m.content`, and encodes each shape's live payload BARE so
+    // `decode(encode(m))` round-trips byte-identically. The owned AoS is dropped clean at arena end
+    // (a leak / double-free would abort the runtime).
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        Message { role: str, content: Content }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        m: Message := json.decode(\"{\\\"role\\\":\\\"user\\\",\\\"content\\\":[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"hi\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"x\\\"}]}\")?\n    \
+        print(m.role)\n    \
+        print(json.encode(m))\n    \
+        t: Message := json.decode(\"{\\\"role\\\":\\\"sys\\\",\\\"content\\\":\\\"plain\\\"}\")?\n    \
+        print(json.encode(t))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-move-union-field", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "user\n\
+        {\"role\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hi\"},{\"kind\":\"img\",\"text\":\"x\"}]}\n\
+        {\"role\":\"sys\",\"content\":\"plain\"}\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_move_union_field_match_moves_payload_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // `match m.content { Parts(ps) => ps.len() }` moves the owned array out of the enum field; the
+    // binding owns it (freed once at the arm), and `NullStructField` zeroes the enum field so the
+    // struct's exit `Drop` → `drop_enum` frees null there — single-free, no double-free crash.
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        Message { role: str, content: Content }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        m: Message := json.decode(\"{\\\"role\\\":\\\"u\\\",\\\"content\\\":[{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"a\\\"},{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"b\\\"},{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"c\\\"}]}\")?\n    \
+        print(match m.content { Text(s) => -1, Parts(ps) => ps.len() })\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-move-union-match", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+}
+
+#[test]
+fn json_move_union_field_trailing_garbage_no_leak() {
+    if !backend_available() {
+        return;
+    }
+    // A `Message` whose `content` array-variant decoded successfully but is followed by trailing
+    // garbage is a decode `Err`, not a panic — and the owned AoS already materialized in the enum
+    // field must be freed on that error path (`drop_decoded_owned`'s kind-6 arm → `drop_decoded_union`),
+    // not leaked. `?` propagates the Err out of `main` (a Move struct can't be a `Result` Ok payload —
+    // Slice C constraint — so the target is bound with `?`; the runtime frees the partial buffer before
+    // the error propagates). A clean exit-1 (not a signal — the runtime aborts on allocator corruption)
+    // covers the single-free of the partial buffer.
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        Message { role: str, content: Content }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        m: Message := json.decode(\"{\\\"role\\\":\\\"u\\\",\\\"content\\\":[{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"a\\\"}]} xyz\")?\n    \
+        print(m.role)\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-move-union-garbage", src);
+    assert_eq!(out.status.code(), Some(1)); // Err propagated, clean exit (no signal → no double-free)
+}
+
+#[test]
+fn json_chat_array_of_move_message_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // The full gateway shape — `Chat { messages: array<Message> }` where each `Message` owns a Move-enum
+    // `content` field — is an `array<Move-struct>` field (J3b). It decodes both content shapes across the
+    // element array and encodes byte-identically. The whole nested owned structure drops clean at arena
+    // end: `drop_struct_fields`'s array arm loops the messages, deep-frees each `Message` (its `content`
+    // enum's owned `array<Part>` via `drop_enum`), then frees the messages AoS — a leak / double-free
+    // would abort the runtime. This closes the OpenAI chat-request gateway shape.
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        Message { role: str, content: Content }\n\
+        Chat { messages: array<Message> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":\\\"hey\\\"},{\\\"role\\\":\\\"a\\\",\\\"content\\\":[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"ok\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"z\\\"}]}]}\")?\n    \
+        print(c.messages.len())\n    \
+        print(json.encode(c))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-chat-array-message", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "2\n\
+        {\"messages\":[{\"role\":\"u\",\"content\":\"hey\"},{\"role\":\"a\",\"content\":[{\"kind\":\"text\",\"text\":\"ok\"},{\"kind\":\"img\",\"text\":\"z\"}]}]}\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_standalone_array_of_move_struct_local_drops_clean() {
+    if !backend_available() {
+        return;
+    }
+    // A **standalone** `array<Move-struct>` local (`ms: array<Message> := json.decode(...)`), not a
+    // struct field — its `Stmt::Drop` must deep-free each element (via the shared `deep_free_struct_array`
+    // helper), not flat-free the AoS and leak each element's owned `content` buffer. Decode a two-element
+    // array where one element's `content` is the owned `array<Part>` variant; a clean exit proves the
+    // per-element deep free (a double-free would abort; the alloc-count runtime gate pins no-leak).
+    let src = "import core.json\n\
+        Part { kind: str, text: str }\n\
+        Content { Text(str), Parts(array<Part>) }\n\
+        Message { role: str, content: Content }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        ms: array<Message> := json.decode(\"[{\\\"role\\\":\\\"u\\\",\\\"content\\\":[{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"a\\\"},{\\\"kind\\\":\\\"t\\\",\\\"text\\\":\\\"b\\\"}]},{\\\"role\\\":\\\"a\\\",\\\"content\\\":\\\"hi\\\"}]\")?\n    \
+        print(ms.len())\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-standalone-move-arr", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn json_array_of_move_struct_with_string_field_rejected_via_element() {
+    // The element restriction is unchanged where it must be: an `array<Struct>` whose element owns a
+    // bare `array<string>` field is rejected — the `array<string>` field itself is deferred (its
+    // per-element string free is a separate slice), caught at the element struct's declaration.
+    assert!(check_errs(
+        "json-arr-move-arrstring",
+        "import core.json\n\
+         Bag { words: array<string> }\n\
+         Holder { bags: array<Bag> }\n\
+         fn f(s: str) -> Result<Holder, Error> = json.decode(s)\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
