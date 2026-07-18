@@ -3771,9 +3771,11 @@ to `Static` for an owned-array payload → freely returnable; `str`-payload enum
 J1a's, unchanged. **v1 confinement (fail-closed):** a Move enum is a bare local / param / return only —
 rejected as a struct field, `Option`/`Result` payload (the wrap site), fixed-`array` element, lambda
 capture, box/tuple/task payload (some pre-existing) — each with a clean "later slice" diagnostic, so no
-owned enum leaks past a drop mechanism that can't tag-switch it. Match-binding an owned payload is
-deferred (bind `_`-cover the variant); the owned `array<Struct>` payload is exercised end-to-end in J2b
-(JSON). Tests: `enum_match.rs` J2 section (construct/move/return/if-join drop-clean, 7 deferral
+owned enum leaks past a drop mechanism that can't tag-switch it. **Match-binding an owned payload
+works** — `lower_match_enum` already nulls the scrutinee on a bound arm (`null_moved_source`, extended
+with the enum arm), so the binding moves the buffer out and the scrutinee's drop frees null, the same
+path `Result`/`Option` use for their Move payloads (no special sema handling). The owned `array<Struct>`
+payload is exercised end-to-end in J2b (JSON). Tests: `enum_match.rs` J2 section (construct/move/return/if-join drop-clean, 7 deferral
 rejections, the nested-array non-panic). → **J2b** the union **Array** shape-class arm (decode/encode
 the `array<Struct>` variant) → the full multimodal `Content` union → **the gateway is closed** →
 **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync

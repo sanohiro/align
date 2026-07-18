@@ -18993,24 +18993,14 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bindings (intra-pattern dupes are the branch above).
                                 self.check_shadow(&b.name, b.span, scope_mark);
                             }
-                            // Binding a Move (owned) payload — an owned `array<Struct>` variant (J2)
-                            // — in a match arm is deferred: whether the bind moves the buffer out of
-                            // the scrutinee (suppressing its drop) or borrows it as a view has no
-                            // consumer yet, and a naive owned binding would double-free (both the
-                            // binding and the enum's tag-switched `Drop` free the same buffer). Reject
-                            // it cleanly and bind `Error` so the arm still resolves. The value is used
-                            // whole (moved into `encode`, returned) or matched with `_` for now.
-                            let ty = match payload.get(i) {
-                                Some(&s) if s.is_move() => {
-                                    self.diags.error(
-                                        format!("binding an owned sum-type payload ('{}': {}) in a match is not supported yet — use the value whole (move / `json.encode`), or cover the variant with a top-level `_` arm", b.name, ty_name(scalar_to_ty(s))),
-                                        b.span,
-                                    );
-                                    Ty::Error
-                                }
-                                Some(&s) => scalar_to_ty(s),
-                                None => Ty::Error,
-                            };
+                            // Binding a Move (owned) payload — an owned `array<T>` variant (J2), or a
+                            // pre-existing Move scalar like `cli parsed` in a `Result`/`Option` — moves
+                            // the buffer out of the scrutinee: `lower_match_enum` calls
+                            // `null_moved_source(scrutinee)` on a bound arm so the scrutinee's exit
+                            // `Drop` frees null, and the binding local owns the buffer (dropped once at
+                            // scope end). No special sema handling — the same path Result/Option already
+                            // use for their Move payloads.
+                            let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
                             self.declare(&b.name, ty, false)
                         })
                         .collect();

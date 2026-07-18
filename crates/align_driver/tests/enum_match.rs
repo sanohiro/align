@@ -607,15 +607,20 @@ fn scalar_only_and_str_enum_stay_non_move() {
 }
 
 #[test]
-fn binding_owned_enum_payload_in_match_rejected() {
-    // Binding a Move (owned `array`) payload in a match arm is deferred (whether it moves the buffer
-    // out of the scrutinee or borrows it has no consumer yet, and a naive owned binding double-frees).
-    // The value is used whole (move / `json.encode`) or the variant is covered by a `_` arm.
-    assert!(check_errs(
-        "enum-bind-owned",
-        "Content { Text(str), Nums(array<i64>) }\n\
-         fn main() -> i32 = match Content.Nums([1].to_array()) {\n  Nums(ns) => ns.len() as i32\n  Text(t)  => -1\n}\n"
-    ));
+fn binding_owned_enum_payload_in_match_moves_it_out() {
+    if !backend_available() {
+        return;
+    }
+    // Binding a Move (owned `array`) payload in a match arm moves the buffer out of the scrutinee:
+    // `lower_match_enum` nulls the scrutinee on a bound arm (so its exit `Drop` frees null) and the
+    // binding local owns the buffer, dropped once at scope end — the same path `Result`/`Option`
+    // already use for their Move payloads. A clean run proves single-free.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn take(c: Content) -> i64 = match c {\n  Text(t)  => t.len() as i64\n  Nums(ns) => ns.sum()\n}\n\
+        fn main() -> i32 {\n  \
+        return (take(Content.Nums([3, 4, 5].to_array())) + take(Content.Text(\"hi\"))) as i32\n}\n";
+    let out = build_and_run("enum-bind-owned", src);
+    assert_eq!(out.status.code(), Some(14)); // 12 (3+4+5) + 2 ("hi")
 }
 
 #[test]
