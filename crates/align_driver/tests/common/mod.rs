@@ -133,19 +133,34 @@ pub fn build_and_run(name: &str, src: &str) -> std::process::Output {
 
 /// [`build_and_run`] with trailing arguments forwarded to the compiled program.
 pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::process::Output {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    assert!(
-        !checked.diags.has_errors(),
-        "unexpected errors:\n{}",
-        align_driver::format_diagnostics(&sm, &checked.diags)
-    );
-    // Lower with only `sm`/`checked` live in this frame, then hand off — the path/emit/link locals
-    // live in `emit_link_run`'s frame, not this one. MIR lowering recurses per expression nesting
-    // level, so keeping this frame lean is what lets a within-limit deep expression (`expr_depth`,
-    // ~40-deep) lower on the 2 MB test thread with margin.
-    let mir = lower_to_mir(&checked.hir);
-    emit_link_run(&mir, name, prog_args)
+    // Run the whole compile→link→run on a **large-stack worker thread** (the production `alignc`
+    // binary compiles on its 8 MB main thread; only this in-process harness runs on the 2 MB default
+    // test-thread stack). Sema/MIR-lowering/codegen all recurse per expression-nesting level, so a
+    // within-limit-but-deep expression (`expr_depth`, up to `MAX_EXPR_DEPTH`) needs headroom the
+    // 2 MB test thread does not have on every platform (x86-64 debug frames are larger than arm64's).
+    // A panic inside (an assertion failure) is re-raised on the test thread so failures still report.
+    let (name, src) = (name.to_string(), src.to_string());
+    let prog_args: Vec<String> = prog_args.iter().map(|a| a.to_string()).collect();
+    let handle = std::thread::Builder::new()
+        .name(format!("align-build-{name}"))
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let mut sm = SourceMap::new();
+            let checked = check(&mut sm, &name, &src);
+            assert!(
+                !checked.diags.has_errors(),
+                "unexpected errors:\n{}",
+                align_driver::format_diagnostics(&sm, &checked.diags)
+            );
+            let mir = lower_to_mir(&checked.hir);
+            let arg_refs: Vec<&str> = prog_args.iter().map(String::as_str).collect();
+            emit_link_run(&mir, &name, &arg_refs)
+        })
+        .expect("spawn build thread");
+    match handle.join() {
+        Ok(out) => out,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Object-emit + link + run for an already-lowered program — its own stack frame, so the
