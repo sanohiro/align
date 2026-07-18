@@ -709,21 +709,12 @@ fn build_module<'c>(
     // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
     let struct_types: Vec<StructType<'c>> =
         program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
-    // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
-    // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
-    // keep declaration order) to eliminate padding. Source access is by name, so this is invisible.
-    // `field_perm[sid][logical]` is the logical→physical index map — every field GEP / byte-offset
-    // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
-    // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
-    // unchanged.
-    let field_perm: Vec<Vec<u32>> =
-        program.structs.iter().map(|s| logical_to_physical(s, &program.structs)).collect();
-    for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
-        set_struct_body(ctx, *st, s, perm, &struct_types, &target_data);
-    }
-
     // Sum-type layouts → a non-union tagged struct `{ i32 tag, <every variant's payload flattened> }`,
-    // indexed by enum id. Payloads are primitive scalars (S1b), so the tables are not consulted.
+    // indexed by enum id. Built **before** the struct bodies (J1b) because a struct field may now be a
+    // sum type, so `set_struct_body` needs the enum types to exist. Enum payloads are scalars or
+    // (opaque, not-yet-bodied) structs — a literal LLVM struct may reference an opaque type by value;
+    // it becomes sized once the struct bodies below are set. (Enum payloads are never another enum —
+    // `enum_payload_ok` — so this construction needs no enum type in turn.)
     let enum_types: Vec<StructType<'c>> = program
         .enums
         .iter()
@@ -737,6 +728,18 @@ fn build_module<'c>(
             ctx.struct_type(&fields, false)
         })
         .collect();
+    // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
+    // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
+    // keep declaration order) to eliminate padding. Source access is by name, so this is invisible.
+    // `field_perm[sid][logical]` is the logical→physical index map — every field GEP / byte-offset
+    // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
+    // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
+    // unchanged.
+    let field_perm: Vec<Vec<u32>> =
+        program.structs.iter().map(|s| logical_to_physical(s, &program.structs, &program.enums)).collect();
+    for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
+        set_struct_body(ctx, *st, s, perm, &struct_types, &enum_types, &target_data);
+    }
 
     // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements are primitive
     // scalars (PR1), so the struct-type table is not consulted here.
@@ -3041,7 +3044,7 @@ fn task_tramp_key(ty: Ty) -> String {
 /// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
 /// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
 /// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
-fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
+fn field_abi_align(ty: Ty, structs: &[StructDef], enums: &[EnumDef]) -> u64 {
     match ty {
         Ty::Int(it) => (it.bits / 8).max(1) as u64,
         Ty::Float(ft) => (ft.bits / 8) as u64,
@@ -3051,9 +3054,19 @@ fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
         Ty::Struct(id) | Ty::StructArray(id, _) => structs[id as usize]
             .fields
             .iter()
-            .map(|f| field_abi_align(f.ty, structs))
+            .map(|f| field_abi_align(f.ty, structs, enums))
             .max()
             .unwrap_or(1),
+        // A sum type lowers to `{ i32 tag, <payloads flattened> }` (`enum_types`), so its ABI
+        // alignment is the max of the i32 tag (4) and every payload scalar's alignment (J1b: an enum
+        // is a valid struct field). Must match sema's `enum_size_align`.
+        Ty::Enum(id) => enums.get(id as usize).map_or(4, |e| {
+            e.variants
+                .iter()
+                .flat_map(|v| v.payload.iter())
+                .map(|&s| field_abi_align(scalar_to_ty(s), structs, enums))
+                .fold(4, u64::max)
+        }),
         Ty::Array(s, _) => scalar_bytes(s).clamp(1, 8),
         _ => 8,
     }
@@ -3064,14 +3077,14 @@ fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
 /// (a *stable* sort), so the layout is deterministic. A `layout(C)` struct keeps declaration order
 /// (identity map) — its byte layout is the FFI/`raw`/json boundary and must not move. The returned
 /// vector `m` satisfies `m[logical] = physical`; invert with [`physical_order`] to emit the body.
-fn logical_to_physical(s: &StructDef, structs: &[StructDef]) -> Vec<u32> {
+fn logical_to_physical(s: &StructDef, structs: &[StructDef], enums: &[EnumDef]) -> Vec<u32> {
     let n = s.fields.len();
     if s.c_repr {
         return (0..n as u32).collect();
     }
     // Physical order = logical indices sorted by descending alignment (stable → decl order on ties).
     let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, structs)));
+    order.sort_by_key(|&i| std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, structs, enums)));
     // Invert: `map[logical] = physical`.
     let mut map = vec![0u32; n];
     for (phys, &logical) in order.iter().enumerate() {
@@ -3113,13 +3126,15 @@ fn set_struct_body<'c>(
     s: &StructDef,
     perm: &[u32],
     struct_types: &[StructType<'c>],
+    enum_types: &[StructType<'c>],
     target_data: &inkwell::targets::TargetData,
 ) {
     // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view, a
-    // nested struct to its (now-created) struct type). Fields are emitted in physical order: physical
-    // slot `p` holds the logical field whose map entry is `p`.
+    // nested struct to its (now-created) struct type, a sum-type field to its `enum_types` entry —
+    // J1b). Fields are emitted in physical order: physical slot `p` holds the logical field whose map
+    // entry is `p`. The enum types must already exist (created opaque/literal before this runs).
     let mut fields: Vec<BasicTypeEnum> =
-        physical_order(perm).iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, struct_types, &[])).collect();
+        physical_order(perm).iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, struct_types, enum_types)).collect();
     if let Some(a) = s.align {
         // Measure the natural size (from an anonymous struct of the same fields), then pad the type
         // up to `round_up(natural_size, align)` so the array stride is over-aligned.
@@ -9574,6 +9589,38 @@ mod tests {
             // array-field layout dual (a `array<Struct>` / `array<scalar>` field is a heap handle).
             sdef("ArrStruct", false, &[i(64, true), Ty::DynStructArray(2, Layout::Aos)]), // { i64, {ptr,len} }
             sdef("ArrScalar", false, &[Ty::Bool, Ty::DynArray(align_sema::Scalar::Int(IntTy { bits: 64, signed: true }))]),
+            // Sum-type (`enum`) fields (JSON completeness J1b): an enum lowers to `{ i32 tag, payloads
+            // flattened }`, so its field alignment/size must agree between sema (`enum_size_align`) and
+            // LLVM. `EScalar`/`EStr`/`EObj` (enum ids 0/1/2 below) cover scalar-only (align 4),
+            // `str`-view (align 8), and object (struct payload) shapes, plus a reorder (`SEnum1`).
+            sdef("SEnumScalar", false, &[Ty::Enum(0)]),                  // { i32, i32, i8 } → (12, 4)
+            sdef("SEnum1", false, &[Ty::Enum(0), i(64, true)]),          // reorder: i64 then enum
+            sdef("SEnumStr", false, &[Ty::Enum(1)]),                     // { i32, {ptr,len} , i64 }
+            sdef("SEnumObj", false, &[Ty::Bool, Ty::Enum(2)]),           // reorder: enum then bool
+        ];
+
+        // Sum-type layouts referenced by the `SEnum*` fields above. Built exactly as codegen builds
+        // `enum_types`: a literal `{ i32 tag, <every variant's payload flattened in variant order> }`.
+        fn sc_int(bits: u8, signed: bool) -> align_sema::Scalar {
+            align_sema::Scalar::Int(IntTy { bits, signed })
+        }
+        fn edef(name: &str, variants: &[&[align_sema::Scalar]]) -> align_sema::hir::EnumDef {
+            let mut field_base = 1u32;
+            let variants = variants
+                .iter()
+                .enumerate()
+                .map(|(k, &payload)| {
+                    let v = align_sema::hir::EnumVariant { name: format!("V{k}"), payload: payload.to_vec(), field_base };
+                    field_base += payload.len() as u32;
+                    v
+                })
+                .collect();
+            align_sema::hir::EnumDef { name: name.to_string(), variants }
+        }
+        let enums = vec![
+            edef("EScalar", &[&[sc_int(32, true)], &[align_sema::Scalar::Bool]]), // { i32, i32, i8 }
+            edef("EStr", &[&[align_sema::Scalar::Str], &[sc_int(64, true)]]),     // { i32, {ptr,len}, i64 }
+            edef("EObj", &[&[align_sema::Scalar::Struct(2)], &[sc_int(32, true)]]), // { i32, Pair, i32 }
         ];
 
         let ctx = Context::create();
@@ -9581,17 +9628,30 @@ mod tests {
         let td = tm.get_target_data();
 
         // Build the LLVM struct types exactly as `codegen` does (opaque, then body via the shared
-        // `set_struct_body` — the same size-padding path production uses).
+        // `set_struct_body` — the same size-padding path production uses). Enum types are built first
+        // (as literal `{ i32, payloads }` structs) so a struct field of enum type resolves.
         let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
+        let enum_types: Vec<StructType> = enums
+            .iter()
+            .map(|e| {
+                let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
+                for v in &e.variants {
+                    for &s in &v.payload {
+                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[]));
+                    }
+                }
+                ctx.struct_type(&fields, false)
+            })
+            .collect();
         for (s, st) in structs.iter().zip(&struct_types) {
-            let perm = logical_to_physical(s, &structs);
-            set_struct_body(&ctx, *st, s, &perm, &struct_types, &td);
+            let perm = logical_to_physical(s, &structs, &enums);
+            set_struct_body(&ctx, *st, s, &perm, &struct_types, &enum_types, &td);
         }
 
         for (id, s) in structs.iter().enumerate() {
             let st = struct_types[id];
             let llvm = (td.get_abi_size(&st), td.get_abi_alignment(&st) as u64);
-            let sema = align_sema::struct_abi_layout(id as u32, &structs);
+            let sema = align_sema::struct_abi_layout(id as u32, &structs, &enums);
             assert_eq!(sema, llvm, "layout parity mismatch on `{}` (sema {sema:?} vs LLVM {llvm:?})", s.name);
         }
     }
