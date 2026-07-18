@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON-COMPLETENESS DESIGN SETTLED — MERGED as #530** (`50b3865`;
+_Last updated: 2026-07-18, **JSON COMPLETENESS J1a SHIPPED — enum `str` payloads with region
+tracking, MERGED as #531** (`ee5a1e4`). The design's "region tracking pending" prerequisite for
+shape-directed unions. A sum type may now carry a `str`-view payload (and a `str`-bearing
+plain-data / non-Move struct payload); the enum is region-tracked iff any variant payload is.
+`enum_payload_ok` + pass 0c admit `Scalar::Str` and a non-Move struct; `tracks_region` (method)
+gets a precise `Ty::Enum` arm, `region_of(EnumValue)` folds the shortest payload region (moved out
+of the `Static` group — the bug fixed), and `ty_may_borrow` (free fn) gets a `Ty::Enum` arm + now
+takes the `enums` table (threaded into `EscapeCheck`/`MoveCheck`/MIR `Builder`, all 6 call sites
+updated). Verified sound (str escapes caught through direct AND struct payloads, at construction /
+match-result / match-binding) AND precise (plain-struct + scalar-only enums freely returnable —
+`region_of` gives the Static answer even though `tracks_region(Struct)` is conservatively true;
+builtin `Error` + structured-error enums unaffected). Never Move (a `str` borrows) — owned payloads
+(array<Struct>, tag-switched drop) are J2. Codegen unchanged (a str payload already lowers as a
+flattened `{ptr,len}`). `/align-self-review` (Gate-1 sibling sweep) + `/code-review` high (0
+findings; 2 precision/soundness tests added) both run. Tests: `enum_match.rs` J1 section (41
+green); fuzz_differential (enum+match, 10) + sema (151) green; clippy clean. **NEXT: J1b — the
+shape-directed union decode/encode itself** (a union-decodable enum = pairwise-distinct shape
+classes, compile-checked; a new descriptor kind + first-byte dispatch; enum as a struct field /
+decode target; encode writes the live payload bare) over str/number/bool/object payloads (array =
+J2). Previous update: 2026-07-18, **JSON-COMPLETENESS DESIGN SETTLED — MERGED as #530** (`50b3865`;
 owner-directed "design before implementation"). Three forks settled with the owner: (1) **unions =
 shape-directed sum-type mapping** — a JSON `oneOf` maps to a sum type discriminated by the value's
 shape class (Str/Number/Bool/Object/Array; pairwise-distinct compile-checked; O(1) first-byte
