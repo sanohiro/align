@@ -403,3 +403,36 @@ fn scalar_only_enum_still_returnable() {
     let out = build_and_run("enum-scalar-returnable", src);
     assert_eq!(out.status.code(), Some(5));
 }
+
+#[test]
+fn plain_struct_payload_enum_returnable() {
+    if !backend_available() {
+        return;
+    }
+    // Precision (the J1 region change must not over-restrict): a plain-data (no-`str`) struct
+    // payload borrows nothing, so its enum is `region_of` Static and freely returnable across a
+    // function boundary, even though `tracks_region(Struct)` is conservatively true.
+    let src = "Point { x: i64, y: i64 }\n\
+        Shape { P(Point), Empty(bool) }\n\
+        fn make() -> Shape = Shape.P(Point{x: 3, y: 4})\n\
+        fn main() -> i32 {\n  \
+        return match make() {\n    P(p) => (p.x + p.y) as i32\n    Empty(b) => 0\n  }\n}\n";
+    let out = build_and_run("enum-plain-struct-returnable", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn str_bearing_struct_payload_cannot_escape() {
+    // Soundness through a struct payload: a `str`-bearing struct payload's inner view cannot escape
+    // the arena backing it (the match binding `q.role` is region-tied to the enum's region).
+    assert!(check_errs(
+        "enum-str-struct-escape",
+        "Part { role: str }\n\
+         Msg { One(Part), Empty(bool) }\n\
+         fn main() -> Result<(), Error> {\n  \
+         x := 1\n  \
+         r := arena {\n    p := Part{role: template \"u{x}\"}\n    m := Msg.One(p)\n    \
+         match m {\n      One(q) => q.role\n      Empty(b) => \"x\"\n    }\n  }\n  \
+         return Ok(())\n}\n"
+    ));
+}
