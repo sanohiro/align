@@ -1902,21 +1902,21 @@ type argument (the settled v1 boundary).
 ### core.json
 
 ```text
-json.scan
 json.decode
 json.encode
-json.validate<T>
-json.token
-json.field_table<T>
+json.doc
+json.scan
 ```
 
 `decode` and `encode` carry no written type argument: `decode`'s target is the
 expected type from context (`u: User := json.decode(d)?`) and `encode`'s is the
 type of its value argument — inference recovers both, so Align has no
-expression-position type-argument syntax (no turbofish). `validate<T>` and
-`field_table<T>` are the residual schema-selector case where `T` appears in
-neither arguments nor result; their explicit-type surface is still open (they may
-fold into `decode`).
+expression-position type-argument syntax (no turbofish). `scan`'s row type comes
+from the binding annotation the same way (`rows: json.scanner<Row> :=
+json.scan(view)`). This is the complete surface: there is no `validate<T>`
+(decoding and discarding IS validation — one way), no SAX `token` tier (`doc` +
+`scan` cover it), and no public `field_table<T>` (a compiler-internal artifact).
+`doc` is the schema-unknown tier — see §14.
 
 A struct field may itself be a `Struct`: `decode` recurses into the nested object
 and `encode` renders it back, so a nested record round-trips in declaration order
@@ -1933,6 +1933,68 @@ array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
 The array element struct must be non-owned in v1 (`array<string>` deferred), and a
 `soa<Struct>` stays primitive/`str` columns.
+
+### Union (Sum-Type) Mapping
+
+A JSON `oneOf` maps to an Align sum type, discriminated by the value's **shape
+class** — `Str` / `Number` / `Bool` / `Object` / `Array` — an O(1) dispatch on the
+first structural byte, no backtracking:
+
+```align
+Content { Text(str), Parts(array<Part>) }
+Message { role: str, content: Content }    // "content": "hi"  OR  "content": [ ... ]
+```
+
+A union-decodable sum type must have every variant carry exactly one payload, and
+the payload shape classes must be **pairwise distinct** — two object-payload
+variants (or `i64 | f64`, both `Number`) are a compile error. `null` is not a
+class: absence belongs to `Option` (`Option<Content>` composes). Encode writes the
+live variant's payload **bare** (no wrapper key), so the mapping round-trips by
+construction. Distinguishing object-vs-object by a tag field (`{"type": …}`) is
+expressed as a single struct with `Option` fields, not a second discrimination
+rule.
+
+### Document View (schema unknown)
+
+When the shape is not known at compile time, `json.doc` parses the input once into
+an arena-backed structural tape and navigates it by zero-copy views — the
+schema-unknown tier that complements typed decode (never a competing way to read
+typed data). Parsing is fallible (`Result` — malformed input is an `Err`);
+navigation after it is **total**: `get`/`at` always return a `json.doc`, and a
+missing member / out-of-range index yields a doc whose `kind()` is `Missing`,
+which propagates through further navigation — absence surfaces once, as `None`
+from the leaf `as_*` accessor, never as per-step unwrapping (`?` is Result-only):
+
+```align
+arena {
+  d := json.doc(body)?                    // Result<json.doc, Error>
+  model := d.get("model").as_str() else ""
+  text := d.get("choices").at(0).get("message").get("content").as_str()
+  n := d.get("choices").len()             // 0 on a non-array/object
+  k := d.key(0)                           // Option<str> — objects as data (ordered)
+  parts := d.get("items").elems()         // array<json.doc>: pipelines over a level
+}
+```
+
+`kind() -> json.kind { Object, Array, Str, Number, Bool, Null, Missing }`
+distinguishes JSON `null` from absence when the caller cares; both make every
+`as_*` return `None`. Everything is a borrowed view region-tied to the input and
+the arena. There is no heap value tree: no per-node allocation, no map type —
+keys-as-data is `key(i)` + `at(i)` over an object's ordered members. The one
+allocating accessor is `as_str()` on an escape-bearing string (unescapes into the
+arena, bulk-freed).
+
+### Streaming (larger than memory)
+
+`json.scan` streams NDJSON or a top-level array as typed rows without
+materializing the whole input; the row type comes from the binding annotation and
+the scanner is a pipeline source (row views borrow the current chunk and die with
+the stage):
+
+```align
+rows: json.scanner<Event> := json.scan(view)
+total := rows.where(.active).pay.sum()?
+```
 
 ### core.template
 

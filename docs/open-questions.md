@@ -1955,7 +1955,7 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
 ### Type-argument syntax: no turbofish (expression position)
-**Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual (still open):** a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); narrow, unimplemented, and may fold into `decode`. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
+**Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual — CLOSED 2026-07-18 (the JSON-completeness design):** the schema-selector builtins `json.validate<T>` / `json.field_table<T>` are **deleted from the catalog** (validate folds into decode-and-discard; field_table is compiler-internal), so no `<T>`-only surface remains there; the one surviving schema-selector is the streaming scanner (`rows: json.scanner<Row> := json.scan(view)`), whose type comes from the binding annotation exactly like `decode` — consistent, no new syntax. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
 
 ### External soundness audit — multi-agent (2026-07-02, VERIFIED; fixes in progress)
 
@@ -3650,54 +3650,89 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
   structs/arrays) and (b) the build-system / package-layout / dependency-resolution design
   above. Re-evaluate on real reuse pressure from shipped apps — extraction over invention.
 
-### JSON completeness — owner-directed priority AFTER the runway (filed 2026-07-18)
+### JSON completeness — DESIGN SETTLED 2026-07-18 (owner-approved; the implementation source of truth)
 
-**Owner directive (2026-07-18): once the REST-gateway runway (Slices A/B/C) lands, the very next
-priority is to make `core.json` *holistically complete* — no more piecemeal "this JSON shape is
-supported, that one isn't."** The runway closes the OpenAI-gateway shapes but leaves a residue of
-gaps; the owner does not want that fragmentation to persist. This item tracks the residue and
-sequences its closure directly after Slice C. Each sub-item is tagged **impl** (just build it, the
-design is clear) or **design** (a decision must be settled first — flagged because it may touch the
-"typed records over the text boundary" framing of draft §14).
+**Owner directive (2026-07-18): make `core.json` *holistically complete* — no more piecemeal "this
+JSON shape is supported, that one isn't."** The design below was settled with the owner (three
+forks decided 2026-07-18: lazy document view / shape-directed unions / catalog trimmed). It is the
+source of truth for the implementation slices J1–J6; spec text lives in draft §14 + §18.1.
 
-After A/B/C, `core.json` covers: struct targets (flat / nested / `Option` / `array` fields),
-`array<Struct>`, `soa<Struct>`, `array<scalar>`; field types Int/Float/Bool/Str/nested-Struct/
-`Option<T>`/`array<T>`. The remaining gaps to close for "complete JSON":
+**"Complete" = three tiers, plus a catalog with no dangling entries:**
 
-1. **Enum / discriminated-union payloads (impl → design).** A sum-type field/target — the OpenAI
-   multimodal `content` (`str` **or** an array of parts) is exactly this (`oneOf`). The runway v1
-   restricts `content` to `str`; this is the LAST piece of the gateway itself. Needs a
-   tag-discrimination decode rule (which key / value shape selects the variant) — likely
-   internally-tagged or shape-directed; a genuine design decision (Align enums have no JSON-standard
-   discriminator convention). Encode is mechanical once decode's rule is settled.
-2. **Dynamic / untyped JSON — a `JsonValue` type (design, the big one).** `serde_json::Value`'s
-   analogue: parse arbitrary unknown-shape JSON into a recursive `Value { Null, Bool, Num, Str,
-   Array, Object }`. Align's json is deliberately **schema-driven** (draft §14 "typed records"), so
-   this is a philosophy call, not just code: does "complete JSON" require a dynamic value, or is
-   schema-required decoding the intended completeness? The owner's "no gaps" steer leans toward
-   providing it (real JSON in the wild is often shape-unknown at compile time — webhooks,
-   config, third-party APIs). If adopted it needs: the recursive `Value` type (owned, arena or heap;
-   `Map`/`Array` payloads → depends on array/map fields), accessors (`v.get("k")`, `v.as_i64()`),
-   and an encode path. This is the single largest design+impl item; settle its philosophy stance
-   FIRST (it may re-frame draft §14).
-3. **JSON object-as-map — dynamic string keys (design+impl).** `{"k1": v, "k2": v, …}` where the
-   keys are *data*, not schema fields → a `map<str, V>` decode target. Needs the `map`/dictionary
-   type (does Align have one? — none today; this may pull in a whole collection type) OR fold into
-   `JsonValue`'s `Object`. Decide together with #2.
-4. **`json.scan` / `json.token` — streaming / SAX tier (impl).** Incremental parse for documents too
-   large to materialize (NDJSON `json.scan` is already gestured at in the roadmap). API + a pull/push
-   token model; no new value shapes, so mostly mechanical once the streaming contract is set.
-5. **`json.validate<T>` — schema validation (impl, small).** Validate bytes conform to `T` without
-   materializing; the settled no-turbofish rule means its `<T>` surface must come from context or
-   fold into `decode` (open-questions §"no expression-position type-argument syntax" residual).
-6. **Top-level scalar / bool / null targets, and deep array/Option/array nesting combinations
-   (impl).** `x: i64 := json.decode(s)?`, `array<array<T>>`, `array<Option<T>>` — fill the matrix so
-   there is no "this combination isn't a target" surprise.
+```text
+Tier 1  typed decode/encode, full matrix   (schema known  — the §14 identity, completed)
+Tier 2  json.doc lazy document view        (schema unknown — zero-copy, arena-backed)
+Tier 3  json.scan streaming rows           (larger than memory — pipeline source)
+```
 
-**Sequencing:** Slice B → Slice C → **close #1 (enum/union — finishes the gateway)** → settle #2/#3
-philosophy (the `JsonValue`/map decision — the crux of "complete") → #4/#5/#6. Only after #1–#6 is
-`core.json` "complete" in the owner's sense. Record the settled framing in draft §14 +
-`impl/core-design/json.md` as each lands.
+**T1a — unions: shape-directed sum-type mapping (SETTLED).** A JSON `oneOf` (the OpenAI multimodal
+`content: str | array<Part>`) maps to an Align sum type; the variant is selected by the JSON
+value's **shape class** — `Str` (`"`), `Number` (digit/`-`), `Bool` (`t`/`f`), `Object` (`{`),
+`Array` (`[`) — an O(1) dispatch on the first structural byte, no backtracking. **Compile-time
+restriction (the Align move — restriction buys determinism):** a union-decodable enum has every
+variant carrying exactly one payload, each payload mapping to one shape class, all classes
+**pairwise distinct** — two object-payload variants (or `i64 | f64`, both `Number`) are a compile
+error naming the clash. Tag-only variants are rejected (a string-enum name mapping is future).
+`null` is deliberately NOT a class: absence belongs to `Option` (`Option<Content>` composes for
+nullable unions) — one absence representation. Encode is the inverse image: the live variant's
+payload encodes **bare** (no wrapper key), so round-trip holds by construction. Object-vs-object
+discrimination (internally-tagged `{"type": …}`) is NOT a second rule — that shape is expressed
+today as a single struct with `Option` fields; revisit only on real pressure. **Language
+prerequisite (the bulk of the work): enum `str` + owned payloads.** Today `enum_payload_ok` allows
+only primitive scalars / `str`-free plain structs because enums are neither region-tracked nor
+dropped. The union work extends enums: region-tracked iff any variant payload tracks a region
+(`str` view payloads — `tracks_region`/`region_of`/`ty_may_borrow` grow `Ty::Enum` arms); Move
+iff any payload is Move (`array<T>` payloads — drop switches on the tag and frees the live
+payload; MoveCheck/`null_moved_source`/`drop_struct_fields` grow enum arms; element restriction =
+Slice C's non-owned rule). The Gate-1 sibling-pass sweep applies in full.
+
+**T2 — dynamic JSON: `json.doc`, a lazy document view (SETTLED — NOT a serde-style value tree).**
+A `serde_json::Value` heap tree (per-node allocation, pointer-chasing) contradicts Nothing hidden
++ data-oriented and would drag in recursive enums and a map type; rejected. Instead the simdjson
+"on-demand" model, built on the existing SIMD structural index: `d := json.doc(s)?` inside an
+`arena {}` parses once into an arena-backed tape (`Result` — malformed input is an `Err`).
+Navigation after the parse is **total, Missing-propagating** (`?` is Result-only, so per-step
+`Option` unwrapping would be unusable): `d.get("k")` / `d.at(i)` always return a `json.doc`; a
+missing member / out-of-range index yields `kind() == Missing`, which propagates through further
+navigation, so absence surfaces exactly once — as `None` from a leaf accessor
+(`as_str/as_i64/as_f64/as_bool -> Option<…>`). `kind() -> json.kind { Object, Array, Str, Number,
+Bool, Null, Missing }` distinguishes JSON `null` from absence when asked; both yield `None` from
+`as_*`. Keys-as-data (object-as-`map`) is `d.key(i) -> Option<str>` + `d.at(i)` over an object's
+ordered members — NO map type enters the language. `d.len()` is 0 on a non-container; `d.elems()
+-> array<json.doc>` bump-materializes child handles so ordinary pipelines run over a document
+level (the Align idiom instead of an iterator protocol). `json.doc` is a Copy view handle
+region-tied to min(input, arena); nothing escapes the arena un-cloned. Implementation details
+recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape sibling-skip
+offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
+unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
+
+**T3 — streaming: `json.scan` (SETTLED, per the recorded std-runway scanner design).** NDJSON /
+top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
+json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a
+turbofish). v1 the scanner is a **pipeline source only** (fused terminals:
+`rows.where(.active).map(…)…`), which sidesteps per-row escape/invalidation entirely — a row view
+borrows the current chunk and dies with the stage. Measured basis: streaming projected scan beat
+materializing 2.7–2.9× at 1–5M rows.
+
+**Catalog trimmed (SETTLED — dangling entries removed, not left "unimplemented"):**
+`json.validate<T>` **deleted** (decode-and-discard IS validation with zero-copy costs; one way);
+`json.token` **deleted** (doc + scan cover the realistic cases; no consumer — build it only if one
+appears, as a Future note); `json.field_table<T>` **deleted** (a compiler-internal artifact, not
+API). §18.1's core.json surface becomes exactly: `decode`, `encode`, `doc`, `scan`. This also
+closes the no-turbofish settled item's "schema-selector residual" — `scan` is the one survivor
+and it types from the binding annotation.
+
+**T1b — matrix fill (impl, no new design):** top-level scalar/bool targets (`x: i64 :=
+json.decode(s)?`), `array<scalar>` struct fields, `Option<struct>` ENCODE (the B follow-up),
+supported-constructor compositions (`array<Option<T>>` etc.). Rule: any composition of supported
+constructors closes; the v1 non-owned boundaries stay explicit (`array<string>` waits for
+owned-element drop).
+
+**Slices:** **J1** enum `str` payloads (region) + shape-directed union decode/encode over
+str/number/bool/object payloads → **J2** enum owned payloads (`array<Struct>`, drop) → full
+`Content` union → **the gateway is closed** → **J3** matrix fill (T1b) → **J4** `json.doc` →
+**J5** `json.scan` → **J6** spec sync sweep (draft §14 two-tier framing done at design time;
+per-slice updates as they land). Each slice ships ideal-form or defers per CLAUDE.md.
 
 ### Details (settled during implementation)
 ```text

@@ -141,6 +141,17 @@ zero copy
 field tables
 ```
 
+Later (2026-07-18), when JSON was pushed to completeness, a **serde-style
+recursive value tree** (`JsonValue { Null, Bool, Num, Str, Array, Object }`)
+was considered for schema-unknown input and **rejected**: per-node heap
+allocation and pointer-chasing are the cost model Align exists to avoid, and it
+would have pulled recursive enums and a map type into the language. The chosen
+form is the simdjson-style lazy document view (`json.doc`) — one SIMD scan into
+an arena-backed tape, borrowed zero-copy views for navigation. Two other
+catalog entries were rejected at the same time rather than left pending:
+`validate<T>` (decoding and discarding is validation) and the SAX `token` tier
+(no consumer; the view + streaming scan cover it).
+
 ---
 
 ## The compiler-friendly direction

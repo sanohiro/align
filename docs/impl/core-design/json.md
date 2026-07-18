@@ -91,20 +91,26 @@ zero new state, cost confined to records with undeclared colons).
 owned arrays escape freely. Escaping a decoded view past its input is caught at the escape
 point (clone out to keep).
 
-## Spec'd but not implemented
+## Designed but not implemented (the JSON-completeness design, settled 2026-07-18)
 
-- `json.scan`, `json.token` (streaming/SAX tier), `json.validate<T>`, `json.field_table<T>`
-  (§18.1 catalog) — no dispatch arms. The `<T>`-explicit pair is *also* blocked on the settled
-  no-turbofish rule: §18.1 already records that they are "the residual schema-selector case …
-  may fold into `decode`". Settle that in `open-questions.md` before implementing anything here.
-- `json.decode<T>(...)` call syntax — permanently out (settled); the annotation-through-`?`
-  form is the one way.
-- Option-field / `array<T>`-field / enum-payload decode targets — not in the verified matrix;
-  extending the target grammar is design work (field tables, null policy, language-side field-type
-  support) before code. **Nested-struct fields SHIPPED (REST-gateway runway, Slice A);**
-  `open-questions.md` Open → "REST-gateway runway" holds the remaining slice plan (Option → array
-  fields), the null policy proposal, and the language-side field-type prerequisites (`is_field_ok`
-  today rejects `Option<T>`/`array<T>` fields). Enum-payload targets stay deferred there too.
+The full design lives in `open-questions.md` → "JSON completeness — DESIGN SETTLED" (the
+implementation source of truth; spec text in draft §14 + §18.1). Remaining slices J1–J6:
+
+- **Unions (J1–J2):** a JSON `oneOf` maps to a sum type discriminated by pairwise-distinct
+  **shape classes** (Str/Number/Bool/Object/Array; compile-checked; O(1) first-byte dispatch;
+  encode writes the live payload bare). Language prerequisite: enum `str` payloads (region
+  tracking) then owned payloads (`array<Struct>`, tag-switched drop).
+- **Matrix fill (J3):** top-level scalar targets, `array<scalar>` fields, `Option<struct>`
+  encode, supported-constructor compositions.
+- **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
+  Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
+  `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for
+  pipelines (no map type, no serde-style value tree).
+- **`json.scan` (J5):** streaming typed rows, binding-annotation-typed, pipeline source only.
+
+Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
+validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`
+(compiler-internal). `json.decode<T>(...)` call syntax stays permanently out (no turbofish).
 
 ## Pitfalls
 
