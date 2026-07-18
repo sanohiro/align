@@ -8,7 +8,40 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **v0.1.0 RELEASED + brew/apt DISTRIBUTION LIVE**
+_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY SLICE A SHIPPED — nested-struct JSON
+decode/encode, MERGED as #527** (`993faac`; owner-directed "次の予定" = the filed runway). A
+`json.decode`/`json.encode` struct field may now itself be a `Struct`: decode recurses (runtime
+kind-4 `JsonSubTable` pointer; `parse_object` slow path AND `write_field_indexed` Mison speculative
+path both recurse via `decode_nested` — a nested field is one record-level colon whose value the
+record-splitter leaves at a deeper bracket depth, so the flat colon-ordinal speculation is
+undisturbed, P1/P2 honored), encode recurses through `json_object_parts` (extended field `path`),
+and a nested record round-trips in declaration order (the OpenAI chat-completions `usage: Usage`
+shape). `IndexField` generalized single-`field`→`Vec<u32>` path (reusing `elem_field_ptr`/
+`phys_field_indices`) so a fixed struct-array element with a nested field encodes uniformly — no
+partial support. `struct_has_str` recurses so a nested-`str` struct is region-tied to the input.
+Codegen `emit_desc_table` recurses to emit one `JsonSubTable` global per nested struct type
+(acyclic → terminates); descriptor LLVM struct gains a `sub` ptr matching the runtime `#[repr(C)]`.
+**Also fixed a pre-existing stale-cache miscompile this slice would have extended (#514/#517
+class):** a decode target struct's field name/type feeds only the codegen descriptor, not the
+surrounding MIR, so a field RENAME at the same slot (or a nested struct's field change) left
+`impl_hash` unchanged and the warm object cache served a stale object decoding the OLD key
+(reproduced end-to-end). The `JsonDecode*` MIR rvalues now bake a recursive `json_schema_sig`
+(names + types via sign/width-faithful `ty_name` + `layout(C)`/`align`, nested expanded) printed
+into the MIR; pinned by `cache_codegen.rs` gate 2b (flat + nested). `/align-self-review` (added the
+`field_width` negative-size guard + `json_object_parts` cycle guard) + `/code-review` high (0
+correctness findings; 1 test-coverage gap — fixed struct-array nested encode — pinned) both run and
+reflected. Tests: m5 (`json_decode_encode_nested_struct_roundtrip`, `..._array_mison`,
+`json_encode_fixed_struct_array_with_nested`), runtime descriptor-level slow + Mison recursion,
+cache gate 2b, example `examples/json_nested.align`. Docs: json.md (+ja mirror), draft.md §14,
+language-spec, open-questions runway (Slice A marked shipped). Workspace clippy clean; json/cache/
+mir/sema suites green (the 10 `align_runtime` network/fd tests + the `cache_codegen` gate7 Mach-O
+`LC_UUID` exe-byte flake fail on pristine `main` too — macOS-sandbox environmental, cataloged).
+**Next: REST-gateway runway Slice B (`Option<T>` struct fields + optional-field decode) then Slice C
+(`array<T>` struct fields — the `choices: array<Choice>` request shape).** Slice B settles the null
+policy: missing key → `None`; JSON `null` → `None`; type mismatch → `Err`; `encode` omits a `None`
+field entirely. Both slices need the language-side `is_field_ok` extension (today rejects
+`Option<T>`/`array<T>` fields) + layout/MoveCheck/escape field tracking — the sibling-type-class
+sweep (`/align-self-review` Gate 1). Previous update: 2026-07-18, **v0.1.0 RELEASED + brew/apt DISTRIBUTION LIVE**
 (owner-directed release). Tagged `v0.1.0` (annotated) + GitHub release with curated notes and the
 CI-built artifacts (3 tarballs, amd64/arm64 `.deb`, `align.rb`, checksums). Fixed the release
 workflow's `cp LICENSE` bug (repo is dual-licensed `LICENSE-APACHE`+`LICENSE-MIT`, no bare `LICENSE`
