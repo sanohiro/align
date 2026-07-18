@@ -1918,6 +1918,13 @@ expression-position type-argument syntax (no turbofish). `validate<T>` and
 neither arguments nor result; their explicit-type surface is still open (they may
 fold into `decode`).
 
+A struct field may itself be a `Struct`: `decode` recurses into the nested object
+and `encode` renders it back, so a nested record round-trips in declaration order
+(unknown keys are still skipped at every level, and nested `str` fields stay
+zero-copy views into the input). `Option<T>` and `array<T>` fields are not yet
+decode/encode targets (the REST-gateway runway's later slices), and `soa<Struct>`
+columns stay primitive/`str` (no nested columns).
+
 ### core.template
 
 ```text

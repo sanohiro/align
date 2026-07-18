@@ -3176,6 +3176,17 @@ struct DecodeTable<'c> {
     phf_seed: u64,
 }
 
+/// The field-descriptor table (+ PHF) `emit_desc_table` emits for one struct, without the store
+/// size. A nested-struct field's `JsonSubTable` global bundles this with the store size; the
+/// top-level `DecodeTable` adds the store size for the decode call.
+struct DescTable<'c> {
+    descs: inkwell::values::PointerValue<'c>,
+    n_fields: u64,
+    phf_ptr: inkwell::values::PointerValue<'c>,
+    phf_len: u64,
+    phf_seed: u64,
+}
+
 /// The canonical `wyhash`, seeded — the hash behind the compile-time perfect-hash field dispatch.
 /// This and the runtime-side `json_phf_hash` (`align_runtime`) **both** call `align_hash::wyhash`,
 /// so the slot a JSON key maps to is byte-identical on the two ends *by construction* — the shared
@@ -5578,8 +5589,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
             }
-            Rvalue::IndexField(slot, idx, field) => {
-                let ep = self.elem_field_ptr(*slot, idx, &[*field])?;
+            Rvalue::IndexField(slot, idx, path) => {
+                let ep = self.elem_field_ptr(*slot, idx, path)?;
                 let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
@@ -6457,10 +6468,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("builder_into_string returns a {ptr,len}")
             }
             Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
-            Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
+            // `schema` is a cache-invalidation fingerprint printed into the MIR; codegen rebuilds the
+            // descriptor table directly from `struct_id`, so it does not read `schema` here.
+            Rvalue::JsonDecode { struct_id, input, out, .. } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
-            Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
-            Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
+            Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
+            Rvalue::JsonDecodeSoa { struct_id, input, out, arena, .. } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8147,16 +8160,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// table `[{ name_ptr, name_len: i64, tag: i32, offset: i64 }]` (tag = byte width for
     /// ints, 0 for bool; offset from the target layout), and call the runtime parser. Returns
     /// the i32 status.
-    /// Emit the constant `{name_ptr, name_len, tag, offset}` field-descriptor table for decoding
-    /// struct `struct_id`, returning `(table base, n_fields, struct store size)`. The table is a
-    /// private constant global (no per-call alloca → safe inside a loop). Shared by single-struct
-    /// and `array<Struct>` decode (MMv2 slice 8d).
-    fn decode_field_table(&mut self, struct_id: u32) -> DecodeTable<'c> {
-        let sty = self.struct_types[struct_id as usize];
+    /// The LLVM type of one `json.decode` field descriptor: `{ name_ptr, name_len: i64, tag: i32,
+    /// offset: i64, sub: ptr }` — matching the runtime `JsonField` `#[repr(C)]`. `sub` is null except
+    /// for a nested-struct field (kind 4), where it points to a [`json_subtable_ty`] global.
+    fn json_desc_ty(&self) -> inkwell::types::StructType<'c> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
-        let desc_ty = self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into()], false);
+        self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into(), ptr_ty.into()], false)
+    }
+
+    /// The LLVM type of a nested-struct field's sub-schema, matching the runtime `JsonSubTable`
+    /// `#[repr(C)]`: `{ descs: ptr, n_fields: i64, store_size: i64, phf: ptr, phf_len: i64,
+    /// phf_seed: i64 }`.
+    fn json_subtable_ty(&self) -> inkwell::types::StructType<'c> {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        self.ctx
+            .struct_type(&[ptr_ty.into(), i64t.into(), i64t.into(), ptr_ty.into(), i64t.into(), i64t.into()], false)
+    }
+
+    /// Emit the constant `{name_ptr, name_len, tag, offset, sub}` field-descriptor table (+ its
+    /// perfect-hash slot table) for decoding struct `struct_id`, returning the table base, field
+    /// count, and PHF. Recurses to emit a [`json_subtable_ty`] global for each nested-struct field
+    /// (kind 4) — the struct graph is acyclic (sema's `struct_acyclic` rejects self-reference), so
+    /// the recursion terminates. The table is a private constant global (no per-call alloca → safe
+    /// inside a loop). Shared by single-struct and `array<Struct>` decode (MMv2 slice 8d).
+    fn emit_desc_table(&mut self, struct_id: u32) -> DescTable<'c> {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let desc_ty = self.json_desc_ty();
+        let null = ptr_ty.const_null();
         let fields = self.structs[struct_id as usize].fields.clone();
         let descs: Vec<inkwell::values::StructValue> = fields
             .iter()
@@ -8164,17 +8199,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map(|(i, f)| {
                 let (name_ptr, name_len) = self.str_global(&f.name);
                 // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
-                // 2 = float, 3 = str. Bit 16 is the int sign flag (1 = signed, 0 = unsigned); it
-                // lets the runtime range-check the parsed value before writing (only meaningful for
-                // kind 0). It sits above the kind/width bytes, so the existing `tag & 0xff` (width)
-                // and `(tag >> 8) & 0xff` (kind) decoders are unchanged.
-                // A `str` field is a `{ptr,len}` view (16 bytes) written zero-copy into the input.
-                let tag: u64 = match f.ty {
-                    Ty::Int(it) => ((it.signed as u64) << 16) | (it.bits / 8) as u64,
-                    Ty::Bool => (1 << 8) | 1,
-                    Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
-                    Ty::Str => (3 << 8) | 16,
-                    _ => unreachable!("json.decode field is int/float/bool/str (sema-checked)"),
+                // 2 = float, 3 = str, 4 = nested struct. Bit 16 is the int sign flag (1 = signed,
+                // 0 = unsigned); it lets the runtime range-check the parsed value before writing (only
+                // meaningful for kind 0). It sits above the kind/width bytes, so the existing
+                // `tag & 0xff` (width) and `(tag >> 8) & 0xff` (kind) decoders are unchanged.
+                // A `str` field is a `{ptr,len}` view (16 bytes) written zero-copy into the input; a
+                // nested-struct field carries kind 4 with `sub` pointing to its own sub-schema (the
+                // width byte is unused — the runtime reads `sub.store_size`).
+                let (tag, sub_ptr): (u64, inkwell::values::PointerValue) = match f.ty {
+                    Ty::Int(it) => (((it.signed as u64) << 16) | (it.bits / 8) as u64, null),
+                    Ty::Bool => ((1 << 8) | 1, null),
+                    Ty::Float(ft) => ((2 << 8) | (ft.bits / 8) as u64, null),
+                    Ty::Str => ((3 << 8) | 16, null),
+                    Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)),
+                    _ => unreachable!("json.decode field is int/float/bool/str/nested-struct (sema-checked)"),
                 };
                 // The descriptor lists fields by *name* in logical order, but the byte offset must be
                 // the field's physical slot (fields are alignment-reordered for non-`layout(C)`
@@ -8185,6 +8223,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     name_len.into(),
                     i32t.const_int(tag, false).into(),
                     i64t.const_int(offset, false).into(),
+                    sub_ptr.into(),
                 ])
             })
             .collect();
@@ -8212,13 +8251,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
             None => (ptr_ty.const_null(), 0, 0),
         };
 
+        DescTable { descs: table.as_pointer_value(), n_fields: fields.len() as u64, phf_ptr, phf_len, phf_seed }
+    }
+
+    /// Emit the `JsonSubTable` global for a nested-struct field of type `struct_id` (its descriptor
+    /// table, store size, and PHF), returning a pointer to it for the parent field's `sub` slot.
+    fn emit_json_subtable(&mut self, struct_id: u32) -> inkwell::values::PointerValue<'c> {
+        let inner = self.emit_desc_table(struct_id); // recurse — acyclic, so it terminates
+        let store_size = self.target_data.get_store_size(&self.struct_types[struct_id as usize]);
+        let i64t = self.ctx.i64_type();
+        let subtable_ty = self.json_subtable_ty();
+        let val = subtable_ty.const_named_struct(&[
+            inner.descs.into(),
+            i64t.const_int(inner.n_fields, false).into(),
+            i64t.const_int(store_size, false).into(),
+            inner.phf_ptr.into(),
+            i64t.const_int(inner.phf_len, false).into(),
+            i64t.const_int(inner.phf_seed, false).into(),
+        ]);
+        let g = self.module.add_global(subtable_ty, None, "jsub");
+        g.set_initializer(&val);
+        g.set_constant(true);
+        mark_private_unnamed_addr(g);
+        g.as_pointer_value()
+    }
+
+    /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
+    /// with the struct's store size. The table is a private constant global (safe inside a loop).
+    fn decode_field_table(&mut self, struct_id: u32) -> DecodeTable<'c> {
+        let sty = self.struct_types[struct_id as usize];
+        let t = self.emit_desc_table(struct_id);
         DecodeTable {
-            descs: table.as_pointer_value(),
-            n_fields: fields.len() as u64,
+            descs: t.descs,
+            n_fields: t.n_fields,
             store_size: self.target_data.get_store_size(&sty),
-            phf_ptr,
-            phf_len,
-            phf_seed,
+            phf_ptr: t.phf_ptr,
+            phf_len: t.phf_len,
+            phf_seed: t.phf_seed,
         }
     }
 

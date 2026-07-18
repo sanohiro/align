@@ -301,7 +301,11 @@ AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or
 decode-to-AoS-then-transpose), both arena-allocated. `json.decode`'s field contract is strict and
 exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped),
 enforced on both the strict fallback and the Mison speculative fast path (a duplicate at an unqueried
-position is re-checked against the declared set and rejected). See `draft.md` §9.
+position is re-checked against the declared set and rejected). A struct field may itself be a
+`Struct` — `decode` recurses into the nested object and `encode` renders it back (a nested record
+round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
+`Option<T>`/`array<T>` fields are not yet decode/encode targets, and `soa<T>` columns stay
+primitive/`str`. See `draft.md` §9, §14.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

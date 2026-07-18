@@ -241,7 +241,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
-        Rvalue::IndexField(slot, idx, field) => format!("_{slot}[{}].{field}", operand_str(idx)),
+        Rvalue::IndexField(slot, idx, path) => {
+            let fields = path.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(".");
+            format!("_{slot}[{}].{fields}", operand_str(idx))
+        }
         Rvalue::MakeVec { elems, elem, n } => {
             let parts: Vec<String> = elems.iter().map(operand_str).collect();
             format!("vec{n}<{}>[{}]", ty_name(*elem), parts.join(", "))
@@ -413,17 +416,17 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 .collect();
             format!("template[{}]", ps.join(", "))
         }
-        Rvalue::JsonDecode { struct_id, input, out } => {
-            format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonDecode { struct_id, schema, input, out } => {
+            format!("json_decode(struct#{struct_id} {schema}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDecodeArray { elem, input, out } => {
             format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
         }
-        Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
-            format!("json_decode_struct_array(struct#{struct_id}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonDecodeStructArray { struct_id, schema, input, out } => {
+            format!("json_decode_struct_array(struct#{struct_id} {schema}, {}, -> _{out})", operand_str(input))
         }
-        Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
-            format!("json_decode_soa(struct#{struct_id}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
+        Rvalue::JsonDecodeSoa { struct_id, schema, input, out, arena } => {
+            format!("json_decode_soa(struct#{struct_id} {schema}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
         }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))

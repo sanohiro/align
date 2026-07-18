@@ -213,6 +213,61 @@ fn gate2_private_body_edit_misses_only_edited_unit() {
     }
 }
 
+// ---- Gate 2b: a json.decode target-struct field RENAME invalidates the cache -------------------
+
+/// A `json.decode` target struct's field name/type feeds only the codegen descriptor table, not the
+/// surrounding MIR — a field RENAME at the same slot (or a NESTED struct's field change) leaves every
+/// other MIR statement byte-identical. Without the schema fingerprint baked into the decode rvalue
+/// (`json_schema_sig`), the unit's `impl_hash` would be unchanged and the warm cache would serve a
+/// STALE object still decoding the OLD key (the #514/#517 stale-cache class, reproduced end-to-end).
+/// This gate pins that the rename misses on the unit's own MIR digest — both flat and nested.
+#[test]
+fn gate2b_json_decode_field_rename_invalidates() {
+    if !backend() {
+        return;
+    }
+    // Flat: rename `k` → `zzz` with the JSON literal (still key "k") and every other line unchanged.
+    let flat_v1 = "import core.json\nS { a: i64, k: str }\nfn main() -> Result<(), Error> {\n  s: S := json.decode(\"{\\\"a\\\":1,\\\"k\\\":\\\"x\\\"}\")?\n  print(s.a)\n  return Ok(())\n}\n";
+    let flat_v2 = "import core.json\nS { a: i64, zzz: str }\nfn main() -> Result<(), Error> {\n  s: S := json.decode(\"{\\\"a\\\":1,\\\"k\\\":\\\"x\\\"}\")?\n  print(s.a)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-rename-flat", &[("main.align", flat_v1)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    if cc_available() {
+        assert_eq!(cold.run(&proj, Profile::Release), "1\n"); // v1: key "k" matches → decode ok
+    }
+    proj.write("main.align", flat_v2);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hot.outcome("main").hit, "a decode target field rename must miss");
+    assert_eq!(
+        hot.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the rename flips the baked json schema fingerprint → the unit's MIR digest"
+    );
+    if cc_available() {
+        // v2 declares `zzz` but the input still carries key "k" → strict decode fails (missing
+        // `zzz`), `?` propagates the Err, `main` returns without printing. A stale hit on the v1
+        // object would wrongly print "1\n"; the rebuilt v2 prints nothing.
+        assert_eq!(hot.run(&proj, Profile::Release), "", "the rebuilt v2 must fail decoding, not serve the stale v1 object");
+    }
+
+    // Nested: renaming a NESTED struct's field must invalidate the parent's decode unit too.
+    let nest_v1 = "import core.json\nInner { x: i64, k: str }\nOuter { id: i64, inner: Inner }\nfn main() -> Result<(), Error> {\n  o: Outer := json.decode(\"{\\\"id\\\":1,\\\"inner\\\":{\\\"x\\\":5,\\\"k\\\":\\\"h\\\"}}\")?\n  print(o.id)\n  return Ok(())\n}\n";
+    let nest_v2 = "import core.json\nInner { x: i64, renamed: str }\nOuter { id: i64, inner: Inner }\nfn main() -> Result<(), Error> {\n  o: Outer := json.decode(\"{\\\"id\\\":1,\\\"inner\\\":{\\\"x\\\":5,\\\"k\\\":\\\"h\\\"}}\")?\n  print(o.id)\n  return Ok(())\n}\n";
+    let projn = Project::new("json-rename-nested", &[("main.align", nest_v1)], "main.align");
+    let cachen = projn.cache();
+    let coldn = emit_all(&projn, &cachen, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(coldn.outcomes.iter().all(|o| !o.hit));
+    projn.write("main.align", nest_v2);
+    let hotn = emit_all(&projn, &cachen, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hotn.outcome("main").hit, "a nested decode struct's field rename must miss");
+    assert_eq!(
+        hotn.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the nested field feeds the recursive schema fingerprint → the parent unit's MIR digest"
+    );
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]

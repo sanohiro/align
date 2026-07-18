@@ -4986,7 +4986,32 @@ impl<'a> EscapeCheck<'a> {
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
     /// a primitive-only one is free to escape the arena (`s[i]` gather returns a Copy POD value).
     fn struct_has_str(&self, id: u32) -> bool {
-        self.structs[id as usize].fields.iter().any(|f| f.ty == Ty::Str)
+        self.struct_has_str_rec(id, &mut Vec::new())
+    }
+
+    /// Whether struct `id` holds a `str` field at any nesting depth — a decoded nested struct's `str`
+    /// fields are zero-copy views into the JSON input, so a struct that (transitively) contains one is
+    /// region-tied to that input and cannot outlive it (`region_of`). Cycle-safe (`stack`) even though
+    /// the struct graph is acyclic (`struct_acyclic`), so a mis-built graph can't loop forever.
+    fn struct_has_str_rec(&self, id: u32, stack: &mut Vec<u32>) -> bool {
+        if stack.contains(&id) {
+            return false;
+        }
+        stack.push(id);
+        let mut found = false;
+        for f in &self.structs[id as usize].fields {
+            let has = match f.ty {
+                Ty::Str => true,
+                Ty::Struct(nid) => self.struct_has_str_rec(nid, stack),
+                _ => false,
+            };
+            if has {
+                found = true;
+                break;
+            }
+        }
+        stack.pop();
+        found
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
@@ -14967,7 +14992,7 @@ impl<'a, 't> Checker<'a, 't> {
         match ty {
             // A single struct → a JSON object.
             Ty::Struct(sid) => {
-                self.json_object_parts(base, sid, None, &mut parts, args[0].span, &mut ok);
+                self.json_object_parts(base, sid, None, &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
             }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
@@ -14976,7 +15001,7 @@ impl<'a, 't> Checker<'a, 't> {
                     if i > 0 {
                         parts.push(TemplatePart::Text(",".to_string()));
                     }
-                    self.json_object_parts(base, sid, Some(i), &mut parts, args[0].span, &mut ok);
+                    self.json_object_parts(base, sid, Some(i), &[], &mut Vec::new(), &mut parts, args[0].span, &mut ok);
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
@@ -15103,45 +15128,98 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Validate that struct `sid`'s fields are all `json.decode`-able (int / float / bool, or a
-    /// `str` zero-copy view into the input). Reports the first offending field and returns false.
-    /// Shared by the single-struct and `array<Struct>` decode paths (MMv2 slice 8d).
+    /// Validate that struct `sid`'s fields are all `json.decode`-able (int / float / bool, a `str`
+    /// zero-copy view into the input, or a **nested struct** whose own fields are likewise decodeable
+    /// — recursively). Reports the first offending field and returns false. Shared by the
+    /// single-struct and `array<Struct>` decode paths (MMv2 slice 8d); a nested struct decodes into
+    /// its parent's field slot via the runtime's kind-4 recursion (the REST-gateway runway, Slice A).
     fn decode_struct_fields_ok(&mut self, sid: u32, span: Span) -> bool {
+        self.decode_struct_fields_ok_rec(sid, span, &mut Vec::new())
+    }
+
+    fn decode_struct_fields_ok_rec(&mut self, sid: u32, span: Span, stack: &mut Vec<u32>) -> bool {
+        // The struct graph is acyclic (`struct_acyclic`), so this is defense in depth against a
+        // mis-built graph looping forever, not a reachable diagnostic.
+        if stack.contains(&sid) {
+            self.diags
+                .error("'json.decode' cannot decode a self-referential struct".to_string(), span);
+            return false;
+        }
+        stack.push(sid);
         let fields = self.structs[sid as usize].fields.clone();
         for f in &fields {
-            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str) {
-                self.diags.error(
-                    format!("'json.decode' field '{}' has type {} (only int/float/bool/str decode for now)", f.name, ty_name(f.ty)),
-                    span,
-                );
-                return false;
+            match f.ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str => {}
+                Ty::Struct(nid) => {
+                    if !self.decode_struct_fields_ok_rec(nid, span, stack) {
+                        stack.pop();
+                        return false;
+                    }
+                }
+                _ => {
+                    self.diags.error(
+                        format!(
+                            "'json.decode' field '{}' has type {} (only int/float/bool/str/nested-struct decode for now)",
+                            f.name,
+                            ty_name(f.ty)
+                        ),
+                        span,
+                    );
+                    stack.pop();
+                    return false;
+                }
             }
         }
+        stack.pop();
         true
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
     /// local `base` itself (`elem` = None) or element `elem` of the struct-array local `base`.
-    /// Sets `*ok = false` (and reports) on a field type `json.encode` can't render yet.
+    /// `path_prefix` is the chain of logical field indices from the root struct to `sid` (empty at
+    /// the top level); a **nested-struct field** recurses with its index appended, emitting a nested
+    /// `{...}` object (the REST-gateway runway, Slice A). Sets `*ok = false` (and reports) on a field
+    /// type `json.encode` can't render yet.
+    #[allow(clippy::too_many_arguments)]
     fn json_object_parts(
         &mut self,
         base: LocalId,
         sid: u32,
         elem: Option<u32>,
+        path_prefix: &[u32],
+        visiting: &mut Vec<u32>,
         parts: &mut Vec<TemplatePart>,
         span: Span,
         ok: &mut bool,
     ) {
-        // `self.structs` is a `&'a [StructDef]`, so this borrow is tied to `'a`, not `self`
-        // — `self.diags` stays mutably borrowable in the loop (no clone needed).
-        let fields = &self.structs[sid as usize].fields;
+        // The struct graph is acyclic (`struct_acyclic`), but sema logs-and-continues, so a cyclic
+        // struct that already errored could still reach here with a `Ty::Struct` field looping back —
+        // guard so `json.encode` diagnoses instead of recursing forever.
+        if visiting.contains(&sid) {
+            self.diags
+                .error("'json.encode' cannot encode a self-referential struct".to_string(), span);
+            *ok = false;
+            return;
+        }
+        visiting.push(sid);
+        // Clone the field list so the recursion (which needs `&mut self`) doesn't hold a borrow of
+        // `self.structs` across the loop — `Field` is cheap to clone (a name + a `Copy` type).
+        let fields = self.structs[sid as usize].fields.clone();
         parts.push(TemplatePart::Text("{".to_string()));
         for (i, f) in fields.iter().enumerate() {
             let sep = if i == 0 { "" } else { "," };
             parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
+            let mut full = path_prefix.to_vec();
+            full.push(i as u32);
+            // A nested struct emits its own object; every leaf reads its field value through the
+            // full path (`base.path…` or the struct-array element `base[elem].path…`).
+            if let Ty::Struct(nid) = f.ty {
+                self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
+                continue;
+            }
             let kind = match elem {
-                None => ExprKind::Field { root: base, path: vec![i as u32] },
-                Some(e) => ExprKind::IndexField { base, index: e, field: i as u32 },
+                None => ExprKind::Field { root: base, path: full },
+                Some(e) => ExprKind::IndexField { base, index: e, path: full },
             };
             let field_expr = Expr { kind, ty: f.ty, span };
             match f.ty {
@@ -15150,7 +15228,7 @@ impl<'a, 't> Checker<'a, 't> {
                 _ => {
                     self.diags.error(
                         format!(
-                            "'json.encode' field '{}' has unsupported type {} (int/float/bool/str only for now)",
+                            "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct only for now)",
                             f.name,
                             ty_name(f.ty)
                         ),
@@ -15161,6 +15239,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         parts.push(TemplatePart::Text("}".to_string()));
+        visiting.pop();
     }
 
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.

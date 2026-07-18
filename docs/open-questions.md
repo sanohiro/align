@@ -3543,14 +3543,32 @@ Two independent gaps block declaring/decoding/encoding these today, in different
    covers flat structs and top-level arrays only; nested-struct / Option-field / array-field
    targets are recorded there as "design work before code". `encode` is flat-struct-only.
 
+**Status (updated 2026-07-18): Slice A SHIPPED. Slices B, C remain.**
+
 **Plan — three slices, each shippable and ideal-form on its own:**
 
-- **A. Nested-struct fields in `core.json` (json-only; no language change).** Nested `Struct`
-  fields are already legal, so recursive field-descriptor tables on decode + recursive `encode`
-  through the builder path are pure `core.json` work. Pitfall discipline is json.md P1/P2
-  verbatim: extend the Mison speculative path and the strict fallback **together**, re-fuzz both
-  (the differential oracle), keep the exactly-once field contract per nesting level. Decoded
-  `str` fields at any depth stay zero-copy views region-tied to the input.
+- **A. Nested-struct fields in `core.json` (json-only; no language change). — SHIPPED 2026-07-18.**
+  Nested `Struct` fields are already legal, so recursive field-descriptor tables on decode +
+  recursive `encode` through the builder path were pure `core.json` work. Delivered: the runtime
+  `JsonField` carries a kind-4 `JsonSubTable` pointer (nested descriptors + PHF + store size), and
+  both `parse_object` (slow path) and `write_field_indexed` (Mison speculative path) recurse — a
+  nested field is one record-level colon whose value the record-splitter leaves at a deeper bracket
+  depth, so the flat colon-ordinal speculation is undisturbed (json.md P1/P2 honored). `encode`
+  recurses through `json_object_parts` with an extended field `path`; `IndexField` was generalized
+  from a single `field` to a `Vec<u32>` path (reusing the existing `elem_field_ptr`/
+  `phys_field_indices` nested-path machinery) so a fixed struct-array element with a nested field
+  encodes uniformly — no partial support. `struct_has_str` recurses so a nested-`str` struct is
+  region-tied to the input recursively. **Also fixed a pre-existing stale-cache miscompile this
+  slice would have extended (the #514/#517 class):** a decode target struct's field name/type feeds
+  only the codegen descriptor, not the surrounding MIR, so a field RENAME at the same slot (or a
+  nested struct's field change) left `impl_hash` unchanged → the warm object cache served a stale
+  object decoding the OLD key (reproduced end-to-end). The `JsonDecode*` MIR rvalues now bake a
+  recursive `json_schema_sig` (names + types + `layout(C)`/`align`, nested expanded) printed into
+  the MIR; pinned by `cache_codegen.rs` gate 2b (flat + nested). Tests: `m5.rs`
+  (`json_decode_encode_nested_struct_roundtrip`, `json_decode_nested_struct_array_mison`), runtime
+  descriptor-level (`json_decode_nested_struct_single`/`..._array_mison`), example
+  `examples/json_nested.align`. (The broader `layout(C)`-toggle / field-reorder offset-cache concern
+  for NON-json struct field access is untouched here and remains a separate pre-existing question.)
 - **B. `Option<T>` struct fields (language) + optional-field decode (json).**
   - Field support: extend `is_field_ok` + the layout pair (`ty_size_align` / `field_abi_align`
     — `layout_parity` pins their agreement) + MoveCheck/escape field tracking; `struct_is_move`
