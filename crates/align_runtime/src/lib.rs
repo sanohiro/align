@@ -1907,6 +1907,16 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
             }
         }
         5 => unsafe { json_encode_struct_array_at(b, fp, d.sub) },
+        // A shape-directed union (`enum`) field (JSON completeness J1b-2b): `d.sub` is a [`JsonUnion`];
+        // emit the live variant's payload bare at `fp`.
+        6 => {
+            if d.sub.is_null() {
+                b.buf.extend_from_slice(b"null");
+            } else {
+                let u = unsafe { &*(d.sub as *const JsonUnion) };
+                unsafe { encode_union_at(b, fp, u) };
+            }
+        }
         _ => {
             // Integer: read per (width, sign).
             let w = (d.tag & 0xff) as usize;
@@ -1933,13 +1943,7 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
 /// # Safety
 /// `union_desc` must be a valid [`JsonUnion`]; `base` must point at a live enum value of
 /// `union_desc.store_size` bytes; `b` must be a valid builder.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *const u8, union_desc: *const JsonUnion) {
-    if b.is_null() || base.is_null() || union_desc.is_null() {
-        return;
-    }
-    let b = unsafe { &mut *b };
-    let u = unsafe { &*union_desc };
+unsafe fn encode_union_at(b: &mut Builder, base: *const u8, u: &JsonUnion) {
     // Read the enum tag (i32 at offset 0).
     let mut tag_bytes = [0u8; 4];
     unsafe { core::ptr::copy_nonoverlapping(base, tag_bytes.as_mut_ptr(), 4) };
@@ -1965,6 +1969,23 @@ pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *cons
     let kind = (d.tag >> 8) & 0xff;
     let fp = unsafe { base.add(d.offset as usize) };
     unsafe { json_encode_value(b, fp, d, kind) };
+}
+
+/// FFI entry for a **top-level** `json.encode(union)` (the `UnionValue` template piece): null-guard
+/// the pointers, then emit the live variant's payload bare via [`encode_union_at`]. A union **field**
+/// encodes through [`json_encode_value`]'s kind-6 arm instead.
+///
+/// # Safety
+/// `union_desc` must be a valid [`JsonUnion`]; `base` must point at a live enum value of
+/// `union_desc.store_size` bytes; `b` must be a valid builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *const u8, union_desc: *const JsonUnion) {
+    if b.is_null() || base.is_null() || union_desc.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let u = unsafe { &*union_desc };
+    unsafe { encode_union_at(b, base, u) };
 }
 
 /// Encode an owned `array<Struct>`'s `{ptr,len}` slot (at `slot`) into `[...]` — the element schema
@@ -2905,6 +2926,14 @@ fn field_width(d: &JsonField, kind: i32) -> Option<i64> {
         // `offset + width <= out_size` bounds check.
         let sz = unsafe { (*d.sub).store_size };
         (sz >= 0).then_some(sz)
+    } else if kind == 6 {
+        // A shape-directed union field (JSON completeness J1b-2b): `sub` points at a [`JsonUnion`]
+        // (not a `JsonSubTable`), whose `store_size` is the enum's byte width — the same bounds role.
+        if d.sub.is_null() {
+            return None;
+        }
+        let sz = unsafe { (*(d.sub as *const JsonUnion)).store_size };
+        (sz >= 0).then_some(sz)
     } else {
         Some((d.tag & 0xff) as i64)
     }
@@ -2924,6 +2953,15 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
     match kind {
         // Nested struct: recurse into the sub-object at `dst`.
         4 => unsafe { decode_nested(p, d.sub, dst) },
+        // A shape-directed union (`enum`) field (JSON completeness J1b-2b): `d.sub` is a [`JsonUnion`];
+        // decode one value by shape class into the enum slot at `dst` (which was zeroed by the caller).
+        6 => {
+            if d.sub.is_null() {
+                return None;
+            }
+            let u = unsafe { &*(d.sub as *const JsonUnion) };
+            unsafe { decode_union_value(p, u, dst) }
+        }
         // `array<Struct>` field: parse a JSON array of objects into an owned AoS and write its
         // `{ptr,len}` (16 bytes) into the field slot at `dst` (REST-gateway runway Slice C).
         5 => {

@@ -1856,3 +1856,98 @@ fn json_union_rejects_ambiguous_shape_classes() {
     assert!(check_errs("json-union-no-shape", "import core.json\nBad { A(char), B(i64) }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"1\")?\n  return Ok(())\n}\n"));
     assert!(check_errs("json-union-obj-clash", "import core.json\nP{x:i64}\nQ{y:i64}\nBad { A(P), B(Q) }\nfn main() -> Result<(), Error> {\n  x: Bad := json.decode(\"{}\")?\n  return Ok(())\n}\n"));
 }
+
+// ---- JSON completeness J1b-2b: shape-directed union as a struct field ---------------------------
+
+#[test]
+fn json_union_struct_field_decode_encode_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // The `Message { content: Content }` shape — a union as a struct field (kind-6 descriptor). Decode
+    // a message whose `content` is a str vs a number, match the field, and re-encode byte-identically.
+    let src = "import core.json\n\
+        Content { Text(str), Count(i64), Flag(bool) }\n\
+        Message { role: str, content: Content }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        a: Message := json.decode(\"{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hello\\\"}\")?\n    \
+        b: Message := json.decode(\"{\\\"role\\\":\\\"sys\\\",\\\"content\\\":42}\")?\n    \
+        print(json.encode(a))\n    print(json.encode(b))\n    \
+        print(match a.content { Text(s) => s.len() as i64, Count(n) => n, Flag(f) => -1 })\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-field", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"role\":\"user\",\"content\":\"hello\"}\n{\"role\":\"sys\",\"content\":42}\n5\n"
+    );
+}
+
+#[test]
+fn json_union_struct_field_object_payload_and_option_coexist() {
+    if !backend_available() {
+        return;
+    }
+    // An object-payload union variant (`Pic(Img)` → `"content":{...}`) as a field, coexisting with an
+    // `Option` field — the union field slots into the trailing-comma layout, and an omitted `None`
+    // leaves no dangling comma.
+    let src = "import core.json\n\
+        Img { url: str }\n\
+        Content { Text(str), Pic(Img) }\n\
+        Message { content: Content, name: Option<str> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        a: Message := json.decode(\"{\\\"content\\\":{\\\"url\\\":\\\"u\\\"},\\\"name\\\":\\\"bob\\\"}\")?\n    \
+        b: Message := json.decode(\"{\\\"content\\\":\\\"hi\\\"}\")?\n    \
+        print(json.encode(a))\n    print(json.encode(b))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-field-obj", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"content\":{\"url\":\"u\"},\"name\":\"bob\"}\n{\"content\":\"hi\"}\n"
+    );
+}
+
+#[test]
+fn json_union_struct_field_rejects_non_union_enum() {
+    // A struct field whose enum is not union-decodable (ambiguous shape classes) is rejected in sema
+    // on BOTH the decode and encode side — codegen's `emit_json_union` is never reached (no panic).
+    assert!(check_errs(
+        "json-union-field-bad-decode",
+        "import core.json\nBad { A(i64), B(f64) }\nWrap { x: Bad }\nfn main() -> Result<(), Error> {\n  w: Wrap := json.decode(\"{}\")?\n  return Ok(())\n}\n"
+    ));
+    assert!(check_errs(
+        "json-union-field-bad-encode",
+        "import core.json\nBad { A(i64), B(f64) }\nWrap { x: Bad }\nfn main() -> i32 {\n  w := Wrap { x: Bad.A(1) }\n  s := json.encode(w)\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn json_union_field_in_struct_array_roundtrips() {
+    if !backend_available() {
+        return;
+    }
+    // The `messages: array<Message>` shape (the OpenAI chat request) where each element's `content` is
+    // a union — exercises the union field (kind 6) through the array-of-structs decode path (incl. the
+    // Mison speculative path) AND the descriptor-driven array encoder. The first element's content is
+    // an OBJECT-payload variant (a nested object inside a union inside an array element — the hardest
+    // composition); the second is a scalar. Round-trips byte-identically.
+    let src = "import core.json\n\
+        Img { url: str, w: i64 }\n\
+        Content { Text(str), Pic(Img) }\n\
+        Message { role: str, content: Content }\n\
+        Chat { messages: array<Message> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":{\\\"url\\\":\\\"z\\\",\\\"w\\\":9}},{\\\"role\\\":\\\"a\\\",\\\"content\\\":\\\"hi\\\"}]}\")?\n    \
+        print(json.encode(c))\n    print(c.messages.len())\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-union-field-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"messages\":[{\"role\":\"u\",\"content\":{\"url\":\"z\",\"w\":9}},{\"role\":\"a\",\"content\":\"hi\"}]}\n2\n"
+    );
+}

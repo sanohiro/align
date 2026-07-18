@@ -5870,7 +5870,7 @@ fn transpose_to_soa(
 /// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
 fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let soa_ty = Ty::Soa(struct_id);
-    let schema = json_schema_sig(&b.structs, struct_id);
+    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(soa_ty);
     let inp = lower_expr(b, input);
     // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
@@ -7232,13 +7232,13 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 /// would otherwise hide (a field RENAME at the same slot, or a NESTED struct's field change; the
 /// stale-cache bug class of #514/#517). The struct graph is acyclic (`struct_acyclic`), so the
 /// recursion terminates; a `visiting` guard is defense in depth against a mis-built graph.
-fn json_schema_sig(structs: &[hir::StructDef], struct_id: u32) -> String {
+fn json_schema_sig(structs: &[hir::StructDef], enums: &[hir::EnumDef], struct_id: u32) -> String {
     let mut s = String::new();
-    json_schema_sig_into(structs, struct_id, &mut Vec::new(), &mut s);
+    json_schema_sig_into(structs, enums, struct_id, &mut Vec::new(), &mut s);
     s
 }
 
-fn json_schema_sig_into(structs: &[hir::StructDef], struct_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
+fn json_schema_sig_into(structs: &[hir::StructDef], enums: &[hir::EnumDef], struct_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
     if visiting.contains(&struct_id) {
         out.push_str("<cycle>");
         return;
@@ -7259,7 +7259,11 @@ fn json_schema_sig_into(structs: &[hir::StructDef], struct_id: u32, visiting: &m
         out.push_str(&f.name);
         out.push(':');
         match f.ty {
-            Ty::Struct(nid) => json_schema_sig_into(structs, nid, visiting, out),
+            Ty::Struct(nid) => json_schema_sig_into(structs, enums, nid, visiting, out),
+            // A union (`enum`) field (J1b-2b): expand its variant payloads so a change to the union's
+            // shape invalidates the enclosing struct's decode/encode cache (the #514/#517 class). Pass
+            // the shared `visiting` so a struct→union→struct cycle terminates (sema rejects it anyway).
+            Ty::Enum(eid) => json_union_schema_sig_into(enums, structs, eid, visiting, out),
             other => out.push_str(&ty_name(other)),
         }
     }
@@ -7274,24 +7278,34 @@ fn json_schema_sig_into(structs: &[hir::StructDef], struct_id: u32, visiting: &m
 /// codegen cache key) tracks any change to a variant name, order, or payload type — none of which
 /// alters this function's other MIR (the stale-cache bug class of #514/#517).
 fn json_union_schema_sig(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32) -> String {
-    let mut s = String::from("U{");
+    let mut s = String::new();
+    json_union_schema_sig_into(enums, structs, enum_id, &mut Vec::new(), &mut s);
+    s
+}
+
+/// The cycle-safe worker: `visiting` is the shared struct-id DFS path, threaded through object-payload
+/// expansion so a union whose object payload (transitively) contains the same struct terminates
+/// (`<cycle>`) instead of recursing forever. Such a type is rejected by sema's enum-aware
+/// `struct_acyclic`, so this is defense-in-depth, matching [`json_schema_sig_into`].
+fn json_union_schema_sig_into(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
+    out.push_str("U{");
     if let Some(ed) = enums.get(enum_id as usize) {
         for (i, v) in ed.variants.iter().enumerate() {
             if i > 0 {
-                s.push(',');
+                out.push(',');
             }
-            s.push_str(&v.name);
-            s.push(':');
-            // A union variant carries exactly one payload (sema-checked); expand a struct payload.
+            out.push_str(&v.name);
+            out.push(':');
+            // A union variant carries exactly one payload (sema-checked); expand a struct payload
+            // through the shared `visiting` set so a cycle terminates.
             match v.payload.first() {
-                Some(align_sema::Scalar::Struct(nid)) => json_schema_sig_into(structs, *nid, &mut Vec::new(), &mut s),
-                Some(sc) => s.push_str(&ty_name(align_sema::scalar_to_ty(*sc))),
-                None => s.push_str("()"),
+                Some(align_sema::Scalar::Struct(nid)) => json_schema_sig_into(structs, enums, *nid, visiting, out),
+                Some(sc) => out.push_str(&ty_name(align_sema::scalar_to_ty(*sc))),
+                None => out.push_str("()"),
             }
         }
     }
-    s.push('}');
-    s
+    out.push('}');
 }
 
 /// `json.decode(input)` into a shape-directed union (`enum`) target → decode one value into an out
@@ -7338,7 +7352,7 @@ fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, res
 
 fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let sty = Ty::Struct(struct_id);
-    let schema = json_schema_sig(&b.structs, struct_id);
+    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(sty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
@@ -8778,7 +8792,7 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 /// `Drop`-frees it), while its elements' `str` fields remain views into the input.
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
-    let schema = json_schema_sig(&b.structs, struct_id);
+    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());

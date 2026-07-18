@@ -8253,7 +8253,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // which the runtime uses to decode the JSON array into an owned AoS. The nested `str`
             // element fields stay borrowed views into the input.
             Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)),
-            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct/array<struct> (sema-checked)"),
+            // A shape-directed union (`enum`) field (kind 6, JSON completeness J1b-2b): `sub` is a
+            // `JsonUnion` (not a `JsonSubTable`) — the runtime `field_width`/`write_value`/encode arms
+            // reinterpret it by the kind. The width byte is unused (the size comes from
+            // `JsonUnion.store_size`, like a nested struct's kind-4 `sub.store_size`).
+            Ty::Enum(eid) => (6 << 8, self.emit_json_union(eid)),
+            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct/array<struct>/enum-union (sema-checked)"),
         }
     }
 

@@ -15381,10 +15381,19 @@ impl<'a, 't> Checker<'a, 't> {
                         return false;
                     }
                 }
+                // A shape-directed union (`enum`) field (J1b-2b): the `Message { content: Content }`
+                // shape. The enum must be union-decodable (pairwise-distinct shape classes); an object
+                // payload's struct is validated recursively by `check_union_decodable`.
+                Ty::Enum(eid) => {
+                    if !self.check_union_decodable(eid, span) {
+                        stack.pop();
+                        return false;
+                    }
+                }
                 _ => {
                     self.diags.error(
                         format!(
-                            "'json.decode' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct> decode for now)",
+                            "'json.decode' field '{}' has type {} (int/float/bool/str/nested-struct/Option/array<struct>/enum-union decode for now)",
                             f.name,
                             ty_name(f.ty)
                         ),
@@ -15538,6 +15547,17 @@ impl<'a, 't> Checker<'a, 't> {
                 // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
                 // encoder (dynamic length → a runtime loop, not a static unroll).
                 parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
+            } else if let Ty::Enum(eid) = f.ty {
+                // A shape-directed union (`enum`) field (J1b-2b): emit the live variant's payload bare
+                // after the `"name":` prefix already pushed above — the value-side dual of the union
+                // decode field. The enum must be union-decodable (also validated at the decode side);
+                // check here too so encode-only use can't reach codegen's `emit_json_union` on a
+                // non-union enum (which would panic on a 0-/multi-payload variant).
+                if !self.check_union_decodable(eid, span) {
+                    *ok = false;
+                } else {
+                    parts.push(TemplatePart::UnionValue { access: access(f.ty), enum_id: eid });
+                }
             } else {
                 match f.ty {
                     Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
