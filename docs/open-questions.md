@@ -3728,11 +3728,20 @@ supported-constructor compositions (`array<Option<T>>` etc.). Rule: any composit
 constructors closes; the v1 non-owned boundaries stay explicit (`array<string>` waits for
 owned-element drop).
 
-**Slices:** **J1** enum `str` payloads (region) + shape-directed union decode/encode over
-str/number/bool/object payloads → **J2** enum owned payloads (`array<Struct>`, drop) → full
-`Content` union → **the gateway is closed** → **J3** matrix fill (T1b) → **J4** `json.doc` →
-**J5** `json.scan` → **J6** spec sync sweep (draft §14 two-tier framing done at design time;
-per-slice updates as they land). Each slice ships ideal-form or defers per CLAUDE.md.
+**Slices:** **J1a — SHIPPED: enum `str` payloads with region tracking** (the design's "region
+tracking pending" prerequisite). `enum_payload_ok` / pass 0c admit a `str` view and a `str`-bearing
+plain-data (non-Move) struct payload; the enum is region-tracked iff any variant payload is —
+`tracks_region` / `region_of(EnumValue)` / `ty_may_borrow` grew precise `Ty::Enum` arms (the enums
+table is now threaded into `EscapeCheck` / `MoveCheck` / the MIR `Builder`, and `ty_may_borrow`
+takes it as a param). A scalar-only enum stays Copy / freely returnable; a `str`-bearing enum
+cannot escape the region backing its view (construction, match-result, and match-binding escapes
+all caught). Never Move (a `str` borrows) — owned payloads are J2. Tests: `enum_match.rs` (J1
+section). **J1b (next): shape-directed union decode/encode** over str/number/bool/object payloads
+(the descriptor's shape-class table + first-byte dispatch; enum as a struct field / decode target).
+→ **J2** enum owned payloads (`array<Struct>`, drop) → full `Content` union → **the gateway is
+closed** → **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
+sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
+ships ideal-form or defers per CLAUDE.md.
 
 ### Details (settled during implementation)
 ```text

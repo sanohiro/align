@@ -199,9 +199,11 @@ fn struct_variant_payload() {
 }
 
 #[test]
-fn str_field_struct_payload_rejected() {
-    // A region-tracked struct (a `str` field) as a variant payload needs enum region-tracking — deferred.
-    assert!(check_errs("str-struct-payload", "Name { s: str }\nTag { Named(Name) }\nfn main() -> i32 { return 0 }\n"));
+fn str_field_struct_payload_accepted() {
+    // J1 lifted the old restriction: a `str`-bearing plain-data struct is now a legal variant
+    // payload (the enum tracks its region — see `enum_str_bearing_struct_payload`). An OWNED (Move)
+    // struct payload stays rejected (that is J2), covered by `non_primitive_payload_rejected`.
+    assert!(!check_errs("str-struct-payload", "Name { s: str }\nTag { Named(Name) }\nfn main() -> i32 { return 0 }\n"));
 }
 
 #[test]
@@ -336,5 +338,101 @@ fn duplicate_arm_rejected() {
     assert!(check_errs(
         "enum-duparm",
         "Color { Red, Green }\nfn main() -> i32 {\n  c := Color.Red\n  return match c { Red => 1, Red => 2, Green => 3 }\n}\n"
+    ));
+}
+
+// ---- J1: enum `str` payloads (region tracking) --------------------------------------------------
+
+#[test]
+fn enum_str_payload_construct_and_match() {
+    if !backend_available() {
+        return;
+    }
+    // A sum type may carry a `str`-view payload (J1). Construct, match, and use the bound `str`.
+    let src = "Content { Text(str), Count(i64) }\n\
+        fn main() -> i32 {\n  \
+        a := Content.Text(\"hello\")\n  \
+        b := Content.Count(42)\n  \
+        n := match a {\n    Text(s) => s.len()\n    Count(k) => k\n  }\n  \
+        m := match b {\n    Text(s) => s.len()\n    Count(k) => k\n  }\n  \
+        return (n + m) as i32\n}\n";
+    let out = build_and_run("enum-str-payload", src);
+    assert_eq!(out.status.code(), Some(47)); // len("hello") 5 + 42
+}
+
+#[test]
+fn enum_str_bearing_struct_payload() {
+    if !backend_available() {
+        return;
+    }
+    // A `str`-bearing plain-data struct is now a legal payload (J1: the enum tracks its region).
+    let src = "Part { role: str, order: i64 }\n\
+        Msg { One(Part), Empty(bool) }\n\
+        fn main() -> i32 {\n  \
+        m := Msg.One(Part{role: \"user\", order: 3})\n  \
+        return match m {\n    One(p) => p.order as i32\n    Empty(b) => 0\n  }\n}\n";
+    let out = build_and_run("enum-str-struct-payload", src);
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn enum_str_payload_cannot_escape_arena() {
+    // J1 soundness: a sum type holding an arena `str` view is region-tracked, so it cannot escape
+    // the arena that backs the view (else the match binding would be a use-after-free).
+    assert!(check_errs(
+        "enum-str-escape",
+        "Content { Text(str), Count(i64) }\n\
+         fn main() -> Result<(), Error> {\n  \
+         x := 7\n  \
+         c := arena {\n    s := template \"hi {x}\"\n    Content.Text(s)\n  }\n  \
+         return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn scalar_only_enum_still_returnable() {
+    if !backend_available() {
+        return;
+    }
+    // A scalar-only sum type is NOT region-tracked — it stays freely returnable across boundaries
+    // (the J1 region change must not over-restrict plain enums).
+    let src = "Tag { A(i64), B(bool) }\n\
+        fn make() -> Tag = Tag.A(5)\n\
+        fn main() -> i32 {\n  \
+        return match make() {\n    A(n) => n as i32\n    B(b) => 0\n  }\n}\n";
+    let out = build_and_run("enum-scalar-returnable", src);
+    assert_eq!(out.status.code(), Some(5));
+}
+
+#[test]
+fn plain_struct_payload_enum_returnable() {
+    if !backend_available() {
+        return;
+    }
+    // Precision (the J1 region change must not over-restrict): a plain-data (no-`str`) struct
+    // payload borrows nothing, so its enum is `region_of` Static and freely returnable across a
+    // function boundary, even though `tracks_region(Struct)` is conservatively true.
+    let src = "Point { x: i64, y: i64 }\n\
+        Shape { P(Point), Empty(bool) }\n\
+        fn make() -> Shape = Shape.P(Point{x: 3, y: 4})\n\
+        fn main() -> i32 {\n  \
+        return match make() {\n    P(p) => (p.x + p.y) as i32\n    Empty(b) => 0\n  }\n}\n";
+    let out = build_and_run("enum-plain-struct-returnable", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn str_bearing_struct_payload_cannot_escape() {
+    // Soundness through a struct payload: a `str`-bearing struct payload's inner view cannot escape
+    // the arena backing it (the match binding `q.role` is region-tied to the enum's region).
+    assert!(check_errs(
+        "enum-str-struct-escape",
+        "Part { role: str }\n\
+         Msg { One(Part), Empty(bool) }\n\
+         fn main() -> Result<(), Error> {\n  \
+         x := 1\n  \
+         r := arena {\n    p := Part{role: template \"u{x}\"}\n    m := Msg.One(p)\n    \
+         match m {\n      One(q) => q.role\n      Empty(b) => \"x\"\n    }\n  }\n  \
+         return Ok(())\n}\n"
     ));
 }
