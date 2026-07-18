@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY SLICE A SHIPPED — nested-struct JSON
+_Last updated: 2026-07-18, **REST-GATEWAY RUNWAY SLICE B SHIPPED — `Option<T>` struct fields +
+optional decode/encode, MERGED as #528** (`a45ea5d`; owner chose "implement encode now"). A struct
+field may now be `Option<T>` (payload scalar / `str` / nested struct), decoded + encoded with the
+settled **null policy**: missing key → None, JSON `null` → None, type mismatch → Err, required field
+still Errs when missing; **encode omits a None field entirely** (never `"k":null`), so
+`decode(encode(x))` round-trips. Language: `is_field_ok` admits `Option<T>`; sema `ty_size_align` ↔
+codegen `option_struct_type` agree on `{i8 tag, payload}` (layout_parity extended, every payload kind
++ reorder + layout(C)); `struct_acyclic`/`struct_has_str`/`tracks_region`/`ty_may_borrow` recurse
+through Options. **v1 boundary: Option payload must be NON-OWNED** (`Option<string>`/`Option<Move-struct>`
+rejected at declaration — owned-Option-drop-as-a-field has no consumer, and table-free
+`Scalar::Struct.is_move()` would else mis-classify+leak; zero owned-drop surface, covers the whole
+json consumer). Decode: `JsonField` gains `opt_tag` (-1=required, else Option tag byte offset), optional
+fields exempt from `all_required_seen`, single-sourced `write_value` shared by slow+Mison paths. Encode:
+an Option-bearing object uses a trailing-comma layout + one `align_rt_builder_pop_comma` before `}`
+(`{"a":1}`/`{}`), via new `TemplatePart::OptionField`/`PopComma` swept through every HIR-template
+analysis pass; pure-required objects keep the static layout (zero regression). **One recorded follow-up:
+`Option<struct>` ENCODE** (decode supports it). `/align-self-review` + `/code-review` high (0
+correctness findings; 1 test-coverage gap — nested×Option compose — pinned) both run. Tests: m5 (null
+policy, Option<Struct> array via Mison, omit-None encode, round-trip, nested×Option compose),
+layout_parity Option cases. Docs: open-questions runway (Slice B shipped) **+ the owner-directed
+JSON-completeness plan** (after Slice C: close enum/union payloads = finishes the gateway, then settle
+JsonValue/map + streaming/validate — so no "this JSON shape works, that one doesn't" gap persists),
+json.md (+ja), draft §14, language-spec. clippy clean; fuzz_differential (10) + encode/json suites
+green (macOS-sandbox network/fd + gate7 UUID flake fail on pristine main too). **Next: REST-gateway
+runway Slice C (`array<T>` struct fields — the `messages: array<Message>`/`choices: array<Choice>`
+shape), then the JSON-completeness push (enum/union payloads → JsonValue/map → streaming/validate).**
+`LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config` is also needed for codegen build.rs on this Mac
+(added to the macos-build-env memory). Previous update: 2026-07-18, **REST-GATEWAY RUNWAY SLICE A SHIPPED — nested-struct JSON
 decode/encode, MERGED as #527** (`993faac`; owner-directed "次の予定" = the filed runway). A
 `json.decode`/`json.encode` struct field may now itself be a `Struct`: decode recurses (runtime
 kind-4 `JsonSubTable` pointer; `parse_object` slow path AND `write_field_indexed` Mison speculative
