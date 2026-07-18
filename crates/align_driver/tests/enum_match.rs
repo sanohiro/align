@@ -701,3 +701,19 @@ fn nested_array_and_soa_enum_payload_rejected_not_panic() {
         "E { V(array<array<i64>>), Z }\nfn main() -> i32 = 0\n"
     ));
 }
+
+#[test]
+fn owned_enum_payload_moves_out_of_match_as_return() {
+    if !backend_available() {
+        return;
+    }
+    // The strongest binding case: the bound owned `array` is moved OUT of the match arm as the
+    // function's return value (ownership transfer across a boundary). The scrutinee is nulled, the
+    // caller's returned array owns the buffer and frees it once — a clean run + correct sum proves it.
+    let src = "Content { Text(str), Nums(array<i64>) }\n\
+        fn extract(c: Content) -> array<i64> = match c {\n  Nums(ns) => ns\n  Text(t)  => [0].to_array()\n}\n\
+        fn main() -> i32 {\n  \
+        xs := extract(Content.Nums([7, 8, 9].to_array()))\n  return xs.sum() as i32\n}\n";
+    let out = build_and_run("enum-bind-moveout", src);
+    assert_eq!(out.status.code(), Some(24)); // 7 + 8 + 9
+}
