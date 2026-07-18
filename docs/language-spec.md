@@ -310,7 +310,12 @@ A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips; the element struct must be non-owned in v1. `soa<T>` columns
-stay primitive/`str`. See `draft.md` §9, §14.
+stay primitive/`str`. The settled completeness design (draft §14): a JSON `oneOf` maps to a sum
+type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1) dispatch, encode
+writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
+`json.doc` view (no serde-style value tree, no map type); `json.scan` streams typed rows as a
+pipeline source. The core.json surface is exactly `decode`/`encode`/`doc`/`scan` — `validate<T>`,
+`token`, and `field_table<T>` are deleted. See `draft.md` §9, §14, §18.1.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no
@@ -350,16 +355,17 @@ build a string); the one way is a `builder`. (`draft.md` §7/§12.)
 ### JSON
 
 ```text
-json.scan
 json.decode
 json.encode
-json.validate<T>
+json.doc
+json.scan
 ```
 
 `decode`/`encode` take no written type argument — the target type comes from
 context (`u: User := json.decode(d)?`) or the value argument; Align has no
-expression-position type-argument syntax (no turbofish). `validate<T>` is the
-residual schema-selector case (type in neither args nor result), still open.
+expression-position type-argument syntax (no turbofish); `scan`'s row type comes
+from the binding annotation the same way. This is the complete surface —
+`validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
 
 ### Templates
 

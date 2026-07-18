@@ -487,6 +487,27 @@ error, and surfacing it as a value beats a silent partial decode — "nothing hi
 intended contract; the current decoder's speculative fast-path has one known narrow deviation, tracked
 as a pre-freeze gap in `open-questions.md`. (Settled 2026-06-29.)
 
+**Completeness has three tiers, not one type (settled 2026-07-18).** "Complete JSON" is typed
+decode/encode over the full type matrix (schema known), a lazy `json.doc` view (schema unknown),
+and a `json.scan` streaming source (larger than memory) — each the ideal form for its regime, none
+competing for the same job ("one way" per job). Three deliberate rejections define the shape:
+
+- **No serde-style value tree.** A recursive `JsonValue` heap tree is per-node allocation and
+  pointer-chasing — the exact cost model Align exists to avoid ("nothing hidden", data-oriented) —
+  and would drag recursive enums and a map type into the language. The simdjson-style on-demand
+  view gets the same capability from the machinery Align already has: the SIMD structural index,
+  arenas, and region-tied borrowed views. Objects-as-data (dynamic keys) are covered by ordered
+  member iteration on the view, so **no map type enters the language** for JSON's sake.
+- **Unions discriminate by shape, restricted until deterministic.** A JSON `oneOf` maps to a sum
+  type whose variant payloads occupy pairwise-distinct shape classes (Str/Number/Bool/Object/
+  Array), checked at compile time — so decode is a single-byte O(1) dispatch, no backtracking, no
+  ordering sensitivity ("compiler-friendly by restriction"). `null` is not a class; absence is
+  `Option`'s job everywhere (one absence representation).
+- **The catalog carries no dangling entries.** `validate<T>` (decode-and-discard is validation),
+  `token` (no consumer; doc + scan cover it), and `field_table<T>` (compiler-internal) were
+  deleted rather than left "spec'd but unimplemented" — a catalog entry is a promise, and unkept
+  promises are exactly the "this works, that doesn't" fragmentation the completeness push removes.
+
 ---
 
 ## The safety stance

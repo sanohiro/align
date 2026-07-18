@@ -77,12 +77,27 @@ Pure（パース処理は純粋な計算であり、I/O は発生しない。バ
 
 `region_of(decoded str view) = region_of(input)`、`region_of(soa columns) = enclosing arena`。所有権を持つ（owned な）配列は自由にエスケープできる。デコード済みのビューを、その入力データの寿命を超えてエスケープさせようとした場合は、エスケープの時点でコンパイルエラーとして捕捉される（保持し続けたい場合は `.clone()` でコピーを取り出す必要がある）。
 
-## 仕様先行(未実装)
+## 設計済み・未実装（JSON 完全対応設計、2026-07-18 決着）
 
-- `json.scan`、`json.token`（ストリーミング/SAX 層）、`json.validate<T>`、`json.field_table<T>`（§18.1 のカタログ）— 現在ディスパッチ用のアームは未実装。`<T>` を明示するこれらの機能は、turbofish 構文を持たないという決定済みのルールによって *ブロックされている*。§18.1 でも既に「残るスキーマ選択のユースケースは… `decode` に統合される可能性がある」と記載されている。実装を進める前に、まずは `open-questions.md` でこの方針を決着させること。
-- `json.decode<T>(...)` の呼び出し構文 — これは恒久的にサポートされない（決定済）。型は変数束縛や `?` 演算子の文脈から推論させる形が唯一の手段となる。
-- Option フィールド / `array<T>` フィールド / enum ペイロードをターゲットとするデコード — 現在は検証済みマトリクスに含まれていない。ターゲット文法の拡張は、コードを書く前に設計（フィールドテーブル、null の扱い、言語側のフィールド型対応）を行う必要がある。**ネストされた構造体フィールドは出荷済み（REST-gateway runway, Slice A）。**
-  `open-questions.md` Open →「REST-gateway runway」に残りのスライス計画（Option → array フィールド）、null 方針の提案、言語側のフィールド型前提（現在 `is_field_ok` は `Option<T>`/`array<T>` フィールドを拒否する）を記録している。enum ペイロードのターゲットも同項目で引き続き延期扱い。
+完全な設計は `open-questions.md` →「JSON completeness — DESIGN SETTLED」（実装の source of
+truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
+
+- **union（J1–J2）:** JSON の `oneOf` は sum type に写像し、**shape class**（Str/Number/Bool/
+  Object/Array、pairwise 相異をコンパイル時強制、先頭バイト O(1) ディスパッチ）で判別。encode は
+  生きている variant の payload を裸で書く。言語側の前提: enum の `str` payload（region 追跡）→
+  所有 payload（`array<Struct>`、tag 分岐 drop）。
+- **行列残り（J3）:** top-level scalar ターゲット、`array<scalar>` フィールド、`Option<struct>`
+  encode、サポート済みコンストラクタの合成。
+- **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
+  Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。
+  キーがデータの object は順序付き `key(i)`+`at(i)` で吸収、`elems()` で 1 階層を materialize して
+  pipeline に流す（map 型も serde 式 value 木も導入しない）。
+- **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
+  source 専用。
+
+決着済みの削除（未実装のまま残すのではなくカタログから削除）: `json.validate<T>`（decode して
+捨てるのが validation）、`json.token`（doc + scan で覆う。consumer なし）、`json.field_table<T>`
+（コンパイラ内部）。`json.decode<T>(...)` 呼び出し構文は恒久的に不採用（no turbofish）。
 
 ## Pitfalls
 
