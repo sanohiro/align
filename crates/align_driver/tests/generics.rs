@@ -348,11 +348,16 @@ fn generic_enum_no_payload_variant_uninferable() {
 }
 
 #[test]
-fn generic_enum_invalid_payload_rejected() {
-    // A monomorph payload must satisfy the same rule a non-generic enum enforces: no `str`-field
-    // struct (an enum is neither dropped nor region-tracked) — else use-after-free / leak.
-    let src = "Named { s: str }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Named { s: \"hi\" })\n  return 0\n}\n";
-    assert!(check_errs("gen-enum-badpayload", src));
+fn generic_enum_payload_follows_the_non_generic_rule() {
+    // A monomorph payload must satisfy the same rule a non-generic enum enforces (`enum_payload_ok`).
+    // J1 lifted the old `str`-field-struct restriction — an enum is now region-tracked — so a
+    // `str`-bearing *plain-data* struct payload is ACCEPTED (mirrors `enum_match::str_field_struct_payload_accepted`).
+    let ok = "Named { s: str }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Named { s: \"hi\" })\n  return 0\n}\n";
+    assert!(!check_errs("gen-enum-str-struct-ok", ok));
+    // A **Move** struct payload (owns a `string`) is still rejected — an enum payload is not dropped
+    // recursively, so an owned field would leak (that is J2), and the generic path enforces it too.
+    let bad = "Owned { s: string }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Owned { s: \"hi\".clone() })\n  return 0\n}\n";
+    assert!(check_errs("gen-enum-move-struct-bad", bad));
 }
 
 #[test]
