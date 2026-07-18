@@ -8,7 +8,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-2a SHIPPED — top-level shape-directed union
+_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-2b SHIPPED — shape-directed union as a struct
+field, MERGED as #534**. A struct field may now be a union (`Message { content: Content }`); with the
+earlier slices, the full **`Chat { messages: array<Message> }`** OpenAI chat request round-trips
+byte-identically (union field composes with nested / `Option` / `array<Struct>` fields, incl. an
+object-payload union value inside an array element via the Mison speculative path). A JSON descriptor
+**kind 6** whose `sub` is the `JsonUnion` (reused decode+encode): `field_width`/`write_value` (all
+decode paths) + `json_encode_value` grew a kind-6 arm; `encode_union_at` factored out of the FFI
+entry; `drop_decoded_owned` skips it (non-owned in v1); all `d.sub` casts null-guarded. Codegen
+`json_payload_tag_sub` grew a `Ty::Enum` arm → `(6<<8, emit_json_union)`. Sema
+`decode_struct_fields_ok`/`json_object_parts` grew enum-field arms — BOTH call `check_union_decodable`
+so `emit_json_union` never sees a bad enum (clean sema error on decode AND encode). MIR
+`json_schema_sig_into` expands a union field via cycle-safe `json_union_schema_sig_into` (the union
+schema now appears inside the struct sig, invalidating the cache on a variant change). `/align-self-review`
+(Gate 1 kind-6 sweep across every descriptor-kind dispatch; Gate 6 cycle-safe schema) + `/code-review`
+high (0 findings) both run. Tests: `m5.rs` J1b-2b (field decode/encode, object-payload + Option
+coexist, `array<Message>` with object content, non-union-enum-field rejected on both sides). CI green
+all 3 platforms. **With J1b (1 + 2a + 2b) complete, the only shape the gateway still can't express is
+the multimodal `content: str | array<Part>` union — its `array<Part>` variant needs an enum OWNED
+payload, which is J2.** **NEXT: J2 — enum owned `array<Struct>` payloads + tag-switched drop**
+(enums become Move; `MoveCheck`/`null_moved_source`/`drop_struct_fields` grow enum arms; the union
+descriptor gains an array-shape arm) → the full `Content` union closes the REST gateway → then J3
+matrix fill / J4 `json.doc` / J5 `json.scan` / J6 spec sync. Previous update: 2026-07-18,
+**JSON COMPLETENESS J1b-2a SHIPPED — top-level shape-directed union
 decode/encode, MERGED as #533**. A JSON `oneOf` maps to a sum type discriminated by the value's
 **shape class** — Str (`"`) / Number (digit/`-`) / Bool (`t`/`f`) / Object (`{`), an O(1) first-byte
 dispatch; encode writes the live variant's payload **bare**, so `decode(encode(x))` round-trips.
