@@ -1219,7 +1219,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
         .fns
         .iter()
         .map(|f| {
-            let mut mf = lower_fn(f, &program.tuples, &program.structs, lines.as_ref());
+            let mut mf = lower_fn(f, &program.tuples, &program.structs, &program.enums, lines.as_ref());
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
             // every function `internal` for byte-identity.
             mf.exportable = per_unit && f.exportable;
@@ -1618,6 +1618,8 @@ struct Builder {
     tuples: Vec<hir::TupleDef>,
     /// Struct defs — `to_soa` reads each field's type to scatter it into its column.
     structs: Vec<hir::StructDef>,
+    /// Enum defs — so `ty_may_borrow` sees a `str`-bearing sum type as borrow-carrying (J1).
+    enums: Vec<hir::EnumDef>,
     /// Monotonic id for each `map_into` loop's alias scope (a fresh disjoint `in`/`out`
     /// scope pair per loop). Threaded into [`Rvalue::SliceIndexNoalias`] / [`Stmt::PtrStoreNoalias`]
     /// so codegen tags the source load and the `dst` store of the *same* loop with the same
@@ -1855,6 +1857,7 @@ fn lower_fn(
     f: &hir::Fn,
     tuples: &[hir::TupleDef],
     structs: &[hir::StructDef],
+    enums: &[hir::EnumDef],
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
     let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
@@ -1883,6 +1886,7 @@ fn lower_fn(
         drop_individual_exprs: f.drop_individual_exprs.clone(),
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
+        enums: enums.to_vec(),
         alias_scope: 0,
         loops: Vec::new(),
         ctx: Box::new(BuilderCtx {
@@ -3788,7 +3792,7 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     let v = b.fresh_value(e.ty);
     inherit_borrow_owners(b, v, &ops);
     b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops.clone())));
-    if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples) {
+    if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums) {
         for op in &ops {
             drop_borrow_owners(b, op);
         }
@@ -4312,7 +4316,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         Src::Slot(slot) => b.push(Stmt::Let(v, Rvalue::Index(slot, idx))),
     }
     if let Some(src) = borrowed_src {
-        if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples) {
+        if align_sema::ty_may_borrow(elem_ty, &b.structs, &b.tuples, &b.enums) {
             inherit_borrow_owners(b, v, [&src]);
         } else {
             drop_borrow_owners(b, &src);
@@ -4508,7 +4512,7 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
         leaf
     };
     if let Some(source) = &slice_val {
-        if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples) {
+        if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples, &b.enums) {
             inherit_borrow_owners(b, result, [source]);
         } else {
             drop_borrow_owners(b, source);

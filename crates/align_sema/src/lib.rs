@@ -726,7 +726,7 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
 /// same recursive classification when deciding whether an indexed result retains a synthetic
 /// temporary owner or can release it immediately after a scalar load.
-pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     match ty {
         Ty::Str
         | Ty::Slice(_)
@@ -736,19 +736,24 @@ pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::DictEncoded(..)
         | Ty::DynSliceArray(_)
         | Ty::Fn(_) => true,
-        Ty::Array(s, _) | Ty::DynArray(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+        Ty::Array(s, _) | Ty::DynArray(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id) => structs
             .get(id as usize)
-            .is_some_and(|s| s.fields.iter().any(|f| ty_may_borrow(f.ty, structs, tuples))),
-        Ty::Option(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+            .is_some_and(|s| s.fields.iter().any(|f| ty_may_borrow(f.ty, structs, tuples, enums))),
+        Ty::Option(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
         Ty::Result(ok, err) => {
-            ty_may_borrow(scalar_to_ty(ok), structs, tuples)
-                || ty_may_borrow(scalar_to_ty(err), structs, tuples)
+            ty_may_borrow(scalar_to_ty(ok), structs, tuples, enums)
+                || ty_may_borrow(scalar_to_ty(err), structs, tuples, enums)
         }
         Ty::Tuple(id) => tuples
             .get(id as usize)
-            .is_some_and(|t| t.elems.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples))),
-        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples),
+            .is_some_and(|t| t.elems.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums))),
+        // A sum type may borrow iff a variant payload does (J1: a `str`-view / `str`-bearing-struct
+        // payload — `Content.Text(view)` borrows the view's storage, so its owner must stay live).
+        Ty::Enum(id) => enums
+            .get(id as usize)
+            .is_some_and(|e| e.variants.iter().any(|v| v.payload.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums)))),
+        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
         _ => false,
     }
 }
@@ -2736,17 +2741,18 @@ pub fn check_program_with_effects(
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
                     }
+                    // A `str` view payload (J1): makes the enum region-tracked (see `tracks_region` /
+                    // `region_of` / `ty_may_borrow`), never Move (a `str` borrows, owns nothing).
+                    Ty::Str => payload.push(Scalar::Str),
                     Ty::Struct(id) if struct_is_move(id, &structs) => diags.error(
                         format!("a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)", structs[id as usize].name),
                         t.span(),
                     ),
-                    Ty::Struct(id) if structs[id as usize].fields.iter().all(|f| f.ty != Ty::Str) => {
+                    // A plain-data struct payload — `str`-bearing is now allowed (J1: the enum is
+                    // region-tracked through it). A Move struct is caught above.
+                    Ty::Struct(id) => {
                         payload.push(Scalar::Struct(id));
                     }
-                    Ty::Struct(_) => diags.error(
-                        "a sum-type payload struct may not contain a `str` field yet (region tracking pending)".to_string(),
-                        t.span(),
-                    ),
                     Ty::Error => {}
                     other => diags.error(
                         format!("variant payloads must be a primitive scalar or plain struct for now, got {}", ty_name(other)),
@@ -3297,15 +3303,17 @@ pub fn check_program_with_effects(
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
     // holds a `str` element) while iterating `&mut fns`.
-    let Program { fns, tuples, structs, .. } = &mut program;
+    let Program { fns, tuples, structs, enums, .. } = &mut program;
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
+    let enums: &[hir::EnumDef] = enums;
     for f in fns.iter_mut() {
         MoveCheck {
             f,
             diags,
             tuples,
             structs,
+            enums,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
@@ -3317,6 +3325,7 @@ pub fn check_program_with_effects(
                 diags,
                 tuples,
                 structs,
+                enums,
                 state: EscapeState::default(),
                 drop_region: std::collections::HashMap::new(),
                 drop_individual: std::collections::HashMap::new(),
@@ -4624,6 +4633,9 @@ struct EscapeCheck<'a> {
     tuples: &'a [hir::TupleDef],
     /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
     structs: &'a [StructDef],
+    /// Enum defs (to decide whether a `Ty::Enum` is region-tracked — true iff a variant payload is;
+    /// J1's `str`-view / `str`-bearing-struct payloads).
+    enums: &'a [hir::EnumDef],
     /// Region and local-backed-slice provenance at the current control-flow point.
     state: EscapeState,
     /// Region used to classify each owned local's function-wide cleanup. Unlike `state`, this keeps
@@ -4862,6 +4874,13 @@ impl<'a> EscapeCheck<'a> {
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
             Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
             Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
+            // A sum type is region-tracked iff any variant payload is (J1: a `str`-view or
+            // `str`-bearing-struct payload makes the enum a borrow — `Content.Text(view)` must not
+            // outlive the view; scalar-only enums stay Copy / `Static`, freely returnable).
+            Ty::Enum(id) => self
+                .enums
+                .get(id as usize)
+                .is_some_and(|e| e.variants.iter().any(|v| v.payload.iter().any(|s| self.tracks_region(scalar_to_ty(*s))))),
             // `Task<R>` (④b) is a box in the task_group region — region-tracked like `box<T>`, so
             // a task handle cannot escape its `task_group` scope.
             Ty::Task(_) => true,
@@ -4917,7 +4936,6 @@ impl<'a> EscapeCheck<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
-            | Ty::Enum(_)
             | Ty::Error
             | Ty::Unit => false,
         }
@@ -5187,6 +5205,12 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Tuple { elems, .. } => elems
                 .iter()
                 .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            // A sum-type value lives as long as its shortest-lived payload (J1: `Content.Text(view)`
+            // is bound to `view`'s region — a scalar-only variant folds to `Static`, freely
+            // returnable). Same rule as a tuple / struct literal over its members.
+            ExprKind::EnumValue { payload, .. } => payload
+                .iter()
+                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
             // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
             // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
             ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
@@ -5384,7 +5408,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::IntArith { .. }
             | ExprKind::MathOp { .. }
             | ExprKind::FnValue(..)
-            | ExprKind::EnumValue { .. }
             | ExprKind::Wait
             | ExprKind::OptionNone
             | ExprKind::RawAlloc(..)
@@ -7331,6 +7354,8 @@ struct MoveCheck<'a> {
     /// Struct defs — so a Move struct (one that owns a `string`/owned field, transitively) is
     /// recognised as a Move type for use-after-move tracking (Slice 3).
     structs: &'a [StructDef],
+    /// Enum defs — so a `str`-bearing sum type is recognised as borrow-carrying (`ty_may_borrow`).
+    enums: &'a [hir::EnumDef],
     /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
     /// every `break` bound to that loop; their union is the move state after the loop (code past a
     /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
@@ -7452,7 +7477,7 @@ impl<'a> MoveCheck<'a> {
         self.f
             .locals
             .get(id as usize)
-            .is_some_and(|l| ty_may_borrow(l.ty, self.structs, self.tuples))
+            .is_some_and(|l| ty_may_borrow(l.ty, self.structs, self.tuples, self.enums))
     }
 
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
@@ -7486,7 +7511,7 @@ impl<'a> MoveCheck<'a> {
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
-        if !ty_may_borrow(e.ty, self.structs, self.tuples) {
+        if !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums) {
             return BorrowRoots::new();
         }
         let mut roots = BorrowRoots::new();
@@ -7559,7 +7584,7 @@ impl<'a> MoveCheck<'a> {
                 let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
                     s.fields
                         .iter()
-                        .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples))
+                        .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums))
                 });
                 if borrows_input {
                     self.borrow_sources(input)
@@ -20680,15 +20705,14 @@ fn struct_acyclic(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bo
 }
 
 /// Whether a scalar is a valid sum-type variant payload — the same rule the non-generic enum pass
-/// (0c) enforces on resolved types: a primitive scalar, or a plain-data struct with no `str` field
-/// (an enum is neither dropped nor region-tracked, so Move/`str`-bearing payloads are rejected).
+/// (0c) enforces on resolved types: a primitive scalar, a `str` view (J1: makes the enum
+/// region-tracked, never Move), or a **non-Move** struct (a `str`-bearing plain-data struct is now
+/// allowed — the enum tracks its region). A Move struct (owns a `string`/collection) is still
+/// rejected — an enum payload is not dropped recursively, so an owned field would leak (that is J2).
 fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
     match s {
-        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char => true,
-        // A plain-data struct with no `str` field. A Move struct (owns a `string`/owned field) is
-        // rejected — an enum/Option payload is neither dropped recursively nor move-tracked through a
-        // struct, so an owned field would leak / double-free (Slice 3).
-        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|sd| !struct_is_move(id, structs) && sd.fields.iter().all(|f| f.ty != Ty::Str)),
+        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str => true,
+        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs)),
         _ => false,
     }
 }
