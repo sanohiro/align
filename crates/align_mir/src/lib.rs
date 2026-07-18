@@ -2036,7 +2036,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                         || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs))
                         // A Move enum (owns an `array<Struct>` payload, J2) moved away must be nulled
                         // so its exit tag-switched `Drop` frees null, not the buffer the new owner took.
-                        || matches!(ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums, &b.structs))
+                        || matches!(ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums))
                 }
                 None => false,
             };

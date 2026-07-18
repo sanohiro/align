@@ -788,7 +788,7 @@ fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], e
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
         // A Move enum (owns an `array<Struct>` payload, J2) captured by value into a closure would be
         // copy-captured and double-dropped — reject it like any other owned capture.
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums, structs))
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, or a nested
@@ -815,13 +815,15 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// `Drop` must free the live payload (an owned `array<Struct>`, J2). The `Drop` switches on the tag
 /// and frees exactly the active variant's owned payload (`drop_enum` in codegen). An enum whose every
 /// payload is a scalar / `str` view / non-Move struct owns nothing and stays **Copy** (region-tracked
-/// iff a `str` payload — see `tracks_region` / `region_of`). The `Scalar::Struct` arm is defensive:
-/// pass 0c rejects a Move-struct payload today, but this keeps the classification correct if that is
-/// ever relaxed.
-pub fn enum_is_move(id: u32, enums: &[hir::EnumDef], structs: &[StructDef]) -> bool {
-    enums.get(id as usize).is_some_and(|e| {
-        e.variants.iter().flat_map(|v| v.payload.iter()).any(|&s| s.is_move() || matches!(s, Scalar::Struct(sid) if struct_is_move(sid, structs)))
-    })
+/// iff a `str` payload — see `tracks_region` / `region_of`).
+///
+/// Keyed on `Scalar::is_move()` alone — the SAME predicate `drop_enum` uses to pick which payload
+/// fields to free — so the classifier and the drop stay in lockstep. Pass 0c admits only owned
+/// `array<T>` (a flat-freeable `{ptr,len}`) as a Move payload; a Move *struct* payload is rejected
+/// there (it would need a recursive `drop_struct_fields`, which `drop_enum` does not do), so this
+/// never sees one.
+pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
+    enums.get(id as usize).is_some_and(|e| e.variants.iter().flat_map(|v| v.payload.iter()).any(|s| s.is_move()))
 }
 
 /// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
@@ -1031,7 +1033,7 @@ fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
         // A Move sum type (owns an `array<Struct>` payload, J2).
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums, structs))
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -1128,7 +1130,7 @@ fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> 
         || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs))
         // A Move sum type (owns an `array<Struct>` payload, J2) — its `Drop` switches on the tag and
         // frees the live variant's owned payload (`drop_enum`).
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums, structs))
+        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
@@ -2875,7 +2877,7 @@ pub fn check_program_with_effects(
         // (A non-Move enum field — scalar / `str` / plain-struct payloads — stays allowed, J1b.)
         for f in &structs[i].fields {
             if let Ty::Enum(eid) = f.ty
-                && enum_is_move(eid, &enums, &structs)
+                && enum_is_move(eid, &enums)
             {
                 let span = decl.2.fields.iter().find(|sf| sf.name.name == f.name).map_or(decl.2.span, |sf| sf.span);
                 diags.error(
@@ -11837,8 +11839,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// Move-enum-in-`Option`/`Result` *value*, so no leaking value can survive. Nullable/fallible
     /// owned unions (`Option<Content>`) are a later slice (J3 matrix fill).
     fn reject_move_enum_payload(&mut self, ty: Ty, wrapper: &str, span: Span) {
-        if let Ty::Enum(id) = self.resolve(ty)
-            && enum_is_move(id, self.enums, self.structs)
+        let ty = self.resolve(ty);
+        if let Ty::Enum(id) = ty
+            && enum_is_move(id, self.enums)
         {
             self.diags.error(
                 format!("a Move sum type ({}) cannot be a `{wrapper}` payload yet — a nullable/fallible owned union is a later slice; use the value whole for now", self.ty_display(ty)),
@@ -13086,7 +13089,7 @@ impl<'a, 't> Checker<'a, 't> {
         // droppable `StructArray`, so admitting it would leak each element's buffer. Reject cleanly —
         // a Move enum is used as a single value for now.
         if let Ty::Enum(id) = self.resolve(elem_ty)
-            && enum_is_move(id, self.enums, self.structs)
+            && enum_is_move(id, self.enums)
         {
             self.diags.error(
                 format!("`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value", self.ty_display(elem_ty)),
