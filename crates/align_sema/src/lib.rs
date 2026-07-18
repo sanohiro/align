@@ -2804,20 +2804,18 @@ pub fn check_program_with_effects(
     // Pass 0c-2: enum-field acyclicity. A struct field may now be a sum type (J1b), and an enum embeds
     // its payloads inline, so a cycle can run through it (`Node { c: E }`, `E { V(Node) }`) — an
     // infinite layout, like a direct self-referential struct field. This is checked here (not in pass
-    // 0b-2, which runs before enum payloads are resolved): for every struct field that is an enum,
-    // walk the combined struct+enum graph seeded with the containing struct, so a payload struct that
-    // loops back is reported. `struct_field_span` recovers the field's span for the diagnostic.
+    // 0b-2, which runs before enum payloads are resolved): every struct that has at least one enum
+    // field is walked **once** over the combined struct+enum graph seeded with the containing struct,
+    // so a payload struct that loops back is reported. The span points at the first enum field (the
+    // frontier through which the cycle must pass); it is recovered from the AST decl by field name.
     for (i, decl) in struct_decls.iter().enumerate() {
-        for f in &structs[i].fields {
-            let Ty::Enum(_) = f.ty else { continue };
-            if !struct_acyclic(i as u32, &structs, &enums, &mut Vec::new()) {
-                let span = decl.2.fields.iter().find(|sf| sf.name.name == f.name).map_or(decl.2.span, |sf| sf.span);
-                diags.error(
-                    format!("struct field '{}' is recursive through a sum type — a struct cannot contain itself without a `box` indirection", f.name),
-                    span,
-                );
-                break; // one cycle report per struct is enough
-            }
+        let Some(enum_field) = structs[i].fields.iter().find(|f| matches!(f.ty, Ty::Enum(_))) else { continue };
+        if !struct_acyclic(i as u32, &structs, &enums, &mut Vec::new()) {
+            let span = decl.2.fields.iter().find(|sf| sf.name.name == enum_field.name).map_or(decl.2.span, |sf| sf.span);
+            diags.error(
+                format!("struct field '{}' is recursive through a sum type — a struct cannot contain itself without a `box` indirection", enum_field.name),
+                span,
+            );
         }
     }
 
