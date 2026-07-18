@@ -18937,6 +18937,23 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
         };
+        // A **Move** enum matched through a *nested* struct-field place (`match o.inner.c { … }`, J3)
+        // cannot have its owned payload nulled on a binding move: `null_moved_source` / `NullStructField`
+        // reach only a depth-1 field of a local (`match m.content`) or a bare local, so a deeper path
+        // would leave the enclosing struct's `Drop` freeing the same buffer the arm binding took — a
+        // double-free. Reject the nested-place case cleanly (defer, like a nested `string`-field move);
+        // a bare local and a depth-1 field both null correctly and stay allowed. A binding-less match
+        // (`Or`/`_` patterns only) moves nothing, so it is fine at any depth.
+        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.enums))
+            && matches!(&s.kind, ExprKind::Field { path, .. } if path.len() > 1)
+            && arms.iter().any(|a| matches!(&a.pattern, ast::MatchPattern::Variant { bindings, .. } if !bindings.is_empty()))
+        {
+            self.diags.error(
+                "matching a Move sum type through a nested struct field and binding its payload is not supported yet — bind the field to a local first, or clone".to_string(),
+                scrutinee.span,
+            );
+            return err;
+        }
         let mut covered = vec![false; variants.len()];
         let mut has_wildcard = false;
         let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());

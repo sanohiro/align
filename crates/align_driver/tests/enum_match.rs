@@ -645,6 +645,24 @@ fn move_enum_struct_field_is_move_and_drops_clean() {
 }
 
 #[test]
+fn move_enum_nested_field_match_binding_rejected() {
+    // J3 soundness: matching a Move enum through a NESTED struct-field place (`match o.inner.c`) and
+    // binding its owned payload cannot null the buffer — `null_moved_source` / `NullStructField` reach
+    // only a depth-1 field or a bare local, so a deeper path would double-free (the enclosing struct's
+    // `Drop` frees the same buffer the binding took). Rejected cleanly (defer); a depth-1 field and a
+    // bare local both null correctly and stay allowed (see `move_enum_struct_field_is_move_and_drops_clean`).
+    assert!(check_errs(
+        "enum-nested-movefield-match",
+        "Content { Text(str), Nums(array<i64>) }\n\
+         Inner { c: Content }\n\
+         Outer { inner: Inner }\n\
+         fn main() -> i32 {\n  \
+         o := Outer { inner: Inner { c: Content.Nums([1, 2, 3].to_array()) } }\n  \
+         return match o.inner.c { Text(t) => 0, Nums(ns) => ns.sum() } as i32\n}\n"
+    ));
+}
+
+#[test]
 fn array_string_and_move_struct_enum_payloads_rejected() {
     // The owned-array payload element must be non-owned (one flat free): `array<string>` (a
     // per-element deep free) and `array<Move-struct>` are deferred, rejected cleanly rather than
