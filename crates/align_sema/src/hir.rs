@@ -1464,6 +1464,12 @@ pub enum TemplatePart {
     /// Drop a single trailing `,` from the builder — the "omit `None`" comma fixup, emitted once
     /// before an `Option`-bearing object's closing `}`. Only produced by `json.encode` desugaring.
     PopComma,
+    /// `json.encode` of an **`array<Struct>` field** (REST-gateway runway Slice C): emit the owned AoS
+    /// as a JSON array `[{...},...]` via a runtime loop over the descriptor-driven encoder (a dynamic
+    /// length can't unroll into a static template). `access` is the array field value (`{ptr,len}`);
+    /// `struct_id` is the element struct (its schema drives per-element encoding). Only produced by
+    /// `json.encode` desugaring.
+    StructArrayField { access: Expr, struct_id: u32 },
 }
 
 #[derive(Clone, Debug)]

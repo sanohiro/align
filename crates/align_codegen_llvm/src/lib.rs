@@ -1180,6 +1180,15 @@ fn build_module<'c>(
         module.add_function("align_rt_builder_pop_comma", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        "json_encode_struct_array".to_string(),
+        module.add_function(
+            "align_rt_json_encode_struct_array",
+            // (builder, ptr, len, descs, n_descs, esz) -> void
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_write_int".to_string(),
         module.add_function(
             "align_rt_builder_write_int",
@@ -7882,6 +7891,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropnest").map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
                 }
+                // An owned `array<T>` field (REST-gateway runway Slice C) — free its single heap
+                // buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an empty array). The
+                // element is non-owned (sema pass 0b-2 rejects `array<string>` / `array<Move-struct>`),
+                // so this is one flat free — no per-element deep free — and `array<Struct>`'s `str`
+                // fields are borrowed views into the input, not freed here.
+                Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
+                    let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
+                    let agg = self
+                        .builder
+                        .build_load(slice_struct_type(self.ctx), fp, "droparrv")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "droparrptr").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                }
                 // A nested Move-struct *array* field — drop each element (defensive: struct fields
                 // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
                 // owned case here means a future array-valued field can't silently fail-open and leak).
@@ -8187,7 +8211,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Float(ft) => ((2 << 8) | (ft.bits / 8) as u64, null),
             Ty::Str => ((3 << 8) | 16, null),
             Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)),
-            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct (sema-checked)"),
+            // `array<Struct>` field (kind 5, REST-gateway runway Slice C): width 16 (the field's own
+            // `{ptr,len}` slot); `sub` is the ELEMENT struct's schema (store_size = element stride),
+            // which the runtime uses to decode the JSON array into an owned AoS. The nested `str`
+            // element fields stay borrowed views into the input.
+            Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)),
+            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct/array<struct> (sema-checked)"),
         }
     }
 
@@ -8735,6 +8764,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::PopComma => {
                     self.builder
                         .build_call(self.funcs["builder_pop_comma"], &[bptr.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                // `json.encode` of an `array<Struct>` field: hand the owned AoS `{ptr,len}` and the
+                // element schema (the same descriptor table decode uses) to the runtime encoder, which
+                // loops the elements emitting `[{...},...]` (a dynamic length can't unroll statically).
+                align_mir::TemplatePiece::StructArrayField { array, struct_id } => {
+                    let agg = self.operand(array).into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "sap").map_err(|e| self.err(e))?;
+                    let len = self.builder.build_extract_value(agg, 1, "sal").map_err(|e| self.err(e))?;
+                    let t = self.emit_desc_table(*struct_id);
+                    let n = i64t.const_int(t.n_fields, false);
+                    let esz = i64t.const_int(self.target_data.get_store_size(&self.struct_types[*struct_id as usize]), false);
+                    self.builder
+                        .build_call(
+                            self.funcs["json_encode_struct_array"],
+                            &[bptr.into(), ptr.into(), len.into(), t.descs.into(), n.into(), esz.into()],
+                            "",
+                        )
                         .map_err(|e| self.err(e))?;
                 }
             }
@@ -9523,6 +9570,10 @@ mod tests {
             sdef("Ostruct", false, &[opt(Ty::Struct(2))]),               // { i8, Pair } → (12, 4)
             sdef("OMix", false, &[Ty::Bool, opt(i(64, true)), opt(Ty::Str), i(8, true)]), // reorder
             StructDef { align: None, c_repr: true, ..sdef("OStrC", true, &[Ty::Bool, opt(Ty::Str)]) }, // layout(C) + option
+            // `array<T>` fields (REST-gateway runway Slice C): an owned `{ptr,len}` (16, 8) — pins the
+            // array-field layout dual (a `array<Struct>` / `array<scalar>` field is a heap handle).
+            sdef("ArrStruct", false, &[i(64, true), Ty::DynStructArray(2, Layout::Aos)]), // { i64, {ptr,len} }
+            sdef("ArrScalar", false, &[Ty::Bool, Ty::DynArray(align_sema::Scalar::Int(IntTy { bits: 64, signed: true }))]),
         ];
 
         let ctx = Context::create();

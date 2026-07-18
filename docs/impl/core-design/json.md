@@ -20,13 +20,28 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct / Option<T> fields; field order free; unknown keys ignored)
+//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
 //   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 ```
+
+**`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
+`array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; the full OpenAI
+request/response now round-trips. Decode: a descriptor kind 5 (`sub` = element schema) drives
+`decode_struct_array_value`, which parses the JSON sub-array into an owned AoS (`parse_object` per
+element, so nested/`Option` element fields recurse) and writes `{ptr,len}` to the field; the field
+buffer is freed by the struct's `Drop`. Encode: a `StructArrayField` piece calls the runtime
+descriptor-driven encoder (`json_encode_struct_array` → `json_encode_object`, **reusing the decode
+descriptors** — symmetric, handles nested/Option/str/scalar). **Memory-safety:** on a decode `Err`
+after an array field allocated, `drop_decoded_owned` frees the partial struct's AoS buffers (the
+runtime dual of codegen `drop_struct_fields`). **v1 element restriction:** non-owned (scalar /
+`str`-view / plain-data struct) — `array<string>` / `array<Move-struct>` rejected at declaration.
+**Constraint:** a Move struct (owns an array) can't be a `Result`/`Option` Ok payload across a
+function boundary — decode + use in-scope. Deferred: `array<scalar>` field decode, owned-element
+arrays.
 
 **`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
 scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →

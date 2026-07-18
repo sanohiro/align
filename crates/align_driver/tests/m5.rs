@@ -402,6 +402,73 @@ fn json_encode_nested_struct_and_option_compose() {
 }
 
 #[test]
+fn json_array_struct_field_decode_read_and_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // REST-gateway runway Slice C: an `array<Struct>` field — the `messages: array<Message>` request
+    // shape. Decode into an owned AoS in the field, read elements, and re-encode byte-identically.
+    let json = r#"{"model":"gpt","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}"#;
+    // NB: a Move struct (owns the array buffer) can't be a `Result` Ok payload that crosses a
+    // function boundary (a pre-existing restriction), so decode + use it in the same scope.
+    let src = format!(
+        "import core.json\n\
+         Msg {{ role: str, content: str }}\n\
+         Req {{ model: str, messages: array<Msg> }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  \
+         r: Req := json.decode(s)?\n  \
+         print(r.messages.len())\n  \
+         print(r.messages[0].role)\n  print(r.messages[1].content)\n  \
+         print(json.encode(r))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-array-field", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("2\nuser\nyo\n{json}\n"));
+}
+
+#[test]
+fn json_full_openai_response_shape_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // The complete chat-completions response: `array<Choice>` (each Choice has a nested Message)
+    // plus a nested Usage — Slices A + B + C composed. `decode → encode` round-trips.
+    let json = r#"{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":8,"completion_tokens":2}}"#;
+    let src = format!(
+        "import core.json\n\
+         Usage {{ prompt_tokens: i64, completion_tokens: i64 }}\n\
+         Message {{ role: str, content: str }}\n\
+         Choice {{ index: i64, message: Message }}\n\
+         Response {{ id: str, choices: array<Choice>, usage: Usage }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  r: Response := json.decode(s)?\n  print(json.encode(r))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-openai-response", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{json}\n"));
+}
+
+#[test]
+fn json_empty_array_struct_field() {
+    if !backend_available() {
+        return;
+    }
+    // An empty `array<Struct>` field decodes to len 0 (null buffer, no allocation) and encodes `[]`.
+    let json = r#"{"model":"m","messages":[]}"#;
+    let src = format!(
+        "import core.json\n\
+         Msg {{ role: str }}\n\
+         Req {{ model: str, messages: array<Msg> }}\n\
+         fn main() -> Result<(), Error> {{\n  \
+         s := {json:?}\n  r: Req := json.decode(s)?\n  print(r.messages.len())\n  print(json.encode(r))\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-empty-array-field", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("0\n{json}\n"));
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;

@@ -16,13 +16,26 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct / Option<T> fields; field order free; unknown keys ignored)
+//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
 //   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 ```
+
+**`array<Struct>` フィールド（REST-gateway runway, Slice C）。** 構造体フィールドは所有の `array<Struct>`
+であってよい — `messages: array<Message>` / `choices: array<Choice>` shape。フル OpenAI リクエスト/
+レスポンスがラウンドトリップする。decode: descriptor kind 5（`sub` = 要素スキーマ）が
+`decode_struct_array_value` を駆動し、JSON サブ配列を所有 AoS にパース（要素ごとに `parse_object`、
+nested/`Option` 要素フィールドも再帰）して `{ptr,len}` をフィールドに書く。バッファは構造体の `Drop` で解放。
+encode: `StructArrayField` ピースが runtime の descriptor 駆動エンコーダ（`json_encode_struct_array` →
+`json_encode_object`、**decode descriptor を再利用** — 対称的で nested/Option/str/scalar を扱う）を呼ぶ。
+**memory-safety:** array フィールド確保後に decode が `Err` になった場合、`drop_decoded_owned` が部分構造体の
+AoS バッファを解放（codegen `drop_struct_fields` の runtime 双対）。**v1 要素制限:** 非所有（scalar /
+`str` view / plain-data struct）— `array<string>` / `array<Move-struct>` は宣言時に拒否。**制約:** Move
+構造体（array を所有）は関数境界を越える `Result`/`Option` Ok payload になれない — スコープ内で decode +
+使用する。延期: `array<scalar>` フィールド decode、所有要素配列。
 
 **`Option<T>` フィールド（REST-gateway runway, Slice B）。** 構造体フィールドは `Option<T>`（payload は
 scalar / `str` / ネスト構造体）であってよい。**null ポリシー:** decode はキー欠落→`None`、JSON `null`→

@@ -414,6 +414,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
                     crate::TemplatePiece::PopComma => "pop_comma".to_string(),
+                    crate::TemplatePiece::StructArrayField { array, struct_id } => format!("struct_array_field(struct#{struct_id}, {})", operand_str(array)),
                 })
                 .collect();
             format!("template[{}]", ps.join(", "))

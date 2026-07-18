@@ -1792,6 +1792,192 @@ pub unsafe extern "C" fn align_rt_builder_pop_comma(b: *mut Builder) {
     }
 }
 
+/// Append an unsigned integer's decimal digits (the encode dual of the `u64`-range decode; a `u64`
+/// field can exceed `i64::MAX`, which [`builder_push_i64`] can't represent).
+fn builder_push_u64(buf: &mut BuilderBuf, v: u64) {
+    if v <= i64::MAX as u64 {
+        builder_push_i64(buf, v as i64);
+        return;
+    }
+    let mut tmp = [0u8; 20]; // widest u64 = 20 digits
+    let mut i = tmp.len();
+    let mut n = v;
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// Read a little-endian integer of `w` (1/2/4/8) bytes at `ptr` as a zero-extended `u64`.
+///
+/// # Safety
+/// `ptr` must be valid for `w` bytes (`w <= 8`).
+#[inline]
+unsafe fn read_le_uint(ptr: *const u8, w: usize) -> u64 {
+    let mut b = [0u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(ptr, b.as_mut_ptr(), w.min(8)) };
+    u64::from_le_bytes(b)
+}
+
+/// Encode a decoded struct at `base` back to a JSON object `{...}` into the builder `b`, per its
+/// field `descs` — the runtime dual of decode's [`parse_object`], used by `json.encode` for the
+/// element objects of an `array<Struct>` field (and, recursively, nested-struct / array / str /
+/// scalar fields). A `None` `Option` field (tag 0) is **omitted** entirely (the settled policy);
+/// field names are identifiers, so the key needs no escaping (only `str` *values* are escaped).
+///
+/// # Safety
+/// `base`/`descs` must describe the struct actually encoded; each nested `sub` must be valid.
+unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonField]) {
+    b.buf.push(b'{');
+    let mut wrote = false;
+    for d in descs {
+        let kind = (d.tag >> 8) & 0xff;
+        // An optional field with a `None` tag (0) is omitted.
+        if d.opt_tag >= 0 {
+            let tag_byte = unsafe { *base.add(d.opt_tag as usize) };
+            if tag_byte == 0 {
+                continue;
+            }
+        }
+        if wrote {
+            b.buf.push(b',');
+        }
+        wrote = true;
+        b.buf.push(b'"');
+        b.buf.extend_from_slice(unsafe { field_name(d) });
+        b.buf.extend_from_slice(b"\":");
+        if d.offset < 0 {
+            b.buf.extend_from_slice(b"null"); // defensive: a mis-built descriptor
+            continue;
+        }
+        let fp = unsafe { base.add(d.offset as usize) };
+        match kind {
+            1 => b.buf.extend_from_slice(if unsafe { *fp } != 0 { &b"true"[..] } else { &b"false"[..] }),
+            2 => {
+                let w = (d.tag & 0xff) as usize;
+                if w == 4 {
+                    let mut bytes = [0u8; 4];
+                    unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 4) };
+                    push_float(&mut b.buf, f32::from_le_bytes(bytes));
+                } else {
+                    let mut bytes = [0u8; 8];
+                    unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 8) };
+                    push_float(&mut b.buf, f64::from_le_bytes(bytes));
+                }
+            }
+            3 => {
+                // `str` field `{ptr,len}` → quoted + escaped.
+                let mut pb = [0u8; 8];
+                let mut lb = [0u8; 8];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(fp, pb.as_mut_ptr(), 8);
+                    core::ptr::copy_nonoverlapping(fp.add(8), lb.as_mut_ptr(), 8);
+                }
+                let sptr = usize::from_le_bytes(pb) as *const u8;
+                let slen = i64::from_le_bytes(lb);
+                b.buf.push(b'"');
+                if slen > 0 && !sptr.is_null() {
+                    write_json_str_body(&mut b.buf, unsafe { safe_slice(sptr, slen) });
+                }
+                b.buf.push(b'"');
+            }
+            4 => {
+                if d.sub.is_null() {
+                    b.buf.extend_from_slice(b"null");
+                } else {
+                    let sub = unsafe { &*d.sub };
+                    let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+                    unsafe { json_encode_object(b, fp, sub_descs) };
+                }
+            }
+            5 => unsafe { json_encode_struct_array_at(b, fp, d.sub) },
+            _ => {
+                // Integer: read per (width, sign).
+                let w = (d.tag & 0xff) as usize;
+                let signed = (d.tag & 0x1_0000) != 0;
+                let raw = unsafe { read_le_uint(fp, w) };
+                if signed {
+                    // Sign-extend the `w`-byte value to i64.
+                    let shift = 64 - (w as u32) * 8;
+                    let v = ((raw as i64) << shift) >> shift;
+                    builder_push_i64(&mut b.buf, v);
+                } else {
+                    builder_push_u64(&mut b.buf, raw);
+                }
+            }
+        }
+    }
+    b.buf.push(b'}');
+}
+
+/// Encode an owned `array<Struct>`'s `{ptr,len}` slot (at `slot`) into `[...]` — the element schema
+/// is `sub` (its `store_size` = element stride). Used by `json.encode` for an `array<Struct>` field.
+///
+/// # Safety
+/// `slot` must point to a `{ptr,len}` (16 bytes); `sub` must be a valid element [`JsonSubTable`].
+unsafe fn json_encode_struct_array_at(b: &mut Builder, slot: *const u8, sub: *const JsonSubTable) {
+    if sub.is_null() {
+        b.buf.extend_from_slice(b"null");
+        return;
+    }
+    let mut pb = [0u8; 8];
+    let mut lb = [0u8; 8];
+    unsafe {
+        core::ptr::copy_nonoverlapping(slot, pb.as_mut_ptr(), 8);
+        core::ptr::copy_nonoverlapping(slot.add(8), lb.as_mut_ptr(), 8);
+    }
+    let ptr = usize::from_le_bytes(pb) as *const u8;
+    let len = i64::from_le_bytes(lb).max(0);
+    let sub = unsafe { &*sub };
+    let esz = sub.store_size.max(0) as usize;
+    let descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+    b.buf.push(b'[');
+    for i in 0..len as usize {
+        if i > 0 {
+            b.buf.push(b',');
+        }
+        let eptr = unsafe { ptr.add(i * esz) };
+        unsafe { json_encode_object(b, eptr, descs) };
+    }
+    b.buf.push(b']');
+}
+
+/// `json.encode` of an `array<Struct>` field: encode the owned AoS at `(ptr, len)` into the builder
+/// as a JSON array `[{...},...]`, per the element schema `descs` (stride `esz`). Called by codegen
+/// for the `StructArrayField` template piece.
+///
+/// # Safety
+/// `b` must be a valid `Builder`; `(ptr, len)` an owned AoS of `len` `esz`-byte elements; `descs` the
+/// element schema.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_encode_struct_array(
+    b: *mut Builder,
+    ptr: *const u8,
+    len: i64,
+    descs: *const JsonField,
+    n_descs: i64,
+    esz: i64,
+) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let descs = unsafe { safe_slice(descs, n_descs) };
+    let len = len.max(0);
+    let esz = esz.max(0) as usize;
+    b.buf.push(b'[');
+    for i in 0..len as usize {
+        if i > 0 {
+            b.buf.push(b',');
+        }
+        let eptr = unsafe { ptr.add(i * esz) };
+        unsafe { json_encode_object(b, eptr, descs) };
+    }
+    b.buf.push(b']');
+}
+
 fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
     if (-999..=999).contains(&v) {
         // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,
@@ -2347,6 +2533,15 @@ impl SeenSet {
         }
     }
 
+    /// Whether field `i` has been marked (for the decode error-cleanup path — free only the owned
+    /// fields actually written into the partial struct).
+    fn is_set(&self, i: usize) -> bool {
+        match self {
+            SeenSet::Mask(m) => i < 64 && (m & (1u64 << i)) != 0,
+            SeenSet::Big(v) => v.get(i).copied().unwrap_or(false),
+        }
+    }
+
     /// Whether every **required** declared field has been marked. An `Option` field (`opt_tag >= 0`)
     /// is optional — a missing key leaves it `None`, so it is not required to be present. A required
     /// field that never appears makes the object malformed (the strict exactly-once contract).
@@ -2427,6 +2622,107 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
     unsafe { parse_object(p, descs, dst, sub.store_size, phf, sub.phf_seed as u64) }
 }
 
+/// Decode a JSON array-of-objects **value** at `p` (an `array<Struct>` field, REST-gateway runway
+/// Slice C) into a freshly heap-allocated owned AoS, returning its `{ptr, len}` (len = element
+/// count). Each element decodes via [`parse_object`] per the element `sub`-schema — so nested-struct
+/// / `Option` element fields recurse — into an `esz`-byte slot; `str` element fields stay zero-copy
+/// views into the input, so the array borrows the input (the parent struct is region-tied to it).
+/// The buffer is owned (freed by the struct's `Drop` — `drop_struct_fields`'s array arm). An empty
+/// array allocates nothing (`{null, 0}`). Returns `None` on any malformed element / structure.
+///
+/// # Safety
+/// `sub` must be a valid [`JsonSubTable`] (element schema; `store_size` = element stride); `p` must
+/// be positioned at (optional whitespace then) the array's `[`.
+unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable) -> Option<AlignStr> {
+    if sub.is_null() {
+        return None;
+    }
+    let sub = unsafe { &*sub };
+    let esz = sub.store_size.max(0) as usize;
+    let descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+    let phf = unsafe { phf_slice(sub.phf, sub.phf_len) };
+    let phf_seed = sub.phf_seed as u64;
+    p.ws();
+    p.expect(b'[')?;
+    p.ws();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut count: i64 = 0;
+    if p.peek() == Some(b']') {
+        p.pos += 1;
+    } else {
+        loop {
+            let eoff = buf.len();
+            buf.resize(eoff + esz, 0); // zero the element so missing/None fields read as 0
+            // `buf` is a distinct heap Vec; the element pointer is valid for `esz` bytes and does not
+            // alias the input `src` the `str` views point into.
+            let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
+            unsafe { parse_object(p, descs, eptr, esz as i64, phf, phf_seed)? };
+            count += 1;
+            p.ws();
+            match p.peek() {
+                Some(b',') => {
+                    p.pos += 1;
+                    p.ws();
+                    continue;
+                }
+                Some(b']') => {
+                    p.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    // Materialize into a fresh owned heap buffer (freed by the parent struct's Drop). Empty → null.
+    let total = buf.len() as i64;
+    let dst = align_rt_alloc(total);
+    if total > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+    }
+    Some(AlignStr { ptr: dst, len: count })
+}
+
+/// Free the owned heap buffers a struct at `base` holds, per its `descs` — its `array<Struct>` field
+/// buffers (kind 5) and, recursively, those inside non-optional nested-struct fields (kind 4). The
+/// runtime dual of codegen's `drop_struct_fields`, used ONLY on the decode error path to release
+/// buffers already written into a partial struct before returning the decode `Err` (otherwise a
+/// sibling field failing after an `array` field decoded would leak that buffer). `only_seen` gates
+/// the top level to the fields actually written; a nested struct reached through a *seen* kind-4
+/// field is fully decoded (the strict contract), so its owned fields are freed unconditionally.
+/// Optional fields and `array<Struct>` element structs are non-owned by the field restrictions, so
+/// they are skipped. `align_rt_free(null)` is a no-op (an empty array / unwritten field).
+///
+/// # Safety
+/// `base`/`descs` must describe the struct actually being decoded; each kind-4 `sub` must be valid.
+unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Option<&SeenSet>) {
+    for (i, d) in descs.iter().enumerate() {
+        if only_seen.is_some_and(|s| !s.is_set(i)) {
+            continue; // a field never written into the partial struct — nothing to free
+        }
+        // Optional payloads are non-owned; a negative offset is a mis-built descriptor (skip safely).
+        if d.opt_tag >= 0 || d.offset < 0 {
+            continue;
+        }
+        let off = d.offset as usize;
+        match (d.tag >> 8) & 0xff {
+            5 => {
+                // Read the array `{ptr,len}` slot's pointer (first 8 bytes) and free the buffer.
+                let mut pb = [0u8; 8];
+                unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
+                let ptr = usize::from_le_bytes(pb) as *mut u8;
+                unsafe { align_rt_free(ptr) };
+            }
+            // A seen nested struct is complete → free all its owned fields (no seen gate).
+            4 if !d.sub.is_null() => {
+                let sub = unsafe { &*d.sub };
+                let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+                unsafe { drop_decoded_owned(base.add(off), sub_descs, None) };
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The declared field's byte width and destination bounds. For every kind except a nested struct the
 /// width is the tag's low byte (1/2/4/8, or 16 for a `str` view); a nested struct (kind 4) takes its
 /// width from `sub.store_size` (the tag width byte is unused there). Returns `None` on a null nested
@@ -2461,6 +2757,21 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
     match kind {
         // Nested struct: recurse into the sub-object at `dst`.
         4 => unsafe { decode_nested(p, d.sub, dst) },
+        // `array<Struct>` field: parse a JSON array of objects into an owned AoS and write its
+        // `{ptr,len}` (16 bytes) into the field slot at `dst` (REST-gateway runway Slice C).
+        5 => {
+            if w != 16 {
+                return None;
+            }
+            let arr = unsafe { decode_struct_array_value(p, d.sub)? };
+            let ptr_bytes = (arr.ptr as usize as u64).to_le_bytes();
+            let len_bytes = arr.len.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
+            }
+            Some(())
+        }
         1 => {
             if w != 1 {
                 return None;
@@ -2536,6 +2847,7 @@ unsafe fn parse_object(
     // a struct of <= 64 fields tracks "seen" in a `u64` bitmask, falling back to a `Vec` only for
     // a wider struct (which essentially never occurs).
     let mut seen = SeenSet::new(descs.len());
+    let ok = (|| -> Option<()> {
     p.ws();
     p.expect(b'{')?;
     p.ws();
@@ -2604,6 +2916,15 @@ unsafe fn parse_object(
     } else {
         None
     }
+    })();
+    // On failure, free any owned buffers (`array<Struct>` fields, and those inside seen nested
+    // structs) already written into the partial struct — the decode `Err` path does not drop the out
+    // struct, so this prevents a leak when a sibling field fails after an array field decoded
+    // (memory-safety; the runtime dual of codegen's `drop_struct_fields`). Only *seen* fields wrote.
+    if ok.is_none() {
+        unsafe { drop_decoded_owned(out, descs, Some(&seen)) };
+    }
+    ok
 }
 
 /// The declared field's name bytes (for key verification + dispatch).
@@ -17492,6 +17813,80 @@ mod tests {
             assert_eq!(read_i64_at(buf, base + 32), *c, "count row {r}");
         }
         unsafe { align_rt_free(out.ptr as *mut u8) };
+    }
+
+    #[test]
+    fn json_decode_array_struct_field_and_encode() {
+        // `array<Struct>` field (REST-gateway runway Slice C): decode a JSON array-of-objects into an
+        // owned AoS in the field, then re-encode it. Parent { items: array<Inner> @0, n: i64 @16 };
+        // Inner { x: i64 @0, tag: str @8 } (store_size 24).
+        let (ix, itag) = (b"x", b"tag");
+        let inner_descs = [
+            JsonField { name_ptr: ix.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: itag.as_ptr(), name_len: 3, tag: (3 << 8) | 16, offset: 8, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 2,
+            store_size: 24,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let (items, n) = (b"items", b"n");
+        let descs = [
+            JsonField { name_ptr: items.as_ptr(), name_len: 5, tag: (5 << 8) | 16, offset: 0, sub: &inner_sub, opt_tag: -1 },
+            JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"{"items":[{"x":1,"tag":"a"},{"x":2,"tag":"bb"}],"n":9}"#;
+        let mut out = [0u8; 24];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        assert_eq!(rc, 0, "valid array-field input decodes");
+        assert_eq!(read_i64_at(&out, 16), 9, "n");
+        // The field slot holds the owned AoS {ptr,len}: len 2.
+        let arr_len = read_i64_at(&out, 8);
+        assert_eq!(arr_len, 2, "two array elements");
+        let arr_ptr = read_i64_at(&out, 0) as usize as *const u8;
+        let elem0 = unsafe { std::slice::from_raw_parts(arr_ptr, 48) };
+        assert_eq!(read_i64_at(elem0, 0), 1, "items[0].x");
+        assert_eq!(unsafe { read_str_at(elem0, 8) }, b"a", "items[0].tag");
+        assert_eq!(read_i64_at(elem0, 24), 2, "items[1].x");
+        assert_eq!(unsafe { read_str_at(elem0, 32) }, b"bb", "items[1].tag");
+
+        // Re-encode the array field via the runtime encoder.
+        let mut b = Builder { buf: BuilderBuf::new(0), arena: core::ptr::null_mut() };
+        unsafe {
+            align_rt_json_encode_struct_array(&mut b, arr_ptr, arr_len, inner_descs.as_ptr(), 2, 24);
+        }
+        let encoded = unsafe { std::slice::from_raw_parts(b.buf.ptr, b.buf.len) };
+        assert_eq!(encoded, br#"[{"x":1,"tag":"a"},{"x":2,"tag":"bb"}]"#);
+
+        // Free the decoded AoS (simulating the struct's Drop) so this test leaks nothing.
+        unsafe { align_rt_free(arr_ptr as *mut u8) };
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_array_field_error_path_frees_buffer() {
+        // Memory-safety: when a sibling field fails AFTER an `array<Struct>` field decoded, the
+        // partial struct's array buffer must be freed on the `Err` path (the caller doesn't drop a
+        // failed decode). Parent { arr: array<Inner> @0, req: i64 @16 } with `req` missing.
+        let ix = b"x";
+        let inner_descs = [JsonField { name_ptr: ix.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }];
+        let inner_sub = JsonSubTable { descs: inner_descs.as_ptr(), n_fields: 1, store_size: 8, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let (arr, req) = (b"arr", b"req");
+        let descs = [
+            JsonField { name_ptr: arr.as_ptr(), name_len: 3, tag: (5 << 8) | 16, offset: 0, sub: &inner_sub, opt_tag: -1 },
+            JsonField { name_ptr: req.as_ptr(), name_len: 3, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"{"arr":[{"x":1},{"x":2}]}"#; // `req` missing → fails after `arr` allocated
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 24];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        assert_ne!(rc, 0, "a missing required field must fail the decode");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert!(a1 > a0, "the array field allocated a buffer");
+        assert_eq!(a1 - a0, f1 - f0, "the error path freed every buffer it allocated (no leak)");
     }
 
     #[test]

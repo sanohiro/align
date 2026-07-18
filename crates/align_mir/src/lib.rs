@@ -991,6 +991,10 @@ pub enum TemplatePiece {
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
     PopComma,
+    /// `json.encode` of an `array<Struct>` field (REST-gateway runway Slice C): emit the owned AoS
+    /// `array` (`{ptr,len}`) as `[{...},...]` via the runtime descriptor-driven encoder. `struct_id`
+    /// is the element struct (codegen emits its schema + element stride for the runtime call).
+    StructArrayField { array: Operand, struct_id: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -2695,6 +2699,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         pieces.push(TemplatePiece::OptionField { opt: op, name: name.clone() });
                     }
                     hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
+                    hir::TemplatePart::StructArrayField { access, struct_id } => {
+                        let op = lower_expr(b, access);
+                        pieces.push(TemplatePiece::StructArrayField { array: op, struct_id: *struct_id });
+                    }
                 }
                 if b.is_terminated() {
                     return Operand::Value(b.fresh_value(e.ty));
