@@ -44,8 +44,15 @@ key), so `decode(encode(x))` round-trips by construction. Runtime: a `JsonUnion`
 classifies the first byte, writes the payload via the shared `write_value`, and sets the tag; encode
 reads the tag and emits the live arm via the shared `json_encode_value`. **v1 boundary:** payloads are
 str / number / bool / object (an owned `array<Struct>` payload — the OpenAI multimodal `content`
-union — needs enum owned-payload drop, J2). `json.encode` of a union needs a local binding (like
-struct encode). **Union as a struct field** (`Message { content: Content }`) is J1b-2b.
+union — needs enum owned-payload drop, J2). `json.encode` of a top-level union needs a local binding
+(like struct encode). **Union as a struct field (J1b-2b, SHIPPED):** a struct field may be a union
+(`Message { content: Content }`) — a descriptor **kind 6** whose `sub` is the `JsonUnion` (reused for
+both decode and encode); `field_width`/`write_value` (all decode paths — slow + Mison speculative +
+fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes with nested structs,
+`Option` fields (trailing-comma layout), and `array<Struct>` fields — the full
+`Chat { messages: array<Message> }` shape round-trips byte-identically. The union's variants are
+expanded into the enclosing struct's `json_union_schema_sig` so a variant change invalidates the
+decode/encode cache.
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
 `array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; the full OpenAI
@@ -120,8 +127,9 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   encode writes the live payload bare). Language prerequisite: enum `str` payloads (region
   tracking) then owned payloads (`array<Struct>`, tag-switched drop). **SHIPPED so far:** enum `str`
   payloads + region tracking (J1a); enum as a struct field (J1b-1); top-level union decode/encode
-  over str/number/bool/object payloads (J1b-2a, documented above). **Remaining:** union as a struct
-  field (J1b-2b) → enum owned `array<Struct>` payloads + the full `Content` union (J2).
+  over str/number/bool/object payloads (J1b-2a); union as a struct field (J1b-2b) — all documented
+  above. **Remaining:** enum owned `array<Struct>` payloads + tag-switched drop → the full multimodal
+  `Content` union closes the gateway (J2).
 - **Matrix fill (J3):** top-level scalar targets, `array<scalar>` fields, `Option<struct>`
   encode, supported-constructor compositions.
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and

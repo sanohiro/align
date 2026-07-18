@@ -39,9 +39,15 @@ enum は各バリアントがちょうど 1 つの payload を持ち、各 paylo
 payload arm ＋ shape-class→arm テーブル ＋ arm→enum-tag テーブル）。decode は先頭バイトを分類し、共有
 `write_value` で payload を書き、tag を設定。encode は tag を読んで共有 `json_encode_value` で該当 arm を
 出力。**v1 の境界:** payload は str / number / bool / object（所有 `array<Struct>` payload — OpenAI
-マルチモーダル `content` union — は enum 所有 payload の drop が必要、J2）。union の `json.encode` は
-ローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union**（`Message { content:
-Content }`）は J1b-2b。
+マルチモーダル `content` union — は enum 所有 payload の drop が必要、J2）。トップレベル union の
+`json.encode` はローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union（J1b-2b,
+SHIPPED）:** 構造体フィールドは union であってよい（`Message { content: Content }`）— descriptor
+**kind 6**（`sub` は `JsonUnion`、decode/encode で共有）。`field_width`/`write_value`（全 decode パス
+= slow + Mison speculative + fallback）と `json_encode_value` に kind-6 アームが加わり、union
+フィールドは nested struct・`Option` フィールド（trailing-comma layout）・`array<Struct>` フィールドと
+合成される — 完全な `Chat { messages: array<Message> }` シェイプが byte-identical にラウンドトリップ。
+union のバリアントは外側 struct の `json_union_schema_sig` に展開されるので、バリアント変更で
+decode/encode キャッシュが無効化される。
 
 **`array<Struct>` フィールド（REST-gateway runway, Slice C）。** 構造体フィールドは所有の `array<Struct>`
 であってよい — `messages: array<Message>` / `choices: array<Choice>` shape。フル OpenAI リクエスト/

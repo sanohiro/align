@@ -3747,11 +3747,17 @@ every variant one payload, each mapping to a shape class (Str/Number/Bool/Object
 (`json_encode_value` factored out of `json_encode_object`, `align_rt_json_encode_union`). New
 `Rvalue::JsonDecodeUnion` + `TemplatePiece::UnionValue` swept through every exhaustive HIR/MIR pass
 (region_of gives input-region for a str-bearing union, Static for scalar-only); `json_union_schema_sig`
-baked into the MIR for cache invalidation. Tests: `m5.rs` J1b section. **J1b-2b (next): union as a
-struct field** (`Message { content: Content }`) — a descriptor kind 6 into `write_value` /
-`json_object_parts` reusing `emit_json_union`.
-→ **J2** enum owned payloads (`array<Struct>`, drop) → full `Content` union → **the gateway is
-closed** → **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
+baked into the MIR for cache invalidation. Tests: `m5.rs` J1b section. **J1b-2b — SHIPPED: union as a
+struct field** (`Message { content: Content }`) — a JSON descriptor **kind 6** whose `sub` is the
+`JsonUnion` (reused decode+encode); `field_width`/`write_value` (all decode paths) + `json_encode_value`
+grew a kind-6 arm; sema `decode_struct_fields_ok`/`json_object_parts` grew enum-field arms (both check
+union-decodability so `emit_json_union` never sees a bad enum); `json_schema_sig_into` expands a union
+field (cycle-safe). Composes with nested / `Option` / `array<Struct>` fields — the full
+`Chat { messages: array<Message> }` shape round-trips. Tests: `m5.rs` J1b-2b (field decode/encode,
+object-payload + Option coexist, array<Message>, non-union-enum-field rejected).
+→ **J2** enum owned payloads (`array<Struct>`, tag-switched drop) → the full multimodal `Content`
+union → **the gateway is closed** → **J3** matrix fill (T1b) → **J4** `json.doc` → **J5** `json.scan`
+→ **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 
