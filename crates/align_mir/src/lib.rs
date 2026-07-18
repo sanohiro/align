@@ -983,6 +983,14 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
+    /// A `json.encode` `Option<T>` field (REST-gateway runway, Slice B): when `opt` is `Some`, append
+    /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
+    /// JSON-escaped — with a trailing comma); when `None`, append nothing. `opt`'s type
+    /// (`Ty::Option(scalar)`) tells codegen the payload kind. Paired with [`PopComma`].
+    OptionField { opt: Operand, name: String },
+    /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
+    /// closing `}`.
+    PopComma,
 }
 
 #[derive(Clone, Debug)]
@@ -2682,6 +2690,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         let op = lower_expr(b, h);
                         pieces.push(TemplatePiece::JsonStrHole(op));
                     }
+                    hir::TemplatePart::OptionField { access, name } => {
+                        let op = lower_expr(b, access);
+                        pieces.push(TemplatePiece::OptionField { opt: op, name: name.clone() });
+                    }
+                    hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
                 }
                 if b.is_terminated() {
                     return Operand::Value(b.fresh_value(e.ty));

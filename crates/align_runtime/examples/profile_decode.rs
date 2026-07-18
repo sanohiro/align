@@ -60,7 +60,7 @@ fn gen_json(n: usize) -> String {
 }
 
 fn field(name: &'static [u8], tag: i32, offset: i64) -> JsonField {
-    JsonField { name_ptr: name.as_ptr(), name_len: name.len() as i64, tag, offset, sub: core::ptr::null() }
+    JsonField { name_ptr: name.as_ptr(), name_len: name.len() as i64, tag, offset, sub: core::ptr::null(), opt_tag: -1 }
 }
 
 fn main() {

@@ -1455,6 +1455,15 @@ pub enum TemplatePart {
     /// A `str` expression to be emitted as a JSON string literal (quoted + escaped).
     /// Produced by `json.encode` desugaring, not by surface `template` syntax.
     JsonStr(Expr),
+    /// `json.encode` of an **`Option<T>` field** (REST-gateway runway, Slice B): when the option is
+    /// `Some`, emit `"name":<payload>,` (the payload rendered per its scalar kind — int/float/bool
+    /// raw, str JSON-escaped — with a **trailing comma**); when `None`, emit nothing. `access` is the
+    /// option field value. Paired with [`PopComma`] before the closing `}` so omitted fields leave no
+    /// dangling comma. Only produced by `json.encode` desugaring.
+    OptionField { access: Expr, name: String },
+    /// Drop a single trailing `,` from the builder — the "omit `None`" comma fixup, emitted once
+    /// before an `Option`-bearing object's closing `}`. Only produced by `json.encode` desugaring.
+    PopComma,
 }
 
 #[derive(Clone, Debug)]

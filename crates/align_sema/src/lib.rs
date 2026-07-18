@@ -869,8 +869,18 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64
         Ty::Char => (4, 4),
         Ty::Unit => (0, 1),
         Ty::Struct(id) => struct_size_align(id, structs, visiting),
+        // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
+        // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
+        // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
+        Ty::Option(s) => {
+            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, visiting);
+            let pal = pal.max(1);
+            let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
+            (align_up(payload_off + psz, pal), pal)
+        }
         // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
-        // (A struct can hold only scalar / `str` fields today; the rest are a defensive default.)
+        // (A struct can hold only scalar / `str` / `Option` / nested-struct fields today; the rest are
+        // a defensive default.)
         _ => (16, 8),
     }
 }
@@ -2636,20 +2646,46 @@ pub fn check_program_with_effects(
     // Done in a separate pass because the referenced struct may be declared after the referencing one.
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
-            let Ty::Struct(nid) = structs[i].fields[fi].ty else { continue };
+            let fty = structs[i].fields[fi].ty;
+            // An `Option<T>` field's payload must be **non-owned** in v1 (REST-gateway runway Slice B).
+            // A non-owned payload (scalar / `str` view / plain-data struct) needs no drop, so an
+            // Option field adds zero owned-drop surface; an owned payload (`Option<string>`, an owned
+            // collection, or a Move struct) would need a new conditional "free the payload iff Some"
+            // drop-as-a-field path that has no consumer yet — `json.decode` only ever fills a decoded
+            // view/scalar/plain-struct into an Option field. Reject the owned case cleanly (deferred),
+            // rather than silently leak it (a Move-struct payload is invisible to the table-free
+            // `payload_is_move`, so it would otherwise mis-classify the struct as non-Move).
+            if let Ty::Option(sc) = fty {
+                let owned = sc.is_move() || matches!(sc, Scalar::Struct(nid) if struct_is_move(nid, &structs));
+                if owned {
+                    diags.error(
+                        format!(
+                            "an `Option` struct field must have a non-owned payload for now (got Option<{}>) — an owned/Move Option payload is a later slice",
+                            ty_name(scalar_to_ty(sc))
+                        ),
+                        f.span,
+                    );
+                }
+            }
+            // The nested-struct checks apply to a direct `Struct` field AND an `Option<Struct>` field:
+            // both embed the struct **inline**, so both need the acyclic + no-`align(N)` guarantees.
+            let nested = match fty {
+                Ty::Struct(nid) | Ty::Option(Scalar::Struct(nid)) => nid,
+                _ => continue,
+            };
             // An `align(N)` struct embedded as a field is not honored yet — embedding needs the
             // struct's size padded up to its alignment (deferred), so the over-alignment would be
             // silently dropped. Reject it cleanly rather than mislead (only a standalone value is
             // over-aligned today).
-            if structs[nid as usize].align.is_some() {
+            if structs[nested as usize].align.is_some() {
                 diags.error(
-                    format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nid as usize].name),
+                    format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nested as usize].name),
                     f.span,
                 );
             }
             // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
-            // depth 1, `Node { next: Node }`) is detected.
-            if !struct_acyclic(nid, &structs, &mut vec![i as u32]) {
+            // depth 1, `Node { next: Node }` or `Node { next: Option<Node> }`) is detected.
+            if !struct_acyclic(nested, &structs, &mut vec![i as u32]) {
                 diags.error(
                     format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
                     f.span,
@@ -4367,8 +4403,10 @@ impl EffectScan<'_> {
             ExprKind::StrTrim { recv, .. } => self.expr(recv),
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
-                        self.expr(h);
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
+                        TemplatePart::OptionField { access, .. } => self.expr(access),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
@@ -5003,6 +5041,10 @@ impl<'a> EscapeCheck<'a> {
             let has = match f.ty {
                 Ty::Str => true,
                 Ty::Struct(nid) => self.struct_has_str_rec(nid, stack),
+                // An `Option<str>` field holds a `str` view when `Some`; an `Option<Struct>` field can
+                // hold a str-bearing struct — both make the enclosing struct input-region-tied.
+                Ty::Option(Scalar::Str) => true,
+                Ty::Option(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
                 _ => false,
             };
             if has {
@@ -6289,8 +6331,10 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
-                        self.walk(h, depth);
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::OptionField { access, .. } => self.walk(access, depth),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
@@ -6901,8 +6945,10 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
-                        self.visit(h);
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
+                        TemplatePart::OptionField { access, .. } => self.visit(access),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
@@ -8280,9 +8326,11 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
-                        // A hole value is read (copied) into the builder, not moved out.
-                        self.expr(h, moved, false, false);
+                    // A hole / option-field value is read (copied) into the builder, not moved out.
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
+                        TemplatePart::OptionField { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
@@ -12465,7 +12513,7 @@ impl<'a, 't> Checker<'a, 't> {
                 text.push_str(part);
                 Some(text)
             }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) => None,
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma => None,
         });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
@@ -15156,10 +15204,21 @@ impl<'a, 't> Checker<'a, 't> {
                         return false;
                     }
                 }
+                // An `Option<T>` field is optional (missing key / JSON `null` → `None`); its payload
+                // must itself be decodeable. `Option<Struct>` recurses into the payload struct. The
+                // owned-payload restriction (no `Option<string>`/`Option<Move-struct>`) is enforced at
+                // declaration (pass 0b-2), so a decodeable Option payload here is scalar/str/plain-struct.
+                Ty::Option(Scalar::Int(_)) | Ty::Option(Scalar::Float(_)) | Ty::Option(Scalar::Bool) | Ty::Option(Scalar::Str) => {}
+                Ty::Option(Scalar::Struct(nid)) => {
+                    if !self.decode_struct_fields_ok_rec(nid, span, stack) {
+                        stack.pop();
+                        return false;
+                    }
+                }
                 _ => {
                     self.diags.error(
                         format!(
-                            "'json.decode' field '{}' has type {} (only int/float/bool/str/nested-struct decode for now)",
+                            "'json.decode' field '{}' has type {} (only int/float/bool/str/nested-struct/Option decode for now)",
                             f.name,
                             ty_name(f.ty)
                         ),
@@ -15205,38 +15264,79 @@ impl<'a, 't> Checker<'a, 't> {
         // Clone the field list so the recursion (which needs `&mut self`) doesn't hold a borrow of
         // `self.structs` across the loop — `Field` is cheap to clone (a name + a `Copy` type).
         let fields = self.structs[sid as usize].fields.clone();
+        // An `Option`-bearing object can't use the static leading-comma layout — a `None` field is
+        // omitted at runtime, so which field is "first" is dynamic. Switch to the trailing-comma
+        // scheme: every present field emits `"name":value,` and a `PopComma` before `}` drops the
+        // last one (`{"a":1,"b":2}` / `{}`). A pure-required object keeps the original static layout,
+        // so existing `json.encode` codegen is unchanged (zero regression surface).
+        let has_option = fields.iter().any(|f| matches!(f.ty, Ty::Option(_)));
         parts.push(TemplatePart::Text("{".to_string()));
         for (i, f) in fields.iter().enumerate() {
-            let sep = if i == 0 { "" } else { "," };
-            parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
             let mut full = path_prefix.to_vec();
             full.push(i as u32);
-            // A nested struct emits its own object; every leaf reads its field value through the
-            // full path (`base.path…` or the struct-array element `base[elem].path…`).
-            if let Ty::Struct(nid) = f.ty {
-                self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
-                continue;
-            }
-            let kind = match elem {
-                None => ExprKind::Field { root: base, path: full },
-                Some(e) => ExprKind::IndexField { base, index: e, path: full },
+            let access = |ty: Ty| Expr {
+                kind: match elem {
+                    None => ExprKind::Field { root: base, path: full.clone() },
+                    Some(e) => ExprKind::IndexField { base, index: e, path: full.clone() },
+                },
+                ty,
+                span,
             };
-            let field_expr = Expr { kind, ty: f.ty, span };
-            match f.ty {
-                Ty::Str => parts.push(TemplatePart::JsonStr(field_expr)),
-                t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(field_expr)),
-                _ => {
+            // An optional (`Option<T>`) field: a single conditional `OptionField` piece that emits
+            // `"name":value,` only when `Some`. Only present in the trailing-comma scheme.
+            if let Ty::Option(s) = f.ty {
+                if matches!(s, Scalar::Struct(_)) {
+                    // `Option<struct>` encode = a conditional nested object rendered from the payload
+                    // value — a follow-up (decode already supports it); scalar/str Options encode now.
                     self.diags.error(
                         format!(
-                            "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct only for now)",
-                            f.name,
-                            ty_name(f.ty)
+                            "'json.encode' of Option<struct> field '{}' is not supported yet (Option<scalar>/Option<str> encode now; nested-Option encode is a follow-up)",
+                            f.name
                         ),
                         span,
                     );
                     *ok = false;
+                    continue;
+                }
+                parts.push(TemplatePart::OptionField { access: access(f.ty), name: f.name.clone() });
+                continue;
+            }
+            // A required field. The key prefix carries the leading separator in the static layout, or
+            // no separator in the trailing-comma layout (the trailing comma is pushed after the value).
+            if has_option {
+                parts.push(TemplatePart::Text(format!("\"{}\":", f.name)));
+            } else {
+                let sep = if i == 0 { "" } else { "," };
+                parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
+            }
+            // A nested struct emits its own object; every leaf reads its field value through the full
+            // path (`base.path…` or the struct-array element `base[elem].path…`).
+            if let Ty::Struct(nid) = f.ty {
+                self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
+            } else {
+                match f.ty {
+                    Ty::Str => parts.push(TemplatePart::JsonStr(access(Ty::Str))),
+                    t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(access(f.ty))),
+                    _ => {
+                        self.diags.error(
+                            format!(
+                                "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option only for now)",
+                                f.name,
+                                ty_name(f.ty)
+                            ),
+                            span,
+                        );
+                        *ok = false;
+                        continue;
+                    }
                 }
             }
+            if has_option {
+                parts.push(TemplatePart::Text(",".to_string()));
+            }
+        }
+        if has_option {
+            parts.push(TemplatePart::PopComma);
         }
         parts.push(TemplatePart::Text("}".to_string()));
         visiting.pop();
@@ -19052,8 +19152,10 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
-                        self.finalize_expr(h);
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::OptionField { access, .. } => self.finalize_expr(access),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
@@ -20497,11 +20599,19 @@ fn resolve_user_type(
 /// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
 /// `string`, or a nested struct.
 fn is_field_ok(ty: Ty) -> bool {
-    // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, or a **nested
-    // struct** (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass).
-    // An owned (`string` or Move-struct) field makes the enclosing struct a Move type with a
-    // recursive `Drop` (Slice 3). Owned *collections* (`array<T>` etc.) as fields are a later slice.
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error)
+    // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, a **nested struct**
+    // (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass), or an
+    // **`Option<T>`** whose payload is itself a valid field type (scalar / `str` / `string` / nested
+    // struct). An owned (`string`, Move-struct, or `Option<owned>`) field makes the enclosing struct a
+    // Move type with a recursive `Drop` (Slice 3 / the REST-gateway runway Slice B). Owned
+    // *collections* (`array<T>` etc.) as fields are a later slice.
+    match ty {
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
+        // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
+        // rejected until array fields land, matching the direct-field rule).
+        Ty::Option(s) => is_field_ok(scalar_to_ty(s)),
+        _ => false,
+    }
 }
 
 /// Whether struct `id`'s field graph is **acyclic** — no struct contains itself, directly or
@@ -20516,6 +20626,10 @@ fn struct_acyclic(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bo
     visiting.push(id);
     let ok = def.fields.iter().all(|f| match f.ty {
         Ty::Struct(nid) => struct_acyclic(nid, structs, visiting),
+        // An `Option<Struct>` field stores the struct **inline** (`{ i8 tag, Struct }`), so a
+        // `Node { next: Option<Node> }` is still an infinite layout — recurse into the payload struct
+        // exactly like a direct nested-struct field (a `box` indirection is the way to a recursive type).
+        Ty::Option(Scalar::Struct(nid)) => struct_acyclic(nid, structs, visiting),
         _ => true,
     });
     visiting.pop();

@@ -1176,6 +1176,10 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "builder_pop_comma".to_string(),
+        module.add_function("align_rt_builder_pop_comma", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
         "builder_write_int".to_string(),
         module.add_function(
             "align_rt_builder_write_int",
@@ -8161,13 +8165,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// ints, 0 for bool; offset from the target layout), and call the runtime parser. Returns
     /// the i32 status.
     /// The LLVM type of one `json.decode` field descriptor: `{ name_ptr, name_len: i64, tag: i32,
-    /// offset: i64, sub: ptr }` — matching the runtime `JsonField` `#[repr(C)]`. `sub` is null except
-    /// for a nested-struct field (kind 4), where it points to a [`json_subtable_ty`] global.
+    /// offset: i64, sub: ptr, opt_tag: i64 }` — matching the runtime `JsonField` `#[repr(C)]`. `sub`
+    /// is null except for a nested-struct payload (kind 4); `opt_tag` is `-1` for a required field or
+    /// the `Option` tag byte offset for an optional (`Option<T>`) field.
     fn json_desc_ty(&self) -> inkwell::types::StructType<'c> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
-        self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into(), ptr_ty.into()], false)
+        self.ctx
+            .struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into(), ptr_ty.into(), i64t.into()], false)
+    }
+
+    /// The `(tag, sub)` descriptor pair for a decodeable **payload** type — the `(signed<<16)|
+    /// (kind<<8)|width` tag and the nested sub-table pointer (non-null only for a `Struct` payload).
+    /// Shared by a direct field and an `Option<T>` field's payload so both encode the payload
+    /// identically. `null` is the null pointer constant for non-struct payloads.
+    fn json_payload_tag_sub(&mut self, ty: Ty, null: inkwell::values::PointerValue<'c>) -> (u64, inkwell::values::PointerValue<'c>) {
+        match ty {
+            Ty::Int(it) => (((it.signed as u64) << 16) | (it.bits / 8) as u64, null),
+            Ty::Bool => ((1 << 8) | 1, null),
+            Ty::Float(ft) => ((2 << 8) | (ft.bits / 8) as u64, null),
+            Ty::Str => ((3 << 8) | 16, null),
+            Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)),
+            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct (sema-checked)"),
+        }
+    }
+
+    /// The byte offset of an `Option<s>`'s payload within its `{ i8 tag, payload }` LLVM layout
+    /// (`option_struct_type` element 1) — where the decoder writes the `Some` value.
+    fn option_payload_offset(&self, s: Scalar) -> u64 {
+        let opt_ty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
+        self.target_data.offset_of_element(&opt_ty, 1).expect("Option payload is element 1")
     }
 
     /// The LLVM type of a nested-struct field's sub-schema, matching the runtime `JsonSubTable`
@@ -8199,31 +8227,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map(|(i, f)| {
                 let (name_ptr, name_len) = self.str_global(&f.name);
                 // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
-                // 2 = float, 3 = str, 4 = nested struct. Bit 16 is the int sign flag (1 = signed,
-                // 0 = unsigned); it lets the runtime range-check the parsed value before writing (only
-                // meaningful for kind 0). It sits above the kind/width bytes, so the existing
-                // `tag & 0xff` (width) and `(tag >> 8) & 0xff` (kind) decoders are unchanged.
-                // A `str` field is a `{ptr,len}` view (16 bytes) written zero-copy into the input; a
-                // nested-struct field carries kind 4 with `sub` pointing to its own sub-schema (the
-                // width byte is unused — the runtime reads `sub.store_size`).
-                let (tag, sub_ptr): (u64, inkwell::values::PointerValue) = match f.ty {
-                    Ty::Int(it) => (((it.signed as u64) << 16) | (it.bits / 8) as u64, null),
-                    Ty::Bool => ((1 << 8) | 1, null),
-                    Ty::Float(ft) => ((2 << 8) | (ft.bits / 8) as u64, null),
-                    Ty::Str => ((3 << 8) | 16, null),
-                    Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)),
-                    _ => unreachable!("json.decode field is int/float/bool/str/nested-struct (sema-checked)"),
+                // 2 = float, 3 = str, 4 = nested struct. Bit 16 is the int sign flag (only meaningful
+                // for kind 0). A `str` field is a `{ptr,len}` view; a nested-struct field carries kind
+                // 4 with `sub` pointing to its sub-schema. The descriptor lists fields by *name* in
+                // logical order, but the byte offset is the physical slot (fields are
+                // alignment-reordered for non-`layout(C)` structs); `field_byte_offset` maps
+                // logical→physical.
+                let field_off = self.field_byte_offset(struct_id, i as u32);
+                // An `Option<T>` field describes its **payload** (tag/sub), with `offset` pointing at
+                // the payload slot inside the `Option` (`{ i8 tag, payload }`) and `opt_tag` = the
+                // field's own byte offset (the tag byte). A required field is `opt_tag = -1` with
+                // `offset` = the field itself.
+                let (tag, sub_ptr, offset, opt_tag): (u64, inkwell::values::PointerValue, u64, i64) = match f.ty {
+                    Ty::Option(s) => {
+                        let (tag, sub_ptr) = self.json_payload_tag_sub(scalar_to_ty(s), null);
+                        (tag, sub_ptr, field_off + self.option_payload_offset(s), field_off as i64)
+                    }
+                    other => {
+                        let (tag, sub_ptr) = self.json_payload_tag_sub(other, null);
+                        (tag, sub_ptr, field_off, -1)
+                    }
                 };
-                // The descriptor lists fields by *name* in logical order, but the byte offset must be
-                // the field's physical slot (fields are alignment-reordered for non-`layout(C)`
-                // structs); `field_byte_offset` maps logical→physical.
-                let offset = self.field_byte_offset(struct_id, i as u32);
                 desc_ty.const_named_struct(&[
                     name_ptr.into(),
                     name_len.into(),
                     i32t.const_int(tag, false).into(),
                     i64t.const_int(offset, false).into(),
                     sub_ptr.into(),
+                    i64t.const_int(opt_tag as u64, true).into(),
                 ])
             })
             .collect();
@@ -8624,6 +8655,86 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let len = self.builder.build_extract_value(agg, 1, "jl").map_err(|e| self.err(e))?;
                     self.builder
                         .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                // `json.encode` `Option<T>` field: when `Some`, append `"name":<payload>,`; else
+                // nothing. The payload is rendered per its scalar kind exactly like the plain holes
+                // above (int/float/bool raw, str JSON-escaped), with a trailing comma that a later
+                // [`PopComma`] strips if this was the last present field.
+                align_mir::TemplatePiece::OptionField { opt, name } => {
+                    let Ty::Option(s) = self.f.operand_ty(opt) else {
+                        return Err(self.err("json.encode OptionField piece is not an Option"));
+                    };
+                    let agg = self.operand(opt).into_struct_value();
+                    let tag = self.builder.build_extract_value(agg, 0, "otag").map_err(|e| self.err(e))?.into_int_value();
+                    let payload = self.builder.build_extract_value(agg, 1, "opay").map_err(|e| self.err(e))?;
+                    let is_some = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "issome")
+                        .map_err(|e| self.err(e))?;
+                    let func = self
+                        .builder
+                        .get_insert_block()
+                        .and_then(|b| b.get_parent())
+                        .ok_or_else(|| self.err("no enclosing function for OptionField"))?;
+                    let some_bb = self.ctx.append_basic_block(func, "opt.some");
+                    let cont_bb = self.ctx.append_basic_block(func, "opt.cont");
+                    self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(some_bb);
+                    // `"name":` prefix.
+                    let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), pptr.into(), plen.into()], "")
+                        .map_err(|e| self.err(e))?;
+                    // Render the payload by its scalar kind (mirrors the holes above).
+                    match scalar_to_ty(s) {
+                        Ty::Str => {
+                            let pa = payload.into_struct_value();
+                            let sptr = self.builder.build_extract_value(pa, 0, "osp").map_err(|e| self.err(e))?;
+                            let slen = self.builder.build_extract_value(pa, 1, "osl").map_err(|e| self.err(e))?;
+                            self.builder
+                                .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), sptr.into(), slen.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
+                        Ty::Bool => {
+                            let v = payload.into_int_value();
+                            let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
+                            self.builder
+                                .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
+                        fty @ Ty::Float(_) => {
+                            let v = payload.into_float_value();
+                            let callee = if fty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
+                            self.builder.build_call(self.funcs[callee], &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
+                        }
+                        ity => {
+                            let v = payload.into_int_value();
+                            let wide = if v.get_type().get_bit_width() < 64 {
+                                if is_signed(ity) {
+                                    self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+                                } else {
+                                    self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+                                }
+                            } else {
+                                v
+                            };
+                            self.builder
+                                .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
+                    }
+                    // Trailing comma (stripped by `PopComma` if this is the last present field).
+                    let (cptr, clen) = self.str_global(",");
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), cptr.into(), clen.into()], "")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(cont_bb);
+                }
+                align_mir::TemplatePiece::PopComma => {
+                    self.builder
+                        .build_call(self.funcs["builder_pop_comma"], &[bptr.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }
@@ -9346,6 +9457,11 @@ mod tests {
         fn f(bits: u8) -> Ty {
             Ty::Float(FloatTy { bits })
         }
+        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (ty_size_align ↔
+        // option_struct_type) across scalar / str / nested-struct payloads and reorder cases.
+        fn opt(ty: Ty) -> Ty {
+            Ty::Option(align_sema::ty_to_scalar(ty).expect("option payload is a scalar"))
+        }
         fn sdef(name: &str, c_repr: bool, fields: &[Ty]) -> StructDef {
             StructDef {
                 name: name.to_string(),
@@ -9400,6 +9516,13 @@ mod tests {
             adef("A32mix", 32, &[i(8, true), i(64, true), i(8, true)]), // reorder + pad (nat 24 → 32)
             // `layout(C)` composed with `align(N)` (the FFI case): decl order preserved, size padded.
             StructDef { align: Some(32), ..sdef("A32C", true, &[i(8, true), i(64, true), i(8, true)]) },
+            // `Option<T>` fields (REST-gateway runway Slice B): every payload kind + a reorder case.
+            sdef("Oi64", false, &[opt(i(64, true))]),                     // { i8, i64 } → (16, 8)
+            sdef("Obool", false, &[opt(Ty::Bool)]),                      // { i8, i8 }  → (2, 1)
+            sdef("Ostr", false, &[opt(Ty::Str)]),                        // { i8, {ptr,len} } → (24, 8)
+            sdef("Ostruct", false, &[opt(Ty::Struct(2))]),               // { i8, Pair } → (12, 4)
+            sdef("OMix", false, &[Ty::Bool, opt(i(64, true)), opt(Ty::Str), i(8, true)]), // reorder
+            StructDef { align: None, c_repr: true, ..sdef("OStrC", true, &[Ty::Bool, opt(Ty::Str)]) }, // layout(C) + option
         ];
 
         let ctx = Context::create();

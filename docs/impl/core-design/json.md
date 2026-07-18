@@ -20,13 +20,25 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct fields; field order free; unknown keys ignored)
+//   struct                 (flat OR with nested-struct / Option<T> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
-//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct fields recurse)
+//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 ```
+
+**`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
+scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →
+`None`, a type mismatch → `Err`; a required (non-`Option`) field still `Err`s when missing. **Encode
+omits a `None` field entirely** (never `"k":null`), so `decode(encode(x))` round-trips. Runtime: the
+`JsonField` descriptor gains `opt_tag` (`-1` = required, else the `Option` tag byte offset); an
+optional field is exempt from `all_required_seen`, and the shared `write_value` writes the payload at
+the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing object to a
+trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
+the static layout). **v1 boundary:** an Option payload must be **non-owned** (`Option<string>` /
+`Option<Move-struct>` rejected at declaration — no consumer, and owned-Option-drop-as-a-field is
+deferred). One recorded follow-up: `Option<struct>` **encode** (decode supports it).
 
 **Nested-struct fields (REST-gateway runway, Slice A).** A struct field may itself be a `Struct`;
 `decode` recurses into the nested object and `encode` renders it back, so a nested record round-trips.

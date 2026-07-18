@@ -1773,6 +1773,25 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
     b.buf.extend_from_slice(unsafe { safe_slice(ptr, len) });
 }
 
+/// Drop a single trailing `,` byte if the builder ends with one — the `json.encode` "omit `None`
+/// field" comma fixup (REST-gateway runway, Slice B). An `Option`-bearing object emits every present
+/// field as `"name":value,` (a trailing comma) and calls this once before the closing `}`, so a
+/// `None`-omitted or all-absent object closes cleanly (`{"a":1,"b":2}` / `{}`), never `{,}` or a
+/// dangling comma. A no-op when the last byte is not a comma (e.g. an empty `{}`).
+///
+/// # Safety
+/// `b` must be a valid `Builder` (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_pop_comma(b: *mut Builder) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    if b.buf.len > 0 && unsafe { *b.buf.ptr.add(b.buf.len - 1) } == b',' {
+        b.buf.len -= 1;
+    }
+}
+
 fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
     if (-999..=999).contains(&v) {
         // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,
@@ -2170,6 +2189,15 @@ fn write_json_escape(buf: &mut BuilderBuf, c: u8) {
 ///
 /// `sub` is null except for a nested-struct field (kind 4), where it points to the nested struct's
 /// own descriptor table ([`JsonSubTable`]) so the decoder recurses into [`parse_object`].
+///
+/// `opt_tag` supports **`Option<T>` fields** (REST-gateway runway, Slice B): it is `-1` for an
+/// ordinary required field, or `>= 0` for an optional field — the byte offset of the `Option`'s
+/// `i8` tag within the out struct. For an optional field `offset`/`tag`/`sub` describe the
+/// **payload** exactly as for a required field, but `offset` is the payload's slot inside the
+/// `Option` (`{ i8 tag, payload }`), not the field itself. Decode: a missing key or JSON `null`
+/// leaves the zeroed slot (tag 0 = `None`, not required to be present); a present value writes the
+/// payload at `offset` then sets the tag byte at `opt_tag` to 1 (`Some`). Encode omits a `None`
+/// field entirely.
 #[repr(C)]
 pub struct JsonField {
     pub name_ptr: *const u8,
@@ -2177,6 +2205,7 @@ pub struct JsonField {
     pub tag: i32,
     pub offset: i64,
     pub sub: *const JsonSubTable,
+    pub opt_tag: i64,
 }
 
 /// A nested-struct field's sub-schema: the nested struct's own field descriptors, store size, and
@@ -2318,12 +2347,13 @@ impl SeenSet {
         }
     }
 
-    /// Whether all `n` declared fields have been marked.
-    fn all_seen(&self, n: usize) -> bool {
+    /// Whether every **required** declared field has been marked. An `Option` field (`opt_tag >= 0`)
+    /// is optional — a missing key leaves it `None`, so it is not required to be present. A required
+    /// field that never appears makes the object malformed (the strict exactly-once contract).
+    fn all_required_seen(&self, descs: &[JsonField]) -> bool {
         match self {
-            // `Mask` is only used for `n <= 64`; `n == 64` needs `!0` (a `1 << 64` shift is UB).
-            SeenSet::Mask(m) => *m == if n >= 64 { !0u64 } else { (1u64 << n) - 1 },
-            SeenSet::Big(v) => v.iter().all(|&s| s),
+            SeenSet::Mask(m) => descs.iter().enumerate().all(|(i, d)| d.opt_tag >= 0 || (m & (1u64 << i)) != 0),
+            SeenSet::Big(v) => descs.iter().enumerate().all(|(i, d)| d.opt_tag >= 0 || v[i]),
         }
     }
 }
@@ -2417,11 +2447,79 @@ fn field_width(d: &JsonField, kind: i32) -> Option<i64> {
     }
 }
 
+/// Write one field's parsed value from `p` into `dst` (which addresses `width` writable bytes) per
+/// its `kind`/`width`/sign — the per-kind dispatch shared by [`parse_object`] (slow path) and, via a
+/// fresh sub-parser, the `Option`-field arm of the Mison path. `dst` is the payload slot (the field
+/// itself for a required field, or the `Option`'s payload slot for an optional one). Returns `None`
+/// on a type mismatch / malformed value / null nested sub-table.
+///
+/// # Safety
+/// `dst` must be valid for `width` writable bytes; kind 4 requires a valid `d.sub`.
+#[inline]
+unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, dst: *mut u8) -> Option<()> {
+    let w = width as usize;
+    match kind {
+        // Nested struct: recurse into the sub-object at `dst`.
+        4 => unsafe { decode_nested(p, d.sub, dst) },
+        1 => {
+            if w != 1 {
+                return None;
+            }
+            let v = p.boolean()?;
+            unsafe { *dst = v as u8 };
+            Some(())
+        }
+        2 => {
+            if w != 4 && w != 8 {
+                return None;
+            }
+            let v = p.number()?;
+            // `bytes` is a local (stack) array from `to_le_bytes()`, `dst` a distinct heap/arena
+            // slot — they never alias, so a straight-line bulk copy is sound.
+            if w == 4 {
+                let bytes = (v as f32).to_le_bytes();
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+            } else {
+                let bytes = v.to_le_bytes();
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+            }
+            Some(())
+        }
+        3 => {
+            // str: a zero-copy `{ptr,len}` view into the input buffer.
+            if w != 16 {
+                return None;
+            }
+            let s = p.string()?;
+            let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
+            let len_bytes = (s.len() as i64).to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
+            }
+            Some(())
+        }
+        _ => {
+            if w != 1 && w != 2 && w != 4 && w != 8 {
+                return None;
+            }
+            // Parse + range-check per the field's (width, sign); a `u64` field takes the full-range
+            // unsigned path. Rejects out-of-range instead of silently truncating/sign-wrapping.
+            let v = p.integer_field(w, (d.tag & 0x1_0000) != 0)?;
+            let bytes = v.to_le_bytes();
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, w) };
+            Some(())
+        }
+    }
+}
+
 /// Parse one JSON object from `p` into the (caller-zeroed) struct at `out` (`out_size` bytes) per
 /// the field `descs`, leaving `p` positioned just past the closing `}`. Returns `None` on a parse
 /// error, a missing or duplicate declared field, or an out-of-range descriptor. Shared by the
 /// single-struct decode and the `array<Struct>` AoS decode (MMv2 slice 8d). Recurses for a
-/// nested-struct field (kind 4) via [`decode_nested`].
+/// nested-struct field (kind 4) via [`decode_nested`]; an `Option` field (`opt_tag >= 0`) is
+/// optional — a missing key or JSON `null` leaves the zeroed `None` slot, a present value writes the
+/// payload and sets the `Some` tag.
 ///
 /// # Safety
 /// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
@@ -2469,67 +2567,19 @@ unsafe fn parse_object(
                         return None;
                     }
                     let off = d.offset as usize;
-                    let w = width as usize;
-                    match kind {
-                        4 => {
-                            // Nested struct: recurse into the sub-object at this field's slot. `p` is
-                            // already at the value (past `:` + ws); `parse_object` re-skips ws and
-                            // consumes through the nested `}`, enforcing the strict contract recursively.
-                            unsafe { decode_nested(p, d.sub, out.add(off))? };
-                        }
-                        1 => {
-                            if w != 1 {
+                    // `p` is already at the value (past `:` + ws). An optional field maps JSON `null`
+                    // to `None` (the zeroed slot's tag is already 0), otherwise writes the payload and
+                    // sets the `Some` tag byte at `opt_tag`. A required field writes the value directly.
+                    if d.opt_tag >= 0 {
+                        if p.skip_null().is_none() {
+                            unsafe { write_value(p, kind, width, d, out.add(off))? };
+                            if d.opt_tag >= out_size {
                                 return None;
                             }
-                            let v = p.boolean()?;
-                            unsafe { *out.add(off) = v as u8 };
+                            unsafe { *out.add(d.opt_tag as usize) = 1 };
                         }
-                        2 => {
-                            if w != 4 && w != 8 {
-                                return None;
-                            }
-                            let v = p.number()?;
-                            // Write the float repr at the field width (f32 / f64). `bytes` is a local
-                            // (stack) array from `to_le_bytes()`, `out` is a distinct heap/arena
-                            // buffer — the two never alias, so a straight-line bulk copy is sound.
-                            if w == 4 {
-                                let bytes = (v as f32).to_le_bytes();
-                                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), bytes.len()) };
-                            } else {
-                                let bytes = v.to_le_bytes();
-                                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), bytes.len()) };
-                            }
-                        }
-                        3 => {
-                            // str: a zero-copy `{ptr,len}` view into the input buffer.
-                            // `string()` borrows the input and rejects escapes, so its
-                            // pointer is the absolute address of the content within `src`.
-                            if w != 16 {
-                                return None;
-                            }
-                            let s = p.string()?;
-                            let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
-                            let len_bytes = (s.len() as i64).to_le_bytes();
-                            // Two disjoint 8-byte fields of the 16-byte `{ptr,len}` slot; `ptr_bytes`/
-                            // `len_bytes` are local arrays, `out` is a distinct heap/arena buffer.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), out.add(off), 8);
-                                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), out.add(off + 8), 8);
-                            }
-                        }
-                        _ => {
-                            if w != 1 && w != 2 && w != 4 && w != 8 {
-                                return None;
-                            }
-                            // Parse + range-check per the field's (width, sign); a `u64` field takes
-                            // the full-range unsigned path. Rejects out-of-range instead of silently
-                            // writing the low `w` bytes and truncating/sign-wrapping.
-                            let v = p.integer_field(w, (d.tag & 0x1_0000) != 0)?;
-                            let bytes = v.to_le_bytes();
-                            // `w <= 8 == bytes.len()` (checked above); `bytes` is a local array, `out`
-                            // a distinct heap/arena buffer.
-                            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), w) };
-                        }
+                    } else {
+                        unsafe { write_value(p, kind, width, d, out.add(off))? };
                     }
                 }
                 None => p.skip_value()?,
@@ -2549,7 +2599,7 @@ unsafe fn parse_object(
         }
     }
     // All declared fields must be present.
-    if seen.all_seen(descs.len()) {
+    if seen.all_required_seen(descs) {
         Some(())
     } else {
         None
@@ -2586,6 +2636,15 @@ trait FieldDst {
     /// # Safety
     /// The returned pointer must be valid for `width` writable bytes.
     unsafe fn field_ptr(&self, fi: usize, d: &JsonField, width: i64) -> Option<*mut u8>;
+
+    /// A writable pointer at an arbitrary byte `offset` (`width` bytes) within this field's
+    /// destination object — used to set an `Option` field's `i8` tag byte. Only the AoS/struct
+    /// destination carries `Option` fields (soa rejects them at the type level), so the SoA impl
+    /// returns `None`. Returns `None` if `offset`/`width` falls outside the object.
+    ///
+    /// # Safety
+    /// The returned pointer must be valid for `width` writable bytes.
+    unsafe fn byte_ptr(&self, offset: i64, width: i64) -> Option<*mut u8>;
 }
 
 /// AoS element slot of `esz` bytes; field `d` lands at `eptr + d.offset`.
@@ -2597,10 +2656,15 @@ struct AosDst {
 impl FieldDst for AosDst {
     #[inline]
     unsafe fn field_ptr(&self, _fi: usize, d: &JsonField, width: i64) -> Option<*mut u8> {
-        if d.offset < 0 || d.offset.checked_add(width).is_none_or(|end| end > self.esz) {
+        unsafe { self.byte_ptr(d.offset, width) }
+    }
+
+    #[inline]
+    unsafe fn byte_ptr(&self, offset: i64, width: i64) -> Option<*mut u8> {
+        if offset < 0 || offset.checked_add(width).is_none_or(|end| end > self.esz) {
             return None;
         }
-        Some(unsafe { self.eptr.add(d.offset as usize) })
+        Some(unsafe { self.eptr.add(offset as usize) })
     }
 }
 
@@ -2621,6 +2685,13 @@ impl FieldDst for SoaDst<'_> {
             return None;
         }
         Some(unsafe { self.base.add(off + self.row * stride) })
+    }
+
+    #[inline]
+    unsafe fn byte_ptr(&self, _offset: i64, _width: i64) -> Option<*mut u8> {
+        // A `soa<Struct>` never carries an `Option` field (rejected at the type level), so the
+        // optional-tag path is unreachable here.
+        None
     }
 }
 
@@ -2647,68 +2718,22 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
     let kind = (d.tag >> 8) & 0xff;
     let width = field_width(d, kind)?;
     let p = unsafe { dst.field_ptr(fi, d, width)? };
-    let w = width as usize;
     let colon = idx[k] as usize;
     let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1) };
-    if kind == 4 {
-        // Nested struct: the record-splitting loop keeps only the *record-level* colons in
-        // `rec_cols` (nested colons sit at a deeper bracket depth), so a nested field is one
-        // record-level colon whose value is a `{...}`. Parse it with the slow recursive decoder from
-        // the value position; the outer Mison walk is index-driven, so `vp`'s final position is unused.
-        return unsafe { decode_nested(&mut vp, d.sub, p) };
-    }
-    if kind == 3 {
-        // str: a zero-copy `{ptr,len}` view. The lean index holds no value quotes, so scan the
-        // string from the raw bytes via `string()` (which borrows the input and rejects escapes).
-        if w != 16 {
-            return None;
+    // Optional field (`opt_tag >= 0`): JSON `null` → `None` (the element buffer is zeroed, so the tag
+    // is already 0); any other value writes the payload at `p` (the `Option`'s payload slot) and sets
+    // the `Some` tag byte. A required field writes the value directly. The per-kind write (incl. the
+    // kind-4 nested recursion) is the single-sourced [`write_value`], shared with the slow path.
+    if d.opt_tag >= 0 {
+        if vp.skip_null().is_some() {
+            return Some(());
         }
-        let s = vp.string()?;
-        let pb = (s.as_ptr() as usize as u64).to_le_bytes();
-        let lb = (s.len() as i64).to_le_bytes();
-        // Two disjoint 8-byte fields of the 16-byte `{ptr,len}` slot; `pb`/`lb` are local arrays,
-        // `p` is the field's own destination (never aliases a local).
-        unsafe {
-            std::ptr::copy_nonoverlapping(pb.as_ptr(), p, 8);
-            std::ptr::copy_nonoverlapping(lb.as_ptr(), p.add(8), 8);
-        }
+        unsafe { write_value(&mut vp, kind, width, d, p)? };
+        let tag = unsafe { dst.byte_ptr(d.opt_tag, 1)? };
+        unsafe { *tag = 1 };
         return Some(());
     }
-    match kind {
-        1 => {
-            if w != 1 {
-                return None;
-            }
-            let v = vp.boolean()?;
-            unsafe { *p = v as u8 };
-        }
-        2 => {
-            if w != 4 && w != 8 {
-                return None;
-            }
-            let v = vp.number()?;
-            // `b` is a local array from `to_le_bytes()`, `p` the field's own destination — disjoint.
-            if w == 4 {
-                let b = (v as f32).to_le_bytes();
-                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
-            } else {
-                let b = v.to_le_bytes();
-                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
-            }
-        }
-        _ => {
-            if w != 1 && w != 2 && w != 4 && w != 8 {
-                return None;
-            }
-            // Parse + range-check per the field's (width, sign); `u64` uses the full-range path —
-            // see `parse_object` / `JsonParser::integer_field`.
-            let v = vp.integer_field(w, (d.tag & 0x1_0000) != 0)?;
-            let b = v.to_le_bytes();
-            // `w <= 8 == b.len()` (checked above); `b` is a local array, `p` a distinct destination.
-            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, w) };
-        }
-    }
-    Some(())
+    unsafe { write_value(&mut vp, kind, width, d, p) }
 }
 
 /// Mison **speculation** fast path: the record's colon count matched the learned pattern, so for each
@@ -2790,7 +2815,7 @@ unsafe fn json_fallback<D: FieldDst>(
             unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst)? };
         }
     }
-    if seen.all_seen(ctx.descs.len()) {
+    if seen.all_required_seen(ctx.descs) {
         Some(())
     } else {
         None // a declared field is missing
@@ -16883,7 +16908,7 @@ mod tests {
         // `tag = (signed << 16) | byte-width`). Returns (status, first 8 out bytes).
         fn decode(json: &[u8], tag: i32, out_size: i64) -> (i32, [u8; 8]) {
             let name = b"n";
-            let f = JsonField { name_ptr: name.as_ptr(), name_len: 1, tag, offset: 0, sub: core::ptr::null() };
+            let f = JsonField { name_ptr: name.as_ptr(), name_len: 1, tag, offset: 0, sub: core::ptr::null(), opt_tag: -1 };
             let mut out = [0u8; 8];
             let rc = unsafe {
                 align_rt_json_decode(
@@ -16978,7 +17003,7 @@ mod tests {
         // accept the full u64 range and reject overflow / negatives — the third of the three integer
         // write sites (Gate 1: same parse routing everywhere).
         let n = b"n";
-        let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() }]; // u64
+        let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }]; // u64
         let read_u64 = |ptr: *const u8, off: usize| -> u64 {
             let mut b = [0u8; 8];
             // `ptr` is the decoded-buffer source, `b` a distinct local array — disjoint.
@@ -17026,7 +17051,7 @@ mod tests {
         // both known keys and an unknown key (which both must report as absent → skipped).
         let names = [b"id".as_slice(), b"score", b"age"];
         let descs: Vec<JsonField> =
-            names.iter().map(|n| JsonField { name_ptr: n.as_ptr(), name_len: n.len() as i64, tag: 0, offset: 0, sub: core::ptr::null() }).collect();
+            names.iter().map(|n| JsonField { name_ptr: n.as_ptr(), name_len: n.len() as i64, tag: 0, offset: 0, sub: core::ptr::null(), opt_tag: -1 }).collect();
         // A hand-built collision-free table (m=4, seed found by scanning) — mirrors `build_phf`.
         let m = 4usize;
         let mut seed = 0u64;
@@ -17294,8 +17319,8 @@ mod tests {
         let active = b"active";
         let pay = b"pay";
         let descs = [
-            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
         ];
         let src = br#"[{"active":true,"pay":10},{"active":false,"pay":20}]"#;
         let arena = align_rt_arena_begin();
@@ -17326,8 +17351,8 @@ mod tests {
         let active = b"active";
         let pay = b"pay";
         let descs = [
-            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null() },
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
         ];
         let arena = align_rt_arena_begin();
         let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
@@ -17383,8 +17408,8 @@ mod tests {
     fn nested_inner_descs() -> ([&'static [u8]; 2], [JsonField; 2]) {
         let names: [&[u8]; 2] = [b"x", b"name"];
         let descs = [
-            JsonField { name_ptr: names[0].as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: names[1].as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 8, sub: core::ptr::null() },
+            JsonField { name_ptr: names[0].as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: names[1].as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 8, sub: core::ptr::null(), opt_tag: -1 },
         ];
         (names, descs)
     }
@@ -17403,9 +17428,9 @@ mod tests {
         };
         let (id, inner, count) = (b"id", b"inner", b"count");
         let descs = [
-            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub },
-            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null() },
+            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub, opt_tag: -1 },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null(), opt_tag: -1 },
         ];
         // Field order deliberately shuffled; whitespace inside the nested object.
         let src = br#"{"count":9,"inner":{ "name":"hi", "x":5 },"id":1}"#;
@@ -17445,9 +17470,9 @@ mod tests {
         };
         let (id, inner, count) = (b"id", b"inner", b"count");
         let descs = [
-            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub },
-            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null() },
+            JsonField { name_ptr: id.as_ptr(), name_len: 2, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: inner.as_ptr(), name_len: 5, tag: 4 << 8, offset: 8, sub: &inner_sub, opt_tag: -1 },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 32, sub: core::ptr::null(), opt_tag: -1 },
         ];
         let src = br#"[{"id":1,"inner":{"x":5,"name":"a"},"count":9},
                        {"id":2,"inner":{"x":6,"name":"bb"},"count":8},
@@ -17512,7 +17537,7 @@ mod tests {
         };
 
         let a = b"a";
-        let one = [JsonField { name_ptr: a.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() }]; // a: u64
+        let one = [JsonField { name_ptr: a.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }]; // a: u64
 
         // REPRODUCTION: record 1 (`{"a":1,"x":9}`) learns the pattern `[a, <unqueried x>]` (colon
         // count 2). Record 2 (`{"a":1,"a":2}`) also has 2 colons, so speculation runs; its second
@@ -17527,8 +17552,8 @@ mod tests {
         // A duplicate at a *queried* pattern position stays rejected too (the key verify at that
         // ordinal fails → fallback → duplicate error). Two declared fields so both colons are queried.
         let ab = [
-            JsonField { name_ptr: b"a".as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null() },
-            JsonField { name_ptr: b"b".as_ptr(), name_len: 1, tag: 8, offset: 8, sub: core::ptr::null() },
+            JsonField { name_ptr: b"a".as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: b"b".as_ptr(), name_len: 1, tag: 8, offset: 8, sub: core::ptr::null(), opt_tag: -1 },
         ];
         assert_eq!(
             decode(br#"[{"a":1,"b":2},{"a":1,"a":2}]"#, &ab, 16).0,
@@ -19150,7 +19175,7 @@ mod tests {
     fn json_decode_rejects_non_utf8_input() {
         // A one-field struct `{ s: str }` — str field: kind 3, width 16, offset 0.
         let name = b"s";
-        let descs = [JsonField { name_ptr: name.as_ptr(), name_len: 1, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null() }];
+        let descs = [JsonField { name_ptr: name.as_ptr(), name_len: 1, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 }];
         let decode = |src: &[u8]| -> i32 {
             let mut out = [0u8; 16];
             unsafe {
