@@ -8,7 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-18, **JSON COMPLETENESS J1a SHIPPED — enum `str` payloads with region
+_Last updated: 2026-07-18, **JSON COMPLETENESS J1b-1 SHIPPED — enum as a struct field, PR #532**
+(the language prerequisite for shape-directed unions; the split first half of J1b). A struct field
+may now be a **sum type** — the `Message { content: Content }` shape union decode/encode needs. An
+enum is never Move today (`enum_payload_ok`: scalar / `str` / non-Move struct payloads), so an enum
+field needs no `Drop`; a `str`-bearing enum field region-ties the enclosing struct (soundness), a
+scalar-only enum field stays freely returnable (precision). **Sema:** `is_field_ok` admits
+`Ty::Enum`; `struct_has_str_rec` gains an enum arm (so `region_of`/escape catch a struct holding a
+`str`-bearing enum field leaving its arena); `ty_size_align`/`struct_size_align`/`struct_abi_layout`
+thread the `enums` table + `enum_size_align` (the enum lowers to `{ i32 tag, payloads-in-variant-
+order }`, the exact dual of codegen's `enum_types`, pinned by `layout_parity`); `struct_acyclic`
+becomes enum-aware with a new **post-0c pass** for cycles through an enum field (`Node{c:E}`,
+`E{V(Node)}`). **Codegen:** `enum_types` are built BEFORE the struct bodies (a struct field may be
+an enum) and threaded into `set_struct_body`; `field_abi_align`/`logical_to_physical` grow a
+`Ty::Enum` arm (align = `max(4, payload aligns)`) so sema and codegen agree on field reordering;
+`layout_parity` grows `SEnum*` cases. JSON decode/encode still cleanly REJECT an enum field in sema
+(the `json_payload_tag_sub` `unreachable!` stays unreachable) — that is J1b-2. `/align-self-review`
++ `/code-review` high (0 correctness findings; 2 minor comment/redundancy nits fixed) both run.
+Tests: `enum_match.rs` J1b section (46 green — construct+match, all payload shapes in-scope,
+scalar-only field freely returnable, str-bearing field cannot escape, cycle-through-enum rejected;
+Move-struct-owns-string + enum field drops clean); sema (151) + layout_parity green; clippy clean.
+**NEXT: J1b-2 — the shape-directed union decode/encode itself** (the descriptor's shape-class table
++ first-byte dispatch over str/number/bool/object payloads; enum as a decode target / union struct
+field; encode writes the live payload bare; array payloads = J2). Previous update: 2026-07-18,
+**JSON COMPLETENESS J1a SHIPPED — enum `str` payloads with region
 tracking, MERGED as #531** (`ee5a1e4`). The design's "region tracking pending" prerequisite for
 shape-directed unions. A sum type may now carry a `str`-view payload (and a `str`-bearing
 plain-data / non-Move struct payload); the enum is region-tracked iff any variant payload is.

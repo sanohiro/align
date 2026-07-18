@@ -436,3 +436,92 @@ fn str_bearing_struct_payload_cannot_escape() {
          return Ok(())\n}\n"
     ));
 }
+
+// ---- J1b: enum as a struct field (the JSON union language prerequisite) --------------------------
+
+#[test]
+fn struct_with_enum_field_construct_and_match() {
+    if !backend_available() {
+        return;
+    }
+    // A struct field may now be a sum type (`Msg { st: Status }`, J1b) — the `Message { content: … }`
+    // shape the JSON union needs. Construct the struct with an enum value, read the field, and match.
+    let src = "Status { Ok, Bad(i32) }\n\
+        Msg { code: i64, st: Status }\n\
+        fn eval(m: Msg) -> i64 = match m.st {\n  Ok => m.code\n  Bad(n) => m.code + n as i64\n}\n\
+        fn main() -> i32 {\n  \
+        a := Msg { code: 40, st: Status.Ok }\n  \
+        b := Msg { code: 40, st: Status.Bad(2) }\n  \
+        return (eval(a) + eval(b)) as i32\n}\n";
+    let out = build_and_run("struct-enum-field", src);
+    assert_eq!(out.status.code(), Some(82)); // 40 + (40+2)
+}
+
+#[test]
+fn struct_enum_field_str_and_object_payloads_in_scope() {
+    if !backend_available() {
+        return;
+    }
+    // A struct's enum field over every J1b payload shape used in-scope: `str` view (Named), a struct /
+    // object payload (At), and a tag-only/scalar variant (Empty). The `str` view stays inside the
+    // arena that backs it, so there is no escape.
+    let src = "Point { x: i64, y: i64 }\n\
+        Shape { Named(str), At(Point), Empty }\n\
+        Holder { s: Shape }\n\
+        fn measure(h: Holder) -> i64 = match h.s {\n  \
+        Named(name) => name.len() as i64\n  At(p) => p.x + p.y\n  Empty => 0\n}\n\
+        fn main() -> i32 {\n  \
+        arena {\n    n := template \"hello\"\n    \
+        a := Holder { s: Shape.Named(n) }\n    \
+        b := Holder { s: Shape.At(Point { x: 3, y: 4 }) }\n    \
+        c := Holder { s: Shape.Empty }\n    \
+        return (measure(a) + measure(b) + measure(c)) as i32\n  }\n}\n";
+    let out = build_and_run("struct-enum-field-shapes", src);
+    assert_eq!(out.status.code(), Some(12)); // len("hello") 5 + (3+4) + 0
+}
+
+#[test]
+fn struct_with_scalar_enum_field_freely_returnable() {
+    if !backend_available() {
+        return;
+    }
+    // Precision: a struct whose enum field is scalar-only borrows nothing, so it is freely returnable
+    // from an arena (the J1b field admission must not over-restrict — the region change is opt-in on a
+    // `str`-bearing payload, matching `scalar_only_enum_still_returnable` at the enum level).
+    let src = "Status { Ok, Bad(i32) }\n\
+        Msg { code: i64, st: Status }\n\
+        fn make() -> Msg = arena { Msg { code: 7, st: Status.Bad(3) } }\n\
+        fn main() -> i32 {\n  \
+        m := make()\n  \
+        return match m.st {\n    Ok => m.code as i32\n    Bad(n) => (m.code as i32) + n\n  }\n}\n";
+    let out = build_and_run("struct-scalar-enum-returnable", src);
+    assert_eq!(out.status.code(), Some(10)); // 7 + 3
+}
+
+#[test]
+fn struct_with_str_enum_field_cannot_escape_arena() {
+    // Soundness: a struct holding a `str`-bearing enum field is input/arena-region-tied
+    // (`struct_has_str_rec` grew an enum arm), so the struct cannot escape the arena backing the view —
+    // else `w.c`'s `Text(view)` would be a use-after-free. Mirrors `enum_str_payload_cannot_escape_arena`
+    // one wrapper deeper.
+    assert!(check_errs(
+        "struct-enum-field-escape",
+        "Content { Text(str), Count(i64) }\n\
+         Wrap { c: Content }\n\
+         fn make(x: i64) -> Wrap {\n  \
+         return arena {\n    s := template \"hi {x}\"\n    Wrap { c: Content.Text(s) }\n  }\n}\n\
+         fn main() -> i32 {\n  w := make(5)\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn struct_recursive_through_enum_field_rejected() {
+    // A struct cannot contain itself through an enum field either (`Node { c: Wrap }`, `Wrap { N(Node) }`
+    // is an infinite inline layout). Caught by the post-0c enum-aware acyclicity pass.
+    assert!(check_errs(
+        "struct-enum-cycle",
+        "Node { c: Wrap }\n\
+         Wrap { N(Node), Leaf(i64) }\n\
+         fn main() -> i32 = 0\n"
+    ));
+}

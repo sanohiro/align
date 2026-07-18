@@ -851,16 +851,18 @@ fn align_up(n: u64, a: u64) -> u64 {
 /// **Alignment parity with codegen's `field_abi_align`.** The per-field *alignment* this returns is
 /// the sort key both here and in `align_codegen_llvm::logical_to_physical` use to order fields by
 /// descending alignment, so the two must agree on the alignment of every **valid struct-field type**
-/// (`is_field_ok`: `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`). They do — for that
-/// domain both give width-or-8-for-a-pointer, and both take a nested struct's alignment as the max of
-/// its members. The branches where they *differ* (`Unit` → here 1, there 4; `Array` → here 8, there
+/// (`is_field_ok`: `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`/`Option`/`array<T>`/
+/// sum-type `Enum`). They do — for that domain both give width-or-8-for-a-pointer, take a nested
+/// struct's alignment as the max of its members, and take a sum type's alignment as `max(4, payloads)`
+/// (`enum_size_align` ↔ `field_abi_align`'s `Ty::Enum` arm). The branches where they *differ*
+/// (`Unit` → here 1, there 4; `Array` → here 8, there
 /// `scalar_bytes.min(8)`) are all types `is_field_ok` **rejects**, so they never reach struct
 /// ordering; the divergence is unreachable, not a bug. `tests/…`/`layout_parity` (in the codegen
 /// crate) pins this against the real LLVM ABI size/align so any future drift — or a new wider-aligned
 /// field type (e.g. a `vecN<T>` field, 16-byte aligned) added to `is_field_ok` without updating
 /// **both** functions — fails loudly. Scalars top out at 64-bit (no `i128`/`f128`), so no field is
 /// wider than 8-byte aligned today.
-fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
     match ty {
         Ty::Int(it) => {
             let b = (it.bits / 8).max(1) as u64;
@@ -873,12 +875,17 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64
         Ty::Bool => (1, 1),
         Ty::Char => (4, 4),
         Ty::Unit => (0, 1),
-        Ty::Struct(id) => struct_size_align(id, structs, visiting),
+        Ty::Struct(id) => struct_size_align(id, structs, enums, visiting),
+        // A sum type lowers to codegen's non-union tagged struct `{ i32 tag, <every variant's payload
+        // flattened in variant order> }` (`enum_types`), natural alignment, **declaration order** (not
+        // reordered — unlike a struct). Must stay the exact dual of codegen's `field_abi_align`/
+        // `enum_types` (pinned by `layout_parity`). J1b: an enum is a valid struct field.
+        Ty::Enum(id) => enum_size_align(id, structs, enums, visiting),
         // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
         // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
         // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
         Ty::Option(s) => {
-            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, visiting);
+            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, enums, visiting);
             let pal = pal.max(1);
             let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
             (align_up(payload_off + psz, pal), pal)
@@ -896,7 +903,7 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64
 /// keeps declaration order. An `align(N)` over-alignment pads the reported *size* up to `N` (a tight
 /// array stride), but the reported *alignment* stays natural — the over-alignment lives at the
 /// storage seam (`type_align`), not in the aggregate type. Cycle-safe.
-fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+fn struct_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
     if visiting.contains(&id) {
         return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
     }
@@ -909,7 +916,7 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
         .fields
         .iter()
         .map(|f| {
-            let (fsz, fal) = ty_size_align(f.ty, structs, visiting);
+            let (fsz, fal) = ty_size_align(f.ty, structs, enums, visiting);
             (fsz, fal.max(1))
         })
         .collect();
@@ -937,13 +944,38 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
     (align_up(size, effective), align)
 }
 
+/// Natural-alignment `(size, align)` of a sum type as codegen lays it out (`enum_types`): the
+/// non-union tagged struct `{ i32 tag, <every variant's payload flattened in **variant declaration
+/// order**> }`, `packed=false`. Unlike a struct, an enum's payload fields are **not** reordered by
+/// alignment — codegen emits them in variant order — so this walks them in order with natural
+/// padding. The exact dual of codegen's `enum_types` construction + `field_abi_align`'s `Ty::Enum`
+/// arm (pinned by `layout_parity`). Cycle-safe through the shared struct `visiting` set (a payload
+/// struct that loops back stops there; such a graph is rejected by `struct_acyclic` regardless).
+fn enum_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+    let Some(def) = enums.get(id as usize) else {
+        return (4, 4); // an unresolved enum id — size as a bare tag (defensive; reported elsewhere)
+    };
+    // Field 0 is the i32 tag; then each variant's payload scalars, in order.
+    let mut size = 4u64;
+    let mut align = 4u64;
+    for v in &def.variants {
+        for &s in &v.payload {
+            let (fsz, fal) = ty_size_align(scalar_to_ty(s), structs, enums, visiting);
+            let fal = fal.max(1);
+            size = align_up(size, fal) + fsz;
+            align = align.max(fal);
+        }
+    }
+    (align_up(size, align), align)
+}
+
 /// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
 /// non-`layout(C)` struct; declaration order for `layout(C)`). Public wrapper over
 /// [`struct_size_align`] for the cross-crate layout-parity test in `align_codegen_llvm`, which checks
 /// this against the real LLVM ABI size/alignment so the two hand-written layout computations
 /// (`ty_size_align` here, `field_abi_align` there) can never silently drift.
-pub fn struct_abi_layout(id: u32, structs: &[StructDef]) -> (u64, u64) {
-    struct_size_align(id, structs, &mut Vec::new())
+pub fn struct_abi_layout(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> (u64, u64) {
+    struct_size_align(id, structs, enums, &mut Vec::new())
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
@@ -2712,8 +2744,10 @@ pub fn check_program_with_effects(
                 );
             }
             // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
-            // depth 1, `Node { next: Node }` or `Node { next: Option<Node> }`) is detected.
-            if !struct_acyclic(nested, &structs, &mut vec![i as u32]) {
+            // depth 1, `Node { next: Node }` or `Node { next: Option<Node> }`) is detected. Enum
+            // payloads aren't resolved yet (that is pass 0c), so cycles running *through* an enum field
+            // are checked separately after 0c (see the enum-field acyclicity pass below).
+            if !struct_acyclic(nested, &structs, &enums, &mut vec![i as u32]) {
                 diags.error(
                     format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
                     f.span,
@@ -2765,6 +2799,24 @@ pub fn check_program_with_effects(
             field_base += n;
         }
         enums[i] = hir::EnumDef { name: mangle_fn(module, *_is_entry, &e.name.name), variants };
+    }
+
+    // Pass 0c-2: enum-field acyclicity. A struct field may now be a sum type (J1b), and an enum embeds
+    // its payloads inline, so a cycle can run through it (`Node { c: E }`, `E { V(Node) }`) — an
+    // infinite layout, like a direct self-referential struct field. This is checked here (not in pass
+    // 0b-2, which runs before enum payloads are resolved): every struct that has at least one enum
+    // field is walked **once** over the combined struct+enum graph seeded with the containing struct,
+    // so a payload struct that loops back is reported. The span points at the first enum field (the
+    // frontier through which the cycle must pass); it is recovered from the AST decl by field name.
+    for (i, decl) in struct_decls.iter().enumerate() {
+        let Some(enum_field) = structs[i].fields.iter().find(|f| matches!(f.ty, Ty::Enum(_))) else { continue };
+        if !struct_acyclic(i as u32, &structs, &enums, &mut Vec::new()) {
+            let span = decl.2.fields.iter().find(|sf| sf.name.name == enum_field.name).map_or(decl.2.span, |sf| sf.span);
+            diags.error(
+                format!("struct field '{}' is recursive through a sum type — a struct cannot contain itself without a `box` indirection", enum_field.name),
+                span,
+            );
+        }
     }
 
     // Every function across all modules, tagged with its module path + whether that is the entry
@@ -5086,6 +5138,19 @@ impl<'a> EscapeCheck<'a> {
                 // hold a str-bearing struct — both make the enclosing struct input-region-tied.
                 Ty::Option(Scalar::Str) => true,
                 Ty::Option(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
+                // A sum-type (`enum`) field holds a `str` view when its live variant carries one — a
+                // `Content.Text(view)` field makes the enclosing struct input-region-tied, exactly like
+                // a direct `str` field (J1b). Recurse into a `str`-bearing struct payload too; a
+                // scalar-only enum contributes no region (stays `Static`, freely returnable).
+                Ty::Enum(eid) => self.enums.get(eid as usize).is_some_and(|e| {
+                    e.variants.iter().any(|v| {
+                        v.payload.iter().any(|&s| match s {
+                            Scalar::Str => true,
+                            Scalar::Struct(nid) => self.struct_has_str_rec(nid, stack),
+                            _ => false,
+                        })
+                    })
+                }),
                 _ => false,
             };
             if has {
@@ -9209,8 +9274,9 @@ impl<'a, 't> Checker<'a, 't> {
             let mut visiting = Vec::new();
             // The struct name for the message — `.get()` (not direct indexing) so a stray id can
             // never panic; `sz > 0` already implies the struct exists (a missing one sizes to 0).
+            let enums = &self.enums;
             let huge = |structs: &[StructDef], id: u32, visiting: &mut Vec<u32>| {
-                let (sz, _) = struct_size_align(id, structs, visiting);
+                let (sz, _) = struct_size_align(id, structs, enums, visiting);
                 (sz > HUGE_STRUCT_BYTES)
                     .then(|| structs.get(id as usize).map(|d| (sz, d.name.clone())))
                     .flatten()
@@ -20670,6 +20736,13 @@ fn is_field_ok(ty: Ty) -> bool {
     // *collections* (`array<T>` etc.) as fields are a later slice.
     match ty {
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
+        // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
+        // J1b). An enum is **never Move** today (its payloads are scalar / `str` / non-Move struct —
+        // `enum_payload_ok`), so it needs no recursive `Drop`; a `str`-bearing enum field region-ties
+        // the enclosing struct to the borrowed storage (`struct_has_str_rec` / `tracks_region` handle
+        // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
+        // arm gains the same non-Move / Drop split the `array<T>` field has.
+        Ty::Enum(_) => true,
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
         // rejected until array-in-Option lands, matching the direct-field rule).
         Ty::Option(s) => is_field_ok(scalar_to_ty(s)),
@@ -20686,18 +20759,35 @@ fn is_field_ok(ty: Ty) -> bool {
 /// transitively, without a `box` indirection (which would be an infinite layout). `visiting` is the
 /// current DFS path (seeded with the original containing struct). An out-of-range id is a resolution
 /// error already reported elsewhere — treated as acyclic so it doesn't emit a spurious cycle error.
-fn struct_acyclic(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+///
+/// **Enum fields (J1b):** a sum-type field stores its payload **inline** (`{ i32 tag, payloads… }`),
+/// so a cycle can now run *through* an enum — `Node { c: E }`, `E { V(Node) }`. Enum payloads are
+/// scalars or structs (never another enum — `enum_payload_ok`), so the walk recurses into each
+/// variant's struct payloads; every enum-involving cycle therefore passes through a struct on the
+/// `visiting` path and is caught. Requires the `enums` table populated (call **after** pass 0c).
+fn struct_acyclic(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
     if visiting.contains(&id) {
         return false; // recursion — forbidden without a `box` indirection
     }
     let Some(def) = structs.get(id as usize) else { return true };
     visiting.push(id);
     let ok = def.fields.iter().all(|f| match f.ty {
-        Ty::Struct(nid) => struct_acyclic(nid, structs, visiting),
+        Ty::Struct(nid) => struct_acyclic(nid, structs, enums, visiting),
         // An `Option<Struct>` field stores the struct **inline** (`{ i8 tag, Struct }`), so a
         // `Node { next: Option<Node> }` is still an infinite layout — recurse into the payload struct
         // exactly like a direct nested-struct field (a `box` indirection is the way to a recursive type).
-        Ty::Option(Scalar::Struct(nid)) => struct_acyclic(nid, structs, visiting),
+        Ty::Option(Scalar::Struct(nid)) => struct_acyclic(nid, structs, enums, visiting),
+        // A sum-type field embeds its payloads inline — recurse into every struct payload (a scalar /
+        // `str` payload is a leaf). `E` is not pushed onto `visiting` (it holds struct ids), but any
+        // cycle back to a struct on the path is still detected there.
+        Ty::Enum(eid) => enums.get(eid as usize).is_none_or(|e| {
+            e.variants.iter().all(|v| {
+                v.payload.iter().all(|&s| match s {
+                    Scalar::Struct(nid) => struct_acyclic(nid, structs, enums, visiting),
+                    _ => true,
+                })
+            })
+        }),
         _ => true,
     });
     visiting.pop();
