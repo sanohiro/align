@@ -2667,15 +2667,51 @@ pub unsafe extern "C" fn align_rt_json_decode_union(input: *const u8, input_len:
     }
     let u = unsafe { &*union_desc };
     let mut p = JsonParser { src, pos: 0 };
-    let ok = (|| -> Option<()> {
-        unsafe { decode_union_value(&mut p, u, out)? };
-        p.ws();
-        if p.pos != src.len() {
-            return None; // trailing garbage
+    // `decode_union_value` is atomic: on failure it allocates nothing that survives (an
+    // `array<Struct>` arm builds into a local `Vec` freed on the early return; the owned buffer is
+    // materialized only after the value fully parses). So a decode failure needs no cleanup.
+    if unsafe { decode_union_value(&mut p, u, out) }.is_none() {
+        return 1;
+    }
+    p.ws();
+    if p.pos != src.len() {
+        // Trailing garbage AFTER a successful decode: the value is a live enum, so an owned
+        // `array<Struct>` (kind-5) payload is now materialized in `out` — free it before returning the
+        // decode `Err`, else it leaks (the Align side has no bound value to drop on the error path).
+        unsafe { drop_decoded_union(out, u) };
+        return 1;
+    }
+    0
+}
+
+/// Free the owned payload of a decoded union value on an error path (trailing garbage after a
+/// successful `decode_union_value`). The union analogue of [`drop_decoded_owned`]: read the enum tag,
+/// find the matching arm, and if it is a kind-5 owned `array<Struct>` free its `{ptr,len}` buffer and
+/// null the slot (idempotent). Every other arm is non-owned (scalar / `str` view / plain-data object),
+/// so there is nothing else to free.
+///
+/// # Safety
+/// `base` must point at a decoded enum of `u.store_size` bytes; `u` must be a valid [`JsonUnion`].
+unsafe fn drop_decoded_union(base: *mut u8, u: &JsonUnion) {
+    let mut tag_bytes = [0u8; 4];
+    unsafe { core::ptr::copy_nonoverlapping(base, tag_bytes.as_mut_ptr(), 4) };
+    let tag = i32::from_le_bytes(tag_bytes);
+    let arms = unsafe { safe_slice(u.arms, u.n_arms) };
+    let enum_tags = unsafe { core::slice::from_raw_parts(u.enum_tags, arms.len()) };
+    for (i, d) in arms.iter().enumerate() {
+        if enum_tags[i] != tag {
+            continue;
         }
-        Some(())
-    })();
-    if ok.is_some() { 0 } else { 1 }
+        if (d.tag >> 8) & 0xff == 5 && d.offset >= 0 {
+            let off = d.offset as usize;
+            let mut pb = [0u8; 8];
+            unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
+            let ptr = usize::from_le_bytes(pb) as *mut u8;
+            unsafe { align_rt_free(ptr) };
+            unsafe { core::ptr::write_bytes(base.add(off), 0, 8) };
+        }
+        return;
+    }
 }
 
 /// Tracks which declared fields `parse_object` has seen, to reject duplicates and require all of
@@ -18125,6 +18161,37 @@ mod tests {
         // The inner `items` array allocated once; it must be freed EXACTLY once (no double-free).
         assert_eq!(a1 - a0, 1, "one array buffer allocated");
         assert_eq!(f1 - f0, 1, "freed exactly once — no double free, no leak");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_union_array_arm_trailing_garbage_frees_buffer() {
+        // Memory-safety (J2b): a top-level union whose live variant is an owned `array<Struct>`
+        // materializes the AoS into the enum, but trailing garbage then fails the decode. The caller
+        // has no bound value to drop on that `Err`, so `drop_decoded_union` must free the AoS — else it
+        // leaks. `Content { Text(str)@8, Parts(array<Part>)@24 }`; `Part { kind: str@0, text: str@16 }`.
+        let (pk, pt) = (b"kind", b"text");
+        let part_descs = [
+            JsonField { name_ptr: pk.as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: pt.as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let part_sub = JsonSubTable { descs: part_descs.as_ptr(), n_fields: 2, store_size: 32, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        // arm 0 = Text(str) at offset 8; arm 1 = Parts(array<Part>) at offset 24 (kind 5).
+        let arms = [
+            JsonField { name_ptr: core::ptr::null(), name_len: 0, tag: (3 << 8) | 16, offset: 8, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: core::ptr::null(), name_len: 0, tag: (5 << 8) | 16, offset: 24, sub: &part_sub, opt_tag: -1 },
+        ];
+        let class_to_arm: [i32; 5] = [0, -1, -1, -1, 1]; // Str→arm0, Array→arm1
+        let enum_tags: [i32; 2] = [0, 1];
+        let u = JsonUnion { arms: arms.as_ptr(), class_to_arm: class_to_arm.as_ptr(), enum_tags: enum_tags.as_ptr(), n_arms: 2, store_size: 40 };
+        let src = br#"[{"kind":"a","text":"b"}] xyz"#; // valid array value, then trailing garbage
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 40];
+        let rc = unsafe { align_rt_json_decode_union(src.as_ptr(), src.len() as i64, &u, out.as_mut_ptr()) };
+        assert_ne!(rc, 0, "trailing garbage must fail the union decode");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, 1, "the array arm allocated one buffer");
+        assert_eq!(f1 - f0, 1, "the error path freed it exactly once — no leak, no double-free");
     }
 
     #[test]

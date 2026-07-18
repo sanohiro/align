@@ -27,25 +27,29 @@ json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: U
 //                           inside arena {}; str columns borrow the input text; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 //   enum (union)           (shape-directed: a JSON oneOf → a sum type; the variant is selected by the
-//                           value's shape class — str/number/bool/object; O(1) first-byte dispatch;
-//                           str payloads borrow the input; array-payload variants = J2)
+//                           value's shape class — str/number/bool/object/array; O(1) first-byte dispatch;
+//                           str payloads borrow the input; an owned array<Struct> variant is J2b)
 ```
 
 **Union (sum-type) targets (JSON completeness J1b).** A JSON `oneOf` maps to a sum type
 discriminated by the value's **shape class** — `Str` (`"`) / `Number` (digit/`-`) / `Bool` (`t`/`f`)
-/ `Object` (`{`) — an O(1) dispatch on the first structural byte. **Compile-checked (the Align
-move):** a union-decodable enum has every variant carry exactly one payload, each payload mapping to
-one shape class, all classes **pairwise distinct** — `i64 | f64` (both Number) or two object payloads
-are a compile error naming the clash; a tag-only or no-shape (`char`) payload is rejected too. `null`
-is not a class (absence belongs to `Option`); a runtime value whose shape has no variant (e.g. an
-array, or `null`) is a decode `Err`. Encode writes the live variant's payload **bare** (no wrapper
-key), so `decode(encode(x))` round-trips by construction. Runtime: a `JsonUnion` descriptor (one
-`JsonField` payload arm per variant + a shape-class→arm table + an arm→enum-tag table); decode
-classifies the first byte, writes the payload via the shared `write_value`, and sets the tag; encode
-reads the tag and emits the live arm via the shared `json_encode_value`. **v1 boundary:** payloads are
-str / number / bool / object (an owned `array<Struct>` payload — the OpenAI multimodal `content`
-union — needs enum owned-payload drop, J2). `json.encode` of a top-level union needs a local binding
-(like struct encode). **Union as a struct field (J1b-2b, SHIPPED):** a struct field may be a union
+/ `Object` (`{`) / `Array` (`[`) — an O(1) dispatch on the first structural byte. **Compile-checked
+(the Align move):** a union-decodable enum has every variant carry exactly one payload, each payload
+mapping to one shape class, all classes **pairwise distinct** — `i64 | f64` (both Number), two object
+payloads, or two array payloads are a compile error naming the clash; a tag-only or no-shape (`char`)
+payload is rejected too. `null` is not a class (absence belongs to `Option`); a runtime value whose
+shape no variant claims (e.g. an array in a union with no array variant, or `null`) is a decode `Err`.
+Encode writes the live variant's payload **bare** (no wrapper key), so `decode(encode(x))` round-trips
+by construction. Runtime: a `JsonUnion` descriptor (one `JsonField` payload arm per variant + a
+shape-class→arm table + an arm→enum-tag table); decode classifies the first byte, writes the payload
+via the shared `write_value`, and sets the tag; encode reads the tag and emits the live arm via the
+shared `json_encode_value`. **Owned `array<Struct>` payload (J2b, SHIPPED — the OpenAI multimodal
+`content: str | array<Part>` union):** a `[` dispatches to the Array-class arm (descriptor kind 5, the
+element struct's sub-schema), decoding into an owned AoS the enum's tag-switched `Drop` frees; encode
+writes it as a bare JSON array. The full `Content { Text(str), Parts(array<Part>) }` round-trips. The
+element struct must be non-owned (Slice-C rule; `array<string>` / `array<Move-struct>` deferred), and
+an `array<scalar>` union payload has no descriptor arm yet (J3). `json.encode` of a top-level union
+needs a local binding (like struct encode). **Union as a struct field (J1b-2b, SHIPPED):** a struct field may be a union
 (`Message { content: Content }`) — a descriptor **kind 6** whose `sub` is the `JsonUnion` (reused for
 both decode and encode); `field_width`/`write_value` (all decode paths — slow + Mison speculative +
 fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes with nested structs,

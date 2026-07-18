@@ -15530,8 +15530,10 @@ impl<'a, 't> Checker<'a, 't> {
             return false;
         }
         let mut ok = true;
-        // Each shape class (Str/Number/Bool/Object) may be claimed by at most one variant.
-        let mut class_owner: [Option<String>; 4] = Default::default();
+        // Each shape class (Str/Number/Bool/Object/Array) may be claimed by at most one variant.
+        // Sized `JSON_SHAPE_CLASSES` so an Array-class payload (`union_shape_class` → 4) indexes in
+        // bounds (J2b — a `[_; 4]` would panic on the Array arm).
+        let mut class_owner: [Option<String>; JSON_SHAPE_CLASSES] = Default::default();
         for v in &variants {
             if v.payload.len() != 1 {
                 self.diags.error(
@@ -15559,8 +15561,14 @@ impl<'a, 't> Checker<'a, 't> {
                 continue;
             }
             class_owner[cls as usize] = Some(v.name.clone());
-            // An object (struct) payload must itself be json-decodable — recurse into its fields.
-            if let Scalar::Struct(sid) = sc
+            // An object (struct) payload — or the ELEMENT struct of an `array<Struct>` payload (J2b)
+            // — must itself be json-decodable: recurse into its fields (the array element reuses the
+            // struct-array descriptor, so its element struct is validated exactly like a nested object).
+            let recurse_sid = match sc {
+                Scalar::Struct(sid) | Scalar::DynStructArray(sid) => Some(sid),
+                _ => None,
+            };
+            if let Some(sid) = recurse_sid
                 && !self.decode_struct_fields_ok(sid, span)
             {
                 ok = false;
@@ -21045,6 +21053,12 @@ pub fn union_shape_class(s: Scalar) -> Option<u8> {
         Scalar::Int(_) | Scalar::Float(_) => Some(1),
         Scalar::Bool => Some(2),
         Scalar::Struct(_) => Some(3),
+        // An owned `array<Struct>` payload → Array(4), a leading `[` (JSON completeness J2b — the
+        // multimodal `Content { Text(str), Parts(array<Part>) }` union). Decode/encode reuse the
+        // struct-array descriptor arm (kind 5), so the element must be a non-owned decodable struct
+        // (checked in `check_union_decodable`). An `array<scalar>` union payload (`Scalar::DynArray`)
+        // has no descriptor arm yet — it stays `None` (rejected) until J3.
+        Scalar::DynStructArray(_) => Some(4),
         _ => None,
     }
 }

@@ -7311,6 +7311,14 @@ fn json_union_schema_sig_into(enums: &[hir::EnumDef], structs: &[hir::StructDef]
             // through the shared `visiting` set so a cycle terminates.
             match v.payload.first() {
                 Some(align_sema::Scalar::Struct(nid)) => json_schema_sig_into(structs, enums, *nid, visiting, out),
+                // An owned `array<Struct>` payload (J2b): expand the ELEMENT struct's schema (prefixed
+                // `[]`) so a change to the element's fields invalidates the union's decode/encode cache
+                // (#514/#517 class) — `ty_name` alone prints only the struct id, missing a field
+                // rename / type change that the descriptor (hence the decoded bytes) depends on.
+                Some(align_sema::Scalar::DynStructArray(nid)) => {
+                    out.push_str("[]");
+                    json_schema_sig_into(structs, enums, *nid, visiting, out);
+                }
                 Some(sc) => out.push_str(&ty_name(align_sema::scalar_to_ty(*sc))),
                 None => out.push_str("()"),
             }
