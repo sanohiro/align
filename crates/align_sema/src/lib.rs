@@ -2868,31 +2868,14 @@ pub fn check_program_with_effects(
         // `drop_enum`. No rejection here — a Move enum field is as legal as a `string`/owned-array field.
     }
 
-    // Pass 0c-3: `array<Move-struct>` struct-field rejection. An `array<Struct>` field is freed by ONE
-    // flat free of its AoS buffer (`drop_struct_fields`'s array arm), so its element must be non-owned;
-    // an owned-element array needs a per-element deep free (a later slice). This runs **after** pass 0c
-    // — not in 0b-2 with the `array<string>` check — because an element struct can be Move *only*
-    // through a not-yet-resolved enum field (`Chat { messages: array<Message> }` where `Message` owns
-    // a Move-enum field, J3): at 0b-2 the enum payloads are empty, so `struct_is_move` would wrongly
-    // read the element as non-Move and let the field leak each element's owned buffer. Here the enum
-    // table is populated, so `struct_is_move` is accurate. (A `string`/nested-struct-owned element is
-    // caught here too — one check for every reason an element can be Move.)
-    for (i, decl) in struct_decls.iter().enumerate() {
-        for f in &structs[i].fields {
-            if let Ty::DynStructArray(eid, _) = f.ty
-                && struct_is_move(eid, &structs, &enums)
-            {
-                let span = decl.2.fields.iter().find(|sf| sf.name.name == f.name).map_or(decl.2.span, |sf| sf.span);
-                diags.error(
-                    format!(
-                        "an `array<{}>` field needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
-                        structs[eid as usize].name
-                    ),
-                    span,
-                );
-            }
-        }
-    }
+    // `array<Move-struct>` struct fields (`Chat { messages: array<Message> }`, J3b) are now supported:
+    // codegen's `drop_struct_fields` array arm loops the `len` elements and recursively deep-frees each
+    // (freeing a `string`/owned-array/Move-enum field, transitively), then frees the AoS buffer; the
+    // runtime decode error path (`drop_decoded_owned` kind-5 / `decode_struct_array_value`) mirrors that
+    // per-element deep free. So there is no `array<Move-struct>` rejection here — an owned-element array
+    // is as legal as an owned scalar-element one. (`array<string>` — a bare-`string` element — is still
+    // rejected in pass 0b-2 above: it is a `DynArray(String)`, not a struct-element array, and its
+    // per-element string free is a separate slice.)
 
     // Every function across all modules, tagged with its module path + whether that is the entry
     // module (so its name is unmangled). Used by passes 1 / 2 and the module-resolution table.

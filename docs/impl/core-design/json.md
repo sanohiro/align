@@ -78,11 +78,20 @@ buffer is freed by the struct's `Drop`. Encode: a `StructArrayField` piece calls
 descriptor-driven encoder (`json_encode_struct_array` → `json_encode_object`, **reusing the decode
 descriptors** — symmetric, handles nested/Option/str/scalar). **Memory-safety:** on a decode `Err`
 after an array field allocated, `drop_decoded_owned` frees the partial struct's AoS buffers (the
-runtime dual of codegen `drop_struct_fields`). **v1 element restriction:** non-owned (scalar /
-`str`-view / plain-data struct) — `array<string>` / `array<Move-struct>` rejected at declaration.
-**Constraint:** a Move struct (owns an array) can't be a `Result`/`Option` Ok payload across a
-function boundary — decode + use in-scope. Deferred: `array<scalar>` field decode, owned-element
-arrays.
+runtime dual of codegen `drop_struct_fields`). **`array<Move-struct>` elements (J3b, SHIPPED):** the
+element may now itself be **Move** — the `Chat { messages: array<Message> }` shape, each `Message`
+owning a Move-enum `content` field. Drop is a **deep** free: a shared codegen `deep_free_struct_array`
+helper loops the `len` elements, recursively `drop_struct_fields` each (freeing its `string`/owned-array/
+Move-enum field), then frees the AoS — called from both the struct-field drop AND a standalone
+`array<Struct>` local's `Stmt::Drop`. The runtime error path mirrors it: `drop_decoded_owned`'s kind-5
+arm deep-frees each element (gated by `sub_owns_buffers`), and `decode_struct_array_value` frees the
+elements already materialized in `buf[0..count]` on a mid-array parse failure. **With J3b the OpenAI
+chat gateway closes end-to-end** (`Chat` round-trips byte-identically). **Still rejected:**
+`array<string>` (a bare-`string`-element array field — its per-element string free is a separate slice,
+caught at 0b-2). **Constraint:** a Move struct (owns an array/Move-enum) can't be a `Result`/`Option`
+Ok payload across a function boundary — decode + use in-scope; `json.encode` of a bare
+`array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
+Deferred: `array<scalar>` field decode.
 
 **`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
 scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →
@@ -145,9 +154,9 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   over str/number/bool/object payloads (J1b-2a); union as a struct field (J1b-2b); enum owned
   `array<Struct>` payloads + tag-switched drop (J2a); the union Array shape-class arm (J2b); the
   multimodal union as a **Move-enum struct field** (`Message { content: Content }`, J3a) — all
-  documented above. **The `content` union now closes the gateway standalone and as a record field.**
-- **Matrix fill (J3):** `array<Move-struct>` owned-element deep free (closes
-  `Chat { messages: array<Message> }`, J3b), top-level scalar targets, `array<scalar>` fields,
+  documented above. Plus `array<Move-struct>` struct fields — the owned-element deep free (J3b) —
+  which closes `Chat { messages: array<Message> }`. **The OpenAI chat gateway now closes end-to-end.**
+- **Matrix fill (J3):** top-level scalar/bool decode targets, `array<scalar>` fields,
   `Option<struct>` encode, supported-constructor compositions.
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf

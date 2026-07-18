@@ -5045,6 +5045,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // A Move sum type (J2): tag-switched drop — free the live variant's owned
                         // `array<Struct>` payload buffer (null-safe on a moved-out / unconstructed slot).
                         self.drop_enum(self.slots[slot], eid)?;
+                    } else if matches!(ty, Ty::DynStructArray(eid, _) if struct_is_move(eid, self.structs, self.enums)) {
+                        // An owned `array<Move-struct>` standalone local (J3b) — e.g.
+                        // `ms: array<Message> := json.decode(...)`. Deep-free each element's owned buffers
+                        // then the AoS, via the same helper the struct-*field* drop uses (a flat free
+                        // would leak every element's owned buffer). Null-safe (a moved-out `{null,0}`
+                        // frees nothing and iterates 0 times).
+                        let Ty::DynStructArray(eid, _) = ty else { unreachable!() };
+                        self.deep_free_struct_array(self.slots[slot], eid)?;
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -7915,6 +7923,56 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// recurses. Null-safe: an unconstructed / moved-out struct was zeroed (`DropFlagInit`), so each
     /// owned leaf reads `{null,0}` and `free(null)` is a no-op. Copy fields (scalars, `str` borrows,
     /// plain-data nested structs) are skipped. (Slice 3 of `08-nested-structs.md`.)
+    /// Deep-free an owned `array<Move-struct>` (J3b) whose `{ptr,len}` aggregate lives at `slice_ptr`:
+    /// loop over the `len` elements, recursively `drop_struct_fields` each (freeing its own owned
+    /// fields — a `string`/owned-array/Move-enum field, transitively), then free the AoS buffer itself.
+    /// A flat free alone would leak every element's owned buffer. `drop_struct_fields` may append basic
+    /// blocks (a Move-enum element's `drop_enum`), so the loop back-edge branches from the block current
+    /// *after* the recursive call (`get_insert_block`). An empty array (len 0 / null ptr) skips the loop
+    /// and frees null. Shared by the struct-field drop (`drop_struct_fields`) and the standalone-local
+    /// drop (`Stmt::Drop`), so a bare `array<Move-struct>` local and an `array<Move-struct>` field free
+    /// identically.
+    fn deep_free_struct_array(&self, slice_ptr: inkwell::values::PointerValue<'c>, eid: u32) -> Result<(), CodegenError> {
+        let agg = self
+            .builder
+            .build_load(slice_struct_type(self.ctx), slice_ptr, "dropdeeparrv")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        let ptr = self.builder.build_extract_value(agg, 0, "dropdeeparrptr").map_err(|e| self.err(e))?.into_pointer_value();
+        let len = self.builder.build_extract_value(agg, 1, "dropdeeparrlen").map_err(|e| self.err(e))?.into_int_value();
+        let elem_ty = self.struct_types[eid as usize];
+        let i64t = self.ctx.i64_type();
+        let head = self.ctx.append_basic_block(self.func, "dropdeep.head");
+        let body = self.ctx.append_basic_block(self.func, "dropdeep.body");
+        let done = self.ctx.append_basic_block(self.func, "dropdeep.done");
+        let pred = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+        self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+        // head: i = phi [0, pred], [i+1, after-body]; branch to body while i < len.
+        self.builder.position_at_end(head);
+        let phi = self.builder.build_phi(i64t, "dropdeep.i").map_err(|e| self.err(e))?;
+        phi.add_incoming(&[(&i64t.const_zero(), pred)]);
+        let i_cur = phi.as_basic_value().into_int_value();
+        let cond = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULT, i_cur, len, "dropdeep.cmp")
+            .map_err(|e| self.err(e))?;
+        self.builder.build_conditional_branch(cond, body, done).map_err(|e| self.err(e))?;
+        // body: deep-free element i's owned fields, then i+1 and loop back.
+        self.builder.position_at_end(body);
+        let ep = unsafe {
+            self.builder.build_in_bounds_gep(elem_ty, ptr, &[i_cur], "dropdeep.ep").map_err(|e| self.err(e))?
+        };
+        self.drop_struct_fields(ep, eid)?;
+        let after = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+        let inext = self.builder.build_int_add(i_cur, i64t.const_int(1, false), "dropdeep.inext").map_err(|e| self.err(e))?;
+        phi.add_incoming(&[(&inext, after)]);
+        self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+        // done: free the AoS buffer (null-safe for an empty array).
+        self.builder.position_at_end(done);
+        self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
     fn drop_struct_fields(&self, base: inkwell::values::PointerValue<'c>, struct_id: u32) -> Result<(), CodegenError> {
         let st = self.struct_types[struct_id as usize];
         // Snapshot (index, field type) so we don't hold a borrow of `self.structs` across the
@@ -7949,11 +8007,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropenumfld").map_err(|e| self.err(e))?;
                     self.drop_enum(fp, eid)?;
                 }
-                // An owned `array<T>` field (REST-gateway runway Slice C) — free its single heap
-                // buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an empty array). The
-                // element is non-owned (sema pass 0b-2 rejects `array<string>` / `array<Move-struct>`),
-                // so this is one flat free — no per-element deep free — and `array<Struct>`'s `str`
-                // fields are borrowed views into the input, not freed here.
+                // An owned `array<Move-struct>` field (J3b) — the `Chat { messages: array<Message> }`
+                // shape, where each element owns a buffer (a `string`/owned-array field, or a Move-enum
+                // field like `Message`'s `content`). Deep-free each element then the AoS (`free(null)` is
+                // a no-op for an empty array) via the shared helper.
+                Ty::DynStructArray(eid, _) if struct_is_move(eid, self.structs, self.enums) => {
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropdeeparr").map_err(|e| self.err(e))?;
+                    self.deep_free_struct_array(fp, eid)?;
+                }
+                // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
+                // free its single heap buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an
+                // empty array). A scalar / `str`-view / plain-data-struct element owns nothing, so this is
+                // one flat free — no per-element deep free — and `array<Struct>`'s `str` fields are
+                // borrowed views into the input, not freed here. (A Move-struct element is deep-freed by
+                // the arm above.)
                 Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
                     let agg = self

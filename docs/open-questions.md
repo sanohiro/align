@@ -3823,10 +3823,22 @@ decode target uses `?`), and reassigning a Move-enum field leaks the old buffer 
 leaf is drop-of-old'd today — the SAME pre-existing gap `array<T>` fields have, not new). `/align-self-review`
 (Gate 1 Move-reason sweep; Gate 3 no-panic) + `/code-review` high run. Tests: `enum_match.rs`
 (construct/match-move/drop-clean), `m5.rs` J3 (both-shape decode/encode+round-trip, match-move no double-free,
-trailing-garbage no-leak, `array<Message>` rejected). **NEXT: J3b — `array<Move-struct>` struct fields
-(the owned-element deep free) to close `Chat { messages: array<Message> }`, then the T1b matrix fill.** →
-**J3** matrix fill (T1b — `array<Move-struct>` owned-element deep free that closes `Chat`, plus top-level
-scalars, `array<scalar>` fields, `Option<struct>` encode, supported-constructor compositions) →
+trailing-garbage no-leak, `array<Message>` rejected). **J3b — SHIPPED: `array<Move-struct>` struct
+fields (the owned-element deep free), closing `Chat { messages: array<Message> }`.** An `array<Struct>`
+field (and a standalone `array<Struct>` local) whose element is Move — a `string`/owned-array/Move-enum
+field, transitively — is deep-freed via a shared codegen `deep_free_struct_array` helper (a runtime loop
+over `len` recursively dropping each element, then freeing the AoS) called from both
+`drop_struct_fields`'s array arm AND `Stmt::Drop`'s standalone-local arm (the Gate-1 sibling hole); the
+runtime decode error path deep-frees each element (`drop_decoded_owned` kind-5, gated by a new
+`sub_owns_buffers` walk) and the mid-array partial (`decode_struct_array_value`'s `cleanup_partial`)
+before bailing. The J3a pass-0c-3 rejection is lifted; `array<string>` (bare-string element) stays
+deferred at 0b-2. **The OpenAI chat gateway now closes end-to-end** (`Chat` round-trips byte-identically).
+v1 limits: `json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
+(decode→encode passthrough works). Tests: `m5.rs` (full gateway round-trip, standalone-local drop,
+`array<string>`-element rejection), runtime alloc-count deep-free gates (a shared `ALLOC_COUNT_LOCK`
+serializes the count-asserting tests). **NEXT: J3 T1b matrix fill.** →
+**J3** matrix fill (T1b — top-level scalar/bool decode targets, `array<scalar>` fields,
+`Option<struct>` encode, supported-constructor compositions) →
 **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.

@@ -8,8 +8,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J3a SHIPPED (branch `json-j3a-move-enum-struct-field`,
-not yet merged) — the multimodal union as a Move-enum struct field (`Message { content: Content }`)**.
+_Last updated: 2026-07-19, **JSON COMPLETENESS J3b SHIPPED (branch `json-j3a-move-enum-struct-field`,
+not yet merged) — `array<Move-struct>` struct fields, closing the full OpenAI chat gateway shape
+`Chat { messages: array<Message> }`.** An `array<Struct>` field (and a standalone `array<Struct>` local)
+whose element is **Move** — a `string`/owned-array/Move-enum field, transitively — is now deep-freed
+instead of one flat free that leaked each element's owned buffer. **Codegen:** a shared
+`deep_free_struct_array(slice_ptr, eid)` helper emits a runtime loop over `len` that recursively
+`drop_struct_fields` each element, then frees the AoS buffer (`get_insert_block` captures the loop
+back-edge because a Move-enum element's `drop_enum` appends blocks); called from BOTH
+`drop_struct_fields`'s array arm (struct field) AND `Stmt::Drop`'s new `DynStructArray`-Move arm
+(standalone local — the Gate-1 sibling hole: `ms: array<Message> := json.decode(...)`). **Runtime:**
+`drop_decoded_owned`'s kind-5 arm deep-frees each element (gated by a new `sub_owns_buffers` walk) before
+freeing the AoS on the decode error path, and `decode_struct_array_value`'s `cleanup_partial` deep-frees
+the elements already materialized in `buf[0..count]` on a mid-array parse failure (the current failing
+element is cleaned by `parse_object`). **Sema:** the J3a pass-0c-3 `array<Move-struct>` rejection is
+lifted (every Move element is deep-freeable); `array<string>` (a bare-`string`-element array field) stays
+rejected at 0b-2. **v1 limits:** `json.encode` of a bare `array<Move-struct>` and pipelines over a
+Move-struct-array field are still restricted (element access is Slice-C-limited; the decode→encode
+passthrough of a `Chat` record works). `/align-self-review` (Gate 1 sibling-drop sweep — found + fixed
+the standalone-local leak; Gate 2/3 FFI/panic) + `/code-review` high run. Tests: `m5.rs`
+(`json_chat_array_of_move_message_roundtrip` — the full gateway shape, `json_standalone_array_of_move_struct_local_drops_clean`,
+`array<string>`-element rejection), runtime alloc-count (`json_array_of_move_struct_sibling_failure_deep_frees_every_element`
+exact 3==3, `..._mid_array_failure_frees_prior_elements` balance) + a shared `ALLOC_COUNT_LOCK` mutex
+serializing all 5 count-asserting alloc-count tests (global-counter pollution fix). Suites green: m5 139,
+runtime alloc-count full-suite 251 passed (only the known network/fd sandbox tests fail), clippy clean.
+**With J3b the OpenAI chat request/response gateway CLOSES end-to-end** (`Chat { messages: array<Message> }`
+with the multimodal `content` union round-trips byte-identically). **NEXT: J3 T1b matrix fill** —
+top-level scalar/bool decode targets (`x: i64 := json.decode(s)?`), `array<scalar>` struct fields,
+`Option<struct>` ENCODE (the Slice-B follow-up), supported-constructor compositions → **J4** `json.doc`
+→ **J5** `json.scan` → **J6** spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS J3a SHIPPED
+(branch `json-j3a-move-enum-struct-field`) — the multimodal union as a Move-enum struct field (`Message { content: Content }`)**.
 A **Move** enum (an owned `array<Struct>` payload variant) is now a legal struct field, which makes the
 enclosing struct **Move** — so the full multimodal `content: str | array<Part>` union composes into a
 record and decodes/encodes both shapes, round-tripping byte-identically. **Classifier:**

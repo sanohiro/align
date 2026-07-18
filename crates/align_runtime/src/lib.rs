@@ -2870,13 +2870,27 @@ unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable
     if p.peek() == Some(b']') {
         p.pos += 1;
     } else {
+        // Deep-free the `count` elements already materialized in `buf` before bailing on a mid-array
+        // error — an `array<Move-struct>` element (J3b) owns per-element buffers that dropping the `buf`
+        // Vec would leak (the current failing element `eptr` is cleaned by `parse_object`'s own error
+        // path, so it is excluded — 0..count). A no-op for a non-owned element (`sub_owns_buffers`).
+        let cleanup_partial = |buf: &mut [u8], count: i64| {
+            if unsafe { sub_owns_buffers(descs) } {
+                for k in 0..count.max(0) as usize {
+                    unsafe { drop_decoded_owned(buf.as_mut_ptr().add(k * esz), descs, None) };
+                }
+            }
+        };
         loop {
             let eoff = buf.len();
             buf.resize(eoff + esz, 0); // zero the element so missing/None fields read as 0
             // `buf` is a distinct heap Vec; the element pointer is valid for `esz` bytes and does not
             // alias the input `src` the `str` views point into.
             let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
-            unsafe { parse_object(p, descs, eptr, esz as i64, phf, phf_seed)? };
+            if unsafe { parse_object(p, descs, eptr, esz as i64, phf, phf_seed) }.is_none() {
+                cleanup_partial(&mut buf, count);
+                return None;
+            }
             count += 1;
             p.ws();
             match p.peek() {
@@ -2889,7 +2903,10 @@ unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable
                     p.pos += 1;
                     break;
                 }
-                _ => return None,
+                _ => {
+                    cleanup_partial(&mut buf, count);
+                    return None;
+                }
             }
         }
     }
@@ -2914,6 +2931,28 @@ unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable
 ///
 /// # Safety
 /// `base`/`descs` must describe the struct actually being decoded; each kind-4 `sub` must be valid.
+/// Whether a decoded struct described by `descs` transitively owns any heap buffer that
+/// [`drop_decoded_owned`] would free — an `array<Struct>` field (kind 5), a union field (kind 6), or a
+/// nested struct (kind 4) that does. Used to decide whether an `array<Struct>` element needs a
+/// per-element deep free (`array<Move-struct>`, J3b) versus a single flat free of the AoS buffer. A
+/// kind-6 union that owns nothing makes the walk return `true` conservatively — the per-element
+/// `drop_decoded_owned` then no-ops via `drop_decoded_union`, so this only ever over-approximates
+/// (never leaks). Cycle-free: the struct graph `json.decode` accepts is acyclic (`decode_struct_fields_ok`).
+///
+/// # Safety
+/// Every kind-4/5/6 `sub` in `descs` (and transitively) must be a valid descriptor pointer.
+unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
+    descs.iter().any(|d| match (d.tag >> 8) & 0xff {
+        5 | 6 => !d.sub.is_null(),
+        4 if !d.sub.is_null() => {
+            let sub = unsafe { &*d.sub };
+            let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+            unsafe { sub_owns_buffers(sub_descs) }
+        }
+        _ => false,
+    })
+}
+
 unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Option<&SeenSet>) {
     for (i, d) in descs.iter().enumerate() {
         if only_seen.is_some_and(|s| !s.is_set(i)) {
@@ -2926,15 +2965,31 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
         let off = d.offset as usize;
         match (d.tag >> 8) & 0xff {
             5 => {
-                // Read the array `{ptr,len}` slot's pointer (first 8 bytes), free the buffer, then
-                // NULL the slot — idempotent, so a nested struct freed by its OWN parse_object cleanup
-                // and then again by the outer struct's cleanup (a Move nested field whose decode failed
-                // after allocating an array) does not double-free (the second read sees null).
+                // Read the array `{ptr,len}` slot's pointer (first 8 bytes) and element count (next 8).
+                // If the element struct itself owns buffers (an `array<Move-struct>` field — the
+                // `Chat { messages: array<Message> }` shape, J3b), **deep-free each element first**
+                // (`drop_decoded_owned` on the element, per its sub-descriptors) so a per-element
+                // owned buffer is not leaked, then free the AoS buffer and NULL the slot. The NULL makes
+                // this idempotent — a nested struct freed by its OWN `parse_object` cleanup and again by
+                // the outer struct's cleanup does not double-free (the second read sees null / len 0).
                 let mut pb = [0u8; 8];
                 unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
                 let ptr = usize::from_le_bytes(pb) as *mut u8;
+                if !ptr.is_null() && !d.sub.is_null() {
+                    let sub = unsafe { &*d.sub };
+                    let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
+                    if unsafe { sub_owns_buffers(sub_descs) } {
+                        let mut lb = [0u8; 8];
+                        unsafe { core::ptr::copy_nonoverlapping(base.add(off + 8), lb.as_mut_ptr(), 8) };
+                        let count = i64::from_le_bytes(lb).max(0) as usize;
+                        let esz = sub.store_size.max(0) as usize;
+                        for k in 0..count {
+                            unsafe { drop_decoded_owned(ptr.add(k * esz), sub_descs, None) };
+                        }
+                    }
+                }
                 unsafe { align_rt_free(ptr) };
-                unsafe { core::ptr::write_bytes(base.add(off), 0, 8) };
+                unsafe { core::ptr::write_bytes(base.add(off), 0, 16) };
             }
             // A seen nested struct is complete → free all its owned fields (no seen gate).
             4 if !d.sub.is_null() => {
@@ -18115,9 +18170,17 @@ mod tests {
         unsafe { align_rt_free(arr_ptr as *mut u8) };
     }
 
+    /// Serializes the alloc-count-asserting tests. The `ALLOC_CALLS`/`FREE_CALLS` counters are
+    /// process-global atomics, so two heavy-allocating tests running concurrently pollute each other's
+    /// snapshot deltas. Each such test holds this lock for its whole body (the `GET_MANY_SERVER_LOCK`
+    /// precedent), making the count assertions deterministic regardless of `--test-threads`.
+    #[cfg(feature = "alloc-count")]
+    static ALLOC_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_array_field_error_path_frees_buffer() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Memory-safety: when a sibling field fails AFTER an `array<Struct>` field decoded, the
         // partial struct's array buffer must be freed on the `Err` path (the caller doesn't drop a
         // failed decode). Parent { arr: array<Inner> @0, req: i64 @16 } with `req` missing.
@@ -18142,6 +18205,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_nested_move_struct_array_failure_no_double_free() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Memory-safety: a nested Move struct field (owns an `array<Struct>`) whose OWN decode fails
         // after the array allocated must not be freed twice — once by its parse_object cleanup and
         // again by the outer struct's cleanup. `drop_decoded_owned` nulls the slot after freeing, so
@@ -18175,6 +18239,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_union_array_arm_trailing_garbage_frees_buffer() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Memory-safety (J2b): a top-level union whose live variant is an owned `array<Struct>`
         // materializes the AoS into the enum, but trailing garbage then fails the decode. The caller
         // has no bound value to drop on that `Err`, so `drop_decoded_union` must free the AoS — else it
@@ -18201,6 +18266,66 @@ mod tests {
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, 1, "the array arm allocated one buffer");
         assert_eq!(f1 - f0, 1, "the error path freed it exactly once — no leak, no double-free");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_array_of_move_struct_sibling_failure_deep_frees_every_element() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Memory-safety (J3b): an `array<Move-struct>` field (`Chat { messages: array<Message> }`,
+        // where each `Message` itself owns an `array<Part>`) decoded successfully, but a later sibling
+        // field then fails the outer decode. `drop_decoded_owned`'s kind-5 arm must **deep-free** each
+        // element's owned `array<Part>` buffer (via `sub_owns_buffers` + the per-element loop) AND the
+        // outer `messages` AoS — a plain flat free would leak every element's buffer.
+        // Chat { messages: array<Message> @0, n: i64 @16 }; Message { parts: array<Part> @0 };
+        // Part { v: i64 @0 }. `n` is missing → the outer struct fails after `messages` decoded.
+        let pv = b"v";
+        let part_descs = [JsonField { name_ptr: pv.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }];
+        let part_sub = JsonSubTable { descs: part_descs.as_ptr(), n_fields: 1, store_size: 8, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let parts = b"parts";
+        let msg_descs = [JsonField { name_ptr: parts.as_ptr(), name_len: 5, tag: (5 << 8) | 16, offset: 0, sub: &part_sub, opt_tag: -1 }];
+        let msg_sub = JsonSubTable { descs: msg_descs.as_ptr(), n_fields: 1, store_size: 16, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let (messages, n) = (b"messages", b"n");
+        let descs = [
+            JsonField { name_ptr: messages.as_ptr(), name_len: 8, tag: (5 << 8) | 16, offset: 0, sub: &msg_sub, opt_tag: -1 },
+            JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        // 2 messages, each with a 2-element `parts` array → 1 (messages AoS) + 2 (part AoS each) = 3 allocs.
+        let src = br#"{"messages":[{"parts":[{"v":1},{"v":2}]},{"parts":[{"v":3},{"v":4}]}]}"#; // `n` missing
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 24];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        assert_ne!(rc, 0, "the missing required `n` must fail the decode");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, 3, "one messages AoS + one parts AoS per message");
+        assert_eq!(f1 - f0, 3, "the error path deep-freed every element buffer and the AoS — no leak, no double-free");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_array_of_move_struct_mid_array_failure_frees_prior_elements() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Memory-safety (J3b): a malformed element PART-WAY through an `array<Move-struct>` must free the
+        // owned buffers of the elements already decoded — `decode_struct_array_value`'s `cleanup_partial`
+        // deep-frees `buf[0..count]` before bailing (the current failing element is cleaned by
+        // `parse_object`), so no per-element buffer leaks. Same shape as above; the 3rd message's `parts`
+        // is malformed (a non-array), so messages 0 and 1 (each owning a `parts` AoS) must be freed.
+        let pv = b"v";
+        let part_descs = [JsonField { name_ptr: pv.as_ptr(), name_len: 1, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 }];
+        let part_sub = JsonSubTable { descs: part_descs.as_ptr(), n_fields: 1, store_size: 8, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let parts = b"parts";
+        let msg_descs = [JsonField { name_ptr: parts.as_ptr(), name_len: 5, tag: (5 << 8) | 16, offset: 0, sub: &part_sub, opt_tag: -1 }];
+        let msg_sub = JsonSubTable { descs: msg_descs.as_ptr(), n_fields: 1, store_size: 16, phf: core::ptr::null(), phf_len: 0, phf_seed: 0 };
+        let messages = b"messages";
+        let descs = [JsonField { name_ptr: messages.as_ptr(), name_len: 8, tag: (5 << 8) | 16, offset: 0, sub: &msg_sub, opt_tag: -1 }];
+        // messages 0 and 1 decode (allocating their parts AoS), message 2's `parts` is `5` (not an array) → fail.
+        let src = br#"{"messages":[{"parts":[{"v":1}]},{"parts":[{"v":2}]},{"parts":5}]}"#;
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 16];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0) };
+        assert_ne!(rc, 0, "the malformed 3rd element must fail the decode");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, f1 - f0, "every buffer allocated before the mid-array failure was freed (no leak)");
     }
 
     #[test]
