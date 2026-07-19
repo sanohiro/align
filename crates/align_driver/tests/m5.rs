@@ -961,6 +961,117 @@ fn json_decode_struct_array_where_field_then_map() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
 }
 
+// ---- J5: json.scan streaming typed rows ------------------------------------------------------
+
+#[test]
+fn json_scan_array_where_field_sum() {
+    if !backend_available() {
+        return;
+    }
+    // J5 slice 1: `json.scan` over a top-level JSON array, streamed one row at a time (no
+    // materialized `array<User>`). `rows.where(.active).score.sum()` fuses field-predicate +
+    // projection + sum into the streaming loop, and the terminal is `Result<i32, Error>` (a
+    // malformed row would surface as `Err`; `?` unwraps). bob (inactive) is filtered → 10 + 5 = 15.
+    let src = "import core.json\nUser { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"name\\\":\\\"cyd\\\",\\\"active\\\":true,\\\"score\\\":5}]\")\n  total := rows.where(.active).score.sum()?\n  print(total)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-array-sum", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+}
+
+#[test]
+fn json_scan_ndjson_count() {
+    if !backend_available() {
+        return;
+    }
+    // The same scanner handles NDJSON (newline-delimited objects, no enclosing `[]`): the runtime
+    // treats newlines as whitespace and commas/`[` as separators. `where(.active).count()` over 3
+    // rows keeps the 2 active → `Result<i64, Error>`, unwrapped by `?`.
+    let src = "import core.json\nUser { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"{\\\"id\\\":1,\\\"active\\\":true,\\\"score\\\":10}\\n{\\\"id\\\":2,\\\"active\\\":false,\\\"score\\\":99}\\n{\\\"id\\\":3,\\\"active\\\":true,\\\"score\\\":5}\")\n  n := rows.where(.active).count()?\n  print(n)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-ndjson-count", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn json_scan_projected_sum_all() {
+    if !backend_available() {
+        return;
+    }
+    // A bare field projection (no `where`) sums every row's `score`: 10 + 99 + 5 = 114.
+    let src = "import core.json\nUser { id: i64, score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10},{\\\"id\\\":2,\\\"score\\\":99},{\\\"id\\\":3,\\\"score\\\":5}]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-project-sum", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "114\n");
+}
+
+#[test]
+fn json_scan_empty_array_sum_is_zero() {
+    if !backend_available() {
+        return;
+    }
+    // An empty stream folds to the reducer identity (sum = 0) and yields `Ok(0)` — no allocation,
+    // no row decoded.
+    let src = "import core.json\nUser { score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+#[test]
+fn json_scan_malformed_row_errors() {
+    if !backend_available() {
+        return;
+    }
+    // A malformed row mid-stream makes the terminal `Err` — `?` propagates it, so `main` exits 1
+    // (nothing leaked; the fold accumulator is a scalar).
+    let src = "import core.json\nUser { id: i64, score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10}, oops]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-bad", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn json_scan_map_over_rows() {
+    if !backend_available() {
+        return;
+    }
+    // A `map(f)` stage over whole streamed rows: dbl(u) = u.score * 2 over the active rows →
+    // (10 + 5) * 2 = 30 (bob inactive, skipped). Exercises the whole-struct element load in a scan.
+    let src = "import core.json\nUser { active: bool, score: i64 }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")\n  print(rows.where(.active).map(dbl).sum()?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-map", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
+}
+
+#[test]
+fn json_scan_materializing_terminal_rejected() {
+    // A `json.scanner<Row>` is a streaming source; a materializing terminal (`.to_array()`) over a
+    // stream is rejected in sema (slice 1) with a clear diagnostic, not mis-lowered.
+    let errs = check_diagnostics(
+        "json-scan-to-array-reject",
+        "import core.json\nUser { score: i64 }\nfn main() -> Result<(), Error> {\n  arena {\n    rows: json.scanner<User> := json.scan(\"[{\\\"score\\\":1}]\")\n    xs := rows.score.to_array()\n    print(xs.len())\n  }\n  return Ok(())\n}\n",
+    );
+    assert!(errs.contains("streaming source"), "unexpected diagnostics:\n{errs}");
+}
+
+#[test]
+fn json_scan_cannot_escape_its_input() {
+    // A `json.scanner<Row>` borrows its input view; returning one built over a function-local owned
+    // `string` (freed at scope exit) is a region/escape error (the scanner would dangle). Mirrors the
+    // `str.bytes()` owned-escape check — the region machinery is shared.
+    let src = "import core.json\nRow { x: i64 }\nfn bad() -> json.scanner<Row> {\n  s := \"[{\\\"x\\\":1}]\".clone()\n  return json.scan(s)\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("json-scan-escape", src));
+}
+
+#[test]
+fn json_scan_requires_binding_annotation() {
+    // Without a `json.scanner<Row>` annotation the row type cannot be inferred — a clear error.
+    let errs = check_diagnostics(
+        "json-scan-no-annot",
+        "import core.json\nfn main() -> Result<(), Error> {\n  rows := json.scan(\"[]\")\n  return Ok(())\n}\n",
+    );
+    assert!(errs.contains("cannot infer the scan row type"), "unexpected diagnostics:\n{errs}");
+}
+
 #[test]
 fn array_index_fixed_and_owned() {
     if !backend_available() {

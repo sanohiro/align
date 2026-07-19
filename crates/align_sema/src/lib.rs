@@ -498,6 +498,15 @@ pub enum Ty {
     /// total and returns another `json.doc`; leaf accessors (`as_str`/`as_i64`/`as_f64`/`as_bool`)
     /// return `Option`; `d.kind()` returns the builtin `json.kind` enum.
     JsonDoc,
+    /// A `json.scanner<Row>` (`core.json`, J5) — a streaming typed-row scanner over a JSON view. A
+    /// **Copy** `{ ptr, len }` handle (the input view; same ABI as a `str`/slice), **region-tracked**
+    /// (it borrows the input, never Move, never dropped). Produced by `json.scan(view)` with `Row`
+    /// carried by the binding annotation (`rows: json.scanner<Row> := json.scan(view)`); the id is the
+    /// row struct. It is a **pipeline source only** (v1): a fused terminal (`rows.where(.active).pay.sum()`)
+    /// streams one row at a time (decode-into-a-slot per step, no materialized `array<Row>`), and the
+    /// terminal's type is `Result<T, Error>` (a malformed row surfaces once as `Err`). Handles both a
+    /// top-level JSON array and NDJSON. The decoded row's `str` fields borrow the input.
+    JsonScanner(u32),
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -729,6 +738,9 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         // A `json.doc` is a `{tape,node}` handle, not a `slice<T>` payload; its escape is enforced
         // through `tracks_region`, not `mentions_slice`.
         | Ty::JsonDoc
+        // A `json.scanner<Row>` is a `{ptr,len}` input view; like `json.doc`, its escape is enforced
+        // through `tracks_region`, not `mentions_slice`.
+        | Ty::JsonScanner(_)
         // The compiler-internal `str_finder` plan is an opaque owned handle; it holds no slice.
         | Ty::StrFinder
         | Ty::DictEncoded(..)
@@ -755,6 +767,8 @@ pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], en
         | Ty::Soa(_)
         // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view (J4).
         | Ty::JsonDoc
+        // A `json.scanner<Row>` borrows the JSON input view it streams over (J5).
+        | Ty::JsonScanner(_)
         | Ty::DictEncoded(..)
         | Ty::DynSliceArray(_)
         | Ty::Fn(_) => true,
@@ -4592,7 +4606,9 @@ impl EffectScan<'_> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
-            | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input),
+            | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
+            // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
+            | ExprKind::JsonScan { input, .. } => self.expr(input),
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => self.expr(input),
@@ -5022,6 +5038,9 @@ impl<'a> EscapeCheck<'a> {
             // A `json.doc` view borrows the arena tape + the JSON input (min of the two), so it is
             // region-tracked — it (and any str/sub-doc read of it) must not outlive either (J4).
             Ty::JsonDoc => true,
+            // A `json.scanner<Row>` view borrows the JSON input it streams over, so it is
+            // region-tracked — it must not outlive that input (J5).
+            Ty::JsonScanner(_) => true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
             Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
@@ -5340,6 +5359,10 @@ impl<'a> EscapeCheck<'a> {
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
             ExprKind::JsonDoc { input } => self.region_of(input, depth).shorter(Region::arena(depth)),
+            // `json.scan(input)` (J5): the scanner is a `{ptr,len}` view of the input (no arena tape),
+            // and the rows it streams borrow the input. So it is region-tied to the input alone — it
+            // cannot outlive it (a scanner escaping its input view is caught, like a `str`).
+            ExprKind::JsonScan { input, .. } => self.region_of(input, depth),
             // `d.get(k)` / `d.at(i)` yield another `json.doc` viewing the same tape; `d.as_str()` a
             // `str` view into the input (or the arena, for an escaped string). All live exactly as long
             // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
@@ -5904,6 +5927,8 @@ impl<'a> EscapeCheck<'a> {
             // a borrow of a function-local stack array, so it is not local-backed (escape is governed
             // by `region_of` = the arena). Like `to_array` / a `json.decode` view.
             | ExprKind::JsonDocElems { .. }
+            // A `json.scanner<Row>` handle is a `{ptr,len}` input view, not a local-backed slice (J5).
+            | ExprKind::JsonScan { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
@@ -6605,6 +6630,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
+            ExprKind::JsonScan { input, .. } => self.walk(input, depth),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.walk(doc, depth),
             ExprKind::JsonDocGet { doc, key } => {
                 self.walk(doc, depth);
@@ -7229,6 +7255,7 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
             ExprKind::JsonDoc { input } => self.visit(input),
+            ExprKind::JsonScan { input, .. } => self.visit(input),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.visit(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.visit(doc);
@@ -7850,6 +7877,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocElems { doc } => {
                 self.borrow_sources(doc)
             }
+            // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
+            // past the input's liveness is caught.
+            ExprKind::JsonScan { input, .. } => self.borrow_sources(input),
             ExprKind::Call { args, .. } => {
                 let mut roots = BorrowRoots::new();
                 for arg in args {
@@ -8645,6 +8675,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
+            // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
+            ExprKind::JsonScan { input, .. } => self.expr(input, moved, false, false),
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
             // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
             ExprKind::JsonDoc { input } => self.expr(input, moved, false, false),
@@ -9019,6 +9051,11 @@ struct Checker<'a, 't> {
     ret_hint: Ty,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
+    /// True while checking a pipeline terminal that supports a `json.scanner<Row>` streaming source
+    /// (`sum`/`count` in J5 slice 1). Set transiently by those terminal builders around
+    /// `check_pipeline`; every other terminal leaves it false, so `check_pipeline` rejects a scanner
+    /// source cleanly (a materializing / non-streaming terminal over a stream is unsupported).
+    scan_terminal: bool,
     /// Nesting depth of `unsafe {}` blocks (0 = in safe code). `raw.*` ops are valid only inside one.
     unsafe_depth: u32,
     /// Nesting depth of `task_group {}` blocks (0 = not in one). `spawn`/`wait` are valid only
@@ -9168,6 +9205,7 @@ impl<'a, 't> Checker<'a, 't> {
             scope: Vec::new(),
             ret_hint: Ty::Unit,
             arena_depth: 0,
+            scan_terminal: false,
             unsafe_depth: 0,
             task_group_depth: 0,
             wait_state: Vec::new(),
@@ -9313,6 +9351,7 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::StructArray(id, n) => format!("array<{}>[{n}]", self.ty_display(Ty::Struct(id))),
             Ty::DynStructArray(id, _) => format!("array<{}>", self.ty_display(Ty::Struct(id))),
             Ty::Soa(id) => format!("soa<{}>", self.ty_display(Ty::Struct(id))),
+            Ty::JsonScanner(id) => format!("json.scanner<{}>", self.ty_display(Ty::Struct(id))),
             Ty::DictEncoded(id, _) => format!("dict_encoded<{}>", self.ty_display(Ty::Struct(id))),
             // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
             _ => ty_name(ty),
@@ -12161,6 +12200,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("core.json", "json.doc", span);
                 return self.check_json_doc(args, span);
             }
+            if module == "json" && method == "scan" {
+                self.require_import("core.json", "json.scan", span);
+                return self.check_json_scan(args, expected, span);
+            }
             if module == "fs" && method == "read_file" {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
@@ -13637,6 +13680,22 @@ impl<'a, 't> Checker<'a, 't> {
             // `where(.field)` / `.field` / reduce pipeline as AoS, but a scan touches only the
             // columns it reads — so `ps.where(.active).pay.sum()` streams just `active` and `pay`.
             Ty::Soa(id) => Ty::Struct(id),
+            // A `json.scanner<Row>` source (J5): each streamed element is a decoded `Row` struct. The
+            // fused terminal decodes one row per step into a slot and folds it; unlike every other
+            // source it has no runtime length (it streams until the input is exhausted) and its
+            // terminal is `Result<T, Error>`. Only a streaming reducer supports it (slice 1: `sum`/
+            // `count`, flagged via `scan_terminal`); a materializing terminal (`to_array`, `sort`,
+            // `group_by`, …) over a stream is rejected here rather than mis-lowered.
+            Ty::JsonScanner(id) => {
+                if !self.scan_terminal {
+                    self.diags.error(
+                        "a `json.scanner<Row>` is a streaming source — only `.sum()` / `.count()` terminals are supported for now (materializing terminals like `.to_array()` / `.sort()` over a stream are a later slice)".to_string(),
+                        span,
+                    );
+                    return None;
+                }
+                Ty::Struct(id)
+            }
             // An `array<slice<T>>` (a `chunks` result): each element is a `slice<T>` chunk —
             // the input to `chunks(n).par_map(f)`'s `f: (slice<T>) -> R`.
             Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
@@ -13666,7 +13725,9 @@ impl<'a, 't> Checker<'a, 't> {
         // slot-backed stack array / struct array (`IndexField`) or a dynamic `array<Struct>`
         // view addressed through its buffer pointer (`IndexFieldPtr`, slice 8d-2). A scalar
         // `{ptr,len}` view (`slice` / owned scalar `array`) has no per-element struct to project.
-        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..) | Ty::Soa(_));
+        // A `json.scanner<Row>` is slot-backed too: its row decodes into a per-step struct slot, so a
+        // `.field` projection / `where(.field)` reads that slot by field — no `{ptr,len}` scalar view.
+        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..) | Ty::Soa(_) | Ty::JsonScanner(_));
         let mut stages = Vec::new();
         // `.field` / `where(.field)` read the *source* element by index; after a `map` the logical
         // element is a computed value no longer in the source buffer, so those stages are only
@@ -13876,13 +13937,29 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("'sum' takes no arguments".to_string(), span);
         }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let Some((source, stages, elem)) = self.check_pipeline(recv, expected, span) else {
+        // `sum` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
+        let prev_scan = self.scan_terminal;
+        self.scan_terminal = true;
+        let piped = self.check_pipeline(recv, expected, span);
+        self.scan_terminal = prev_scan;
+        let Some((source, stages, elem)) = piped else {
             return err;
         };
         if !elem.is_numeric() {
             self.diags
                 .error(format!("'sum' needs a numeric element type, got {}", ty_name(elem)), span);
             return err;
+        }
+        // A `json.scanner<Row>` source streams rows that may fail to parse mid-stream, so its fused
+        // terminal is `Result<T, Error>` (unwrap with `?`), unlike an in-memory array's bare `T`. The
+        // summed field is a concrete struct-field scalar, so no inference constraint is needed.
+        if matches!(source.ty, Ty::JsonScanner(_)) {
+            let sc = ty_to_scalar(elem).expect("a numeric element is a scalar");
+            return Expr {
+                kind: ExprKind::ArraySum { source: Box::new(source), stages },
+                ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
+                span,
+            };
         }
         self.constrain(elem, expected, span);
         Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
@@ -14205,12 +14282,27 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("'count' takes no arguments".to_string(), span);
         }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let Some((source, stages, _elem)) = self.check_pipeline(recv, None, span) else {
+        // `count` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
+        let prev_scan = self.scan_terminal;
+        self.scan_terminal = true;
+        let piped = self.check_pipeline(recv, None, span);
+        self.scan_terminal = prev_scan;
+        let Some((source, stages, _elem)) = piped else {
             return err;
         };
+        // A `json.scanner<Row>` count is `Result<i64, Error>` — a malformed row surfaces as `Err`
+        // (streaming; unwrap with `?`), unlike an in-memory array's bare `i64`.
+        let count_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if matches!(source.ty, Ty::JsonScanner(_)) {
+            return Expr {
+                kind: ExprKind::ArrayCount { source: Box::new(source), stages },
+                ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+                span,
+            };
+        }
         Expr {
             kind: ExprKind::ArrayCount { source: Box::new(source), stages },
-            ty: Ty::Int(IntTy { bits: 64, signed: true }),
+            ty: count_ty,
             span,
         }
     }
@@ -15626,6 +15718,49 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::JsonDoc { input: Box::new(input) },
             ty: Ty::Result(Scalar::JsonDoc, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `json.scan(input)` (J5) — build a streaming typed-row scanner over the JSON input view. The row
+    /// type is carried by the binding annotation (`rows: json.scanner<Row> := json.scan(view)`),
+    /// exactly like `decode` takes its target from the expected type (no turbofish; the settled
+    /// schema-selector residual). The scanner borrows the input (a region-tracked `{ptr,len}` handle —
+    /// the streamed rows' `str` fields view the input), so it cannot outlive it. It is a **pipeline
+    /// source only** (v1): a fused terminal (`rows.where(.active).pay.sum()`) streams one row at a time
+    /// without materializing an `array<Row>`, and the terminal's type is `Result<T, Error>` (a
+    /// malformed row surfaces once as `Err`). No `arena {}` is needed — the row decodes into a
+    /// per-step stack slot, and its `str` fields borrow the input, not the arena.
+    fn check_json_scan(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(format!("'json.scan' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        // The row struct is the type argument of the expected `json.scanner<Row>`.
+        let sid = match expected.map(|e| self.resolve(e)) {
+            Some(Ty::JsonScanner(id)) => id,
+            _ => {
+                self.diags.error(
+                    "cannot infer the scan row type; annotate the binding, e.g. `rows: json.scanner<Row> := json.scan(d)`".to_string(),
+                    span,
+                );
+                return err;
+            }
+        };
+        // Each row decodes like a single struct target; reuse the decode eligibility gate.
+        if !self.decode_struct_fields_ok(sid, span) {
+            return err;
+        }
+        // The rows' `str` fields are zero-copy views into the input, so the input's region bounds the
+        // scanner. `check_str_init` accepts a `str` or auto-borrows an owned `string`.
+        let input = self.check_str_init(&args[0]);
+        if input.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::JsonScan { struct_id: sid, input: Box::new(input) },
+            ty: Ty::JsonScanner(sid),
             span,
         }
     }
@@ -19855,6 +19990,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
+            ExprKind::JsonScan { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.finalize_expr(doc);
@@ -20574,6 +20710,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
+        Ty::JsonScanner(id) => format!("json.scanner<struct#{id}>"),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -20957,6 +21094,22 @@ fn resolve_type(
                 return Ty::Error;
             }
             return cx.enum_ids.get("json.kind").map(|&id| Ty::Enum(id)).unwrap_or(Ty::Error);
+        }
+        // `json.scanner<Row>` (J5) — a streaming typed-row scanner. The one type argument is the row
+        // struct; it selects the scanner's element type and (at codegen) its decode descriptor.
+        if name == "scanner" {
+            let [arg] = args else {
+                diags.error("`json.scanner<Row>` takes exactly one type argument (the row struct)".to_string(), span);
+                return Ty::Error;
+            };
+            return match resolve_type(arg, cx, type_params, diags) {
+                Ty::Error => Ty::Error,
+                Ty::Struct(id) => Ty::JsonScanner(id),
+                other => {
+                    diags.error(format!("`json.scanner<Row>`'s row must be a struct type, got {}", ty_name(other)), span);
+                    Ty::Error
+                }
+            };
         }
     }
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or

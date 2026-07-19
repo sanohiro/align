@@ -455,6 +455,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDocLen { doc } => format!("json_doc_len({})", operand_str(doc)),
         Rvalue::JsonDocKey { doc, index, out } => format!("json_doc_key({}, {}, -> _{out})", operand_str(doc), operand_str(index)),
         Rvalue::JsonDocElems { doc, arena, out } => format!("json_doc_elems({}, arena={}, -> _{out})", operand_str(doc), operand_str(arena)),
+        Rvalue::JsonScanNew { input } => format!("json_scan_new({})", operand_str(input)),
+        Rvalue::JsonScanNext { scanner, struct_id, schema, cursor, row } => {
+            format!("json_scan_next({}, struct#{struct_id}, schema={schema:?}, cursor=_{cursor}, -> row _{row})", operand_str(scanner))
+        }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }

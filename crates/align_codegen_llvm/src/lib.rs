@@ -1758,6 +1758,20 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.scan one row (J5): (input, input_len, cursor: *i64, fields, n, out_row: *u8, out_size,
+        // phf, phf_len, phf_seed) -> i32 status (0 = row / 1 = done / 2 = malformed). Reuses the
+        // struct decode descriptor; `cursor` is the mutable byte offset into the input.
+        "json_scan_next".to_string(),
+        module.add_function(
+            "align_rt_json_scan_next",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         // json.decode directly into soa<Struct> (input, input_len, fields, n, arena, out: *{ptr,len},
         // phf, phf_len, phf_seed) -> i32 status. Direct-fill rail: the runtime counts rows, arena-
         // allocates the columns, and fills them (no AoS / transpose). `arena` replaces `elem_size`.
@@ -2817,7 +2831,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // array views) lowers to the slice struct.
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -2929,7 +2943,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
-        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx, ex),
@@ -6672,6 +6686,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.gen_json_doc_elems(doc, arena, *out)?;
                 return Ok(None);
             }
+            // json.scan (J5). The scanner value IS the input `{ptr,len}` view — no allocation.
+            Rvalue::JsonScanNew { input } => self.operand(input),
+            // One streaming step: decode the next object at `*cursor` into the `row` slot, return the
+            // i32 status (0 = row / 1 = done / 2 = malformed).
+            Rvalue::JsonScanNext { scanner, struct_id, cursor, row, .. } => self.gen_json_scan_next(*struct_id, scanner, *cursor, *row)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8982,6 +9001,33 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_struct_array returns i32"))
+    }
+
+    /// One streaming step of a `json.scan(view)` fused terminal (J5): decode the next JSON object at
+    /// `*cursor` in the scanner's input view into the `row` struct slot, advancing `*cursor`. Reuses
+    /// the same decode descriptor table as [`gen_json_decode_struct_array`] (the row IS one element),
+    /// passing the cursor + row slot pointers. Returns the i32 status (0 = row / 1 = done / 2 =
+    /// malformed). The runtime zeroes the row before decoding, so `Option`/default fields are correct.
+    fn gen_json_scan_next(&mut self, struct_id: u32, scanner: &Operand, cursor: Slot, row: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // The scanner is a `{ptr,len}` input view (str-ABI); split it into the input pointer + length.
+        let (in_ptr, in_len) = self.split_str(scanner)?;
+        let cursor_ptr = self.slots[&cursor];
+        let row_ptr = self.slots[&row];
+        let i64t = self.ctx.i64_type();
+        let t = self.decode_field_table(struct_id);
+        let n = i64t.const_int(t.n_fields, false);
+        let out_size = i64t.const_int(t.store_size, false);
+        let phf_len = i64t.const_int(t.phf_len, false);
+        let phf_seed = i64t.const_int(t.phf_seed, false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_scan_next"],
+                &[in_ptr.into(), in_len.into(), cursor_ptr.into(), t.descs.into(), n.into(), row_ptr.into(), out_size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
+                "jscannext",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_scan_next returns i32"))
     }
 
     /// `json.decode` directly into a `soa<Struct>` (the direct-fill rail): zero the out `{ptr,len}`

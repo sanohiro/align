@@ -198,7 +198,18 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと
   同じ不正入力 `s` に対し `json.doc(s)` と `json.decode(s)` が食い違う）。
 - **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
-  source 専用。
+  source 専用。**Slice 1 出荷済み:** `json.scanner<Row>` 型（Copy の `{ptr,len}` 入力ビュー。
+  region-tracked — 入力を借用し、`array<Row>` を実体化しない）＋ `json.scan(view)`（行型は binding
+  annotation `rows: json.scanner<Row> := json.scan(view)` から、`decode` と同じく。arena 不要 — 行は
+  ステップごとのスタックスロットへ decode され、その `str` フィールドは入力を借用）＋ ストリーミング
+  fused reducer `.sum()` / `.count()` → **`Result<T, Error>`**（不正な行は一度だけ `Err` として現れる。
+  `?` で unwrap）。ステージ: `.field` 射影、`.where(.field)`、`.where(pred)`、`.map(f)` — 全ステージを
+  行ごとに [`lower_json_scan_reduce`] が駆動（`lower_array_reduce` のカウントループではない）。1 つの
+  scanner がトップレベル JSON 配列と NDJSON の**両方**を扱う（ランタイム `align_rt_json_scan_next` が
+  先頭 `[`・値間 `,`・空白/改行を区切り、`]`/EOF を終端として扱い、行ごとに struct decode の descriptor を
+  再利用）。ストリームに対する実体化終端（`.to_array()` / `.sort()` / `group_by`）は sema で拒否
+  （誤 lowering ではなく明快な診断）。**Slice 2 に延期:** scanner に対する `reduce` / `any` / `all` /
+  `min` / `max` reducer（`sum`/`count` 同様、Result ラップ + scan dispatch が必要）。
 
 決着済みの削除（未実装のまま残すのではなくカタログから削除）: `json.validate<T>`（decode して
 捨てるのが validation）、`json.token`（doc + scan で覆う。consumer なし）、`json.field_table<T>`

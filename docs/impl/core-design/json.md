@@ -217,6 +217,19 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   `decode` and `doc` together (fixing only one would make `json.doc(s)` and `json.decode(s)` disagree
   on the same malformed `s`).
 - **`json.scan` (J5):** streaming typed rows, binding-annotation-typed, pipeline source only.
+  **Slice 1 SHIPPED:** the `json.scanner<Row>` type (a Copy `{ptr,len}` input view, region-tracked —
+  it borrows the input, never materializes an `array<Row>`) + `json.scan(view)` (row type from the
+  binding annotation `rows: json.scanner<Row> := json.scan(view)`, exactly like `decode`; no arena
+  needed — the row decodes into a per-step stack slot and its `str` fields borrow the input) + the
+  streaming fused reducers `.sum()` / `.count()` → **`Result<T, Error>`** (a malformed row surfaces
+  once as `Err`; unwrap with `?`). Stages: `.field` projection, `.where(.field)`, `.where(pred)`,
+  `.map(f)` — the full stage set, driven per row by [`lower_json_scan_reduce`], not
+  `lower_array_reduce`'s counted loop. One scanner handles **both** a top-level JSON array and NDJSON
+  (the runtime `align_rt_json_scan_next` treats a leading `[`, inter-value `,`, and whitespace/newlines
+  as separators, `]`/EOF as terminators; reuses the struct decode descriptor per row). A materializing
+  terminal (`.to_array()` / `.sort()` / `group_by`) over a stream is rejected in sema (a clean
+  diagnostic, not mis-lowered). **Deferred to slice 2:** the `reduce` / `any` / `all` / `min` / `max`
+  reducers over a scanner (each needs the Result-wrapping + a scan dispatch, like `sum`/`count`).
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
 validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`
