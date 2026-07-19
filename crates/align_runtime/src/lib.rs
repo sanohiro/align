@@ -6437,7 +6437,7 @@ pub unsafe extern "C" fn align_rt_json_doc_elems(tape: *const DocTape, node: i64
         unsafe { out.write(empty) };
         return;
     };
-    if n.kind != DOC_OBJECT && n.kind != DOC_ARRAY || n.a == 0 {
+    if (n.kind != DOC_OBJECT && n.kind != DOC_ARRAY) || n.a == 0 {
         unsafe { out.write(empty) };
         return;
     }
