@@ -8,7 +8,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 3 SHIPPED → J4 COMPLETE (`elems()`;
+_Last updated: 2026-07-19, **JSON COMPLETENESS J5 `json.scan` — COMPLETE (streaming typed rows; merged
+as #546 slice 1 + #547 slice 2).** `json.scan(view)` + the new `json.scanner<Row>` type (a **Copy**
+`{ptr,len}` input view, region-tracked — it borrows the input, never materializes an `array<Row>`; row
+type from the binding annotation `rows: json.scanner<Row> := json.scan(view)`, exactly like `decode`, no
+turbofish; no `arena {}` needed — each row decodes into a per-step stack slot and its `str` fields borrow
+the input). It is a **pipeline source only**: the full streaming reducer family — `.sum()` / `.count()` /
+`.reduce(init,f)` / `.any(p)` / `.all(p)` / `.min()` / `.max()` — each yields **`Result<T, Error>`** (a
+malformed row surfaces once as `Err`; unwrap with `?`), with the full stage set (`.field` / `.where(.field)`
+/ `.where(pred)` / `.map(f)`) driven per row by a dedicated `lower_json_scan_reduce` (a streaming header:
+`JsonScanNext` decodes the next object at a loop-local cursor, branching row / done / malformed — NOT
+`lower_array_reduce`'s counted loop). ONE scanner handles both a top-level JSON array and NDJSON (runtime
+`align_rt_json_scan_next` treats a leading `[`, inter-value `,`, whitespace/newlines as separators and
+`]`/EOF as terminators; reuses the struct decode descriptor per row; a malformed row → `Error.Code(1)`,
+byte-identical to `json.decode` of the same input — pitfall P2). Materializing terminals (`to_array`/`sort`/
+`group_by`/…) over a stream are rejected in sema (a clean diagnostic, not mis-lowered). `Ty::JsonScanner(u32)`
++ HIR `JsonScan` threaded through every exhaustive pass (region_of = the input view / tracks_region /
+ty_may_borrow / mentions_slice / MoveCheck / walk / visit / finalize / borrow_sources / slice_is_local); MIR
+`JsonScanNew` + `JsonScanNext` (the latter bakes the row schema-sig for cache invalidation, P5); codegen FFI
++ descriptor reuse. **draft.md §18.1 + language-spec.md already described this exactly (design ran ahead;
+the implementation matched it), so NO spec-sync (J6) change was needed — the spec is already consistent.**
+Reviewed each slice adversarially before merge: fixed the malformed-error variant (→ `Error.Code(1)`, P2),
+the `scan_terminal` flag leaking into stage-lambda checking (memory-unsafe if a nested scanner's
+materializing terminal inherited it), a whole-struct `any`/`reduce` `cur.expect` panic (now loads the row
+struct), and a non-scalar `reduce` accumulator panic (now a clean diagnostic). Tests: m5 `json_scan_*` (15),
+runtime `json_scan_next_streams_array_and_ndjson`. Suites green: m5 172, sema 151, mir 7, runtime json 24;
+clippy clean. **With `json.scan` the entire JSON-completeness arc (J1–J5) is COMPLETE — core.json is exactly
+`decode`/`encode`/`doc`/`scan`.** NEXT: the JSON arc is closed; pick up the next roadmap item. Previous
+update: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 3 SHIPPED → J4 COMPLETE (`elems()`;
 branch `json-j4-doc-elems`).** `d.elems() -> slice<json.doc>` materializes one document level (each
 Array element, or each Object member VALUE — keys via `key(i)`) as an arena-backed `slice<json.doc>`
 ONCE (O(n) build, O(1) index — vs `at(i)`'s O(i) re-walk per call). **The key realization: no new array
