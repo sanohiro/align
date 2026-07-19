@@ -11,15 +11,29 @@ explicitly vendored, never ambiently resolvable.
 
 ## Status
 
-**DESIGN v2 (2026-07-20, owner-directed).** The owner's brief, restored after a lost conversation
-record and now pinned here so it cannot be lost again: **the deliverable is a blazing-fast,
-zero-copy REST framework — speed is the headline, not a byproduct.** The primary reference is
-**Go's Fiber** (the zero-allocation philosophy of its fasthttp foundation + Express-derived
-ergonomics); the router follows the **httprouter/fasthttp radix-tree lineage** (a separate,
-deliberate reference — Fiber for the framework model, the radix router for dispatch). The
-gateway / LLM apps are merely the framework's first consumers ("what we build with it happens to
-be LLM-related") — they do not shape this design. Plan of record: `../15-pkg-web-plan.md`.
-Hard compiler prerequisite: **F1 field-eligibility widening** (see Prerequisites).
+**DESIGN v2 (2026-07-20, owner-directed; attribution corrected same day).** The owner's brief,
+restored after a lost conversation record and now pinned here so it cannot be lost again: **the
+deliverable is an Align-idiomatic, data-oriented, blazing-fast zero-copy REST framework — speed is
+the headline, and bloat is rejected** (a small surface; nothing speculative). **References are
+instrumental, not mandates:** when the owner asked "which existing framework matches this vision?",
+*Claude* named **Go's Fiber** (fasthttp's zero-allocation philosophy) as the closest analogue —
+the owner did not choose it, and a better existing reference may replace it at any point. The
+router references are likewise instrumental: **httprouter/fasthttp** (the radix lineage) and
+Rust's **matchit** (the minimal fastest-in-class radix matcher). The judging criterion for every
+decision is Align-ness (data-oriented / nothing hidden / one way / minimal), never "because
+framework X does it". **The router is a first-class requirement**: the first consumer app
+(OpenAI-compatible, fixed paths) would not need one, but a REST framework does — so it gets a
+deliberately Align-idiomatic design (below), not an afterthought. The gateway / LLM apps are
+merely the framework's first consumers ("what we build with it happens to be LLM-related") — they
+do not shape this design. Plan of record: `../15-pkg-web-plan.md`. Hard compiler prerequisite:
+**F1 field-eligibility widening** (see Prerequisites).
+
+## Minimalism (owner constraint)
+
+The surface is exactly: routing, ctx accessors, responders, middleware-lite, SSE sugar — nothing
+else. NO template engines, static-file servers, sessions, websockets, ORM hooks, config systems,
+or lifecycle callbacks: each is a separate package if a consumer ever demands it. Every addition
+must name its consumer; "frameworks have this" is not a reason ("one way" + the no-bloat brief).
 
 ## Why Align can win this
 
@@ -42,10 +56,14 @@ regression-pinned number.
 2. Zero heap allocation/request  — framework hot path allocates nothing on the heap; per-request
                                    scratch lives in the request arena (O(1) bulk reset).
                                    Handlers allocate only what they visibly write.
-3. O(segments) dispatch          — a startup-built radix tree (static > param > wildcard priority,
-                                   httprouter semantics); no per-request pattern parsing, no
-                                   regex, no map lookups. Param values land in a fixed slot
-                                   array, not a map.
+3. O(segments) dispatch          — a startup-built radix structure (static > param > wildcard
+                                   priority, httprouter/matchit semantics) stored the ALIGN way:
+                                   flat contiguous arrays (a node table + an edge table indexed
+                                   by offsets), not pointer-chasing heap nodes — the router is
+                                   itself data-oriented (cache-line-friendly walks; the same
+                                   design move as soa/tape/offset-table elsewhere in Align).
+                                   No per-request pattern parsing, no regex, no map lookups.
+                                   Param values land in a fixed slot array, not a map.
 4. Zero-copy output              — response bodies encode straight into the response writer
                                    (the library-foundations "zero-allocation output" pattern);
                                    json.encode composes with the builder → socket path.
@@ -136,6 +154,38 @@ a trailing `*name` captures the rest (tail wildcard). Priority at each tree node
 `:param` > `*wildcard`** (httprouter semantics — `/v1/models/featured` beats `/v1/models/:id`).
 Two routes that can tie → startup abort. No regex, no optional segments, exact trailing-slash
 matching (no hidden redirects). Query strings are never part of the pattern.
+
+## Router internals (the W1 implementable spec)
+
+The route table (visible data) compiles at `serve()` startup into a **flat radix structure** —
+contiguous arrays, offset-indexed, zero pointers (the Align design move: soa/tape/offset-table):
+
+```text
+Node  { first_edge: i64, n_edges: i64,     // static children, sorted by label for binary search
+        param_child: i64,                  // -1 or node index (the ONE :param child)
+        wild_leaf: i64,                    // -1 or leaf index (the ONE trailing *name)
+        leaf: i64 }                        // -1 or leaf index (a route ends at this node)
+Edge  { label: str, node: i64 }            // label = one full literal segment (byte-compare)
+Leaf  { method_handlers: array over Method // per-method handler fn or absent → the path's
+                                           //   method set IS this row (405 Allow comes free)
+        param_names: slice<str>, n_params: i64 }   // pattern-order names for web.param lookup
+```
+
+Build (startup, plain heap — freed at serve exit): insert each route segment-by-segment; a
+literal segment adds/finds a static edge; `:name` claims the node's single param child (two
+different `:a`/`:b` names at the same position = conflict → **abort** naming both patterns);
+`*name` claims the single wildcard leaf (must be trailing; conflicts abort); a duplicate
+(method, path) leaf → abort. Sort each node's edges; store param names per leaf.
+
+Match (per request, zero alloc): split the path by `/` (in place — offsets, no copies); walk from
+the root; at each node try static edges (binary search on the segment) FIRST, else the param
+child (capture the segment view into the fixed slot array `params[i]`), else the wildcard leaf
+(capture the uneaten remainder incl. `/`s); at the end, the leaf's method row gives the handler
+(present → dispatch; absent but row non-empty → 405 + Allow from the row; no leaf → 404). Static
+beats param beats wildcard at EVERY node, with NO backtracking — like matchit/httprouter, a
+pattern set whose match would require backtracking (a static miss that a param path would have
+saved) is detected and **aborted at build time**, keeping the runtime walk strictly linear.
+`web.param(c, "name")` = linear scan of the ≤ n_params name views (n is tiny; no map).
 
 ## Prerequisites (compiler / std — the 土台)
 

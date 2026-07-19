@@ -12,13 +12,26 @@
 
 ## ステータス
 
-**DESIGN v2（2026-07-20、owner 指示）。** 失われた会話記録から復元し、二度と失わないようここに
-固定する owner の要求: **成果物は「zero-copy のくっそ高速な REST フレームワーク」— 速度が主題で
-あり副産物ではない。** 主参照は **Go の Fiber**（基盤 fasthttp の zero-allocation 哲学 + Express
-系 API）。router は **httprouter/fasthttp 系 radix tree** を参照（意図的に別参照 — フレームワーク
-モデルは Fiber、ディスパッチは radix router）。gateway / LLM アプリは単なる最初の消費者
-（「それで作るものが LLM 系というだけ」）— 本設計を規定しない。実行計画: `../../15-pkg-web-plan.md`。
-ハードなコンパイラ前提: **F1 フィールド許可拡張**（前提の節参照）。
+**DESIGN v2（2026-07-20、owner 指示。同日、帰属を訂正）。** 失われた会話記録から復元し、二度と
+失わないようここに固定する owner の要求: **成果物は「Align らしくデータ志向な、zero-copy の
+くっそ高速 REST フレームワーク」— 速度が主題で、無駄（bloat）は拒否**（最小表面。投機的機能なし）。
+**参照は器具であって命令ではない:** owner が「既存でこれに当たるのは何か」と聞いた時に *Claude* が
+**Go の Fiber**（fasthttp の zero-allocation 哲学）を最近似として挙げた — owner の選択ではなく、
+より良い既存参照があれば随時差し替えてよい。router の参照も同様に器具的: **httprouter/fasthttp**
+（radix 系譜）と Rust の **matchit**（最小・最速級の radix マッチャ）。全決定の判定基準は
+Align らしさ（データ志向 / nothing hidden / one way / 最小）であり、「フレームワーク X が
+そうだから」は理由にならない。**router は第一級の要件**: 最初の消費者アプリ（OpenAI 互換・固定
+パス）には不要でも、REST フレームワークには必須 — だから後付けではなく Align らしい設計
+（下記）を与える。gateway / LLM アプリは単なる最初の消費者（「それで作るものが LLM 系という
+だけ」）— 本設計を規定しない。実行計画: `../../15-pkg-web-plan.md`。ハードなコンパイラ前提:
+**F1 フィールド許可拡張**（前提の節参照）。
+
+## 最小主義（owner 制約）
+
+表面は正確に: routing、ctx アクセサ、レスポンダ、middleware-lite、SSE 糖衣 — それだけ。
+テンプレートエンジン・静的ファイル・セッション・websocket・ORM フック・設定システム・ライフ
+サイクルコールバックは**なし**: 消費者が要求したら別パッケージ。全追加は消費者名を挙げること。
+「フレームワークには普通ある」は理由にならない（"one way" + no-bloat 要求）。
 
 ## なぜ Align が勝てるか
 
@@ -39,9 +52,13 @@ GC は存在しない。フレームワークの仕事は**その連鎖を壊さ
                                     文字列を実体化しない（.clone() はアプリの明示的脱出口）
 2. リクエスト毎ヒープ割当ゼロ     — ホットパスはヒープ割当なし。リクエスト毎スクラッチは
                                     リクエスト arena（O(1) 一括リセット）
-3. O(セグメント数) ディスパッチ   — 起動時構築の radix tree（static > param > wildcard 優先、
-                                    httprouter 規則）。リクエスト時のパターン解析なし・regex
-                                    なし・map なし。param 値は固定スロット配列へ
+3. O(セグメント数) ディスパッチ   — 起動時構築の radix 構造（static > param > wildcard 優先、
+                                    httprouter/matchit 規則）を **Align 流**に格納: フラットな
+                                    連続配列（node 表 + offset 参照の edge 表）でポインタ
+                                    追跡なし — router 自体がデータ志向（cache-line に優しい
+                                    walk。soa/tape/offset-table と同じ設計手筋）。リクエスト時の
+                                    パターン解析なし・regex なし・map なし。param 値は固定
+                                    スロット配列へ
 4. zero-copy 出力                 — レスポンスボディはレスポンスライタへ直接エンコード
                                     （library-foundations の zero-allocation output パターン）
 5. 起動時全域検証                 — route tree は serve() で一度だけ構築・検証（衝突/曖昧は
@@ -129,6 +146,37 @@ Route      — Copy struct { method（tag-only enum）, pattern: str, handler: f
 `/v1/models/featured` が `/v1/models/:id` に勝つ）。同点になり得る 2 ルート → 起動時 abort。
 regex なし・省略可能セグメントなし・末尾スラッシュ厳密一致（隠れリダイレクトなし）。クエリ文字列は
 パターン対象外。
+
+## Router 内部（W1 の実装可能仕様）
+
+route table（可視データ）は `serve()` 起動時に**フラット radix 構造**へコンパイル — 連続配列・
+offset 索引・ポインタゼロ（Align の設計手筋: soa/tape/offset-table）:
+
+```text
+Node  { first_edge: i64, n_edges: i64,     // static 子。label ソート済み（二分探索）
+        param_child: i64,                  // -1 か node index（唯一の :param 子）
+        wild_leaf: i64,                    // -1 か leaf index（唯一の末尾 *name）
+        leaf: i64 }                        // -1 か leaf index（この node で終わるルート）
+Edge  { label: str, node: i64 }            // label = リテラル 1 セグメント（バイト比較）
+Leaf  { method_handlers: Method 毎の配列   // ハンドラ fn or 欠席 → この行がパスのメソッド
+                                           //   集合そのもの（405 の Allow が只で出る）
+        param_names: slice<str>, n_params: i64 }   // web.param 用・パターン順の名前
+```
+
+構築（起動時、素のヒープ — serve 終了時解放）: 各ルートをセグメント毎に挿入。リテラルは static
+edge を追加/検索。`:name` は node 唯一の param 子を主張（同位置に別名 `:a`/`:b` = 衝突 → 両
+パターン名入り **abort**）。`*name` は唯一の wildcard leaf を主張（末尾のみ。衝突 abort）。
+(method, path) 重複 leaf → abort。各 node の edge をソート。leaf 毎に param 名を格納。
+
+マッチ（リクエスト毎、割当ゼロ）: path を `/` で分割（in place — offset のみ、コピーなし）。
+root から walk。各 node で static edge を**先に**（セグメントで二分探索）、なければ param 子
+（セグメント view を固定スロット配列 `params[i]` へキャプチャ）、なければ wildcard leaf
+（`/` 込みの残り全部をキャプチャ）。終端 leaf のメソッド行がハンドラを与える（在 → ディスパッチ。
+欠だが行が非空 → 405 + 行から Allow。leaf なし → 404）。static > param > wildcard は**全 node**
+で成立し、**バックトラックなし** — matchit/httprouter と同様、バックトラックを要するパターン
+集合（static 失敗を param 経路なら救えた形）は構築時に検出して **abort**、実行時 walk は
+厳密に線形を保つ。`web.param(c, "name")` = 高々 n_params 個の名前 view の線形走査（n は極小。
+map なし）。
 
 ## 前提（コンパイラ / std — 土台）
 
