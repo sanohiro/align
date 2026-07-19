@@ -228,8 +228,11 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   (the runtime `align_rt_json_scan_next` treats a leading `[`, inter-value `,`, and whitespace/newlines
   as separators, `]`/EOF as terminators; reuses the struct decode descriptor per row). A materializing
   terminal (`.to_array()` / `.sort()` / `group_by`) over a stream is rejected in sema (a clean
-  diagnostic, not mis-lowered). **Deferred to slice 2:** the `reduce` / `any` / `all` / `min` / `max`
-  reducers over a scanner (each needs the Result-wrapping + a scan dispatch, like `sum`/`count`).
+  diagnostic, not mis-lowered). **Slice 2 SHIPPED:** the rest of the streaming reducer family over a
+  scanner — `.reduce(init, f)` / `.any(p)` / `.all(p)` / `.min()` / `.max()` — each `Result<T, Error>`,
+  sharing `lower_json_scan_reduce`'s guarded per-row fold. So the complete streaming reducer set is
+  `sum` / `count` / `reduce` / `any` / `all` / `min` / `max`; only materializing terminals stay out (by
+  design — they would defeat streaming).
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
 validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`

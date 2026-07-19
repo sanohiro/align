@@ -208,8 +208,11 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   scanner がトップレベル JSON 配列と NDJSON の**両方**を扱う（ランタイム `align_rt_json_scan_next` が
   先頭 `[`・値間 `,`・空白/改行を区切り、`]`/EOF を終端として扱い、行ごとに struct decode の descriptor を
   再利用）。ストリームに対する実体化終端（`.to_array()` / `.sort()` / `group_by`）は sema で拒否
-  （誤 lowering ではなく明快な診断）。**Slice 2 に延期:** scanner に対する `reduce` / `any` / `all` /
-  `min` / `max` reducer（`sum`/`count` 同様、Result ラップ + scan dispatch が必要）。
+  （誤 lowering ではなく明快な診断）。**Slice 2 出荷済み:** scanner に対する残りのストリーミング
+  reducer 一式 — `.reduce(init, f)` / `.any(p)` / `.all(p)` / `.min()` / `.max()` — いずれも
+  `Result<T, Error>`。`lower_json_scan_reduce` の guarded な行ごと fold を共有する。よって完全な
+  ストリーミング reducer 集合は `sum` / `count` / `reduce` / `any` / `all` / `min` / `max`。
+  実体化終端のみ対象外（設計どおり — ストリーミングを無効化するため）。
 
 決着済みの削除（未実装のまま残すのではなくカタログから削除）: `json.validate<T>`（decode して
 捨てるのが validation）、`json.token`（doc + scan で覆う。consumer なし）、`json.field_table<T>`
