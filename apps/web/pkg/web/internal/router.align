@@ -263,3 +263,38 @@ pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 {
   }
   result
 }
+
+// ── Parameter capture (W2 bridge) ─────────────────────────────────────────────────────────────
+
+// The captured value of parameter `name` when `path` is matched against `pattern` — `:name` grabs
+// exactly one segment, `*name` grabs the rest of the path. Returns "" if `pattern` has no such
+// parameter. **Zero-copy** (the result is a `str` view into `path`) and zero-allocation: it re-walks
+// the matched pattern instead of materializing a slot array, so `pkg.web.param(c, name)` costs one
+// segment walk and touches no heap. Total by the surface contract — a name absent from the matched
+// route is a startup-checkable bug (route build validates `:param`/`*` names), so "" never reaches a
+// correct handler.
+pub fn param_value(pattern: str, path: str, name: str) -> str {
+  mut pp := 0
+  mut xp := 0
+  plen := pattern.len()
+  xlen := path.len()
+  loop {
+    if pp >= plen { break "" }
+    if xp >= xlen { break "" }
+    pe := seg_end(pattern, pp + 1)
+    xe := seg_end(path, xp + 1)
+    pseg := pattern[pp + 1 .. pe]
+    if pseg.starts_with(":") {
+      pname := pseg[1 .. pseg.len()]
+      if pname == name { break path[xp + 1 .. xe] }
+    }
+    if pseg.starts_with("*") {
+      // A trailing wildcard captures the uneaten remainder of the path (including inner '/'s).
+      wname := pseg[1 .. pseg.len()]
+      if wname == name { break path[xp + 1 .. xlen] }
+      break ""
+    }
+    pp = pe
+    xp = xe
+  }
+}
