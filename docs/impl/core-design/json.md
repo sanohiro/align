@@ -93,6 +93,23 @@ Ok payload across a function boundary — decode + use in-scope; `json.encode` o
 `array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
 Deferred: `array<scalar>` field decode.
 
+**`array<scalar>` fields (JSON completeness T1b).** A struct field may be an owned `array<i64>` /
+`array<f64>` / `array<bool>` — the align-LLM data shapes (embeddings, token ids). A JSON descriptor
+**kind 7**: the field's own `{ptr,len}` slot is width 16 (low byte); the ELEMENT scalar's kind (0=int /
+1=bool / 2=float, bits 20-23), width (bits 24-27) and sign (bit 16) pack into the tag's upper bits, so
+one tag carries both. Decode: `decode_scalar_array_value` parses the JSON array into an owned buffer via
+the shared per-scalar `write_value`, so the same range / sign / float-width checks a scalar *field* gets
+apply per element. Encode: a `ScalarArrayField` template piece → `json_encode_scalar_array` loops the
+buffer emitting `[e0,e1,…]` (dynamic length → runtime loop). Drop: the owned buffer flat-frees (scalars
+own nothing) — `drop_struct_fields`'s `DynArray` arm on success, `drop_decoded_owned` kind-7 on the
+decode error path (`sub_owns_buffers` gained kind 7 so a scalar-array field inside an `array<Move-struct>`
+element is deep-freed). Composes with J3b (`Table { rows: array<Row>, meta: array<i64> }` where
+`Row { vals: array<f64> }`). The element type is baked into the decode schema fingerprint
+(`json_schema_sig` → the element-aware MIR `ty_name`), so an `array<i64>`→`array<f64>` change invalidates
+the cache. **Deferred:** `array<str>` (a borrowed-view element — region-tracking follow-up) and
+`array<char>` (no JSON form). v1 limits: `.sum()`/pipelines over an owned scalar-array field and
+`json.encode` of a bare `array<scalar>` stay restricted (decode + `.len()` + encode-as-field work).
+
 **`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
 scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →
 `None`, a type mismatch → `Err`; a required (non-`Option`) field still `Err`s when missing. **Encode

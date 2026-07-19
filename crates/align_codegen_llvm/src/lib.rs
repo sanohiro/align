@@ -1192,6 +1192,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "json_encode_scalar_array".to_string(),
+        module.add_function(
+            "align_rt_json_encode_scalar_array",
+            // (builder, ptr, len, elem_tag: i32) -> void
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_write_int".to_string(),
         module.add_function(
             "align_rt_builder_write_int",
@@ -8402,6 +8411,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // which the runtime uses to decode the JSON array into an owned AoS. The nested `str`
             // element fields stay borrowed views into the input.
             Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)),
+            // `array<scalar>` field (kind 7, JSON completeness T1b): the field's own `{ptr,len}` slot is
+            // width 16 (low byte); the ELEMENT scalar (int/float/bool) is packed into the upper bits so
+            // one tag carries both — elem-signed bit 16, elem-kind (0=int/1=bool/2=float) bits 20-23,
+            // elem-width bits 24-27. `sub` is null (scalars need no sub-schema). The element's own
+            // (kind,width,sign) come from the scalar-field encoding, relocated here.
+            Ty::DynArray(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool)) => {
+                let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(s), null);
+                let elem_kind = (etag >> 8) & 0xff;
+                let elem_width = etag & 0xff;
+                let elem_signed = (etag >> 16) & 1;
+                ((7 << 8) | 16 | (elem_signed << 16) | (elem_kind << 20) | (elem_width << 24), null)
+            }
             // A shape-directed union (`enum`) field (kind 6, JSON completeness J1b-2b): `sub` is a
             // `JsonUnion` (not a `JsonSubTable`) — the runtime `field_width`/`write_value`/encode arms
             // reinterpret it by the kind. The width byte is unused (the size comes from
@@ -9085,6 +9106,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             &[bptr.into(), ptr.into(), len.into(), t.descs.into(), n.into(), esz.into()],
                             "",
                         )
+                        .map_err(|e| self.err(e))?;
+                }
+                // `json.encode` of an `array<scalar>` field (T1b): hand the owned buffer `{ptr,len}` and
+                // the element scalar tag (`(kind<<8)|width|(signed<<16)`, computed from the element type)
+                // to the runtime encoder, which loops emitting `[e0,e1,…]` (dynamic length can't unroll).
+                align_mir::TemplatePiece::ScalarArrayField { array, elem } => {
+                    let agg = self.operand(array).into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "scap").map_err(|e| self.err(e))?;
+                    let len = self.builder.build_extract_value(agg, 1, "scal").map_err(|e| self.err(e))?;
+                    let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                    let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null);
+                    let etag = self.ctx.i32_type().const_int(etag, false);
+                    self.builder
+                        .build_call(self.funcs["json_encode_scalar_array"], &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` of a shape-directed union: materialize the enum value in memory (the

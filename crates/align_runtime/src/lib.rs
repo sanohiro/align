@@ -1907,6 +1907,14 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
             }
         }
         5 => unsafe { json_encode_struct_array_at(b, fp, d.sub) },
+        // `array<scalar>` field (kind 7, JSON completeness T1b): the element info is packed in the tag's
+        // upper bits (see the decode kind-7 arm). Encode the `{ptr,count}` at `fp` as `[e0,e1,…]`.
+        7 => {
+            let elem_kind = (d.tag >> 20) & 0xf;
+            let elem_signed = (d.tag & (1 << 16)) != 0;
+            let elem_width = ((d.tag >> 24) & 0xf) as usize;
+            unsafe { json_encode_scalar_array_at(b, fp, elem_kind, elem_width, elem_signed) };
+        }
         // A shape-directed union (`enum`) field (JSON completeness J1b-2b): `d.sub` is a [`JsonUnion`];
         // emit the live variant's payload bare at `fp`.
         6 => {
@@ -1993,6 +2001,66 @@ pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *cons
 ///
 /// # Safety
 /// `slot` must point to a `{ptr,len}` (16 bytes); `sub` must be a valid element [`JsonSubTable`].
+/// Encode a `{ptr,count}` owned scalar array at `slot` as a JSON array `[e0,e1,…]` (JSON completeness
+/// T1b). Each element is formatted by the shared per-scalar [`json_encode_value`] via a synthetic
+/// element descriptor, so an `array<i64>`/`array<f64>`/`array<bool>` element renders exactly like a
+/// scalar *field* of the same type. `elem_kind` = 0 int / 1 bool / 2 float. An empty / null array → `[]`.
+///
+/// # Safety
+/// `slot` must address a valid `{ptr,count}` (16 bytes); the buffer `count` `elem_width`-byte scalars.
+unsafe fn json_encode_scalar_array_at(b: &mut Builder, slot: *const u8, elem_kind: i32, elem_width: usize, elem_signed: bool) {
+    let mut pb = [0u8; 8];
+    let mut lb = [0u8; 8];
+    unsafe {
+        core::ptr::copy_nonoverlapping(slot, pb.as_mut_ptr(), 8);
+        core::ptr::copy_nonoverlapping(slot.add(8), lb.as_mut_ptr(), 8);
+    }
+    let ptr = usize::from_le_bytes(pb) as *const u8;
+    let len = i64::from_le_bytes(lb).max(0);
+    let ed = JsonField {
+        name_ptr: core::ptr::null(),
+        name_len: 0,
+        tag: (elem_kind << 8) | (elem_width as i32) | ((elem_signed as i32) << 16),
+        offset: 0,
+        sub: core::ptr::null(),
+        opt_tag: -1,
+    };
+    b.buf.push(b'[');
+    if !ptr.is_null() {
+        for i in 0..len as usize {
+            if i > 0 {
+                b.buf.push(b',');
+            }
+            let eptr = unsafe { ptr.add(i * elem_width) };
+            unsafe { json_encode_value(b, eptr, &ed, elem_kind) };
+        }
+    }
+    b.buf.push(b']');
+}
+
+/// `json.encode` of an `array<scalar>` field (JSON completeness T1b): encode the owned buffer at
+/// `(ptr, len)` as `[e0,e1,…]`. `elem_tag` packs the element scalar tag — kind (bits 8-15), width (low
+/// byte), sign (bit 16) — exactly as a scalar field's descriptor tag; codegen computes it from the
+/// element type. Called by codegen for the `ScalarArrayField` template piece.
+///
+/// # Safety
+/// `b` must be a valid `Builder`; `(ptr, len)` an owned buffer of `len` scalars of the tagged width.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_encode_scalar_array(b: *mut Builder, ptr: *const u8, len: i64, elem_tag: i32) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let elem_kind = (elem_tag >> 8) & 0xff;
+    let elem_width = (elem_tag & 0xff) as usize;
+    let elem_signed = (elem_tag & (1 << 16)) != 0;
+    // Reconstruct the `{ptr,len}` slot layout `json_encode_scalar_array_at` reads.
+    let mut slot = [0u8; 16];
+    slot[..8].copy_from_slice(&(ptr as usize as u64).to_le_bytes());
+    slot[8..].copy_from_slice(&len.to_le_bytes());
+    unsafe { json_encode_scalar_array_at(b, slot.as_ptr(), elem_kind, elem_width, elem_signed) };
+}
+
 unsafe fn json_encode_struct_array_at(b: &mut Builder, slot: *const u8, sub: *const JsonSubTable) {
     if sub.is_null() {
         b.buf.extend_from_slice(b"null");
@@ -2850,6 +2918,64 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// The buffer is owned (freed by the struct's `Drop` — `drop_struct_fields`'s array arm). An empty
 /// array allocates nothing (`{null, 0}`). Returns `None` on any malformed element / structure.
 ///
+/// Decode a JSON array of **scalars** (`array<i64>` / `array<f64>` / `array<bool>` — JSON completeness
+/// T1b) into a freshly heap-allocated owned buffer, returning its `{ptr, count}`. Each element is
+/// parsed by the shared per-scalar [`write_value`] into an `elem_width`-byte slot — so the same range /
+/// sign / float-width checks a scalar *field* gets apply per element. `elem_kind` is the scalar kind
+/// (0 = int, 1 = bool, 2 = float), `elem_signed` the int sign. The buffer is owned (freed by the
+/// struct's `Drop` — `drop_struct_fields`'s flat `DynArray` free; scalars own nothing, so no deep
+/// free). An empty array allocates nothing (`{null, 0}`). Returns `None` on any malformed element.
+///
+/// # Safety
+/// `p` must be positioned at (optional whitespace then) the array's `[`; `elem_width ∈ {1,2,4,8}`.
+unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<AlignStr> {
+    p.ws();
+    p.expect(b'[')?;
+    p.ws();
+    // Synthetic per-element descriptor so `write_value`'s scalar arms see the right width/sign. A
+    // scalar element has no name / sub-table / Option tag.
+    let ed = JsonField {
+        name_ptr: core::ptr::null(),
+        name_len: 0,
+        tag: (elem_kind << 8) | (elem_width as i32) | ((elem_signed as i32) << 16),
+        offset: 0,
+        sub: core::ptr::null(),
+        opt_tag: -1,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut count: i64 = 0;
+    if p.peek() == Some(b']') {
+        p.pos += 1;
+    } else {
+        loop {
+            let eoff = buf.len();
+            buf.resize(eoff + elem_width, 0);
+            let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
+            unsafe { write_value(p, elem_kind, elem_width as i64, &ed, eptr)? };
+            count += 1;
+            p.ws();
+            match p.peek() {
+                Some(b',') => {
+                    p.pos += 1;
+                    p.ws();
+                    continue;
+                }
+                Some(b']') => {
+                    p.pos += 1;
+                    break;
+                }
+                _ => return None, // scalar elements own nothing → no partial-cleanup needed on bail
+            }
+        }
+    }
+    let total = buf.len() as i64;
+    let dst = align_rt_alloc(total);
+    if total > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+    }
+    Some(AlignStr { ptr: dst, len: count })
+}
+
 /// # Safety
 /// `sub` must be a valid [`JsonSubTable`] (element schema; `store_size` = element stride); `p` must
 /// be positioned at (optional whitespace then) the array's `[`.
@@ -2931,7 +3057,10 @@ unsafe fn decode_struct_array_value(p: &mut JsonParser, sub: *const JsonSubTable
 /// Every kind-4/5/6 `sub` in `descs` (and transitively) must be a valid descriptor pointer.
 unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
     descs.iter().any(|d| match (d.tag >> 8) & 0xff {
+        // kind 5 = array<Struct>, 6 = union (owned payload possible), 7 = array<scalar> — all own a
+        // heap buffer `drop_decoded_owned` frees.
         5 | 6 => !d.sub.is_null(),
+        7 => true,
         4 if !d.sub.is_null() => {
             let sub = unsafe { &*d.sub };
             let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
@@ -3007,6 +3136,15 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
                 let u = unsafe { &*(d.sub as *const JsonUnion) };
                 unsafe { drop_decoded_union(base.add(off), u) };
             }
+            // An `array<scalar>` field (kind 7, T1b): flat-free the owned `{ptr,len}` buffer (scalar
+            // elements own nothing, so no deep free) and NULL the 16-byte slot (idempotent, like kind 5).
+            7 => {
+                let mut pb = [0u8; 8];
+                unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
+                let ptr = usize::from_le_bytes(pb) as *mut u8;
+                unsafe { align_rt_free(ptr) };
+                unsafe { core::ptr::write_bytes(base.add(off), 0, 16) };
+            }
             _ => {}
         }
     }
@@ -3070,6 +3208,26 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
                 return None;
             }
             let arr = unsafe { decode_struct_array_value(p, d.sub)? };
+            let ptr_bytes = (arr.ptr as usize as u64).to_le_bytes();
+            let len_bytes = arr.len.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
+            }
+            Some(())
+        }
+        // `array<scalar>` field (kind 7, JSON completeness T1b): parse a JSON array of scalars into an
+        // owned buffer and write its `{ptr,count}` (16 bytes) into the field slot. The ELEMENT info is
+        // packed into the tag's upper bits (the low byte is the field's own `{ptr,len}` slot width 16):
+        // elem-signed bit 16, elem-kind (0=int/1=bool/2=float) bits 20-23, elem-width bits 24-27.
+        7 => {
+            if w != 16 {
+                return None;
+            }
+            let elem_kind = (d.tag >> 20) & 0xf;
+            let elem_signed = (d.tag & (1 << 16)) != 0;
+            let elem_width = ((d.tag >> 24) & 0xf) as usize;
+            let arr = unsafe { decode_scalar_array_value(p, elem_kind, elem_width, elem_signed)? };
             let ptr_bytes = (arr.ptr as usize as u64).to_le_bytes();
             let len_bytes = arr.len.to_le_bytes();
             unsafe {
@@ -18267,6 +18425,31 @@ mod tests {
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, 1, "the array arm allocated one buffer");
         assert_eq!(f1 - f0, 1, "the error path freed it exactly once — no leak, no double-free");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_scalar_array_field_sibling_failure_frees_buffer() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Memory-safety (T1b): an `array<scalar>` field (kind 7) decoded, then a required sibling field
+        // fails the outer decode. `drop_decoded_owned`'s kind-7 arm must free the owned scalar buffer on
+        // the `Err` path (the caller drops nothing on a failed decode) — else it leaks.
+        // S { xs: array<i64> @0, req: i64 @16 }; `req` missing → fails after `xs` allocated.
+        let (xs, req) = (b"xs", b"req");
+        // kind-7 tag: slot width 16, elem int width 8 signed → (7<<8)|16 | (0<<20) | (1<<16) | (8<<24).
+        let xs_tag = (7 << 8) | 16 | (1 << 16) | (8 << 24);
+        let descs = [
+            JsonField { name_ptr: xs.as_ptr(), name_len: 2, tag: xs_tag, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: req.as_ptr(), name_len: 3, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"{"xs":[1,2,3]}"#; // `req` missing
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 24];
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        assert_ne!(rc, 0, "the missing required `req` must fail the decode");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, 1, "the `xs` scalar array allocated one buffer");
+        assert_eq!(f1 - f0, 1, "the error path freed it exactly once — no leak");
     }
 
     #[cfg(feature = "alloc-count")]

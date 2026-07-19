@@ -3836,9 +3836,21 @@ deferred at 0b-2. **The OpenAI chat gateway now closes end-to-end** (`Chat` roun
 v1 limits: `json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
 (decode→encode passthrough works). Tests: `m5.rs` (full gateway round-trip, standalone-local drop,
 `array<string>`-element rejection), runtime alloc-count deep-free gates (a shared `ALLOC_COUNT_LOCK`
-serializes the count-asserting tests). **NEXT: J3 T1b matrix fill.** →
-**J3** matrix fill (T1b — top-level scalar/bool decode targets, `array<scalar>` fields,
-`Option<struct>` encode, supported-constructor compositions) →
+serializes the count-asserting tests). **T1b (part 1) — SHIPPED: `array<scalar>` struct fields** (`array<i64>` / `array<f64>` / `array<bool>` —
+the align-LLM embeddings / token-id shapes). A new JSON descriptor **kind 7** (the field slot is width 16;
+the element scalar's kind/width/sign pack into the tag's upper bits). Decode parses via the shared
+per-scalar `write_value` (same range/sign/float-width checks per element); encode emits `[e0,e1,…]` via a
+runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar_array`). Composes with J3b
+(a scalar-array field inside an `array<Move-struct>` element). Drop: the owned buffer flat-frees
+(`drop_struct_fields`'s `DynArray` arm on success; `drop_decoded_owned` kind-7 on the decode error path;
+`sub_owns_buffers` gained kind 7). Also fixed a pre-existing #514/#517 stale-cache bug: MIR `ty_name`
+rendered a bare `"array"` for `DynArray`, so a `array<i64>`→`array<f64>` element change didn't invalidate
+the decode cache (now renders the element). `array<str>` (borrowed element) / `array<char>` deferred. v1
+limits: `.sum()`/pipelines over an owned scalar-array field and `json.encode` of a bare `array<scalar>`
+stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **NEXT: the rest of
+T1b** — top-level scalar/bool decode targets, `Option<struct>` encode, `array<Option<T>>` compositions. →
+**J3** matrix fill (T1b remainder — top-level scalar/bool decode targets, `Option<struct>` encode,
+supported-constructor compositions) →
 **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.

@@ -4547,7 +4547,7 @@ impl EffectScan<'_> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -6509,7 +6509,7 @@ impl<'a> EscapeCheck<'a> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -7123,7 +7123,7 @@ impl UnnecessaryHeapScan {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -8521,7 +8521,7 @@ impl<'a> MoveCheck<'a> {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -12726,7 +12726,7 @@ impl<'a, 't> Checker<'a, 't> {
                 text.push_str(part);
                 Some(text)
             }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::UnionValue { .. } => None,
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::ScalarArrayField { .. } | TemplatePart::UnionValue { .. } => None,
         });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
@@ -15476,6 +15476,12 @@ impl<'a, 't> Checker<'a, 't> {
                         return false;
                     }
                 }
+                // An `array<scalar>` field (JSON completeness T1b): decode a JSON array of numbers /
+                // bools into an owned scalar buffer. The element is a numeric / bool scalar — a Copy,
+                // non-borrowing element, so the array is owned + `Static` (freely returnable) and freed
+                // by one flat `Drop`. `array<str>` (a borrowed view element) and `array<char>` are
+                // deferred (str borrows the input; char has no JSON form).
+                Ty::DynArray(Scalar::Int(_)) | Ty::DynArray(Scalar::Float(_)) | Ty::DynArray(Scalar::Bool) => {}
                 // A shape-directed union (`enum`) field (J1b-2b): the `Message { content: Content }`
                 // shape. The enum must be union-decodable (pairwise-distinct shape classes); an object
                 // payload's struct is validated recursively by `check_union_decodable`.
@@ -15650,6 +15656,9 @@ impl<'a, 't> Checker<'a, 't> {
                 // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
                 // encoder (dynamic length → a runtime loop, not a static unroll).
                 parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
+            } else if let Ty::DynArray(s) = f.ty {
+                // An `array<scalar>` field (T1b) emits `[e0,e1,…]` via a runtime loop (dynamic length).
+                parts.push(TemplatePart::ScalarArrayField { access: access(f.ty), elem: s });
             } else if let Ty::Enum(eid) = f.ty {
                 // A shape-directed union (`enum`) field (J1b-2b): emit the live variant's payload bare
                 // after the `"name":` prefix already pushed above — the value-side dual of the union
@@ -19527,7 +19536,7 @@ impl<'a, 't> Checker<'a, 't> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
