@@ -12527,25 +12527,14 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        // `json.doc` navigation / leaf accessors (J4): `d.kind()` / `d.get(k)` / `d.at(i)` /
-        // `d.as_str()` / `d.as_i64()` / `d.as_f64()` / `d.as_bool()`. Intercepted on a `json.doc`
-        // receiver BEFORE the shared-name handlers below (`as_str` on bytes, `get` on a box), so those
-        // names stay free on other values. A non-`json.doc` receiver falls through: `as_str`/`get`
-        // reach their own handlers, the exclusive names (`kind`/`at`/`as_*`) reach the final
-        // unknown-method arm. The receiver may be a temporary (a `json.doc` is Copy, never dropped, so
-        // chaining `d.get("a").at(0).as_i64()` is fine — no bound-local gate, unlike the Move handles).
-        if matches!(method, "kind" | "get" | "at" | "as_str" | "as_i64" | "as_f64" | "as_bool") {
+        // `bytes.as_str()` — the validating bytes→text VIEW (A7). Dispatched on a `bytes` (`slice<u8>`)
+        // receiver so the name stays free on other values. `d.as_str()` on a `json.doc` (J4) shares the
+        // name, so it is intercepted here — on the SAME single `check_expr(recv)` (no double-check).
+        if method == "as_str" {
             let recv_expr = self.check_expr(recv, None);
             if recv_expr.ty == Ty::JsonDoc {
                 return self.check_json_doc_method(recv_expr, method, args, span);
             }
-            // Otherwise let a shared-name handler (or the final unknown-method arm) take it; those
-            // paths re-check `recv` idempotently for the bound-local receivers they accept.
-        }
-        // `bytes.as_str()` — the validating bytes→text VIEW (A7). Dispatched on a `bytes` (`slice<u8>`)
-        // receiver so the name stays free on other values.
-        if method == "as_str" {
-            let recv_expr = self.check_expr(recv, None);
             if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
                 return self.check_bytes_as_str(recv_expr, args, span);
             }
@@ -12770,6 +12759,14 @@ impl<'a, 't> Checker<'a, 't> {
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
         match method {
+            // `json.doc` navigation / leaf accessors (J4): `d.kind()` / `d.get(k)` / `d.at(i)` /
+            // `d.as_i64()` / `d.as_f64()` / `d.as_bool()`. Type-guarded on the receiver (checked once
+            // above), BEFORE the shared `get` (box) arm so the name stays free on other values.
+            // (`d.as_str()` shares the `as_str` intercept above.) The receiver may be a temporary — a
+            // `json.doc` is Copy, never dropped, so chaining `d.get("a").at(0).as_i64()` is fine.
+            "kind" | "get" | "at" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
+                self.check_json_doc_method(recv_expr, method, args, span)
+            }
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
             // http-client arm below; `check_box_get` otherwise swallows it with a box-only error).
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),

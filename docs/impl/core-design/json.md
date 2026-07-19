@@ -193,8 +193,16 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   `json.doc(s)?` parse (arena-backed tape, `Result<json.doc, Error>`) + `kind()` (→ builtin
   `json.kind` sum type) + `get`/`at` navigation + the four leaf accessors `as_str`/`as_i64`/`as_f64`/
   `as_bool` (→ `Option`; `as_str` is a zero-copy input view, escaped strings unescape into the arena).
-  **Deferred to slice 2:** `len()`, `elems()` (materialize a level for pipelines), and `key(i)`
-  (objects-as-ordered-data).
+  A number's **form** selects the accessor (`42.0` / `1e3` are integer-valued but non-integer form →
+  `as_i64` `None`, `as_f64` `Some`), matching simdjson's on-demand model. `get` on a **duplicate** key
+  returns the **first** occurrence (lazy-view; deliberately distinct from `decode`'s last-wins —
+  duplicate keys are pathological in both). **Deferred to slice 2:** `len()`, `elems()` (materialize a
+  level for pipelines), and `key(i)` (objects-as-ordered-data).
+  **Known systemic leniency (not a J4 regression — shared with `decode`'s scanner):** raw C0 control
+  bytes inside strings and leading zeros in numbers (`007`) are currently accepted; making the shared
+  `find_quote_or_escape` / `number_span` strict (RFC 8259 §7/§6) is a follow-up that must land for
+  `decode` and `doc` together (fixing only one would make `json.doc(s)` and `json.decode(s)` disagree
+  on the same malformed `s`).
 - **`json.scan` (J5):** streaming typed rows, binding-annotation-typed, pipeline source only.
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is

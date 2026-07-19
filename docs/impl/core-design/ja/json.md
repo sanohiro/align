@@ -177,8 +177,14 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   `json.doc(s)?` パース（arena 常駐 tape、`Result<json.doc, Error>`）+ `kind()`（→ 組み込み
   `json.kind` 直和型）+ `get`/`at` ナビゲーション + 4 つの葉アクセサ `as_str`/`as_i64`/`as_f64`/
   `as_bool`（→ `Option`。`as_str` は入力へのゼロコピービュー、エスケープ文字列は arena に unescape）。
-  **Slice 2 に延期:** `len()`、`elems()`（1 階層を pipeline 用に materialize）、`key(i)`（順序付き
-  object-as-data）。
+  数値は**形**でアクセサが決まる（`42.0` / `1e3` は整数値だが非整数形 → `as_i64` は `None`、`as_f64`
+  は `Some`。simdjson on-demand と同じ）。**重複キー**の `get` は**最初**の出現を返す（遅延ビュー。
+  `decode` の last-wins とは意図的に異なる。重複キーは両者で pathological）。**Slice 2 に延期:**
+  `len()`、`elems()`（1 階層を pipeline 用に materialize）、`key(i)`（順序付き object-as-data）。
+  **既知の systemic な緩さ（J4 の退行ではない — `decode` のスキャナと共有）:** 文字列内の生の C0 制御
+  バイトと数値の先頭ゼロ（`007`）を現状は受理する。共有の `find_quote_or_escape` / `number_span` を
+  RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと
+  同じ不正入力 `s` に対し `json.doc(s)` と `json.decode(s)` が食い違う）。
 - **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
   source 専用。
 

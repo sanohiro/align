@@ -6275,7 +6275,10 @@ pub unsafe extern "C" fn align_rt_json_doc_kind(tape: *const DocTape, node: i64)
 }
 
 /// `d.get(key)` — the value of object member `key`, or `Missing` (absent / not an object / already
-/// Missing). Writes a `{ tape, child }` handle into `out`.
+/// Missing). Writes a `{ tape, child }` handle into `out`. On a **duplicate** key (RFC-undefined),
+/// the **first** occurrence wins — the lazy-view semantics (stop at the first match, O(members) worst
+/// case, early-exit in the common case), matching simdjson's on-demand model. (This deliberately
+/// differs from the typed `json.decode`'s last-wins; duplicate keys are pathological in both.)
 ///
 /// # Safety
 /// `tape` must be null or a live [`DocTape`]; `key`/`key_len` a valid range; `out` 16 writable bytes.
@@ -6386,8 +6389,10 @@ unsafe fn doc_number_span<'a>(tape: *const DocTape, node: i64) -> Option<&'a str
     core::str::from_utf8(&input[n.a as usize..n.a as usize + n.b as usize]).ok()
 }
 
-/// `d.as_i64()` — `Some(i64)` if this doc is a JSON number with an exact `i64` value, else `None`
-/// (not a number, fractional/exponent form, or out of `i64` range). Returns 1/0.
+/// `d.as_i64()` — `Some(i64)` if this doc is a JSON number in **integer lexical form** within `i64`
+/// range, else `None` (not a number, a fractional / exponent form even when integer-valued like
+/// `42.0` / `1e3`, or out of range). Returns 1/0. (Integer-valued floats stay `as_f64`'s domain — a
+/// number's *form* selects the accessor, matching simdjson's on-demand `get_int64`.)
 ///
 /// # Safety
 /// `tape` must be null or a live [`DocTape`]; `out` must point to a writable `i64`.
@@ -24767,6 +24772,42 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // Key "kA" (from `kA`).
         unsafe { align_rt_json_doc_get(t, root.node, "kA".as_ptr(), 2, &mut v) };
         assert_eq!(doc_str(v.tape, v.node).as_deref(), Some("a\tbé😀"));
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_duplicate_key_first_wins() {
+        // Lazy-view semantics: get() returns the FIRST occurrence of a duplicated key (simdjson
+        // on-demand), deliberately distinct from json.decode's last-wins. Pinned so it can't drift.
+        let (arena, root) = unsafe { doc_parse(r#"{"k": 1, "k": 2}"#) }.expect("parse");
+        let t = root.tape;
+        let mut v = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "k".as_ptr(), 1, &mut v) };
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(v.tape, v.node, &mut iv) }, 1);
+        assert_eq!(iv, 1, "duplicate key: first occurrence wins");
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_number_form_selects_accessor() {
+        // `42.0` and `1e3` are integer-VALUED but in fractional/exponent FORM → as_i64 None, as_f64 Some.
+        let (arena, root) = unsafe { doc_parse(r#"[42.0, 1e3, 7]"#) }.expect("parse");
+        let t = root.tape;
+        let get = |i: i64| {
+            let mut e = DocHandle { tape: core::ptr::null(), node: 0 };
+            unsafe { align_rt_json_doc_at(t, root.node, i, &mut e) };
+            e
+        };
+        let e0 = get(0);
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(e0.tape, e0.node, &mut iv) }, 0, "42.0 is not integer form");
+        let mut fv = 0f64;
+        assert_eq!(unsafe { align_rt_json_doc_as_f64(e0.tape, e0.node, &mut fv) }, 1);
+        assert_eq!(fv, 42.0);
+        let e2 = get(2); // 7 is integer form → both work
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(e2.tape, e2.node, &mut iv) }, 1);
+        assert_eq!(iv, 7);
         unsafe { align_rt_arena_end(arena) };
     }
 
