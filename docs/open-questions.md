@@ -3494,6 +3494,12 @@ distribution for the future pkg ecosystem". This entry is the design for that ec
 foundation. **Target: consumer-gated** — implement when the first shared library exists (e.g. an
 align-LLM component extracted for reuse, or the first third-party dependency). Nothing blocks on it.
 
+**Consumer-gate OPENED 2026-07-20 (owner directive: framework-first).** The first shared library is
+`pkg.web`, built deliberately (not extracted); the v1 implementation scope below (the two
+import-edge rules + spec text) is phase **F0** of `impl/15-gateway-workspace-plan.md`, the plan of
+record for the pkg-foundation + `pkg.web` + gateway sequence. This entry moves PROPOSAL → Settled
+when F0 lands with the spec text.
+
 **Thesis: the package layer adds two path rules and zero new compiler concepts.** A "package" is a
 *distribution-layer* unit — the subtree a tool (or a human) vendors under `pkg/` — and the compiler
 never learns what one is. Resolution, visibility, effects, escape, capabilities: all carry over
@@ -3763,6 +3769,13 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
   are policy, not protocol). Double-gated on (a) fully-escaping fn values (storing handlers in
   structs/arrays) and (b) the build-system / package-layout / dependency-resolution design
   above. Re-evaluate on real reuse pressure from shipped apps — extraction over invention.
+  **SUPERSEDED 2026-07-20 (owner re-decision): framework-first.** The pkg foundation + `pkg.web`
+  are built deliberately BEFORE the gateway app (which becomes the framework's first consumer/
+  validation instead of its predecessor). Gate (b) opens via the pkg-foundation proposal's F0
+  scope; gate (a) was probed narrower than recorded — a router needs only **non-capturing** fn
+  values as struct fields / array elements (Copy/`Static`, no environment; capturing escaping
+  closures stay deferred). Plan of record: `impl/15-gateway-workspace-plan.md` (F0 pkg foundation
+  → F1 fn-in-field slice → F2 pkg.web design doc → F3 framework slices → F4 the gateway app).
 
 ### JSON completeness — DESIGN SETTLED 2026-07-18 (owner-approved; the implementation source of truth)
 
