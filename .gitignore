@@ -40,3 +40,6 @@ ll_out/
 /test_*.sh
 /unsafe_raw
 /*.o
+
+# stray alignc build outputs run from the repo root
+/main
