@@ -79,16 +79,18 @@ consumes `FnTy` effects). NOT in scope: capturing closures escaping (unchanged d
 Acceptance: a `Route { path: str, handler: fn(ctx) -> R }` table in an array, dispatched by lookup,
 end-to-end; effect inference still fails closed on unknown targets.
 
-**F2 — pkg.web design doc (before any framework code).** `docs/impl/pkg-design/web.md` (+ `ja/`
-mirror), at std-design depth: signatures, Move/effect classification, error policy, slice plan,
-pitfalls. Design constraints recorded now: pkg.web is **policy over protocol** — it composes the
-std.http floor (`serve`/`accept`/`ctx.*`/`respond`/`respond_stream`) and must not re-implement
-protocol; routing = a route table of fn values (F1) with explicit `:param` segment convention;
-error objects (the OpenAI error shape as the first concrete need); SSE framing sugar; JSON
-in/out decode/encode sugar over `core.json`; NO middleware chains in v1 (the capturing-closure
-consumer — defer), NO async/callback model (sequential accept is the v1 recorded direction), and
-"one way": one router form, one handler signature. The design session settles the surface with the
-owner before implementation.
+**F2 — pkg.web design doc — WRITTEN 2026-07-20 (PROPOSAL).** `docs/impl/pkg-design/web.md` (+
+`ja/` mirror), at std-design depth: signatures, Move/effect classification, error policy, W1–W5
+slice plan, pitfalls, and the std.http prerequisites (query/percent-decode, SSE framing — the
+"consumer arrived" items). Primary reference: **Go 1.22 `net/http` ServeMux** (method-aware
+`{param}` pattern routing, automatic 404/405); chi/httprouter as the performance reference
+(radix tree deferred; v1 linear scan, bench-gated). Three forks (⚖ A route constructors /
+B pattern syntax / C params delivery) await owner settlement before W1 starts; recommendations
+are in the doc. **Distribution (owner question answered 2026-07-20):** `pkg.web` is a
+**first-party package shipped with the system** — the align repo/release carries it as a
+vendorable subtree; consumers copy `pkg/web/` into their project (later automated by the fetch
+tool). It stays an ordinary pkg-layer package — explicitly vendored, never ambiently resolvable
+(no search paths; pkg-foundation D2/D6 hold).
 
 **F3 — pkg.web implementation slices** (per the F2 doc's slice plan; expected shape: types+router
 core → request/response sugar → SSE helpers → hardening), developed at `apps/gateway/pkg/web/`
