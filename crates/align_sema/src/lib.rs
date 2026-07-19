@@ -21350,6 +21350,17 @@ fn resolve_type(
             }
             Ty::Child
         }
+        // `http_request_ctx` (`std.http`) — one accepted+parsed request, an owned Move handle
+        // (`srv.accept()`). A surface type name (F1②) so the pkg.web request `Ctx` can **own** it as
+        // a struct field (`Ctx { req: http_request_ctx, … }`) — the struct becomes Move and its drop
+        // closes the connection (`http_ctx_free`) exactly once.
+        "http_request_ctx" => {
+            if !args.is_empty() {
+                diags.error("http_request_ctx takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::HttpRequestCtx
+        }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
             let inner = match args {
@@ -21580,6 +21591,37 @@ fn resolve_user_type(
     }
 }
 
+/// Whether `ty` is a bare Move **handle** — a single opaque-pointer resource handle whose drop
+/// closes/frees it (a reader/writer/buffer, a socket, a file, an http request/response/client/
+/// server/ctx/stream, a cli command/parsed). Admitted as a struct field (F1②, the pkg.web request
+/// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (`ty_owns_buffer_rec`
+/// already classifies it so), and its recursive drop closes the handle exactly once. This set MUST
+/// stay in lockstep with `align_codegen_llvm::handle_free_fn` (a field type allowed here but not
+/// freed there would leak). Excludes `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer
+/// drops) and the `{ptr,len}` owned collections (`string`/`array` — their own field arms).
+fn is_move_handle(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::File
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+    )
+}
+
 /// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
 /// `string`, or a nested struct.
 fn is_field_ok(ty: Ty) -> bool {
@@ -21598,6 +21640,13 @@ fn is_field_ok(ty: Ty) -> bool {
         // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
         // arm gains the same non-Move / Drop split the `array<T>` field has.
         Ty::Enum(_) => true,
+        // A Move **handle** field (F1②, the pkg.web request `Ctx` owning its `http_request_ctx`). A
+        // bare pointer handle (`file`, `http_request_ctx`, a reader/writer/buffer, a socket, an http
+        // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
+        // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
+        // handle arm → the null-safe `*_free`; `ty_owns_buffer_rec` already classifies the struct as
+        // Move). The admitted set matches codegen's `handle_free_fn`.
+        _ if is_move_handle(ty) => true,
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
         // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
