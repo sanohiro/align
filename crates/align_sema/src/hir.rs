@@ -1475,6 +1475,11 @@ pub enum TemplatePart {
     /// `struct_id` is the element struct (its schema drives per-element encoding). Only produced by
     /// `json.encode` desugaring.
     StructArrayField { access: Expr, struct_id: u32 },
+    /// `json.encode` of an **`array<scalar>` field** (JSON completeness T1b): emit the owned buffer as a
+    /// JSON array `[e0,e1,…]` via a runtime loop (dynamic length). `access` is the array field value
+    /// (`{ptr,len}`); `elem` is the element scalar (int/float/bool — codegen packs its kind/width/sign
+    /// into the runtime encoder's element tag). Only produced by `json.encode` desugaring.
+    ScalarArrayField { access: Expr, elem: crate::Scalar },
     /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
     /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
     /// `decode(encode(x))` round-trips. `access` is the enum value; `enum_id` selects the descriptor.

@@ -306,6 +306,35 @@ fn gate2c_json_union_array_element_rename_invalidates() {
     }
 }
 
+// ---- Gate 2d: an array<scalar> field's ELEMENT type change invalidates the cache ---------------
+
+/// An `array<scalar>` field (T1b, kind-7 descriptor) feeds its element kind/width/sign only through the
+/// codegen descriptor tag, not the surrounding MIR — changing the element type (`array<i64>` →
+/// `array<f64>`) at the same slot leaves every other MIR statement byte-identical. The schema
+/// fingerprint (`json_schema_sig` → `ty_name`) must render the element type so the change flips the
+/// unit's MIR digest; else the warm cache serves a STALE object decoding the OLD element width/kind.
+#[test]
+fn gate2d_json_scalar_array_element_type_change_invalidates() {
+    if !backend() {
+        return;
+    }
+    // v1 `xs: array<i64>` → v2 `xs: array<f64>`; the JSON literal and every other line are unchanged.
+    let v1 = "import core.json\nS { xs: array<i64> }\nfn main() -> Result<(), Error> {\n  arena {\n    v: S := json.decode(\"{\\\"xs\\\":[1,2,3]}\")?\n    print(v.xs.len())\n  }\n  return Ok(())\n}\n";
+    let v2 = "import core.json\nS { xs: array<f64> }\nfn main() -> Result<(), Error> {\n  arena {\n    v: S := json.decode(\"{\\\"xs\\\":[1,2,3]}\")?\n    print(v.xs.len())\n  }\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scalar-arr-elem", &[("main.align", v1)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    proj.write("main.align", v2);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hot.outcome("main").hit, "a scalar-array element type change must miss");
+    assert_eq!(
+        hot.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the element type feeds the baked json schema fingerprint → the unit's MIR digest"
+    );
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]

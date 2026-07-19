@@ -2201,3 +2201,109 @@ fn json_array_of_move_struct_with_string_field_rejected_via_element() {
          fn main() -> i32 = 0\n"
     ));
 }
+
+// ---- JSON completeness T1b: array<scalar> struct fields ------------------------------------------
+// A struct field may be an owned `array<i64>` / `array<f64>` / `array<bool>` (kind-7 descriptor). Decode
+// parses a JSON scalar array into an owned buffer via the shared per-scalar `write_value`; encode emits
+// `[e0,e1,…]` via the runtime loop. The align-LLM data shapes (embeddings `array<f64>`, token ids
+// `array<i64>`) — not a struct/AoS.
+
+#[test]
+fn json_scalar_array_fields_decode_encode_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // A struct with int / float / bool array fields decodes each into an owned buffer (readable via
+    // `.len()`), and encodes byte-identically (`[1,2,3]` / `[1.5,2.5]` / `[true,false,true]`). The owned
+    // buffers drop clean at arena end (a leak / double-free would abort the runtime).
+    let src = "import core.json\n\
+        Vec { name: str, xs: array<i64>, ys: array<f64>, flags: array<bool> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        v: Vec := json.decode(\"{\\\"name\\\":\\\"e\\\",\\\"xs\\\":[1,2,3],\\\"ys\\\":[1.5,2.5],\\\"flags\\\":[true,false,true]}\")?\n    \
+        print(v.xs.len())\n    \
+        print(v.ys.len())\n    \
+        print(json.encode(v))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-scalar-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "3\n2\n{\"name\":\"e\",\"xs\":[1,2,3],\"ys\":[1.5,2.5],\"flags\":[true,false,true]}\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_scalar_array_field_widths_and_empty_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // Element width / sign are honored per the field type: an empty `array<i64>` → `[]`, signed `i32`
+    // negatives, and a full-range `u64` (18446744073709551615 = u64::MAX) all decode and re-encode
+    // byte-identically (the same range / sign checks a scalar field gets, applied per element).
+    let src = "import core.json\n\
+        S { a: array<i64>, b: array<i32>, c: array<u64> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        v: S := json.decode(\"{\\\"a\\\":[],\\\"b\\\":[-5,7],\\\"c\\\":[18446744073709551615,0]}\")?\n    \
+        print(v.a.len())\n    \
+        print(json.encode(v))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-scalar-array-widths", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\n{\"a\":[],\"b\":[-5,7],\"c\":[18446744073709551615,0]}\n"
+    );
+}
+
+#[test]
+fn json_scalar_array_composes_with_move_struct_array() {
+    if !backend_available() {
+        return;
+    }
+    // T1b composes with J3b: a scalar-array field inside an `array<Move-struct>` element. `Row` owns a
+    // `vals: array<f64>` (making `Row` Move), and `Table.rows: array<Row>` is an `array<Move-struct>` —
+    // the deep free drops each `Row`'s `vals` buffer, then the `rows` AoS, plus the top-level `meta`.
+    let src = "import core.json\n\
+        Row { id: i64, vals: array<f64> }\n\
+        Table { rows: array<Row>, meta: array<i64> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        t: Table := json.decode(\"{\\\"rows\\\":[{\\\"id\\\":1,\\\"vals\\\":[1.0,2.0]},{\\\"id\\\":2,\\\"vals\\\":[3.0]}],\\\"meta\\\":[10,20]}\")?\n    \
+        print(t.rows.len())\n    \
+        print(json.encode(t))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-scalar-array-nested", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "2\n{\"rows\":[{\"id\":1,\"vals\":[1.0,2.0]},{\"id\":2,\"vals\":[3.0]}],\"meta\":[10,20]}\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_scalar_array_type_mismatch_is_err() {
+    if !backend_available() {
+        return;
+    }
+    // A non-numeric element in an int array is a decode `Err`, not a panic — the per-element
+    // `write_value` fails the same way a scalar field would on `"two"`.
+    let src = "import core.json\n\
+        S { xs: array<i64> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        v: S := json.decode(\"{\\\"xs\\\":[1,\\\"two\\\",3]}\")?\n  \
+        print(v.xs.len())\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-scalar-array-mismatch", src);
+    assert_eq!(out.status.code(), Some(1)); // Err propagated, clean exit
+}
+
+#[test]
+fn json_scalar_array_str_element_rejected() {
+    // `array<str>` (a borrowed-view element) as a decode field is deferred (str borrows the input — a
+    // region-tracking follow-up), rejected cleanly rather than silently mis-handled.
+    assert!(check_errs(
+        "json-scalar-array-str",
+        "import core.json\n\
+         S { xs: array<str> }\n\
+         fn f(s: str) -> Result<S, Error> = json.decode(s)\n\
+         fn main() -> i32 = 0\n"
+    ));
+}

@@ -8,8 +8,38 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J3b SHIPPED (branch `json-j3a-move-enum-struct-field`,
-not yet merged) — `array<Move-struct>` struct fields, closing the full OpenAI chat gateway shape
+_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 1) SHIPPED (branch `json-t1b-matrix-fill`,
+not yet merged) — `array<scalar>` struct fields (`array<i64>` / `array<f64>` / `array<bool>`).** A struct
+field may now be an owned scalar array — the align-LLM data shapes (embeddings `array<f64>`, token ids
+`array<i64>`), decoded/encoded byte-identically and composing with J3b (a scalar-array field inside an
+`array<Move-struct>` element). **New JSON descriptor kind 7:** the field's own `{ptr,len}` slot is width
+16 (low byte); the ELEMENT scalar is packed into the tag's upper bits (elem-signed bit 16, elem-kind
+0=int/1=bool/2=float bits 20-23, elem-width bits 24-27), so one tag carries both. **Runtime:**
+`decode_scalar_array_value` parses a JSON scalar array into an owned buffer via the shared per-scalar
+`write_value` (so the same range / sign / float-width checks a scalar *field* gets apply per element);
+`write_value`/`json_encode_value` grew kind-7 arms; `json_encode_scalar_array` (+ FFI
+`align_rt_json_encode_scalar_array`) emits `[e0,e1,…]`; `field_width` kind 7 = 16 (the else branch);
+`drop_decoded_owned` grew a kind-7 flat-free arm AND `sub_owns_buffers` a kind-7 `true` (the Gate-1
+decode-error-path leak — a scalar-array field / a scalar-array field inside an `array<Move-struct>`
+element). **Sema:** `decode_struct_fields_ok` admits `Ty::DynArray(int/float/bool)`; `json_object_parts`
+emits a new `ScalarArrayField` template piece. `array<str>` (borrowed element) / `array<char>` deferred.
+**Codegen:** `json_payload_tag_sub` `Ty::DynArray(scalar)` → kind-7 tag; the `ScalarArrayField` piece →
+runtime encoder call. **MIR:** `TemplatePart`/`TemplatePiece::ScalarArrayField` threaded through every
+exhaustive template pass + the printer. **Also fixed a pre-existing #514/#517 stale-cache bug the new
+gate caught:** MIR `ty_name(Ty::DynArray)` rendered a bare `"array"` (dropping the element), so the baked
+`json_schema_sig` couldn't distinguish `array<i64>` from `array<f64>` at the same slot → a warm cache
+would serve a stale wrong-element-width decode object; now renders `array<i64>`. `/align-self-review`
+(Gate 1 kind-dispatch + template-pass sweep — found the drop-error-path + stale-cache holes; Gate 3
+no-panic) + `/code-review` high run. Tests: `m5.rs` T1b (int/float/bool decode/encode+round-trip,
+widths+empty+u64-max, composes-with-`array<Move-struct>`, type-mismatch Err, `array<str>` rejected),
+`cache_codegen` gate2d (element-type-change invalidates), runtime alloc-count (scalar-array error-path
+free). Suites green: m5 144, sema 151, cache_codegen 19 (+gate2d; only the known macOS gate7 flake
+fails), runtime alloc-count 252 passed; clippy clean. **v1 limits (unchanged):** `.sum()`/pipelines over
+an owned scalar-array field and `json.encode` of a bare `array<scalar>` stay restricted (decode + `.len()`
++ encode-as-field work). **NEXT: the rest of T1b** — top-level scalar/bool decode targets
+(`x: i64 := json.decode(s)?`), `Option<struct>` ENCODE (the Slice-B follow-up), `array<Option<T>>`
+compositions → J4 `json.doc` → J5 `json.scan` → J6 spec sync. Previous update: 2026-07-19,
+**JSON COMPLETENESS J3b SHIPPED (MERGED as #537) — `array<Move-struct>` struct fields, closing the full OpenAI chat gateway shape
 `Chat { messages: array<Message> }`.** An `array<Struct>` field (and a standalone `array<Struct>` local)
 whose element is **Move** — a `string`/owned-array/Move-enum field, transitively — is now deep-freed
 instead of one flat free that leaked each element's owned buffer. **Codegen:** a shared

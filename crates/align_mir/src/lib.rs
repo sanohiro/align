@@ -1002,6 +1002,11 @@ pub enum TemplatePiece {
     /// `array` (`{ptr,len}`) as `[{...},...]` via the runtime descriptor-driven encoder. `struct_id`
     /// is the element struct (codegen emits its schema + element stride for the runtime call).
     StructArrayField { array: Operand, struct_id: u32 },
+    /// `json.encode` of an `array<scalar>` field (JSON completeness T1b): emit the owned scalar buffer
+    /// (`{ptr,len}`) as `[e0,e1,…]` via the runtime encoder. `elem` is the element scalar
+    /// (int/float/bool); codegen packs its kind/width/sign into the runtime call's element tag. `elem`
+    /// prints in the MIR (Debug), so an element-type change invalidates the object cache.
+    ScalarArrayField { array: Operand, elem: align_sema::Scalar },
     /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
     /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
     /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits;
@@ -2737,6 +2742,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     hir::TemplatePart::StructArrayField { access, struct_id } => {
                         let op = lower_expr(b, access);
                         pieces.push(TemplatePiece::StructArrayField { array: op, struct_id: *struct_id });
+                    }
+                    hir::TemplatePart::ScalarArrayField { access, elem } => {
+                        let op = lower_expr(b, access);
+                        pieces.push(TemplatePiece::ScalarArrayField { array: op, elem: *elem });
                     }
                     hir::TemplatePart::UnionValue { access, enum_id } => {
                         let op = lower_expr(b, access);
@@ -9388,7 +9397,10 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Vec(_, n) => format!("vec{n}"),
         Ty::Mask(_, n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
-        Ty::DynArray(_) => "array".to_string(),
+        // Render the element scalar — the `json_schema_sig` for an `array<scalar>` decode field (T1b)
+        // bakes this into the unit's MIR digest, so `array<i64>` and `array<f64>` MUST differ (else a
+        // warm cache serves a stale wrong-element-width decode object — the #514/#517 class).
+        Ty::DynArray(s) => format!("array<{}>", ty_name(align_sema::scalar_to_ty(s))),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
         Ty::DynResponseArray => "array<response>".to_string(),

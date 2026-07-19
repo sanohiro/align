@@ -415,6 +415,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
                     crate::TemplatePiece::PopComma => "pop_comma".to_string(),
                     crate::TemplatePiece::StructArrayField { array, struct_id } => format!("struct_array_field(struct#{struct_id}, {})", operand_str(array)),
+                    crate::TemplatePiece::ScalarArrayField { array, elem } => format!("scalar_array_field({}, {})", crate::ty_name(align_sema::scalar_to_ty(*elem)), operand_str(array)),
                     crate::TemplatePiece::UnionValue { value, enum_id, schema } => format!("union_value(enum#{enum_id} {schema}, {})", operand_str(value)),
                 })
                 .collect();
