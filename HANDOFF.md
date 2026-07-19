@@ -8,8 +8,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 3) SHIPPED (branch `json-t1b-option-struct-encode`,
-not yet merged) — `Option<struct>` ENCODE (the Slice-B follow-up).** Decode already supported an
+_Last updated: 2026-07-19, **JSON COMPLETENESS T1b COMPLETE — `array<Option<T>>` DEFERRED (docs-only
+closure, branch `json-t1b-array-option`).** The three JSON-specific T1b matrix-fill items all shipped
+(`array<scalar>` fields #538, bare scalar decode #539, `Option<struct>` encode #540). The remaining
+sketch item `array<Option<T>>` is **DEFERRED as a language-type gap, not a JSON gap:** an owned array's
+element is a `PrimScalar` (the deliberately non-recursive, `Copy` subset), and `Option<T>` is a
+composite — so `array<Option<T>>` is un-representable in the type system today (rejected everywhere, not
+just in JSON: `[Some(1), None]` fails to type). It needs a dedicated composite-element owned-array type
+threaded through the whole pipeline — a real language-surface addition, and low value (a `[1,null,3]`
+sparse numeric array is rare in the gateway/align-LLM shapes `array<scalar>` already covers). Per
+CLAUDE.md "ideal form or defer", it waits for that language feature. Recorded in open-questions "T1b" +
+json.md (+ja). **So JSON completeness advances to J4.** **NEXT: J4 `json.doc`** — the schema-unknown
+lazy document view (SETTLED design in open-questions "T2": `d := json.doc(s)?` in an `arena {}` → an
+arena-backed tape over the existing SIMD structural index; total Missing-propagating navigation
+`d.get("k")`/`d.at(i)` → `json.doc`, `d.kind()` → `json.kind{Object,Array,Str,Number,Bool,Null,Missing}`,
+leaf `as_str/as_i64/as_f64/as_bool` → `Option`, `d.key(i)`/`d.len()`/`d.elems()` → `array<json.doc>`;
+a Copy view handle region-tied to min(input, arena); NOT a serde-style value tree). A substantial
+multi-slice feature — start with the type + `json.doc(s)?` parse + `kind()` + leaf accessors MVP. Then
+J5 `json.scan` → J6 spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS T1b (part 3) SHIPPED
+(MERGED as #540) — `Option<struct>` ENCODE (the Slice-B follow-up).** Decode already supported an
 `Option<struct>` field; encode now renders it too — **`Some` → the nested object** (via the runtime
 descriptor-driven encoder), **`None` → the field omitted** (the trailing-comma + `PopComma` scheme). A
 new `OptionStructField` template piece (HIR/MIR + printer, swept through every template pass) + a new FFI

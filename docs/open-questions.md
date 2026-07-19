@@ -3722,11 +3722,21 @@ API). §18.1's core.json surface becomes exactly: `decode`, `encode`, `doc`, `sc
 closes the no-turbofish settled item's "schema-selector residual" — `scan` is the one survivor
 and it types from the binding annotation.
 
-**T1b — matrix fill (impl, no new design):** top-level scalar/bool targets (`x: i64 :=
-json.decode(s)?`), `array<scalar>` struct fields, `Option<struct>` ENCODE (the B follow-up),
-supported-constructor compositions (`array<Option<T>>` etc.). Rule: any composition of supported
-constructors closes; the v1 non-owned boundaries stay explicit (`array<string>` waits for
-owned-element drop).
+**T1b — matrix fill (impl, no new design): COMPLETE.** top-level scalar/bool targets (`x: i64 :=
+json.decode(s)?` — SHIPPED, #539), `array<scalar>` struct fields (SHIPPED, #538), `Option<struct>`
+ENCODE (the B follow-up — SHIPPED, #540). Rule: any composition of supported constructors closes; the
+v1 non-owned boundaries stay explicit (`array<string>` waits for owned-element drop).
+**`array<Option<T>>` DEFERRED (not a JSON gap — a language-type gap).** The T1b sketch listed it as a
+"supported-constructor composition", but it is NOT one: an owned `array<T>`'s element is a
+[`PrimScalar`] (the deliberately **non-recursive, `Copy`** subset — see `Scalar::DynArray`'s doc), and
+`Option<T>` is a composite, not a `PrimScalar`. So `array<Option<T>>` is un-representable in the type
+system today (it is rejected everywhere, not just in JSON — `[Some(1), None]` fails to type). Closing it
+needs a dedicated **composite-element owned-array type** (`array<Option<prim>>` / eventually
+`array<array<T>>`) threaded through the whole pipeline (a new `Ty`/`Scalar` variant, layout, drop,
+region, decode/encode) — a real language-surface addition, not a JSON matrix-fill, and low-value (a
+`[1,null,3]` sparse numeric array is rare in the gateway/align-LLM shapes the shipped `array<scalar>`
+already covers). Per "ideal form or defer — no compromise", it waits for the composite-element-array
+language feature rather than a special-cased JSON-only hack. **So JSON completeness now advances to J4.**
 
 **Slices:** **J1a — SHIPPED: enum `str` payloads with region tracking** (the design's "region
 tracking pending" prerequisite). `enum_payload_ok` / pass 0c admit a `str` view and a `str`-bearing
@@ -3859,8 +3869,9 @@ Composes recursively; the payload struct must be non-Move (`Option<Move-struct>`
 Slice-B). Also fixed a pre-existing #514/#517 stale-cache bug: `json_schema_sig` folded an `Option<struct>`
 field to a bare `"Option"`, so a decode-only payload field rename didn't invalidate the cache — now
 recurses into the payload (and renders `Option<scalar>` width). Tests: `m5.rs` T1b, `cache_codegen`
-gate2e. **NEXT: T1b remainder** — `array<Option<T>>` compositions. →
-**J3** matrix fill (T1b remainder — `array<Option<T>>` / supported-constructor compositions) →
+gate2e. **T1b is now COMPLETE** — `array<Option<T>>` is DEFERRED as a language-type gap (an owned array
+of a composite element needs a dedicated `Ty`/`Scalar`, not a JSON matrix-fill; see the T1b entry above).
+**NEXT: J4 `json.doc`** (the schema-unknown lazy document view). →
 **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.

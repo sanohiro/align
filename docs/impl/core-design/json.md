@@ -181,8 +181,11 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   multimodal union as a **Move-enum struct field** (`Message { content: Content }`, J3a) — all
   documented above. Plus `array<Move-struct>` struct fields — the owned-element deep free (J3b) —
   which closes `Chat { messages: array<Message> }`. **The OpenAI chat gateway now closes end-to-end.**
-- **Matrix fill (J3, in progress):** ~~top-level scalar/bool decode targets~~ (SHIPPED T1b),
-  ~~`array<scalar>` fields~~ (SHIPPED T1b), `Option<struct>` encode, supported-constructor compositions.
+- **Matrix fill (J3/T1b): COMPLETE.** ~~top-level scalar/bool decode targets~~ (SHIPPED),
+  ~~`array<scalar>` fields~~ (SHIPPED), ~~`Option<struct>` encode~~ (SHIPPED). `array<Option<T>>` is
+  **DEFERRED** — an owned array of a composite element is un-representable in the non-recursive
+  `Scalar`/`PrimScalar` type system (a language-type gap needing a dedicated composite-element array
+  type, not a JSON matrix-fill; low value). See open-questions "T1b".
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
   `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for

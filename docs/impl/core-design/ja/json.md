@@ -165,9 +165,11 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   （`Message { content: Content }`、J3a）、`array<Move-struct>` 構造体フィールド — 所有要素の deep
   free（J3b）で `Chat { messages: array<Message> }` を閉じる — いずれも上記で文書化。**OpenAI chat
   ゲートウェイはエンドツーエンドで閉じた。**
-- **行列残り（J3、進行中）:** ~~top-level scalar/bool decode ターゲット~~（SHIPPED T1b）、
-  ~~`array<scalar>` フィールド~~（SHIPPED T1b）、`Option<struct>`
-  encode、サポート済みコンストラクタの合成。
+- **行列残り（J3/T1b）: 完了。** ~~top-level scalar/bool decode ターゲット~~（SHIPPED）、
+  ~~`array<scalar>` フィールド~~（SHIPPED）、~~`Option<struct>` encode~~（SHIPPED）。`array<Option<T>>`
+  は **延期** — composite 要素の所有配列は非再帰 `Scalar`/`PrimScalar` の型システムで表現不可（専用の
+  composite-element 配列型が必要な言語型のギャップで、JSON matrix-fill ではない。価値も低い）。
+  open-questions "T1b" 参照。
 - **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
   Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。
   キーがデータの object は順序付き `key(i)`+`at(i)` で吸収、`elems()` で 1 階層を materialize して
