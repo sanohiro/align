@@ -20,7 +20,8 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> fields; field order free; unknown keys ignored)
+//   i64 / f64 / bool       (a BARE scalar — parses the whole input as one JSON number/bool; Copy → Static/returnable; T1b)
+//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> / array<scalar> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
 //   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
@@ -173,8 +174,8 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   multimodal union as a **Move-enum struct field** (`Message { content: Content }`, J3a) — all
   documented above. Plus `array<Move-struct>` struct fields — the owned-element deep free (J3b) —
   which closes `Chat { messages: array<Message> }`. **The OpenAI chat gateway now closes end-to-end.**
-- **Matrix fill (J3):** top-level scalar/bool decode targets, `array<scalar>` fields,
-  `Option<struct>` encode, supported-constructor compositions.
+- **Matrix fill (J3, in progress):** ~~top-level scalar/bool decode targets~~ (SHIPPED T1b),
+  ~~`array<scalar>` fields~~ (SHIPPED T1b), `Option<struct>` encode, supported-constructor compositions.
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
   `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for

@@ -16,7 +16,8 @@ json.encode(x)   -> str                      // x: struct (nested structs recurs
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
-//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> fields; field order free; unknown keys ignored)
+//   i64 / f64 / bool       (a BARE scalar — parses the whole input as one JSON number/bool; Copy → Static/returnable; T1b)
+//   struct                 (flat OR with nested-struct / Option<T> / array<Struct> / array<scalar> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
 //   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
@@ -158,7 +159,8 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   （`Message { content: Content }`、J3a）、`array<Move-struct>` 構造体フィールド — 所有要素の deep
   free（J3b）で `Chat { messages: array<Message> }` を閉じる — いずれも上記で文書化。**OpenAI chat
   ゲートウェイはエンドツーエンドで閉じた。**
-- **行列残り（J3）:** top-level scalar/bool decode ターゲット、`array<scalar>` フィールド、`Option<struct>`
+- **行列残り（J3、進行中）:** ~~top-level scalar/bool decode ターゲット~~（SHIPPED T1b）、
+  ~~`array<scalar>` フィールド~~（SHIPPED T1b）、`Option<struct>`
   encode、サポート済みコンストラクタの合成。
 - **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
   Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。

@@ -3847,10 +3847,14 @@ runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar
 rendered a bare `"array"` for `DynArray`, so a `array<i64>`→`array<f64>` element change didn't invalidate
 the decode cache (now renders the element). `array<str>` (borrowed element) / `array<char>` deferred. v1
 limits: `.sum()`/pipelines over an owned scalar-array field and `json.encode` of a bare `array<scalar>`
-stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **NEXT: the rest of
-T1b** — top-level scalar/bool decode targets, `Option<struct>` encode, `array<Option<T>>` compositions. →
-**J3** matrix fill (T1b remainder — top-level scalar/bool decode targets, `Option<struct>` encode,
-supported-constructor compositions) →
+stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
+int / float / bool). Parses the WHOLE input as one JSON number / bool; the value is `Copy` (copied out,
+not a view), so the result is `Static` / returnable. New HIR/MIR `JsonDecodeScalar` → runtime
+`align_rt_json_decode_scalar` (via the shared per-scalar `write_value` — same range/sign/float-width
+checks; trailing non-whitespace → `Err`). Bare `str` (input-borrowing view) / `char` deferred. (The
+top-level `array<scalar>` target already existed — MMv2 slice 8c.) **NEXT: the rest of T1b** —
+`Option<struct>` encode (the Slice-B follow-up), `array<Option<T>>` compositions. →
+**J3** matrix fill (T1b remainder — `Option<struct>` encode, supported-constructor compositions) →
 **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.

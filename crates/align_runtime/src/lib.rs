@@ -4021,6 +4021,37 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     0
 }
 
+/// Parse the WHOLE `input` as a single JSON scalar (number / bool) into the `out` scalar slot (JSON
+/// completeness T1b). `elem_tag` is the scalar encoding `(signed << 16) | (kind << 8) | byte-width`
+/// (kind 0 = int, 1 = bool, 2 = float; bit 16 = int sign) — the same tag a scalar *field* uses, so the
+/// shared per-scalar [`write_value`] applies the identical range / sign / float-width checks. Leading /
+/// trailing whitespace is allowed; any trailing non-whitespace is a decode error. Returns 0 on success,
+/// 1 on a malformed value, a type mismatch, or trailing garbage (leaving `out` as the caller-zeroed
+/// bytes). The value is copied out — the result borrows nothing from `input`.
+///
+/// # Safety
+/// `input` must describe a valid byte range; `out` must point to `elem_tag`'s byte-width writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_scalar(input: *const u8, input_len: i64, elem_tag: i32, out: *mut u8) -> i32 {
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
+    // A decoded value must not contain invalid UTF-8 (uniform with every other `json.decode` entry).
+    if !validate_utf8(src) {
+        return 1;
+    }
+    let kind = (elem_tag >> 8) & 0xff;
+    let width = (elem_tag & 0xff) as i64;
+    let ed = JsonField { name_ptr: core::ptr::null(), name_len: 0, tag: elem_tag, offset: 0, sub: core::ptr::null(), opt_tag: -1 };
+    let mut p = JsonParser { src, pos: 0 };
+    let ok = (|| -> Option<()> {
+        p.ws();
+        unsafe { write_value(&mut p, kind, width, &ed, out)? };
+        p.ws();
+        // Trailing non-whitespace after the value is an error (a bare scalar decodes the whole input).
+        (p.pos == src.len()).then_some(())
+    })();
+    if ok.is_none() { 1 } else { 0 }
+}
+
 /// Column-oriented grouped sum (`group_by` first slice): for each `i`, accumulate `vals[i]` into the
 /// bucket for `keys[i]`, then emit the distinct keys and their sums into `out_keys`/`out_vals`
 /// (caller-provided, capacity `cap`). Returns the group count, or `-1` if it would exceed `cap`

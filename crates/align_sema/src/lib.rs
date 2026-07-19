@@ -4552,7 +4552,7 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. }
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input),
             // `builder(capacity)` — the capacity expr may itself have effects.
             ExprKind::BuilderNew { capacity } => {
@@ -5566,6 +5566,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayMapInto { .. }
             | ExprKind::Len(..)
             | ExprKind::JsonDecodeArray { .. }
+            | ExprKind::JsonDecodeScalar { .. }
             | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
@@ -5813,6 +5814,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Template(..)
             | ExprKind::JsonDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
+            | ExprKind::JsonDecodeScalar { .. }
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::JsonDecodeUnion { .. }
@@ -6514,7 +6516,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7128,7 +7130,7 @@ impl UnnecessaryHeapScan {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -8526,7 +8528,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -15404,6 +15406,29 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
+            // A bare **scalar** target (JSON completeness T1b): parse the whole input as one JSON
+            // number / bool into an int / float / bool (`x: i64 := json.decode("42")?`). The value is
+            // `Copy` and copied out (not a view into the input), so the result is `Static` / returnable —
+            // no region tie. (`str` / `char` targets are deferred: a `str` would be an input-borrowing
+            // view; `char` has no JSON form.)
+            Some(Ty::Result(sc @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool), _)) => {
+                let scalar = scalar_to_ty(sc);
+                let input = self.check_str_init(&args[0]);
+                return Expr {
+                    kind: ExprKind::JsonDecodeScalar { scalar, input: Box::new(input) },
+                    ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
+                    span,
+                };
+            }
+            // A bare `str` / `char` target is deferred (not "cannot infer" — the type IS known): a `str`
+            // would be an input-borrowing view (a region-tracking follow-up), and `char` has no JSON form.
+            Some(Ty::Result(sc @ (Scalar::Str | Scalar::Char), _)) => {
+                self.diags.error(
+                    format!("'json.decode' into a bare `{}` is not supported yet (int/float/bool scalar targets now; a `str` view target is a later slice)", scalar_name(sc)),
+                    span,
+                );
+                return err;
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
@@ -19541,7 +19566,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
