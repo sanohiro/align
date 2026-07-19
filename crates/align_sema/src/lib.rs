@@ -13706,6 +13706,11 @@ impl<'a, 't> Checker<'a, 't> {
                 return None;
             }
         };
+        // The `scan_terminal` permission (set by `sum`/`count`) applies ONLY to *this* pipeline's
+        // direct source, which is now resolved. Clear it before the stages are type-checked so a
+        // nested pipeline inside a stage lambda (e.g. `map(fn r { other_scanner.to_array() })`) does
+        // NOT inherit it — that inner materializing terminal must be rejected on its own scanner.
+        self.scan_terminal = false;
         // MIR materializes a stack-array source only when it is an array literal or a named
         // local (slot-addressable); an arbitrary array-valued expression (e.g. an `if` or
         // block) would otherwise crash lowering. A `{ptr,len}` view (`slice`/owned array) is

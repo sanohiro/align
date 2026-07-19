@@ -1022,11 +1022,12 @@ fn json_scan_malformed_row_errors() {
     if !backend_available() {
         return;
     }
-    // A malformed row mid-stream makes the terminal `Err` — `?` propagates it, so `main` exits 1
-    // (nothing leaked; the fold accumulator is a scalar).
-    let src = "import core.json\nUser { id: i64, score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10}, oops]\")\n  print(rows.score.sum()?)\n  return Ok(())\n}\n";
+    // A malformed row mid-stream makes the terminal `Err`, and it is the SAME error `json.decode` of
+    // the same malformed input produces — `Error.Code(1)` (pitfall P2: scan and decode agree). The
+    // `describe` fold maps `Code(c)` to `20 + c`, so a correct scan exits 21 (not `NotFound`=10).
+    let src = "import core.json\nUser { id: i64, score: i64 }\nfn describe(r: Result<i64, Error>) -> i32 = match r {\n  Ok(_)  => -1,\n  Err(e) => match e {\n    NotFound => 10,\n    Invalid  => 11,\n    Denied   => 12,\n    Code(c)  => 20 + c,\n  },\n}\nfn main() -> i32 {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10}, oops]\")\n  return describe(rows.score.sum())\n}\n";
     let out = build_and_run("json-scan-bad", src);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(21));
 }
 
 #[test]
@@ -1049,6 +1050,18 @@ fn json_scan_materializing_terminal_rejected() {
     let errs = check_diagnostics(
         "json-scan-to-array-reject",
         "import core.json\nUser { score: i64 }\nfn main() -> Result<(), Error> {\n  arena {\n    rows: json.scanner<User> := json.scan(\"[{\\\"score\\\":1}]\")\n    xs := rows.score.to_array()\n    print(xs.len())\n  }\n  return Ok(())\n}\n",
+    );
+    assert!(errs.contains("streaming source"), "unexpected diagnostics:\n{errs}");
+}
+
+#[test]
+fn json_scan_materializing_terminal_rejected_inside_stage_lambda() {
+    // The `sum`/`count` scanner permission must apply ONLY to the terminal's direct source, not leak
+    // into a stage lambda: a nested scanner's materializing terminal (`.to_array()`) inside a `.map`
+    // closure must still be rejected, not silently accepted and mis-lowered (review Finding 2).
+    let errs = check_diagnostics(
+        "json-scan-nested-lambda-reject",
+        "import core.json\nRow { x: i64 }\nfn main() -> Result<(), Error> {\n  arena {\n    a: json.scanner<Row> := json.scan(\"[{\\\"x\\\":1}]\")\n    b: json.scanner<Row> := json.scan(\"[{\\\"x\\\":2}]\")\n    total := a.map(fn r { b.x.to_array().len() }).sum()?\n    print(total)\n  }\n  return Ok(())\n}\n",
     );
     assert!(errs.contains("streaming source"), "unexpected diagnostics:\n{errs}");
 }

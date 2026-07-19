@@ -5679,18 +5679,17 @@ fn lower_json_scan_reduce(
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // err_exit: a malformed row → `Err(Error.Invalid)`. The scan status `2` is a "malformed"
-    // sentinel, not an errno; a parse failure is always `Invalid` (tag 0, code 0), exactly the decode
-    // paths' malformed error, so construct it directly rather than mapping the status.
+    // err_exit: a malformed row → the SAME `Err` as `json.decode` of the same malformed input
+    // (pitfall P2 — scan and decode must agree). Decode maps its runtime malformed status `1` through
+    // `make_error_code` to `Error.Code(1)`; the scan runtime uses `2` for "malformed" (since `1` is
+    // its "done" sentinel), so feed `make_error_code` a constant `1` to reproduce decode's error
+    // exactly, rather than leaking the scan-internal status code.
     b.cur = err_exit;
-    let error_id = match result_ty {
-        Ty::Result(_, align_sema::Scalar::Enum(eid)) => eid,
-        _ => 0, // sema guarantees `Result<_, Error>` for a scan terminal
-    };
-    let ec = b.fresh_value(Ty::Enum(error_id));
-    b.push(Stmt::Let(ec, Rvalue::MakeError { enum_id: error_id, tag: Operand::Const(Const::Int(0, status_ty())), code: Operand::Const(Const::Int(0, status_ty())) }));
+    let malformed = b.fresh_value(status_ty());
+    b.push(Stmt::Let(malformed, Rvalue::Use(Operand::Const(Const::Int(1, status_ty())))));
+    let ec = make_error_code(b, malformed, result_ty);
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(ec))));
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 
