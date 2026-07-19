@@ -654,6 +654,35 @@ direction, not a v1 commitment, and it must not distort the language into a GPU-
 
 ---
 
+## The package philosophy
+
+A dependency should be *ordinary source in your tree*, not a resolved artifact. Align's package layer
+adds **two path rules and zero new compiler concepts**: a "package" is the module subtree a tool (or a
+human) vendors under `pkg/`, and the compiler never learns what one is — resolution, visibility,
+effects, escape, and capabilities all carry over from the module system unchanged. Three forces
+converge on this:
+
+- **Nothing hidden, extended to provenance.** The first import segment is a trust tier
+  (`core`/`std`/`pkg`/project), so a file's header shows not just *what* it reaches but *whose* code
+  it trusts. Import aliases are refused (`import x as y` would hide provenance at the call site), so a
+  call stays fully qualified — `pkg.web.get(...)` — and the trust tier is visible at every use, not
+  only in the header. Vendoring is literally copying the subtree; there is no source rewriting on
+  vendor (hidden magic), no develop-layout vs installed-layout split.
+- **Hermetic by construction, no manifest.** The package graph, like M15's unit graph, is discovered
+  from imports + the filesystem — `grep 'import pkg\.'` *is* the dependency list, with no manifest to
+  drift. One version of a package exists per tree because `pkg/<name>/` can exist once, so the diamond
+  problem is resolved by whoever populates the tree, not by a version solver in the compiler; an
+  incompatible major version is a new name (`pkg.web2`). Version *selection* is a fetch-tool concern
+  that ends before the compiler starts.
+- **AI-friendliness as the payoff.** Because dependencies are ordinary, greppable source in the tree,
+  the whole dependency closure is in-context and auditable — the maximally AI-friendly shape. The two
+  rules that make this safe are pure path checks: the **`internal`** rule lets a package keep
+  implementation modules private (without it every module is permanent public API), and **layering**
+  (`core → std → pkg → project`) keeps a vendored package from reaching back into the consuming
+  project — which would compile in exactly one tree and invert the dependency arrow. One visibility
+  model (`pub` + the `internal` path rule) is deliberately the whole story; a second granularity
+  (`pub(pkg)`, export lists, re-exports) is the complexity budget Align refuses.
+
 ## In one sentence
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.

@@ -3486,7 +3486,17 @@ data-dependent checkpoint depth (speculative/backtracking parsers) — is the re
 trigger**: revisit iff the MIR-dataflow escape checker lands AND a measured parser consumer appears
 that recursion + pooling cannot serve. (The old "after MMv2" gate is moot — MMv2 completed.)
 
-### Build system / package layout — pkg-foundation design (PROPOSAL 2026-07-19, awaiting owner sign-off)
+### Build system / package layout — pkg-foundation model (SETTLED 2026-07-20 — F0 v1 landed)
+
+> **SETTLED 2026-07-20.** F0 v1 shipped: the two import-edge rules (D7 `internal` path rule + D8
+> pkg-layering) are enforced in `align_driver::load_units` (`check_pkg_import_edge`), with the spec
+> text landed in `draft.md` §17 "Packages" + §18.3, the `language-spec.md` digest, and the
+> `design-notes.md` "package philosophy" rationale. Driver tests: `pkg_foundation.rs` (D7 within-package
+> OK / outside-package + sibling-package rejected; D8 pkg→project rejected, pkg→pkg + pkg→std + project→pkg
+> OK). The remaining Dn items (the fetch tool D11, compiled-library distribution D12, the `alignc deps`
+> capability report) stay deferred/Future as recorded below — none blocks. The design record is preserved
+> verbatim below.
+
 
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`); M15 shipped per-unit
 interfaces + objects + the incremental cache — explicitly motivated by "compiled-library

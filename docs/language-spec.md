@@ -476,6 +476,16 @@ items — a private same-module fn/type/const in a generic `pub` body is rejecte
 cyclic imports are a compile error. (Constructing an imported sum type's
 variant — `geom.Color.Red` — is a later slice.) (`draft.md` §17.)
 
+**Packages (the `pkg` layer).** A *package* is a distribution-layer subtree under `pkg/<name>/` (root
+`pkg/<name>.align` + optional submodules), discovered from imports + the filesystem with no manifest —
+the compiler adds no new concept, only two pure path rules on import edges: (1) the **`internal`**
+rule — a module path containing an `internal` segment is importable only from within the subtree
+rooted at that segment's parent (`pkg.web.internal.router` reaches out to `pkg.web.*` only); (2)
+**layering** — a `pkg/` module may import only `core`/`std`/`pkg`, never the consuming project. The
+first import segment is a trust tier (`core`/`std`/`pkg`/project); calls stay fully qualified
+(`pkg.web.get(...)`) with no aliases. Vendoring is copying the subtree; one version per tree by
+construction. (`draft.md` §17 "Packages" / §18.3.)
+
 ## Core library
 
 ```text
