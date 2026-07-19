@@ -15420,6 +15420,15 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
+            // A bare `str` / `char` target is deferred (not "cannot infer" — the type IS known): a `str`
+            // would be an input-borrowing view (a region-tracking follow-up), and `char` has no JSON form.
+            Some(Ty::Result(sc @ (Scalar::Str | Scalar::Char), _)) => {
+                self.diags.error(
+                    format!("'json.decode' into a bare `{}` is not supported yet (int/float/bool scalar targets now; a `str` view target is a later slice)", scalar_name(sc)),
+                    span,
+                );
+                return err;
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
