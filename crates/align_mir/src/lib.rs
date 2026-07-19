@@ -608,6 +608,10 @@ pub enum Rvalue {
     /// view `{ptr,len}`) into the `out` slot and returns an `i32` present flag (1 = an object member
     /// at that index → `Some`, 0 → `None`).
     JsonDocKey { doc: Operand, index: Operand, out: Slot },
+    /// `d.elems()` on a `json.doc`: the runtime materializes the level's child handles into an
+    /// arena-allocated buffer and writes the `slice<json.doc>` `{ptr,len}` into the `out` slot. No
+    /// status (an empty container / non-container → an empty slice). `arena` is the enclosing arena.
+    JsonDocElems { doc: Operand, arena: Operand, out: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -2837,6 +2841,16 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
+        hir::ExprKind::JsonDocElems { doc } => {
+            let arena = *b.arenas.last().expect("json.doc.elems() outside an arena (sema-checked)");
+            let out = b.new_slot(e.ty); // slice<json.doc>
+            let d = lower_expr(b, doc);
+            let unit = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(unit, Rvalue::JsonDocElems { doc: d, arena: Operand::Value(arena), out }));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Load(out)));
+            Operand::Value(v)
+        }
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
         // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).

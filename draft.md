@@ -1522,9 +1522,12 @@ non-container yields a `Missing` doc, which propagates through further navigatio
 view into the input, except an escaped string, which is unescaped into the arena (the one allocating
 accessor). `d.len()` is the member / element count (0 on a non-container); `d.key(i) -> Option<str>` is
 the i-th object key in document order — so an object is read as ordered data (keys + `at(i)` values)
-without a `map` type, and a document array is iterated by `at(i)` up to `len()` (by recursion). The
-types `json.doc` and `json.kind` are nameable, so a `fn f(d: json.doc)` helper factors doc code out.
-`json.doc` needs an enclosing `arena {}`, like the direct-to-`soa` decode.
+without a `map` type. `d.elems()` materializes one level (each array element, or each object member
+value) as a `slice<json.doc>` — arena-backed, built once (so iterating with `elems()`+`[i]` is O(n),
+vs `at(i)`'s O(i) per call), indexable and `len`-able like any slice, and nameable as a
+`fn f(xs: slice<json.doc>)` parameter (a level walked by recursion). The types `json.doc` and
+`json.kind` are nameable, so a `fn f(d: json.doc)` helper factors doc code out. `json.doc` (and
+`elems()`) need an enclosing `arena {}`, like the direct-to-`soa` decode.
 
 ---
 

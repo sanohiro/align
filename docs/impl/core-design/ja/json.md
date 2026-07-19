@@ -183,10 +183,16 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   `d.len()`（要素/メンバー数、非コンテナは 0）+ `d.key(i) -> Option<str>`（object の i 番目のキーを
   文書順で。順序付き object-as-data）。`at(i)` と併せて、doc 配列の反復を再帰で回せる（`loop` 不要）。
   型 `json.doc` / `json.kind` は**名前で書ける**ようになった（`fn f(d: json.doc)` ヘルパや
-  `k: json.kind` 束縛が直接解決 — `core.json` の 2 つの組み込み型名）。**Slice 3 に延期:**
-  `elems() -> array<json.doc>` — 1 階層を pipeline source として materialize するには `json.doc` を
-  所有/slice の**要素**にする capability（`PrimScalar`/専用配列型）と doc 要素上の pipeline 機構が
-  必要で、別機能なので「ideal form or defer」に従って待つ。
+  `k: json.kind` 束縛が直接解決 — `core.json` の 2 つの組み込み型名）。**Slice 3 SHIPPED — J4 完了:**
+  `d.elems() -> slice<json.doc>` は 1 階層（Array の各要素、または Object の各メンバー**値** — キーは
+  `key(i)`）を arena 常駐の `slice<json.doc>` に**一度で** materialize する（O(n)、以降のインデックスは
+  O(1)。`at(i)` の呼び出しごと O(i) 再走査に対して有利）。既存の `slice` 機構を再利用:
+  `slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)`（既に表現可能 — 新配列型は不要）なので `.len()` と
+  `xs[i] -> json.doc`（slice に region 拘束、Copy な 16 バイトハンドル → 二重解放なし）がそのまま動き、
+  `slice<json.doc>` は引数型として名前で書けるので `fn f(xs: slice<json.doc>)` が再帰で 1 階層を回せる。
+  slice バッファは外側 arena に bump-allocate（`arena {}` が必要）、min(input, arena) に region 拘束。
+  `slice<json.doc>` 上の `.map`/`.where` **pipeline fusion**（json.doc を取る closure）は自然な次段だが
+  必須ではない — index + len + 再帰で階層反復は今日すでにできる。
   **既知の systemic な緩さ（J4 の退行ではない — `decode` のスキャナと共有）:** 文字列内の生の C0 制御
   バイトと数値の先頭ゼロ（`007`）を現状は受理する。共有の `find_quote_or_escape` / `number_span` を
   RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと

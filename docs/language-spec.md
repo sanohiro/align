@@ -315,8 +315,10 @@ type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1)
 writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
 `json.doc` view (no serde-style value tree, no map type) — `d := json.doc(s)?` in an `arena {}`, then
 total Missing-propagating navigation `d.get(k)` / `d.at(i)` (always a `json.doc`), `d.kind()` → the
-builtin `json.kind` sum type, and leaf accessors `as_str` / `as_i64` / `as_f64` / `as_bool` → `Option`
-(`elems`/`key`/`len` are a later slice); `json.scan` streams typed rows as a pipeline source. The
+builtin `json.kind` sum type, leaf accessors `as_str` / `as_i64` / `as_f64` / `as_bool` → `Option`,
+`d.len()` / `d.key(i)` (objects-as-ordered-data), and `d.elems() -> slice<json.doc>` (materialize a
+level once, then index/`len`/recurse — reuses the slice machinery, no new array type); `json.scan`
+streams typed rows as a pipeline source. The
 core.json surface is exactly `decode`/`encode`/`doc`/`scan` — `validate<T>`, `token`, and
 `field_table<T>` are deleted. See `draft.md` §9, §14, §18.1.
 

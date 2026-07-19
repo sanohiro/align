@@ -4596,7 +4596,7 @@ impl EffectScan<'_> {
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => self.expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.expr(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.expr(doc);
                 self.expr(key);
@@ -5345,6 +5345,10 @@ impl<'a> EscapeCheck<'a> {
             // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
             // (`d.kind()` / `d.as_i64/f64/bool()` copy out a Copy scalar → the `Static` list below.)
             ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => self.region_of(doc, depth),
+            // `d.elems()` bump-allocates the handle buffer in the enclosing arena, and each element
+            // handle views the same tape (the doc's region). So the slice is region-tied to BOTH — the
+            // arena and the doc — i.e. the shorter of the two (like `json.decode → soa` / `to_array`).
+            ExprKind::JsonDocElems { doc } => self.region_of(doc, depth).shorter(Region::arena(depth)),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
@@ -5896,6 +5900,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDocAsScalar { .. }
             | ExprKind::JsonDocLen { .. }
             | ExprKind::JsonDocKey { .. }
+            // `elems()` yields an arena-allocated `slice<json.doc>` — its buffer is bump-allocated, not
+            // a borrow of a function-local stack array, so it is not local-backed (escape is governed
+            // by `region_of` = the arena). Like `to_array` / a `json.decode` view.
+            | ExprKind::JsonDocElems { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
@@ -6597,7 +6605,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.walk(doc, depth),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.walk(doc, depth),
             ExprKind::JsonDocGet { doc, key } => {
                 self.walk(doc, depth);
                 self.walk(key, depth);
@@ -7221,7 +7229,7 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
             ExprKind::JsonDoc { input } => self.visit(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.visit(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.visit(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.visit(doc);
                 self.visit(key);
@@ -7839,7 +7847,7 @@ impl<'a> MoveCheck<'a> {
             // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
             // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
             ExprKind::JsonDoc { input } => self.borrow_sources(input),
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => {
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocElems { doc } => {
                 self.borrow_sources(doc)
             }
             ExprKind::Call { args, .. } => {
@@ -8640,7 +8648,7 @@ impl<'a> MoveCheck<'a> {
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
             // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
             ExprKind::JsonDoc { input } => self.expr(input, moved, false, false),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.expr(doc, moved, false, false),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.expr(doc, moved, false, false),
             ExprKind::JsonDocGet { doc, key } => {
                 self.expr(doc, moved, false, false);
                 self.expr(key, moved, false, false);
@@ -12767,7 +12775,7 @@ impl<'a, 't> Checker<'a, 't> {
             // above), BEFORE the shared `get` (box) arm so the name stays free on other values.
             // (`d.as_str()` shares the `as_str` intercept above.) The receiver may be a temporary — a
             // `json.doc` is Copy, never dropped, so chaining `d.get("a").at(0).as_i64()` is fine.
-            "kind" | "get" | "at" | "key" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
+            "kind" | "get" | "at" | "key" | "elems" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
                 self.check_json_doc_method(recv_expr, method, args, span)
             }
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
@@ -15638,6 +15646,22 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
                 Expr { kind: ExprKind::JsonDocKind { doc: Box::new(recv_expr) }, ty: Ty::Enum(self.json_kind_enum_id), span }
+            }
+            "elems" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.elems()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                // Materializes the handle buffer in the enclosing arena, like the direct-to-`soa`
+                // decode / `.to_array()` — so it needs an `arena {}`.
+                if self.arena_depth == 0 {
+                    self.diags.error(
+                        "'.elems()' materializes a document level in an arena — call it inside an `arena {}` block".to_string(),
+                        span,
+                    );
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocElems { doc: Box::new(recv_expr) }, ty: Ty::Slice(Scalar::JsonDoc), span }
             }
             "get" => {
                 if args.len() != 1 {
@@ -19831,7 +19855,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.finalize_expr(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.finalize_expr(doc);
                 self.finalize_expr(key);

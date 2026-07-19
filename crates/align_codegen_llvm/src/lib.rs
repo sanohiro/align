@@ -1372,6 +1372,15 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        // d.elems(tape, node, arena, out: *{ptr,len}) -> void. Materializes the level's handle buffer.
+        "json_doc_elems".to_string(),
+        module.add_function(
+            "align_rt_json_doc_elems",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
+            None,
+        ),
+    );
     // The three leaf accessors share the (tape, node, out) -> i32 present-flag shape; the out slot's
     // type (str view / i64 / f64 / u8) differs but is an opaque `ptr` at the ABI.
     for (name, sym) in [
@@ -6659,6 +6668,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("json_doc_len returns i64")
             }
             Rvalue::JsonDocKey { doc, index, out } => self.gen_json_doc_key(doc, index, *out)?,
+            Rvalue::JsonDocElems { doc, arena, out } => {
+                self.gen_json_doc_elems(doc, arena, *out)?;
+                return Ok(None);
+            }
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8876,6 +8889,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .try_as_basic_value()
             .basic()
             .expect("json_doc_key returns i32 present flag"))
+    }
+
+    /// `d.elems()` (J4 slice 3): zero the out `{ptr,len}` slot, then call the void runtime materializer,
+    /// which bump-allocates the level's handle buffer in `arena` and writes the `slice<json.doc>` header.
+    fn gen_json_doc_elems(&mut self, doc: &Operand, arena: &Operand, out: Slot) -> Result<(), CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (tape, node) = self.split_doc(doc)?;
+        let ah = self.operand(arena);
+        self.builder
+            .build_call(self.funcs["json_doc_elems"], &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
+            .map_err(|e| self.err(e))?;
+        Ok(())
     }
 
     /// `d.at(index)` (J4): the array-index sibling of [`Self::gen_json_doc_get`].

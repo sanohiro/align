@@ -2522,6 +2522,38 @@ fn main() -> Result<(), Error> {\n\
 }
 
 #[test]
+fn json_doc_elems_materialize_and_iterate() {
+    if !backend_available() {
+        return;
+    }
+    // `elems()` materializes a document level as a `slice<json.doc>` (once, O(n)); iterate it via
+    // recursion with `[i]` + `.len()`. Exercises `slice<json.doc>` as a nameable param type + index.
+    let src = "import core.json\n\
+fn sum(xs: slice<json.doc>, i: i64, acc: i64) -> i64 {\n\
+  if i >= xs.len() { return acc }\n\
+  return sum(xs, i + 1, acc + (xs[i].as_i64() else 0))\n\
+}\n\
+fn run() -> Result<(), Error> {\n\
+  arena {\n\
+    d := json.doc(\"{\\\"a\\\": [10, 20, 30, 7]}\")?\n\
+    xs := d.get(\"a\").elems()\n\
+    print(xs.len())\n\
+    print(sum(xs, 0, 0))\n\
+    print(xs[1].as_i64() else 0-1)\n\
+  }\n\
+  return Ok(())\n\
+}\n\
+fn main() -> Result<(), Error> {\n\
+  run()?\n\
+  return Ok(())\n\
+}\n";
+    let out = build_and_run("json-doc-elems", src);
+    assert_eq!(out.status.code(), Some(0));
+    // len 4; sum 67; xs[1] = 20.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n67\n20\n");
+}
+
+#[test]
 fn json_doc_malformed_is_err_ok_is_parsed() {
     if !backend_available() {
         return;
@@ -2567,6 +2599,18 @@ fn json_doc_view_cannot_escape_arena() {
            arena {\n\
              d := json.doc(s)?\n\
              return Ok(d.at(0).as_str() else \"?\")\n\
+           }\n\
+         }\n\
+         fn main() -> i32 = 0\n"
+    ));
+    // An `elems()` slice is arena-backed — returning it out of the arena is rejected too (#297).
+    assert!(check_errs(
+        "json-doc-elems-escape",
+        "import core.json\n\
+         fn level(s: str) -> Result<slice<json.doc>, Error> {\n\
+           arena {\n\
+             d := json.doc(s)?\n\
+             return Ok(d.elems())\n\
            }\n\
          }\n\
          fn main() -> i32 = 0\n"

@@ -200,10 +200,17 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   non-container) + `d.key(i) -> Option<str>` (the i-th object key in document order — objects-as-ordered
   data). Together with `at(i)`, these drive iteration over a doc array by recursion (no `loop` needed).
   The types `json.doc` and `json.kind` are now **nameable** (a `fn f(d: json.doc)` helper / a
-  `k: json.kind` binding resolve directly — the two builtin `core.json` type names). **Deferred to slice
-  3:** `elems() -> array<json.doc>` — materializing a document level as a pipeline source needs
-  `json.doc` as an owned/slice **element** (a `PrimScalar`/dedicated-array capability) plus the
-  pipeline-over-doc-elements machinery; a distinct feature, so it waits per "ideal form or defer".
+  `k: json.kind` binding resolve directly — the two builtin `core.json` type names). **Slice 3 SHIPPED —
+  J4 COMPLETE:** `d.elems() -> slice<json.doc>` materializes one level (each Array element, or each
+  Object member **value** — keys via `key(i)`) as an arena-backed `slice<json.doc>` **once** (O(n), then
+  O(1) indexing — vs `at(i)`'s O(i) re-walk). It reuses the existing `slice` machinery:
+  `slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)` (already representable — no new array type), so
+  `.len()` and `xs[i] -> json.doc` (region-bound to the slice, a Copy 16-byte handle → no double-free)
+  work out of the box, and `slice<json.doc>` is nameable as a param type, so `fn f(xs: slice<json.doc>)`
+  walks a level by recursion. The slice buffer is bump-allocated in the enclosing arena (needs
+  `arena {}`), region-tied to min(input, arena). Full `.map`/`.where` **pipeline fusion** over a
+  `slice<json.doc>` (closures taking `json.doc`) is the natural next step but not required — index + len
+  + recursion cover level iteration today.
   **Known systemic leniency (not a J4 regression — shared with `decode`'s scanner):** raw C0 control
   bytes inside strings and leading zeros in numbers (`007`) are currently accepted; making the shared
   `find_quote_or_escape` / `number_span` strict (RFC 8259 §7/§6) is a follow-up that must land for

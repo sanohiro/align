@@ -3890,11 +3890,23 @@ data); with `at(i)` these iterate a doc array by recursion (no `loop` needed). T
 `json.doc` / `json.kind` are now **nameable** in annotations (resolved directly in `resolve_type` before
 the import/`pub` check), so a `fn f(d: json.doc)` helper / a `k: json.kind` binding work. Tests: `m5.rs`
 `json_doc_len_and_key_iterate_via_recursion` (recursive sum over a doc array + key-order), runtime
-`json_doc_len_and_key`. **Deferred to J4 slice 3:** `d.elems() -> array<json.doc>` — materializing a
-level as a pipeline source needs `json.doc` as an owned/slice **element** (a `PrimScalar`/dedicated
-owned-doc-array type) plus the pipeline-over-doc-elements machinery; a distinct capability, so it waits
-per "ideal form or defer" (`at`/`len` + recursion already cover level iteration). →
-**J4 slice 3** (`elems`, pipeline source) → **J5** `json.scan` → **J6** spec sync
+`json_doc_len_and_key`. **J4 SLICE 3 SHIPPED — J4 COMPLETE:** `d.elems() -> slice<json.doc>`
+materializes one level (each Array element, or each Object member **value**) as an arena-backed
+`slice<json.doc>` **once** (O(n) build, O(1) index — vs `at(i)`'s O(i) re-walk). The key realization:
+`Ty::Slice(Scalar)` already takes a full `Scalar` and `Scalar::JsonDoc` already exists, so
+`slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)` needs **no new array type** — it reuses the existing
+slice `.len()` + `xs[i]` machinery (`check_index`'s Move-element rejection doesn't fire — a `json.doc`
+is a Copy 16-byte handle, no double-free; `region_of(Index)` binds the element to the slice). The slice
+is nameable as a param type (`fn f(xs: slice<json.doc>)`), so a level is walked by recursion.
+Runtime `align_rt_json_doc_elems` bump-allocates a `DocHandle` buffer in the arena (checked_mul,
+null-safe) and writes the `{ptr,len}` header; region = arena.shorter(doc). New HIR/MIR `JsonDocElems`
+threaded through every exhaustive pass (region = arena-tied like `to_array`; not local-backed).
+Tests: `m5.rs` `json_doc_elems_materialize_and_iterate` (materialize → index → recursive sum) +
+`json-doc-elems-escape` (returning the slice out of the arena rejected, #297), runtime
+`json_doc_elems_materializes_a_level`. **Follow-up (not required for J4):** full `.map`/`.where`
+**pipeline fusion** over a `slice<json.doc>` (closures taking `json.doc`) — index + len + recursion
+already cover level iteration. →
+**J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 
