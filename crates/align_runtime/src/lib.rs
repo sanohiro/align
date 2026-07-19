@@ -3755,6 +3755,74 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     0
 }
 
+/// Decode ONE JSON object at `*cursor` in `input` into the `out_row` struct slot, advancing `*cursor`
+/// past it — the streaming step of a `json.scan(view)` fused terminal (J5). Reuses the same
+/// [`parse_object`] descriptor decode as the array path (the row IS one element); the row's `str`
+/// fields are zero-copy views into `input`. Handles **both** a top-level JSON array and NDJSON by
+/// treating a leading `[`, inter-value `,`, and whitespace (incl. newlines) as skippable separators
+/// and `]` / end-of-input as terminators. Returns `0` (a row was decoded), `1` (the stream is
+/// exhausted — top-level `]` or EOF), or `2` (a malformed row / invalid input). The row is zeroed
+/// before decoding, so `Option` / default fields read correctly.
+///
+/// # Safety
+/// `input` / `fields` must describe valid ranges; `cursor` must point to a writable `i64` byte offset
+/// into `input`; `out_row` must point to `out_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_scan_next(
+    input: *const u8,
+    input_len: i64,
+    cursor: *mut i64,
+    fields: *const JsonField,
+    n_fields: i64,
+    out_row: *mut u8,
+    out_size: i64,
+    phf: *const i32,
+    phf_len: i64,
+    phf_seed: i64,
+) -> i32 {
+    if cursor.is_null() || out_row.is_null() {
+        return 2;
+    }
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
+    // A well-formed cursor is a non-negative byte offset we wrote on the previous step; clamp
+    // defensively (negative / >usize on a 32-bit target → treat as exhausted at end-of-input).
+    let start = usize::try_from(unsafe { *cursor }).unwrap_or(usize::MAX).min(src.len());
+    // On the first step (`cursor == 0`), validate the whole input once — every decoded `str` field is
+    // a zero-copy view into `src`, so this covers them all (like the decode paths). Invalid → error.
+    if start == 0 && !validate_utf8(src) {
+        return 2;
+    }
+    let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
+    let phf = unsafe { phf_slice(phf, phf_len) };
+    let Ok(osz) = usize::try_from(out_size) else { return 2 };
+
+    let mut p = JsonParser { src, pos: start };
+    // Skip inter-value separators: whitespace (incl. newlines), a top-level array's `[`, and the `,`
+    // between values. This is what unifies a JSON array and NDJSON in one scanner.
+    loop {
+        p.ws();
+        match p.peek() {
+            Some(b'[') | Some(b',') => p.pos += 1,
+            _ => break,
+        }
+    }
+    // Terminator: the top-level array closed, or the input is exhausted → the stream is done.
+    match p.peek() {
+        None | Some(b']') => {
+            unsafe { *cursor = p.pos as i64 };
+            return 1;
+        }
+        _ => {}
+    }
+    // Zero the row (Option/default fields), then decode one object.
+    unsafe { core::ptr::write_bytes(out_row, 0, osz) };
+    if unsafe { parse_object(&mut p, descs, out_row, out_size, phf, phf_seed as u64) }.is_none() {
+        return 2;
+    }
+    unsafe { *cursor = p.pos as i64 };
+    0
+}
+
 /// Column-major layout for a `soa<Struct>` of `n` rows, given each field's byte `width` in field
 /// order. Returns `(cols, total_bytes, max_align)` where `cols[j] = (byte_offset, width)` for
 /// column `j`, or `None` if the byte size overflows `usize` (a pathological row count × width on a
@@ -18836,6 +18904,51 @@ mod tests {
         assert_eq!(out2.len, 0);
         assert!(out2.ptr.is_null());
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_scan_next_streams_array_and_ndjson() {
+        // Row = { active: bool @0, pay: i64 @8 }, out_size 16. Stream one row per call, over a
+        // top-level array AND NDJSON, checking status (0 row / 1 done / 2 malformed) + values (J5).
+        let active = b"active";
+        let pay = b"pay";
+        let descs = [
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 8, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let scan_all = |src: &[u8]| -> (Vec<(u8, i64)>, i32) {
+            let mut cursor: i64 = 0;
+            let mut rows: Vec<(u8, i64)> = Vec::new();
+            loop {
+                let mut row = [0u8; 16];
+                let st = unsafe {
+                    align_rt_json_scan_next(src.as_ptr(), src.len() as i64, &mut cursor, descs.as_ptr(), 2, row.as_mut_ptr(), 16, core::ptr::null(), 0, 0)
+                };
+                match st {
+                    0 => rows.push((row[0], read_i64_at(&row, 8))),
+                    other => break (rows, other),
+                }
+            }
+        };
+        // Top-level array: three rows then done (status 1).
+        let arr = br#"[{"active":true,"pay":10},{"active":false,"pay":99},{"active":true,"pay":5}]"#;
+        let (rows, end) = scan_all(arr);
+        assert_eq!(end, 1, "clean array → done");
+        assert_eq!(rows, vec![(1, 10), (0, 99), (1, 5)]);
+        // NDJSON: same rows, newline-delimited, no brackets.
+        let nd = b"{\"active\":true,\"pay\":10}\n{\"active\":false,\"pay\":99}\n{\"active\":true,\"pay\":5}";
+        let (rows, end) = scan_all(nd);
+        assert_eq!(end, 1, "clean ndjson → done");
+        assert_eq!(rows, vec![(1, 10), (0, 99), (1, 5)]);
+        // Empty array → immediately done, zero rows.
+        let (rows, end) = scan_all(b"[]");
+        assert_eq!(end, 1);
+        assert!(rows.is_empty());
+        // A malformed row mid-stream → status 2 after the good prefix.
+        let bad = br#"[{"active":true,"pay":10}, oops]"#;
+        let (rows, end) = scan_all(bad);
+        assert_eq!(end, 2, "malformed row → error status");
+        assert_eq!(rows, vec![(1, 10)]);
     }
 
     /// Read a little-endian `i64` from `buf` at byte `off` (test helper for the packed struct out).

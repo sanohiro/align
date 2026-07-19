@@ -612,6 +612,17 @@ pub enum Rvalue {
     /// arena-allocated buffer and writes the `slice<json.doc>` `{ptr,len}` into the `out` slot. No
     /// status (an empty container / non-container → an empty slice). `arena` is the enclosing arena.
     JsonDocElems { doc: Operand, arena: Operand, out: Slot },
+    /// `json.scan(input)` (J5): build a streaming typed-row scanner over the JSON `input` view. The
+    /// scanner value *is* the input view (`{ptr,len}`) — no allocation, no arena — retyped as
+    /// `json.scanner<Row>`; the row schema lives at codegen (via the value's `json.scanner<Row>` type),
+    /// not in the value. A Copy handle, no `Drop`.
+    JsonScanNew { input: Operand },
+    /// One streaming step of a `json.scanner<Row>` fused terminal (J5): decode the next JSON object at
+    /// `*cursor` in the scanner's input into the `row` slot, advancing `*cursor` past it. Returns an
+    /// `i32` status: `0` = a row was decoded, `1` = the stream is exhausted (top-level `]` / EOF),
+    /// `2` = a malformed row (the terminal yields `Err`). Reuses the decode descriptor of `struct_id`
+    /// (emitted at codegen, keyed on `schema` for cache invalidation like the typed decodes).
+    JsonScanNext { scanner: Operand, struct_id: u32, schema: String, cursor: Slot, row: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -2840,6 +2851,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::JsonDocLen { doc: d }));
             Operand::Value(v)
         }
+        // `json.scan(input)` (J5): the scanner value is the input `{ptr,len}` view retyped as
+        // `json.scanner<Row>` — no allocation. It is bound to a local and consumed as a pipeline
+        // source (the fused terminal drives the streaming steps).
+        hir::ExprKind::JsonScan { struct_id: _, input } => {
+            let inp = lower_expr(b, input);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::JsonScanNew { input: inp }));
+            Operand::Value(v)
+        }
         hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
         hir::ExprKind::JsonDocElems { doc } => {
             let arena = *b.arenas.last().expect("json.doc.elems() outside an arena (sema-checked)");
@@ -3627,13 +3647,23 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ArraySum { source, stages } => {
-            let init = zero_of(e.ty);
-            lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
+            // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
+            // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
+            if let Ty::JsonScanner(sid) = source.ty {
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Sum)
+            } else {
+                let init = zero_of(e.ty);
+                lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
+            }
         }
         hir::ExprKind::ArrayCount { source, stages } => {
-            // i64 accumulator seeded at 0; each surviving element adds 1.
-            let init = Operand::Const(Const::Int(0, i64_ty()));
-            lower_array_reduce(b, source, stages, i64_ty(), init, Reducer::Count)
+            if let Ty::JsonScanner(sid) = source.ty {
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Count)
+            } else {
+                // i64 accumulator seeded at 0; each surviving element adds 1.
+                let init = Operand::Const(Const::Int(0, i64_ty()));
+                lower_array_reduce(b, source, stages, i64_ty(), init, Reducer::Count)
+            }
         }
         hir::ExprKind::ArrayReduce { source, stages, func, captures, init } => {
             let init_op = lower_expr(b, init);
@@ -5502,6 +5532,170 @@ fn lower_array_reduce(
     if let Some(tmp) = temp_free {
         b.push(Stmt::DropValue(tmp));
     }
+    Operand::Value(r)
+}
+
+/// `json.scan(view).<stages>.{sum,count}()` — the **streaming** fused terminal (J5). Unlike
+/// [`lower_array_reduce`]'s counted `0..len` loop, this drives the scanner one row at a time: each
+/// header step decodes the next JSON object into a per-step row slot ([`Rvalue::JsonScanNext`]) and
+/// branches on the status — `0` a row (run the stages + fold), `1` exhausted (`Ok(acc)`), `2` a
+/// malformed row (`Err(Error.Invalid)`). No `array<Row>` is ever materialized. The terminal is
+/// `Result<T, Error>`. The row lives at a 1-element struct-array slot addressed at index `0`, so the
+/// shared field/element seams ([`lower_field_access`] / [`lower_struct_elem`], `struct_view = None`)
+/// address it exactly like a stack `array<Struct>`. Rejected rows branch straight to `cont` (guarded
+/// control flow — a stream folds per row, so there is no cross-row mask/vectorization to preserve).
+/// Slice 1 supports `sum`/`count` reducers; `reduce`/`any`/`all`/`min`/`max` widen in a later slice.
+fn lower_json_scan_reduce(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    struct_id: u32,
+    result_ty: Ty,
+    reducer: Reducer,
+) -> Operand {
+    // The `Ok` payload scalar of the `Result<T, Error>` terminal is the accumulator type.
+    let acc_ty = match result_ty {
+        Ty::Result(sc, _) => align_sema::scalar_to_ty(sc),
+        _ => unreachable!("a json.scan terminal is Result-typed"),
+    };
+    // Fingerprint the row schema into the MIR (cache invalidation, pitfall P5) — a field rename/type
+    // change must re-trigger codegen even though the surrounding MIR is byte-identical.
+    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
+
+    let scanner = lower_expr(b, source);
+    let cursor = b.new_slot(i64_ty());
+    b.push(Stmt::Store(cursor, Operand::Const(Const::Int(0, i64_ty()))));
+    // The per-step row: a 1-element struct-array slot, so `IndexField(row, 0, …)` / `Index(row, 0)`
+    // address it (the `struct_view = None` slot path shared with a stack `array<Struct>`).
+    let row = b.new_slot(Ty::StructArray(struct_id, 1));
+
+    let init = match &reducer {
+        Reducer::Count => Operand::Const(Const::Int(0, i64_ty())),
+        _ => zero_of(acc_ty),
+    };
+    let acc = b.new_slot(acc_ty);
+    b.push(Stmt::Store(acc, init));
+
+    // A repeated-needle `where(str.contains)` plan is hoisted once before the loop, as for arrays.
+    let finder_plans = hoist_str_finder_plans(b, stages);
+
+    let header = b.new_block();
+    let body = b.new_block();
+    let cont = b.new_block();
+    let ok_exit = b.new_block();
+    let err_exit = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Goto(header));
+
+    // header: status = next(scanner, cursor -> row); 0 → body, 1 → ok_exit, 2 → err_exit.
+    b.cur = header;
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(status, Rvalue::JsonScanNext { scanner: scanner.clone(), struct_id, schema: schema.clone(), cursor, row }));
+    let is_row = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_row, Rvalue::Bin(BinOp::Eq, Operand::Value(status), Operand::Const(Const::Int(0, status_ty())))));
+    let after_row = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_row), body, after_row));
+    b.cur = after_row;
+    let is_done = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_done, Rvalue::Bin(BinOp::Eq, Operand::Value(status), Operand::Const(Const::Int(1, status_ty())))));
+    b.terminate(Term::Branch(Operand::Value(is_done), ok_exit, err_exit));
+
+    // body: run the stages over `row[0]`, fold the survivor, goto cont. A failed `where` branches to
+    // `cont` (guarded) so later stages and the reducer run only for accepted rows.
+    b.cur = body;
+    let index = index_const(0);
+    let mut cur: Option<Operand> = None;
+    for (stage_idx, stage) in stages.iter().enumerate() {
+        match &stage.kind {
+            hir::StageKind::Project { field } => {
+                let v = lower_field_access(b, None, &None, row, &index, *field, stage.out_ty);
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Map { func, captures } => {
+                let arg = cur.take().unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
+                let call_args = stage_call_args(b, arg, captures);
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Where { func, captures } => {
+                let arg = match &cur {
+                    Some(a) => a.clone(),
+                    None => Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)),
+                };
+                let call_args = stage_call_args(b, arg, captures);
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
+                let accepted = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                b.cur = accepted;
+            }
+            hir::StageKind::WhereField { field } => {
+                let pred = lower_field_access(b, None, &None, row, &index, *field, Ty::Bool);
+                let accepted = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                b.cur = accepted;
+            }
+            hir::StageKind::WhereStrContains { .. } => {
+                let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
+                let nl = finder_plans[stage_idx].as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let pred = lower_where_str_contains_pred(b, nl, elem);
+                let accepted = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                b.cur = accepted;
+            }
+        }
+    }
+    let a = b.fresh_value(acc_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(acc)));
+    let next: Operand = match &reducer {
+        Reducer::Count => {
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1))));
+            Operand::Value(n)
+        }
+        Reducer::Sum => {
+            let cur = cur.expect("sum needs a scalar element");
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+            Operand::Value(n)
+        }
+        _ => unreachable!("json.scan slice 1 reduces with sum / count only"),
+    };
+    b.push(Stmt::Store(acc, next));
+    b.terminate(Term::Goto(cont));
+
+    // cont: back to the header for the next row.
+    b.cur = cont;
+    b.terminate(Term::Goto(header));
+
+    // ok_exit: the stream is exhausted → `Ok(acc)`.
+    b.cur = ok_exit;
+    let a = b.fresh_value(acc_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(acc)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // err_exit: a malformed row → the SAME `Err` as `json.decode` of the same malformed input
+    // (pitfall P2 — scan and decode must agree). Decode maps its runtime malformed status `1` through
+    // `make_error_code` to `Error.Code(1)`; the scan runtime uses `2` for "malformed" (since `1` is
+    // its "done" sentinel), so feed `make_error_code` a constant `1` to reproduce decode's error
+    // exactly, rather than leaking the scan-internal status code.
+    b.cur = err_exit;
+    let malformed = b.fresh_value(status_ty());
+    b.push(Stmt::Let(malformed, Rvalue::Use(Operand::Const(Const::Int(1, status_ty())))));
+    let ec = make_error_code(b, malformed, result_ty);
+    let errv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
 }
 
@@ -9700,6 +9894,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
+        Ty::JsonScanner(id) => format!("json.scanner<struct#{id}>"),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
