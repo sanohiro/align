@@ -34,15 +34,20 @@ materializing terminal inherited it), a whole-struct `any`/`reduce` `cur.expect`
 struct), and a non-scalar `reduce` accumulator panic (now a clean diagnostic). Tests: m5 `json_scan_*` (15),
 runtime `json_scan_next_streams_array_and_ndjson`. Suites green: m5 172, sema 151, mir 7, runtime json 24;
 clippy clean. **With `json.scan` the entire JSON-completeness arc (J1–J5) is COMPLETE — core.json is exactly
-`decode`/`encode`/`doc`/`scan`.** **NEXT (owner-directed 2026-07-20, framework-first): execute
-`docs/impl/15-gateway-workspace-plan.md`** — F0 pkg foundation (the `internal` + pkg-layering
-import rules + spec text; the pkg-foundation proposal in open-questions is the design, its
-consumer-gate is OPEN) → F1 non-capturing fn values as struct fields/array elements (the router
-prerequisite — probed 2026-07-20: today `fn` in a field errors "struct fields must be a primitive
-scalar…"; capturing escaping closures stay deferred) → F2 the `pkg.web` design doc
-(`docs/impl/pkg-design/web.md`, std-design depth, owner settles the surface) → F3 framework slices
-at `apps/gateway/pkg/web/` → F4 the OpenAI-compatible gateway app on it. Monorepo (no separate
-repo pre-release); one workspace `apps/gateway/` hosts framework + app. Previous
+`decode`/`encode`/`doc`/`scan`.** **NEXT (owner-directed 2026-07-20, framework-first — "the
+gateway can wait"): execute `docs/impl/15-gateway-workspace-plan.md`.** The deliverable is
+**`pkg.web` — the REST-API server framework** (first-party, SHIPPED WITH THE SYSTEM as a
+vendorable subtree; consumers copy `pkg/web/`, never ambient). **F2 (the design) is DONE:**
+`docs/impl/pkg-design/web.md` (+ja) — Go 1.22 ServeMux as primary reference, route table as data
+(Copy structs of fn values), one handler signature `fn(ctx, params: slice<str>) -> Result<(),
+Error>`, automatic 404/405/400/500, linear-scan dispatch (bench-gated radix follow-up), NO
+middleware in v1; **three forks ⚖ A/B/C await owner settlement** (route constructors / `{name}`
+pattern syntax / positional params — recommendations in the doc). Remaining execution order: owner
+settles forks → **F1** non-capturing fn values as struct fields/array elements (the ONE hard
+compiler prerequisite — probed: `fn` in a field errors today; capturing closures stay deferred) →
+**F0** pkg-foundation rules (parallelizable; `internal` + layering + spec text) → **F3** W1–W5
+framework slices at `apps/gateway/pkg/web/` → F4 gateway app LATER. Monorepo; workspace
+`apps/gateway/` hosts framework + (later) app. Previous
 update: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 3 SHIPPED → J4 COMPLETE (`elems()`;
 branch `json-j4-doc-elems`).** `d.elems() -> slice<json.doc>` materializes one document level (each
 Array element, or each Object member VALUE — keys via `key(i)`) as an arena-backed `slice<json.doc>`
