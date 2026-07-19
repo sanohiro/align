@@ -23,10 +23,22 @@ literals / `json.decode` / transforming an existing array yield `array<struct>`)
 (the doc's own "soa/tape/offset-table" move). Mutable struct-array element-field writes (`xs[i].f = v`) DO work
 (node-pool fill lever). String primitives confirmed present for pattern matching: `seg.starts_with(":")`/
 `"*"`, `seg[1..seg.len()]` (str slice), `str == str`. Dotted user modules work (`pkg.web.get`, full path).
-**NEXT: W1 — the radix router core** at `apps/web/pkg/web/internal/router.align` (module
-`pkg.web.internal.router`): pattern parse + SoA radix tree (static/param/wildcard, static>param>wildcard
-priority, conflict-abort at build) + matcher, differential-tested against a linear-scan oracle. Design +
-router internals spec: `pkg-design/web.md`. Then W2 (Ctx/serve/dispatch — the public `pkg.web.*` surface).
+**W1 slice 1 DONE (#560):** `apps/web/pkg/web/internal/router.align` (module `pkg.web.internal.router`) —
+the pattern matcher + linear-scan dispatch **oracle**: `seg_end` (segment boundary), `match_score(pattern,
+path)` (specificity score `score*3 + w`, static w=2 / `:param` w=1 / `*wildcard` ends the walk → below
+static/param; static>param>wildcard left-to-right, no backtracking), `dispatch(patterns, path)` (index of
+the most specific match, -1 none; distinct matches → distinct scores → no ties). Pure, zero-alloc, str
+views. Test `apps_web_router.rs` compiles the real file via `include_str!` under a minimal `pkg.web` root +
+`main` (also exercising F0 D7/D8 end-to-end). match_score's `*3` fold assumes bounded path depth (~<39
+segs; the tree carries no such bound). **NEXT: W1 slice 2 — the flat SoA radix tree** (build + match),
+differential-tested against slice 1's `dispatch` oracle. Build approach: SoA i64 columns (node
+`first_edge`/`n_edges`/`param_child`/`wild_leaf`/`leaf`, edge `node`, leaf `route_index`) + edge labels as
+`array<string>` (owned, cloned at build — startup only; a zero-copy `(pattern_idx,start,end)` triple is the
+later optimization). Since `array_builder` is grow-only with no mid-build random access, allocate each
+column by pushing N defaults → `build()` → a `mut array<i64>`, then construct the tree via random-access
+element writes (`col[i] = v`, which work). Conflict/duplicate/ambiguous routes abort at build. Then W2
+(Ctx/serve/dispatch — the public `pkg.web.*` surface, fully qualified per the owner decision). Design +
+router internals spec: `pkg-design/web.md`.
 Previous milestone: 2026-07-20, **pkg.web F1 — FIELD-ELIGIBILITY WIDENING COMPLETE (all three slices merged).**
 The hard compiler gate for `pkg.web` (`docs/impl/15-pkg-web-plan.md`) is done — a struct field may now be
 (①) a **fn value** (`Route { handler: fn(Ctx) -> Result<(), Error> }`, #554), (③) a **`slice<T>` view**
