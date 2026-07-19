@@ -23,7 +23,27 @@ literals / `json.decode` / transforming an existing array yield `array<struct>`)
 (the doc's own "soa/tape/offset-table" move). Mutable struct-array element-field writes (`xs[i].f = v`) DO work
 (node-pool fill lever). String primitives confirmed present for pattern matching: `seg.starts_with(":")`/
 `"*"`, `seg[1..seg.len()]` (str slice), `str == str`. Dotted user modules work (`pkg.web.get`, full path).
-**W1 slice 1 DONE (#560):** `apps/web/pkg/web/internal/router.align` (module `pkg.web.internal.router`) —
+**W1 ROUTER CORE DONE (#560 slice 1 + #563 slice 2).** The pattern matcher + linear-scan oracle
+(#560) AND the flat **SoA radix tree** (#563) are both merged and **differential-tested** (`tree_dispatch`
+== the `dispatch` oracle over 8 routes × 14 paths: nested params, tail wildcard, static-beats-param,
+trailing slash, interior misses). The tree is all-i64 SoA columns — node table (`n_param`/`n_wild`/
+`n_leaf`) + edge table (`e_par`/`e_child` + a **zero-copy** label `(e_pat,e_start,e_end)` = a str view,
+never stored/escaped, only compared) — built + matched in one function so the owned columns never cross
+a call boundary (serve will build once in its own scope + match in the request loop). Walk = static >
+`:param` > `*wildcard`, no backtracking. Backtracking-requiring route sets are out of v1 (build-abort
+later). All in `apps/web/pkg/web/internal/router.align` (module `pkg.web.internal.router`); driver test
+`apps_web_router.rs`. **En route, fixed a real double-free (#562):** moving a NAMED owned local (string/
+array/handle) into a struct-literal field was not nulling the source (`store_value_at` skipped
+`null_moved_source`) → the source local + the struct both freed the buffer; now nulled (no-op for Copy/
+borrow field values). **W1 remainders (fold into W2):** capturing the `:param` VALUES during the walk (for
+`pkg.web.param(c,"id")`), method-aware leaves (per-path method set → the 405 Allow set), and build-time
+conflict/duplicate/ambiguity abort. **Web-utility status (owner asked 2026-07-20):** implemented — base64/
+base64url/hex/utf8 (`std.encoding`), sha256/512 + hmac_sha256 + argon2id + AEAD (`std.crypto`), full JSON,
+http+SSE. GAPS: **URL/percent encode-decode** (the next `std.http` floor item — `pkg.web.query` needs it,
+lands W3), HTML-escape (only a deferred `template html` context), JWT (a future `pkg.jwt` on the existing
+hmac+base64url — NOT core/std). markdown is opaque JSON text for the LLM gateway — no codec needed.
+**NEXT: W2 (Ctx/serve/dispatch — the public `pkg.web.*` surface, fully qualified) starting with param-value
+capture; and the W3 std.http URL-percent floor.** Previous: 2026-07-20, **W1 slice 1 DONE (#560):** `apps/web/pkg/web/internal/router.align` (module `pkg.web.internal.router`) —
 the pattern matcher + linear-scan dispatch **oracle**: `seg_end` (segment boundary), `match_score(pattern,
 path)` (specificity score `score*3 + w`, static w=2 / `:param` w=1 / `*wildcard` ends the walk → below
 static/param; static>param>wildcard left-to-right, no backtracking), `dispatch(patterns, path)` (index of
