@@ -2307,3 +2307,76 @@ fn json_scalar_array_str_element_rejected() {
          fn main() -> i32 = 0\n"
     ));
 }
+
+// ---- JSON completeness T1b: top-level (bare) scalar decode targets -------------------------------
+// `x: i64 := json.decode("42")?` — parse the WHOLE input as one JSON number / bool into a scalar. The
+// value is Copy (copied out, not a view into the input), so the result is Static / returnable.
+
+#[test]
+fn json_decode_top_level_scalars() {
+    if !backend_available() {
+        return;
+    }
+    // int / float / bool bare targets, plus a whitespace-padded signed narrow int (the per-scalar
+    // range / sign / float-width checks apply, same as a scalar field).
+    let src = "import core.json\n\
+        fn main() -> Result<(), Error> {\n  \
+        x: i64 := json.decode(\"42\")?\n  \
+        y: f64 := json.decode(\"3.5\")?\n  \
+        b: bool := json.decode(\"true\")?\n  \
+        n: i32 := json.decode(\"  -7  \")?\n  \
+        print(x)\n  print(y)\n  print(b)\n  print(n)\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-top-scalar", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n3.5\ntrue\n-7\n");
+}
+
+#[test]
+fn json_decode_top_level_scalar_returnable_from_arena() {
+    if !backend_available() {
+        return;
+    }
+    // A decoded bare scalar is Copy / Static, so it returns freely out of the `arena {}` that backed
+    // the decode input (unlike a str-bearing struct, which is input-region-tied).
+    let src = "import core.json\n\
+        fn parse(s: str) -> Result<i64, Error> {\n  \
+        arena {\n    \
+        x: i64 := json.decode(s)?\n    \
+        return Ok(x)\n  }\n  \
+        return Ok(-1)\n}\n\
+        fn main() -> i32 = match parse(\"77\") { Ok(v) => v as i32, Err(e) => -9 }\n";
+    let out = build_and_run("json-top-scalar-return", src);
+    assert_eq!(out.status.code(), Some(77));
+}
+
+#[test]
+fn json_decode_top_level_scalar_error_paths() {
+    if !backend_available() {
+        return;
+    }
+    // Trailing garbage after the value, a type mismatch (string into an int), and an out-of-range value
+    // (999 into i8, max 127) are each a decode `Err`, not a panic — the whole input must be one
+    // in-range JSON scalar. `dec` returns `Result<i8, Error>` so `?`-free `match` inspects the outcome.
+    let src = "import core.json\n\
+        fn dec(s: str) -> Result<i8, Error> = json.decode(s)\n\
+        fn ok(s: str) -> i64 = match dec(s) { Ok(v) => 1, Err(e) => 0 }\n\
+        fn main() -> i32 = (ok(\"5\") * 8 + ok(\"5 x\") * 4 + ok(\"\\\"hi\\\"\") * 2 + ok(\"999\")) as i32\n";
+    let out = build_and_run("json-top-scalar-err", src);
+    // ok("5")=1 (valid), ok("5 x")=0 (trailing), ok("\"hi\"")=0 (mismatch), ok("999")=0 (out of range i8)
+    // → 8 (the low-byte exit code stays < 256).
+    assert_eq!(out.status.code(), Some(8));
+}
+
+#[test]
+fn json_decode_top_level_str_target_deferred() {
+    // A bare `str` target is deferred (it would be an input-borrowing view — a region-tracking
+    // follow-up), so `s: str := json.decode(...)` still hits the annotate/unsupported path rather than
+    // silently borrowing. (Bare int/float/bool are supported above.)
+    assert!(check_errs(
+        "json-top-str",
+        "import core.json\n\
+         fn f(d: str) -> Result<str, Error> = json.decode(d)\n\
+         fn main() -> i32 = 0\n"
+    ));
+}

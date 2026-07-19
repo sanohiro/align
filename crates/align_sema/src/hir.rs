@@ -675,6 +675,11 @@ pub enum ExprKind {
     /// result is `Static`/returnable, not region-tied to the input). `elem` is the (primitive)
     /// element type; the expression `ty` is `Result<array<T>, Error>`.
     JsonDecodeArray { elem: crate::Ty, input: Box<Expr> },
+    /// `json.decode(input)` targeting a bare scalar (JSON completeness T1b) — parse the WHOLE input as
+    /// one JSON number / bool into a `scalar` (int / float / bool). The value is `Copy` and copied out
+    /// (not a view into the input), so the result is `Static`/returnable; the expression `ty` is
+    /// `Result<scalar, Error>`. Trailing non-whitespace after the value is a decode `Err`.
+    JsonDecodeScalar { scalar: crate::Ty, input: Box<Expr> },
     /// `json.decode(input)` targeting an owned `array<Struct>` (MMv2 slice 8d, draft.md §19) —
     /// parse a JSON array of objects into an owned, dynamic AoS of struct `struct_id`. `str`
     /// fields are zero-copy views into the input, so the array is region-tied to that input; the

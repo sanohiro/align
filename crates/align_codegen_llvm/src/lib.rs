@@ -1307,6 +1307,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode into a bare scalar (input, input_len, elem_tag, out: *scalar) -> i32 status (T1b).
+        "json_decode_scalar".to_string(),
+        module.add_function(
+            "align_rt_json_decode_scalar",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ctx.i32_type().into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // fs.read_file (path_ptr, path_len, out: *{ptr,len}) -> i32 status (std.fs).
         "fs_read_file".to_string(),
         module.add_function(
@@ -6550,6 +6559,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // descriptor table directly from `struct_id`, so it does not read `schema` here.
             Rvalue::JsonDecode { struct_id, input, out, .. } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
+            Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena, .. } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
             Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => self.gen_json_decode_union(*enum_id, input, *out)?,
@@ -8792,6 +8802,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_array returns i32"))
+    }
+
+    /// `json.decode(input)` into a bare **scalar** (T1b): zero the out scalar slot, then call the
+    /// runtime scalar parser with the input `{ptr,len}` and the element tag (same encoding as an array
+    /// element / a scalar field). The runtime writes the parsed scalar to `out` and returns the i32
+    /// status (0 = ok); a trailing-garbage / type-mismatch input is a non-zero status → `Err`.
+    fn gen_json_decode_scalar(&mut self, scalar: Ty, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        // Zero the scalar slot so a failed decode leaves a defined value (the Err path ignores it).
+        let sty = self.llvm_type(scalar);
+        self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jsin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jsin_l").map_err(|e| self.err(e))?;
+        let tag: u64 = match scalar {
+            Ty::Int(it) => ((it.signed as u64) << 16) | (it.bits / 8) as u64,
+            Ty::Bool => (1 << 8) | 1,
+            Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
+            _ => unreachable!("json.decode scalar target is int/float/bool (sema-checked)"),
+        };
+        let tag_v = self.ctx.i32_type().const_int(tag, false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode_scalar"],
+                &[in_ptr.into(), in_len.into(), tag_v.into(), out_ptr.into()],
+                "jdecs",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode_scalar returns i32"))
     }
 
     /// `fs.read_file(path)`: zero the out `{ptr,len}` slot, then call the runtime reader with the

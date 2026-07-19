@@ -556,6 +556,10 @@ pub enum Rvalue {
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
     JsonDecodeArray { elem: Ty, input: Operand, out: Slot },
+    /// `json.decode` into a bare **scalar** (JSON completeness T1b): parse the whole input as one JSON
+    /// number / bool and write it into the `out` scalar slot. Yields an `i32` status (0 = ok). `scalar`
+    /// is the target (int / float / bool); its kind/width/sign give the runtime scalar tag.
+    JsonDecodeScalar { scalar: Ty, input: Operand, out: Slot },
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): parse a JSON array of objects
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
@@ -2769,6 +2773,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
+        hir::ExprKind::JsonDecodeScalar { scalar, input } => lower_json_decode_scalar(b, *scalar, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeUnion { enum_id, input } => lower_json_decode_union(b, *enum_id, input, e.ty),
@@ -7453,6 +7458,47 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     b.terminate(Term::Goto(join));
 
     // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `json.decode(input)` into a bare **scalar** (JSON completeness T1b) → parse the whole input as one
+/// JSON number / bool into an out scalar slot via the runtime parser (status `i32`), then branch into
+/// `Ok(<scalar>)` / `Err(<code>)`. Mirrors [`lower_json_decode_array`]; the scalar is `Copy` (nothing
+/// to drop).
+fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(scalar);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeScalar { scalar, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the parsed scalar and wrap it.
+    b.cur = ok_bb;
+    let s = b.fresh_value(scalar);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code (the out slot is unused on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_code(b, code, result_ty);

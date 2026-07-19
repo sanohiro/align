@@ -8,8 +8,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 1) SHIPPED (branch `json-t1b-matrix-fill`,
-not yet merged) — `array<scalar>` struct fields (`array<i64>` / `array<f64>` / `array<bool>`).** A struct
+_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 2) SHIPPED (branch `json-t1b-scalar-decode`,
+not yet merged) — top-level (bare) scalar decode targets (`x: i64 := json.decode("42")?`).** `json.decode`
+into a bare int / float / bool target parses the WHOLE input as one JSON number / bool. The value is
+`Copy` (copied out, not a view into the input), so the result is **`Static` / returnable** (returns freely
+out of the `arena {}` that backed the input, unlike a str-bearing struct). A new HIR/MIR
+`JsonDecodeScalar { scalar, input }` → `Rvalue::JsonDecodeScalar` → runtime `align_rt_json_decode_scalar`
+(parses via the shared per-scalar `write_value`, so the same range / sign / float-width checks a scalar
+*field* gets apply; leading/trailing whitespace allowed, any trailing non-whitespace → `Err`). Swept
+through every exhaustive HIR/MIR pass (region_of → `Static`, effects/escape/movecheck/borrow-sources) +
+the MIR printer (`scalar` in the digest). **Deferred:** a bare `str` target (an input-borrowing view —
+region-tracking follow-up) and `char` (no JSON form) stay on the annotate/unsupported path.
+`/align-self-review` (Gate 1 new-variant sweep — every analysis pass verified) + `/code-review` high run.
+Tests: `m5.rs` T1b (int/float/bool + whitespace, returnable-from-arena, error paths = trailing-garbage /
+type-mismatch / out-of-range, bare-`str` deferred). Suites green: m5 148, sema 151, mir 7, codegen 26,
+cache_codegen 19 (only the known macOS gate7 flake fails); clippy clean. **NOTE:** the top-level
+`array<scalar>` target (`xs: array<i64> := json.decode("[1,2,3]")?`) already existed (MMv2 slice 8c) — this
+adds the BARE scalar. **NEXT: the rest of T1b** — `Option<struct>` ENCODE (the Slice-B follow-up),
+`array<Option<T>>` compositions → J4 `json.doc` → J5 `json.scan` → J6 spec sync. Previous update:
+2026-07-19, **JSON COMPLETENESS T1b (part 1) SHIPPED (MERGED as #538) — `array<scalar>` struct fields (`array<i64>` / `array<f64>` / `array<bool>`).** A struct
 field may now be an owned scalar array — the align-LLM data shapes (embeddings `array<f64>`, token ids
 `array<i64>`), decoded/encoded byte-identically and composing with J3b (a scalar-array field inside an
 `array<Move-struct>` element). **New JSON descriptor kind 7:** the field's own `{ptr,len}` slot is width

@@ -427,6 +427,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeArray { elem, input, out } => {
             format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
         }
+        Rvalue::JsonDecodeScalar { scalar, input, out } => {
+            format!("json_decode_scalar({} : {}, -> _{out})", operand_str(input), crate::ty_name(*scalar))
+        }
         Rvalue::JsonDecodeStructArray { struct_id, schema, input, out } => {
             format!("json_decode_struct_array(struct#{struct_id} {schema}, {}, -> _{out})", operand_str(input))
         }
