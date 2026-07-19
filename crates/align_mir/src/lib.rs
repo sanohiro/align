@@ -4868,6 +4868,13 @@ fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir:
         _ => {
             let op = lower_expr(b, value);
             b.push(Stmt::StoreField(slot, path.clone(), op));
+            // An **owned** local moved into this field (`T { a: xs }` where `xs` is a
+            // `string`/`array`/handle/Move-struct local) is consumed by the construction — null the
+            // source slot, else both the source local's exit `Drop` and the enclosing struct's
+            // recursive `Drop` free the same buffer (a double-free). No-op for a Copy / borrowed
+            // field value (scalar, `str`/`slice` view). A binding to a bare `let` nulls via its own
+            // store site; a struct literal reaches its leaf owned field values only here.
+            null_moved_source(b, value);
         }
     }
 }
