@@ -20,7 +20,8 @@ const WEB_ROOT: &str = "module pkg.web\n\
 import pkg.web.internal.router\n\
 pub fn dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.dispatch(patterns, path)\n\
 pub fn match_score(pattern: str, path: str) -> i64 = pkg.web.internal.router.match_score(pattern, path)\n\
-pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.tree_dispatch(patterns, path)\n";
+pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.tree_dispatch(patterns, path)\n\
+pub fn param_value(pattern: str, path: str, name: str) -> str = pkg.web.internal.router.param_value(pattern, path, name)\n";
 
 fn web_project(entry_main: &str) -> Vec<(&'static str, String)> {
     vec![
@@ -169,4 +170,29 @@ fn main() -> Result<(), Error> {\n\
     assert_eq!(out.status.code(), Some(0));
     // "0" alone = every path agreed (a mismatch would print a -999 block before it).
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+// ── W2 bridge: :param / *wildcard value capture ───────────────────────────────────────────────
+
+#[test]
+fn param_value_captures_named_segments() {
+    if !backend_available() {
+        return;
+    }
+    // The zero-copy value of each `:param` / `*wildcard`, and "" for a name the matched route does
+    // not declare. These are `str` views into the request path — what `pkg.web.param(c, name)` returns.
+    let main = "module main\n\
+import pkg.web\n\
+fn main() -> Result<(), Error> {\n\
+  print(pkg.web.param_value(\"/v1/models/:id\", \"/v1/models/42\", \"id\"))            // 42\n\
+  print(pkg.web.param_value(\"/users/:uid/posts/:pid\", \"/users/7/posts/9\", \"uid\")) // 7\n\
+  print(pkg.web.param_value(\"/users/:uid/posts/:pid\", \"/users/7/posts/9\", \"pid\")) // 9\n\
+  print(pkg.web.param_value(\"/files/*path\", \"/files/a/b/c\", \"path\"))              // a/b/c\n\
+  print(pkg.web.param_value(\"/v1/models/:id\", \"/v1/models/42\", \"nope\").len())     // 0 (absent)\n\
+  print(pkg.web.param_value(\"/static/x\", \"/static/x\", \"id\").len())                // 0 (no params)\n\
+  return Ok(())\n\
+}\n";
+    let out = run_web("web-param", main);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n7\n9\na/b/c\n0\n0\n");
 }
