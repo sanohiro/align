@@ -580,6 +580,27 @@ pub enum Rvalue {
     /// class → arm table). `schema` is the union's fingerprint (variant names + payload types, struct
     /// payloads expanded — see [`json_union_schema_sig`]) baked in for cache invalidation.
     JsonDecodeUnion { enum_id: u32, schema: String, input: Operand, out: Slot },
+    /// `json.doc(input)` (J4): parse the `str` `input` into an arena-backed tape, writing the root
+    /// `{tape,node}` handle into the `out` slot. Yields an `i32` status (0 = ok). `arena` is the
+    /// enclosing arena handle the runtime bump-allocates the tape from. Schema-unknown, so — unlike the
+    /// typed `JsonDecode*` — it carries NO schema fingerprint (the tape is generic; nothing to stale).
+    JsonDoc { input: Operand, arena: Operand, out: Slot },
+    /// `d.kind()` on a `json.doc`: the runtime returns the `json.kind` tag directly as an `i32`
+    /// (codegen wraps it into the tag-only enum aggregate). Total.
+    JsonDocKind { doc: Operand },
+    /// `d.get(key)` on a `json.doc`: the runtime writes the child `{tape,node}` handle (`Missing` if
+    /// absent / not an object) into the `out` slot. No status (navigation is total).
+    JsonDocGet { doc: Operand, key: Operand, out: Slot },
+    /// `d.at(index)` on a `json.doc`: the runtime writes the element `{tape,node}` handle (`Missing`
+    /// if out of range / not an array) into the `out` slot. No status (navigation is total).
+    JsonDocAt { doc: Operand, index: Operand, out: Slot },
+    /// `d.as_str()` on a `json.doc`: the runtime writes a `str` view (`{ptr,len}`) into the `out`
+    /// slot and returns an `i32` present flag (1 = a JSON string → `Some`, 0 → `None`).
+    JsonDocAsStr { doc: Operand, out: Slot },
+    /// `d.as_i64()` / `d.as_f64()` / `d.as_bool()` on a `json.doc`: the runtime writes the leaf scalar
+    /// into the `out` slot and returns an `i32` present flag (1 → `Some`, 0 → `None`). `scalar` is the
+    /// target leaf type (int / float / bool), selecting the runtime accessor.
+    JsonDocAsScalar { scalar: Ty, doc: Operand, out: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -2789,6 +2810,19 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeUnion { enum_id, input } => lower_json_decode_union(b, *enum_id, input, e.ty),
+        // `json.doc(...)` and the doc accessors (J4). Out-of-line helpers (each builds a block or two)
+        // to keep the recursive `lower_expr` frame flat (the #296 expr-depth lesson).
+        hir::ExprKind::JsonDoc { input } => lower_json_doc(b, input, e.ty),
+        hir::ExprKind::JsonDocKind { doc } => {
+            let d = lower_expr(b, doc);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::JsonDocKind { doc: d }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::JsonDocGet { doc, key } => lower_json_doc_get(b, doc, key, e.ty),
+        hir::ExprKind::JsonDocAt { doc, index } => lower_json_doc_at(b, doc, index, e.ty),
+        hir::ExprKind::JsonDocAsStr { doc } => lower_json_doc_as_str(b, doc, e.ty),
+        hir::ExprKind::JsonDocAsScalar { doc, scalar } => lower_json_doc_as_scalar(b, doc, *scalar, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
         // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
@@ -6500,6 +6534,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Slice(_)
         | Scalar::Enum(_)
         | Scalar::Soa(_)
+        | Scalar::JsonDoc
         | Scalar::Param(_)
         | Scalar::Reader
         | Scalar::Writer
@@ -7527,6 +7562,132 @@ fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, resu
     let ec = make_error_code(b, code, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `json.doc(input)` (J4) → the runtime parses `input` into an arena-backed tape, writing the root
+/// `{tape,node}` handle into an out slot and returning an `i32` status; branch `Ok(<doc>)` /
+/// `Err(<Error.Invalid>)`. The arena comes from the enclosing `arena {}` (sema-checked). Mirrors
+/// [`lower_fs_read_file_view`] (an arena-tied view returned via out slot + status). Out-of-line for
+/// `expr_depth` headroom (#296).
+#[inline(never)]
+fn lower_json_doc(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let arena = *b.arenas.last().expect("json.doc outside an arena (sema-checked)");
+    let out = b.new_slot(Ty::JsonDoc);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::JsonDoc { input: inp, arena: Operand::Value(arena), out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the `{tape,node}` handle and wrap it (arena-backed — no `Drop`).
+    b.cur = ok_bb;
+    let d = b.fresh_value(Ty::JsonDoc);
+    b.push(Stmt::Let(d, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(d))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err (malformed input): the out slot was zeroed; map the status (`Error.Invalid`).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `d.get(key)` / `d.at(index)` on a `json.doc` → the runtime writes the child `{tape,node}` handle
+/// (`Missing` if absent) directly into an out slot; the result *is* that handle (navigation is total,
+/// no `Result`/`Option`). Out-of-line for `expr_depth` headroom.
+#[inline(never)]
+fn lower_json_doc_get(b: &mut Builder, doc: &hir::Expr, key: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::JsonDoc);
+    let d = lower_expr(b, doc);
+    let k = lower_expr(b, key);
+    let unit = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(unit, Rvalue::JsonDocGet { doc: d, key: k, out }));
+    let v = b.fresh_value(result_ty);
+    b.push(Stmt::Let(v, Rvalue::Load(out)));
+    Operand::Value(v)
+}
+
+#[inline(never)]
+fn lower_json_doc_at(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::JsonDoc);
+    let d = lower_expr(b, doc);
+    let i = lower_expr(b, index);
+    let unit = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(unit, Rvalue::JsonDocAt { doc: d, index: i, out }));
+    let v = b.fresh_value(result_ty);
+    b.push(Stmt::Let(v, Rvalue::Load(out)));
+    Operand::Value(v)
+}
+
+/// `d.as_str()` on a `json.doc` → the runtime writes a `str` view into an out slot and returns an
+/// `i32` present flag; branch `Some(<view>)` / `None`. Mirrors [`lower_env_get`], but the payload is a
+/// borrowed `str` view (region-bound to `doc` in sema — the None arm's zeroed slot needs no free).
+#[inline(never)]
+fn lower_json_doc_as_str(b: &mut Builder, doc: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let d = lower_expr(b, doc);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::JsonDocAsStr { doc: d, out }));
+    lower_json_doc_option(b, flag, out, Ty::Str, result_ty)
+}
+
+/// `d.as_i64()` / `d.as_f64()` / `d.as_bool()` on a `json.doc` → the runtime writes the leaf scalar
+/// into an out slot and returns an `i32` present flag; branch `Some(<scalar>)` / `None`. The scalar is
+/// copied out (`Static` — no region tie).
+#[inline(never)]
+fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result_ty: Ty) -> Operand {
+    let out = b.new_slot(scalar);
+    let d = lower_expr(b, doc);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::JsonDocAsScalar { scalar, doc: d, out }));
+    lower_json_doc_option(b, flag, out, scalar, result_ty)
+}
+
+/// The shared `Some(load out)` / `None` branch for a `json.doc` leaf accessor: `flag != 0` → the value
+/// at `out` (of type `payload`) is present. The payload is a Copy view / scalar (no `Drop` either arm).
+fn lower_json_doc_option(b: &mut Builder, flag: ValueId, out: Slot, payload: Ty, result_ty: Ty) -> Operand {
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    b.cur = some_bb;
+    let v = b.fresh_value(payload);
+    b.push(Stmt::Let(v, Rvalue::Load(out)));
+    let somev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(v))));
+    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let nonev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
     b.terminate(Term::Goto(join));
 
     b.cur = join;
@@ -9497,6 +9658,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::JsonDoc => "json.doc".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

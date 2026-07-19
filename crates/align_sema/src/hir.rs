@@ -697,6 +697,27 @@ pub enum ExprKind {
     /// payloads are zero-copy views into the input, so the result is region-tied to it (see
     /// `region_of`). The expression `ty` is `Result<Enum, Error>`.
     JsonDecodeUnion { enum_id: u32, input: Box<Expr> },
+    /// `json.doc(input)` (core.json J4) — parse the `str` `input` ONCE into an arena-backed tape,
+    /// yielding the schema-unknown lazy document view. The expression `ty` is `Result<json.doc, Error>`;
+    /// the doc is region-tied to min(input, enclosing arena). Requires an enclosing `arena {}`.
+    JsonDoc { input: Box<Expr> },
+    /// `d.kind()` on a `json.doc` — the value's `json.kind` tag (`Object`/`Array`/`Str`/`Number`/
+    /// `Bool`/`Null`/`Missing`). Total (a `Missing` doc yields `Missing`). Copy result (`Static`).
+    JsonDocKind { doc: Box<Expr> },
+    /// `d.get(key)` on a `json.doc` — the value of object member `key`, or a `Missing` doc (absent /
+    /// not an object / already Missing). Returns another `json.doc` viewing the same tape, so it is
+    /// region-bound to `doc`.
+    JsonDocGet { doc: Box<Expr>, key: Box<Expr> },
+    /// `d.at(index)` on a `json.doc` — element `index` of an array, or a `Missing` doc (out of range /
+    /// not an array / already Missing). Returns another `json.doc`, region-bound to `doc`.
+    JsonDocAt { doc: Box<Expr>, index: Box<Expr> },
+    /// `d.as_str()` on a `json.doc` — `Some(str)` if the value is a JSON string, else `None`. The
+    /// `str` is a view (into the input, or the arena for an escaped string), so region-bound to `doc`.
+    JsonDocAsStr { doc: Box<Expr> },
+    /// `d.as_i64()` / `d.as_f64()` / `d.as_bool()` on a `json.doc` — `Some(scalar)` if the value is a
+    /// JSON number / bool of that kind, else `None`. `scalar` is the Copy leaf type (`i64`/`f64`/
+    /// `bool`); the value is copied out (`Static`, no region tie).
+    JsonDocAsScalar { doc: Box<Expr>, scalar: crate::Ty },
     /// `s.group_by(.key).{sum,min,max}(.value)` / `.count()` over a `soa<Struct>` local `base` —
     /// column-oriented grouped aggregate. Reads the `key_field` column (and `value_field` for
     /// sum/min/max — `None` for `count`) as `slice<i64>` via [`SoaColumn`] and folds per distinct

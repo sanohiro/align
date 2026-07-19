@@ -189,7 +189,12 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
   `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for
-  pipelines (no map type, no serde-style value tree).
+  pipelines (no map type, no serde-style value tree). **Slice 1 SHIPPED:** the `json.doc` type +
+  `json.doc(s)?` parse (arena-backed tape, `Result<json.doc, Error>`) + `kind()` (→ builtin
+  `json.kind` sum type) + `get`/`at` navigation + the four leaf accessors `as_str`/`as_i64`/`as_f64`/
+  `as_bool` (→ `Option`; `as_str` is a zero-copy input view, escaped strings unescape into the arena).
+  **Deferred to slice 2:** `len()`, `elems()` (materialize a level for pipelines), and `key(i)`
+  (objects-as-ordered-data).
 - **`json.scan` (J5):** streaming typed rows, binding-annotation-typed, pipeline source only.
 
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is

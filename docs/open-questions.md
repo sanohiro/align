@@ -3871,8 +3871,22 @@ field to a bare `"Option"`, so a decode-only payload field rename didn't invalid
 recurses into the payload (and renders `Option<scalar>` width). Tests: `m5.rs` T1b, `cache_codegen`
 gate2e. **T1b is now COMPLETE** — `array<Option<T>>` is DEFERRED as a language-type gap (an owned array
 of a composite element needs a dedicated `Ty`/`Scalar`, not a JSON matrix-fill; see the T1b entry above).
-**NEXT: J4 `json.doc`** (the schema-unknown lazy document view). →
-**J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
+**J4 `json.doc` — SLICE 1 SHIPPED** (the schema-unknown lazy document view MVP): a Copy `{tape,node}`
+handle (`Ty::JsonDoc` / `Scalar::JsonDoc`, region-tied to min(input, arena)); `json.doc(s)?` parses
+ONCE into an arena-backed tape (`Result<json.doc, Error>` — malformed = `Err`, requires an enclosing
+`arena {}`); total Missing-propagating navigation `d.get(k)` / `d.at(i)` (always a `json.doc`, Missing
+= `node < 0`); `d.kind()` → the builtin **`json.kind`** sum type (`Object/Array/Str/Number/Bool/Null/
+Missing`, matched by bare variant name); and the four leaf accessors `as_str`/`as_i64`/`as_f64`/
+`as_bool` → `Option` (`as_str` is a zero-copy input view, escaped strings unescape into the arena — the
+one allocating accessor). Runtime = a `simdjson`-style flat node array (per-node sibling-skip offsets;
+recursive validate-and-emit build) in `align_rt_json_doc_*`. Schema-UNKNOWN, so no `json_schema_sig`
+cache key (the tape is generic — nothing to stale). Threaded through every exhaustive HIR/MIR pass
+(region_of = min(input, arena) for the doc / receiver-region for `get`/`at`/`as_str` / `Static` for
+`kind`/`as_i64/f64/bool`; `tracks_region` + `ty_may_borrow` + `borrow_sources` = the input roots).
+Tests: `m5.rs` (navigate + kind-match + leaf accessors, malformed→Err, arena gate, view-escape
+rejection), runtime `json_doc_*`. **Deferred to J4 slice 2:** `d.len()`, `d.elems() -> array<json.doc>`
+(materialize a level for pipelines), `d.key(i) -> Option<str>` (objects-as-ordered-data). →
+**J4 slice 2** (`len`/`elems`/`key`) → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

@@ -1497,6 +1497,31 @@ The JSON scanner finds structural chars with SIMD.
 { } [ ] : , " \ whitespace
 ```
 
+### Dynamic (schema unknown): `json.doc`
+
+When the shape is not known at compile time, `json.doc` is the lazy document view — parsed **once**
+into an arena-backed tape (no serde-style per-node heap tree, no `map` type). It is a **Copy** view
+handle region-tied to `min(input, arena)`, so it — and any `str` / sub-doc read of it — cannot escape
+the arena that owns the tape.
+
+```align
+arena {
+  d := json.doc(body)?                       // Result<json.doc, Error> — malformed input is Err
+  match d.kind() { Object => …, Array => …, _ => … }   // json.kind: Object/Array/Str/Number/Bool/Null/Missing
+  id := d.get("id").as_i64() else 0          // navigate then read a leaf
+  first := d.get("tags").at(0).as_str() else "?"
+}
+```
+
+Navigation is **total and Missing-propagating**: `d.get(key)` (object member) and `d.at(index)`
+(array element) always return a `json.doc`; a missing member / out-of-range index / navigation on a
+non-container yields a `Missing` doc, which propagates through further navigation so absence surfaces
+**once** — as `None` from a leaf accessor. The leaf accessors `as_str` / `as_i64` / `as_f64` /
+`as_bool` return `Option` (`None` when the value is not that kind); `d.kind()` returns the builtin
+`json.kind` sum type and distinguishes JSON `null` from absence (`Missing`). `as_str` is a zero-copy
+view into the input, except an escaped string, which is unescaped into the arena (the one allocating
+accessor). `json.doc` needs an enclosing `arena {}`, like the direct-to-`soa` decode.
+
 ---
 
 ## 15. Safety

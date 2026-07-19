@@ -442,6 +442,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeUnion { enum_id, schema, input, out } => {
             format!("json_decode_union(enum#{enum_id} {schema}, {}, -> _{out})", operand_str(input))
         }
+        Rvalue::JsonDoc { input, arena, out } => {
+            format!("json_doc({}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
+        }
+        Rvalue::JsonDocKind { doc } => format!("json_doc_kind({})", operand_str(doc)),
+        Rvalue::JsonDocGet { doc, key, out } => format!("json_doc_get({}, {}, -> _{out})", operand_str(doc), operand_str(key)),
+        Rvalue::JsonDocAt { doc, index, out } => format!("json_doc_at({}, {}, -> _{out})", operand_str(doc), operand_str(index)),
+        Rvalue::JsonDocAsStr { doc, out } => format!("json_doc_as_str({}, -> _{out})", operand_str(doc)),
+        Rvalue::JsonDocAsScalar { scalar, doc, out } => {
+            format!("json_doc_as_scalar({} : {}, -> _{out})", operand_str(doc), crate::ty_name(*scalar))
+        }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }

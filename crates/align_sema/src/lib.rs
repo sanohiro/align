@@ -103,6 +103,11 @@ pub enum Scalar {
     /// storage, never dropped). Lets `Result<soa<T>, Error>` carry a decoded soa — the result type
     /// of `s: soa<User> := json.decode(d)?`. Non-recursive (just the id), so `Scalar` stays `Copy`.
     Soa(u32),
+    /// A `json.doc` view payload (`Result<json.doc, Error>` from `json.doc(s)`, J4). A Copy
+    /// `{ tape, node }` handle — **Copy, not Move** (it owns nothing; the tape lives in the arena)
+    /// but **region-tracked** (like [`Scalar::Soa`]: it borrows the arena tape + the JSON input,
+    /// never dropped). Non-recursive (opaque), so `Scalar` stays `Copy`.
+    JsonDoc,
     /// A generic type parameter as a composite payload — `Option<T>` / `Result<T, E>` inside a
     /// generic template (4c-3). Carries the parameter index (like [`Ty::Param`]). Present **only**
     /// while a generic template is type-checked abstractly; monomorphization re-resolves every type
@@ -485,6 +490,14 @@ pub enum Ty {
     /// Move-handle exclusions (never an array/slice/box element; bound to a local). **Impure** (network).
     /// Opaque pointer.
     HttpStream,
+    /// A `json.doc` (`core.json`, J4) — the schema-unknown lazy document view. A **Copy**
+    /// `{ tape, node }` handle laid out like a slice (`{ptr, i64}`): `tape` addresses the
+    /// arena-resident tape (built by `json.doc(s)?`), `node` is a tape index (`< 0` == `Missing`).
+    /// Region-tracked (borrows the arena tape + the JSON input — min of the two, like a str-bearing
+    /// `soa`), never Move, never dropped (nothing owned). Navigation (`d.get(k)` / `d.at(i)`) is
+    /// total and returns another `json.doc`; leaf accessors (`as_str`/`as_i64`/`as_f64`/`as_bool`)
+    /// return `Option`; `d.kind()` returns the builtin `json.kind` enum.
+    JsonDoc,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -571,6 +584,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
+        // A `json.doc` view is the `Ok` payload of `json.doc(s)`'s `Result`. Region-tracked, never
+        // dropped — like `Soa` / `Str`.
+        Ty::JsonDoc => Some(Scalar::JsonDoc),
         // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
         // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
         Ty::Enum(id) => Some(Scalar::Enum(id)),
@@ -609,6 +625,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Slice(elem) => Ty::Slice(prim_to_scalar(elem)),
         Scalar::Enum(id) => Ty::Enum(id),
         Scalar::Soa(id) => Ty::Soa(id),
+        Scalar::JsonDoc => Ty::JsonDoc,
         Scalar::Param(i) => Ty::Param(i),
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
@@ -709,6 +726,9 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        // A `json.doc` is a `{tape,node}` handle, not a `slice<T>` payload; its escape is enforced
+        // through `tracks_region`, not `mentions_slice`.
+        | Ty::JsonDoc
         // The compiler-internal `str_finder` plan is an opaque owned handle; it holds no slice.
         | Ty::StrFinder
         | Ty::DictEncoded(..)
@@ -733,6 +753,8 @@ pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], en
         | Ty::Reader
         | Ty::Writer
         | Ty::Soa(_)
+        // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view (J4).
+        | Ty::JsonDoc
         | Ty::DictEncoded(..)
         | Ty::DynSliceArray(_)
         | Ty::Fn(_) => true,
@@ -2580,6 +2602,23 @@ pub fn check_program_with_effects(
             ],
             align: None,
             c_repr: false,
+        });
+    }
+
+    // The builtin `json.kind` enum (core.json J4) — the result of `d.kind()` on a `json.doc`. A
+    // tag-only Copy sum type; the variant order matches the runtime `DocNode.kind` tags exactly
+    // (`Object`=0 … `Null`=5, `Missing`=6). Registered like the `Error` enum / `argon2_params` struct
+    // above: a reserved dotted name (never a legal user identifier, so no collision), visible so
+    // `match d.kind() { Object => …, … }` resolves the bare variant names by the scrutinee's type.
+    {
+        let json_kind_id = enums.len() as u32;
+        enum_ids.insert("json.kind".to_string(), json_kind_id);
+        enums.push(hir::EnumDef {
+            name: "json.kind".to_string(),
+            variants: ["Object", "Array", "Str", "Number", "Bool", "Null", "Missing"]
+                .into_iter()
+                .map(|v| hir::EnumVariant { name: v.to_string(), payload: Vec::new(), field_base: 1 })
+                .collect(),
         });
     }
 
@@ -4554,6 +4593,18 @@ impl EffectScan<'_> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input),
+            // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
+            // navigate — no I/O); walk their sub-expressions for effects (J4).
+            ExprKind::JsonDoc { input } => self.expr(input),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.expr(doc),
+            ExprKind::JsonDocGet { doc, key } => {
+                self.expr(doc);
+                self.expr(key);
+            }
+            ExprKind::JsonDocAt { doc, index } => {
+                self.expr(doc);
+                self.expr(index);
+            }
             // `builder(capacity)` — the capacity expr may itself have effects.
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
@@ -4968,6 +5019,9 @@ impl<'a> EscapeCheck<'a> {
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
             Ty::Soa(_) => true,
+            // A `json.doc` view borrows the arena tape + the JSON input (min of the two), so it is
+            // region-tracked — it (and any str/sub-doc read of it) must not outlive either (J4).
+            Ty::JsonDoc => true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
             Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
@@ -5282,6 +5336,15 @@ impl<'a> EscapeCheck<'a> {
                 self.region_of(input, depth).shorter(Region::arena(depth))
             }
             ExprKind::JsonDecodeSoa { .. } => Region::arena(depth),
+            // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
+            // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
+            // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
+            ExprKind::JsonDoc { input } => self.region_of(input, depth).shorter(Region::arena(depth)),
+            // `d.get(k)` / `d.at(i)` yield another `json.doc` viewing the same tape; `d.as_str()` a
+            // `str` view into the input (or the arena, for an escaped string). All live exactly as long
+            // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
+            // (`d.kind()` / `d.as_i64/f64/bool()` copy out a Copy scalar → the `Static` list below.)
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } => self.region_of(doc, depth),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
@@ -5567,6 +5630,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Len(..)
             | ExprKind::JsonDecodeArray { .. }
             | ExprKind::JsonDecodeScalar { .. }
+            // `d.kind()` is a Copy `json.kind` tag; `d.as_i64/f64/bool()` copy the scalar out — neither
+            // borrows the doc, so both are `Static` (freely returnable), unlike the view accessors.
+            | ExprKind::JsonDocKind { .. }
+            | ExprKind::JsonDocAsScalar { .. }
             | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
@@ -5818,6 +5885,14 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::JsonDecodeUnion { .. }
+            // The `json.doc` ops produce a `json.doc` / `str` / scalar — never a local-backed
+            // `slice<u8>`. Their escape is enforced by `tracks_region` + `region_of` (J4).
+            | ExprKind::JsonDoc { .. }
+            | ExprKind::JsonDocKind { .. }
+            | ExprKind::JsonDocGet { .. }
+            | ExprKind::JsonDocAt { .. }
+            | ExprKind::JsonDocAsStr { .. }
+            | ExprKind::JsonDocAsScalar { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
@@ -6517,6 +6592,17 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
+            // `json.doc(...)` and the doc accessors: walk their operands (J4).
+            ExprKind::JsonDoc { input } => self.walk(input, depth),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.walk(doc, depth),
+            ExprKind::JsonDocGet { doc, key } => {
+                self.walk(doc, depth);
+                self.walk(key, depth);
+            }
+            ExprKind::JsonDocAt { doc, index } => {
+                self.walk(doc, depth);
+                self.walk(index, depth);
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7131,6 +7217,16 @@ impl UnnecessaryHeapScan {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
+            ExprKind::JsonDoc { input } => self.visit(input),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.visit(doc),
+            ExprKind::JsonDocGet { doc, key } => {
+                self.visit(doc);
+                self.visit(key);
+            }
+            ExprKind::JsonDocAt { doc, index } => {
+                self.visit(doc);
+                self.visit(index);
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -7733,6 +7829,15 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     BorrowRoots::new()
                 }
+            }
+            // A `json.doc` (and every sub-doc / `as_str` view of it) is rooted in the JSON input it
+            // borrows: `json.doc(s)` roots in `s`; `d.get(k)` / `d.at(i)` / `d.as_str()` inherit the
+            // receiver doc's roots. So a use past the input's liveness is caught (#460), like the
+            // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
+            // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
+            ExprKind::JsonDoc { input } => self.borrow_sources(input),
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } => {
+                self.borrow_sources(doc)
             }
             ExprKind::Call { args, .. } => {
                 let mut roots = BorrowRoots::new();
@@ -8529,6 +8634,18 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.expr(input, moved, false, false),
+            // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
+            // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
+            ExprKind::JsonDoc { input } => self.expr(input, moved, false, false),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.expr(doc, moved, false, false),
+            ExprKind::JsonDocGet { doc, key } => {
+                self.expr(doc, moved, false, false);
+                self.expr(key, moved, false, false);
+            }
+            ExprKind::JsonDocAt { doc, index } => {
+                self.expr(doc, moved, false, false);
+                self.expr(index, moved, false, false);
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -8860,6 +8977,8 @@ struct Checker<'a, 't> {
     enum_mono: &'t mut HashMap<String, u32>,
     /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
     error_enum_id: u32,
+    /// The id of the builtin `json.kind` enum (the result of `d.kind()` on a `json.doc`, J4).
+    json_kind_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
     /// resolution (mutable, like the other interners). Field access reads it.
     structs: &'t mut Vec<StructDef>,
@@ -9022,6 +9141,9 @@ impl<'a, 't> Checker<'a, 't> {
             enum_templates,
             enum_mono,
             error_enum_id,
+            // The builtin `json.kind` enum is registered before any `Checker` is built (right after
+            // `Error`), so its id is always present in `enum_ids`.
+            json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
             structs,
             struct_templates,
             struct_mono,
@@ -12024,6 +12146,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("core.json", "json.decode", span);
                 return self.check_json_decode(args, expected, span);
             }
+            if module == "json" && method == "doc" {
+                self.require_import("core.json", "json.doc", span);
+                return self.check_json_doc(args, span);
+            }
             if module == "fs" && method == "read_file" {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
@@ -12400,6 +12526,21 @@ impl<'a, 't> Checker<'a, 't> {
                     .error(format!("'.{method}()' is not a method on {} (it is a `reader` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
+        }
+        // `json.doc` navigation / leaf accessors (J4): `d.kind()` / `d.get(k)` / `d.at(i)` /
+        // `d.as_str()` / `d.as_i64()` / `d.as_f64()` / `d.as_bool()`. Intercepted on a `json.doc`
+        // receiver BEFORE the shared-name handlers below (`as_str` on bytes, `get` on a box), so those
+        // names stay free on other values. A non-`json.doc` receiver falls through: `as_str`/`get`
+        // reach their own handlers, the exclusive names (`kind`/`at`/`as_*`) reach the final
+        // unknown-method arm. The receiver may be a temporary (a `json.doc` is Copy, never dropped, so
+        // chaining `d.get("a").at(0).as_i64()` is fine — no bound-local gate, unlike the Move handles).
+        if matches!(method, "kind" | "get" | "at" | "as_str" | "as_i64" | "as_f64" | "as_bool") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::JsonDoc {
+                return self.check_json_doc_method(recv_expr, method, args, span);
+            }
+            // Otherwise let a shared-name handler (or the final unknown-method arm) take it; those
+            // paths re-check `recv` idempotently for the bound-local receivers they accept.
         }
         // `bytes.as_str()` — the validating bytes→text VIEW (A7). Dispatched on a `bytes` (`slice<u8>`)
         // receiver so the name stays free on other values.
@@ -15448,6 +15589,109 @@ impl<'a, 't> Checker<'a, 't> {
             kind: ExprKind::JsonDecode { struct_id: sid, input: Box::new(input) },
             ty: Ty::Result(Scalar::Struct(sid), Scalar::Enum(self.error_enum_id)),
             span,
+        }
+    }
+
+    /// `json.doc(input)` (J4) — parse the input into an arena-backed lazy document view. Needs an
+    /// enclosing `arena {}` (the tape is arena-allocated, bulk-freed at arena end), like the soa
+    /// decode / `fs.read_file_view`. The result is `Result<json.doc, Error>`; the doc is region-tied
+    /// to min(input, arena) (see `region_of`), so it cannot escape either.
+    fn check_json_doc(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(format!("'json.doc' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        if self.arena_depth == 0 {
+            self.diags.error(
+                "'json.doc' parses into an arena-backed tape — call it inside an `arena {}` block".to_string(),
+                span,
+            );
+            return err;
+        }
+        // `check_str_init` accepts a `str` or auto-borrows an owned `string` (whose region then bounds
+        // the doc, since a decoded `str` view borrows the input bytes).
+        let input = self.check_str_init(&args[0]);
+        if input.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::JsonDoc { input: Box::new(input) },
+            ty: Ty::Result(Scalar::JsonDoc, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_str()` / `d.as_i64()` / `d.as_f64()` / `d.as_bool()`
+    /// on a `json.doc` ([`Ty::JsonDoc`]), the receiver already evaluated. `kind` yields the builtin
+    /// `json.kind` enum; `get`/`at` yield another `json.doc` (region-bound to the receiver — the
+    /// `region_of` arm); `as_str` an `Option<str>` **view** (likewise region-bound); `as_i64`/`as_f64`/
+    /// `as_bool` an `Option<scalar>` copied out (`Static`). The receiver may be a temporary (a
+    /// `json.doc` is Copy, never dropped — chaining is fine).
+    fn check_json_doc_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match method {
+            "kind" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.kind()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocKind { doc: Box::new(recv_expr) }, ty: Ty::Enum(self.json_kind_enum_id), span }
+            }
+            "get" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.get()' on a json.doc takes 1 argument (the member key), got {}", args.len()), span);
+                    return err;
+                }
+                let key = self.check_str_init(&args[0]);
+                if key.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocGet { doc: Box::new(recv_expr), key: Box::new(key) }, ty: Ty::JsonDoc, span }
+            }
+            "at" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.at()' takes 1 argument (the element index), got {}", args.len()), span);
+                    return err;
+                }
+                let idx = self.check_expr(&args[0], Some(i64_ty));
+                if idx.ty == Ty::Error {
+                    return err;
+                }
+                if !idx.ty.is_int_like() {
+                    self.diags.error(format!("a json.doc index must be an integer, got {}", ty_name(idx.ty)), args[0].span);
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocAt { doc: Box::new(recv_expr), index: Box::new(idx) }, ty: Ty::JsonDoc, span }
+            }
+            "as_str" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.as_str()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocAsStr { doc: Box::new(recv_expr) }, ty: Ty::Option(Scalar::Str), span }
+            }
+            "as_i64" | "as_f64" | "as_bool" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                let scalar = match method {
+                    "as_i64" => i64_ty,
+                    "as_f64" => Ty::Float(FloatTy { bits: 64 }),
+                    _ => Ty::Bool,
+                };
+                let sc = ty_to_scalar(scalar).expect("i64/f64/bool is a scalar");
+                Expr { kind: ExprKind::JsonDocAsScalar { doc: Box::new(recv_expr), scalar }, ty: Ty::Option(sc), span }
+            }
+            _ => {
+                self.diags.error(
+                    format!("'.{method}()' is not a method on a json.doc (try kind / get / at / as_str / as_i64 / as_f64 / as_bool)"),
+                    span,
+                );
+                err
+            }
         }
     }
 
@@ -19568,6 +19812,16 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDoc { input } => self.finalize_expr(input),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.finalize_expr(doc),
+            ExprKind::JsonDocGet { doc, key } => {
+                self.finalize_expr(doc);
+                self.finalize_expr(key);
+            }
+            ExprKind::JsonDocAt { doc, index } => {
+                self.finalize_expr(doc);
+                self.finalize_expr(index);
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -20277,6 +20531,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::JsonDoc => "json.doc".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

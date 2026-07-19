@@ -173,7 +173,12 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
 - **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
   Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。
   キーがデータの object は順序付き `key(i)`+`at(i)` で吸収、`elems()` で 1 階層を materialize して
-  pipeline に流す（map 型も serde 式 value 木も導入しない）。
+  pipeline に流す（map 型も serde 式 value 木も導入しない）。**Slice 1 SHIPPED:** `json.doc` 型 +
+  `json.doc(s)?` パース（arena 常駐 tape、`Result<json.doc, Error>`）+ `kind()`（→ 組み込み
+  `json.kind` 直和型）+ `get`/`at` ナビゲーション + 4 つの葉アクセサ `as_str`/`as_i64`/`as_f64`/
+  `as_bool`（→ `Option`。`as_str` は入力へのゼロコピービュー、エスケープ文字列は arena に unescape）。
+  **Slice 2 に延期:** `len()`、`elems()`（1 階層を pipeline 用に materialize）、`key(i)`（順序付き
+  object-as-data）。
 - **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
   source 専用。
 
