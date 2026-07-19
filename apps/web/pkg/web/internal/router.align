@@ -1,0 +1,91 @@
+module pkg.web.internal.router
+
+// pkg.web router core — pattern matching over '/'-separated path segments (W1 slice 1).
+//
+// A route pattern is `/`-separated; each segment is one of:
+//   - a literal        — matches a path segment byte-exactly
+//   - `:name`          — matches exactly one non-empty path segment (a captured parameter)
+//   - `*name`          — a trailing wildcard: matches the rest of the path (one or more segments)
+//
+// Priority at each position is static > `:param` > `*wildcard` (httprouter/matchit semantics —
+// `/v1/models/featured` beats `/v1/models/:id`). This file is the correct **reference** matcher: a
+// linear scan over the route table that a later slice's flat radix tree is differential-tested
+// against. It is pure (no allocation, no I/O): every segment is a `str` view into its input.
+
+// The end index (exclusive) of the '/'-separated segment beginning at `start` in `s`: the position
+// of the next '/' at or after `start`, or `s.len()` when the segment runs to the end of `s`.
+pub fn seg_end(s: str, start: i64) -> i64 {
+  rest := s[start..s.len()]
+  match rest.find("/") {
+    Some(i) => start + i,
+    None => s.len(),
+  }
+}
+
+// A specificity score >= 0 if `path` matches `pattern`, or -1 if it does not. A higher score is a
+// more specific match: each segment folds into `score * 3 + w` left-to-right with w = 2 (static),
+// 1 (`:param`); a `*wildcard` ends the walk without adding, so a wildcard match always scores below
+// a static/param match that reaches further. The `* 3` positional fold makes an earlier static beat
+// a later one, i.e. static > param > wildcard is decided left-to-right (no backtracking), exactly
+// as the radix tree walks it. Distinct patterns that both match one path always get distinct scores
+// (they must differ in some segment's kind or literal), so `dispatch` never ties.
+pub fn match_score(pattern: str, path: str) -> i64 {
+  plen := pattern.len()
+  xlen := path.len()
+  mut pp := 0
+  mut xp := 0
+  mut score := 0
+  loop {
+    p_done := pp >= plen
+    x_done := xp >= xlen
+    if p_done && x_done { break score }
+    // One side ran out of segments before the other, with no wildcard to absorb the rest — no match.
+    if p_done { break -1 }
+    if x_done { break -1 }
+    // `pp` and `xp` both sit on a '/' separator; the segment is (cursor+1 .. seg_end).
+    pe := seg_end(pattern, pp + 1)
+    xe := seg_end(path, xp + 1)
+    pseg := pattern[pp + 1 .. pe]
+    xseg := path[xp + 1 .. xe]
+    if pseg.starts_with("*") {
+      // Trailing wildcard: it absorbs the remainder of the path (which is non-empty here, since
+      // `x_done` was false). Lowest priority — the walk stops without folding in a segment weight.
+      break score
+    }
+    if pseg.starts_with(":") {
+      // A `:param` matches exactly one NON-empty segment.
+      if xe == xp + 1 { break -1 }
+      score = score * 3 + 1
+    } else {
+      // A literal must match byte-exactly (this also matches an empty segment against an empty
+      // pattern segment, which is what makes trailing-slash matching exact).
+      if pseg == xseg {
+        score = score * 3 + 2
+      } else {
+        break -1
+      }
+    }
+    pp = pe
+    xp = xe
+  }
+}
+
+// Linear-scan dispatch (the reference oracle): return the index of the most specific route in
+// `patterns` that matches `path`, or -1 if none match. Distinct matching patterns have distinct
+// scores, so the highest-scoring match is unique; ambiguous (equal-priority) route sets are a build
+// -time error for the radix tree, never resolved here.
+pub fn dispatch(patterns: slice<str>, path: str) -> i64 {
+  n := patterns.len()
+  mut best := -1
+  mut best_score := -1
+  mut i := 0
+  loop {
+    if i >= n { break best }
+    s := match_score(patterns[i], path)
+    if s > best_score {
+      best_score = s
+      best = i
+    }
+    i = i + 1
+  }
+}
