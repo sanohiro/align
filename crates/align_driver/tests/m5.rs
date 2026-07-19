@@ -401,6 +401,79 @@ fn json_encode_nested_struct_and_option_compose() {
     );
 }
 
+// ---- JSON completeness T1b: Option<struct> ENCODE (the Slice-B follow-up) ------------------------
+// Decode already supported an `Option<struct>` field; encode now renders it too — `Some` → the nested
+// object via the runtime descriptor-driven encoder, `None` → the field omitted (trailing-comma scheme).
+
+#[test]
+fn json_option_struct_field_encode_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // A `Some(struct)` renders as a nested object; a `None` omits the field entirely (no `"b":null`).
+    // Decode(encode(x)) round-trips both, including a str field inside the payload struct.
+    let src = "import core.json\n\
+        Inner { v: i64, tag: str }\n\
+        Outer { a: i64, b: Option<Inner>, c: str }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"hi\\\"},\\\"c\\\":\\\"x\\\"}\")?\n    \
+        print(json.encode(p))\n    \
+        q: Outer := json.decode(\"{\\\"a\\\":2,\\\"c\\\":\\\"y\\\"}\")?\n    \
+        print(json.encode(q))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-option-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"a\":1,\"b\":{\"v\":9,\"tag\":\"hi\"},\"c\":\"x\"}\n{\"a\":2,\"c\":\"y\"}\n"
+    );
+}
+
+#[test]
+fn json_option_struct_field_last_and_nested_compose() {
+    if !backend_available() {
+        return;
+    }
+    // The `Option<struct>` field is the LAST field (its trailing comma must be popped on `None`), and
+    // the payload struct itself has a nested plain struct + a nested `Option<str>` — so the omit-None
+    // logic composes recursively through the descriptor-driven encoder.
+    let src = "import core.json\n\
+        Deep { z: bool }\n\
+        Meta { n: i64, note: Option<str>, d: Deep }\n\
+        Doc { id: i64, meta: Option<Meta> }\n\
+        fn main() -> Result<(), Error> {\n  \
+        arena {\n    \
+        a: Doc := json.decode(\"{\\\"id\\\":7,\\\"meta\\\":{\\\"n\\\":5,\\\"note\\\":\\\"hi\\\",\\\"d\\\":{\\\"z\\\":true}}}\")?\n    \
+        print(json.encode(a))\n    \
+        b: Doc := json.decode(\"{\\\"id\\\":8,\\\"meta\\\":{\\\"n\\\":6,\\\"d\\\":{\\\"z\\\":false}}}\")?\n    \
+        print(json.encode(b))\n    \
+        c: Doc := json.decode(\"{\\\"id\\\":9}\")?\n    \
+        print(json.encode(c))\n  }\n  \
+        return Ok(())\n}\n";
+    let out = build_and_run("json-option-struct-nested", src);
+    assert_eq!(out.status.code(), Some(0));
+    let want = "{\"id\":7,\"meta\":{\"n\":5,\"note\":\"hi\",\"d\":{\"z\":true}}}\n\
+        {\"id\":8,\"meta\":{\"n\":6,\"d\":{\"z\":false}}}\n\
+        {\"id\":9}\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn json_option_move_struct_payload_still_rejected() {
+    // The Slice-B boundary is unchanged: an `Option<Move-struct>` payload (a struct owning an
+    // `array`/`string`) is rejected at declaration — an owned Option-payload drop-as-a-field has no
+    // consumer yet. Only NON-Move payload structs get the new encode.
+    assert!(check_errs(
+        "json-option-move-struct",
+        "import core.json\n\
+         Owned { xs: array<i64> }\n\
+         Doc { id: i64, meta: Option<Owned> }\n\
+         fn f(s: str) -> Result<Doc, Error> = json.decode(s)\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
 #[test]
 fn json_array_struct_field_decode_read_and_roundtrip() {
     if !backend_available() {

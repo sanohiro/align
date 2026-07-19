@@ -1471,6 +1471,12 @@ pub enum TemplatePart {
     /// option field value. Paired with [`PopComma`] before the closing `}` so omitted fields leave no
     /// dangling comma. Only produced by `json.encode` desugaring.
     OptionField { access: Expr, name: String },
+    /// `json.encode` of an **`Option<struct>` field** (JSON completeness T1b): when the option is
+    /// `Some`, emit `"name":{…nested object…},` (the payload struct rendered by the descriptor-driven
+    /// encoder); when `None`, emit nothing. `access` is the option field value; `struct_id` is the
+    /// payload struct (its schema drives the encode). Paired with [`PopComma`] like [`OptionField`].
+    /// Only produced by `json.encode` desugaring.
+    OptionStructField { access: Expr, name: String, struct_id: u32 },
     /// Drop a single trailing `,` from the builder — the "omit `None`" comma fixup, emitted once
     /// before an `Option`-bearing object's closing `}`. Only produced by `json.encode` desugaring.
     PopComma,

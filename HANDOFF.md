@@ -8,8 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 2) SHIPPED (branch `json-t1b-scalar-decode`,
-not yet merged) — top-level (bare) scalar decode targets (`x: i64 := json.decode("42")?`).** `json.decode`
+_Last updated: 2026-07-19, **JSON COMPLETENESS T1b (part 3) SHIPPED (branch `json-t1b-option-struct-encode`,
+not yet merged) — `Option<struct>` ENCODE (the Slice-B follow-up).** Decode already supported an
+`Option<struct>` field; encode now renders it too — **`Some` → the nested object** (via the runtime
+descriptor-driven encoder), **`None` → the field omitted** (the trailing-comma + `PopComma` scheme). A
+new `OptionStructField` template piece (HIR/MIR + printer, swept through every template pass) + a new FFI
+`align_rt_json_encode_object` (a single struct by its descriptor table, over the existing
+`json_encode_object`). Codegen tag-branches: on `Some`, writes `"name":`, stores the payload struct to an
+entry alloca, calls the object encoder with the payload's `emit_desc_table`, then a trailing comma. The
+payload struct is validated encodable (`decode_struct_fields_ok`); composes recursively (a payload with a
+nested plain struct + a nested `Option<str>` omits its own `None`s). **v1 boundary (unchanged):** an
+`Option<Move-struct>` payload (a struct owning an `array`/`string`) stays rejected at declaration (Slice-B
+— an owned Option-payload drop-as-a-field has no consumer). **Also fixed a pre-existing #514/#517
+stale-cache bug the new gate caught:** `json_schema_sig` folded an `Option<struct>` field to a bare
+`"Option"` (via `ty_name`), so a payload field RENAME (or an `Option<i64>`→`Option<f64>` change) at the
+same slot did NOT invalidate the **decode** cache — a warm cache served a stale-key object (reproduced
+decode-only end-to-end). Now recurses into the `Option<struct>` payload and renders the `Option<scalar>`
+width. The `OptionStructField` piece also bakes the payload schema (belt-and-suspenders for a
+pure-encode program). `/align-self-review` (Gate 1 template-pass sweep + the schema-sig gap) + `/code-review`
+high run. Tests: `m5.rs` T1b (Some/None round-trip, Option-last-field comma, nested compose,
+`Option<Move-struct>` rejected), `cache_codegen` gate2e (decode-only payload-rename invalidates). Suites
+green: m5 151, sema 151, mir 7, cache_codegen 20 (only the known macOS gate7 flake fails); clippy clean.
+**NEXT: T1b remainder** — `array<Option<T>>` compositions (the last matrix-fill item) → **J4** `json.doc`
+→ **J5** `json.scan` → **J6** spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS T1b (part 2)
+SHIPPED (MERGED as #539) — top-level (bare) scalar decode targets (`x: i64 := json.decode("42")?`).** `json.decode`
 into a bare int / float / bool target parses the WHOLE input as one JSON number / bool. The value is
 `Copy` (copied out, not a view into the input), so the result is **`Static` / returnable** (returns freely
 out of the `arena {}` that backed the input, unlike a str-bearing struct). A new HIR/MIR

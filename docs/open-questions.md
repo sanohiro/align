@@ -3852,9 +3852,15 @@ int / float / bool). Parses the WHOLE input as one JSON number / bool; the value
 not a view), so the result is `Static` / returnable. New HIR/MIR `JsonDecodeScalar` → runtime
 `align_rt_json_decode_scalar` (via the shared per-scalar `write_value` — same range/sign/float-width
 checks; trailing non-whitespace → `Err`). Bare `str` (input-borrowing view) / `char` deferred. (The
-top-level `array<scalar>` target already existed — MMv2 slice 8c.) **NEXT: the rest of T1b** —
-`Option<struct>` encode (the Slice-B follow-up), `array<Option<T>>` compositions. →
-**J3** matrix fill (T1b remainder — `Option<struct>` encode, supported-constructor compositions) →
+top-level `array<scalar>` target already existed — MMv2 slice 8c.) **T1b (part 3) — SHIPPED: `Option<struct>` ENCODE** (the Slice-B follow-up; decode already supported it).
+`Some` → the nested object via the runtime descriptor-driven encoder (a new `OptionStructField` template
+piece + `align_rt_json_encode_object` FFI); `None` → the field omitted (trailing-comma + `PopComma`).
+Composes recursively; the payload struct must be non-Move (`Option<Move-struct>` stays rejected —
+Slice-B). Also fixed a pre-existing #514/#517 stale-cache bug: `json_schema_sig` folded an `Option<struct>`
+field to a bare `"Option"`, so a decode-only payload field rename didn't invalidate the cache — now
+recurses into the payload (and renders `Option<scalar>` width). Tests: `m5.rs` T1b, `cache_codegen`
+gate2e. **NEXT: T1b remainder** — `array<Option<T>>` compositions. →
+**J3** matrix fill (T1b remainder — `array<Option<T>>` / supported-constructor compositions) →
 **J4** `json.doc` → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.

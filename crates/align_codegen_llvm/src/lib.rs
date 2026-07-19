@@ -1201,6 +1201,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "json_encode_object".to_string(),
+        module.add_function(
+            "align_rt_json_encode_object",
+            // (builder, base, descs, n_descs) -> void
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_write_int".to_string(),
         module.add_function(
             "align_rt_builder_write_int",
@@ -9118,6 +9127,48 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         }
                     }
                     // Trailing comma (stripped by `PopComma` if this is the last present field).
+                    let (cptr, clen) = self.str_global(",");
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), cptr.into(), clen.into()], "")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(cont_bb);
+                }
+                // `json.encode` of an `Option<struct>` field (T1b): when `Some`, write `"name":`, render
+                // the payload struct via the runtime descriptor-driven encoder (the same schema decode
+                // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
+                // to an entry alloca so the encoder can read it by field offset.
+                align_mir::TemplatePiece::OptionStructField { opt, name, struct_id, .. } => {
+                    let agg = self.operand(opt).into_struct_value();
+                    let tag = self.builder.build_extract_value(agg, 0, "ostag").map_err(|e| self.err(e))?.into_int_value();
+                    let payload = self.builder.build_extract_value(agg, 1, "ospay").map_err(|e| self.err(e))?;
+                    let is_some = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "osissome")
+                        .map_err(|e| self.err(e))?;
+                    let func = self
+                        .builder
+                        .get_insert_block()
+                        .and_then(|b| b.get_parent())
+                        .ok_or_else(|| self.err("no enclosing function for OptionStructField"))?;
+                    let some_bb = self.ctx.append_basic_block(func, "optstruct.some");
+                    let cont_bb = self.ctx.append_basic_block(func, "optstruct.cont");
+                    self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(some_bb);
+                    let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), pptr.into(), plen.into()], "")
+                        .map_err(|e| self.err(e))?;
+                    // Store the payload struct to an entry alloca and hand its pointer + descriptor table
+                    // to the runtime object encoder (a hoisted slot so an encode in a loop stays flat).
+                    let sty = self.struct_types[*struct_id as usize];
+                    let slot = self.alloca_at_entry(sty.into(), "ostruct_v")?;
+                    self.builder.build_store(slot, payload).map_err(|e| self.err(e))?;
+                    let t = self.emit_desc_table(*struct_id);
+                    let n = i64t.const_int(t.n_fields, false);
+                    self.builder
+                        .build_call(self.funcs["json_encode_object"], &[bptr.into(), slot.into(), t.descs.into(), n.into()], "")
+                        .map_err(|e| self.err(e))?;
                     let (cptr, clen) = self.str_global(",");
                     self.builder
                         .build_call(self.funcs["builder_write"], &[bptr.into(), cptr.into(), clen.into()], "")

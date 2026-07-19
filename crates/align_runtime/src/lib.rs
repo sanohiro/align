@@ -2122,6 +2122,25 @@ pub unsafe extern "C" fn align_rt_json_encode_struct_array(
     b.buf.push(b']');
 }
 
+/// `json.encode` of a **single** struct at `base` into the builder as a JSON object `{...}`, per its
+/// field `descs` — an FFI wrapper over [`json_encode_object`]. Used by codegen for the
+/// `OptionStructField` template piece (`json.encode` of an `Option<struct>` field, JSON completeness
+/// T1b): when the option is `Some`, codegen writes `"name":`, calls this on the payload struct, then a
+/// trailing comma (`PopComma` strips the last). A `None` field is omitted entirely (codegen skips this
+/// call).
+///
+/// # Safety
+/// `b` must be a valid `Builder`; `base` a struct laid out per `descs`; each nested `sub` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_encode_object(b: *mut Builder, base: *const u8, descs: *const JsonField, n_descs: i64) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let descs = unsafe { safe_slice(descs, n_descs) };
+    unsafe { json_encode_object(b, base, descs) };
+}
+
 fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
     if (-999..=999).contains(&v) {
         // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,

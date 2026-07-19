@@ -335,6 +335,38 @@ fn gate2d_json_scalar_array_element_type_change_invalidates() {
     );
 }
 
+// ---- Gate 2e: an Option<struct> payload field RENAME invalidates the cache ---------------------
+
+/// An `Option<struct>` field's payload struct reaches its fields only through the codegen descriptor
+/// (decode) / the `OptionStructField` encode piece (T1b) — never the surrounding MIR — so a payload
+/// field RENAME at the same slot leaves every other MIR statement byte-identical. `json_schema_sig`
+/// must recurse into an `Option<struct>` payload (not fold it to a bare `Option` via `ty_name`), else
+/// the warm cache serves a stale object decoding/encoding the OLD payload key (the #514/#517 class).
+#[test]
+fn gate2e_json_option_struct_payload_rename_invalidates() {
+    if !backend() {
+        return;
+    }
+    // v1 payload `Inner { v, tag }`; v2 renames `tag` → `txt`. The JSON literal keeps key "tag"; every
+    // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins the load-bearing
+    // `json_schema_sig` recursion into `Option<struct>` — the pre-existing decode gap this slice fixes,
+    // independent of the `OptionStructField` encode piece's own baked schema.
+    let v1 = "import core.json\nInner { v: i64, tag: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
+    let v2 = "import core.json\nInner { v: i64, txt: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
+    let proj = Project::new("json-opt-struct-rename", &[("main.align", v1)], "main.align");
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|o| !o.hit));
+    proj.write("main.align", v2);
+    let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!hot.outcome("main").hit, "an Option<struct> payload field rename must miss");
+    assert_eq!(
+        hot.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the payload field feeds the recursive schema fingerprint → the unit's MIR digest"
+    );
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]
