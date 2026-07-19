@@ -11,190 +11,220 @@ explicitly vendored, never ambiently resolvable.
 
 ## Status
 
-**PROPOSAL (2026-07-20)** — the surface below is designed and internally consistent, but three
-forks (marked ⚖) await owner settlement before implementation. Plan of record:
-`../15-gateway-workspace-plan.md` (this doc is its F2; the framework is the deliverable — the
-gateway app is explicitly LATER, owner 2026-07-20). Hard prerequisite: **F1** (non-capturing fn
-values as struct fields / array elements). F0 (pkg-foundation rules) enables `internal` modules and
-layering enforcement but does not block building the package itself.
+**DESIGN v2 (2026-07-20, owner-directed).** The owner's brief, restored after a lost conversation
+record and now pinned here so it cannot be lost again: **the deliverable is a blazing-fast,
+zero-copy REST framework — speed is the headline, not a byproduct.** The primary reference is
+**Go's Fiber** (the zero-allocation philosophy of its fasthttp foundation + Express-derived
+ergonomics); the router follows the **httprouter/fasthttp radix-tree lineage** (a separate,
+deliberate reference — Fiber for the framework model, the radix router for dispatch). The
+gateway / LLM apps are merely the framework's first consumers ("what we build with it happens to
+be LLM-related") — they do not shape this design. Plan of record: `../15-pkg-web-plan.md`.
+Hard compiler prerequisite: **F1 field-eligibility widening** (see Prerequisites).
 
-## Overview
+## Why Align can win this
 
-`pkg.web` is the REST-API server framework: the **policy layer** over the `std.http` protocol floor
-(`serve`/`accept`/`ctx.*`/`respond`/`respond_stream`). The layering rule (recorded 2026-07-18):
-protocol — spec-defined, one correct answer — lives in `std.http`; convention/policy — route
-patterns, handler shape, response sugar — lives here. `pkg.web` re-implements no protocol.
+Fiber is fast because fasthttp refuses per-request allocation and reuses buffers — but Go still
+pays GC, interface boxing, and copies at the `string([]byte)` boundary. Align's semantics make
+Fiber's discipline the *default*: `std.http` already parses a request into ONE buffer + an offset
+table (R1), every accessor is a `str`/`slice<u8>` **view** (zero-copy by construction, enforced by
+regions — a leaked view is a compile error, not a use-after-free), SIMD JSON decodes into
+view-bearing structs, and the per-request `arena {}` resets in O(1) with no GC ever. The framework's
+job is to add **routing + ergonomics without breaking that chain**: nothing on the hot path may
+copy request bytes or touch the heap. That is the existence claim, and W5/W7 make it a measured,
+regression-pinned number.
 
-References: **Go 1.22 `net/http` ServeMux** is the primary design reference — method-aware pattern
-routing (`{param}` wildcards), automatic 404/405 semantics, a standard-library-grade minimal
-surface. chi/httprouter are the performance reference (radix-tree dispatch — deferred; v1 is a
-linear scan, see Pitfalls P2). Middleware-chain frameworks (chi/gin/echo style) are explicitly NOT
-the model for v1: middleware needs capturing escaping closures (deferred language feature) and is
-policy Align has one-way alternatives for (a wrapper fn calls the next fn directly).
+## The performance contract (design invariants, bench-pinned)
 
-The route table is **data** — a visible array value of Copy structs, no registration side effects,
-no globals, no reflection ("nothing hidden"; the compiler sees every route):
+```text
+1. Zero request-byte copies      — path, params, query, headers, body: all views into the
+                                   request buffer. The framework never materializes a string
+                                   from request data. (.clone() is the app's explicit escape.)
+2. Zero heap allocation/request  — framework hot path allocates nothing on the heap; per-request
+                                   scratch lives in the request arena (O(1) bulk reset).
+                                   Handlers allocate only what they visibly write.
+3. O(segments) dispatch          — a startup-built radix tree (static > param > wildcard priority,
+                                   httprouter semantics); no per-request pattern parsing, no
+                                   regex, no map lookups. Param values land in a fixed slot
+                                   array, not a map.
+4. Zero-copy output              — response bodies encode straight into the response writer
+                                   (the library-foundations "zero-allocation output" pattern);
+                                   json.encode composes with the builder → socket path.
+5. Startup-total validation      — the route tree is built and checked ONCE at serve() (conflict/
+                                   ambiguity abort); the request path does no validation work.
+```
+
+Bench anchors (W5/W7): `bench/web_router` (dispatch ns/op vs a hand-written `match` — must be
+within noise), `bench/web_e2e` (req/s: pkg.web vs a raw `std.http` accept loop — framework overhead
+must be ≈ zero; plus a same-box Go Fiber comparison as the external honesty check — the target is
+**competitive-or-better vs Fiber** on plaintext + JSON echo shapes).
+
+## Surface (Fiber-informed, Align-idiomatic)
 
 ```align
 import pkg.web
 
-fn list_models(ctx: http_request_ctx, params: slice<str>) -> Result<(), Error> { ... }
-fn get_model(ctx: http_request_ctx, params: slice<str>) -> Result<(), Error> {
-  id := params[0]                              // the {id} capture, in pattern order
-  ...
+// handlers: ONE signature — fn(c: web.Ctx) -> Result<(), Error>
+fn get_model(c: web.Ctx) -> Result<(), Error> {
+  id := web.param(c, "id")               // str view into the request path
+  m := lookup(id)
+  web.json(c, m)                          // encode → response writer; consumes c
 }
 
 fn main() -> Result<(), Error> {
   routes := [
     web.get("/v1/models", list_models),
-    web.get("/v1/models/{id}", get_model),
+    web.get("/v1/models/:id", get_model),
     web.post("/v1/chat/completions", chat),
   ]
   web.serve("127.0.0.1", 8080, routes)
 }
 ```
 
-## Signatures (proposed)
+No app object, no registration side effects, no globals, no reflection: the route table is a
+visible array **value** of Copy structs; `serve` compiles it into the radix tree at startup.
+(Align has no user-defined methods, so Fiber's `c.Params("id")` becomes the qualified
+`web.param(c, "id")` — same ergonomics, one call convention.)
+
+## Signatures
 
 ```text
-// route construction — ⚖ FORK A (recommended form shown; see Forks)
-web.get(pattern, handler)    -> route        // per-method constructors; pattern is a str literal
-web.post(pattern, handler)   -> route
-web.put(pattern, handler)    -> route
-web.delete(pattern, handler) -> route
+// routes (per-method constructors — the Fiber/Express reading; one way to write a GET route)
+web.get(pattern, handler)     -> route
+web.post(pattern, handler)    -> route
+web.put(pattern, handler)     -> route
+web.delete(pattern, handler)  -> route
+web.patch(pattern, handler)   -> route
 
-// the one handler signature ("one way"):
-//   fn(ctx: http_request_ctx, params: slice<str>) -> Result<(), Error>
-// `params` = the {name} captures as str views in pattern order (region-bound to ctx's
-// request buffer). A handler responds via ctx (std.http: ctx.respond / ctx.respond_stream —
-// both consume ctx) and uses params strictly before that consume (borrow-checked).
+// grouping (pure data: prefix + routes → prefixed routes; no closures involved)
+web.group(prefix, routes)     -> array<route>
 
-// serving
+// serving — Impure; sequential accept v1 (concurrency is the recorded, measured follow-up)
 web.serve(host, port, routes) -> Result<(), Error>
-//   Impure. Sequential accept loop (v1 recorded direction). Per request: match method+path
-//   against the table → dispatch the handler; no match on path → 404; path matches but
-//   method doesn't → 405; handler Err → 500 (after best-effort error response) — all three
-//   automatic responses are framework policy with fixed minimal JSON bodies.
+//   startup: build + validate the radix tree (duplicate/ambiguous → abort with the pattern).
+//   per request: parse (std.http, zero-copy) → radix dispatch → handler; automatic responses:
+//   no path match → 404, path-but-not-method → 405 (with Allow), parse error → 400,
+//   handler Err → 500 (best-effort). Fixed minimal JSON bodies; the loop never dies per-request.
 
-// request sugar
-web.body_str(ctx) -> Result<str, Error>      // ctx.body() bytes as validated UTF-8 str view
-//   JSON in: req: ChatReq := json.decode(web.body_str(ctx)?)?   (core.json as-is; no wrapper)
+// ctx accessors (all Pure; all return views region-bound to c)
+web.param(c, name)   -> str              // named :param capture (fixed slot array; total —
+                                         //   a name not in the pattern is a startup-checkable
+                                         //   bug → abort at tree build if statically absent)
+web.query(c, name)   -> Option<str>      // std.http query floor (percent-decoded per RFC 3986)
+web.header(c, name)  -> Option<str>
+web.body(c)          -> slice<u8>
+web.body_str(c)      -> Result<str, Error>    // UTF-8-validated view
+//   JSON in: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json, view-decoding
 
-// response sugar
-web.json(ctx, x)              -> Result<(), Error>  // 200, content-type: application/json,
-                                                    // body = json.encode(x); consumes ctx
-web.status_json(ctx, code, x) -> Result<(), Error>  // same with an explicit status code
-web.no_content(ctx)           -> Result<(), Error>  // 204, empty body; consumes ctx
+// responders (Impure; consume c — Move discipline, mirrors ctx.respond)
+web.json(c, x)               -> Result<(), Error>   // 200 + application/json + json.encode(x)
+web.status_json(c, code, x)  -> Result<(), Error>
+web.text(c, s)               -> Result<(), Error>   // 200 + text/plain
+web.status(c, code)          -> Result<(), Error>   // status + empty body
 ```
 
 ```text
 // types
-route   — Copy struct { method (tag-only enum), pattern: str, handler: fn(...) -> Result<(), Error> }
-//        Copy because every field is Copy (a str view of a literal, a tag, a fn pointer):
-//        the route table is plain data — buildable in a literal, storable, passable.
+web.Ctx    — the per-request context struct: the std.http request handle + the param slot
+             array (names from the matched route — Static; values — views into the path).
+             A Move struct (it owns the request handle); consumed exactly once by a responder.
+Route      — Copy struct { method (tag-only enum), pattern: str, handler: fn(Ctx) -> Result<(), Error> }
 ```
 
-**Pattern syntax (⚖ FORK B, recommended form):** `/`-separated segments; a literal segment matches
-byte-exactly; a `{name}` segment matches exactly one non-empty segment and captures it (order of
-appearance = index in `params`). Consistent with Align's existing `{...}` hole syntax in
-`template` literals (the same visual language for "a hole to be filled"), and with Go 1.22
-ServeMux. No regex segments, no optional segments, one pattern form. A trailing `{name...}`
-tail-wildcard (Go-style) is deferred until a consumer needs it. Trailing-slash: exact match only
-(no implicit redirect — hidden behavior).
+**Pattern syntax (Fiber/httprouter lineage — settled by the restored reference):** `/`-separated;
+literal segments match byte-exactly; `:name` matches exactly one non-empty segment and captures;
+a trailing `*name` captures the rest (tail wildcard). Priority at each tree node: **static >
+`:param` > `*wildcard`** (httprouter semantics — `/v1/models/featured` beats `/v1/models/:id`).
+Two routes that can tie → startup abort. No regex, no optional segments, exact trailing-slash
+matching (no hidden redirects). Query strings are never part of the pattern.
 
-**Matching semantics (fixed, not configurable):** longest-literal-prefix wins over wildcard at the
-same position (Go semantics — `/v1/models/featured` beats `/v1/models/{id}`); two routes that can
-tie are a **construction-time abort** (duplicate/ambiguous table is a bug, caught at `serve`
-startup, not per request). Query strings are not part of the pattern (use the std.http query floor).
-Percent-decoding of captured segments follows the std floor (see std-prerequisites).
+## Prerequisites (compiler / std — the 土台)
+
+- **F1 — field-eligibility widening (the one hard language slice).** `web.Ctx` and `Route` need
+  struct fields beyond today's whitelist (probed 2026-07-20: `fn` in a field errors "struct fields
+  must be a primitive scalar, str, or a plain struct"): ① a **fn value** field (Copy pointer —
+  the `Route.handler`; effect bits flow via FnTy, #465), ② a **Move handle** field
+  (`http_request_ctx` inside `Ctx` — makes `Ctx` a Move struct; drop/move machinery for Move
+  fields already exists via the J3a Move-enum-field work), ③ a **`slice<str>`** field (the param
+  slots — view slices, region-tracked like `str` fields). Each reuses existing classification
+  machinery; the slice widens `is_field_ok` + the layout/drop/region sweeps. Capturing escaping
+  closures stay OUT (unchanged deferral).
+- **F0 — pkg-foundation rules** (`internal` + pkg-layering import checks + spec text): enables
+  `pkg.web.internal.*` modules (the radix tree lives there) — parallelizable with F1.
+- **std.http floor items (consumer arrived):** `ctx.query` + percent-decode (protocol → std);
+  SSE event framing (WHATWG) when the first streaming consumer lands (the LLM app — W6+).
 
 ## Move/effect classification
 
 ```text
-route            Copy value (str view + tag + fn pointer); never dropped; region = Static
-                 for literal patterns (a computed pattern str would region-bind the route —
-                 legal but unusual)
-routes table     array<route> / fixed array — plain data, Copy elements
-web.serve        Impure (network); borrows the table (never consumed); runs until Err
-handlers         Impure allowed (they do I/O by nature); called through the stored fn value —
-                 effect bits flow through FnTy (#465 machinery, already shipped)
-web.json / etc.  Impure (socket write); CONSUME ctx (mirror ctx.respond)
-web.body_str     Pure; returns a str view region-bound to ctx
+Route / route table   Copy data (str view of a literal + tag + fn pointer); Static; never dropped
+the radix tree        built once inside serve (arena- or startup-heap-owned; freed at serve exit)
+web.Ctx               Move struct (owns the request handle); created by serve per request,
+                      consumed exactly once by a responder; params are views (never dropped)
+web.serve             Impure; borrows the table; runs until setup-Err
+accessors             Pure; views region-bound to c (escape past the responder = compile error)
+responders            Impure; consume c
+handlers              Impure allowed; called through Route.handler (FnTy effect bits, fail-closed)
 ```
 
-The framework is **pure Align** — no `unsafe`, no FFI, no new runtime symbols. It is deliberately
-the proof that the pkg layer needs nothing the language doesn't already give user code.
+The framework is **pure Align** — no `unsafe`, no FFI, no new runtime symbols; it is the proof the
+pkg layer needs nothing user code doesn't have.
 
 ## Error policy
 
-- `web.serve` returns `Err` only for setup failures (bind/listen). Per-request errors never kill
-  the loop: a handler `Err` → the framework sends a minimal 500 JSON body (best-effort) and
-  continues; a malformed request line/headers (std.http parse `Err`) → 400 and continue.
-- Automatic bodies are minimal fixed-shape JSON (`{"error":{"code":404}}` style). Application
-  error shapes (e.g. the OpenAI error object) are app policy — built by the app with
-  `web.status_json`; the framework does not define a rich error vocabulary.
-- No panics reachable from request data: pattern-table validation aborts at startup
-  (programmer error), everything request-derived is `Result`.
+`serve` returns `Err` only for setup (bind/listen/tree-build abort is a startup abort, not Err —
+programmer error). Per-request: framework maps malformed requests to 400, unmatched to 404/405,
+handler `Err` to 500 — fixed minimal JSON bodies, loop continues. Application error vocabularies
+(e.g. the OpenAI error object) are app policy via `web.status_json`. Nothing request-derived can
+panic; everything is `Result` or a view.
 
-## std.http prerequisites (consumer-arrived; std-side slices, not pkg.web code)
+## Middleware (designed now, lands later — W6)
 
-Recorded 2026-07-18 as std-bound-when-consumer-arrives; `pkg.web` is that consumer:
+Fiber's `c.Next()` chain needs capturing closures (deferred). The v1-compatible model is a
+**non-capturing pre-handler list** threaded by Move: `fn(c: Ctx) -> Result<Option<Ctx>, Error>` —
+return `Some(c)` to proceed (ctx handed back), `None` after responding (halt), `Err` for 500.
+Groups carry the list: `web.group_with(prefix, [auth, log], routes)`. Covers auth/logging/CORS
+headers without closures; stateful middleware waits for the capturing-closure feature and a real
+consumer. Verify in F1 probing: `Option<Ctx>` (an Option of a Move struct) — if the payload gap
+bites, the fallback shape is a two-variant enum `Verdict { Proceed(Ctx), Done }` (Move-enum
+payloads shipped in J2).
 
-1. `ctx.query(name) -> Option<str>` + percent-decode (RFC 3986 — protocol, one correct answer).
-2. SSE event framing helper (WHATWG-defined) — needed by the first streaming consumer
-   (the gateway app later, not `pkg.web` v1 itself → lands with W4, may slip after v1).
-3. (verify at W2) an accepted-request path/method accessor surface sufficient for dispatch —
-   `ctx.method()` / `ctx.path()` already ship.
+## Slices (F3 of the plan)
 
-## Forks awaiting owner settlement (⚖)
-
-- **A — route constructors:** per-method `web.get/post/put/delete(pattern, handler)`
-  (RECOMMENDED: the universal REST reading; exactly one way to write a GET route; no
-  stringly-typed method) vs one `web.route(m, pattern, handler)` with a `Method` enum (more
-  literally "one constructor", but every call site grows a tag argument). Not both.
-- **B — pattern syntax:** `{name}` (RECOMMENDED: consistent with `template` holes + Go 1.22) vs
-  `:name` (Sinatra/Express/chi lineage). Not both.
-- **C — params delivery:** positional `params: slice<str>` in pattern order (RECOMMENDED:
-  zero-allocation, no map type, order visible in the pattern) vs named lookup
-  (`web.param(params, "id")` — linear scan sugar; could be added later ON TOP of positional
-  without breaking the signature). Settle whether positional-only is acceptable for v1.
-
-## Slices (F3 of the plan; each lands PR → review → merge)
-
-- **W1 — types + match engine.** `route`/`Method`, pattern parse + validation, the matcher
-  (longest-literal-wins, ambiguity abort) as pure functions over `str`/segments. Unit-testable
-  without sockets. Needs F1 (fn field) for the `route` struct itself.
-- **W2 — serve + dispatch.** The accept loop over `std.http` serve/accept; method+path dispatch;
-  automatic 404/405/400/500; params capture into the per-request flow. Integration tests via the
-  in-process server pattern (`crates/align_driver/tests/m11_http.rs`).
-- **W3 — request/response sugar.** `body_str`, `json`, `status_json`, `no_content`.
-- **W4 — SSE sugar** (with/after the std SSE framing floor) — gated on the first streaming
-  consumer; may land with the gateway app rather than v1.
-- **W5 — hardening + bench.** Route-table edge matrix (ambiguity abort, empty table, deep paths,
-  long segments); `bench/web_router` — dispatch overhead vs a hand-written `match` must be
-  near-zero (the framework's existence claim); record the number.
+- **W1 — router core.** Pattern parse + validation; the **radix tree** (static/param/wildcard
+  nodes, priority order, conflict detection) + matcher as pure functions over path segments;
+  param slot capture. Unit-tested against a linear-scan oracle (differential). Needs F1①.
+- **W2 — Ctx + serve + dispatch.** `web.Ctx` (needs F1②③); the accept loop over std.http;
+  automatic 404/405/400/500; `group`. Integration tests via the in-process server pattern
+  (`crates/align_driver/tests/m11_http.rs`).
+- **W3 — accessors + responders.** param/query/header/body/body_str; json/status_json/text/status.
+- **W4 — hardening.** Route-tree edge matrix (conflicts, deep paths, long segments, empty table,
+  `*` tails, method sets); malformed-request matrix; keepalive reuse.
+- **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
+  (≈ zero overhead required) — the performance contract becomes a pinned regression.
+- **W6 — middleware-lite + SSE sugar** (with the std SSE floor) — gated on the first consumers.
+- **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
+  numbers and the gap analysis in this doc.
 
 ## Pitfalls
 
-- **P1 — the handler fn type must stay ONE type.** `fn(http_request_ctx, slice<str>) ->
-  Result<(), Error>` — resist per-app generic handler signatures; app state threading (DB pools
-  etc.) is a later, deliberate design (likely an explicit state param — but that changes the fn
-  type and the route struct, so it must be one decision, not per-app drift).
-- **P2 — linear-scan dispatch is v1-correct, not v1-lazy.** Fixed small REST tables (< ~100
-  routes) scan faster than tree setup amortizes; the bench (W5) records the crossover evidence.
-  A radix tree is a MEASURED follow-up (chi/httprouter reference), not a default.
-- **P3 — params are views region-bound to ctx.** A handler that stores a param past
-  `ctx.respond` consume is a borrow error by design (the #460 liveness machinery catches it);
-  document `.clone()` as the escape hatch — do not "fix" by copying params eagerly.
-- **P4 — no implicit response mutation.** Helpers consume ctx exactly like `ctx.respond`
-  (Move discipline); there is no response-builder-carried-in-ctx pattern — a handler that wants
-  headers uses std.http's `response_builder` directly.
-- **P5 — startup validation must be total.** Every table defect (duplicate route, ambiguous
-  pair, malformed pattern, empty pattern) aborts at `serve` startup with the offending pattern
-  in the message — never a per-request surprise.
+- **P1 — one handler signature, forever.** `fn(Ctx) -> Result<(), Error>`. App state (DB pools…)
+  is a future single deliberate decision (likely an explicit state param changing the fn type once
+  — never per-app drift).
+- **P2 — the radix tree is the design, not an optimization.** Linear scan exists only as the W1
+  differential-testing oracle. (Fiber/httprouter is the reference precisely for dispatch.)
+- **P3 — params/views escape discipline.** A view stored past the responder consume is a compile
+  error by design (#460 liveness); document `.clone()` as the explicit escape — never eager-copy
+  "to be safe" (that breaks invariant 1).
+- **P4 — no hidden response state.** Responders consume `Ctx` (Move); no builder-inside-ctx
+  mutation pattern. Headers beyond the sugar → std.http `response_builder` directly.
+- **P5 — nothing on the hot path may allocate.** Every W-slice PR states where its bytes live
+  (view / arena / startup); the W5 bench is the enforcement, but review checks it first.
+- **P6 — 405 needs the per-path method set** from the tree (Allow header) — design it into the
+  node layout in W1, not bolted on in W4.
 
 ## Test anchors (planned)
 
-`apps/gateway/pkg/web/` unit-style example entries per slice; driver integration tests
-(`apps_web_*`) for W2's dispatch matrix; `bench/web_router` (W5). The gateway app (F4, later)
-is the full-surface validation consumer.
+Workspace `apps/web/` (the framework author workspace: `pkg/web/` + example/test entries beside
+it); driver integration tests `apps_web_*` (W2/W4 matrices); `bench/web_router` / `bench/web_e2e`
+(W5) / the Fiber comparison (W7). The LLM gateway app (later, separate) is the first full-surface
+consumer — not part of this package's acceptance.

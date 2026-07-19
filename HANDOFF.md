@@ -34,20 +34,24 @@ materializing terminal inherited it), a whole-struct `any`/`reduce` `cur.expect`
 struct), and a non-scalar `reduce` accumulator panic (now a clean diagnostic). Tests: m5 `json_scan_*` (15),
 runtime `json_scan_next_streams_array_and_ndjson`. Suites green: m5 172, sema 151, mir 7, runtime json 24;
 clippy clean. **With `json.scan` the entire JSON-completeness arc (J1–J5) is COMPLETE — core.json is exactly
-`decode`/`encode`/`doc`/`scan`.** **NEXT (owner-directed 2026-07-20, framework-first — "the
-gateway can wait"): execute `docs/impl/15-gateway-workspace-plan.md`.** The deliverable is
-**`pkg.web` — the REST-API server framework** (first-party, SHIPPED WITH THE SYSTEM as a
-vendorable subtree; consumers copy `pkg/web/`, never ambient). **F2 (the design) is DONE:**
-`docs/impl/pkg-design/web.md` (+ja) — Go 1.22 ServeMux as primary reference, route table as data
-(Copy structs of fn values), one handler signature `fn(ctx, params: slice<str>) -> Result<(),
-Error>`, automatic 404/405/400/500, linear-scan dispatch (bench-gated radix follow-up), NO
-middleware in v1; **three forks ⚖ A/B/C await owner settlement** (route constructors / `{name}`
-pattern syntax / positional params — recommendations in the doc). Remaining execution order: owner
-settles forks → **F1** non-capturing fn values as struct fields/array elements (the ONE hard
-compiler prerequisite — probed: `fn` in a field errors today; capturing closures stay deferred) →
-**F0** pkg-foundation rules (parallelizable; `internal` + layering + spec text) → **F3** W1–W5
-framework slices at `apps/gateway/pkg/web/` → F4 gateway app LATER. Monorepo; workspace
-`apps/gateway/` hosts framework + (later) app. Previous
+`decode`/`encode`/`doc`/`scan`.** **NEXT (owner-directed 2026-07-20): execute
+`docs/impl/15-pkg-web-plan.md` — build `pkg.web`, the ZERO-COPY, blazing-fast REST framework.**
+The owner's restored brief (a lost conversation, now pinned in the design doc AND in Claude's
+per-machine memory `pkg-web-fiber-reference.md`): speed is the headline; primary reference **Go's
+Fiber** (fasthttp zero-allocation philosophy), router reference the **httprouter radix-tree
+lineage**; the gateway/LLM apps are merely the framework's first consumers, explicitly LATER.
+**The design is DONE (v2):** `docs/impl/pkg-design/web.md` (+ja) — performance contract (zero
+request-byte copies / zero per-request heap / O(segments) radix dispatch / zero-copy output /
+startup-total validation, bench-pinned W5 + Fiber-comparison W7), Fiber-style surface (per-method
+constructors, `:name`/`*name` patterns with static>param>wildcard priority, one-ctx handlers
+`fn(c: web.Ctx) -> Result<(), Error>`, `web.param(c, "id")`), middleware-lite design
+(non-capturing, Move-threaded), NO open forks. Execution order: **F1** field-eligibility widening
+(the hard compiler gate — struct fields for ① fn values ② the Move `http_request_ctx` handle ③
+`slice<str>`; probed: all three rejected today by `is_field_ok`'s whitelist) ∥ **F0**
+pkg-foundation rules (`internal` + pkg-layering import checks + spec text; proposal in
+open-questions moves → Settled on landing) → **F3** W1–W7 framework slices at `apps/web/pkg/web/`
+(workspace `apps/web/`) → F4 the LLM gateway app LATER, when the owner calls it. Monorepo;
+first-party; shipped with the system as a vendorable subtree. Previous
 update: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 3 SHIPPED → J4 COMPLETE (`elems()`;
 branch `json-j4-doc-elems`).** `d.elems() -> slice<json.doc>` materializes one document level (each
 Array element, or each Object member VALUE — keys via `key(i)`) as an arena-backed `slice<json.doc>`
