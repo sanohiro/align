@@ -3650,7 +3650,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
             // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Sum)
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Sum, None)
             } else {
                 let init = zero_of(e.ty);
                 lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
@@ -3658,7 +3658,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayCount { source, stages } => {
             if let Ty::JsonScanner(sid) = source.ty {
-                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Count)
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, Reducer::Count, None)
             } else {
                 // i64 accumulator seeded at 0; each surviving element adds 1.
                 let init = Operand::Const(Const::Int(0, i64_ty()));
@@ -3667,18 +3667,33 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayReduce { source, stages, func, captures, init } => {
             let init_op = lower_expr(b, init);
-            lower_array_reduce(b, source, stages, e.ty, init_op, Reducer::Fold { func: func.clone(), captures: captures.clone() })
+            let reducer = Reducer::Fold { func: func.clone(), captures: captures.clone() };
+            if let Ty::JsonScanner(sid) = source.ty {
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, Some(init_op))
+            } else {
+                lower_array_reduce(b, source, stages, e.ty, init_op, reducer)
+            }
         }
         hir::ExprKind::ArrayAnyAll { source, stages, func, captures, all } => {
-            // bool accumulator: `all` seeds true (&&-fold), `any` seeds false (||-fold).
-            let init = Operand::Const(Const::Bool(*all));
-            lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), captures: captures.clone(), all: *all })
+            let reducer = Reducer::AnyAll { func: func.clone(), captures: captures.clone(), all: *all };
+            if let Ty::JsonScanner(sid) = source.ty {
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, None)
+            } else {
+                // bool accumulator: `all` seeds true (&&-fold), `any` seeds false (||-fold).
+                let init = Operand::Const(Const::Bool(*all));
+                lower_array_reduce(b, source, stages, Ty::Bool, init, reducer)
+            }
         }
         hir::ExprKind::ArrayMinMax { source, stages, is_max } => {
-            // Seed with the element type's extreme so the running `min`/`max` is replaced by the
-            // first element and an empty pipeline yields that extreme (the fold identity).
-            let init = extreme_of(e.ty, *is_max);
-            lower_array_reduce(b, source, stages, e.ty, init, Reducer::MinMax { is_max: *is_max })
+            let reducer = Reducer::MinMax { is_max: *is_max };
+            if let Ty::JsonScanner(sid) = source.ty {
+                lower_json_scan_reduce(b, source, stages, sid, e.ty, reducer, None)
+            } else {
+                // Seed with the element type's extreme so the running `min`/`max` is replaced by the
+                // first element and an empty pipeline yields that extreme (the fold identity).
+                let init = extreme_of(e.ty, *is_max);
+                lower_array_reduce(b, source, stages, e.ty, init, reducer)
+            }
         }
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
             lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
@@ -5552,6 +5567,9 @@ fn lower_json_scan_reduce(
     struct_id: u32,
     result_ty: Ty,
     reducer: Reducer,
+    // `reduce`'s explicit initial accumulator (already lowered); `None` for every other reducer, whose
+    // seed is derived from the reducer + accumulator type below.
+    init_override: Option<Operand>,
 ) -> Operand {
     // The `Ok` payload scalar of the `Result<T, Error>` terminal is the accumulator type.
     let acc_ty = match result_ty {
@@ -5569,8 +5587,15 @@ fn lower_json_scan_reduce(
     // address it (the `struct_view = None` slot path shared with a stack `array<Struct>`).
     let row = b.new_slot(Ty::StructArray(struct_id, 1));
 
-    let init = match &reducer {
-        Reducer::Count => Operand::Const(Const::Int(0, i64_ty())),
+    // Seed the accumulator: `reduce`'s explicit init if given, else the reducer's identity — `0` for
+    // `count`/`sum`, the bool fold seed (`all` → true, `any` → false) for `any`/`all`, the type
+    // extreme for `min`/`max` (so an empty stream yields the fold identity), exactly as the array
+    // reducers seed.
+    let init = match (&reducer, init_override) {
+        (_, Some(iv)) => iv,
+        (Reducer::Count, _) => Operand::Const(Const::Int(0, i64_ty())),
+        (Reducer::AnyAll { all, .. }, _) => Operand::Const(Const::Bool(*all)),
+        (Reducer::MinMax { is_max }, _) => extreme_of(acc_ty, *is_max),
         _ => zero_of(acc_ty),
     };
     let acc = b.new_slot(acc_ty);
@@ -5661,7 +5686,41 @@ fn lower_json_scan_reduce(
             b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
             Operand::Value(n)
         }
-        _ => unreachable!("json.scan slice 1 reduces with sum / count only"),
+        // `reduce(init, f)`: `acc = f(acc, cur)` (+ captures). Rejected rows already branched to `cont`
+        // (guarded), so `f` runs only for survivors — exactly the array `Fold` semantics.
+        Reducer::Fold { func, captures } => {
+            let cur = cur.expect("reduce needs a scalar element");
+            let mut args = vec![Operand::Value(a), cur];
+            for c in captures {
+                args.push(lower_expr(b, c));
+            }
+            let folded = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
+            Operand::Value(folded)
+        }
+        // `any(p)`/`all(p)`: `acc = acc || p(cur)` / `acc && p(cur)` — a full fold (no early exit),
+        // exactly-once predicate calls per surviving row.
+        Reducer::AnyAll { func, captures, all } => {
+            let cur = cur.expect("any/all needs a scalar element");
+            let t = b.fresh_value(Ty::Bool);
+            let args = stage_call_args(b, cur, captures);
+            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
+            let op = if *all { BinOp::And } else { BinOp::Or };
+            let n = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
+            Operand::Value(n)
+        }
+        // `min`/`max`: `acc = (cur `op` acc) ? cur : acc` — the branchless reduction idiom (the array
+        // path's masked select collapses to this guarded form; NaN handling identical).
+        Reducer::MinMax { is_max } => {
+            let cur = cur.expect("min/max needs a scalar element");
+            let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
+            let cmp = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Select { cond: Operand::Value(cmp), a: cur, b: Operand::Value(a) }));
+            Operand::Value(n)
+        }
     };
     b.push(Stmt::Store(acc, next));
     b.terminate(Term::Goto(cont));

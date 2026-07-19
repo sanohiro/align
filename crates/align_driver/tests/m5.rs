@@ -1055,6 +1055,45 @@ fn json_scan_materializing_terminal_rejected() {
 }
 
 #[test]
+fn json_scan_min_max_reducers() {
+    if !backend_available() {
+        return;
+    }
+    // J5 slice 2: `min`/`max` streaming reducers over a scanner → `Result<i64, Error>`. active scores
+    // are 10 and 5 → min 5, max 10 (bob's 99 is filtered out).
+    let src = "import core.json\nUser { active: bool, score: i64 }\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")\n  print(rows.where(.active).score.min()?)\n  lo: json.scanner<User> := json.scan(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")\n  print(lo.where(.active).score.max()?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-minmax", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n10\n");
+}
+
+#[test]
+fn json_scan_any_all_reducers() {
+    if !backend_available() {
+        return;
+    }
+    // `any`/`all` streaming reducers → `Result<bool, Error>`. any(score > 50) = true (99), all(score
+    // > 0) = true. `print` of a bool renders `true`/`false`.
+    let src = "import core.json\nUser { score: i64 }\nfn big(n: i64) -> bool = n > 50\nfn pos(n: i64) -> bool = n > 0\nfn main() -> Result<(), Error> {\n  a: json.scanner<User> := json.scan(\"[{\\\"score\\\":10},{\\\"score\\\":99},{\\\"score\\\":5}]\")\n  print(a.score.any(big)?)\n  b: json.scanner<User> := json.scan(\"[{\\\"score\\\":10},{\\\"score\\\":99},{\\\"score\\\":5}]\")\n  print(b.score.all(pos)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-anyall", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\ntrue\n");
+}
+
+#[test]
+fn json_scan_reduce_fold() {
+    if !backend_available() {
+        return;
+    }
+    // `reduce(init, f)` streaming fold → `Result<i64, Error>`. Product of active scores, seeded 1:
+    // 10 * 5 = 50 (bob filtered).
+    let src = "import core.json\nUser { active: bool, score: i64 }\nfn mul(a: i64, b: i64) -> i64 = a * b\nfn main() -> Result<(), Error> {\n  rows: json.scanner<User> := json.scan(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")\n  print(rows.where(.active).score.reduce(1, mul)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-reduce", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "50\n");
+}
+
+#[test]
 fn json_scan_materializing_terminal_rejected_inside_stage_lambda() {
     // The `sum`/`count` scanner permission must apply ONLY to the terminal's direct source, not leak
     // into a stage lambda: a nested scanner's materializing terminal (`.to_array()`) inside a `.map`

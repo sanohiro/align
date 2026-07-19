@@ -13689,7 +13689,7 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::JsonScanner(id) => {
                 if !self.scan_terminal {
                     self.diags.error(
-                        "a `json.scanner<Row>` is a streaming source — only `.sum()` / `.count()` terminals are supported for now (materializing terminals like `.to_array()` / `.sort()` over a stream are a later slice)".to_string(),
+                        "a `json.scanner<Row>` is a streaming source — only the fused reducers `.sum()` / `.count()` / `.reduce()` / `.any()` / `.all()` / `.min()` / `.max()` support it; a materializing terminal (`.to_array()` / `.sort()` / `group_by`) over a stream is not supported".to_string(),
                         span,
                     );
                     return None;
@@ -14268,13 +14268,28 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'{name}' takes no arguments"), span);
         }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let Some((source, stages, elem)) = self.check_pipeline(recv, expected, span) else {
+        // `min`/`max` are streaming reducers — they may fold a `json.scanner<Row>` source (J5).
+        let prev_scan = self.scan_terminal;
+        self.scan_terminal = true;
+        let piped = self.check_pipeline(recv, expected, span);
+        self.scan_terminal = prev_scan;
+        let Some((source, stages, elem)) = piped else {
             return err;
         };
         if !elem.is_numeric() {
             self.diags
                 .error(format!("'{name}' needs a numeric element type, got {}", ty_name(elem)), span);
             return err;
+        }
+        // Over a scanner the terminal is `Result<T, Error>` (streaming; a malformed row → `Err`). The
+        // element is a concrete struct-field scalar, so no inference constraint is needed.
+        if matches!(source.ty, Ty::JsonScanner(_)) {
+            let sc = ty_to_scalar(elem).expect("a numeric element is a scalar");
+            return Expr {
+                kind: ExprKind::ArrayMinMax { source: Box::new(source), stages, is_max },
+                ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
+                span,
+            };
         }
         self.constrain(elem, expected, span);
         Expr { kind: ExprKind::ArrayMinMax { source: Box::new(source), stages, is_max }, ty: elem, span }
@@ -14686,7 +14701,12 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // The predicate's parameter type guides an inline source's element type (named only).
         let elem_hint = self.named_param_hint(fn_arg, 0);
-        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+        // `any`/`all` are streaming reducers — they may fold a `json.scanner<Row>` source (J5).
+        let prev_scan = self.scan_terminal;
+        self.scan_terminal = true;
+        let piped = self.check_pipeline(recv, elem_hint, span);
+        self.scan_terminal = prev_scan;
+        let Some((source, stages, elem)) = piped else {
             return err;
         };
         if ty_to_scalar(elem).is_none() {
@@ -14700,9 +14720,15 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), name, span) else {
             return err;
         };
+        // Over a scanner the terminal is `Result<bool, Error>` (streaming; a malformed row → `Err`).
+        let ty = if matches!(source.ty, Ty::JsonScanner(_)) {
+            Ty::Result(Scalar::Bool, Scalar::Enum(self.error_enum_id))
+        } else {
+            Ty::Bool
+        };
         Expr {
             kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func, captures, all },
-            ty: Ty::Bool,
+            ty,
             span,
         }
     }
@@ -14725,7 +14751,12 @@ impl<'a, 't> Checker<'a, 't> {
                 (self.finalize(init.ty), None, init)
             }
         };
-        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+        // `reduce` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
+        let prev_scan = self.scan_terminal;
+        self.scan_terminal = true;
+        let piped = self.check_pipeline(recv, elem_hint, span);
+        self.scan_terminal = prev_scan;
+        let Some((source, stages, elem)) = piped else {
             return err;
         };
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
@@ -14737,6 +14768,16 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "reduce", span) else {
             return err;
         };
+        // Over a scanner the terminal is `Result<A, Error>` (streaming; a malformed row → `Err`). The
+        // accumulator type is concrete (from `init` / the fold's signature), so no constraint is needed.
+        if matches!(source.ty, Ty::JsonScanner(_)) {
+            let sc = ty_to_scalar(acc_ty).expect("a reduce accumulator is a scalar");
+            return Expr {
+                kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, captures, init: Box::new(init) },
+                ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
+                span,
+            };
+        }
         self.constrain(acc_ty, expected, span);
         Expr {
             kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, captures, init: Box::new(init) },
