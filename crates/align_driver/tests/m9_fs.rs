@@ -605,12 +605,14 @@ pub fn main() -> i32 { return 0 }
     );
 }
 
-/// A `bytes` view cannot be smuggled out of its arena inside a **struct**: a struct field cannot be
-/// a `slice` in the first place (rejected at declaration), so the escape is unreachable today. This
-/// locks that assumption — `mentions_slice`/`ty_mentions_slice` walks struct fields defensively, so
-/// if slice fields ever land the arena escape would still be caught rather than fail open.
+/// A `bytes` view cannot be smuggled out of its arena inside a **struct**. Slice fields now land
+/// (F1③ of the pkg.web plan — `Ctx { params: slice<str> }`), so this is no longer rejected at
+/// declaration; instead the region/escape check catches it — the struct inherits the slice field's
+/// arena region (`region_of(StructLit)` folds the field regions), so returning it out of the arena
+/// is an arena escape. This is exactly the "if slice fields ever land the arena escape would still
+/// be caught rather than fail open" invariant the old declaration-rejection stood in for.
 #[test]
-fn read_bytes_view_slice_struct_field_is_rejected() {
+fn read_bytes_view_slice_struct_field_is_caught_as_arena_escape() {
     let prog = "\
 import std.fs
 Holder { data: slice<u8> }
@@ -624,8 +626,8 @@ pub fn main() -> i32 { return 0 }
 ";
     let d = check_diagnostics("m9fs-bytesview-struct-field", prog);
     assert!(
-        d.contains("struct fields must be"),
-        "a struct field cannot be a slice view (the struct-escape path stays unreachable):\n{d}"
+        d.contains("allocated in an arena"),
+        "a struct owning an arena `bytes` view must be rejected as an arena escape:\n{d}"
     );
 }
 

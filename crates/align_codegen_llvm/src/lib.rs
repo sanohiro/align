@@ -3330,6 +3330,41 @@ fn is_signed(ty: Ty) -> bool {
     matches!(ty, Ty::Int(IntTy { signed: true, .. }))
 }
 
+/// The null-safe runtime `*_free` for a bare Move **handle** type — a type laid out as a single
+/// opaque pointer (`scalar_type` maps all of these to `ptr`) whose drop closes/frees that handle.
+/// `None` for any non-handle type (a `{ptr,len}` buffer, an owned collection, a struct/enum/tuple —
+/// each dropped by its own arm). Every listed `*_free` tolerates a null handle, so a moved-out /
+/// zeroed slot drops harmlessly.
+///
+/// **One source of truth for two drop sites:** the standalone-local `Stmt::Drop` and the struct-field
+/// drop (`drop_struct_fields`, F1②) both route through this, so a bare handle local and a handle
+/// *field* free identically. The set here MUST equal the handle types `align_sema::is_field_ok`
+/// admits as fields (`is_move_handle`) — a type allowed as a field but missing here would leak.
+/// `Builder`/`StrFinder`/`ArrayBuilder` are Move but NOT here (distinct non-pointer drops); they are
+/// correspondingly rejected as fields.
+fn handle_free_fn(ty: Ty) -> Option<&'static str> {
+    Some(match ty {
+        Ty::Writer => "io_writer_free",
+        Ty::Reader => "io_reader_free",
+        Ty::Buffer => "buffer_free",
+        Ty::File => "io_file_free",
+        Ty::CliCommand => "cli_command_free",
+        Ty::CliParsed => "cli_parsed_free",
+        Ty::TcpConn => "tcp_conn_free",
+        Ty::TcpListener => "tcp_listener_free",
+        Ty::UdpSocket => "udp_socket_free",
+        Ty::Child => "child_free",
+        Ty::HttpRequest => "http_request_free",
+        Ty::HttpResponse => "http_resp_free",
+        Ty::HttpClient => "http_client_free",
+        Ty::HttpServer => "http_server_free",
+        Ty::HttpRequestCtx => "http_ctx_free",
+        Ty::ResponseBuilder => "http_response_free",
+        Ty::HttpStream => "http_stream_free",
+        _ => return None,
+    })
+}
+
 /// The constant data `json.decode` codegen emits for one struct: the field-descriptor table, the
 /// field count + struct store size, and the perfect-hash slot table (`phf_len = 0` → linear scan).
 struct DecodeTable<'c> {
@@ -4977,31 +5012,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
-                        // A writer flushes + closes; a reader closes; a buffer / cli / http handle
-                        // frees; a tcp_conn / tcp_listener / udp_socket closes its socket fd. Each
-                        // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
-                        // harmlessly).
-                        let free_fn = match ty {
-                            Ty::Writer => "io_writer_free",
-                            Ty::Reader => "io_reader_free",
-                            Ty::Buffer => "buffer_free",
-                            Ty::File => "io_file_free",
-                            Ty::CliCommand => "cli_command_free",
-                            Ty::TcpConn => "tcp_conn_free",
-                            Ty::TcpListener => "tcp_listener_free",
-                            Ty::UdpSocket => "udp_socket_free",
-                            // A `child` reaps its pid (a blocking `waitpid`) if not yet waited.
-                            Ty::Child => "child_free",
-                            Ty::HttpRequest => "http_request_free",
-                            Ty::HttpResponse => "http_resp_free",
-                            Ty::HttpClient => "http_client_free",
-                            Ty::HttpServer => "http_server_free",
-                            Ty::HttpRequestCtx => "http_ctx_free",
-                            Ty::ResponseBuilder => "http_response_free",
-                            Ty::HttpStream => "http_stream_free",
-                            _ => "cli_parsed_free",
-                        };
+                    } else if let Some(free_fn) = handle_free_fn(ty) {
+                        // A bare Move **handle**: a writer flushes + closes; a reader closes; a buffer /
+                        // cli / http handle frees; a tcp_conn / tcp_listener / udp_socket closes its
+                        // socket fd; a `child` reaps its pid. Each runtime `*_free` is null-safe (a
+                        // moved-out / never-initialised slot drops harmlessly). One source of truth
+                        // with the struct-field drop (`handle_free_fn`).
                         let p = self
                             .builder
                             .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "droph")
@@ -8142,6 +8158,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         };
                         self.drop_struct_fields(ep, eid)?;
                     }
+                }
+                // A Move **handle** field (F1②): a bare pointer handle — `http_request_ctx`, `file`,
+                // a reader/writer/buffer, a socket, an http request/response/client/server/stream, a
+                // cli command/parsed. Load the pointer and call its null-safe `*_free`, exactly like a
+                // standalone handle local's `Stmt::Drop` (shared `handle_free_fn` — one source of
+                // truth). A moved-out / zeroed field reads a null handle, so the free is a no-op —
+                // the resource is closed at most once. `is_field_ok` admits exactly this handle set,
+                // so no allowed field type reaches the `_` arm below and silently leaks.
+                ty if handle_free_fn(ty).is_some() => {
+                    let free_fn = handle_free_fn(ty).expect("guarded by the arm pattern");
+                    let fp = self.builder.build_struct_gep(st, base, pi, "drophandle").map_err(|e| self.err(e))?;
+                    let p = self
+                        .builder
+                        .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "drophandlev")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs[free_fn], &[p.into()], "").map_err(|e| self.err(e))?;
                 }
                 _ => {}
             }
