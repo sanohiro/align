@@ -12902,6 +12902,11 @@ impl<'a, 't> Checker<'a, 't> {
                 // to a `Ty::Fn` field on the receiver struct; a non-fn field or a missing field falls
                 // through to the normal "unknown method" error below (unchanged behavior). The field
                 // lookup here is non-diagnosing (`field_index`, not `field_of`).
+                //
+                // This is the LAST arm, so a builtin/value method **wins** over a same-named fn field:
+                // a field named `get`/`len`/`map`/`clone`/… is intercepted by its method arm above and
+                // never reaches here. Fine for the pkg.web surface (`handler` collides with nothing);
+                // a future struct wanting a callable field must avoid the builtin-method names.
                 let fn_field_ty = if let Ty::Struct(sid) = self.resolve(recv_ty) {
                     self.structs
                         .get(sid as usize)
