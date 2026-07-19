@@ -1788,6 +1788,42 @@ An imported `pub` sum type's variant is constructed qualified, the same way its 
 `pal.Color.Green` (tag-only) and `pal.Color.Code(40)` (with a payload). Together with holding,
 returning, and `match`ing it, an exported sum type is fully usable across modules.
 
+### Packages (the pkg layer)
+
+A **package** is a *distribution-layer* unit — the module subtree a tool (or a human) vendors under
+`pkg/` — and the compiler never learns what one is: resolution, visibility, effects, escape, and
+capabilities all carry over unchanged from the module system above. The package graph, like the
+unit graph, is discovered from `import`s + the filesystem, so a build is hermetic on the source tree
+alone (no manifest, no search paths, no registry lookup at compile time). A package is its root
+module file `pkg/<name>.align` plus, optionally, its submodule tree `pkg/<name>/…`; a package's own
+sibling imports are written absolute (`import pkg.web.internal.util`), the same path a consumer
+writes, so vendoring is literally copying the subtree into `pkg/` — there is no develop-layout vs
+installed-layout split. One version of a package exists per tree by construction (a `pkg/<name>/` can
+exist once), so there is no version solver; an incompatible major version is a new name (`pkg.web2`).
+
+The first import segment is a **trust tier**: `core` (language) / `std` (OS boundary) / `pkg`
+(third-party) / anything else (this project). `core`/`std` are compiler builtins (never files); `pkg`
+is the third-party area. A file's import header thus shows not just *what* it reaches but *whose*
+code it trusts. Two path rules govern package edges (both pure path checks, no new syntax, no
+package-boundary metadata):
+
+- **The `internal` path rule.** An import whose path contains a segment `internal` is legal only from
+  within the subtree rooted at that `internal` segment's parent: `pkg.web.internal.router` is
+  importable from `pkg.web` and `pkg.web.*` only. This is what lets a package keep implementation
+  modules private — without it, every module would be permanent public API. (A project-root
+  `internal` with no parent prefix is visible project-wide; the rule is uniform.)
+- **Layering.** A module under `pkg/` may import only `core` / `std` / `pkg` modules — never the
+  consuming project's own modules. A vendored package that reached back into the project would
+  compile in exactly one tree and invert the dependency arrow. This keeps the library layering
+  `core → std → pkg → project` a compiler-checked fact, not a convention.
+
+Visibility stays one model — module-level `pub` plus the `internal` path rule; there is no
+`pub(pkg)` / export-list / re-export machinery (hide a module by path, hide an item by omitting
+`pub`). Import aliases are not offered (they would hide provenance at the call site), so a call stays
+fully qualified — `pkg.web.get(...)` — and the trust tier is visible at every use. Manual vendoring
+(copy the subtree) is a complete dependency mechanism; a fetch tool and a lockfile that records
+source provenance are a tooling concern that ends before the compiler starts (deferred).
+
 ---
 
 # 18. Library Layout
@@ -2429,10 +2465,13 @@ s.finish() -> Result<(), Error>                 // consumes s; writes 0\r\n\r\n 
 
 ## 18.3 pkg
 
-`pkg` is the area for external packages.
+`pkg` is the third-party / framework layer — DB drivers, web frameworks, and ecosystem libraries
+that are deliberately **not** in `core`/`std`. The building blocks that make them easy to build *are*
+in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
+`crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
 ```text
-pkg.web
+pkg.web            // the zero-copy REST framework (first-party, shipped with the system)
 pkg.router
 pkg.db.postgres
 pkg.db.mysql
@@ -2443,21 +2482,20 @@ pkg.aws
 pkg.openai
 ```
 
-DB drivers and Web frameworks are not in core/std.
+A package is a **distribution-layer** concept, defined entirely by §17 "Packages": it is the module
+subtree under `pkg/<name>/` (root `pkg/<name>.align` + optional submodules), discovered from imports
++ the filesystem with no manifest. Its edges obey the two package path rules from §17 — the
+**`internal`** rule (a `pkg.web.internal.*` module is importable only from within `pkg.web`) and
+**layering** (a `pkg/` module imports only `core`/`std`/`pkg`, never the consuming project). Calls
+stay fully qualified (`pkg.web.get(...)`); there are no import aliases. Vendoring a package is copying
+its subtree into `pkg/`; one version exists per tree by construction. Compiled-library distribution
+(shipping an interface + objects instead of source) is enabled by the per-unit interface summaries
+but stays a future packaging exercise — source-first, fully greppable dependencies are the default.
 
-However, the building blocks that make them easy to build are placed in core/std.
-
-```text
-bytes
-buffer
-builder
-arena
-json
-reader/writer
-http primitive
-crypto
-encoding
-```
+**First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
+live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer
+code, never ambiently resolvable: a consumer copies `pkg/web/` into their project exactly as they
+would a third-party dependency.
 
 ---
 

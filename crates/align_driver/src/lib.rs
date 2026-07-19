@@ -53,6 +53,48 @@ fn user_import(p: &align_ast::Path) -> bool {
     p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
 }
 
+/// The pkg-foundation import-edge rules (F0 of `impl/15-pkg-web-plan.md`; `open-questions.md`
+/// "pkg-foundation" D7/D8). Checked per edge in [`load_units`], where the importer's module path
+/// (`importer`) and the imported module's dotted segments (`imported`) are both known. `core`/`std`
+/// imports never reach here (filtered by [`user_import`]), so both rules only ever see user modules.
+///
+/// **D7 — `internal` path rule.** An import whose path contains a segment `internal` is legal only
+/// from within the subtree rooted at that `internal` segment's parent: `pkg.router.internal.pool`
+/// is importable from `pkg.router` and `pkg.router.*` only. A project-root `internal` (no parent
+/// prefix) is visible project-wide. Pure path rule (Go-proven), no package-boundary metadata.
+///
+/// **D8 — layering.** A module under `pkg/` may import only `core` / `std` / `pkg` modules; it may
+/// not reach back into the consuming project's own modules (which would compile in one tree and
+/// nowhere else, and inverts the dependency arrow). `core`/`std` are already allowed (filtered out
+/// before this runs), so the only rejection here is a `pkg.*` module importing a project module.
+fn check_pkg_import_edge(importer: &str, imported: &[&str], span: align_span::Span, diags: &mut Diagnostics) {
+    let modpath = imported.join(".");
+    // D7 — the `internal` path rule (first `internal` segment governs).
+    if let Some(pos) = imported.iter().position(|s| *s == "internal") {
+        let prefix = imported[..pos].join(".");
+        let importer_ok =
+            prefix.is_empty() || importer == prefix || importer.starts_with(&format!("{prefix}."));
+        if !importer_ok {
+            diags.error(
+                format!(
+                    "cannot import internal module `{modpath}` from `{importer}` — an `internal` module is importable only from within `{prefix}`"
+                ),
+                span,
+            );
+        }
+    }
+    // D8 — a module under `pkg/` may import only `core` / `std` / `pkg`.
+    let importer_is_pkg = importer == "pkg" || importer.starts_with("pkg.");
+    if importer_is_pkg && imported.first() != Some(&"pkg") {
+        diags.error(
+            format!(
+                "a module under `pkg/` may import only `core` / `std` / `pkg` modules; `{importer}` cannot import project module `{modpath}` (layering: core -> std -> pkg -> project)"
+            ),
+            span,
+        );
+    }
+}
+
 /// lexer -> parser for the entry file plus its transitively-imported **user** modules, plus the
 /// cyclic-import (DAG) check. The shared front half of [`check`] and [`build_interface_summaries`];
 /// behavior-identical to the former inline loader.
@@ -96,8 +138,13 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
         for imp in imports {
             // The dotted module path (`util.math`) and the matching file path under the entry
             // directory (`util/math.align`): each segment is a directory, the last names the file.
-            let modpath = imp.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+            let segs: Vec<&str> = imp.segments.iter().map(|s| s.name.as_str()).collect();
+            let modpath = segs.join(".");
             edges.entry(cur_path.clone()).or_default().push((modpath.clone(), imp.span));
+            // pkg-foundation import-edge rules (F0): the `internal` path rule + pkg-layering. Checked
+            // per edge (before the `seen` dedup) so an illegal importer is caught even when the target
+            // module was already loaded via a legal edge.
+            check_pkg_import_edge(&cur_path, &segs, imp.span, diags);
             if !seen.insert(modpath.clone()) {
                 continue; // already loaded (shared / cyclic import)
             }
