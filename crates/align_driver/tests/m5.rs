@@ -1081,6 +1081,19 @@ fn json_scan_any_all_reducers() {
 }
 
 #[test]
+fn json_scan_whole_struct_any() {
+    if !backend_available() {
+        return;
+    }
+    // `any`/`reduce` whose function consumes the WHOLE row struct (no `.field` projection): the row is
+    // loaded from its slot as an aggregate. any(u.score > 50) = true (99); reduce sums scores = 114.
+    let src = "import core.json\nUser { score: i64 }\nfn big(u: User) -> bool = u.score > 50\nfn addsc(a: i64, u: User) -> i64 = a + u.score\nfn main() -> Result<(), Error> {\n  a: json.scanner<User> := json.scan(\"[{\\\"score\\\":10},{\\\"score\\\":99},{\\\"score\\\":5}]\")\n  print(a.any(big)?)\n  b: json.scanner<User> := json.scan(\"[{\\\"score\\\":10},{\\\"score\\\":99},{\\\"score\\\":5}]\")\n  print(b.reduce(0, addsc)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-scan-whole-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n114\n");
+}
+
+#[test]
 fn json_scan_reduce_fold() {
     if !backend_available() {
         return;
@@ -1091,6 +1104,17 @@ fn json_scan_reduce_fold() {
     let out = build_and_run("json-scan-reduce", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "50\n");
+}
+
+#[test]
+fn json_scan_reduce_nonscalar_accumulator_rejected() {
+    // A `json.scanner` reduce terminal is `Result<T, Error>`, so its accumulator must be a scalar. A
+    // non-scalar accumulator (a `vec4<i64>`) has no `Result` form — reject cleanly, don't panic.
+    let errs = check_diagnostics(
+        "json-scan-reduce-nonscalar",
+        "import core.json\nRow { score: i64 }\nfn addv(a: vec4<i64>, s: i64) -> vec4<i64> = a\nfn main() -> Result<(), Error> {\n  seed := [1, 2, 3, 4]\n  v: vec4<i64> := seed\n  rows: json.scanner<Row> := json.scan(\"[{\\\"score\\\":1}]\")\n  r := rows.score.reduce(v, addv)?\n  return Ok(())\n}\n",
+    );
+    assert!(errs.contains("reduce accumulator must be a scalar"), "unexpected diagnostics:\n{errs}");
 }
 
 #[test]

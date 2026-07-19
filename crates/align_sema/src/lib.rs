@@ -14770,8 +14770,16 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // Over a scanner the terminal is `Result<A, Error>` (streaming; a malformed row → `Err`). The
         // accumulator type is concrete (from `init` / the fold's signature), so no constraint is needed.
+        // It must be a scalar (a `Result` payload) — a non-scalar accumulator (a `vecN`/`maskN`/fixed
+        // array) has no `Result<T, Error>` form, so reject it cleanly rather than panicking downstream.
         if matches!(source.ty, Ty::JsonScanner(_)) {
-            let sc = ty_to_scalar(acc_ty).expect("a reduce accumulator is a scalar");
+            let Some(sc) = ty_to_scalar(acc_ty) else {
+                self.diags.error(
+                    format!("a `json.scanner` reduce accumulator must be a scalar (its terminal is `Result<T, Error>`), got {}", ty_name(acc_ty)),
+                    span,
+                );
+                return err;
+            };
             return Expr {
                 kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, captures, init: Box::new(init) },
                 ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),

@@ -5687,9 +5687,11 @@ fn lower_json_scan_reduce(
             Operand::Value(n)
         }
         // `reduce(init, f)`: `acc = f(acc, cur)` (+ captures). Rejected rows already branched to `cont`
-        // (guarded), so `f` runs only for survivors — exactly the array `Fold` semantics.
+        // (guarded), so `f` runs only for survivors — exactly the array `Fold` semantics. `f`'s element
+        // arg is a projected scalar when a `.field`/`map` produced one, else the whole row struct (a
+        // fold whose function consumes the struct by value — `reduce(0, fn(a, u) { a + u.score })`).
         Reducer::Fold { func, captures } => {
-            let cur = cur.expect("reduce needs a scalar element");
+            let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
             let mut args = vec![Operand::Value(a), cur];
             for c in captures {
                 args.push(lower_expr(b, c));
@@ -5699,9 +5701,10 @@ fn lower_json_scan_reduce(
             Operand::Value(folded)
         }
         // `any(p)`/`all(p)`: `acc = acc || p(cur)` / `acc && p(cur)` — a full fold (no early exit),
-        // exactly-once predicate calls per surviving row.
+        // exactly-once predicate calls per surviving row. `p`'s arg is a projected scalar or (no
+        // projection) the whole row struct (`rows.any(fn(u) { u.score > 8 })`).
         Reducer::AnyAll { func, captures, all } => {
-            let cur = cur.expect("any/all needs a scalar element");
+            let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(b, cur, captures);
             b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
