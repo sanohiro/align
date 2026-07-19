@@ -326,3 +326,53 @@ fn owned_field_str_borrow_cannot_escape() {
         )
     ));
 }
+
+#[test]
+fn owned_local_moved_into_struct_field_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // Moving a **named owned local** into a struct-literal field consumes it: the field takes the
+    // buffer and the source local must be nulled so its exit Drop doesn't double-free (an inline
+    // temporary — `User{name: "x".clone()}` — never had a source local to null; a named local did,
+    // and `store_value_at` was not nulling it). A clean run (exit 4) proves the buffer frees once.
+    let src = concat!(
+        "User { name: string, age: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  s := \"abcd\".clone()\n",
+        "  u := User { name: s, age: 7 }\n",
+        "  return u.name.len() as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-localmove", src).status.code(), Some(4));
+}
+
+#[test]
+fn owned_array_local_moved_into_struct_field_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // The same nulling for an owned `array<T>` field built via `array_builder` and moved in from a
+    // `mut` local (the radix-router build shape): the source array local must be nulled so the
+    // struct's Drop frees the buffer exactly once.
+    let src = concat!(
+        "fn filled(m: i64) -> array<i64> {\n",
+        "  mut b: array_builder<i64> := array_builder()\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    if i >= m { break }\n",
+        "    b.push(-1)\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  b.build()\n",
+        "}\n",
+        "T { col: array<i64> }\n",
+        "fn main() -> i32 {\n",
+        "  mut xs := filled(4)\n",
+        "  xs[2] = 99\n",
+        "  t := T { col: xs }\n",
+        "  return t.col[2] as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-arrmove", src).status.code(), Some(99));
+}
