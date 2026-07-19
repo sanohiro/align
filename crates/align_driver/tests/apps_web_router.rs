@@ -19,7 +19,8 @@ const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.ali
 const WEB_ROOT: &str = "module pkg.web\n\
 import pkg.web.internal.router\n\
 pub fn dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.dispatch(patterns, path)\n\
-pub fn match_score(pattern: str, path: str) -> i64 = pkg.web.internal.router.match_score(pattern, path)\n";
+pub fn match_score(pattern: str, path: str) -> i64 = pkg.web.internal.router.match_score(pattern, path)\n\
+pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.tree_dispatch(patterns, path)\n";
 
 fn web_project(entry_main: &str) -> Vec<(&'static str, String)> {
     vec![
@@ -98,4 +99,74 @@ fn main() -> Result<(), Error> {\n\
     let out = run_web("web-param-wild", main);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n0\n");
+}
+
+// ── W1 slice 2: the flat SoA radix tree, differential-tested against the oracle ────────────────
+
+#[test]
+fn tree_dispatch_matches_the_expected_routes() {
+    if !backend_available() {
+        return;
+    }
+    // The radix tree resolves the same shapes the oracle does: static leaf > :param > *wildcard,
+    // an interior node with no leaf misses, and a bare miss is -1.
+    let main = "module main\n\
+import pkg.web\n\
+fn main() -> Result<(), Error> {\n\
+  routes := [\"/v1/models\", \"/v1/models/:id\", \"/v1/models/featured\", \"/files/*path\"]\n\
+  print(pkg.web.tree_dispatch(routes, \"/v1/models\"))            // 0\n\
+  print(pkg.web.tree_dispatch(routes, \"/v1/models/42\"))         // 1\n\
+  print(pkg.web.tree_dispatch(routes, \"/v1/models/featured\"))   // 2 (static beats :id)\n\
+  print(pkg.web.tree_dispatch(routes, \"/files/a/b/c\"))          // 3 (*path)\n\
+  print(pkg.web.tree_dispatch(routes, \"/nope\"))                 // -1\n\
+  print(pkg.web.tree_dispatch(routes, \"/v1\"))                   // -1 (interior node, no leaf)\n\
+  return Ok(())\n\
+}\n";
+    let out = run_web("web-tree", main);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n1\n2\n3\n-1\n-1\n");
+}
+
+#[test]
+fn tree_dispatch_agrees_with_the_linear_oracle() {
+    if !backend_available() {
+        return;
+    }
+    // The differential test: over a diverse (non-backtracking) route table and many paths — nested
+    // params, a tail wildcard, static-beats-param, trailing slash, interior misses — the radix tree
+    // and the linear-scan oracle must return the SAME route index for every path. The Align harness
+    // counts disagreements (printing the path index + the two verdicts on any mismatch) and prints
+    // the total; 0 means every path agreed.
+    let main = "module main\n\
+import pkg.web\n\
+fn check(routes: slice<str>, path: str, idx: i64) -> i64 {\n\
+  a := pkg.web.dispatch(routes, path)\n\
+  b := pkg.web.tree_dispatch(routes, path)\n\
+  if a == b {\n\
+    0\n\
+  } else {\n\
+    print(-999)\n\
+    print(idx)\n\
+    print(a)\n\
+    print(b)\n\
+    1\n\
+  }\n\
+}\n\
+fn main() -> Result<(), Error> {\n\
+  routes := [\"/\", \"/v1/models\", \"/v1/models/:id\", \"/v1/models/featured\", \"/v1/models/:id/versions\", \"/files/*path\", \"/users/:uid/posts/:pid\", \"/health\"]\n\
+  paths := [\"/\", \"/v1/models\", \"/v1/models/42\", \"/v1/models/featured\", \"/v1/models/42/versions\", \"/files/a/b/c\", \"/files/x\", \"/users/7/posts/9\", \"/health\", \"/nope\", \"/v1\", \"/v1/models/\", \"/users/7/posts\", \"/files\"]\n\
+  mut mism := 0\n\
+  mut i := 0\n\
+  loop {\n\
+    if i >= paths.len() { break }\n\
+    mism = mism + check(routes, paths[i], i)\n\
+    i = i + 1\n\
+  }\n\
+  print(mism)\n\
+  return Ok(())\n\
+}\n";
+    let out = run_web("web-tree-diff", main);
+    assert_eq!(out.status.code(), Some(0));
+    // "0" alone = every path agreed (a mismatch would print a -999 block before it).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
 }
