@@ -1520,7 +1520,11 @@ non-container yields a `Missing` doc, which propagates through further navigatio
 `as_bool` return `Option` (`None` when the value is not that kind); `d.kind()` returns the builtin
 `json.kind` sum type and distinguishes JSON `null` from absence (`Missing`). `as_str` is a zero-copy
 view into the input, except an escaped string, which is unescaped into the arena (the one allocating
-accessor). `json.doc` needs an enclosing `arena {}`, like the direct-to-`soa` decode.
+accessor). `d.len()` is the member / element count (0 on a non-container); `d.key(i) -> Option<str>` is
+the i-th object key in document order — so an object is read as ordered data (keys + `at(i)` values)
+without a `map` type, and a document array is iterated by `at(i)` up to `len()` (by recursion). The
+types `json.doc` and `json.kind` are nameable, so a `fn f(d: json.doc)` helper factors doc code out.
+`json.doc` needs an enclosing `arena {}`, like the direct-to-`soa` decode.
 
 ---
 

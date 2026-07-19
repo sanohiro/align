@@ -196,8 +196,14 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   A number's **form** selects the accessor (`42.0` / `1e3` are integer-valued but non-integer form →
   `as_i64` `None`, `as_f64` `Some`), matching simdjson's on-demand model. `get` on a **duplicate** key
   returns the **first** occurrence (lazy-view; deliberately distinct from `decode`'s last-wins —
-  duplicate keys are pathological in both). **Deferred to slice 2:** `len()`, `elems()` (materialize a
-  level for pipelines), and `key(i)` (objects-as-ordered-data).
+  duplicate keys are pathological in both). **Slice 2 SHIPPED:** `d.len()` (member/element count, 0 on a
+  non-container) + `d.key(i) -> Option<str>` (the i-th object key in document order — objects-as-ordered
+  data). Together with `at(i)`, these drive iteration over a doc array by recursion (no `loop` needed).
+  The types `json.doc` and `json.kind` are now **nameable** (a `fn f(d: json.doc)` helper / a
+  `k: json.kind` binding resolve directly — the two builtin `core.json` type names). **Deferred to slice
+  3:** `elems() -> array<json.doc>` — materializing a document level as a pipeline source needs
+  `json.doc` as an owned/slice **element** (a `PrimScalar`/dedicated-array capability) plus the
+  pipeline-over-doc-elements machinery; a distinct feature, so it waits per "ideal form or defer".
   **Known systemic leniency (not a J4 regression — shared with `decode`'s scanner):** raw C0 control
   bytes inside strings and leading zeros in numbers (`007`) are currently accepted; making the shared
   `find_quote_or_escape` / `number_span` strict (RFC 8259 §7/§6) is a follow-up that must land for

@@ -4596,12 +4596,12 @@ impl EffectScan<'_> {
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => self.expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.expr(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.expr(doc);
                 self.expr(key);
             }
-            ExprKind::JsonDocAt { doc, index } => {
+            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
                 self.expr(doc);
                 self.expr(index);
             }
@@ -5344,7 +5344,7 @@ impl<'a> EscapeCheck<'a> {
             // `str` view into the input (or the arena, for an escaped string). All live exactly as long
             // as the receiver doc, so they inherit its region — an escape past it is caught (#297).
             // (`d.kind()` / `d.as_i64/f64/bool()` copy out a Copy scalar → the `Static` list below.)
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } => self.region_of(doc, depth),
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => self.region_of(doc, depth),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
@@ -5634,6 +5634,7 @@ impl<'a> EscapeCheck<'a> {
             // borrows the doc, so both are `Static` (freely returnable), unlike the view accessors.
             | ExprKind::JsonDocKind { .. }
             | ExprKind::JsonDocAsScalar { .. }
+            | ExprKind::JsonDocLen { .. }
             | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
@@ -5893,6 +5894,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDocAt { .. }
             | ExprKind::JsonDocAsStr { .. }
             | ExprKind::JsonDocAsScalar { .. }
+            | ExprKind::JsonDocLen { .. }
+            | ExprKind::JsonDocKey { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
@@ -6594,12 +6597,12 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.walk(doc, depth),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.walk(doc, depth),
             ExprKind::JsonDocGet { doc, key } => {
                 self.walk(doc, depth);
                 self.walk(key, depth);
             }
-            ExprKind::JsonDocAt { doc, index } => {
+            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
                 self.walk(doc, depth);
                 self.walk(index, depth);
             }
@@ -7218,12 +7221,12 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.visit(input),
             ExprKind::JsonDoc { input } => self.visit(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.visit(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.visit(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.visit(doc);
                 self.visit(key);
             }
-            ExprKind::JsonDocAt { doc, index } => {
+            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
                 self.visit(doc);
                 self.visit(index);
             }
@@ -7836,7 +7839,7 @@ impl<'a> MoveCheck<'a> {
             // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
             // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
             ExprKind::JsonDoc { input } => self.borrow_sources(input),
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } => {
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } => {
                 self.borrow_sources(doc)
             }
             ExprKind::Call { args, .. } => {
@@ -8637,12 +8640,12 @@ impl<'a> MoveCheck<'a> {
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
             // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
             ExprKind::JsonDoc { input } => self.expr(input, moved, false, false),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.expr(doc, moved, false, false),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.expr(doc, moved, false, false),
             ExprKind::JsonDocGet { doc, key } => {
                 self.expr(doc, moved, false, false);
                 self.expr(key, moved, false, false);
             }
-            ExprKind::JsonDocAt { doc, index } => {
+            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
                 self.expr(doc, moved, false, false);
                 self.expr(index, moved, false, false);
             }
@@ -12764,7 +12767,7 @@ impl<'a, 't> Checker<'a, 't> {
             // above), BEFORE the shared `get` (box) arm so the name stays free on other values.
             // (`d.as_str()` shares the `as_str` intercept above.) The receiver may be a temporary — a
             // `json.doc` is Copy, never dropped, so chaining `d.get("a").at(0).as_i64()` is fine.
-            "kind" | "get" | "at" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
+            "kind" | "get" | "at" | "key" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
                 self.check_json_doc_method(recv_expr, method, args, span)
             }
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
@@ -15662,6 +15665,21 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::JsonDocAt { doc: Box::new(recv_expr), index: Box::new(idx) }, ty: Ty::JsonDoc, span }
             }
+            "key" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.key()' takes 1 argument (the member index), got {}", args.len()), span);
+                    return err;
+                }
+                let idx = self.check_expr(&args[0], Some(i64_ty));
+                if idx.ty == Ty::Error {
+                    return err;
+                }
+                if !idx.ty.is_int_like() {
+                    self.diags.error(format!("a json.doc key index must be an integer, got {}", ty_name(idx.ty)), args[0].span);
+                    return err;
+                }
+                Expr { kind: ExprKind::JsonDocKey { doc: Box::new(recv_expr), index: Box::new(idx) }, ty: Ty::Option(Scalar::Str), span }
+            }
             "as_str" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.as_str()' takes no arguments, got {}", args.len()), span);
@@ -15995,6 +16013,9 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::File => self.check_file_method(r, "len", args, span),
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
+            // A `json.doc`'s length is its member/element count (0 on a non-container / Missing) — a
+            // runtime read of the tape node (J4 slice 2).
+            Ty::JsonDoc => Expr { kind: ExprKind::JsonDocLen { doc: Box::new(r) }, ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
             other => {
                 self.diags
@@ -19810,12 +19831,12 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } => self.finalize_expr(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } => self.finalize_expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.finalize_expr(doc);
                 self.finalize_expr(key);
             }
-            ExprKind::JsonDocAt { doc, index } => {
+            ExprKind::JsonDocAt { doc, index } | ExprKind::JsonDocKey { doc, index } => {
                 self.finalize_expr(doc);
                 self.finalize_expr(index);
             }
@@ -20894,6 +20915,26 @@ fn resolve_type(
         }
     };
     let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+    // The builtin `core.json` types `json.doc` / `json.kind` (J4) are written qualified but are not
+    // user module types — resolve them directly (before the import/`pub` check, which would reject
+    // `json` as an un-imported module). `json.doc` needs no type arguments; `json.kind` is the builtin
+    // enum registered in `enum_ids`.
+    if path.segments.len() == 2 && path.segments[0].name == "json" {
+        if name == "doc" {
+            if !args.is_empty() {
+                diags.error("`json.doc` takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            return Ty::JsonDoc;
+        }
+        if name == "kind" {
+            if !args.is_empty() {
+                diags.error("`json.kind` takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            return cx.enum_ids.get("json.kind").map(|&id| Ty::Enum(id)).unwrap_or(Ty::Error);
+        }
+    }
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
     // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
     if path.segments.len() > 1 {

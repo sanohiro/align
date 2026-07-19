@@ -2489,6 +2489,39 @@ fn main() -> Result<(), Error> {\n\
 }
 
 #[test]
+fn json_doc_len_and_key_iterate_via_recursion() {
+    if !backend_available() {
+        return;
+    }
+    // len() + at() drive a recursive sum over a doc array (no `loop` needed); key(i) reads object
+    // keys in order. Exercises the J4 slice-2 surface end-to-end.
+    let src = "import core.json\n\
+fn sum_from(d: json.doc, i: i64, acc: i64) -> i64 {\n\
+  if i >= d.len() { return acc }\n\
+  return sum_from(d, i + 1, acc + (d.at(i).as_i64() else 0))\n\
+}\n\
+fn run() -> Result<(), Error> {\n\
+  arena {\n\
+    d := json.doc(\"{\\\"xs\\\": [10, 20, 30, 5], \\\"a\\\": 1, \\\"b\\\": 2}\")?\n\
+    print(d.len())\n\
+    print(sum_from(d.get(\"xs\"), 0, 0))\n\
+    print(d.key(0) else \"?\")\n\
+    print(d.key(1) else \"?\")\n\
+    print(d.key(9) else \"none\")\n\
+  }\n\
+  return Ok(())\n\
+}\n\
+fn main() -> Result<(), Error> {\n\
+  run()?\n\
+  return Ok(())\n\
+}\n";
+    let out = build_and_run("json-doc-len-key", src);
+    assert_eq!(out.status.code(), Some(0));
+    // object len 3; xs sum = 65; keys a, b; out-of-range key → none.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n65\nxs\na\nnone\n");
+}
+
+#[test]
 fn json_doc_malformed_is_err_ok_is_parsed() {
     if !backend_available() {
         return;

@@ -3884,9 +3884,17 @@ cache key (the tape is generic — nothing to stale). Threaded through every exh
 (region_of = min(input, arena) for the doc / receiver-region for `get`/`at`/`as_str` / `Static` for
 `kind`/`as_i64/f64/bool`; `tracks_region` + `ty_may_borrow` + `borrow_sources` = the input roots).
 Tests: `m5.rs` (navigate + kind-match + leaf accessors, malformed→Err, arena gate, view-escape
-rejection), runtime `json_doc_*`. **Deferred to J4 slice 2:** `d.len()`, `d.elems() -> array<json.doc>`
-(materialize a level for pipelines), `d.key(i) -> Option<str>` (objects-as-ordered-data). →
-**J4 slice 2** (`len`/`elems`/`key`) → **J5** `json.scan` → **J6** spec sync
+rejection), runtime `json_doc_*`. **J4 SLICE 2 SHIPPED:** `d.len()` (member/element count, 0 on a
+non-container) + `d.key(i) -> Option<str>` (i-th object key in document order — objects-as-ordered
+data); with `at(i)` these iterate a doc array by recursion (no `loop` needed). The builtin type names
+`json.doc` / `json.kind` are now **nameable** in annotations (resolved directly in `resolve_type` before
+the import/`pub` check), so a `fn f(d: json.doc)` helper / a `k: json.kind` binding work. Tests: `m5.rs`
+`json_doc_len_and_key_iterate_via_recursion` (recursive sum over a doc array + key-order), runtime
+`json_doc_len_and_key`. **Deferred to J4 slice 3:** `d.elems() -> array<json.doc>` — materializing a
+level as a pipeline source needs `json.doc` as an owned/slice **element** (a `PrimScalar`/dedicated
+owned-doc-array type) plus the pipeline-over-doc-elements machinery; a distinct capability, so it waits
+per "ideal form or defer" (`at`/`len` + recursion already cover level iteration). →
+**J4 slice 3** (`elems`, pipeline source) → **J5** `json.scan` → **J6** spec sync
 sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
 ships ideal-form or defers per CLAUDE.md.
 

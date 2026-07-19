@@ -601,6 +601,13 @@ pub enum Rvalue {
     /// into the `out` slot and returns an `i32` present flag (1 → `Some`, 0 → `None`). `scalar` is the
     /// target leaf type (int / float / bool), selecting the runtime accessor.
     JsonDocAsScalar { scalar: Ty, doc: Operand, out: Slot },
+    /// `d.len()` on a `json.doc`: the runtime returns the member/element count directly as an `i64`
+    /// (0 for a non-container / Missing). Total.
+    JsonDocLen { doc: Operand },
+    /// `d.key(index)` on a `json.doc`: the runtime writes the `index`-th object member key (a `str`
+    /// view `{ptr,len}`) into the `out` slot and returns an `i32` present flag (1 = an object member
+    /// at that index → `Some`, 0 → `None`).
+    JsonDocKey { doc: Operand, index: Operand, out: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -2823,6 +2830,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDocAt { doc, index } => lower_json_doc_at(b, doc, index, e.ty),
         hir::ExprKind::JsonDocAsStr { doc } => lower_json_doc_as_str(b, doc, e.ty),
         hir::ExprKind::JsonDocAsScalar { doc, scalar } => lower_json_doc_as_scalar(b, doc, *scalar, e.ty),
+        hir::ExprKind::JsonDocLen { doc } => {
+            let d = lower_expr(b, doc);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::JsonDocLen { doc: d }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
         // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
@@ -7663,6 +7677,19 @@ fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::JsonDocAsScalar { scalar, doc: d, out }));
     lower_json_doc_option(b, flag, out, scalar, result_ty)
+}
+
+/// `d.key(index)` on a `json.doc` → the runtime writes the `index`-th member key (a `str` view) into
+/// an out slot and returns an `i32` present flag; branch `Some(<view>)` / `None`. The key view borrows
+/// `doc` (region-bound in sema), like `as_str`.
+#[inline(never)]
+fn lower_json_doc_key(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let d = lower_expr(b, doc);
+    let i = lower_expr(b, index);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::JsonDocKey { doc: d, index: i, out }));
+    lower_json_doc_option(b, flag, out, Ty::Str, result_ty)
 }
 
 /// The shared `Some(load out)` / `None` branch for a `json.doc` leaf accessor: `flag != 0` → the value

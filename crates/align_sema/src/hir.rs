@@ -718,6 +718,13 @@ pub enum ExprKind {
     /// JSON number / bool of that kind, else `None`. `scalar` is the Copy leaf type (`i64`/`f64`/
     /// `bool`); the value is copied out (`Static`, no region tie).
     JsonDocAsScalar { doc: Box<Expr>, scalar: crate::Ty },
+    /// `d.len()` on a `json.doc` — the member / element count for an Object / Array, else `0` (a
+    /// non-container / Missing). A Copy `i64` result (`Static`, no region tie). J4 slice 2.
+    JsonDocLen { doc: Box<Expr> },
+    /// `d.key(index)` on a `json.doc` — the `index`-th member key of an Object (in document order), or
+    /// `None` (not an object / out of range / Missing). The `str` is a view (into the input, or the
+    /// arena for an escaped key), so region-bound to `doc`. The objects-as-ordered-data half of J4.
+    JsonDocKey { doc: Box<Expr>, index: Box<Expr> },
     /// `s.group_by(.key).{sum,min,max}(.value)` / `.count()` over a `soa<Struct>` local `base` —
     /// column-oriented grouped aggregate. Reads the `key_field` column (and `value_field` for
     /// sum/min/max — `None` for `count`) as `slice<i64>` via [`SoaColumn`] and folds per distinct

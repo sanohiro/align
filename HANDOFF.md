@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 1 SHIPPED (the schema-unknown lazy
+_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 2 SHIPPED (`len` + `key` + nameable
+types; branch `json-j4-doc-slice2`).** On top of slice 1 (merged as #543): `d.len()` (member/element
+count, 0 on a non-container / Missing) and `d.key(i) -> Option<str>` (the i-th object member key in
+document order — objects-as-ordered-data, a `str` view region-bound to the doc). With `at(i)` these
+iterate a doc array by **recursion** (no `loop` needed — `loop` is deferred). The builtin type names
+**`json.doc` / `json.kind` are now nameable** in annotations: `resolve_type` special-cases the qualified
+`json.doc` → `Ty::JsonDoc` / `json.kind` → the builtin enum BEFORE the import/`pub` check (which would
+else reject `json` as an un-imported module), so a `fn f(d: json.doc)` helper and a `k: json.kind`
+binding compile — this is what makes recursive doc iteration expressible. New HIR `JsonDocLen`/
+`JsonDocKey` + MIR `Rvalue` siblings threaded through every exhaustive pass (len = `Static` i64; key =
+receiver-region `str` view, like `as_str`); runtime `align_rt_json_doc_len` (i64) / `align_rt_json_doc_key`
+(i32 present flag + `str` view, sharing a new `doc_write_str` helper with `as_str`). Tests: `m5.rs`
+`json_doc_len_and_key_iterate_via_recursion` (recursive sum over a doc array + key-order + out-of-range),
+runtime `json_doc_len_and_key`. Suites green: m5 156, sema 151, mir 7, runtime json_doc 7; clippy clean.
+**`/align-self-review` + review pending before merge.** **Deferred to J4 slice 3:** `d.elems() ->
+array<json.doc>` (materialize a level as a pipeline source — needs `json.doc` as an owned/slice element
++ pipeline-over-doc machinery; `at`/`len`+recursion already cover level iteration). Then **J5** `json.scan`
+→ **J6** spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 1 SHIPPED (the schema-unknown lazy
 document view MVP; branch `json-j4-doc`).** New `Ty::JsonDoc` / `Scalar::JsonDoc` — a **Copy**
 `{tape,node}` handle (laid out `{ptr,i64}` like a slice), region-tied to min(input, arena). `json.doc(s)?`
 inside an `arena {}` parses ONCE into an arena-backed `simdjson`-style flat node tape (per-node
