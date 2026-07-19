@@ -5269,6 +5269,14 @@ impl<'a> EscapeCheck<'a> {
                 // hold a str-bearing struct — both make the enclosing struct input-region-tied.
                 Ty::Option(Scalar::Str) => true,
                 Ty::Option(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
+                // A `slice<str>` field holds `str` views into a backing buffer, so the enclosing
+                // struct is region-tied exactly like a direct `str` field (F1③, the pkg.web param
+                // slots). A `slice<struct>` recurses into a str-bearing element struct; other slice
+                // elements (`slice<i64>`) carry no `str` view (their backing-buffer region-tie is
+                // handled by the `region_of(StructLit)` field fold, not here — this predicate is
+                // specifically about `str` views).
+                Ty::Slice(Scalar::Str) => true,
+                Ty::Slice(Scalar::Struct(nid)) => self.struct_has_str_rec(nid, stack),
                 // A sum-type (`enum`) field holds a `str` view when its live variant carries one — a
                 // `Content.Text(view)` field makes the enclosing struct input-region-tied, exactly like
                 // a direct `str` field (J1b). Recurse into a `str`-bearing struct payload too; a
@@ -10954,7 +10962,14 @@ impl<'a, 't> Checker<'a, 't> {
                         self.diags
                             .error(format!("duplicate field '{}'", fi.name.name), fi.span);
                     }
-                    values[idx] = Some(self.check_expr(&fi.value, Some(layout[idx].1)));
+                    // A `slice<T>` field applies the array→slice borrow (`ArrayToSlice`) when given a
+                    // matching array literal / local, exactly like a `slice<T>` call argument or
+                    // `let` binding (`check_slice_init`) — F1③. Other field types check directly.
+                    let checked = match layout[idx].1 {
+                        Ty::Slice(ps) => self.check_slice_init(&fi.value, ps),
+                        fty => self.check_expr(&fi.value, Some(fty)),
+                    };
+                    values[idx] = Some(checked);
                 }
                 None => {
                     self.diags
@@ -21583,6 +21598,15 @@ fn is_field_ok(ty: Ty) -> bool {
         // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
         // arm gains the same non-Move / Drop split the `array<T>` field has.
         Ty::Enum(_) => true,
+        // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
+        // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
+        // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
+        // (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays non-Move) and needs no
+        // drop. It region-ties the enclosing struct to the borrowed buffer: `region_of(StructLit)`
+        // folds in each field value's region, so a struct holding a slice field cannot outlive the
+        // buffer the slice views (the escape check enforces it). A `slice<str>` element also carries
+        // `str` views, tracked via `struct_has_str_rec` below.
+        Ty::Slice(_) => true,
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
         // `abi_type`/`ty_size_align` already size it), owns no heap (`ty_owns_buffer_rec` excludes it,
