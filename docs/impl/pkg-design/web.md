@@ -78,6 +78,11 @@ must be ≈ zero; plus a same-box Go Fiber comparison as the external honesty ch
 
 ## Surface (Fiber-informed, Align-idiomatic)
 
+> **Call convention (owner-decided 2026-07-20):** call sites are **fully qualified** — `pkg.web.get(...)`,
+> `pkg.web.param(c, "id")`, `c: pkg.web.Ctx` — per §17 D3 (no import aliases; provenance visible at
+> every use). The bare `web.` / `web.Ctx` in the examples below is shorthand for `pkg.web.` and will be
+> spelled out when the public surface lands (W2). This was reconciled when F0 settled D3.
+
 ```align
 import pkg.web
 
