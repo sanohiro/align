@@ -3486,8 +3486,122 @@ data-dependent checkpoint depth (speculative/backtracking parsers) — is the re
 trigger**: revisit iff the MIR-dataflow escape checker lands AND a measured parser consumer appears
 that recursion + pooling cannot serve. (The old "after MMv2" gate is moot — MMv2 completed.)
 
-### Build system / package layout
-Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
+### Build system / package layout — pkg-foundation design (PROPOSAL 2026-07-19, awaiting owner sign-off)
+
+Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`); M15 shipped per-unit
+interfaces + objects + the incremental cache — explicitly motivated by "compiled-library
+distribution for the future pkg ecosystem". This entry is the design for that ecosystem's
+foundation. **Target: consumer-gated** — implement when the first shared library exists (e.g. an
+align-LLM component extracted for reuse, or the first third-party dependency). Nothing blocks on it.
+
+**Thesis: the package layer adds two path rules and zero new compiler concepts.** A "package" is a
+*distribution-layer* unit — the subtree a tool (or a human) vendors under `pkg/` — and the compiler
+never learns what one is. Resolution, visibility, effects, escape, capabilities: all carry over
+unchanged from the settled module system. This is the M15 "driver-discovered unit graph, NO
+manifest" decision extended to its conclusion: the *package* graph is also discovered from imports +
+the filesystem, and a build is hermetic on the source tree alone.
+
+**D1 — the first import segment is a trust tier.** `core` (language) / `std` (OS boundary) / `pkg`
+(third-party) / anything else (this project). `core`/`std` are already builtin-reserved (never
+resolved to files); `pkg` is hereby blessed as the third-party area. A file's import header thus
+shows not just *what* it reaches but *whose code* it trusts — "nothing hidden" extended to
+provenance. No new syntax.
+
+**D2 — packages resolve by the EXISTING filename convention; no new resolution rule.** Today
+`import a.b` → `<entry-dir>/a/b.align` (module decl must match). So `import pkg.router` →
+`pkg/router.align` and `import pkg.db.postgres` → `pkg/db/postgres.align` — this works **today**
+with zero compiler change (verified end-to-end 2026-07-19: a `pkg/router.align` root module + a
+`pkg/router/util.align` submodule with an in-package absolute import, called from `main`, compiles
+and runs on the current `alignc` unchanged). A package = its root module file `pkg/<name>.align` plus (optionally)
+its submodule tree `pkg/<name>/…`; a single-module package is one file; a namespace directory
+(`pkg/db/`) is owned by nobody and shared by its residents. No search paths, no `-I`, no env vars,
+no registry lookup at compile time — what is on disk is what compiles.
+
+**D3 — call sites stay fully qualified (`pkg.router.route(...)`); no import aliases.** Already the
+module rule (`util.math.fn(...)`). An alias (`import x as y`) would hide provenance at the call
+site — rejected for the same reason `where`/`filter` synonyms are. The trust tier from D1 is
+therefore visible at every use, not only in the header.
+
+**D4 — a package's own imports are absolute; the repo layout mirrors the vendored layout; vendoring
+IS copying.** Inside `pkg/router/middleware.align`, a sibling import is written
+`import pkg.router.util` — the same absolute path a consumer would write. Consequence: a package
+author develops in a workspace whose own `pkg/<name>/` holds the package (plus root-level
+example/test entry files), and publishing = sharing that subtree; a consumer vendors it by copying
+it to the same place. No source rewriting on vendor (rewriting is hidden magic), no "develop layout"
+vs "installed layout" split. The compiler cannot tell vendored code from hand-written code — by
+design: your dependencies are ordinary source in your tree, fully greppable/auditable (maximally
+AI-friendly: the whole dependency closure is in-context).
+
+**D5 — ONE version of a package per build, by construction.** `pkg/<name>/` can exist once, so the
+diamond problem is resolved by whoever populates the tree, not by a version solver; type identity
+stays unambiguous (two versions of `pkg.foo.Point` can never coexist). An incompatible major
+version is a **new name at publish time** (`pkg.router2`) — the Go `/v2` convention without the
+special-cased path segment. No semver resolver, no MVS, no lockfile-driven builds: version
+*selection* is a fetch-tool/human concern that ends before the compiler starts.
+
+**D6 — the compiler stays manifest-free; hermetic builds.** `alignc build` reads `.align` files,
+full stop. Dependency *names* are derivable from source (`grep 'import pkg\.'` — no manifest to
+drift, same argument as M15's unit graph). Only *sources/versions* need recording, and that record
+(`align.lock` at the project root: name → URL + rev + content hash, written and read **only** by
+the future fetch tool) is a tool artifact invisible to the compiler. There is deliberately **no
+build-configuration language** — `alignc build <entry>` + the M15 cache IS the build system; a
+multi-binary workspace is one entry file per binary sharing the project root.
+
+**D7 — `internal` path rule (the one new visibility rule).** An import whose path contains a
+segment `internal` is legal only if the importer's module path starts with the path prefix up to
+the `internal` segment's parent: `pkg/router/internal/pool.align` (`pkg.router.internal.pool`) is
+importable from `pkg.router.*` only. Pure path rule (Go-proven), zero syntax, no package-boundary
+metadata needed. Without it every module is forever public API and narrowing later is a break; with
+it, `pub` keeps meaning "visible to my importers" and the path decides who may import at all. Also
+applies outside `pkg/` (a project may hide its own internals from... nothing today, but the rule is
+uniform and future-proof for compiled distribution).
+
+**D8 — layering is enforced: a module under `pkg/` may import only `core` / `std` / `pkg`.** A
+vendored package importing the consuming project's modules would compile in one tree and nowhere
+else (and inverts the dependency arrow). Cheap path check at import resolution; keeps §18's
+layering (core → std → pkg → project) a compiler-checked fact instead of a convention.
+
+**D9 — one visibility model.** Module-level `pub` + the D7 path rule. No `pub(pkg)` / export lists
+/ re-export machinery — a second visibility granularity is exactly the complexity budget Align
+refuses (and D7 makes it unnecessary: hide a module by path, hide an item by omitting `pub`).
+
+**D10 — dead modules cost nothing; no exclusion config.** The BFS compiles only modules reachable
+from the entry's imports, so a vendored package's tests/examples/benches are simply never touched.
+No "exclude" lists, no test-vs-src manifest keys.
+
+**D11 — the fetch tool is deferred; manual vendoring is the v1 mechanism.** Copying a package's
+subtree into `pkg/` is a complete, working dependency mechanism on day one (and stays the
+ground-truth even after a tool exists — the tool only automates the copy + records provenance in
+`align.lock`). A minimal `alignc pkg add <git-url>` verb, registry infrastructure, and signing are
+all deferred until real consumers exist; none changes the compiler-side model above.
+
+**D12 — compiled-library distribution: Future, already enabled by M15.** `InterfaceSummary` ships
+generic `pub` bodies as source, carries three-valued effect bits and the capability (link-lib) set,
+and has a versioned bounds-checked codec — so an interface + per-unit-objects bundle (a closed-source
+package) is a packaging exercise, not a redesign. Deferred with record until a consumer demands it;
+source-first remains the default distribution (auditable, cache makes recompiles cheap).
+
+**Soundness carries over unchanged.** The DAG rule + bottom-up interface checking + body-blind
+escape analysis + type-derived Move/Copy + interface effect bits were all designed
+restriction-first in M15; a package boundary is just a module boundary, so cross-package inference
+is exactly cross-module inference. Capabilities already flow: a pkg dep using `std.crypto` surfaces
+its `-l` libs through the existing interface→link-union path.
+
+**Future tooling (recorded, not v1):** a per-package capability report (`alignc deps`: package →
+the `std.*`/`unsafe`/`extern` surface it reaches — derivable from imports + interfaces; the audit
+story for AI-vendored dependencies), and a lint gating `unsafe`/FFI inside `pkg/` behind an
+explicit allow.
+
+**Not adopted (with reasons):** a compile-time-read manifest (drift; second source of truth); a
+version resolver in the compiler (one-version-by-construction makes it moot); import aliases (hide
+provenance); source rewriting on vendor (hidden magic); registry-first distribution (vendoring is
+the primitive; a registry only feeds it); build scripts / config languages (the entry file + cache
+is the build system); `pub(pkg)` granularity (D9).
+
+**v1 implementation scope (when the consumer-gate opens):** ① the D7 `internal` path rule + ② the
+D8 pkg-layering rule (both are import-edge checks in `load_units`/sema), ③ spec text — `draft.md`
+§17 (the two rules) + §18.3 (replace the placeholder with this model), `language-spec.md` digest,
+`design-notes.md` rationale. Everything else already works or is deferred above.
 
 ### FFI (foreign function interface) — v1 COMPLETE (keystone for the library strategy)
 Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
