@@ -173,7 +173,18 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
 - **`json.doc`（J4）:** スキーマ未知の遅延ビュー — arena 常駐 tape。ナビゲーションは total かつ
   Missing 伝播（`get`/`at` は常に doc を返し、欠落は葉の `as_*` の `None` として一度だけ現れる）。
   キーがデータの object は順序付き `key(i)`+`at(i)` で吸収、`elems()` で 1 階層を materialize して
-  pipeline に流す（map 型も serde 式 value 木も導入しない）。
+  pipeline に流す（map 型も serde 式 value 木も導入しない）。**Slice 1 SHIPPED:** `json.doc` 型 +
+  `json.doc(s)?` パース（arena 常駐 tape、`Result<json.doc, Error>`）+ `kind()`（→ 組み込み
+  `json.kind` 直和型）+ `get`/`at` ナビゲーション + 4 つの葉アクセサ `as_str`/`as_i64`/`as_f64`/
+  `as_bool`（→ `Option`。`as_str` は入力へのゼロコピービュー、エスケープ文字列は arena に unescape）。
+  数値は**形**でアクセサが決まる（`42.0` / `1e3` は整数値だが非整数形 → `as_i64` は `None`、`as_f64`
+  は `Some`。simdjson on-demand と同じ）。**重複キー**の `get` は**最初**の出現を返す（遅延ビュー。
+  `decode` の last-wins とは意図的に異なる。重複キーは両者で pathological）。**Slice 2 に延期:**
+  `len()`、`elems()`（1 階層を pipeline 用に materialize）、`key(i)`（順序付き object-as-data）。
+  **既知の systemic な緩さ（J4 の退行ではない — `decode` のスキャナと共有）:** 文字列内の生の C0 制御
+  バイトと数値の先頭ゼロ（`007`）を現状は受理する。共有の `find_quote_or_escape` / `number_span` を
+  RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと
+  同じ不正入力 `s` に対し `json.doc(s)` と `json.decode(s)` が食い違う）。
 - **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
   source 専用。
 

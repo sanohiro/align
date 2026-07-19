@@ -2453,3 +2453,89 @@ fn json_decode_top_level_str_target_deferred() {
          fn main() -> i32 = 0\n"
     ));
 }
+
+// ── json.doc (J4): the schema-unknown lazy document view ──────────────────────────────────────
+
+#[test]
+fn json_doc_navigate_kind_and_leaf_accessors() {
+    if !backend_available() {
+        return;
+    }
+    // Parse a mixed document once, then navigate + read leaves. `kind()` → json.kind (matched by
+    // bare variant name); `get`/`at` chain over temporaries (a json.doc is Copy); `as_*` → Option
+    // (unwrapped with `else`); a missing member / wrong-type accessor surfaces as Missing / None.
+    let src = "import core.json\n\
+fn run() -> Result<(), Error> {\n\
+  arena {\n\
+    d := json.doc(\"{\\\"a\\\": 42, \\\"b\\\": [true, \\\"hi\\\", 2.5], \\\"c\\\": null}\")?\n\
+    print(match d.kind() { Object => 1, _ => 0 })\n\
+    print(d.get(\"a\").as_i64() else 0)\n\
+    print(d.get(\"b\").at(0).as_bool() else false)\n\
+    print(d.get(\"b\").at(1).as_str() else \"?\")\n\
+    print(d.get(\"b\").at(2).as_f64() else 0.0)\n\
+    print(d.get(\"c\").as_i64() else -1)\n\
+    print(match d.get(\"zzz\").kind() { Missing => 9, _ => 0 })\n\
+    print(d.get(\"b\").as_i64() else -7)\n\
+  }\n\
+  return Ok(())\n\
+}\n\
+fn main() -> Result<(), Error> {\n\
+  run()?\n\
+  return Ok(())\n\
+}\n";
+    let out = build_and_run("json-doc-nav", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n42\ntrue\nhi\n2.5\n-1\n9\n-7\n");
+}
+
+#[test]
+fn json_doc_malformed_is_err_ok_is_parsed() {
+    if !backend_available() {
+        return;
+    }
+    // `json.doc` returns `Result` — malformed input is `Err` (not a panic), a valid document `Ok`.
+    let src = "import core.json\n\
+fn check(s: str) -> i32 {\n\
+  arena {\n\
+    return match json.doc(s) { Ok(_) => 1, Err(_) => 0 }\n\
+  }\n\
+}\n\
+fn main() -> i32 {\n\
+  return check(\"{\\\"a\\\": 1}\") * 10 + check(\"{bad\")\n\
+}\n";
+    let out = build_and_run("json-doc-err", src);
+    // valid → 1, malformed → 0: 1*10 + 0 = 10.
+    assert_eq!(out.status.code(), Some(10));
+}
+
+#[test]
+fn json_doc_requires_arena() {
+    // The tape is arena-allocated, so `json.doc` outside an `arena {}` is a compile error (like the
+    // soa decode / `fs.read_file_view`), not a silent leak.
+    assert!(check_errs(
+        "json-doc-no-arena",
+        "import core.json\n\
+         fn f(s: str) -> Result<(), Error> {\n\
+           d := json.doc(s)?\n\
+           return Ok(())\n\
+         }\n\
+         fn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
+fn json_doc_view_cannot_escape_arena() {
+    // A `str` read from a doc (`as_str`) is a view into the input/arena — returning it out of the
+    // arena that owns the tape is rejected (#297), like every arena-bound view.
+    assert!(check_errs(
+        "json-doc-escape",
+        "import core.json\n\
+         fn first(s: str) -> Result<str, Error> {\n\
+           arena {\n\
+             d := json.doc(s)?\n\
+             return Ok(d.at(0).as_str() else \"?\")\n\
+           }\n\
+         }\n\
+         fn main() -> i32 = 0\n"
+    ));
+}

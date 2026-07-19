@@ -5903,6 +5903,541 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+// ===================== json.doc — schema-unknown lazy document view (J4) =====================
+//
+// `json.doc(s)?` parses the input ONCE into an arena-backed tape, then navigation is total and
+// Missing-propagating (`d.get("k")` / `d.at(i)` always return a doc; a missing member / out-of-range
+// index yields a `Missing` doc that propagates). The Align-side value is a **Copy** `{ tape, node }`
+// handle (`node < 0` == Missing); the tape (header + node array) lives in the arena passed at parse
+// time, bulk-freed at arena end — so a doc (and any `str`/sub-doc view of it) cannot outlive its
+// arena. The tape is a flat `simdjson`-style node array with per-node sibling-skip offsets, so each
+// navigation hop at one nesting level is O(1) (a whole level is a linear walk — `elems()`, a later
+// slice, materializes it). This is deliberately NOT a serde-style per-node heap value tree.
+
+/// One tape node (16 bytes). Built by a full recursive-descent validate+emit pass over the input.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DocNode {
+    /// 0 Object, 1 Array, 2 Str, 3 Number, 4 Bool, 5 Null. `Missing` (6) is never a node — it is a
+    /// `node < 0` handle. Matches the `json.kind` enum's variant order exactly.
+    kind: u32,
+    /// Index of the node following this one's WHOLE subtree (sibling skip). For a scalar this is
+    /// `idx + 1`; for a container it is the index one past its last member/element's subtree.
+    next: u32,
+    /// Object/Array: the member / element count. Str/Number: the byte start into the input (the raw
+    /// span, escapes included for a `str`). Bool: 0 or 1. Null: unused.
+    a: u32,
+    /// Str/Number: the raw byte length into the input. Unused for the other kinds.
+    b: u32,
+}
+
+const DOC_OBJECT: u32 = 0;
+const DOC_ARRAY: u32 = 1;
+const DOC_STR: u32 = 2;
+const DOC_NUMBER: u32 = 3;
+const DOC_BOOL: u32 = 4;
+const DOC_NULL: u32 = 5;
+/// The `json.kind` tag for a `Missing` doc (an absent member / out-of-range index / non-container
+/// navigation). Never stored in a node; returned by [`align_rt_json_doc_kind`] for a `node < 0`.
+const DOC_MISSING: i32 = 6;
+
+/// The arena-resident tape header the Align-side `{ tape, node }` handle's `tape` pointer addresses.
+/// Holds the input view (for the byte spans nodes reference), the node array, and the arena (for the
+/// one allocating accessor, `as_str` on an escaped string). All three live in / are pinned by the
+/// arena, so the whole structure is bulk-freed at arena end.
+#[repr(C)]
+pub struct DocTape {
+    input_ptr: *const u8,
+    input_len: usize,
+    nodes: *const DocNode,
+    nodes_len: usize,
+    arena: *mut Arena,
+}
+
+/// The Align-side `json.doc` value: a Copy `{ tape, node }` handle, laid out like a slice
+/// (`{ptr, i64}`). `node < 0` is `Missing`. Written into the out slot by parse / `get` / `at`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DocHandle {
+    tape: *const DocTape,
+    node: i64,
+}
+
+/// Read 4 hex digits of a `\uXXXX` escape starting at `raw[i]`, or `None` if short / non-hex.
+fn json_hex4(raw: &[u8], i: usize) -> Option<u32> {
+    let bytes = raw.get(i..i + 4)?;
+    let mut v = 0u32;
+    for &b in bytes {
+        v = v * 16 + (b as char).to_digit(16)?;
+    }
+    Some(v)
+}
+
+/// Decode the JSON string body `raw` (the bytes between the quotes, escapes present) into `out`,
+/// honoring the RFC 8259 short escapes and `\uXXXX` (with surrogate pairs). Returns `false` on any
+/// malformed escape — the tape builder validates escapes at parse time (via this same routine over a
+/// scratch buffer), so a live `as_str` never fails, but it stays total. `out` is appended to.
+fn json_unescape_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&e) = raw.get(i) else { return false };
+        i += 1;
+        match e {
+            b'"' => out.push(b'"'),
+            b'\\' => out.push(b'\\'),
+            b'/' => out.push(b'/'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'u' => {
+                let Some(cp) = json_hex4(raw, i) else { return false };
+                i += 4;
+                let scalar = if (0xD800..=0xDBFF).contains(&cp) {
+                    // A high surrogate must be followed by a `\uXXXX` low surrogate.
+                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') {
+                        return false;
+                    }
+                    let Some(lo) = json_hex4(raw, i + 2) else { return false };
+                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                        return false;
+                    }
+                    i += 6;
+                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..=0xDFFF).contains(&cp) {
+                    return false; // a lone low surrogate
+                } else {
+                    cp
+                };
+                let Some(c) = char::from_u32(scalar) else { return false };
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The recursive tape builder: walks the input with a [`JsonParser`], validating the JSON grammar
+/// (and every string escape), and emits one [`DocNode`] per value. `None` on any malformed input.
+struct DocBuilder<'a> {
+    p: JsonParser<'a>,
+    nodes: Vec<DocNode>,
+    /// Reused scratch for validating a string's escapes at parse time (cleared per string).
+    scratch: Vec<u8>,
+}
+
+impl<'a> DocBuilder<'a> {
+    /// Scan a `"..."` string, returning the raw content span `(start, len)` (escapes included) and
+    /// advancing past the closing quote. Validates every escape (so `as_str` can always unescape).
+    fn scan_string(&mut self) -> Option<(u32, u32)> {
+        self.p.expect(b'"')?;
+        let start = self.p.pos;
+        loop {
+            let off = find_quote_or_escape(&self.p.src[self.p.pos..])?;
+            self.p.pos += off;
+            match self.p.src[self.p.pos] {
+                b'"' => {
+                    let end = self.p.pos;
+                    self.p.pos += 1;
+                    let raw = &self.p.src[start..end];
+                    if raw.contains(&b'\\') {
+                        self.scratch.clear();
+                        if !json_unescape_into(raw, &mut self.scratch) {
+                            return None; // a malformed escape → malformed document
+                        }
+                    }
+                    return Some((start as u32, (end - start) as u32));
+                }
+                // A `\`: step over the backslash and its escaped byte; the escape's validity is
+                // confirmed by the whole-span `json_unescape_into` above once the quote is found.
+                _ => {
+                    self.p.pos += 1;
+                    self.p.peek()?;
+                    self.p.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Parse one JSON value at the cursor, emitting its subtree. Depth-bounded like [`skip_value`].
+    fn value(&mut self, depth: u32) -> Option<()> {
+        const MAX_DEPTH: u32 = 128;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        self.p.ws();
+        match self.p.peek()? {
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
+            b'"' => {
+                let (a, b) = self.scan_string()?;
+                self.push(DOC_STR, a, b);
+                Some(())
+            }
+            b't' | b'f' => {
+                let v = self.p.boolean()?;
+                self.push(DOC_BOOL, v as u32, 0);
+                Some(())
+            }
+            b'n' => {
+                self.p.skip_null()?;
+                self.push(DOC_NULL, 0, 0);
+                Some(())
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = self.p.pos;
+                self.p.number_span()?;
+                self.push(DOC_NUMBER, start as u32, (self.p.pos - start) as u32);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Push a scalar/leaf node whose subtree is just itself (`next = idx + 1`).
+    fn push(&mut self, kind: u32, a: u32, b: u32) {
+        let next = self.nodes.len() as u32 + 1;
+        self.nodes.push(DocNode { kind, next, a, b });
+    }
+
+    fn object(&mut self, depth: u32) -> Option<()> {
+        let oi = self.nodes.len();
+        self.nodes.push(DocNode { kind: DOC_OBJECT, next: 0, a: 0, b: 0 }); // patched below
+        self.p.expect(b'{')?;
+        self.p.ws();
+        let mut count = 0u32;
+        if self.p.peek() == Some(b'}') {
+            self.p.pos += 1;
+        } else {
+            loop {
+                self.p.ws();
+                // Member key: an emitted `Str` node immediately preceding the value subtree. Its
+                // `next` points at the value (`idx + 1`), so a whole member is `[key, value…]`.
+                let (ka, kb) = self.scan_string()?;
+                self.push(DOC_STR, ka, kb);
+                self.p.ws();
+                self.p.expect(b':')?;
+                self.value(depth + 1)?;
+                count = count.checked_add(1)?;
+                self.p.ws();
+                match self.p.peek() {
+                    Some(b',') => self.p.pos += 1,
+                    Some(b'}') => {
+                        self.p.pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        let end = self.nodes.len() as u32;
+        self.nodes[oi].next = end;
+        self.nodes[oi].a = count;
+        Some(())
+    }
+
+    fn array(&mut self, depth: u32) -> Option<()> {
+        let ai = self.nodes.len();
+        self.nodes.push(DocNode { kind: DOC_ARRAY, next: 0, a: 0, b: 0 }); // patched below
+        self.p.expect(b'[')?;
+        self.p.ws();
+        let mut count = 0u32;
+        if self.p.peek() == Some(b']') {
+            self.p.pos += 1;
+        } else {
+            loop {
+                self.value(depth + 1)?; // element subtree (skips leading ws itself)
+                count = count.checked_add(1)?;
+                self.p.ws();
+                match self.p.peek() {
+                    Some(b',') => self.p.pos += 1,
+                    Some(b']') => {
+                        self.p.pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        let end = self.nodes.len() as u32;
+        self.nodes[ai].next = end;
+        self.nodes[ai].a = count;
+        Some(())
+    }
+}
+
+/// `json.doc(s)` — parse `input` into an arena-backed tape. On success writes the root `{ tape, 0 }`
+/// handle into `out` (a 16-byte `{ptr, i64}` slot) and returns 0; on malformed input returns 1
+/// (leaving `out` zeroed → the Align side maps it to `Err(Error.Invalid)`). The whole input is
+/// UTF-8-validated once (every `str` view handed out later is a zero-copy slice of it).
+///
+/// # Safety
+/// `input`/`input_len` must describe a valid byte range; `arena` must be a live arena handle; `out`
+/// must point to 16 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_parse(input: *const u8, input_len: i64, arena: *mut Arena, out: *mut DocHandle) -> i32 {
+    if arena.is_null() || out.is_null() {
+        return 1;
+    }
+    // The tape stores byte offsets as `u32`, so a >4 GiB input is out of range (rejected, not a
+    // panic). `safe_len` also rejects a negative / oversized length at the FFI boundary.
+    let Ok(len) = safe_len(input_len) else { return 1 };
+    if len > u32::MAX as usize {
+        return 1;
+    }
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
+    if !validate_utf8(src) {
+        return 1;
+    }
+    let mut db = DocBuilder { p: JsonParser { src, pos: 0 }, nodes: Vec::new(), scratch: Vec::new() };
+    let ok = (|| -> Option<()> {
+        db.value(0)?;
+        db.p.ws();
+        if db.p.pos != src.len() {
+            return None; // trailing garbage
+        }
+        // A node count past `u32::MAX` cannot be addressed by the `u32` sibling-skip offsets.
+        if db.nodes.len() > u32::MAX as usize {
+            return None;
+        }
+        Some(())
+    })();
+    if ok.is_none() {
+        return 1;
+    }
+    // Copy the tape (nodes + header) into the arena so it is bulk-freed at arena end. The Align-side
+    // handle is region-tied to min(input, arena), so nothing here can outlive either.
+    let arena_ref = unsafe { &mut *arena };
+    let n = db.nodes.len();
+    let nodes_ptr = if n == 0 {
+        core::ptr::null()
+    } else {
+        // `checked_mul`: on a 32-bit target `n * 16` wraps for `n > 256M` (n is bounded by `u32::MAX`
+        // above, so this only bites 32-bit) — bail rather than under-allocate and copy OOB.
+        let Some(bytes) = n.checked_mul(core::mem::size_of::<DocNode>()) else { return 1 };
+        let dst = arena_ref.alloc_uninit(bytes, core::mem::align_of::<DocNode>()) as *mut DocNode;
+        unsafe { core::ptr::copy_nonoverlapping(db.nodes.as_ptr(), dst, n) };
+        dst as *const DocNode
+    };
+    let tape_ptr = arena_ref.alloc_uninit(core::mem::size_of::<DocTape>(), core::mem::align_of::<DocTape>()) as *mut DocTape;
+    unsafe {
+        tape_ptr.write(DocTape { input_ptr: input, input_len: len, nodes: nodes_ptr, nodes_len: n, arena });
+        out.write(DocHandle { tape: tape_ptr, node: 0 });
+    }
+    0
+}
+
+/// The tape's input bytes as a slice — null-safe (`from_raw_parts(null, 0)` is UB, so an empty/absent
+/// input yields `&[]`). A live tape from a successful parse always has a non-null, ≥1-byte input (an
+/// empty document is a parse `Err`), but this stays total defensively.
+unsafe fn doc_input<'a>(t: &DocTape) -> &'a [u8] {
+    if t.input_ptr.is_null() || t.input_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(t.input_ptr, t.input_len) }
+    }
+}
+
+/// Resolve a `{ tape, node }` handle to its node, or `None` for a `Missing` handle (`node < 0`,
+/// out-of-range, or a null tape).
+unsafe fn doc_node<'a>(tape: *const DocTape, node: i64) -> Option<&'a DocNode> {
+    if tape.is_null() || node < 0 {
+        return None;
+    }
+    let t = unsafe { &*tape };
+    let i = node as usize;
+    if i >= t.nodes_len {
+        return None;
+    }
+    Some(unsafe { &*t.nodes.add(i) })
+}
+
+/// `d.kind()` → the `json.kind` tag (0 Object … 5 Null, 6 Missing). Total.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`] from [`align_rt_json_doc_parse`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_kind(tape: *const DocTape, node: i64) -> i32 {
+    match unsafe { doc_node(tape, node) } {
+        Some(n) => n.kind as i32,
+        None => DOC_MISSING,
+    }
+}
+
+/// `d.get(key)` — the value of object member `key`, or `Missing` (absent / not an object / already
+/// Missing). Writes a `{ tape, child }` handle into `out`. On a **duplicate** key (RFC-undefined),
+/// the **first** occurrence wins — the lazy-view semantics (stop at the first match, O(members) worst
+/// case, early-exit in the common case), matching simdjson's on-demand model. (This deliberately
+/// differs from the typed `json.decode`'s last-wins; duplicate keys are pathological in both.)
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `key`/`key_len` a valid range; `out` 16 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_get(tape: *const DocTape, node: i64, key: *const u8, key_len: i64, out: *mut DocHandle) {
+    if out.is_null() {
+        return;
+    }
+    let mut result = DocHandle { tape, node: -1 };
+    if let Some(n) = unsafe { doc_node(tape, node) }
+        && n.kind == DOC_OBJECT
+    {
+        let t = unsafe { &*tape };
+        let want: &[u8] = unsafe { safe_slice(key, key_len) };
+        let input = unsafe { doc_input(t) };
+        let mut mi = node as usize + 1;
+        for _ in 0..n.a {
+            let kn = unsafe { &*t.nodes.add(mi) };
+            let raw = &input[kn.a as usize..kn.a as usize + kn.b as usize];
+            if doc_key_eq(raw, want) {
+                result.node = kn.next as i64; // the value node
+                break;
+            }
+            let vi = kn.next as usize;
+            mi = unsafe { &*t.nodes.add(vi) }.next as usize;
+        }
+    }
+    unsafe { out.write(result) };
+}
+
+/// Compare a raw JSON key span (escapes possible) to a plain wanted key. Fast path: no `\` → a byte
+/// compare. Escaped keys unescape into a temporary before comparing.
+fn doc_key_eq(raw: &[u8], want: &[u8]) -> bool {
+    if !raw.contains(&b'\\') {
+        return raw == want;
+    }
+    let mut buf = Vec::new();
+    json_unescape_into(raw, &mut buf) && buf == want
+}
+
+/// `d.at(index)` — element `index` of an array, or `Missing` (out of range / not an array / already
+/// Missing). Writes a `{ tape, child }` handle into `out`.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` 16 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_at(tape: *const DocTape, node: i64, index: i64, out: *mut DocHandle) {
+    if out.is_null() {
+        return;
+    }
+    let mut result = DocHandle { tape, node: -1 };
+    if let Some(n) = unsafe { doc_node(tape, node) }
+        && n.kind == DOC_ARRAY
+        && index >= 0
+        && (index as u64) < n.a as u64
+    {
+        let t = unsafe { &*tape };
+        let mut ei = node as usize + 1;
+        for _ in 0..index {
+            ei = unsafe { &*t.nodes.add(ei) }.next as usize;
+        }
+        result.node = ei as i64;
+    }
+    unsafe { out.write(result) };
+}
+
+/// `d.as_str()` — `Some(str)` if this doc is a JSON string, else `None`. An escape-free string is a
+/// zero-copy view into the input; an escaped string is unescaped into the arena (the one allocating
+/// accessor). Returns 1 (present, `out` filled) or 0 (None).
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` must point to a writable [`AlignStr`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_as_str(tape: *const DocTape, node: i64, out: *mut AlignStr) -> i32 {
+    let Some(n) = (unsafe { doc_node(tape, node) }) else { return 0 };
+    if n.kind != DOC_STR {
+        return 0;
+    }
+    let t = unsafe { &*tape };
+    let input = unsafe { doc_input(t) };
+    let raw = &input[n.a as usize..n.a as usize + n.b as usize];
+    if !raw.contains(&b'\\') {
+        unsafe { out.write(AlignStr { ptr: raw.as_ptr(), len: raw.len() as i64 }) };
+        return 1;
+    }
+    // Escaped: unescape into the arena (bulk-freed at arena end, so the view stays valid). The parse
+    // validated the escapes, so this cannot fail; guard defensively regardless.
+    let mut buf = Vec::new();
+    if !json_unescape_into(raw, &mut buf) {
+        return 0;
+    }
+    let arena_ref = unsafe { &mut *t.arena };
+    let dst = arena_ref.alloc_uninit(buf.len(), 1);
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+    unsafe { out.write(AlignStr { ptr: dst, len: buf.len() as i64 }) };
+    1
+}
+
+/// The raw number-token bytes of a `Number` doc, or `None` if not a number.
+unsafe fn doc_number_span<'a>(tape: *const DocTape, node: i64) -> Option<&'a str> {
+    let n = unsafe { doc_node(tape, node) }?;
+    if n.kind != DOC_NUMBER {
+        return None;
+    }
+    let t = unsafe { &*tape };
+    let input = unsafe { doc_input(t) };
+    // The span was validated as a JSON number over UTF-8-validated input, so it is valid ASCII.
+    core::str::from_utf8(&input[n.a as usize..n.a as usize + n.b as usize]).ok()
+}
+
+/// `d.as_i64()` — `Some(i64)` if this doc is a JSON number in **integer lexical form** within `i64`
+/// range, else `None` (not a number, a fractional / exponent form even when integer-valued like
+/// `42.0` / `1e3`, or out of range). Returns 1/0. (Integer-valued floats stay `as_f64`'s domain — a
+/// number's *form* selects the accessor, matching simdjson's on-demand `get_int64`.)
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` must point to a writable `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_as_i64(tape: *const DocTape, node: i64, out: *mut i64) -> i32 {
+    match unsafe { doc_number_span(tape, node) }.and_then(|s| s.parse::<i64>().ok()) {
+        Some(v) => {
+            unsafe { out.write(v) };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// `d.as_f64()` — `Some(f64)` if this doc is a JSON number, else `None`. Returns 1/0.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` must point to a writable `f64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_as_f64(tape: *const DocTape, node: i64, out: *mut f64) -> i32 {
+    match unsafe { doc_number_span(tape, node) }.and_then(|s| s.parse::<f64>().ok()) {
+        Some(v) => {
+            unsafe { out.write(v) };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// `d.as_bool()` — `Some(bool)` if this doc is a JSON bool, else `None`. Returns 1/0; the bool is
+/// written as a `u8` (0/1) into `out`.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` must point to a writable byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_as_bool(tape: *const DocTape, node: i64, out: *mut u8) -> i32 {
+    match unsafe { doc_node(tape, node) } {
+        Some(n) if n.kind == DOC_BOOL => {
+            unsafe { out.write(n.a as u8) };
+            1
+        }
+        _ => 0,
+    }
+}
+
 /// Finish an arena-backed builder, returning a `str` view and freeing the builder object.
 /// Compiler-generated arena-free templates use [`align_rt_builder_into_string`] instead. The null
 /// arena arm remains a legacy FFI fallback and leaks its bytes to keep the returned view valid.
@@ -24133,5 +24668,157 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             (after - before).abs() <= 50,
             "array<string> built from array_builder must free every element (no leak): {before} -> {after}"
         );
+    }
+
+    // ── json.doc (J4) ──────────────────────────────────────────────────────────────────────────
+
+    /// Parse `s` into a fresh arena, returning the arena and the root handle. The caller must
+    /// `align_rt_arena_end(arena)` after inspecting (every returned view / sub-doc dies with it).
+    unsafe fn doc_parse(s: &str) -> Option<(*mut Arena, DocHandle)> {
+        let arena = align_rt_arena_begin();
+        let mut h = DocHandle { tape: core::ptr::null(), node: 0 };
+        let code = unsafe { align_rt_json_doc_parse(s.as_ptr(), s.len() as i64, arena, &mut h) };
+        if code != 0 {
+            unsafe { align_rt_arena_end(arena) };
+            return None;
+        }
+        Some((arena, h))
+    }
+
+    fn doc_str(tape: *const DocTape, node: i64) -> Option<String> {
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        if unsafe { align_rt_json_doc_as_str(tape, node, &mut out) } == 1 {
+            let bytes = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) };
+            Some(String::from_utf8(bytes.to_vec()).unwrap())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn json_doc_navigates_object_array_and_leaves() {
+        let (arena, root) = unsafe { doc_parse(r#"{"a": 1, "b": [true, "x", 2.5], "c": null}"#) }.expect("parse");
+        let t = root.tape;
+        assert_eq!(unsafe { align_rt_json_doc_kind(t, root.node) }, DOC_OBJECT as i32);
+
+        // d.get("a").as_i64() == Some(1)
+        let mut a = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "a".as_ptr(), 1, &mut a) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(a.tape, a.node) }, DOC_NUMBER as i32);
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(a.tape, a.node, &mut iv) }, 1);
+        assert_eq!(iv, 1);
+
+        // d.get("b").at(0).as_bool() == Some(true); .at(1).as_str() == "x"; .at(2).as_f64() == 2.5
+        let mut b = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "b".as_ptr(), 1, &mut b) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(b.tape, b.node) }, DOC_ARRAY as i32);
+        let mut e0 = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_at(b.tape, b.node, 0, &mut e0) };
+        let mut bv = 2u8;
+        assert_eq!(unsafe { align_rt_json_doc_as_bool(e0.tape, e0.node, &mut bv) }, 1);
+        assert_eq!(bv, 1);
+        let mut e1 = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_at(b.tape, b.node, 1, &mut e1) };
+        assert_eq!(doc_str(e1.tape, e1.node).as_deref(), Some("x"));
+        let mut e2 = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_at(b.tape, b.node, 2, &mut e2) };
+        let mut fv = 0f64;
+        assert_eq!(unsafe { align_rt_json_doc_as_f64(e2.tape, e2.node, &mut fv) }, 1);
+        assert_eq!(fv, 2.5);
+
+        // d.get("c").kind() == Null
+        let mut c = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "c".as_ptr(), 1, &mut c) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(c.tape, c.node) }, DOC_NULL as i32);
+
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_missing_propagates_and_wrong_type_is_none() {
+        let (arena, root) = unsafe { doc_parse(r#"{"a": {"b": 1}}"#) }.expect("parse");
+        let t = root.tape;
+        // Missing member → Missing; navigation on Missing stays Missing.
+        let mut miss = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "zzz".as_ptr(), 3, &mut miss) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(miss.tape, miss.node) }, DOC_MISSING);
+        let mut miss2 = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(miss.tape, miss.node, "b".as_ptr(), 1, &mut miss2) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(miss2.tape, miss2.node) }, DOC_MISSING);
+        // .at on an object, .get on a number → Missing; a leaf accessor of the wrong kind → None.
+        let mut oob = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_at(t, root.node, 0, &mut oob) };
+        assert_eq!(unsafe { align_rt_json_doc_kind(oob.tape, oob.node) }, DOC_MISSING);
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(t, root.node, &mut iv) }, 0); // object is not an i64
+        assert!(doc_str(t, root.node).is_none());
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_top_level_scalar_and_escapes() {
+        // A bare top-level scalar is a valid document.
+        let (arena, root) = unsafe { doc_parse("42") }.expect("parse bare number");
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(root.tape, root.node, &mut iv) }, 1);
+        assert_eq!(iv, 42);
+        unsafe { align_rt_arena_end(arena) };
+
+        // An escaped string unescapes (incl. `\uXXXX` and a surrogate pair 😀 = U+1F600).
+        let (arena, root) = unsafe { doc_parse(r#"{"kA": "a\tbé😀"}"#) }.expect("parse escapes");
+        let t = root.tape;
+        let mut v = DocHandle { tape: core::ptr::null(), node: 0 };
+        // Key "kA" (from `kA`).
+        unsafe { align_rt_json_doc_get(t, root.node, "kA".as_ptr(), 2, &mut v) };
+        assert_eq!(doc_str(v.tape, v.node).as_deref(), Some("a\tbé😀"));
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_duplicate_key_first_wins() {
+        // Lazy-view semantics: get() returns the FIRST occurrence of a duplicated key (simdjson
+        // on-demand), deliberately distinct from json.decode's last-wins. Pinned so it can't drift.
+        let (arena, root) = unsafe { doc_parse(r#"{"k": 1, "k": 2}"#) }.expect("parse");
+        let t = root.tape;
+        let mut v = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "k".as_ptr(), 1, &mut v) };
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(v.tape, v.node, &mut iv) }, 1);
+        assert_eq!(iv, 1, "duplicate key: first occurrence wins");
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_number_form_selects_accessor() {
+        // `42.0` and `1e3` are integer-VALUED but in fractional/exponent FORM → as_i64 None, as_f64 Some.
+        let (arena, root) = unsafe { doc_parse(r#"[42.0, 1e3, 7]"#) }.expect("parse");
+        let t = root.tape;
+        let get = |i: i64| {
+            let mut e = DocHandle { tape: core::ptr::null(), node: 0 };
+            unsafe { align_rt_json_doc_at(t, root.node, i, &mut e) };
+            e
+        };
+        let e0 = get(0);
+        let mut iv = 0i64;
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(e0.tape, e0.node, &mut iv) }, 0, "42.0 is not integer form");
+        let mut fv = 0f64;
+        assert_eq!(unsafe { align_rt_json_doc_as_f64(e0.tape, e0.node, &mut fv) }, 1);
+        assert_eq!(fv, 42.0);
+        let e2 = get(2); // 7 is integer form → both work
+        assert_eq!(unsafe { align_rt_json_doc_as_i64(e2.tape, e2.node, &mut iv) }, 1);
+        assert_eq!(iv, 7);
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_malformed_is_err() {
+        for bad in [r#"{"a": }"#, "[1,", "tru", r#""unterminated"#, "{,}", r#"{"a" 1}"#, "1 2", r#"{"a": "\x"}"#] {
+            let arena = align_rt_arena_begin();
+            let mut h = DocHandle { tape: core::ptr::null(), node: 0 };
+            let code = unsafe { align_rt_json_doc_parse(bad.as_ptr(), bad.len() as i64, arena, &mut h) };
+            assert_eq!(code, 1, "expected Err for malformed input {bad:?}");
+            unsafe { align_rt_arena_end(arena) };
+        }
     }
 }

@@ -313,9 +313,12 @@ OpenAI request/response round-trips; the element struct must be non-owned in v1.
 stay primitive/`str`. The settled completeness design (draft §14): a JSON `oneOf` maps to a sum
 type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1) dispatch, encode
 writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
-`json.doc` view (no serde-style value tree, no map type); `json.scan` streams typed rows as a
-pipeline source. The core.json surface is exactly `decode`/`encode`/`doc`/`scan` — `validate<T>`,
-`token`, and `field_table<T>` are deleted. See `draft.md` §9, §14, §18.1.
+`json.doc` view (no serde-style value tree, no map type) — `d := json.doc(s)?` in an `arena {}`, then
+total Missing-propagating navigation `d.get(k)` / `d.at(i)` (always a `json.doc`), `d.kind()` → the
+builtin `json.kind` sum type, and leaf accessors `as_str` / `as_i64` / `as_f64` / `as_bool` → `Option`
+(`elems`/`key`/`len` are a later slice); `json.scan` streams typed rows as a pipeline source. The
+core.json surface is exactly `decode`/`encode`/`doc`/`scan` — `validate<T>`, `token`, and
+`field_table<T>` are deleted. See `draft.md` §9, §14, §18.1.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

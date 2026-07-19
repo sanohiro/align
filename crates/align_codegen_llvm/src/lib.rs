@@ -1324,6 +1324,53 @@ fn build_module<'c>(
             None,
         ),
     );
+    // ── json.doc (J4) ──────────────────────────────────────────────────────────────────────────
+    funcs.insert(
+        // json.doc(input, input_len, arena, out: *{tape,node}) -> i32 status (0 = ok). Parse into an
+        // arena-backed tape; on malformed input returns 1 (out stays zeroed → Err(Error.Invalid)).
+        "json_doc_parse".to_string(),
+        module.add_function(
+            "align_rt_json_doc_parse",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // d.kind()(tape, node) -> i32 the json.kind tag (6 = Missing). Total.
+        "json_doc_kind".to_string(),
+        module.add_function("align_rt_json_doc_kind", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // d.get(tape, node, key, key_len, out: *{tape,node}) -> void. Writes the child handle (Missing if absent).
+        "json_doc_get".to_string(),
+        module.add_function(
+            "align_rt_json_doc_get",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // d.at(tape, node, index, out: *{tape,node}) -> void. Writes the element handle (Missing if OOB).
+        "json_doc_at".to_string(),
+        module.add_function(
+            "align_rt_json_doc_at",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    // The three leaf accessors share the (tape, node, out) -> i32 present-flag shape; the out slot's
+    // type (str view / i64 / f64 / u8) differs but is an opaque `ptr` at the ABI.
+    for (name, sym) in [
+        ("json_doc_as_str", "align_rt_json_doc_as_str"),
+        ("json_doc_as_i64", "align_rt_json_doc_as_i64"),
+        ("json_doc_as_f64", "align_rt_json_doc_as_f64"),
+        ("json_doc_as_bool", "align_rt_json_doc_as_bool"),
+    ] {
+        funcs.insert(
+            name.to_string(),
+            module.add_function(sym, ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+        );
+    }
     funcs.insert(
         // fs.read_file (path_ptr, path_len, out: *{ptr,len}) -> i32 status (std.fs).
         "fs_read_file".to_string(),
@@ -2745,7 +2792,9 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Enum(id) => ex[id as usize].into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
+        // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -2857,7 +2906,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
-        Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx, ex),
@@ -3219,6 +3268,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // (it only rides an `Option`/`Result`, e.g. `read_bytes_view`), but sizing it correctly (vs.
         // `unreachable!`) keeps this total should a slice element ever be sized here.
         Scalar::Slice(_) => 16,
+        // A `json.doc` handle is a `{tape,node}` = `{ptr,i64}`, 16 bytes (like `Str`/`Slice`). Never a
+        // box/array payload today (it only rides an `Option`/`Result`), but sized correctly for totality.
+        Scalar::JsonDoc => 16,
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
@@ -6572,6 +6624,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena, .. } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
             Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => self.gen_json_decode_union(*enum_id, input, *out)?,
+            // json.doc (J4). `get`/`at` are void (the runtime writes the child handle into `out`).
+            Rvalue::JsonDoc { input, arena, out } => self.gen_json_doc(input, arena, *out)?,
+            Rvalue::JsonDocKind { doc } => self.gen_json_doc_kind(doc, result_ty)?,
+            Rvalue::JsonDocGet { doc, key, out } => {
+                self.gen_json_doc_get(doc, key, *out)?;
+                return Ok(None);
+            }
+            Rvalue::JsonDocAt { doc, index, out } => {
+                self.gen_json_doc_at(doc, index, *out)?;
+                return Ok(None);
+            }
+            Rvalue::JsonDocAsStr { doc, out } => self.gen_json_doc_as_str(doc, *out)?,
+            Rvalue::JsonDocAsScalar { scalar, doc, out } => self.gen_json_doc_as_scalar(*scalar, doc, *out)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8719,6 +8784,110 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode returns i32"))
+    }
+
+    /// `json.doc(input)` (J4): zero the out `{tape,node}` slot, then call the runtime parser with the
+    /// input `{ptr,len}` and the enclosing arena handle. Returns the i32 status (0 = ok).
+    fn gen_json_doc(&mut self, input: &Operand, arena: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (in_ptr, in_len) = self.split_str(input)?;
+        let ah = self.operand(arena);
+        let cs = self
+            .builder
+            .build_call(self.funcs["json_doc_parse"], &[in_ptr.into(), in_len.into(), ah.into(), out_ptr.into()], "jdoc")
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_doc_parse returns i32"))
+    }
+
+    /// Split a `json.doc` handle operand into `(tape_ptr, node_i64)` — the same `{ptr,i64}` layout as
+    /// a `str`/slice, so `split_str` does exactly the right extraction.
+    fn split_doc(&mut self, op: &Operand) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
+        self.split_str(op)
+    }
+
+    /// `d.kind()` (J4): call the runtime for the i32 `json.kind` tag, then wrap it into the tag-only
+    /// enum aggregate `{ i32 }` (like [`Rvalue::MakeError`] but a single field).
+    fn gen_json_doc_kind(&mut self, doc: &Operand, result_ty: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let (tape, node) = self.split_doc(doc)?;
+        let tag = self
+            .builder
+            .build_call(self.funcs["json_doc_kind"], &[tape.into(), node.into()], "jkind")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("json_doc_kind returns i32");
+        let Ty::Enum(id) = result_ty else { unreachable!("d.kind() has an enum result type") };
+        let sty = self.enum_types[id as usize];
+        Ok(self
+            .builder
+            .build_insert_value(sty.const_zero(), tag, 0, "jkindtag")
+            .map_err(|e| self.err(e))?
+            .into_struct_value()
+            .into())
+    }
+
+    /// `d.get(key)` (J4): zero the out `{tape,node}` slot, then call the void runtime navigator, which
+    /// writes the child handle (`Missing` if absent). The result is loaded from `out` by the caller.
+    fn gen_json_doc_get(&mut self, doc: &Operand, key: &Operand, out: Slot) -> Result<(), CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (tape, node) = self.split_doc(doc)?;
+        let (kp, kl) = self.split_str(key)?;
+        self.builder
+            .build_call(self.funcs["json_doc_get"], &[tape.into(), node.into(), kp.into(), kl.into(), out_ptr.into()], "")
+            .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    /// `d.at(index)` (J4): the array-index sibling of [`Self::gen_json_doc_get`].
+    fn gen_json_doc_at(&mut self, doc: &Operand, index: &Operand, out: Slot) -> Result<(), CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (tape, node) = self.split_doc(doc)?;
+        let idx = self.operand(index);
+        self.builder
+            .build_call(self.funcs["json_doc_at"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "")
+            .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    /// `d.as_str()` (J4): zero the out `{ptr,len}` slot, then call the runtime accessor, which writes a
+    /// `str` view into `out` on a JSON string and returns an i32 present flag.
+    fn gen_json_doc_as_str(&mut self, doc: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (tape, node) = self.split_doc(doc)?;
+        Ok(self
+            .builder
+            .build_call(self.funcs["json_doc_as_str"], &[tape.into(), node.into(), out_ptr.into()], "jasstr")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("json_doc_as_str returns i32 present flag"))
+    }
+
+    /// `d.as_i64()` / `d.as_f64()` / `d.as_bool()` (J4): zero the out scalar slot, then call the leaf
+    /// accessor for `scalar`, which writes the value into `out` and returns an i32 present flag.
+    fn gen_json_doc_as_scalar(&mut self, scalar: Ty, doc: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // The out slot is read by the caller only on the `Some` (present) branch, and the runtime
+        // writes it exactly then — so it never needs zeroing (unlike the view slots above, whose
+        // `Drop`/consumers could otherwise see stale bytes).
+        let out_ptr = self.slots[&out];
+        let (tape, node) = self.split_doc(doc)?;
+        let sym = match scalar {
+            Ty::Int(_) => "json_doc_as_i64",
+            Ty::Float(_) => "json_doc_as_f64",
+            Ty::Bool => "json_doc_as_bool",
+            _ => unreachable!("json.doc leaf accessor scalar is i64/f64/bool"),
+        };
+        Ok(self
+            .builder
+            .build_call(self.funcs[sym], &[tape.into(), node.into(), out_ptr.into()], "jasscalar")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("json.doc leaf accessor returns i32 present flag"))
     }
 
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): zero the out `{ptr,len}` slot,

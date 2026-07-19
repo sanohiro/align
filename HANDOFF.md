@@ -8,7 +8,32 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS T1b COMPLETE — `array<Option<T>>` DEFERRED (docs-only
+_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 1 SHIPPED (the schema-unknown lazy
+document view MVP; branch `json-j4-doc`).** New `Ty::JsonDoc` / `Scalar::JsonDoc` — a **Copy**
+`{tape,node}` handle (laid out `{ptr,i64}` like a slice), region-tied to min(input, arena). `json.doc(s)?`
+inside an `arena {}` parses ONCE into an arena-backed `simdjson`-style flat node tape (per-node
+sibling-skip offsets; a recursive validate-and-emit build, full escape/UTF-8 validation → malformed =
+`Err`), yielding `Result<json.doc, Error>`. Navigation is **total + Missing-propagating**: `d.get(k)` /
+`d.at(i)` always return a `json.doc` (`Missing` = `node < 0`, propagates). `d.kind()` → the new **builtin
+`json.kind`** tag-only sum type (`Object/Array/Str/Number/Bool/Null/Missing`, registered like `Error` /
+`argon2_params`; matched by bare variant name). Leaf accessors `as_str`/`as_i64`/`as_f64`/`as_bool` →
+`Option` (`as_str` = zero-copy input view, escaped strings unescape into the arena — the one allocating
+accessor). Runtime `align_rt_json_doc_{parse,kind,get,at,as_str,as_i64,as_f64,as_bool}`. Schema-UNKNOWN
+→ NO `json_schema_sig` cache key (the tape is generic). Threaded through every exhaustive HIR/MIR pass
+(new HIR `JsonDoc`/`JsonDocKind`/`JsonDocGet`/`JsonDocAt`/`JsonDocAsStr`/`JsonDocAsScalar`; MIR `Rvalue`
+siblings; region_of = min(input,arena) for the doc, receiver-region for `get`/`at`/`as_str`, `Static`
+for `kind`/`as_scalar`; `tracks_region` + `ty_may_borrow` + `borrow_sources` = the input roots — the
+#297 escape is enforced). Codegen adds `Ty::JsonDoc` to the slice-struct groups + 8 FFI decls + the
+tag-only-enum wrap for `kind()`. Method dispatch intercepts `kind`/`get`/`at`/`as_str`/`as_i64/f64/bool`
+on a `json.doc` receiver BEFORE the shared-name (`as_str` on bytes / `get` on a box) handlers; the
+receiver may be a temporary (Copy, never dropped → chaining `d.get("a").at(0).as_i64()` is fine). Tests:
+`m5.rs` (navigate+kind-match+leaf accessors round-trip, malformed→Err, arena gate, view-escape
+rejection = arena-region error), runtime `json_doc_*` (tape nav / Missing propagation / escapes+surrogate
+pairs / malformed corpus). Suites green: m5 155, sema 151, mir 7, runtime json_doc 4, cache_codegen 20
+(only the known macOS gate7 `LC_UUID` flake fails); clippy clean. **`/align-self-review` + `/code-review`
+pending before merge.** **NEXT: J4 slice 2** — `d.len()`, `d.elems() -> array<json.doc>` (materialize a
+level for pipelines), `d.key(i) -> Option<str>` (objects-as-ordered-data) → **J5** `json.scan` → **J6**
+spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS T1b COMPLETE — `array<Option<T>>` DEFERRED (docs-only
 closure, branch `json-t1b-array-option`).** The three JSON-specific T1b matrix-fill items all shipped
 (`array<scalar>` fields #538, bare scalar decode #539, `Option<struct>` encode #540). The remaining
 sketch item `array<Option<T>>` is **DEFERRED as a language-type gap, not a JSON gap:** an owned array's
