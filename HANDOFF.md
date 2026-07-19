@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-20, **pkg.web F1 — FIELD-ELIGIBILITY WIDENING COMPLETE (all three slices merged).**
+_Last updated: 2026-07-20, **pkg.web F0 + F1 COMPLETE — the compiler + package foundation for the framework is done.**
+**F0 (pkg-foundation, #558):** the two import-edge path rules — D7 `internal` (a `pkg.web.internal.*` module
+is importable only from within `pkg.web`) + D8 layering (a `pkg/` module imports only `core`/`std`/`pkg`) —
+enforced in `align_driver::load_units` (`check_pkg_import_edge`); spec text landed (draft §17 "Packages" +
+§18.3, language-spec digest, design-notes "package philosophy"); open-questions PROPOSAL → SETTLED; tests
+`pkg_foundation.rs` (6). **Owner surface decision (2026-07-20):** call sites are **fully qualified** —
+`pkg.web.get(...)` / `pkg.web.param(c,"id")` / `c: pkg.web.Ctx` — per D3 (no import aliases); the `web.`
+shorthand in `pkg-design/web.md` examples is spelled out when the public surface lands (W2). Noted in web.md.
+**W1 feasibility (probed):** the radix tree must be built as **SoA scalar columns** — `array_builder<i64>`
+per Node/Leaf field + `array_builder<string>` for edge labels — NOT `array<Node>`: Align cannot build a
+runtime-sized `array<struct>` (no `array_builder<struct>`, no `range`/`[v;n]`/`array_fill`; only fixed
+literals / `json.decode` / transforming an existing array yield `array<struct>`). This is MORE Align-idiomatic
+(the doc's own "soa/tape/offset-table" move). Mutable struct-array element-field writes (`xs[i].f = v`) DO work
+(node-pool fill lever). String primitives confirmed present for pattern matching: `seg.starts_with(":")`/
+`"*"`, `seg[1..seg.len()]` (str slice), `str == str`. Dotted user modules work (`pkg.web.get`, full path).
+**NEXT: W1 — the radix router core** at `apps/web/pkg/web/internal/router.align` (module
+`pkg.web.internal.router`): pattern parse + SoA radix tree (static/param/wildcard, static>param>wildcard
+priority, conflict-abort at build) + matcher, differential-tested against a linear-scan oracle. Design +
+router internals spec: `pkg-design/web.md`. Then W2 (Ctx/serve/dispatch — the public `pkg.web.*` surface).
+Previous milestone: 2026-07-20, **pkg.web F1 — FIELD-ELIGIBILITY WIDENING COMPLETE (all three slices merged).**
 The hard compiler gate for `pkg.web` (`docs/impl/15-pkg-web-plan.md`) is done — a struct field may now be
 (①) a **fn value** (`Route { handler: fn(Ctx) -> Result<(), Error> }`, #554), (③) a **`slice<T>` view**
 (`Ctx { params: slice<str> }`, region-tied so an arena/local-array view can't escape via a struct, #555),
