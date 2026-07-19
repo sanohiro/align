@@ -151,3 +151,91 @@ fn non_scalar_signature_rejected_as_value() {
         "fn sum(xs: slice<i64>) -> i64 = 0\n\nfn main() -> i32 {\n  f := sum\n  return 0\n}\n"
     ));
 }
+
+// ── F1①: function-value struct fields (the pkg.web `Route.handler` gate) ──────────────────────
+
+#[test]
+fn fn_value_struct_field_stored_and_called() {
+    if !backend_available() {
+        return;
+    }
+    // A `Ty::Fn` field on a struct: build the struct with a named function, read the field back,
+    // and indirect-call it (`r.handler(arg)`). This is the shape `pkg.web`'s `Route` needs.
+    let src = "fn h(x: i64) -> i64 = x + 100\n\nRoute { pattern: str, handler: fn(i64) -> i64 }\n\nfn main() -> Result<(), Error> {\n  r := Route { pattern: \"/a\", handler: h }\n  print(r.handler(5))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-field", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "105\n");
+}
+
+#[test]
+fn fn_value_struct_field_array_dispatch() {
+    if !backend_available() {
+        return;
+    }
+    // An `array<Route>` dispatched by index — the router acceptance shape: each element carries a
+    // distinct handler, called through the field after an indexed read.
+    let src = concat!(
+        "fn list_models(n: i64) -> i64 = n + 100\n",
+        "fn get_model(n: i64) -> i64 = n + 200\n\n",
+        "Route { pattern: str, handler: fn(i64) -> i64 }\n\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  routes := [\n",
+        "    Route { pattern: \"/models\", handler: list_models },\n",
+        "    Route { pattern: \"/models/:id\", handler: get_model },\n",
+        "  ]\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    if i >= routes.len() { break }\n",
+        "    r := routes[i]\n",
+        "    print(r.handler(i))\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("fv-field-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n201\n");
+}
+
+#[test]
+fn fn_value_struct_field_wrong_arity_rejected() {
+    // Calling a fn-typed field with the wrong argument count is a clean type error, not a panic.
+    assert!(check_errs(
+        "fv-field-arity",
+        "fn h(x: i64) -> i64 = x\nR { f: fn(i64) -> i64 }\nfn main() -> Result<(), Error> {\n  r := R { f: h }\n  print(r.f(1, 2))\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn non_fn_struct_field_called_rejected() {
+    // A non-function field called as `r.field(args)` still reports "unknown method", unchanged.
+    assert!(check_errs(
+        "fv-field-nonfn",
+        "R { x: i64 }\nfn main() -> Result<(), Error> {\n  r := R { x: 1 }\n  print(r.x(1))\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn fn_field_beside_owned_field_drops_cleanly() {
+    if !backend_available() {
+        return;
+    }
+    // A **Move** struct (it owns a `string`) that also carries a fn-value field and a scalar: the fn
+    // field is Copy and owns nothing, so `drop_struct_fields` must free only the `string` and skip
+    // the fn field. Call the fn field, read the scalar, then let the struct drop at scope exit — a
+    // clean exit (0) proves the drop freed exactly once (no double-free / leak on the fn field).
+    let src = concat!(
+        "fn a(n: i64) -> i64 = n + 1\n",
+        "Holder { name: string, handler: fn(i64) -> i64, age: i64 }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  h := Holder { name: \"hi\".clone(), handler: a, age: 7 }\n",
+        "  print(h.handler(41))\n",
+        "  print(h.age)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("fv-field-owned-drop", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n7\n");
+}
