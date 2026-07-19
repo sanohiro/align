@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 2 SHIPPED (`len` + `key` + nameable
+_Last updated: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 3 SHIPPED → J4 COMPLETE (`elems()`;
+branch `json-j4-doc-elems`).** `d.elems() -> slice<json.doc>` materializes one document level (each
+Array element, or each Object member VALUE — keys via `key(i)`) as an arena-backed `slice<json.doc>`
+ONCE (O(n) build, O(1) index — vs `at(i)`'s O(i) re-walk per call). **The key realization: no new array
+type was needed** — `Ty::Slice(Scalar)` already takes a full `Scalar` and `Scalar::JsonDoc` already
+exists, so `slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)` REUSES the existing slice machinery:
+`.len()` and `xs[i] -> json.doc` work out of the box (`check_index`'s Move-element rejection doesn't
+fire — a `json.doc` is a Copy 16-byte handle, no double-free; `region_of(Index)` binds the element to
+the slice), and `slice<json.doc>` is nameable as a param type so `fn f(xs: slice<json.doc>)` walks a
+level by recursion. Runtime `align_rt_json_doc_elems` bump-allocates a `DocHandle` buffer in the arena
+(`checked_mul`, null-safe) + writes the `{ptr,len}` header; region = `arena.shorter(region_of(doc))`
+(like `to_array`). New HIR/MIR `JsonDocElems` threaded through every exhaustive pass. Tests: `m5.rs`
+`json_doc_elems_materialize_and_iterate` (materialize → index → recursive sum = 67) + the
+`json-doc-elems-escape` negative (returning the slice out of the arena is an arena-region error, #297),
+runtime `json_doc_elems_materializes_a_level`. Suites green: m5 157, sema 151, mir 7, runtime json_doc 8;
+clippy clean. **`/align-self-review` + review pending before merge. FOLLOW-UP (not required for J4):**
+full `.map`/`.where` **pipeline fusion** over a `slice<json.doc>` (closures taking `json.doc`) — index +
+len + recursion already cover level iteration. **With `elems()` the entire J4 `json.doc` surface (parse,
+kind, get/at, all leaf accessors, len, key, elems, nameable types) is COMPLETE.** Then **J5** `json.scan`
+→ **J6** spec sync. Previous update: 2026-07-19, **JSON COMPLETENESS J4 `json.doc` — SLICE 2 SHIPPED (`len` + `key` + nameable
 types; branch `json-j4-doc-slice2`).** On top of slice 1 (merged as #543): `d.len()` (member/element
 count, 0 on a non-container / Missing) and `d.key(i) -> Option<str>` (the i-th object member key in
 document order — objects-as-ordered-data, a `str` view region-bound to the doc). With `at(i)` these

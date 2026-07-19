@@ -6419,6 +6419,52 @@ pub unsafe extern "C" fn align_rt_json_doc_key(tape: *const DocTape, node: i64, 
     unsafe { doc_write_str(t, kn.a, kn.b, out) }
 }
 
+/// `d.elems()` — materialize one document level as an arena-backed `slice<json.doc>` `{ptr,len}`:
+/// each Array element, or each Object member **value** (keys are read separately via `key(i)`), as a
+/// `{tape,node}` handle. A non-container / Missing / empty container yields an empty slice (`{null,0}`).
+/// The handle buffer is bump-allocated from `arena` (bulk-freed at arena end), so the slice — and the
+/// handles it holds — are region-tied to the doc's arena. `out` is a `{ptr, i64 len}` slice header.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `arena` a live arena handle; `out` a writable slice header.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_elems(tape: *const DocTape, node: i64, arena: *mut Arena, out: *mut AlignStr) {
+    if out.is_null() {
+        return;
+    }
+    let empty = AlignStr { ptr: core::ptr::null(), len: 0 };
+    let (Some(n), false) = (unsafe { doc_node(tape, node) }, arena.is_null()) else {
+        unsafe { out.write(empty) };
+        return;
+    };
+    if n.kind != DOC_OBJECT && n.kind != DOC_ARRAY || n.a == 0 {
+        unsafe { out.write(empty) };
+        return;
+    }
+    let t = unsafe { &*tape };
+    let count = n.a as usize;
+    let Some(bytes) = count.checked_mul(core::mem::size_of::<DocHandle>()) else {
+        unsafe { out.write(empty) };
+        return;
+    };
+    let arena_ref = unsafe { &mut *arena };
+    let buf = arena_ref.alloc_uninit(bytes, core::mem::align_of::<DocHandle>()) as *mut DocHandle;
+    // Walk the level's children, writing one handle per element/value. For an Array the children are
+    // consecutive (`elem.next` is the next element); for an Object each member is `[key, value…]`, so
+    // the value is `key.next` and the next member's key is `value.next` (the `get`/`key` sibling-skip).
+    let mut ci = node as usize + 1;
+    for i in 0..count {
+        let vi = if n.kind == DOC_ARRAY {
+            ci // an array element IS the child
+        } else {
+            unsafe { &*t.nodes.add(ci) }.next as usize // an object member's value = key.next
+        };
+        unsafe { buf.add(i).write(DocHandle { tape, node: vi as i64 }) };
+        ci = unsafe { &*t.nodes.add(vi) }.next as usize; // next element / next member's key
+    }
+    unsafe { out.write(AlignStr { ptr: buf as *const u8, len: count as i64 }) };
+}
+
 /// The raw number-token bytes of a `Number` doc, or `None` if not a number.
 unsafe fn doc_number_span<'a>(tape: *const DocTape, node: i64) -> Option<&'a str> {
     let n = unsafe { doc_node(tape, node) }?;
@@ -24846,6 +24892,49 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // key on a non-object → None.
         let mut kout = AlignStr { ptr: core::ptr::null(), len: 0 };
         assert_eq!(unsafe { align_rt_json_doc_key(arr.tape, arr.node, 0, &mut kout) }, 0);
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_elems_materializes_a_level() {
+        let (arena, root) = unsafe { doc_parse(r#"{"a": [10, 20, 30], "obj": {"x": 1, "y": 2}, "n": 5}"#) }.expect("parse");
+        let t = root.tape;
+        let get = |k: &str| {
+            let mut h = DocHandle { tape: core::ptr::null(), node: 0 };
+            unsafe { align_rt_json_doc_get(t, root.node, k.as_ptr(), k.len() as i64, &mut h) };
+            h
+        };
+        // elems() of an array → each element; read back as i64.
+        let a = get("a");
+        let mut sl = AlignStr { ptr: core::ptr::null(), len: 0 };
+        unsafe { align_rt_json_doc_elems(a.tape, a.node, arena, &mut sl) };
+        assert_eq!(sl.len, 3);
+        let handles = unsafe { core::slice::from_raw_parts(sl.ptr as *const DocHandle, sl.len as usize) };
+        let vals: Vec<i64> = handles
+            .iter()
+            .map(|h| {
+                let mut v = 0i64;
+                assert_eq!(unsafe { align_rt_json_doc_as_i64(h.tape, h.node, &mut v) }, 1);
+                v
+            })
+            .collect();
+        assert_eq!(vals, vec![10, 20, 30]);
+        // elems() of an object → each member VALUE (keys via key(i) separately).
+        let obj = get("obj");
+        let mut osl = AlignStr { ptr: core::ptr::null(), len: 0 };
+        unsafe { align_rt_json_doc_elems(obj.tape, obj.node, arena, &mut osl) };
+        assert_eq!(osl.len, 2);
+        let oh = unsafe { core::slice::from_raw_parts(osl.ptr as *const DocHandle, osl.len as usize) };
+        let mut v0 = 0i64;
+        unsafe { align_rt_json_doc_as_i64(oh[0].tape, oh[0].node, &mut v0) };
+        let mut v1 = 0i64;
+        unsafe { align_rt_json_doc_as_i64(oh[1].tape, oh[1].node, &mut v1) };
+        assert_eq!((v0, v1), (1, 2));
+        // elems() of a scalar → empty.
+        let n = get("n");
+        let mut esl = AlignStr { ptr: core::ptr::null(), len: 7 };
+        unsafe { align_rt_json_doc_elems(n.tape, n.node, arena, &mut esl) };
+        assert_eq!(esl.len, 0);
         unsafe { align_rt_arena_end(arena) };
     }
 

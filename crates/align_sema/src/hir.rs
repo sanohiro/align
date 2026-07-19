@@ -725,6 +725,12 @@ pub enum ExprKind {
     /// `None` (not an object / out of range / Missing). The `str` is a view (into the input, or the
     /// arena for an escaped key), so region-bound to `doc`. The objects-as-ordered-data half of J4.
     JsonDocKey { doc: Box<Expr>, index: Box<Expr> },
+    /// `d.elems()` on a `json.doc` — materialize one document level (each Array element, or each Object
+    /// member value) as an arena-backed `slice<json.doc>`. The handle buffer is bump-allocated in the
+    /// enclosing arena, and the element handles view the same tape, so the slice is region-tied to
+    /// min(input, arena). A non-container / empty yields an empty slice. J4 slice 3 (a pipeline source
+    /// materialized once — `at(i)` re-walks per call, `elems()` is O(n) then O(1) indexing).
+    JsonDocElems { doc: Box<Expr> },
     /// `s.group_by(.key).{sum,min,max}(.value)` / `.count()` over a `soa<Struct>` local `base` —
     /// column-oriented grouped aggregate. Reads the `key_field` column (and `value_field` for
     /// sum/min/max — `None` for `count`) as `slice<i64>` via [`SoaColumn`] and folds per distinct
