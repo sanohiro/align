@@ -29,6 +29,11 @@ pub fn seg_end(s: str, start: i64) -> i64 {
 // a later one, i.e. static > param > wildcard is decided left-to-right (no backtracking), exactly
 // as the radix tree walks it. Distinct patterns that both match one path always get distinct scores
 // (they must differ in some segment's kind or literal), so `dispatch` never ties.
+//
+// The `* 3` fold grows the score as ~3^depth, so it assumes a realistically bounded path depth (a
+// depth beyond ~39 segments would wrap i64 — Align's defined two's-complement wrap — and could then
+// mis-rank; real URLs are a handful of segments deep). This is a property of the scoring *oracle*
+// only; the radix tree walks segment-by-segment and carries no such bound.
 pub fn match_score(pattern: str, path: str) -> i64 {
   plen := pattern.len()
   xlen := path.len()
