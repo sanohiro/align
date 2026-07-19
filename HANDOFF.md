@@ -8,7 +8,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-19, **JSON COMPLETENESS J5 `json.scan` — COMPLETE (streaming typed rows; merged
+_Last updated: 2026-07-20, **pkg.web F1 — FIELD-ELIGIBILITY WIDENING COMPLETE (all three slices merged).**
+The hard compiler gate for `pkg.web` (`docs/impl/15-pkg-web-plan.md`) is done — a struct field may now be
+(①) a **fn value** (`Route { handler: fn(Ctx) -> Result<(), Error> }`, #554), (③) a **`slice<T>` view**
+(`Ctx { params: slice<str> }`, region-tied so an arena/local-array view can't escape via a struct, #555),
+and (②) a **Move handle** (`Ctx { req: http_request_ctx }` — the struct becomes Move, drop closes the
+handle exactly once via the shared `handle_free_fn`; `http_request_ctx` is now a nameable surface type,
+#556). All four kinds coexist + drop cleanly (handle+string freed once, slice/fn/scalar skipped);
+move-once + partial-move-out + arena-escape + `Option<handle>` all rejected cleanly. New tests:
+`fn_values.rs` (+5), `struct_slice_fields.rs` (+5), `struct_handle_fields.rs` (+8); `handle_free_fn` is the
+one source of truth shared by `Stmt::Drop` and `drop_struct_fields`. Each slice went PR → self-review →
+`/code-review` → merge. **NEXT: F0 (pkg-foundation rules — `internal` path + pkg-layering import checks +
+spec text; parallelizable) then F3/W1 (the radix-tree router core at `apps/web/pkg/web/`, per the design
+doc `pkg-design/web.md`). W1 needs only F1① (done), so it is unblocked.** Previous update: 2026-07-19,
+**JSON COMPLETENESS J5 `json.scan` — COMPLETE (streaming typed rows; merged
 as #546 slice 1 + #547 slice 2).** `json.scan(view)` + the new `json.scanner<Row>` type (a **Copy**
 `{ptr,len}` input view, region-tracked — it borrows the input, never materializes an `array<Row>`; row
 type from the binding annotation `rows: json.scanner<Row> := json.scan(view)`, exactly like `decode`, no
