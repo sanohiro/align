@@ -11492,7 +11492,21 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
     fn check_call_fn_value(&mut self, lid: LocalId, fid: u32, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let callee = Expr { kind: ExprKind::Local(lid), ty: Ty::Fn(fid), span };
+        self.check_indirect_call(callee, args, expected, span)
+    }
+
+    /// The shared body of an indirect call: `callee` is an already-checked expression of a
+    /// **function-value** type (`Ty::Fn`) — a fn-value local (`f(args)`), or a struct's fn-typed
+    /// field read (`route.handler(args)`, F1① of the pkg.web plan). Checks arity + argument types
+    /// against the callee's signature and builds a [`ExprKind::CallFnValue`].
+    fn check_indirect_call(&mut self, callee: Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Ty::Fn(fid) = self.resolve(callee.ty) else {
+            // The receiver was already diagnosed (a non-fn callee never reaches here from the two
+            // call sites); stay quiet.
+            return err;
+        };
         // Clone only the parameter scalars (needed across the `&mut self` `check_expr` calls);
         // the per-arg LLVM type is computed in the loop, with no intermediate `Vec<Ty>`.
         let params = self.fn_types[fid as usize].params.clone();
@@ -11516,7 +11530,6 @@ impl<'a, 't> Checker<'a, 't> {
             }
             checked.push(e);
         }
-        let callee = Expr { kind: ExprKind::Local(lid), ty: Ty::Fn(fid), span };
         self.constrain(ret, expected, span);
         Expr { kind: ExprKind::CallFnValue { callee: Box::new(callee), args: checked }, ty: ret, span }
     }
@@ -12883,6 +12896,30 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_http_stream_method(recv_expr, method, args, span)
             }
             _ => {
+                // `place.field(args)` where `field` is a **function-value** field of a struct
+                // (`route.handler(c)`, F1① of the pkg.web plan): read the field (a `{fn_ptr, env_ptr}`
+                // value) then indirect-call it. Distinguished from a real method by the name resolving
+                // to a `Ty::Fn` field on the receiver struct; a non-fn field or a missing field falls
+                // through to the normal "unknown method" error below (unchanged behavior). The field
+                // lookup here is non-diagnosing (`field_index`, not `field_of`).
+                //
+                // This is the LAST arm, so a builtin/value method **wins** over a same-named fn field:
+                // a field named `get`/`len`/`map`/`clone`/… is intercepted by its method arm above and
+                // never reaches here. Fine for the pkg.web surface (`handler` collides with nothing);
+                // a future struct wanting a callable field must avoid the builtin-method names.
+                let fn_field_ty = if let Ty::Struct(sid) = self.resolve(recv_ty) {
+                    self.structs
+                        .get(sid as usize)
+                        .and_then(|d| d.field_index(method).map(|i| d.fields[i as usize].ty))
+                        .filter(|&fty| matches!(self.resolve(fty), Ty::Fn(_)))
+                } else {
+                    None
+                };
+                if fn_field_ty.is_some() {
+                    let field = ast::Ident { name: method.to_string(), span };
+                    let callee = self.check_field_access(recv, &field, None, span);
+                    return self.check_indirect_call(callee, args, expected, span);
+                }
                 if recv_ty != Ty::Error {
                     self.diags
                         .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
@@ -21546,6 +21583,13 @@ fn is_field_ok(ty: Ty) -> bool {
         // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
         // arm gains the same non-Move / Drop split the `array<T>` field has.
         Ty::Enum(_) => true,
+        // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
+        // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
+        // `abi_type`/`ty_size_align` already size it), owns no heap (`ty_owns_buffer_rec` excludes it,
+        // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
+        // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
+        // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
+        Ty::Fn(_) => true,
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
         // rejected until array-in-Option lands, matching the direct-field rule).
         Ty::Option(s) => is_field_ok(scalar_to_ty(s)),
