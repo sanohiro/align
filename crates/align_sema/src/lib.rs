@@ -4547,7 +4547,7 @@ impl EffectScan<'_> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -6511,7 +6511,7 @@ impl<'a> EscapeCheck<'a> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -7125,7 +7125,7 @@ impl UnnecessaryHeapScan {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.visit(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.visit(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -8523,7 +8523,7 @@ impl<'a> MoveCheck<'a> {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.expr(h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.expr(access, moved, false, false),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
@@ -12728,7 +12728,7 @@ impl<'a, 't> Checker<'a, 't> {
                 text.push_str(part);
                 Some(text)
             }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::ScalarArrayField { .. } | TemplatePart::UnionValue { .. } => None,
+            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OptionField { .. } | TemplatePart::OptionStructField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::ScalarArrayField { .. } | TemplatePart::UnionValue { .. } => None,
         });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
@@ -15649,17 +15649,18 @@ impl<'a, 't> Checker<'a, 't> {
             // An optional (`Option<T>`) field: a single conditional `OptionField` piece that emits
             // `"name":value,` only when `Some`. Only present in the trailing-comma scheme.
             if let Ty::Option(s) = f.ty {
-                if matches!(s, Scalar::Struct(_)) {
-                    // `Option<struct>` encode = a conditional nested object rendered from the payload
-                    // value — a follow-up (decode already supports it); scalar/str Options encode now.
-                    self.diags.error(
-                        format!(
-                            "'json.encode' of Option<struct> field '{}' is not supported yet (Option<scalar>/Option<str> encode now; nested-Option encode is a follow-up)",
-                            f.name
-                        ),
-                        span,
-                    );
-                    *ok = false;
+                if let Scalar::Struct(pid) = s {
+                    // `Option<struct>` encode (JSON completeness T1b): a conditional nested object — when
+                    // `Some`, the payload struct is rendered by the runtime descriptor-driven encoder
+                    // (`OptionStructField`); when `None`, the field is omitted (the trailing-comma
+                    // scheme + `PopComma`). The payload struct must be encodable (its schema drives the
+                    // descriptor table) — validate it like a decode target so a bad field is a clean
+                    // sema error, not a codegen surprise.
+                    if !self.decode_struct_fields_ok(pid, span) {
+                        *ok = false;
+                    } else {
+                        parts.push(TemplatePart::OptionStructField { access: access(f.ty), name: f.name.clone(), struct_id: pid });
+                    }
                     continue;
                 }
                 parts.push(TemplatePart::OptionField { access: access(f.ty), name: f.name.clone() });
@@ -19561,7 +19562,7 @@ impl<'a, 't> Checker<'a, 't> {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }

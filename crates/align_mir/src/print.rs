@@ -413,6 +413,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::FloatHole(o) => format!("float({})", operand_str(o)),
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
+                    crate::TemplatePiece::OptionStructField { opt, name, struct_id, schema } => {
+                        format!("opt_struct_field({name:?}, struct#{struct_id} {schema}, {})", operand_str(opt))
+                    }
                     crate::TemplatePiece::PopComma => "pop_comma".to_string(),
                     crate::TemplatePiece::StructArrayField { array, struct_id } => format!("struct_array_field(struct#{struct_id}, {})", operand_str(array)),
                     crate::TemplatePiece::ScalarArrayField { array, elem } => format!("scalar_array_field({}, {})", crate::ty_name(align_sema::scalar_to_ty(*elem)), operand_str(array)),

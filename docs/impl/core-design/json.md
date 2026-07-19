@@ -121,7 +121,14 @@ the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing o
 trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
 the static layout). **v1 boundary:** an Option payload must be **non-owned** (`Option<string>` /
 `Option<Move-struct>` rejected at declaration — no consumer, and owned-Option-drop-as-a-field is
-deferred). One recorded follow-up: `Option<struct>` **encode** (decode supports it).
+deferred). **`Option<struct>` encode (T1b, SHIPPED):** `Some` renders the nested object via the runtime
+descriptor-driven encoder (a new `OptionStructField` template piece → `align_rt_json_encode_object`, a
+single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
+scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
+own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and stays non-Move.
+The `OptionStructField` piece bakes the payload's `json_schema_sig` for cache invalidation; the same
+recursion was added to `json_schema_sig` for the DECODE side too (an `Option<struct>` payload field
+change had folded to a bare `"Option"` — a stale-cache gap, now fixed).
 
 **Nested-struct fields (REST-gateway runway, Slice A).** A struct field may itself be a `Struct`;
 `decode` recurses into the nested object and `encode` renders it back, so a nested record round-trips.

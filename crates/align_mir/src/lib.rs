@@ -999,6 +999,13 @@ pub enum TemplatePiece {
     /// JSON-escaped — with a trailing comma); when `None`, append nothing. `opt`'s type
     /// (`Ty::Option(scalar)`) tells codegen the payload kind. Paired with [`PopComma`].
     OptionField { opt: Operand, name: String },
+    /// `json.encode` of an `Option<struct>` field (JSON completeness T1b): when `opt` is `Some`, append
+    /// `"name":{…},` (the payload struct rendered by the runtime descriptor-driven encoder); when
+    /// `None`, append nothing. `struct_id` is the payload struct (codegen emits its descriptor table);
+    /// `schema` is its recursive field fingerprint baked in for cache invalidation (a payload field
+    /// change feeds only the codegen descriptor, so — like the decode rvalues — it must reach the MIR
+    /// digest, else a warm cache serves a stale-key encode). Paired with [`PopComma`].
+    OptionStructField { opt: Operand, name: String, struct_id: u32, schema: String },
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
     PopComma,
@@ -2741,6 +2748,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     hir::TemplatePart::OptionField { access, name } => {
                         let op = lower_expr(b, access);
                         pieces.push(TemplatePiece::OptionField { opt: op, name: name.clone() });
+                    }
+                    hir::TemplatePart::OptionStructField { access, name, struct_id } => {
+                        let op = lower_expr(b, access);
+                        let schema = json_schema_sig(&b.structs, &b.enums, *struct_id);
+                        pieces.push(TemplatePiece::OptionStructField { opt: op, name: name.clone(), struct_id: *struct_id, schema });
                     }
                     hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
                     hir::TemplatePart::StructArrayField { access, struct_id } => {
@@ -7297,6 +7309,17 @@ fn json_schema_sig_into(structs: &[hir::StructDef], enums: &[hir::EnumDef], stru
             // shape invalidates the enclosing struct's decode/encode cache (the #514/#517 class). Pass
             // the shared `visiting` so a struct→union→struct cycle terminates (sema rejects it anyway).
             Ty::Enum(eid) => json_union_schema_sig_into(enums, structs, eid, visiting, out),
+            // An `Option<struct>` field's payload struct reaches decode/encode only through the codegen
+            // descriptor / the `OptionStructField` piece — never other MIR — so a payload field change
+            // must be expanded here (else a warm cache serves a stale-key object; the #514/#517 class).
+            // `ty_name` alone would fold it to a bare "Option". Render the payload width for an
+            // `Option<scalar>` too (`Option<i64>` vs `Option<f64>` differ).
+            Ty::Option(align_sema::Scalar::Struct(pid)) => {
+                out.push_str("Option<");
+                json_schema_sig_into(structs, enums, pid, visiting, out);
+                out.push('>');
+            }
+            Ty::Option(s) => out.push_str(&format!("Option<{}>", ty_name(align_sema::scalar_to_ty(s)))),
             other => out.push_str(&ty_name(other)),
         }
     }

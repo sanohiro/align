@@ -112,8 +112,14 @@ scalar / `str` / ネスト構造体）であってよい。**null ポリシー:*
 `all_required_seen` の対象外で、共有の `write_value` が payload スロットに書いてから `Some` tag を立てる。
 encode は `Option` を含むオブジェクトを trailing-comma 方式に切替え、`}` の前で `align_rt_builder_pop_comma`
 を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**v1 境界:** Option payload は **非所有**
-（`Option<string>`/`Option<Move-struct>` は宣言時に拒否）。残る follow-up は `Option<struct>` の **encode**
-（decode は対応済み）。
+（`Option<string>`/`Option<Move-struct>` は宣言時に拒否）。**`Option<struct>` encode（T1b, SHIPPED）:**
+`Some` は runtime の descriptor 駆動エンコーダ（新 `OptionStructField` テンプレートピース →
+`align_rt_json_encode_object`、descriptor テーブルで単一 struct を出力）でネストオブジェクトを描画し、
+`None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と
+ネストした `Option<str>` を持つ payload はその `None` も省略）。payload struct は encodable であることを
+検証（`decode_struct_fields_ok`）し、非 Move を維持。`OptionStructField` ピースは payload の
+`json_schema_sig` をキャッシュ無効化のために焼き込む。同じ再帰を DECODE 側の `json_schema_sig` にも追加した
+（`Option<struct>` payload フィールド変更が素の `"Option"` に畳まれていた stale-cache ギャップを修正）。
 
 **ネストされた構造体フィールド（REST-gateway runway, Slice A）。** 構造体のフィールドはそれ自身が
 `Struct` であってよい。`decode` はネストされたオブジェクトへ再帰し、`encode` はそれを再構築するため、
