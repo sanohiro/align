@@ -103,6 +103,19 @@ fn http_request_ctx_field_type_checks() {
 }
 
 #[test]
+fn option_of_handle_field_stays_rejected() {
+    // `is_field_ok` admits a bare handle, and `Option<T>` recurses into its payload — so
+    // `Option<http_request_ctx>` would reach `is_field_ok = true`. But `drop_struct_fields` has no
+    // Option-with-Move-payload arm (it would leak the handle when `Some`), so the owned-Option-
+    // payload rejection (pass 0b-2) MUST still fire, keeping that leak path unreachable. Defense in
+    // depth pinned here because F1② made handle scalars field-eligible.
+    assert!(check_errs(
+        "opt-handle",
+        "H { x: Option<http_request_ctx> }\nfn main() -> Result<(), Error> { return Ok(()) }\n"
+    ));
+}
+
+#[test]
 fn all_field_kinds_coexist_and_drop_cleanly() {
     if !backend_available() {
         return;
