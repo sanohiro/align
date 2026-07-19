@@ -179,8 +179,14 @@ truth。spec 本文は draft §14 + §18.1）。残りスライスは J1–J6：
   `as_bool`（→ `Option`。`as_str` は入力へのゼロコピービュー、エスケープ文字列は arena に unescape）。
   数値は**形**でアクセサが決まる（`42.0` / `1e3` は整数値だが非整数形 → `as_i64` は `None`、`as_f64`
   は `Some`。simdjson on-demand と同じ）。**重複キー**の `get` は**最初**の出現を返す（遅延ビュー。
-  `decode` の last-wins とは意図的に異なる。重複キーは両者で pathological）。**Slice 2 に延期:**
-  `len()`、`elems()`（1 階層を pipeline 用に materialize）、`key(i)`（順序付き object-as-data）。
+  `decode` の last-wins とは意図的に異なる。重複キーは両者で pathological）。**Slice 2 SHIPPED:**
+  `d.len()`（要素/メンバー数、非コンテナは 0）+ `d.key(i) -> Option<str>`（object の i 番目のキーを
+  文書順で。順序付き object-as-data）。`at(i)` と併せて、doc 配列の反復を再帰で回せる（`loop` 不要）。
+  型 `json.doc` / `json.kind` は**名前で書ける**ようになった（`fn f(d: json.doc)` ヘルパや
+  `k: json.kind` 束縛が直接解決 — `core.json` の 2 つの組み込み型名）。**Slice 3 に延期:**
+  `elems() -> array<json.doc>` — 1 階層を pipeline source として materialize するには `json.doc` を
+  所有/slice の**要素**にする capability（`PrimScalar`/専用配列型）と doc 要素上の pipeline 機構が
+  必要で、別機能なので「ideal form or defer」に従って待つ。
   **既知の systemic な緩さ（J4 の退行ではない — `decode` のスキャナと共有）:** 文字列内の生の C0 制御
   バイトと数値の先頭ゼロ（`007`）を現状は受理する。共有の `find_quote_or_escape` / `number_span` を
   RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと

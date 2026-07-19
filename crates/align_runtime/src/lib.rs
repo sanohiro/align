@@ -6358,14 +6358,20 @@ pub unsafe extern "C" fn align_rt_json_doc_as_str(tape: *const DocTape, node: i6
         return 0;
     }
     let t = unsafe { &*tape };
+    unsafe { doc_write_str(t, n.a, n.b, out) }
+}
+
+/// Write the JSON string body at input byte-range `[start, start+len)` into `out` as a `str` view:
+/// zero-copy when escape-free, else unescaped into the arena (bulk-freed at arena end). Returns 1
+/// (written) or 0 (a malformed escape — parse validated escapes, so this is defensive only). Shared
+/// by `as_str` (a Str value) and `key` (an object member key).
+unsafe fn doc_write_str(t: &DocTape, start: u32, len: u32, out: *mut AlignStr) -> i32 {
     let input = unsafe { doc_input(t) };
-    let raw = &input[n.a as usize..n.a as usize + n.b as usize];
+    let raw = &input[start as usize..start as usize + len as usize];
     if !raw.contains(&b'\\') {
         unsafe { out.write(AlignStr { ptr: raw.as_ptr(), len: raw.len() as i64 }) };
         return 1;
     }
-    // Escaped: unescape into the arena (bulk-freed at arena end, so the view stays valid). The parse
-    // validated the escapes, so this cannot fail; guard defensively regardless.
     let mut buf = Vec::new();
     if !json_unescape_into(raw, &mut buf) {
         return 0;
@@ -6375,6 +6381,42 @@ pub unsafe extern "C" fn align_rt_json_doc_as_str(tape: *const DocTape, node: i6
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
     unsafe { out.write(AlignStr { ptr: dst, len: buf.len() as i64 }) };
     1
+}
+
+/// `d.len()` — the member / element count for an Object / Array, else 0 (a non-container / Missing).
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_len(tape: *const DocTape, node: i64) -> i64 {
+    match unsafe { doc_node(tape, node) } {
+        Some(n) if n.kind == DOC_OBJECT || n.kind == DOC_ARRAY => n.a as i64,
+        _ => 0,
+    }
+}
+
+/// `d.key(index)` — the `index`-th object member key (in document order), a `str` view into the input
+/// (or the arena for an escaped key). Returns 1 (`Some`, `out` filled) or 0 (`None`: not an object /
+/// out of range / Missing). The objects-as-ordered-data half of J4.
+///
+/// # Safety
+/// `tape` must be null or a live [`DocTape`]; `out` must point to a writable [`AlignStr`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_key(tape: *const DocTape, node: i64, index: i64, out: *mut AlignStr) -> i32 {
+    let Some(n) = (unsafe { doc_node(tape, node) }) else { return 0 };
+    if n.kind != DOC_OBJECT || index < 0 || (index as u64) >= n.a as u64 {
+        return 0;
+    }
+    let t = unsafe { &*tape };
+    // Walk to the index-th member's key node: `[key, value…]` per member, so a member's next key is
+    // `value.next` (the same sibling-skip `get` uses).
+    let mut mi = node as usize + 1;
+    for _ in 0..index {
+        let vi = unsafe { &*t.nodes.add(mi) }.next as usize; // the member's value
+        mi = unsafe { &*t.nodes.add(vi) }.next as usize; // the next member's key
+    }
+    let kn = unsafe { &*t.nodes.add(mi) };
+    unsafe { doc_write_str(t, kn.a, kn.b, out) }
 }
 
 /// The raw number-token bytes of a `Number` doc, or `None` if not a number.
@@ -24772,6 +24814,38 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // Key "kA" (from `kA`).
         unsafe { align_rt_json_doc_get(t, root.node, "kA".as_ptr(), 2, &mut v) };
         assert_eq!(doc_str(v.tape, v.node).as_deref(), Some("a\tbé😀"));
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_len_and_key() {
+        let (arena, root) = unsafe { doc_parse(r#"{"a": 1, "b": 2, "c": [10, 20, 30]}"#) }.expect("parse");
+        let t = root.tape;
+        // len of an object = member count; of an array = element count; of a scalar = 0.
+        assert_eq!(unsafe { align_rt_json_doc_len(t, root.node) }, 3);
+        let mut arr = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "c".as_ptr(), 1, &mut arr) };
+        assert_eq!(unsafe { align_rt_json_doc_len(arr.tape, arr.node) }, 3);
+        let mut a = DocHandle { tape: core::ptr::null(), node: 0 };
+        unsafe { align_rt_json_doc_get(t, root.node, "a".as_ptr(), 1, &mut a) };
+        assert_eq!(unsafe { align_rt_json_doc_len(a.tape, a.node) }, 0); // a number is not a container
+
+        // key(i) returns the i-th member key in document order; out of range → None.
+        let key = |i: i64| -> Option<String> {
+            let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+            if unsafe { align_rt_json_doc_key(t, root.node, i, &mut out) } == 1 {
+                Some(String::from_utf8(unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }.to_vec()).unwrap())
+            } else {
+                None
+            }
+        };
+        assert_eq!(key(0).as_deref(), Some("a"));
+        assert_eq!(key(1).as_deref(), Some("b"));
+        assert_eq!(key(2).as_deref(), Some("c"));
+        assert_eq!(key(3), None); // out of range
+        // key on a non-object → None.
+        let mut kout = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_json_doc_key(arr.tape, arr.node, 0, &mut kout) }, 0);
         unsafe { align_rt_arena_end(arena) };
     }
 

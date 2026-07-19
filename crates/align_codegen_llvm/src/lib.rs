@@ -1358,6 +1358,20 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        // d.len(tape, node) -> i64 the member/element count (0 on a non-container / Missing).
+        "json_doc_len".to_string(),
+        module.add_function("align_rt_json_doc_len", i64t2.fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // d.key(tape, node, index, out: *{ptr,len}) -> i32 present flag. Writes the index-th object key view.
+        "json_doc_key".to_string(),
+        module.add_function(
+            "align_rt_json_doc_key",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
     // The three leaf accessors share the (tape, node, out) -> i32 present-flag shape; the out slot's
     // type (str view / i64 / f64 / u8) differs but is an opaque `ptr` at the ABI.
     for (name, sym) in [
@@ -6637,6 +6651,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::JsonDocAsStr { doc, out } => self.gen_json_doc_as_str(doc, *out)?,
             Rvalue::JsonDocAsScalar { scalar, doc, out } => self.gen_json_doc_as_scalar(*scalar, doc, *out)?,
+            Rvalue::JsonDocLen { doc } => {
+                let (tape, node) = self.split_doc(doc)?;
+                self.builder
+                    .build_call(self.funcs["json_doc_len"], &[tape.into(), node.into()], "jlen")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("json_doc_len returns i64")
+            }
+            Rvalue::JsonDocKey { doc, index, out } => self.gen_json_doc_key(doc, index, *out)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -8838,6 +8860,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(self.funcs["json_doc_get"], &[tape.into(), node.into(), kp.into(), kl.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(())
+    }
+
+    /// `d.key(index)` (J4 slice 2): zero the out `{ptr,len}` slot, then call the runtime accessor, which
+    /// writes the index-th member key (a `str` view) into `out` and returns an i32 present flag.
+    fn gen_json_doc_key(&mut self, doc: &Operand, index: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+        let (tape, node) = self.split_doc(doc)?;
+        let idx = self.operand(index);
+        Ok(self
+            .builder
+            .build_call(self.funcs["json_doc_key"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "jkey")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("json_doc_key returns i32 present flag"))
     }
 
     /// `d.at(index)` (J4): the array-index sibling of [`Self::gen_json_doc_get`].
