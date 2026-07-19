@@ -94,3 +94,172 @@ pub fn dispatch(patterns: slice<str>, path: str) -> i64 {
     i = i + 1
   }
 }
+
+// ── The flat SoA radix tree (W1 slice 2) ──────────────────────────────────────────────────────
+//
+// The dispatch design (not an optimization — the linear scan above is only the differential oracle).
+// The route table compiles into flat **struct-of-arrays** i64 columns (Align can't build a runtime-
+// sized array<struct>, and SoA is the idiomatic "soa/tape/offset-table" move anyway): a node table
+// (`n_param`/`n_wild`/`n_leaf`) and an edge table (`e_par`/`e_child` + a zero-copy label as
+// `(e_pat, e_start, e_end)` = `patterns[e_pat][e_start..e_end]`, so no label is ever allocated).
+// Build and match live in one function so the columns never cross a call boundary (serve builds them
+// once in its own scope and matches in its request loop — no owned-array-struct passing needed).
+//
+// The walk is static > `:param` > `*wildcard` at every node with NO backtracking, exactly as the
+// oracle scores it — so `tree_dispatch` and `dispatch` agree for every non-backtracking route set
+// (the differential test pins this). A route set whose match would REQUIRE backtracking (a static
+// miss a param path would have saved) is out of scope for v1 and is a build-time abort in a later
+// slice; realistic REST tables never need it.
+
+// Total number of '/'-separated segments across every pattern — the upper bound on node/edge count.
+pub fn count_segs(patterns: slice<str>) -> i64 {
+  n := patterns.len()
+  mut total := 0
+  mut r := 0
+  loop {
+    if r >= n { break total }
+    p := patterns[r]
+    mut c := 0
+    loop {
+      if c >= p.len() { break }
+      c = seg_end(p, c + 1)
+      total = total + 1
+    }
+    r = r + 1
+  }
+}
+
+// An `array<i64>` of length `m` filled with `v` — the SoA column allocator (`array_builder` is the
+// only runtime-sized array constructor; a fixed literal can't take a runtime length).
+pub fn filled(m: i64, v: i64) -> array<i64> {
+  mut b: array_builder<i64> := array_builder()
+  mut i := 0
+  loop {
+    if i >= m { break }
+    b.push(v)
+    i = i + 1
+  }
+  b.build()
+}
+
+// Build the radix tree from `patterns` and match `path` against it in one pass. Returns the index of
+// the winning route, or -1 if none matches. O(total segments) to build + O(path depth) to match.
+pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 {
+  cap := count_segs(patterns) + 2
+  // Node columns: for node i, the param-child node index / the wildcard route index / the route
+  // index ending exactly here (each -1 when absent). Node 0 is the root.
+  mut n_param := filled(cap, -1)
+  mut n_wild := filled(cap, -1)
+  mut n_leaf := filled(cap, -1)
+  // Edge columns: parent node, child node, and the label as a zero-copy (pattern, start, end) slice.
+  mut e_par := filled(cap, -1)
+  mut e_child := filled(cap, -1)
+  mut e_pat := filled(cap, -1)
+  mut e_start := filled(cap, -1)
+  mut e_end := filled(cap, -1)
+  mut nc := 1
+  mut ec := 0
+  // --- build: insert each route segment-by-segment ---
+  np := patterns.len()
+  mut r := 0
+  loop {
+    if r >= np { break }
+    pat := patterns[r]
+    mut node := 0
+    mut cur := 0
+    loop {
+      if cur >= pat.len() {
+        // The route ends at this node (first writer wins; a duplicate (method,path) is a build
+        // abort in a later slice).
+        if n_leaf[node] == -1 { n_leaf[node] = r }
+        break
+      }
+      ss := cur + 1
+      se := seg_end(pat, ss)
+      seg := pat[ss..se]
+      if seg.starts_with("*") {
+        if n_wild[node] == -1 { n_wild[node] = r }
+        break
+      }
+      if seg.starts_with(":") {
+        if n_param[node] == -1 {
+          n_param[node] = nc
+          nc = nc + 1
+        }
+        node = n_param[node]
+        cur = se
+      } else {
+        // A literal: follow the existing static edge with this label, else add one + a child node.
+        mut child := -1
+        mut j := 0
+        loop {
+          if j >= ec { break }
+          if e_par[j] == node {
+            lab := patterns[e_pat[j]][e_start[j]..e_end[j]]
+            if lab == seg {
+              child = e_child[j]
+              break
+            }
+          }
+          j = j + 1
+        }
+        if child == -1 {
+          child = nc
+          nc = nc + 1
+          e_par[ec] = node
+          e_child[ec] = child
+          e_pat[ec] = r
+          e_start[ec] = ss
+          e_end[ec] = se
+          ec = ec + 1
+        }
+        node = child
+        cur = se
+      }
+    }
+    r = r + 1
+  }
+  // --- match: walk the tree for `path`, static > param > wildcard, no backtracking ---
+  mut node2 := 0
+  mut cur2 := 0
+  mut result := -1
+  loop {
+    if cur2 >= path.len() {
+      result = n_leaf[node2]
+      break
+    }
+    ss := cur2 + 1
+    se := seg_end(path, ss)
+    seg := path[ss..se]
+    mut child := -1
+    mut j := 0
+    loop {
+      if j >= ec { break }
+      if e_par[j] == node2 {
+        lab := patterns[e_pat[j]][e_start[j]..e_end[j]]
+        if lab == seg {
+          child = e_child[j]
+          break
+        }
+      }
+      j = j + 1
+    }
+    if child != -1 {
+      node2 = child
+      cur2 = se
+    } else {
+      if n_param[node2] != -1 && se > ss {
+        node2 = n_param[node2]
+        cur2 = se
+      } else {
+        if n_wild[node2] != -1 {
+          result = n_wild[node2]
+          break
+        }
+        result = -1
+        break
+      }
+    }
+  }
+  result
+}
