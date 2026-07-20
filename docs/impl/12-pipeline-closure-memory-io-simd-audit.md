@@ -747,6 +747,31 @@ to emit a release object; sampled peak RSS was 52,152 / 46,788 / 70,292 / 77,844
 The mandatory 2 MiB-stack integration gate completed in 0.64 s. Reproduction and the complete
 baseline are in `bench/deep_pipeline/` and `crates/align_driver/tests/deep_pipeline.rs`.
 
+**Recorded result (2026-07-20, Apple arm64, LLVM/clang 22.1.8): the vector-SHAPE half of that gate
+is x86-64-only, and the reason is an ISA property.** These kernels reduce a chain of `i64`
+multiplies (`mix`), and AArch64 NEON has no 64-bit-lane integer multiply — `MUL` covers
+`.8b/.16b/.4h/.8h/.2s/.4s`, not `.2d`. LLVM therefore emits scalar `madd`, keeps scalar accumulators
+where it does vectorize, and past a shallow depth declines to vectorize the loop at all (measured on
+this host: `named` had a vector loop at depth 1-2, `masked`/`capture` through depth 4, and none
+beyond; only the multiply-free `masked_1` reduced in lanes). x86-64-v3 has no 64-bit vector multiply
+either — `vpmullq` is AVX-512DQ — but LLVM emulates it with 32-bit multiplies and finds that
+profitable, which is why the shape holds at every depth on the Ryzen baseline above.
+
+Three measurements scope this as a platform characteristic rather than a regression: `opt` 19, 20,
+21 and 22 produce the same scalar result from identical input IR (so it is not the LLVM 22
+upgrade); the same loop written in C and compiled by clang for arm64 does not vectorize at **any**
+depth, while Align's still does at depth 1-2 (so Align is not behind idiomatic C — it is slightly
+ahead); and removing only the multiply from that C loop yields `<2 x i64>` + `llvm.vector.reduce.add`,
+while narrowing it to 32-bit lanes yields `<4 x i32>`, which pins the multiply as the sole cause.
+
+The practical consequence to carry into any ARM throughput work: **multiply-heavy `i64` pipelines do
+not lane-reduce on NEON**, so their ARM throughput is expected to trail the x86-64-v3 figures above,
+and a fair ARM comparison must use an equal-LLVM C control rather than the x86-64 numbers. The
+arch-independent gates — one fused loop, no intermediate allocation, no surviving non-intrinsic
+stage call — are unaffected and still run everywhere. `deep_pipeline.rs` previously asserted the
+x86-64 shape on aarch64 too and so could never have passed there; asserting the current aarch64
+shape instead would curve-fit to one cost-model cutoff, so that arm asserts nothing.
+
 ---
 
 ## 5. Closure representation and inlining

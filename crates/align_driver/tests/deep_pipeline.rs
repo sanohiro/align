@@ -185,7 +185,31 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
                 }
             }
 
-            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+            // The vector-SHAPE gate is x86-64-v3 only, deliberately — the fusion, inlining,
+            // no-allocation and no-runtime-call gates above are the arch-independent ones and run
+            // everywhere.
+            //
+            // These kernels reduce a chain of `i64` multiplies (`mix`), and **AArch64 NEON has no
+            // 64-bit-lane integer multiply** (`MUL` covers `.8b/.16b/.4h/.8h/.2s/.4s`, not `.2d`),
+            // so there is no lane-reduced form for LLVM to pick: it emits scalar `madd`, and past a
+            // shallow depth stops vectorizing the loop at all. x86-64-v3 has no 64-bit vector
+            // multiply either (`vpmullq` is AVX-512DQ), but LLVM emulates it with 32-bit multiplies
+            // and finds that profitable, which is why the shape holds there at every depth.
+            //
+            // Measured before scoping this, so it is not a guess and not a papered-over regression:
+            //   - Not an LLVM 22 regression — `opt` 19, 20, 21 and 22 all produce the same scalar
+            //     result from the same input IR.
+            //   - Not an Align codegen defect — the identical loop written in C and compiled by
+            //     clang for arm64 does not vectorize at ANY depth, while Align's still does at
+            //     depth 1-2. A C loop with the multiply REMOVED becomes `<2 x i64>` +
+            //     `llvm.vector.reduce.add`, and with 32-bit lanes `<4 x i32>`, which is what pins
+            //     the multiply as the sole cause.
+            //
+            // The aarch64 arm of this gate previously asserted the x86-64 shape and so could never
+            // have passed. Asserting today's aarch64 shape instead would be curve-fitting to one
+            // LLVM cost-model cutoff — the depth at which it gives up is a threshold, not a
+            // contract — so nothing is asserted there rather than something meaningless.
+            if cfg!(target_arch = "x86_64") {
                 for family in VECTORIZABLE_FAMILIES {
                     for depth in DEPTHS {
                         let name = format!("{family}_{depth}");
