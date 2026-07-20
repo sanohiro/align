@@ -1918,6 +1918,7 @@ fn build_module<'c>(
         ("hex_encode", "align_rt_hex_encode"),
         ("percent_encode", "align_rt_percent_encode"),
         ("form_encode", "align_rt_form_encode"),
+        ("html_escape", "align_rt_html_escape"),
     ] {
         funcs.insert(
             key.to_string(),
@@ -7123,6 +7124,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Hex => "hex_encode",
                     align_sema::hir::EncodingKind::Percent => "percent_encode",
                     align_sema::hir::EncodingKind::Form => "form_encode",
+                    align_sema::hir::EncodingKind::Html => "html_escape",
                 };
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
@@ -7137,6 +7139,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Hex => "hex_decode",
                     align_sema::hir::EncodingKind::Percent => "percent_decode",
                     align_sema::hir::EncodingKind::Form => "form_decode",
+                    // `html_escape` is encode-only — sema maps no `*_decode` method to `Html`, so an
+                    // `EncodingDecode` node can never carry it.
+                    align_sema::hir::EncodingKind::Html => unreachable!("html has no decode direction"),
                 };
                 let out_ptr = self.slots[out];
                 self.builder

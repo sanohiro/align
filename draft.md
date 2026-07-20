@@ -2369,6 +2369,7 @@ encoding.percent_encode(data: bytes) -> string          // RFC 3986 URI componen
 encoding.percent_decode(s: str) -> Result<buffer, Error> // `%` not followed by 2 hex -> Error.Invalid
 encoding.form_encode(data: bytes) -> string             // x-www-form-urlencoded; space -> `+`
 encoding.form_decode(s: str) -> Result<buffer, Error>    // `+` -> space, %XX -> byte
+encoding.html_escape(data: bytes) -> string             // & < > " ' -> entities (text + attribute safe)
 encoding.utf8_valid(b: bytes) -> bool                   // check before turning bytes into str
 ```
 

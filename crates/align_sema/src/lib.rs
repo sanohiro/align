@@ -12321,7 +12321,7 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "encoding"
                 && matches!(
                     method,
-                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "utf8_valid"
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid"
                 )
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
@@ -17197,6 +17197,7 @@ impl<'a, 't> Checker<'a, 't> {
             "base64url_encode" | "base64url_decode" => hir::EncodingKind::Base64Url,
             "percent_encode" | "percent_decode" => hir::EncodingKind::Percent,
             "form_encode" | "form_decode" => hir::EncodingKind::Form,
+            "html_escape" => hir::EncodingKind::Html,
             _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
         };
         // `utf8_valid(b)` — a byte-only check (`slice<u8>`); trivially true for a `str`, so it takes

@@ -103,8 +103,8 @@ DONE   application/x-www-form-urlencoded        std.encoding     (2026-07-20)
 DONE   query-string lookup (zero-alloc, escaped   pkg.web.internal.query (2026-07-20)
        keys matched without materializing)
 TODO   multipart/form-data (uploads)            pkg.web or pkg
-TODO   Cookie parse / Set-Cookie build          pkg.web
-TODO   HTML escaping                            std.encoding (or the deferred `html` template)
+DONE   Cookie parse / Set-Cookie build          pkg.web.cookie   (2026-07-20)
+DONE   HTML escaping                            std.encoding     (2026-07-20)
 TODO   CORS                                     pkg.web middleware-lite (W6)
 LATER  JWT HS384/512, RS256/ES256               needs std.crypto hmac_sha384/512, RSA/ECDSA
 ```
