@@ -1,0 +1,113 @@
+module pkg.web.cors
+
+// pkg.web CORS (WHATWG Fetch §3.2). A **public** submodule: an application constructs the policy.
+//
+// This module owns the *decisions* — which `Access-Control-*` values a response may carry — as pure
+// functions over the policy and the request's `Origin`. Emitting them as headers belongs to serve,
+// so the rules stay testable without a socket.
+//
+// The security-critical parts, made explicit rather than defaulted:
+//   - `*` together with credentials is FORBIDDEN by the Fetch spec (it would let any site read a
+//     credentialed response). `valid` rejects such a policy instead of silently downgrading it.
+//   - A non-wildcard policy REFLECTS the request's origin, so the response varies by request —
+//     `vary_origin` says when `Vary: Origin` must be sent, without which a shared cache can serve
+//     one origin's response to another.
+//   - An origin that is not on the allowlist yields "" (send no `Access-Control-Allow-Origin` at
+//     all), never a permissive fallback.
+
+// The policy. `allow_origins` holds exact origins (scheme://host[:port]) or the single entry "*".
+// `allow_methods` / `allow_headers` are the pre-joined preflight header values; `max_age` is the
+// preflight cache in seconds (< 0 omits the header).
+pub CorsPolicy {
+  allow_origins: slice<str>,
+  allow_credentials: bool,
+  allow_methods: str,
+  allow_headers: str,
+  max_age: i64,
+}
+
+// Whether `p` lists the wildcard.
+pub fn is_wildcard(p: CorsPolicy) -> bool {
+  n := p.allow_origins.len()
+  mut i := 0
+  loop {
+    if i >= n { break false }
+    if p.allow_origins[i] == "*" { break true }
+    i = i + 1
+  }
+}
+
+// Whether the policy is internally consistent. `*` with credentials is rejected: the Fetch spec
+// forbids that pair, and honouring it would expose every credentialed response to any origin. A
+// policy with no origins is valid — it simply grants no CORS.
+pub fn valid(p: CorsPolicy) -> bool {
+  if p.allow_credentials && is_wildcard(p) {
+    return false
+  }
+  return true
+}
+
+// The `Access-Control-Allow-Origin` value to send for a request whose `Origin` is `origin`, or ""
+// to send no such header (deny). Matching is EXACT — an origin is granted only by being listed, never
+// by prefix/suffix resemblance, which is the classic CORS bypass. An invalid policy grants nothing.
+pub fn allow_origin(p: CorsPolicy, origin: str) -> str {
+  if !valid(p) {
+    return ""
+  }
+  if is_wildcard(p) {
+    return "*"
+  }
+  n := p.allow_origins.len()
+  mut i := 0
+  loop {
+    if i >= n { break "" }
+    if p.allow_origins[i] == origin { break origin }
+    i = i + 1
+  }
+}
+
+// Whether a response under this policy must carry `Vary: Origin`. True for any non-wildcard policy,
+// because the `Access-Control-Allow-Origin` it emits depends on the request's `Origin` — omitting
+// `Vary` there lets a shared cache hand one origin's response to another.
+pub fn vary_origin(p: CorsPolicy) -> bool {
+  if is_wildcard(p) {
+    return false
+  }
+  return true
+}
+
+// Whether `method` is granted by the policy's `allow_methods` (a comma-separated list, optionally
+// space-padded, as it is sent on the wire). Used to answer a preflight's
+// `Access-Control-Request-Method`.
+pub fn method_allowed(p: CorsPolicy, method: str) -> bool {
+  s := p.allow_methods
+  sb := s.bytes()
+  n := s.len()
+  mut start := 0
+  loop {
+    if start > n { break false }
+    // Skip spaces after the previous ','.
+    loop {
+      if start >= n { break }
+      if sb[start] as i64 != 32 { break }
+      start = start + 1
+    }
+    mut end := start
+    loop {
+      if end >= n { break }
+      if sb[end] as i64 == 44 { break }   // ','
+      end = end + 1
+    }
+    // Trim trailing spaces of this entry.
+    mut stop := end
+    loop {
+      if stop <= start { break }
+      if sb[stop - 1] as i64 != 32 { break }
+      stop = stop - 1
+    }
+    if s[start..stop] == method {
+      break true
+    }
+    start = end + 1
+  }
+}

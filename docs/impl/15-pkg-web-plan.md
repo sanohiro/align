@@ -105,7 +105,8 @@ DONE   query-string lookup (zero-alloc, escaped   pkg.web.internal.query (2026-0
 TODO   multipart/form-data (uploads)            pkg.web or pkg
 DONE   Cookie parse / Set-Cookie build          pkg.web.cookie   (2026-07-20)
 DONE   HTML escaping                            std.encoding     (2026-07-20)
-TODO   CORS                                     pkg.web middleware-lite (W6)
+DONE   CORS decisions (allowlist, wildcard+cred  pkg.web.cors     (2026-07-20)
+       rejection, Vary, preflight methods)      — header emission wires in at serve
 LATER  JWT HS384/512, RS256/ES256               needs std.crypto hmac_sha384/512, RSA/ECDSA
 ```
 
