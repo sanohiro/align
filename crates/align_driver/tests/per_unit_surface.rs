@@ -8,9 +8,12 @@
 //!  1. **N=1 byte-identity across every profile** — a single-file program's per-unit object equals
 //!     its whole-program object for `dev`/`release`/`fast`/`small`/`tiny` (+ `--rt-lto` where legal),
 //!     and the linked executables match. The migration keystone, widened past `gate_a`.
-//!  2. **CLI equivalence** — the real `alignc build`/`run`/`size` on a single file produce an
-//!     executable byte-identical to a library whole-program reference, identical program output, a
-//!     size report; the removed `build-per-unit` verb is now an unknown command.
+//!  2. **CLI equivalence** — the real `alignc emit-obj`/`build`/`run`/`size` on a single file
+//!     produce an OBJECT byte-identical to a library whole-program reference (the portable form of
+//!     this gate: the compiler's own output, nothing linker- or platform-dependent in it), plus an
+//!     identical program output and a size report; the removed `build-per-unit` verb is now an
+//!     unknown command. The linked-executable comparison additionally runs off Mach-O — see the
+//!     note at the assertion for why the archive path makes it meaningless there.
 //!  3. **`emit-obj` multi-file** — one object per unit at `<module>.o` (incl. a dotted path), a
 //!     non-entry `pub` fn external in ITS object, `--export` entry-unit-only (applied / wrong-unit /
 //!     unknown), and a rejected `[out.o]` positional.
@@ -136,8 +139,20 @@ fn n1_object_and_exe_identical_across_all_profiles() {
             );
 
             // And the linked executables match (deterministic link of identical objects).
-            let wp_exe = proj.dir.join(format!("wp-{tag}"));
-            let pu_exe = proj.dir.join(format!("pu-{tag}"));
+            //
+            // Both link to the same BASENAME in separate directories, not to `wp-{tag}`/`pu-{tag}`
+            // side by side: on macOS the linker derives the ad-hoc code signature's identifier from
+            // the output file's name, so two executables differing only in filename differ in bytes
+            // no matter how identical their inputs were. (Measured: same basename in different
+            // directories is byte-identical; different basenames are not.) The variable under test
+            // is whole-program vs per-unit, so the filename has to be held constant like every
+            // other input — the same reason `cache_codegen`'s gate7 links to a fixed path (#579).
+            let wp_dir = proj.dir.join(format!("wp-{tag}.d"));
+            let pu_dir = proj.dir.join(format!("pu-{tag}.d"));
+            std::fs::create_dir_all(&wp_dir).expect("wp exe dir");
+            std::fs::create_dir_all(&pu_dir).expect("pu exe dir");
+            let wp_exe = wp_dir.join("n1");
+            let pu_exe = pu_dir.join("n1");
             link_objects(&[wp.as_path()], &wp_exe, &wp_mir.link_libs, profile).expect("wp link");
             link_objects(&[pu.as_path()], &pu_exe, &pu_mir.link_libs, profile).expect("pu link");
             assert_eq!(
@@ -159,18 +174,54 @@ fn cli_build_run_size_match_library_reference() {
     }
     let src = "fn main() {\n  print(1234)\n}\n";
 
-    // Library whole-program reference executable (lower_to_mir -> emit_object -> link_executable at
-    // the CLI's default release/baseline).
-    let reference = build_exe("s2b-ref", src);
-    let ref_bytes = std::fs::read(&reference.exe).expect("read reference exe");
-
     let proj = Proj::new("cli-equiv", &[("app.align", src)]);
 
-    // `build`: the produced `<stem>` executable is byte-identical to the library reference.
+    // Library whole-program reference, emitted at exactly the path the CLI will use so nothing
+    // path-dependent can differ, and read into memory before the CLI overwrites it.
+    let obj = proj.dir.join("app.o");
+    let exe = proj.dir.join("app");
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "app.align", src);
+    assert!(!checked.diags.has_errors(), "the reference program must compile clean");
+    let ref_mir = lower_to_mir(&checked.hir);
+    emit_object_file(&ref_mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false)
+        .expect("reference emit");
+    let ref_obj_bytes = std::fs::read(&obj).expect("read reference object");
+    link_objects(&[obj.as_path()], &exe, &ref_mir.link_libs, Profile::Release).expect("reference link");
+    let ref_exe_bytes = std::fs::read(&exe).expect("read reference exe");
+
+    // The OBJECT is the portable form of this gate, and the stronger one: it is the compiler's
+    // actual output, with no linker- or platform-dependent content in it. `emit-obj` is the same
+    // per-unit pipeline `build` runs.
+    let emitted = proj.run(&["emit-obj", "app.align"]);
+    assert!(emitted.status.success(), "emit-obj failed: {}", String::from_utf8_lossy(&emitted.stderr));
+    let cli_obj_bytes = std::fs::read(&obj).expect("read cli object");
+    assert_eq!(
+        ref_obj_bytes, cli_obj_bytes,
+        "CLI per-unit codegen must byte-match the whole-program reference"
+    );
+
+    // `build`: the produced `<stem>` executable runs and, where the platform permits, is
+    // byte-identical to the reference link.
     let built = proj.run(&["build", "app.align"]);
     assert!(built.status.success(), "build failed: {}", String::from_utf8_lossy(&built.stderr));
-    let cli_bytes = std::fs::read(proj.dir.join("app")).expect("read cli exe");
-    assert_eq!(ref_bytes, cli_bytes, "CLI per-unit build must byte-match the whole-program reference");
+    let cli_exe_bytes = std::fs::read(&exe).expect("read cli exe");
+
+    // The executable comparison is NOT run on Mach-O, and the reason is specific rather than a
+    // blanket exemption. `runtime_archive()` resolves `libalign_runtime.a` relative to
+    // `current_exe()`, so the library reference — linked from inside this test binary in
+    // `target/<profile>/deps/` — picks up `deps/libalign_runtime.a`, while `alignc` in
+    // `target/<profile>/` picks up its sibling. Same archive, two paths, and Mach-O records the
+    // path of every linked object in its debug map (`OSO` stabs): 22 entries differing by the five
+    // characters of `deps/` accounted for exactly the 112-byte size difference observed. Nothing
+    // there is downstream of per-unit vs whole-program, which is what this gate is about — and the
+    // object assertion above already pins that, on every platform.
+    if cfg!(not(target_os = "macos")) {
+        assert_eq!(
+            ref_exe_bytes, cli_exe_bytes,
+            "CLI per-unit build must byte-match the whole-program reference"
+        );
+    }
 
     // `run`: program output is identical.
     let ran = proj.run(&["run", "app.align"]);
