@@ -15096,9 +15096,20 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         };
-        let (params, e2) = {
+        let (params, ret_ty) = {
             let ft = &self.fn_types[fid as usize];
-            (ft.params.clone(), ty_to_scalar(ft.ret).unwrap_or(Scalar::Unit))
+            (ft.params.clone(), ft.ret)
+        };
+        // `map_err`'s function is `fn(E) -> E'`: its return becomes the mapped `Result`'s error type,
+        // so it must BE an error type. Since a fn value may now return `Result<T, E>` too, reject a
+        // non-scalar return here rather than defaulting it — silently substituting a placeholder
+        // would mis-type the whole expression.
+        let Some(e2) = ty_to_scalar(ret_ty) else {
+            self.diags.error(
+                format!("'map_err' function must return an error type, got {}", ty_name(ret_ty)),
+                args[0].span,
+            );
+            return err;
         };
         if params.as_slice() != [e] {
             self.diags.error(
