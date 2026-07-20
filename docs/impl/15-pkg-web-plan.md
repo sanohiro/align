@@ -102,12 +102,35 @@ DONE   URL/percent encode+decode (RFC 3986)     std.encoding     (2026-07-20)
 DONE   application/x-www-form-urlencoded        std.encoding     (2026-07-20)
 DONE   query-string lookup (zero-alloc, escaped   pkg.web.internal.query (2026-07-20)
        keys matched without materializing)
-TODO   multipart/form-data (uploads)            pkg.web or pkg
 DONE   Cookie parse / Set-Cookie build          pkg.web.cookie   (2026-07-20)
 DONE   HTML escaping                            std.encoding     (2026-07-20)
 DONE   CORS decisions (allowlist, wildcard+cred  pkg.web.cors     (2026-07-20)
        rejection, Vary, preflight methods)      — header emission wires in at serve
+TODO   multipart/form-data (uploads)            pkg.web or pkg
+NEXT   fn VALUE with a `Result` return          compiler (FnTy.ret is a Scalar today)
+NEXT   fn VALUE called with a STRUCT argument   compiler (closure ABI aggregate-arg path)
 LATER  JWT HS384/512, RS256/ES256               needs std.crypto hmac_sha384/512, RSA/ECDSA
+```
+
+**The two `NEXT` compiler items gate the designed handler contract.** `Route.handler` is
+`fn(Ctx) -> Result<(), Error>`; a fn *value* cannot carry a `Result` return, and calling one with a
+struct argument aborts (F1① only exercised scalar parameters). Until both land, a matched handler is
+called directly rather than through the route table's field — the shapes otherwise compose and are
+proven over a real socket (`apps_web_serve.rs`).
+
+**OAuth 2.0 / OIDC** (owner asked 2026-07-20) is a package (`pkg.oauth`) over these parts, not a
+separate subsystem:
+
+```text
+client flows (authorization-code + PKCE)   BUILDABLE NOW — authorize URL (percent_encode),
+                                           token exchange (std.http client + form_encode body),
+                                           token JSON (core.json), PKCE S256 (sha256 + base64url),
+                                           state/nonce (crypto.random)
+bearer-token parsing on the resource side  BUILDABLE NOW — header read + pkg.jwt
+validating a PUBLIC provider's token       BLOCKED on RS256: Google / Auth0 / Okta / Entra all sign
+                                           with RS256, so this needs std.crypto RSA verification
+                                           (EVP over the already-linked libssl — a bounded addition,
+                                           not a redesign), then JWKS fetch (https + JSON) on top
 ```
 
 A `TODO` here is committed work with a home, not a maybe. Discovering a *further* gap later is
