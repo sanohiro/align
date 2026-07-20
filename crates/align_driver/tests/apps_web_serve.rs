@@ -7,13 +7,10 @@
 //! nulled so the struct's drop does not double-free it. A clean server exit is itself the assertion:
 //! a double-freed request handle would abort the process.
 //!
-//! TWO COMPILER GAPS remain before the *designed* handler contract (`Route.handler`, a fn value
-//! called per request) can be driven here, both found by trying exactly that:
-//!   1. a fn VALUE cannot carry a `Result` return (`FnTy.ret` is a `Scalar`), so a handler cannot be
-//!      `fn(Ctx) -> Result<(), Error>` as designed;
-//!   2. calling a fn value with a STRUCT argument aborts at runtime — F1① only ever exercised scalar
-//!      parameters, so the closure ABI's aggregate-argument path is untested and broken.
-//! Until both land, the route table's handler is invoked directly rather than through the field.
+//! The route table's handler IS invoked through its fn-value field (`r.handler(c)`) — the designed
+//! dispatch. ONE compiler gap remains before the designed *signature* can be used: a fn VALUE cannot
+//! carry a `Result` return (`FnTy.ret` is a `Scalar`), so a handler returns `i64` (0 = ok) here
+//! instead of `Result<(), Error>`.
 
 mod common;
 use common::*;
@@ -26,8 +23,8 @@ const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.ali
 
 /// A minimal `pkg.web` root wiring the internal router to the public shapes this test drives.
 /// NOTE: handlers return `i64` (0 = ok) rather than the designed `Result<(), Error>` only because a
-/// fn VALUE cannot yet carry a `Result` return (`FnTy.ret` is a `Scalar`); everything else here is
-/// the designed shape. Widening that is the last compiler step for the real handler contract. The
+/// fn VALUE cannot yet carry a `Result` return (`FnTy.ret` is a `Scalar`); everything else — including
+/// dispatch through the `Route.handler` fn field — is the designed shape. The
 /// full surface (`get`/`post`/`serve`/`json`/…) is the rest of W2; what is pinned here is that the
 /// *shapes* compose — `Ctx` owning the handle, `Route` carrying a fn value, dispatch, param reads,
 /// and a consuming respond.
@@ -112,9 +109,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
   }\n\
   r := routes[idx]\n\
   c := pkg.web.Ctx { req: ctx, pattern: r.pattern }\n\
-  // Direct call (not `r.handler(c)`) until fn values accept a struct argument — see the gaps above.\n\
-  rc := if idx == 0 { list_models(c) } else { get_model(c) }\n\
-  if rc != 0 { return Err(Error.Invalid) }\n\
+  if r.handler(c) != 0 { return Err(Error.Invalid) }\n\
   return Ok(())\n\
 }\n";
 
