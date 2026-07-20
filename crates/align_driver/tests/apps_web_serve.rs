@@ -7,10 +7,9 @@
 //! nulled so the struct's drop does not double-free it. A clean server exit is itself the assertion:
 //! a double-freed request handle would abort the process.
 //!
-//! The route table's handler IS invoked through its fn-value field (`r.handler(c)`) — the designed
-//! dispatch. ONE compiler gap remains before the designed *signature* can be used: a fn VALUE cannot
-//! carry a `Result` return (`FnTy.ret` is a `Scalar`), so a handler returns `i64` (0 = ok) here
-//! instead of `Result<(), Error>`.
+//! This is the DESIGNED contract, end to end: `Route.handler` is `fn(Ctx) -> Result<(), Error>`, the
+//! route table holds it in a fn-value field, and the matched handler is invoked through that field
+//! (`r.handler(c)`) — nothing here is a stand-in for a missing compiler feature.
 
 mod common;
 use common::*;
@@ -22,16 +21,14 @@ use std::time::{Duration, Instant};
 const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
 
 /// A minimal `pkg.web` root wiring the internal router to the public shapes this test drives.
-/// NOTE: handlers return `i64` (0 = ok) rather than the designed `Result<(), Error>` only because a
-/// fn VALUE cannot yet carry a `Result` return (`FnTy.ret` is a `Scalar`); everything else — including
-/// dispatch through the `Route.handler` fn field — is the designed shape. The
+/// The
 /// full surface (`get`/`post`/`serve`/`json`/…) is the rest of W2; what is pinned here is that the
 /// *shapes* compose — `Ctx` owning the handle, `Route` carrying a fn value, dispatch, param reads,
 /// and a consuming respond.
 const WEB_ROOT: &str = "module pkg.web\n\
 import pkg.web.internal.router\n\
 pub Ctx { req: http_request_ctx, pattern: str }\n\
-pub Route { pattern: str, handler: fn(Ctx) -> i64 }\n\
+pub Route { pattern: str, handler: fn(Ctx) -> Result<(), Error> }\n\
 pub fn dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.tree_dispatch(patterns, path)\n\
 pub fn param(pattern: str, path: str, name: str) -> str = pkg.web.internal.router.param_value(pattern, path, name)\n";
 
@@ -66,28 +63,25 @@ import std.http\n\
 import std.cli\n\
 import pkg.web\n\
 \n\
-fn get_model(c: pkg.web.Ctx) -> i64 {\n\
+fn get_model(c: pkg.web.Ctx) -> Result<(), Error> {\n\
   id := pkg.web.param(c.pattern, c.req.path(), \"id\")\n\
   rb := http.response(200)\n\
   rb.header(\"X-Route\", \"model\")\n\
   rb.body(id)\n\
-  c.req.respond(rb) else { return 1 }\n\
-  return 0\n\
+  return c.req.respond(rb)\n\
 }\n\
 \n\
-fn list_models(c: pkg.web.Ctx) -> i64 {\n\
+fn list_models(c: pkg.web.Ctx) -> Result<(), Error> {\n\
   rb := http.response(200)\n\
   rb.header(\"X-Route\", \"list\")\n\
   rb.body(\"all\")\n\
-  c.req.respond(rb) else { return 1 }\n\
-  return 0\n\
+  return c.req.respond(rb)\n\
 }\n\
 \n\
-fn not_found(c: pkg.web.Ctx) -> i64 {\n\
+fn not_found(c: pkg.web.Ctx) -> Result<(), Error> {\n\
   rb := http.response(404)\n\
   rb.body(\"nope\")\n\
-  c.req.respond(rb) else { return 1 }\n\
-  return 0\n\
+  return c.req.respond(rb)\n\
 }\n\
 \n\
 pub fn main(args: array<str>) -> Result<(), Error> {\n\
@@ -104,13 +98,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
   idx := pkg.web.dispatch(patterns, ctx.path())\n\
   if idx < 0 {\n\
     c := pkg.web.Ctx { req: ctx, pattern: \"\" }\n\
-    if not_found(c) != 0 { return Err(Error.Invalid) }\n\
-    return Ok(())\n\
+    return not_found(c)\n\
   }\n\
   r := routes[idx]\n\
   c := pkg.web.Ctx { req: ctx, pattern: r.pattern }\n\
-  if r.handler(c) != 0 { return Err(Error.Invalid) }\n\
-  return Ok(())\n\
+  return r.handler(c)\n\
 }\n";
 
 fn run_server(name: &str, request: &[u8]) -> String {

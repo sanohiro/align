@@ -611,6 +611,14 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
 /// take only true scalar / owned parameters today; a borrowed-slice parameter or return stays with
 /// the rest of the deferred non-scalar fn-value surface (`fn_values.rs`). Using this at the fn-value
 /// sites keeps that restriction after `Scalar::Slice` joined `ty_to_scalar`.
+/// Whether `ty` may be the RETURN of a function value. Scalars as before, plus `Result<T, E>` — the
+/// shape every fallible callback has (`pkg.web`'s `fn(Ctx) -> Result<(), Error>`). Deliberately not
+/// "any type": widening is exactly what a consumer needed, so no untested aggregate-return ABI is
+/// admitted by accident.
+pub fn fn_value_ret_ok(ty: Ty) -> bool {
+    fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..))
+}
+
 pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
     match ty_to_scalar(ty) {
         Some(Scalar::Slice(_)) => None,
@@ -10522,10 +10530,11 @@ impl<'a, 't> Checker<'a, 't> {
             return err();
         };
         let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
-        let ret = fn_sig_scalar(sig.ret);
-        match (params, ret) {
-            (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
-                let fid = fresh_fn_type(self.fn_types, ps, r, FnEffect::Unknown);
+        let ret_ok = fn_value_ret_ok(sig.ret);
+        let sig_ret = sig.ret;
+        match (params, ret_ok) {
+            (Some(ps), true) if !sig.out.iter().any(|o| *o) => {
+                let fid = fresh_fn_type(self.fn_types, ps, sig_ret, FnEffect::Unknown);
                 let ty = Ty::Fn(fid);
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::FnValue(mangled), ty, span }
@@ -11397,12 +11406,12 @@ impl<'a, 't> Checker<'a, 't> {
         // Scalar signature only (slice ②a), matching named function values. The captures are
         // hidden from the closure's *type* — only the explicit parameters appear in `Ty::Fn`.
         let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| fn_sig_scalar(self.finalize(*t))).collect();
-        let rscalar = fn_sig_scalar(self.finalize(ret));
-        let (Some(ps), Some(r)) = (pscalars, rscalar) else {
-            self.diags.error("a lambda value supports only scalar parameters and return type".to_string(), span);
+        let rty = self.finalize(ret);
+        let (Some(ps), true) = (pscalars, fn_value_ret_ok(rty)) else {
+            self.diags.error("a lambda value supports only scalar parameters, and a scalar or `Result` return".to_string(), span);
             return err;
         };
-        let fid = fresh_fn_type(self.fn_types, ps, r, FnEffect::Unknown);
+        let fid = fresh_fn_type(self.fn_types, ps, rty, FnEffect::Unknown);
         let ty = Ty::Fn(fid);
         self.constrain(ty, expected, span);
         // No captures → a plain function pointer (slice ②a). Captures → a closure carrying its
@@ -11464,7 +11473,7 @@ impl<'a, 't> Checker<'a, 't> {
         // The closure value (the `{thunk, env}` machinery is reused as-is; the lifted function may
         // return `Result` — the thunk just forwards it). Its `Ty::Fn` tag uses the `ok` scalar as
         // the return (a repr-only tag — a closure value is a pointer pair regardless).
-        let fid = fresh_fn_type(self.fn_types, Vec::new(), ok, FnEffect::Unknown);
+        let fid = fresh_fn_type(self.fn_types, Vec::new(), scalar_to_ty(ok), FnEffect::Unknown);
         let cty = Ty::Fn(fid);
         let closure = if captures.is_empty() {
             Expr { kind: ExprKind::FnValue(name), ty: cty, span: arg.span }
@@ -11527,7 +11536,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Clone only the parameter scalars (needed across the `&mut self` `check_expr` calls);
         // the per-arg LLVM type is computed in the loop, with no intermediate `Vec<Ty>`.
         let params = self.fn_types[fid as usize].params.clone();
-        let ret = scalar_to_ty(self.fn_types[fid as usize].ret);
+        let ret = self.fn_types[fid as usize].ret;
         if args.len() != params.len() {
             self.diags.error(
                 format!("this function value expects {} argument(s), got {}", params.len(), args.len()),
@@ -15087,9 +15096,20 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         };
-        let (params, e2) = {
+        let (params, ret_ty) = {
             let ft = &self.fn_types[fid as usize];
             (ft.params.clone(), ft.ret)
+        };
+        // `map_err`'s function is `fn(E) -> E'`: its return becomes the mapped `Result`'s error type,
+        // so it must BE an error type. Since a fn value may now return `Result<T, E>` too, reject a
+        // non-scalar return here rather than defaulting it — silently substituting a placeholder
+        // would mis-type the whole expression.
+        let Some(e2) = ty_to_scalar(ret_ty) else {
+            self.diags.error(
+                format!("'map_err' function must return an error type, got {}", ty_name(ret_ty)),
+                args[0].span,
+            );
+            return err;
         };
         if params.as_slice() != [e] {
             self.diags.error(
@@ -21066,7 +21086,7 @@ fn intern_tuple(tuples: &mut Vec<hir::TupleDef>, elems: Vec<Scalar>) -> u32 {
     (tuples.len() - 1) as u32
 }
 
-fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scalar) -> u32 {
+fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Ty) -> u32 {
     let ft = hir::FnTy { params, ret, effect: std::cell::Cell::new(FnEffect::Unknown) };
     if let Some(i) = fn_types.iter().position(|t| *t == ft) {
         return i as u32;
@@ -21078,7 +21098,7 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scala
 /// Allocate a distinct function-value type for one concrete origin. Its signature remains
 /// structurally compatible with a source `fn(T) -> R` annotation, while its effect cell can be
 /// refined independently from unrelated functions with the same ABI.
-fn fresh_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scalar, effect: FnEffect) -> u32 {
+fn fresh_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Ty, effect: FnEffect) -> u32 {
     fn_types.push(hir::FnTy { params, ret, effect: std::cell::Cell::new(effect) });
     (fn_types.len() - 1) as u32
 }
@@ -21159,15 +21179,13 @@ fn resolve_type(
                     }
                 }
             }
+            // The return may be any type a function can return — notably `Result<T, E>`, which a
+            // fallible handler needs; it is NOT narrowed to a `Scalar`.
             let rty = resolve_type(ret, cx, type_params, diags);
             if rty == Ty::Error {
                 return Ty::Error;
             }
-            let Some(rs) = ty_to_scalar(rty) else {
-                diags.error(format!("a function-type return must be a scalar for now, got {}", ty_name(rty)), ret.span());
-                return Ty::Error;
-            };
-            return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rs));
+            return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
         }
         ast::Type::Tuple { elems, span: _ } => {
             // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
