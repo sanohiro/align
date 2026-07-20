@@ -217,6 +217,22 @@ fn non_fn_struct_field_called_rejected() {
 }
 
 #[test]
+fn capturing_closure_in_a_struct_field_cannot_escape_the_frame() {
+    // SOUNDNESS: a fn-value field holding a *capturing* closure may not escape — its `env_ptr` is on
+    // this frame, so returning the struct would use-after-free the freed env. `region_of(Closure)`
+    // classifies a capturing closure as `Frame` (even capturing only `Static` values), so the escape
+    // check rejects returning `R { f: fn x { x + base } }`. Before the fix this compiled and returned
+    // garbage (the same root cause as the enum fn-payload escape). A non-capturing named fn stays legal.
+    assert!(
+        check_errs(
+            "fv-field-capescape",
+            "R { f: fn(i64) -> i64 }\nfn make(base: i64) -> R = R { f: fn x: i64 { x + base } }\nfn main() -> i32 = 0\n"
+        ),
+        "returning a struct whose fn field is a frame-capturing closure must be rejected (UAF)"
+    );
+}
+
+#[test]
 fn fn_field_beside_owned_field_drops_cleanly() {
     if !backend_available() {
         return;

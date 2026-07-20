@@ -179,6 +179,18 @@ pub enum Scalar {
     /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
     /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
     HttpStream,
+    /// A first-class **function value** payload (`Ty::Fn`, indexed into `Program.fn_types`). A
+    /// sum-type variant may carry one — the `Handler { Respond(fn(Ctx) -> …), Stream(fn(Ctx, …) -> …) }`
+    /// or-kind that lets pkg.web's stream and unary routes share one table. A fn value is a **Copy**
+    /// `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align): it owns no heap, so an enum carrying
+    /// only fn payloads is never Move and never dropped (its tag-switched drop skips this slot).
+    /// Non-recursive (just the id), so `Scalar` stays `Copy`. Like every handle scalar it is a
+    /// *payload* only — never an array/slice/box element (that is a fn-value **struct field**, which
+    /// `is_field_ok` admits separately). It IS conservatively **region-tracked** (`tracks_region`,
+    /// like `reader`/`writer`) — a future capturing closure's `env_ptr` could borrow — but a
+    /// non-capturing fn's `region_of` is `Static`, so a fn-payload enum stays freely returnable and
+    /// array-eligible in practice (a `Route { handler: Handler }` table is fine).
+    Fn(u32),
 }
 
 impl Scalar {
@@ -667,6 +679,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
         Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
+        Scalar::Fn(fid) => Ty::Fn(fid),
     }
 }
 
@@ -2903,9 +2916,17 @@ pub fn check_program_with_effects(
                             t.span(),
                         ),
                     },
+                    // A first-class **function-value** payload (the `Handler { Respond(fn…), Stream(fn…) }`
+                    // or-kind, pkg.web W6). `resolve_type` has already built and validated the `fn(...)`
+                    // signature into `fn_types` (scalar/handle params, `fn_value_ret_ok` return), so the
+                    // id is sound. A fn value is Copy `{fn_ptr, env_ptr}` (16 bytes): it owns nothing, so
+                    // a fn-only enum stays non-Move and its tag-switched drop skips this slot. Strictly
+                    // smaller than a Move-handle payload. (Generic sum types with a fn payload are still
+                    // rejected upstream at the template payload resolver — deferred, no consumer.)
+                    Ty::Fn(fid) => payload.push(Scalar::Fn(fid)),
                     Ty::Error => {}
                     other => diags.error(
-                        format!("variant payloads must be a primitive scalar, plain struct, or owned `array<T>` for now, got {}", ty_name(other)),
+                        format!("variant payloads must be a primitive scalar, plain struct, owned `array<T>`, or fn value for now, got {}", ty_name(other)),
                         t.span(),
                     ),
                 }
@@ -5631,9 +5652,20 @@ impl<'a> EscapeCheck<'a> {
             // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
             // this must become the shorter of the break values' regions instead.)
             ExprKind::Loop { .. } => Region::Static,
+            // A closure `{fn_ptr, env_ptr}`: if it captures anything, codegen copies the captures into
+            // a **frame-local** environment buffer (see align_mir lowering), so the value lives no
+            // longer than the current frame — it must be `Frame`, NOT `Static`, even when every
+            // capture is itself `Static` (an `i64`/literal). Folding from `Region::Static` would call a
+            // Static-only-capturing closure returnable, but its env is on this frame; escaping it (as a
+            // struct fn-field or an enum `Scalar::Fn` payload that outlives the frame) is a
+            // use-after-free of the freed env. A capture that itself borrows (arena/frame) shortens it
+            // further. A **non-capturing** closure has a null env and is genuinely `Static` (returnable)
+            // — the same as a bare named-fn `FnValue`, which is why a fn-payload route table of named
+            // functions stays legal.
+            ExprKind::Closure { captures, .. } if captures.is_empty() => Region::Static,
             ExprKind::Closure { captures, .. } => captures
                 .iter()
-                .fold(Region::Static, |acc, c| acc.shorter(self.region_of(c, depth))),
+                .fold(Region::Frame, |acc, c| acc.shorter(self.region_of(c, depth))),
             // Producers that own their result, return a scalar, or otherwise carry no borrow
             // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
             // expression must force its escape semantics to be classified here instead of falling
@@ -19407,6 +19439,21 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
     }
 
+    /// Whether a value of type `got` satisfies an expected payload/field type `expected`. Exact type
+    /// identity, EXCEPT function values compare **by signature, not by `fn_types` id**: each `fn`
+    /// expression interns a fresh `FnTy` (its inferred effect bit / origin differ), so two
+    /// `fn(i64) -> i64` values are interchangeable though their ids differ. Mirrors [`unify`]'s
+    /// `Ty::Fn` arm — the one place a bare `!=` on resolved types is wrong for a fn value.
+    fn payload_ty_matches(&self, got: Ty, expected: Ty) -> bool {
+        let got = self.resolve(got);
+        if got == expected {
+            return true;
+        }
+        matches!((got, expected), (Ty::Fn(aid), Ty::Fn(bid))
+            if self.fn_types.get(aid as usize).zip(self.fn_types.get(bid as usize))
+                .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret))
+    }
+
     /// `Type.Variant(args)` — construct a sum-type value with a payload. Checks the argument count
     /// and each argument against the variant's payload scalar.
     fn check_variant_ctor(&mut self, enum_id: u32, field: &ast::Ident, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
@@ -19429,7 +19476,7 @@ impl<'a, 't> Checker<'a, 't> {
             .map(|(a, &s)| {
                 let pt = scalar_to_ty(s);
                 let e = self.check_expr(a, Some(pt));
-                if e.ty != Ty::Error && self.resolve(e.ty) != pt {
+                if e.ty != Ty::Error && !self.payload_ty_matches(e.ty, pt) {
                     self.diags.error(format!("payload type mismatch: expected {}, got {}", self.ty_display(pt), self.ty_display(e.ty)), e.span);
                 }
                 e
@@ -21432,6 +21479,18 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::ResponseBuilder
+        }
+        // `http_stream` (`std.http`) — a committed response's body stream, an owned Move handle
+        // (`ctx.respond_stream(rb)`). A surface type name so a stream handler can take it by value
+        // (`fn(Ctx, http_stream) -> Result<(), Error>`): the framework keeps the request handle for
+        // the whole request, and the pump owns only the stream. Its drop closes the stream fd
+        // (`http_stream_free`) exactly once, so an abandoned stream cannot leak the connection.
+        "http_stream" => {
+            if !args.is_empty() {
+                diags.error("http_stream takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::HttpStream
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {

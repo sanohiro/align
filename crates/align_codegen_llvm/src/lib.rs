@@ -2851,6 +2851,10 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Mask(_, n) => ctx.bool_type().vec_type(n).into(),
         // `rng` — the 256-bit Xoshiro256++ state as `[4 x i64]` (a Copy by-value aggregate).
         Ty::Rng => rng_llvm_type(ctx),
+        // A function value (`Scalar::Fn` as an enum variant payload) is a closure `{fn_ptr, env_ptr}`,
+        // matching `abi_type`/`closure_struct_type`. Without this arm the catch-all below would
+        // silently size it as `i32` — a 16-byte payload lowered to 4 bytes, clobbering the next slot.
+        Ty::Fn(_) => closure_struct_type(ctx).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -3329,6 +3333,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
         Scalar::Child => unreachable!("a child handle is not a box/array payload"),
+        Scalar::Fn(_) => unreachable!("a fn value is not a box/array payload"),
     }
 }
 

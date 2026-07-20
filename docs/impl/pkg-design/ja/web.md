@@ -340,21 +340,30 @@ v1 の `serve` は逐次 — **開いた stream は他の全 client を飢えさ
 
 ### Enabler（2026-07-21 探査済み; 実装順）
 
-1. **`http_stream` をソースで型名に** — `resolve_type` エントリ、#583 の `response_builder` と
-   全く同じパターン。探査: 今日は `unknown type: 'http_stream'`。自明。
-2. **fn 値を enum variant payload に** — 探査: `variant payloads must be a primitive scalar,
-   plain struct, or owned array for now, got fn#0`。この拡張は #583 より**厳密に小さい**
-   （fn 値は Copy: `is_move` 不要、drop dispatch 不要、move 時の null 不要; payload スロットは
-   ポインタ 1 つ）。それでも #583 のチェックリスト（ty_to_scalar/scalar_to_ty/scalar_bytes/
-   sort_key_order の fail-closed 腕）は掃くこと。リスク低減の注記: fn フィールドを持つ struct は
-   payload として**既に合法**（探査 green: variant 内の `Spec { tag: i64, f: fn(i64) -> i64 }` を
-   match して呼べる）— bare-fn 拡張が難航しても形は存在する; ただし wrapper を公開表面として
-   出荷しないこと。
-3. **Move ハンドルをパラメータに持つ fn 値シグネチャ**（間接呼び出しで `http_stream` を値渡し）:
-   #573 が間接呼び出しの owned-arg null 化を修正済み; pump の stream が serve のフレームで
-   null 化されること（エラーパスで二重 close しないこと）を driver テストで検証。
+1. **`http_stream` をソースで型名に — 完了。** `resolve_type` エントリ、#583 の `response_builder`
+   と全く同じパターン; `http_stream` は既に完全な `Scalar`/`Ty`（`respond_stream` の `Ok` payload、
+   `.send`/`.finish` を持つ）だったので、欠けていたのはソース表記だけ。`crates/align_driver/tests/
+   http_stream_nameable.rs` で固定（param/return 表記、型引数なし、配列要素は依然不可）。
+2. **fn 値を enum variant payload に — 完了。** 新 `Scalar::Fn(u32)` variant（元々なかった — fn 値は
+   `Ty::Fn` でスカラー形がなく、variant payload では表現できなかった）。fn 値は Copy `{fn_ptr,
+   env_ptr}`（16 バイト、8-align）なので fn のみの enum は非 Move で drop されず、混在 enum の
+   tag 分岐 drop は fn スロットをスキップする。#583 のチェックリストを掃いた — `scalar_to_ty`、MIR
+   `sort_key_order`（fail-closed 腕）、codegen `scalar_bytes`（unreachable）、そして catch-all の
+   暗黙 `i32` の代わりに 16 バイトスロットを確保する codegen `scalar_type` の fn 腕。構築時、fn
+   payload は **`fn_types` id ではなくシグネチャで比較**（各 `fn` 式は新しい `FnTy` を intern する）。
+   `ty_to_scalar(Ty::Fn)` は `None` のまま（fn は variant payload 専用で、`Option`/`Result`/`box`
+   payload ではない）。`crates/align_driver/tests/fn_variant_payload.rs` で固定（dispatch、実際の
+   `Handler` シグネチャ、Copy/非 drop、`align_interface` 経由のクロスモジュール往復、
+   `Route { handler: Handler }` 配列形状、fn+Move 配列混在 drop、誤シグネチャの拒否）。
+   **defer（fail-closed、消費者なし）:** fn payload を持つ *generic* sum 型は template payload
+   resolver で拒否 — 中途半端には出荷しない。
+3. **Move ハンドルをパラメータに持つ fn 値シグネチャ — 完了（Move 値 proxy で検証）。** #573 が
+   間接呼び出し後に caller フレームで owned-arg を null 化する; 200k ループのテストが owned
+   `array<i64>`（`http_stream` の代役）を値渡しで match 抽出した fn payload に通し、二重 free が
+   ないこと（signal 終了ではなく完走）と move-after-use 拒否を検証。実 `http_stream` receiver は
+   enabler 4 待ち。
 4. **std.http `respond_stream` の作り直し**（上記変更①–③）— `docs/impl/std-design/http.md` に
-   記録; M12 テストを新 receiver 形に更新（pre-release: 完全置換、compat パスなし）。
+   記録; M12 テストを新 receiver 形に更新（pre-release: 完全置換、compat パスなし）。**未完了。**
 
 ### バックログ（記録のみ、v1 外）
 
