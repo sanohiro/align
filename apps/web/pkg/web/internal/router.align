@@ -305,7 +305,13 @@ pub fn param_value(pattern: str, path: str, name: str) -> str {
 
 // Dispatch a ROUTE TABLE: the index of the route that should answer `method` + `path`, or -1.
 //
-// Path matching is the radix walk above (static > `:param` > `*wildcard`); the method is then
+// Path matching uses `match_score` (the linear reference scan) rather than `tree_dispatch`, because
+// the tree builder takes a `slice<str>` of patterns and a route TABLE cannot be projected to one
+// without materializing an `array<str>` (which `array_builder` cannot build — `str` views are not a
+// valid element). Wiring the radix tree directly over a `slice<Route>` — reading `.pattern` per
+// route inside the build — is the follow-up; the two agree by construction (the differential test
+// pins `tree_dispatch` against this same `match_score` ordering), so this is a performance gap, not
+// a semantic one. Priority is unchanged: static > `:param` > `*wildcard`. The method is then
 // checked on the winning path. A route whose `method` is empty answers any method, which is how a
 // fallback is written. Because the tree is keyed by path alone, two routes sharing a path but
 // differing in method are resolved here, after the walk: the table is scanned for a route with the
