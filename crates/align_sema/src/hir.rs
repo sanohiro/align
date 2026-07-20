@@ -108,8 +108,11 @@ pub struct ImportedFn {
 pub struct FnTy {
     /// Parameter types (scalar-only for now).
     pub params: Vec<crate::Scalar>,
-    /// Return type (a scalar).
-    pub ret: crate::Scalar,
+    /// Return type. A full [`crate::Ty`] rather than a `Scalar` so a function value can carry a
+    /// `Result<T, E>` return — the shape every fallible handler has (`pkg.web`'s
+    /// `fn(Ctx) -> Result<(), Error>`). Parameters stay `Scalar` (a struct parameter is
+    /// `Scalar::Struct`, which already covers the handler's `Ctx`).
+    pub ret: crate::Ty,
     /// Inferred observable effect of invoking a value of this type. This is internal type
     /// information: source annotations remain `fn(T) -> R`, while the checker refines the bit from
     /// each value's origin and conservatively joins mutable assignments. `Unknown` is fail-closed

@@ -269,3 +269,42 @@ fn owned_local_moved_through_an_indirect_call_no_double_free() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
 }
+
+#[test]
+fn fn_value_with_a_result_return() {
+    if !backend_available() {
+        return;
+    }
+    // A function value may return `Result<T, E>` — the shape every fallible callback has. Both a
+    // fn-value LOCAL (unwrapped with `?`) and a fn-value struct FIELD (matched) carry it, which is
+    // what makes `pkg.web`'s designed `Route.handler: fn(Ctx) -> Result<(), Error>` expressible.
+    let src = concat!(
+        "fn ok_fn(x: i64) -> Result<(), Error> = Ok(())\n",
+        "fn fail_fn(x: i64) -> Result<(), Error> = Err(Error.Invalid)\n",
+        "R { h: fn(i64) -> Result<(), Error> }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  f := ok_fn\n",
+        "  f(1)?\n",
+        "  print(1)\n",
+        "  r := R { h: fail_fn }\n",
+        "  match r.h(2) {\n",
+        "    Ok(_) => print(99),\n",
+        "    Err(_) => print(2),\n",
+        "  }\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("fv-result-ret", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
+}
+
+#[test]
+fn fn_value_with_a_slice_return_still_rejected() {
+    // The widening is exactly "scalars + Result", not "any type": a view return through a fn value
+    // has no tested ABI or region story, so it stays rejected.
+    assert!(check_errs(
+        "fv-slice-ret",
+        "fn view(xs: slice<i64>) -> slice<i64> = xs\nfn main() -> i32 {\n  f := view\n  return 0\n}\n"
+    ));
+}
