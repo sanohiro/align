@@ -77,6 +77,39 @@ design doc "Middleware").
   pkg.web (stub engine seam; SSE; per-request arena). Not part of the framework's acceptance;
   scheduled when the owner calls it.
 
+## 2b. REST-completeness backlog (owner directive 2026-07-20)
+
+**Scope rule: `pkg.web` is a general REST API / web-server framework. The LLM gateway is only its
+first consumer — never a reason to omit or defer a feature.** The owner pushed back on exactly that
+framing ("LLMゲートウェイで必要ない機能は全て削ろうとするのが気に入らない"): scoping by one
+consumer makes the support surface undefined and forces repeated "actually, that isn't supported"
+conversations. Judge every candidate by *does a REST API / web server commonly need this?*
+Layering still applies — the right answer is often "build it in `std` or its own `pkg`", but that
+must mean **build it there**, never **skip it**. (The design doc's "no bloat" constraint governs the
+framework's *core surface*, not standard web functionality.)
+
+Status of the things a REST/web server is expected to have:
+
+```text
+DONE   JSON (decode/encode/doc/scan)            core.json
+DONE   HTTP client/server + SSE/chunked         std.http
+DONE   base64 / base64url / hex / utf8_valid    std.encoding
+DONE   sha256/512, hmac_sha256, argon2id,       std.crypto
+       AEAD, constant_time_equal, random
+DONE   gzip / zstd                              std.compress
+DONE   JWT (HS256; alg-pinned, CT-compared)     pkg.jwt          (2026-07-20)
+DONE   URL/percent encode+decode (RFC 3986)     std.encoding     (2026-07-20)
+TODO   application/x-www-form-urlencoded        std or pkg.web   (builds on percent)
+TODO   multipart/form-data (uploads)            pkg.web or pkg
+TODO   Cookie parse / Set-Cookie build          pkg.web
+TODO   HTML escaping                            std.encoding (or the deferred `html` template)
+TODO   CORS                                     pkg.web middleware-lite (W6)
+LATER  JWT HS384/512, RS256/ES256               needs std.crypto hmac_sha384/512, RSA/ECDSA
+```
+
+A `TODO` here is committed work with a home, not a maybe. Discovering a *further* gap later is
+normal; designing to one consumer is not.
+
 ## 3. Deferred / out of scope (with reasons)
 
 - **Capturing escaping closures** — unchanged deferral; middleware-lite (non-capturing,

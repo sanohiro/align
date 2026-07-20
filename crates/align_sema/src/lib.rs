@@ -12315,12 +12315,13 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.io", "io.copy", span);
                 return self.check_io_copy(args, span);
             }
-            // `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
-            // transforms: encode -> owned `string`, decode -> `Result<buffer, Error>`.
+            // `std.encoding` — Base64 (standard + URL-safe), hex, RFC 3986 percent-encoding, and
+            // UTF-8 validation. Pure byte transforms: encode -> owned `string`, decode ->
+            // `Result<buffer, Error>`.
             if module == "encoding"
                 && matches!(
                     method,
-                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "utf8_valid"
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode" | "percent_decode" | "utf8_valid"
                 )
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
@@ -17194,6 +17195,7 @@ impl<'a, 't> Checker<'a, 't> {
         let kind = match method {
             "base64_encode" | "base64_decode" => hir::EncodingKind::Base64,
             "base64url_encode" | "base64url_decode" => hir::EncodingKind::Base64Url,
+            "percent_encode" | "percent_decode" => hir::EncodingKind::Percent,
             _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
         };
         // `utf8_valid(b)` — a byte-only check (`slice<u8>`); trivially true for a `str`, so it takes
