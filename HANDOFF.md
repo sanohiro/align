@@ -8,7 +8,27 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-20, **pkg.web F0 + F1 COMPLETE — the compiler + package foundation for the framework is done.**
+_Last updated: 2026-07-20, **pkg.web W2 IN PROGRESS — the request pipeline runs end-to-end over a real
+socket.** `apps_web_serve.rs` drives: radix-router dispatch -> `Ctx` (a struct that OWNS the
+`http_request_ctx`) -> `param_value` zero-copy `:id` capture -> the handler invoked **through the
+`Route.handler` fn-value field** -> a responder that CONSUMES the handle out of that field. A clean
+server exit is the assertion (a double-freed request handle aborts). Enablers landed: #571 (http-ctx
+receiver may be a field PLACE; MoveCheck allows a partial move of a Move-HANDLE field; MIR/codegen null
+it — and codegen's `NullStructField` zeroed every non-enum field as a 16-byte `{ptr,len}`, which would
+have CLOBBERED the next field for an 8-byte handle: now keyed on `handle_free_fn`) and #573 (an owned
+argument moved through an INDIRECT call was never nulled -> the caller and callee both freed it; same
+omission class as #562, other move site). **ONE gap left for the designed handler SIGNATURE:** a fn
+VALUE cannot carry a `Result` return (`FnTy.ret` is a `Scalar`), so handlers are `fn(Ctx) -> i64`
+(0 = ok) instead of `fn(Ctx) -> Result<(), Error>`. Widening `FnTy.ret` Scalar -> Ty (plus the
+indirect-call ABI for an aggregate return) is the next compiler step. **Web utilities shipped this
+session** (owner directive: pkg.web is a GENERAL REST framework, never scoped to the LLM gateway —
+`docs/impl/15-pkg-web-plan.md` §2b is the committed backlog): JWT HS256 alg-pinned + CT-compared
+(#566, byte-identical to the canonical jwt.io vector), RFC 3986 percent (#567), x-www-form-urlencoded
++ zero-alloc query lookup with escape-aware key matching (#568), HTML escaping + RFC 6265 cookies with
+header-injection rejection (#569), CORS with exact-origin matching and the forbidden
+wildcard+credentials pair rejected (#570). Backlog remainder: multipart/form-data; OAuth client flows
+are buildable now while validating a PUBLIC provider's token is blocked on RS256 (std.crypto RSA verify
+over the already-linked libssl). Previous: **pkg.web F0 + F1 COMPLETE — the compiler + package foundation for the framework is done.**
 **F0 (pkg-foundation, #558):** the two import-edge path rules — D7 `internal` (a `pkg.web.internal.*` module
 is importable only from within `pkg.web`) + D8 layering (a `pkg/` module imports only `core`/`std`/`pkg`) —
 enforced in `align_driver::load_units` (`check_pkg_import_edge`); spec text landed (draft §17 "Packages" +
