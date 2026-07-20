@@ -98,9 +98,24 @@ Still open from that cluster, both unchanged by this decision:
 - **`web.json(c, x)` cannot encode `x`** — no user-written generics, so the signature is
   `json(body: str)` and the handler writes `web.json(json.encode(m))`. Arguably better (the
   encode's allocation stays visible), and the design doc now says so.
-- **Streaming/SSE needs its own escape hatch.** A handler that returns a built response cannot
-  stream; `respond_stream`/`http_stream` (M12) are untouched, and W6's SSE slice has to decide how a
-  handler opts into holding the connection.
+- **Streaming/SSE — DESIGNED 2026-07-21 (owner-directed), implementation pending.** The full design
+  is `docs/impl/pkg-design/web.md` → "Streaming" (+ ja mirror): stream routes in the SAME table via
+  `Handler { Respond(fn…), Stream(fn(Ctx, http_stream)…) }`, `web.sse`/`web.stream` constructors,
+  framework-built lazy head, `s.reject(rb)` as the pre-stream 4xx window, and the ownership rule
+  extended (framework owns ctx for the whole request; the pump owns only the stream). std.http side:
+  `docs/impl/std-design/http.md` item 8 — `respond_stream` becomes a non-consuming receiver with a
+  lazy head + `reject`. **Implementation order (enablers, all probed):**
+  1. `http_stream` nameable (`resolve_type`, the exact #583 pattern) — trivial;
+  2. fn value as enum variant payload (Copy — strictly smaller than #583: no is_move/drop; still
+     sweep the #583 checklist); probed fallback exists (fn-field struct payload checks green) but
+     is NOT the public surface;
+  3. the indirect-call Move-handle-param verification test (#573 class);
+  4. the std.http `respond_stream` rework (M12 tests updated outright);
+  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`).
+  **Hard ordering note: production streaming needs concurrent serve first** (an open stream starves
+  the sequential v1 loop); the design is independent of it, the shipping is not. The middleware
+  section was also rewritten for the settled ownership model (`Option<response_builder>` verdict —
+  legal since #583).
 
 ### Bug found and fixed while doing this
 

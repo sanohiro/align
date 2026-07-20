@@ -251,16 +251,134 @@ handler `Err` to 500 — fixed minimal JSON bodies, loop continues. Application 
 (e.g. the OpenAI error object) are app policy via `web.status_json`. Nothing request-derived can
 panic; everything is `Result` or a view.
 
-## Middleware (designed now, lands later — W6)
+## Middleware (redesigned 2026-07-21 for the settled ownership model — lands W6)
 
-Fiber's `c.Next()` chain needs capturing closures (deferred). The v1-compatible model is a
-**non-capturing pre-handler list** threaded by Move: `fn(c: Ctx) -> Result<Option<Ctx>, Error>` —
-return `Some(c)` to proceed (ctx handed back), `None` after responding (halt), `Err` for 500.
-Groups carry the list: `web.group_with(prefix, [auth, log], routes)`. Covers auth/logging/CORS
-headers without closures; stateful middleware waits for the capturing-closure feature and a real
-consumer. Verify in F1 probing: `Option<Ctx>` (an Option of a Move struct) — if the payload gap
-bites, the fallback shape is a two-variant enum `Verdict { Proceed(Ctx), Done }` (Move-enum
-payloads shipped in J2).
+Fiber's `c.Next()` chain needs capturing closures (deferred). The framework-owns-the-handle model
+makes the v1 shape simpler than the original Move-threading design: `Ctx` is Copy, so a
+pre-handler neither consumes nor returns it —
+
+```text
+fn(c: Ctx) -> Result<Option<response_builder>, Error>
+//   None      -> proceed to the next pre-handler / the handler
+//   Some(rb)  -> short-circuit: serve writes rb, the handler never runs (auth reject, redirect)
+//   Err       -> 500, same as a handler Err
+```
+
+`Option<response_builder>` is a legal payload since #583. Groups carry the list:
+`web.group_with(prefix, [auth, log], routes)`. Covers auth/logging/CORS headers without closures;
+stateful middleware waits for the capturing-closure feature and a real consumer.
+
+
+## Streaming (SSE + generic) — designed 2026-07-21, lands W6
+
+**The problem.** A handler is `fn(Ctx) -> Result<response_builder, Error>` — it builds ONE complete
+response. SSE and LLM token streams instead hold the connection and write incrementally, so
+streaming needs a second interaction model. The settled ownership rule extends rather than breaks:
+**the framework owns the request handle for the whole request; a stream handler additionally owns
+the response STREAM** — which only exists once the response head is committed, the exact moment the
+framework's ability to answer differently (404/405/500) has ended anyway. Nothing is given up.
+
+### Surface
+
+```align
+// The second (and last) handler signature, scoped to stream routes. Borrows the request through
+// `c` (valid for the whole call — serve still holds the handle) and OWNS the response stream.
+fn events(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {
+  web.send_event(s, "tick")?
+  s.finish()
+}
+
+routes := [
+  web.get("/v1/models", list_models),
+  web.sse("/v1/events", events),                                   // GET; text/event-stream
+  web.stream("POST", "/v1/chat/completions", "application/x-ndjson", chat),
+]
+```
+
+```text
+web.sse(pattern, pump)                       -> route   // method GET (EventSource always GETs),
+                                                        //   Content-Type text/event-stream
+web.stream(method, pattern, content_type, pump) -> route // the general form
+web.send_event(s, data)  -> Result<(), Error>           // one `data: {data}\n\n` frame, one send;
+                                                        //   single-line data (multi-line = caller)
+```
+
+### Types
+
+```text
+Handler {
+  Respond(fn(Ctx) -> Result<response_builder, Error>),
+  Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+}
+Route { method: str, pattern: str, stream_type: str, handler: Handler }
+//   stream_type: the stream head's Content-Type; "" on Respond routes (never read).
+```
+
+One table, one dispatch: stream routes go through the same radix tree, the same method resolution,
+and contribute to 405 `Allow` like any row. `Handler` is the Align-idiomatic or-kind — a sum type,
+NOT two fn fields with filler fns (rejected: a filler is a magic sentinel) and NOT a second route
+table (rejected: splits priority/405 across tables).
+
+### serve semantics
+
+```text
+match r.handler {
+  Respond(h) => rb := answer(h, c); ctx.respond(rb) else {}          // unchanged
+  Stream(pump) => {
+    rb := http.response(200)
+    rb.header("Content-Type", r.stream_type)
+    rb.header("Cache-Control", "no-cache")            // a cached stream is nonsense; always set
+    s := ctx.respond_stream(rb) else { <skip pump> }  // client already gone -> next request
+    pump(c, s) else {}                                // Err after the head: nothing to answer
+  }
+}
+```
+
+- `respond_stream` is a **non-consuming** bound receiver (std.http change ①, below): `ctx` stays in
+  serve's frame, so `c`'s views stay valid for the whole pump call — this is what makes
+  `fn(Ctx, http_stream)` well-formed under the borrow rules. The fd is lifted into the stream; `ctx`
+  is spent (a second respond is `Err`); its drop frees the parse buffer only.
+- **The head is lazy** (std.http change ②): `respond_stream` stores the head; the first `send` (or
+  `finish`) writes it. Before that, `s.reject(rb) -> Result<(), Error>` (std.http change ③)
+  discards the stored head and writes `rb` as a complete NORMAL response instead — after a send it
+  is `Err`. This is what gives a stream route its 4xx window: parse/validate the request inside the
+  pump, `return s.reject(...)` on bad input, stream on good input — one fn, no separate validate
+  phase (rejected: a per-route validate fn doubles the parse work and bloats Route).
+- After the first send there is NO error window, by HTTP's own rules: a pump `Err` mid-stream just
+  ends the stream (drop closes the fd; the client sees termination). Same silent-`Err` posture as a
+  handler Err — the W4 logging story covers both.
+- The loop never dies per request, unchanged.
+
+### Ordering constraint (hard)
+
+v1 `serve` is sequential — **an open stream starves every other client**. Streaming must land
+together with (or after) the recorded concurrent-serve follow-up; shipping it on the sequential
+loop is test-only. This is an ordering note, not a design dependency: nothing above changes shape
+with concurrency.
+
+### Enablers (probed 2026-07-21; in implementation order)
+
+1. **`http_stream` nameable in source** — `resolve_type` entry, the exact #583 `response_builder`
+   pattern. Probed: `unknown type: 'http_stream'` today. Trivial.
+2. **fn value as enum variant payload** — probed: `variant payloads must be a primitive scalar,
+   plain struct, or owned array for now, got fn#0`. The widening is STRICTLY smaller than #583's
+   (a fn value is Copy: no `is_move`, no drop dispatch, no null-on-move; payload slot is one
+   pointer). Sweep the #583 checklist anyway (ty_to_scalar/scalar_to_ty/scalar_bytes/sort_key_order
+   fail-closed arm). De-risk note: a struct wrapping a fn field IS already legal as a payload
+   (probed green: `Spec { tag: i64, f: fn(i64) -> i64 }` in a variant, matched and called) — so if
+   the bare-fn widening stalls, the shape exists; do not ship the wrapper as the public surface.
+3. **A fn-value signature with a Move-handle param** (`http_stream` by value through an indirect
+   call): #573 fixed the owned-arg nulling on indirect calls; verify with a driver test that the
+   pump's stream is nulled in serve's frame (no double close on the error path).
+4. **std.http `respond_stream` rework** (changes ①–③ above) — recorded in
+   `docs/impl/std-design/http.md`; update the M12 tests to the new receiver form (pre-release:
+   change outright, no compat path).
+
+### Backlog (recorded, not v1)
+
+Heartbeat/keep-alive comments, `event:`/`id:` fields + `Last-Event-ID` resume, multi-line
+`send_event` data splitting, per-request head customization on stream routes, and stream
+timeouts/backpressure — each waits for a consumer.
 
 ## Slices (F3 of the plan)
 
@@ -275,7 +393,8 @@ payloads shipped in J2).
   `*` tails, method sets); malformed-request matrix; keepalive reuse.
 - **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
   (≈ zero overhead required) — the performance contract becomes a pinned regression.
-- **W6 — middleware-lite + SSE sugar** (with the std SSE floor) — gated on the first consumers.
+- **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21); implementation
+  gated on the streaming enablers and (for streams in production) concurrent serve.
 - **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
   numbers and the gap analysis in this doc.
 

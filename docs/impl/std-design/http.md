@@ -439,6 +439,30 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - Client parse stays CL-only (chunked → `Error.Invalid` on align's own client — the
      recorded asymmetry; the gateway's clients are external).
 
+8. **`respond_stream` rework for pkg.web stream routes — DESIGNED 2026-07-21, NOT SHIPPED.**
+   pkg.web's streaming design (`docs/impl/pkg-design/web.md` → "Streaming") is the consumer; it
+   requires the framework to keep owning the request context while a stream handler runs, and a
+   4xx window before the head is committed. Three changes, all pre-release-outright (update the
+   M12 tests, no compat path):
+   - **① Non-consuming receiver.** `ctx.respond_stream(rb) -> Result<http_stream, Error>` consumes
+     `rb` ONLY. The fd is lifted into the stream as today; `ctx` stays with the caller, **spent**:
+     a later `respond`/`respond_stream` on it is `Err` (not abort — reachable via ordinary control
+     flow, unlike the bodied-rb contract bug); its Drop frees the parse buffer and skips the fd
+     close (already lifted). This is what keeps `Ctx`'s views (path/query/**body** — an LLM pump
+     reads the prompt while streaming) valid for the whole pump call. Precedent: `rb.header` is
+     already a mutating non-consuming bound receiver.
+   - **② Lazy head.** `respond_stream` VALIDATES the rb eagerly (header-only contract, P6 guards,
+     TE/Connection policy — unchanged, still abort on a bodied rb) but serializes the head into the
+     stream handle instead of writing it; the first `send` (or `finish`) writes it. Observable
+     change: a client sees nothing until the first event — document in the fn doc, it is the price
+     of ③.
+   - **③ `s.reject(rb) -> Result<(), Error>`.** Legal only before the first send (after: `Err`,
+     poison untouched): discards the stored head, writes `rb` as a complete NORMAL response
+     (respond's serializer, CL+body), closes. Consumes the stream. This is a stream route's only
+     pre-stream 4xx/5xx path — validation happens inside the pump, `reject` answers it.
+   - `send`/`finish`/Drop/poison semantics above are otherwise unchanged; `framed` (1.0/1.1) is
+     chosen at `respond_stream` time as today and baked into the stored head.
+
 ## Known v1 limitations (Slice 2/3/5)
 
 - **HTTPS is CLIENT-SIDE ONLY (Slice 5).** Server-side TLS is deferred — `http.serve` is plaintext,
