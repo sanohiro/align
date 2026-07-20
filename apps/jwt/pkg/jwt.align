@@ -115,16 +115,27 @@ pub fn decode_hs256(token: str, secret: str) -> Result<string, Error> {
 // RFC 7519 §4.1, so a payload carrying neither is valid; a payload that is not a JSON object is not.
 // Kept separate from `decode_hs256` because signature validity and claim validity are different
 // questions — a caller may want the claims of an expired-but-authentic token.
+// A claim that is ABSENT is fine (both are optional); a claim that is PRESENT but not a NumericDate
+// violates RFC 7519 §4.1 and makes the token untrustworthy rather than unconstrained — so `false`,
+// never "treat it as missing".
 pub fn time_claims_valid(payload_json: str, now_unix: i64) -> bool {
   arena {
     d := json.doc(payload_json) else { return false }
-    exp_ok := match d.get("exp").as_i64() {
-      Some(e) => now_unix < e,
-      None => true,
+    exp := d.get("exp")
+    exp_ok := match exp.kind() {
+      Missing => true,
+      _ => match exp.as_i64() {
+        Some(e) => now_unix < e,
+        None => false,
+      },
     }
-    nbf_ok := match d.get("nbf").as_i64() {
-      Some(nb) => now_unix >= nb,
-      None => true,
+    nbf := d.get("nbf")
+    nbf_ok := match nbf.kind() {
+      Missing => true,
+      _ => match nbf.as_i64() {
+        Some(nb) => now_unix >= nb,
+        None => false,
+      },
     }
     exp_ok && nbf_ok
   }

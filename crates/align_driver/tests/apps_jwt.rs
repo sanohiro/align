@@ -101,9 +101,11 @@ fn main() -> Result<(), Error> {\n\
   print(pkg.jwt.time_claims_valid(\"{\\\"nbf\\\":2000}\", 1000))   // false — not valid yet\n\
   print(pkg.jwt.time_claims_valid(\"{\\\"nbf\\\":500}\", 1000))    // true\n\
   print(pkg.jwt.time_claims_valid(\"{\\\"sub\\\":\\\"x\\\"}\", 1000)) // true  — neither claim present\n\
+  print(pkg.jwt.time_claims_valid(\"{\\\"exp\\\":\\\"soon\\\"}\", 1000)) // false — present but not a NumericDate\n\
+  print(pkg.jwt.time_claims_valid(\"not json\", 1000))          // false — unparseable payload\n\
   return Ok(())\n\
 }\n";
     let out = run_jwt("jwt-claims", main);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\nfalse\nfalse\ntrue\ntrue\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\nfalse\nfalse\ntrue\ntrue\nfalse\nfalse\n");
 }
