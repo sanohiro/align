@@ -3,17 +3,34 @@ module pkg.web.types
 // pkg.web's public value types. A dependency-free leaf module: the internal router needs `Route` to
 // dispatch a table, and the `pkg.web` root needs both to build and serve one — so neither can define
 // them without creating an import cycle (and Align has no re-exports, D9). Consumers name them
-// qualified, like every other cross-module type: `fn h(c: pkg.web.types.Ctx) -> Result<(), Error>`.
+// qualified, like every other cross-module type:
+// `fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error>`.
 
-// The per-request context. A **Move** struct: it OWNS the accepted request handle, so a responder
-// consumes it exactly once (`c.req.respond(rb)` moves the handle out of the field, which is nulled
-// so the struct's drop cannot double-free it). `pattern` is the matched route's pattern — Static
-// text from the route table — which is what lets a parameter be read back out of the path without
-// a per-request slot array.
-pub Ctx { req: http_request_ctx, pattern: str }
+// The per-request context — a **Copy** struct of views. It owns nothing: the request handle stays
+// with `serve`, and `method`/`path`/`query` are zero-copy views into it, valid for the handler call.
+//
+// This is the load-bearing ownership decision (owner, 2026-07-20). The alternative — `Ctx` OWNING
+// the handle, with responders consuming it — was built first and does not work:
+//   - every accessor (`param`/`query`/`header`/`body`) borrows from the context, so passing `c` by
+//     value to one would CONSUME the very context the handler still has to answer through;
+//   - reading a param and then responding (`id := param(c, …)` then `text(c, id)`) is rejected
+//     outright: the borrow is live while `c` is moved;
+//   - and a handler that fails has already consumed the handle, so "handler Err -> 500" cannot be
+//     implemented — there is nothing left to respond through.
+// All three dissolve when the framework holds the handle. A handler is a pure-ish function of the
+// request that BUILDS a response and hands it back; `serve` writes it, and answers 500 when the
+// handler returns Err.
+//
+// `pattern` is the matched route's pattern — Static text from the route table — which is what lets
+// `param` read a capture back out of the path without a per-request slot array.
+pub Ctx { method: str, path: str, query: str, pattern: str }
 
 // One route: the method it answers, the pattern it matches, and the handler to run. A **Copy**
-// struct — a `str` view of literal text, plus a fn value — so a route table is an ordinary array
+// struct — `str` views of literal text, plus a fn value — so a route table is an ordinary array
 // value with no ownership story. `method` is the uppercase HTTP method ("GET", "POST", …); an empty
 // method matches ANY method, which is how a catch-all/fallback route is written.
-pub Route { method: str, pattern: str, handler: fn(Ctx) -> Result<(), Error> }
+//
+// The handler returns the response it built (`response_builder` became a legal `Result` payload for
+// exactly this). Returning `Err` is how a handler declines to answer: `serve` turns it into a 500,
+// which is only possible because the request handle never left `serve`'s frame.
+pub Route { method: str, pattern: str, handler: fn(Ctx) -> Result<response_builder, Error> }

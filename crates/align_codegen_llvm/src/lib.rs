@@ -3323,6 +3323,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
         Scalar::HttpServer => unreachable!("an http_server handle is not a box/array payload"),
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
+        Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
@@ -5053,7 +5054,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -5069,6 +5070,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::HttpServer) => "http_server_free",
                                         Some(Scalar::HttpRequestCtx) => "http_ctx_free",
                                         Some(Scalar::HttpStream) => "http_stream_free",
+                                        Some(Scalar::ResponseBuilder) => "http_response_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder

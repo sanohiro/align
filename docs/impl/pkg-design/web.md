@@ -86,11 +86,12 @@ must be ≈ zero; plus a same-box Go Fiber comparison as the external honesty ch
 ```align
 import pkg.web
 
-// handlers: ONE signature — fn(c: web.Ctx) -> Result<(), Error>
-fn get_model(c: web.Ctx) -> Result<(), Error> {
+// handlers: ONE signature — fn(c: web.Ctx) -> Result<response_builder, Error>
+// The handler BUILDS a response and hands it back; the framework writes it.
+fn get_model(c: web.Ctx) -> Result<response_builder, Error> {
   id := web.param(c, "id")               // str view into the request path
-  m := lookup(id)
-  web.json(c, m)                          // encode → response writer; consumes c
+  m := lookup(id)?                        // `?` works: a failure becomes a 500
+  web.json(json.encode(m))
 }
 
 fn main() -> Result<(), Error> {
@@ -108,6 +109,18 @@ visible array **value** of Copy structs; `serve` compiles it into the radix tree
 (Align has no user-defined methods, so Fiber's `c.Params("id")` becomes the qualified
 `web.param(c, "id")` — same ergonomics, one call convention.)
 
+**Who owns the request handle (settled by the owner, 2026-07-20): `serve` does.** The first
+implementation gave it to the handler — `Ctx` was a Move struct owning it, and responders consumed
+it. Building the framework on that shape produced three dead ends, all the same root cause: every
+accessor borrows from the context, so `web.param(c, name)` would consume the very context the
+handler still had to answer through; reading a param and then responding was rejected outright (a
+live borrow while `c` is moved); and "handler Err → 500" could not be implemented, because a handler
+that fails has already consumed the handle and left nothing to respond through. Moving the handle to
+`serve` dissolves all three: a handler becomes a function of the request that builds a response, and
+the framework — which still holds the connection — writes it or answers 500. The compiler enabler
+this needed was making `response_builder` a nameable type and a legal `Result` payload
+(`docs/impl/std-design/http.md`).
+
 ## Signatures
 
 ```text
@@ -124,9 +137,9 @@ web.group(prefix, routes)     -> array<route>
 // serving — Impure; sequential accept v1 (concurrency is the recorded, measured follow-up)
 web.serve(host, port, routes) -> Result<(), Error>
 //   startup: build + validate the radix tree (duplicate/ambiguous → abort with the pattern).
-//   per request: parse (std.http, zero-copy) → radix dispatch → handler; automatic responses:
-//   no path match → 404, path-but-not-method → 405 (with Allow), parse error → 400,
-//   handler Err → 500 (best-effort). Fixed minimal JSON bodies; the loop never dies per-request.
+//   per request: parse (std.http, zero-copy) → split the request-target into path + query →
+//   radix dispatch → handler → WRITE what it returned. Automatic responses: no path match → 404,
+//   path-but-not-method → 405 (with Allow), handler Err → 500. The loop never dies per-request.
 
 // ctx accessors (all Pure; all return views region-bound to c)
 web.param(c, name)   -> str              // named :param capture (fixed slot array; total —
@@ -138,19 +151,25 @@ web.body(c)          -> slice<u8>
 web.body_str(c)      -> Result<str, Error>    // UTF-8-validated view
 //   JSON in: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json, view-decoding
 
-// responders (Impure; consume c — Move discipline, mirrors ctx.respond)
-web.json(c, x)               -> Result<(), Error>   // 200 + application/json + json.encode(x)
-web.status_json(c, code, x)  -> Result<(), Error>
-web.text(c, s)               -> Result<(), Error>   // 200 + text/plain
-web.status(c, code)          -> Result<(), Error>   // status + empty body
+// responders (Pure; they BUILD a response — they do not touch the request handle, so a handler may
+// call accessors and responders in any order)
+web.json(body)               -> Result<response_builder, Error>  // 200 + application/json
+web.status_json(code, body)  -> Result<response_builder, Error>
+web.text(s)                  -> Result<response_builder, Error>  // 200 + text/plain
+web.status_text(code, s)     -> Result<response_builder, Error>
+web.status(code)             -> Result<response_builder, Error>  // status + empty body
+//   `body` is the ENCODED document, not a value: Align has no user-written generics, so a
+//   `json(x)` that encoded `x` is not expressible — and `web.json(json.encode(m))` is the better
+//   reading anyway, since encoding's allocation stays visible in the handler (Nothing hidden).
 ```
 
 ```text
 // types
-web.Ctx    — the per-request context struct: the std.http request handle + the param slot
-             array (names from the matched route — Static; values — views into the path).
-             A Move struct (it owns the request handle); consumed exactly once by a responder.
-Route      — Copy struct { method (tag-only enum), pattern: str, handler: fn(Ctx) -> Result<(), Error> }
+web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, and the
+             matched pattern). It owns NOTHING — the request handle stays with `serve`, and the
+             views are valid for the handler call.
+Route      — Copy struct { method: str, pattern: str,
+                           handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
 
 **Pattern syntax (Fiber/httprouter lineage — settled by the restored reference):** `/`-separated;

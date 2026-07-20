@@ -11,9 +11,47 @@ module pkg.web.internal.query
 
 // Byte constants (Align has no byte literals; these are the ASCII codes we scan for).
 AMP := 38    // '&'
+QMARK := 63  // '?'
 EQ := 61     // '='
 PLUS := 43   // '+'
 PCT := 37    // '%'
+
+// ── Request-target splitting ──────────────────────────────────────────────────────────────────
+//
+// HTTP sends ONE request-target on the request line (`GET /v1/models?limit=5 HTTP/1.1`), and
+// `ctx.path()` returns it verbatim — query string included. Routing must match the path ALONE, and
+// the query accessors want the part after '?', so the target is split exactly once per request.
+// Both halves are zero-copy views into the target.
+
+// The index of the first '?' in `target`, or its length when there is none.
+fn qmark_at(target: str) -> i64 {
+  tb := target.bytes()
+  n := target.len()
+  mut i := 0
+  loop {
+    if i >= n { break n }
+    if tb[i] as i64 == QMARK { break i }
+    i = i + 1
+  }
+}
+
+// The path half of a request-target: everything before the first '?' (the whole target when there
+// is no query). `/v1/models?limit=5` -> `/v1/models`.
+//
+// Routing MUST use this rather than the raw target: matching `/v1/models?limit=5` against the
+// pattern `/v1/models` fails, so a query string would 404 every route that has one.
+pub fn target_path(target: str) -> str = target[0 .. qmark_at(target)]
+
+// The query half of a request-target: everything after the first '?', with no leading '?' (empty
+// when there is no query) — the `a=1&b=2` shape `raw`/`has` expect.
+pub fn target_query(target: str) -> str {
+  n := target.len()
+  q := qmark_at(target)
+  if q >= n {
+    return ""
+  }
+  target[q + 1 .. n]
+}
 
 // The value of one hex digit byte, or -1 if it is not a hex digit.
 pub fn hex_val(b: u8) -> i64 {

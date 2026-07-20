@@ -69,16 +69,28 @@ GC は存在しない。フレームワークの仕事は**その連鎖を壊さ
 （素の `std.http` ループ比 req/s — フレームワークのオーバーヘッド ≈ ゼロ必須。加えて同一マシンの
 Go Fiber 比較 — plaintext + JSON echo で **Fiber と同等以上**が目標）。
 
+**リクエストハンドルを誰が所有するか（オーナー決定、2026-07-20）: `serve` である。** 最初の実装は
+ハンドラに所有させていた — `Ctx` がハンドルを所有する Move struct で、レスポンダがそれを消費した。
+その形でフレームワークを作ると、根本原因が同一の行き止まりが 3 つ生じた: アクセサはすべてコンテキ
+ストから借用するので `web.param(c, name)` はハンドラがまだ応答に使うコンテキストを消費してしまう。
+param を読んでから応答することは端的に拒否される（`c` を move する時点で借用が生きている）。そして
+「ハンドラ Err → 500」が実装できない — 失敗した時点でハンドラは既にハンドルを消費しており、応答
+する手段が残っていないからである。ハンドルを `serve` に移すと 3 つとも解消する: ハンドラはリクエ
+ストの関数となってレスポンスを組み立て、接続を保持し続けているフレームワークがそれを書き込むか、
+500 を返す。これに必要だったコンパイラ側の enabler が、`response_builder` を型名として書けるように
+し `Result` のペイロードとして許可することだった（`docs/impl/std-design/http.md`）。
+
 ## 表面（Fiber 参考、Align 流儀）
 
 ```align
 import pkg.web
 
-// ハンドラ: 唯一のシグネチャ — fn(c: web.Ctx) -> Result<(), Error>
-fn get_model(c: web.Ctx) -> Result<(), Error> {
+// ハンドラ: 唯一のシグネチャ — fn(c: web.Ctx) -> Result<response_builder, Error>
+// ハンドラはレスポンスを**組み立てて返す**。書き込むのはフレームワーク。
+fn get_model(c: web.Ctx) -> Result<response_builder, Error> {
   id := web.param(c, "id")               // リクエスト path への str view
-  m := lookup(id)
-  web.json(c, m)                          // エンコード → レスポンスライタ。c を消費
+  m := lookup(id)?                        // `?` が使える: 失敗は 500 になる
+  web.json(json.encode(m))
 }
 
 fn main() -> Result<(), Error> {
@@ -112,9 +124,9 @@ web.group(prefix, routes)     -> array<route>
 // サービング — Impure。v1 は逐次 accept（並行化は記録済みの計測付き follow-up）
 web.serve(host, port, routes) -> Result<(), Error>
 //   起動時: radix tree 構築 + 検証（重複/曖昧 → パターン名入り abort）。リクエスト毎:
-//   パース（std.http、zero-copy）→ radix ディスパッチ → ハンドラ。自動応答: path 不一致 → 404、
-//   path 一致 method 不一致 → 405（Allow 付き）、パース失敗 → 400、ハンドラ Err → 500。
-//   固定の最小 JSON ボディ。ループはリクエスト単位で死なない。
+//   パース（std.http、zero-copy）→ request-target を path と query に分割 → radix ディスパッチ
+//   → ハンドラ → 返されたものを**書き込む**。自動応答: path 不一致 → 404、path 一致 method
+//   不一致 → 405（Allow 付き）、ハンドラ Err → 500。ループはリクエスト単位で死なない。
 
 // ctx アクセサ（全て Pure。全て c に region 束縛された view を返す）
 web.param(c, name)   -> str              // :param キャプチャ（固定スロット配列。total —
@@ -125,19 +137,25 @@ web.body(c)          -> slice<u8>
 web.body_str(c)      -> Result<str, Error>    // UTF-8 検証済み view
 //   JSON 入力: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json、view デコード
 
-// レスポンダ（Impure。c を消費 — Move 規律、ctx.respond のミラー）
-web.json(c, x)               -> Result<(), Error>   // 200 + application/json + json.encode(x)
-web.status_json(c, code, x)  -> Result<(), Error>
-web.text(c, s)               -> Result<(), Error>   // 200 + text/plain
-web.status(c, code)          -> Result<(), Error>   // ステータス + 空ボディ
+// レスポンダ（Pure。レスポンスを**組み立てる**だけでリクエストハンドルに触れないので、ハンドラは
+// アクセサとレスポンダを任意の順序で何度でも呼べる）
+web.json(body)               -> Result<response_builder, Error>  // 200 + application/json
+web.status_json(code, body)  -> Result<response_builder, Error>
+web.text(s)                  -> Result<response_builder, Error>  // 200 + text/plain
+web.status_text(code, s)     -> Result<response_builder, Error>
+web.status(code)             -> Result<response_builder, Error>  // ステータス + 空ボディ
+//   `body` は値ではなく**エンコード済み**の文書である: Align にユーザ定義ジェネリクスは無いので
+//   `x` 自身をエンコードする `json(x)` は表現できない。また `web.json(json.encode(m))` の方が読み
+//   としても良い — エンコードの確保がハンドラ内で可視のままになる（Nothing hidden）。
 ```
 
 ```text
 // 型
-web.Ctx    — リクエスト毎コンテキスト struct: std.http リクエストハンドル + param スロット配列
-             （名前はマッチしたルート由来 — Static。値は path への view）。Move struct
-             （リクエストハンドルを所有）。レスポンダがちょうど 1 回消費。
-Route      — Copy struct { method（tag-only enum）, pattern: str, handler: fn(Ctx) -> Result<(), Error> }
+web.Ctx    — リクエスト毎コンテキスト: view だけを持つ **Copy** struct（method, path, query,
+             およびマッチしたパターン）。何も所有しない — リクエストハンドルは `serve` に留まり、
+             view はハンドラ呼び出しの間有効である。
+Route      — Copy struct { method: str, pattern: str,
+                           handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
 
 **パターン構文（Fiber/httprouter 系譜 — 復元された参照により決定）:** `/` 区切り。リテラルは
