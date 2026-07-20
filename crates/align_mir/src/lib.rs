@@ -2149,7 +2149,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
         // null there, not the buffer the new binding now owns. (Sema allows this only for a depth-1
         // `string` field; deeper paths / Move-struct fields stay rejected, so `path` is `[idx]`.)
-        hir::ExprKind::Field { root, path } if path.len() == 1 && e.ty == Ty::String => {
+        hir::ExprKind::Field { root, path } if path.len() == 1 && (e.ty == Ty::String || align_sema::is_move_handle(e.ty)) => {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and

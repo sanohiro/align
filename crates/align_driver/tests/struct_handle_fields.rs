@@ -82,12 +82,36 @@ fn handle_field_use_after_move_rejected() {
 }
 
 #[test]
-fn handle_field_partial_move_out_rejected() {
-    // Moving the handle field out of the struct (a partial move) is deferred — a clean diagnostic,
-    // never a silent double-free of both the field and the struct's drop.
+fn handle_field_partial_move_out_nulls_the_field() {
+    if !backend_available() {
+        return;
+    }
+    // Moving a Move-handle field OUT of a struct (`b := h.buf`) is supported: the new binding takes
+    // the handle and the struct's field is NULLED, so the struct's drop frees null there instead of
+    // double-freeing. Only that field is consumed — the struct's other fields stay readable. This is
+    // exactly what lets pkg.web's `Ctx` hand its owned `http_request_ctx` to a consuming responder
+    // (`c.req.respond(rb)`); a clean exit proves the handle is freed once.
+    let src = concat!(
+        "Holder { buf: buffer, tag: i64 }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  h := Holder { buf: buffer(64), tag: 7 }\n",
+        "  b := h.buf\n",
+        "  print(h.tag)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("handlefield-partial", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
+fn handle_field_reuse_after_partial_move_rejected() {
+    // The field itself is consumed by the move: touching it again is a use-after-move, so the
+    // nulling can never be observed as a live handle.
     assert!(check_errs(
-        "handlefield-partial",
-        "Holder { buf: buffer, tag: i64 }\nfn main() -> Result<(), Error> {\n  h := Holder { buf: buffer(64), tag: 7 }\n  b := h.buf\n  return Ok(())\n}\n"
+        "handlefield-partial-reuse",
+        "Holder { buf: buffer, tag: i64 }\nfn use2(x: buffer) -> i64 = 1\nfn main() -> Result<(), Error> {\n  h := Holder { buf: buffer(64), tag: 7 }\n  b := h.buf\n  c := h.buf\n  return Ok(())\n}\n"
     ));
 }
 

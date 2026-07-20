@@ -316,6 +316,38 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     std::process::Command::new(&exe).output().expect("run")
 }
 
+/// A native executable built from a MULTI-file project, with the project directory kept alive for
+/// the executable's lifetime. The multi-file dual of [`build_exe`]: the caller spawns the process
+/// itself, so a server program that blocks on `accept` can be driven by a client in the same test.
+pub struct BuiltExeMulti {
+    pub exe: PathBuf,
+    _proj: TempProject,
+}
+
+/// Compile a multi-file project to a native executable and return its path (without running it).
+/// Asserts the program type-checks; the temp project (sources, object, exe) is removed when the
+/// returned [`BuiltExeMulti`] is dropped.
+pub fn build_exe_multi(name: &str, files: &[(&str, &str)], entry: &str) -> BuiltExeMulti {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_name, &entry_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let pid = std::process::id();
+    let obj = proj.dir.join(format!("align-mexe-{pid}-{name}.o"));
+    let exe = proj.dir.join(format!("align-mexe-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    BuiltExeMulti { exe, _proj: proj }
+}
+
 /// The outcome of running BOTH the whole-program checker and the M15 S1b per-unit checker on the
 /// same multi-file program — the differential-equivalence gate's raw material.
 pub struct DiffCheck {

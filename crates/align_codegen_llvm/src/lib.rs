@@ -4962,6 +4962,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     let zero: inkwell::values::BasicValueEnum = match self.structs[sid as usize].fields[*idx as usize].ty {
                         Ty::Enum(eid) => self.enum_types[eid as usize].const_zero().into(),
+                        // A Move **handle** field is a single opaque POINTER, not a `{ptr,len}` —
+                        // zeroing it with a 16-byte slice struct would clobber the next field.
+                        // `handle_free_fn` is the same predicate that decides its drop is a pointer
+                        // free, so the two can never disagree about the field's shape.
+                        ty if handle_free_fn(ty).is_some() => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
                         _ => slice_struct_type(self.ctx).const_zero().into(),
                     };
                     self.builder.build_store(field_ptr, zero).map_err(|e| self.err(e))?;

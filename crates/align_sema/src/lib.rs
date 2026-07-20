@@ -8305,9 +8305,11 @@ impl<'a> MoveCheck<'a> {
                             format!("use of moved field '{fld_name}' of '{name}'")
                         };
                         self.diags.error(msg, e.span);
-                    } else if consuming && e.ty == Ty::String {
+                    } else if consuming && (e.ty == Ty::String || is_move_handle(e.ty)) {
                         // A partial move of a depth-1 owned `string` field (`n := u.name`,
-                        // `f(u.name)` by value, `return u.name`): mark just that field moved. The
+                        // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
+                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle):
+                        // mark just that field moved. The
                         // struct's recursive `Drop` frees null there (MIR nulls the field on move);
                         // the struct can no longer move as a whole, and the field can't be reused,
                         // but its other fields stay readable. A *borrow* (`u.name.len()`, a `str`
@@ -18269,7 +18271,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// and yields `Result<(), Error>` (Impure).
     fn check_http_ctx_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+        // The receiver must be a **place** — a bound local (`ctx := srv.accept()?`), or a field of
+        // one (`c.req`, the pkg.web `Ctx` shape: a struct that OWNS the request handle). Both are
+        // owned by a live binding, so the handle is dropped exactly once; what stays rejected is a
+        // *temporary* (`srv.accept()?.path()`), whose handle nothing would drop. A consuming
+        // `respond` on a field additionally nulls that field (`null_moved_source`) so the enclosing
+        // struct's drop does not double-free it.
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
                     "bind the http request context to a local first, then use it (`ctx := srv.accept()?` then `ctx.path()` / `ctx.respond(rb)`) — a temporary owned request handle is not dropped yet".to_string(),
@@ -21603,7 +21611,7 @@ fn resolve_user_type(
 /// stay in lockstep with `align_codegen_llvm::handle_free_fn` (a field type allowed here but not
 /// freed there would leak). Excludes `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer
 /// drops) and the `{ptr,len}` owned collections (`string`/`array` — their own field arms).
-fn is_move_handle(ty: Ty) -> bool {
+pub fn is_move_handle(ty: Ty) -> bool {
     matches!(
         ty,
         Ty::Writer
