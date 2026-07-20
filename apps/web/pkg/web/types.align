@@ -1,0 +1,19 @@
+module pkg.web.types
+
+// pkg.web's public value types. A dependency-free leaf module: the internal router needs `Route` to
+// dispatch a table, and the `pkg.web` root needs both to build and serve one — so neither can define
+// them without creating an import cycle (and Align has no re-exports, D9). Consumers name them
+// qualified, like every other cross-module type: `fn h(c: pkg.web.types.Ctx) -> Result<(), Error>`.
+
+// The per-request context. A **Move** struct: it OWNS the accepted request handle, so a responder
+// consumes it exactly once (`c.req.respond(rb)` moves the handle out of the field, which is nulled
+// so the struct's drop cannot double-free it). `pattern` is the matched route's pattern — Static
+// text from the route table — which is what lets a parameter be read back out of the path without
+// a per-request slot array.
+pub Ctx { req: http_request_ctx, pattern: str }
+
+// One route: the method it answers, the pattern it matches, and the handler to run. A **Copy**
+// struct — a `str` view of literal text, plus a fn value — so a route table is an ordinary array
+// value with no ownership story. `method` is the uppercase HTTP method ("GET", "POST", …); an empty
+// method matches ANY method, which is how a catch-all/fallback route is written.
+pub Route { method: str, pattern: str, handler: fn(Ctx) -> Result<(), Error> }

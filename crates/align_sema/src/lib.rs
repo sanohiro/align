@@ -11924,6 +11924,22 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
             _ => self.check_expr(a, None),
         };
+        // A fixed **struct** array (`[Route{…}, Route{…}]` -> `Ty::StructArray`) coerces to
+        // `slice<Struct>` by the same borrow: the element type matches, and the AoS buffer is what a
+        // `{ptr,len}` view already points at. Without this a route TABLE could not be passed to a
+        // dispatcher by borrow at all — only moved.
+        let struct_arr_match = matches!((e.ty, ps), (Ty::StructArray(aid, _), Scalar::Struct(pid)) if aid == pid);
+        if struct_arr_match {
+            if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+                self.diags.error(
+                    "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                    e.span,
+                );
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+            }
+            let span = e.span;
+            return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+        }
         if let Ty::Array(es, _) = e.ty
             && es == ps {
                 // The borrow lowers via the same slot-materialization as a pipeline source,

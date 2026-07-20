@@ -4915,10 +4915,20 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
     if matches!(elem, Ty::Struct(_)) {
         for (i, e) in elems.iter().enumerate() {
             if let hir::ExprKind::StructLit { fields, .. } = &e.kind {
+                // A literal element is written field by field, so no intermediate struct value is
+                // materialized.
                 for (j, fe) in fields.iter().enumerate() {
                     let v = lower_expr(b, fe);
                     b.push(Stmt::StoreElemField(slot, index_const(i), vec![j as u32], v));
                 }
+            } else {
+                // ANY OTHER struct-valued element — a call (`[mk(1), mk(2)]`, the route-table shape
+                // `[web.get(…), web.post(…)]`), a local, a field read: lower it and store the whole
+                // element. This arm previously stored NOTHING, silently leaving the element
+                // uninitialised (a zeroed scalar, a garbage `str`/fn pointer).
+                let v = lower_expr(b, e);
+                b.push(Stmt::StoreIndex(slot, index_const(i), v));
+                null_moved_source(b, e);
             }
         }
     } else {
