@@ -8227,6 +8227,92 @@ fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
     Some(v)
 }
 
+/// Encoded length under `application/x-www-form-urlencoded`: identical to percent-encoding except a
+/// space costs 1 byte (`+`) rather than 3.
+fn form_encoded_len(data: &[u8]) -> Option<usize> {
+    let mut n: usize = 0;
+    for &b in data {
+        n = n.checked_add(if is_unreserved(b) || b == b' ' { 1 } else { 3 })?;
+    }
+    Some(n)
+}
+
+/// Write `data` form-urlencoded into `out` (exactly [`form_encoded_len`] bytes): space becomes `+`,
+/// every other non-unreserved byte becomes `%XX`.
+fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    assert_eq!(form_encoded_len(data), Some(out.len()), "form destination length mismatch");
+    let mut o = 0;
+    for &b in data {
+        if b == b' ' {
+            out[o].write(b'+');
+            o += 1;
+        } else if is_unreserved(b) {
+            out[o].write(b);
+            o += 1;
+        } else {
+            out[o].write(b'%');
+            out[o + 1].write(HEX[(b >> 4) as usize]);
+            out[o + 2].write(HEX[(b & 0x0f) as usize]);
+            o += 3;
+        }
+    }
+}
+
+/// Decode `application/x-www-form-urlencoded`: `+` is a space, `%XX` is a byte, everything else
+/// passes through. A `%` not followed by two hex digits invalidates the input (`None`).
+fn form_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
+    let mut v = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'+' => {
+                v.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= input.len() {
+                    return None;
+                }
+                let hi = hex_val(input[i + 1])?;
+                let lo = hex_val(input[i + 2])?;
+                v.push(hi << 4 | lo);
+                i += 3;
+            }
+            b => {
+                v.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(v)
+}
+
+/// `encoding.form_encode(data)` — `application/x-www-form-urlencoded`: space becomes `+`, every
+/// other non-unreserved byte `%XX`. Returns an owned `string`. Encode ONE key or value at a time;
+/// the `=`/`&` that join them are structure, not data.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_form_encode(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let Some(out_len) = form_encoded_len(data) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| form_encode_into(data, out)) }
+}
+
+/// `encoding.form_decode(s)` — the inverse: `+` to space, `%XX` to a byte. A malformed escape is
+/// `AL_INVALID`. Same out-slot contract as [`align_rt_base64_decode`].
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_form_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { decode_into(form_decode_impl(bytes_view(ptr, len)), out) }
+}
+
 /// `encoding.percent_encode(data)` — RFC 3986 percent-encoding of a URI component: every byte
 /// outside the unreserved set becomes `%XX`. Returns an owned `string`.
 ///

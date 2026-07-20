@@ -1382,6 +1382,10 @@ pub enum EncodingKind {
     /// Deliberately NOT the `application/x-www-form-urlencoded` variant — that one additionally maps
     /// `+` to space, a different codec that builds on this one.
     Percent,
+    /// `application/x-www-form-urlencoded` (the HTML form / query-string payload rule): space is
+    /// `+`, every other non-unreserved byte is `%XX`. One key or value at a time — the `=`/`&`
+    /// joining them are structure, not data.
+    Form,
 }
 
 /// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)

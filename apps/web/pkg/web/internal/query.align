@@ -1,0 +1,139 @@
+module pkg.web.internal.query
+
+// pkg.web query-string support — locating a parameter in an `a=1&b=2` string.
+//
+// The payload rule is `application/x-www-form-urlencoded` (the same one HTML forms use for a POST
+// body), so a key or value may carry `+` for space and `%XX` escapes. Everything here is
+// **zero-allocation**: the returned value is a `str` view into the input, and key comparison decodes
+// escapes *as it walks* rather than materializing a decoded key. Decoding a value does allocate
+// (the bytes genuinely change), so that stays the caller's explicit step —
+// `encoding.form_decode(raw)` — keeping "nothing hidden" at the allocation boundary.
+
+// Byte constants (Align has no byte literals; these are the ASCII codes we scan for).
+AMP := 38    // '&'
+EQ := 61     // '='
+PLUS := 43   // '+'
+PCT := 37    // '%'
+
+// The value of one hex digit byte, or -1 if it is not a hex digit.
+pub fn hex_val(b: u8) -> i64 {
+  v := b as i64
+  if v >= 48 && v <= 57 { return v - 48 }        // '0'..'9'
+  if v >= 97 && v <= 102 { return v - 97 + 10 }  // 'a'..'f'
+  if v >= 65 && v <= 70 { return v - 65 + 10 }   // 'A'..'F'
+  return -1
+}
+
+// Decode the byte at `i` of the form-encoded `b`, returning `(byte_value, next_index)` packed as
+// `value * 8 + advance` — a tuple would allocate nothing but needs two returns, so the pack keeps
+// this one `i64` (value is 0..255, advance is 1 or 3). Returns -1 on a malformed `%` escape.
+fn decode_at(b: slice<u8>, i: i64) -> i64 {
+  c := b[i] as i64
+  if c == PLUS {
+    return 32 * 8 + 1        // '+' is a space
+  }
+  if c == PCT {
+    if i + 2 >= b.len() { return -1 }
+    hi := hex_val(b[i + 1])
+    lo := hex_val(b[i + 2])
+    if hi < 0 || lo < 0 { return -1 }
+    return (hi * 16 + lo) * 8 + 3
+  }
+  return c * 8 + 1
+}
+
+// Whether the form-encoded `key` decodes to exactly `name`. Escapes are resolved byte-by-byte
+// during the comparison, so an escaped key (`a%20b` for `a b`) matches without any allocation.
+// A malformed escape makes the key un-matchable rather than an error — a query string is untrusted
+// input on the request path and must never abort the server.
+pub fn key_matches(key: str, name: str) -> bool {
+  kb := key.bytes()
+  nb := name.bytes()
+  mut i := 0
+  mut j := 0
+  loop {
+    if i >= kb.len() {
+      break j >= nb.len()
+    }
+    if j >= nb.len() {
+      break false
+    }
+    d := decode_at(kb, i)
+    if d < 0 {
+      break false
+    }
+    if d / 8 != nb[j] as i64 {
+      break false
+    }
+    i = i + d % 8
+    j = j + 1
+  }
+}
+
+// The RAW (still form-encoded) value of parameter `name` in `query` (an `a=1&b=2` string, with no
+// leading '?'), or "" when the parameter is absent. The result is a `str` view into `query` — decode
+// it with `encoding.form_decode` when it may carry escapes.
+//
+// A parameter with no '=' (`?flag`) yields "" — present with an empty value, which is also what
+// `?flag=` gives; callers that must distinguish presence use `has`.
+pub fn raw(query: str, name: str) -> str {
+  qb := query.bytes()
+  n := query.len()
+  mut start := 0
+  loop {
+    if start > n {
+      break ""
+    }
+    // The end of this `key=value` pair: the next '&', or the end of the string.
+    mut end := start
+    loop {
+      if end >= n { break }
+      if qb[end] as i64 == AMP { break }
+      end = end + 1
+    }
+    // Split the pair at its first '='.
+    mut eq := start
+    loop {
+      if eq >= end { break }
+      if qb[eq] as i64 == EQ { break }
+      eq = eq + 1
+    }
+    k := query[start..eq]
+    if key_matches(k, name) {
+      if eq >= end {
+        break ""
+      }
+      break query[eq + 1..end]
+    }
+    start = end + 1
+  }
+}
+
+// Whether `query` contains parameter `name` at all (with or without a value) — the distinction
+// `raw` collapses, since a valueless `?flag` and an empty `?flag=` both decode to "".
+pub fn has(query: str, name: str) -> bool {
+  qb := query.bytes()
+  n := query.len()
+  mut start := 0
+  loop {
+    if start > n {
+      break false
+    }
+    mut end := start
+    loop {
+      if end >= n { break }
+      if qb[end] as i64 == AMP { break }
+      end = end + 1
+    }
+    mut eq := start
+    loop {
+      if eq >= end { break }
+      if qb[eq] as i64 == EQ { break }
+      eq = eq + 1
+    }
+    if key_matches(query[start..eq], name) {
+      break true
+    }
+    start = end + 1
+  }
+}

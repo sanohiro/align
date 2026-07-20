@@ -1917,6 +1917,7 @@ fn build_module<'c>(
         ("base64url_encode", "align_rt_base64url_encode"),
         ("hex_encode", "align_rt_hex_encode"),
         ("percent_encode", "align_rt_percent_encode"),
+        ("form_encode", "align_rt_form_encode"),
     ] {
         funcs.insert(
             key.to_string(),
@@ -1929,6 +1930,7 @@ fn build_module<'c>(
         ("base64url_decode", "align_rt_base64url_decode"),
         ("hex_decode", "align_rt_hex_decode"),
         ("percent_decode", "align_rt_percent_decode"),
+        ("form_decode", "align_rt_form_decode"),
     ] {
         funcs.insert(
             key.to_string(),
@@ -7120,6 +7122,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Base64Url => "base64url_encode",
                     align_sema::hir::EncodingKind::Hex => "hex_encode",
                     align_sema::hir::EncodingKind::Percent => "percent_encode",
+                    align_sema::hir::EncodingKind::Form => "form_encode",
                 };
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
@@ -7133,6 +7136,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Base64Url => "base64url_decode",
                     align_sema::hir::EncodingKind::Hex => "hex_decode",
                     align_sema::hir::EncodingKind::Percent => "percent_decode",
+                    align_sema::hir::EncodingKind::Form => "form_decode",
                 };
                 let out_ptr = self.slots[out];
                 self.builder
