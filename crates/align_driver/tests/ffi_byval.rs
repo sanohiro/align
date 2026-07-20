@@ -1,4 +1,4 @@
-//! `extern "C"` by-value struct passing/returning — SysV AMD64 only (draft.md §15). A `layout(C)`
+//! `extern "C"` by-value struct passing/returning — SysV AMD64, x86-64 Linux only (draft.md §15). A `layout(C)`
 //! struct (declaration-order, natural-alignment, scalar int/float fields) crosses the C boundary in
 //! registers using the System V AMD64 classification: each eightbyte is INTEGER (→ a GP register /
 //! `i64` slot) or SSE (→ an XMM register / `double` slot); a two-register value returns as an
@@ -15,10 +15,10 @@
 //! single-register returns, a full param+return round trip, and the rejections (> 16-byte MEMORY,
 //! non-`layout(C)` struct).
 //!
-//! **This suite is x86-64-only**, because the feature is. On any other target codegen refuses to
-//! emit a by-value struct call at all, and `sysv_only_targets_fail_closed` is what runs instead —
-//! pinning that the refusal is a clear diagnostic rather than some other target's ABI applied
-//! silently.
+//! **This suite is x86-64-Linux-only**, because the feature is — codegen gates on the triple being
+//! `x86_64` *and* `linux`. On any other target it refuses to emit a by-value struct call at all,
+//! and `sysv_only_targets_fail_closed` is what runs instead, pinning that the refusal is a clear
+//! diagnostic rather than some other target's ABI applied silently.
 
 mod common;
 use common::*;
@@ -28,17 +28,22 @@ fn ok(src: &str) -> bool {
     !check(&mut sm, "ffi_byval", src).diags.has_errors()
 }
 
-/// By-value struct FFI is SysV-AMD64-only by design, so every test below is x86-64-only too — on
-/// any other target codegen refuses to emit the call at all (see `sysv_only_targets_fail_closed`,
-/// which is what runs there instead). Without the arch condition this whole suite fails on arm64
-/// against a compiler that is behaving exactly as specified.
+/// By-value struct FFI is x86-64-Linux-only by design, so every test below is too — on any other
+/// target codegen refuses to emit the call at all (see `sysv_only_targets_fail_closed`, which is
+/// what runs there instead). Without this condition the whole suite fails against a compiler that
+/// is behaving exactly as specified.
 fn gated() -> bool {
     sysv_target() && backend_available() && cc_available()
 }
 
 /// Whether this host is the one target where by-value struct passing is implemented.
+///
+/// This must mirror `align_codegen_llvm`'s condition EXACTLY — it gates on the triple being
+/// `x86_64` *and* `linux`, so x86-64 macOS and Windows are refused too. Gating these tests on the
+/// architecture alone would leave them failing on an Intel Mac for the same reason they failed on
+/// arm64.
 fn sysv_target() -> bool {
-    cfg!(target_arch = "x86_64")
+    cfg!(all(target_arch = "x86_64", target_os = "linux"))
 }
 
 #[test]
