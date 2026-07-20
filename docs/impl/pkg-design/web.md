@@ -358,21 +358,32 @@ with concurrency.
 
 ### Enablers (probed 2026-07-21; in implementation order)
 
-1. **`http_stream` nameable in source** — `resolve_type` entry, the exact #583 `response_builder`
-   pattern. Probed: `unknown type: 'http_stream'` today. Trivial.
-2. **fn value as enum variant payload** — probed: `variant payloads must be a primitive scalar,
-   plain struct, or owned array for now, got fn#0`. The widening is STRICTLY smaller than #583's
-   (a fn value is Copy: no `is_move`, no drop dispatch, no null-on-move; payload slot is one
-   pointer). Sweep the #583 checklist anyway (ty_to_scalar/scalar_to_ty/scalar_bytes/sort_key_order
-   fail-closed arm). De-risk note: a struct wrapping a fn field IS already legal as a payload
-   (probed green: `Spec { tag: i64, f: fn(i64) -> i64 }` in a variant, matched and called) — so if
-   the bare-fn widening stalls, the shape exists; do not ship the wrapper as the public surface.
-3. **A fn-value signature with a Move-handle param** (`http_stream` by value through an indirect
-   call): #573 fixed the owned-arg nulling on indirect calls; verify with a driver test that the
-   pump's stream is nulled in serve's frame (no double close on the error path).
+1. **`http_stream` nameable in source — DONE.** A `resolve_type` entry, the exact #583
+   `response_builder` pattern; `http_stream` was already a full `Scalar`/`Ty` (the `respond_stream`
+   `Ok` payload, with `.send`/`.finish`), so only the source spelling was missing. Pinned by
+   `crates/align_driver/tests/http_stream_nameable.rs` (param/return spelling, nullary, still not an
+   array element).
+2. **fn value as enum variant payload — DONE.** A new `Scalar::Fn(u32)` variant (there was none — a
+   fn value was `Ty::Fn` with no scalar form, so a variant payload could not represent one). A fn
+   value is Copy `{fn_ptr, env_ptr}` (16 bytes, 8-align), so a fn-only enum is non-Move and never
+   dropped; a mixed enum's tag-switched drop skips the fn slot. The #583 checklist was swept —
+   `scalar_to_ty`, MIR `sort_key_order` (fail-closed arm), codegen `scalar_bytes` (unreachable), and
+   the codegen `scalar_type` fn arm that reserves the 16-byte slot instead of the catch-all's silent
+   `i32`. Construction compares fn payloads **by signature, not `fn_types` id** (each `fn` expr
+   interns a fresh `FnTy`). `ty_to_scalar(Ty::Fn)` stays `None` (fn is a variant payload only, not an
+   `Option`/`Result`/`box` payload). Pinned by `crates/align_driver/tests/fn_variant_payload.rs`
+   (dispatch, the real `Handler` signature, Copy/no-drop, cross-module round-trip via
+   `align_interface`, the `Route { handler: Handler }` array shape, mixed fn+Move-array drop, and a
+   wrong-signature reject). **Deferred (fail-closed, no consumer):** a *generic* sum type with a fn
+   payload — rejected at the template payload resolver — is not shipped half-built.
+3. **A fn-value signature with a Move-handle param — DONE (verified via a Move-value proxy).** #573
+   nulls the owned arg in the caller's frame after an INDIRECT call; a 200k-loop test drives an owned
+   `array<i64>` (the `http_stream` stand-in) by value through a match-extracted fn payload and
+   asserts no double-free (completion, not a signal exit) plus a move-after-use reject. The real
+   `http_stream` receiver awaits enabler 4.
 4. **std.http `respond_stream` rework** (changes ①–③ above) — recorded in
    `docs/impl/std-design/http.md`; update the M12 tests to the new receiver form (pre-release:
-   change outright, no compat path).
+   change outright, no compat path). **Not yet done.**
 
 ### Backlog (recorded, not v1)
 

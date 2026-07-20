@@ -98,20 +98,28 @@ Still open from that cluster, both unchanged by this decision:
 - **`web.json(c, x)` cannot encode `x`** — no user-written generics, so the signature is
   `json(body: str)` and the handler writes `web.json(json.encode(m))`. Arguably better (the
   encode's allocation stays visible), and the design doc now says so.
-- **Streaming/SSE — DESIGNED 2026-07-21 (owner-directed), implementation pending.** The full design
-  is `docs/impl/pkg-design/web.md` → "Streaming" (+ ja mirror): stream routes in the SAME table via
-  `Handler { Respond(fn…), Stream(fn(Ctx, http_stream)…) }`, `web.sse`/`web.stream` constructors,
-  framework-built lazy head, `s.reject(rb)` as the pre-stream 4xx window, and the ownership rule
-  extended (framework owns ctx for the whole request; the pump owns only the stream). std.http side:
-  `docs/impl/std-design/http.md` item 8 — `respond_stream` becomes a non-consuming receiver with a
-  lazy head + `reject`. **Implementation order (enablers, all probed):**
-  1. `http_stream` nameable (`resolve_type`, the exact #583 pattern) — trivial;
-  2. fn value as enum variant payload (Copy — strictly smaller than #583: no is_move/drop; still
-     sweep the #583 checklist); probed fallback exists (fn-field struct payload checks green) but
-     is NOT the public surface;
-  3. the indirect-call Move-handle-param verification test (#573 class);
-  4. the std.http `respond_stream` rework (M12 tests updated outright);
-  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`).
+- **Streaming/SSE — DESIGNED 2026-07-21 (owner-directed); COMPILER ENABLERS 1–3 DONE 2026-07-21.**
+  The full design is `docs/impl/pkg-design/web.md` → "Streaming" (+ ja mirror): stream routes in the
+  SAME table via `Handler { Respond(fn…), Stream(fn(Ctx, http_stream)…) }`, `web.sse`/`web.stream`
+  constructors, framework-built lazy head, `s.reject(rb)` as the pre-stream 4xx window, and the
+  ownership rule extended (framework owns ctx for the whole request; the pump owns only the stream).
+  std.http side: `docs/impl/std-design/http.md` item 8 — `respond_stream` becomes a non-consuming
+  receiver with a lazy head + `reject`. **Implementation order (enablers, all probed):**
+  1. `http_stream` nameable (`resolve_type`, the exact #583 pattern) — **DONE** (it was already a full
+     `Scalar`/`Ty`; only the source spelling was missing). `http_stream_nameable.rs`.
+  2. fn value as enum variant payload — **DONE.** New `Scalar::Fn(u32)` (there was none); fn value is
+     Copy `{fn_ptr,env_ptr}` (16 B), so a fn-only enum is non-Move / non-drop. Swept the #583
+     checklist (`scalar_to_ty`, `sort_key_order` fail-closed, `scalar_bytes` unreachable, and the
+     codegen `scalar_type` fn arm that reserves 16 B instead of the catch-all's silent `i32`).
+     Construction compares fn payloads BY SIGNATURE, not `fn_types` id. `ty_to_scalar(Ty::Fn)` stays
+     `None` (variant payload only). `fn_variant_payload.rs`. Generic fn-payload sum types stay
+     rejected at the template resolver — deferred, no consumer.
+  3. the indirect-call Move-handle-param verification — **DONE (via a Move-value proxy):** an owned
+     `array<i64>` (http_stream stand-in) passed by value through a match-extracted fn payload nulls in
+     the caller frame (#573), no double-free over a 200k loop; move-after-use rejected. Real
+     `http_stream` receiver awaits enabler 4.
+  4. the std.http `respond_stream` rework (M12 tests updated outright) — NOT YET.
+  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`) — NOT YET.
   **Hard ordering note: production streaming needs concurrent serve first** (an open stream starves
   the sequential v1 loop); the design is independent of it, the shipping is not. The middleware
   section was also rewritten for the settled ownership model (`Option<response_builder>` verdict —

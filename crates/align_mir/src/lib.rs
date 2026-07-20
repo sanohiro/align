@@ -6858,7 +6858,8 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::HttpServer
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
-        | Scalar::HttpStream => KeyOrder::PartialFloat,
+        | Scalar::HttpStream
+        | Scalar::Fn(_) => KeyOrder::PartialFloat,
     }
 }
 
