@@ -762,9 +762,22 @@ impl ThinBuilt {
         link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
         exe
     }
-    /// Link + read the exe bytes. Caller must have checked `cc_available()`.
+    /// Link + read the exe bytes, at a FIXED per-project path rather than [`Self::link_to`]'s
+    /// nonce'd one. Caller must have checked `cc_available()`.
+    ///
+    /// A byte-identity comparison has to hold every input constant except the one under test, and
+    /// the output filename is an input to the linker: on macOS it lands in the ad-hoc code
+    /// signature, whose identifier comes from the output file's NAME. Linking two builds to
+    /// `exe-{nonce}` therefore made them differ by exactly those name bytes on every run, whatever
+    /// the cache or `-j` did. (The basename is what matters — the same basename in different
+    /// directories is byte-identical, so cross-project comparisons still work.) Same fix as
+    /// `cache_codegen`'s gate7 (#579); the first result is read into memory before any second link
+    /// to the same path.
     pub fn exe_bytes(&self, proj: &Proj) -> Vec<u8> {
-        std::fs::read(self.link_to(proj)).expect("read exe")
+        let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
+        let exe = proj.dir.join("exe-byte-identity");
+        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
+        std::fs::read(&exe).expect("read exe")
     }
     /// Link + run; returns stdout. Caller must have checked `cc_available()`.
     pub fn run(&self, proj: &Proj) -> String {
