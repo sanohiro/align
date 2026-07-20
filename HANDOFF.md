@@ -8,7 +8,103 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-20, **pkg.web W2 IN PROGRESS — the request pipeline runs end-to-end over a real
+_Last updated: 2026-07-20 (session close), **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE.**
+
+## Where pkg.web stands
+
+Shipped Align source (all compiled by driver tests via `include_str!`, so the repo files ARE the
+tested source):
+
+```text
+apps/web/pkg/web/types.align            Ctx (Move, owns http_request_ctx) + Route (Copy: method,
+                                        pattern, fn(Ctx) -> Result<(), Error>). A dependency-free
+                                        PUBLIC leaf — the internal router needs Route and the root
+                                        needs both, so neither can define them (import cycle), and
+                                        Align has no re-exports (D9).
+apps/web/pkg/web/internal/router.align  seg_end / match_score / dispatch (linear oracle) /
+                                        tree_dispatch (flat SoA radix tree, differential-tested) /
+                                        param_value (zero-copy :param + *wildcard capture) /
+                                        dispatch_routes + method_not_allowed (method-aware, 404 vs 405)
+apps/web/pkg/web/internal/query.align   raw / has / key_matches — zero-alloc query lookup; an ESCAPED
+                                        key matches by decoding as the comparison walks
+apps/web/pkg/web/cookie.align           get / build (+CookieOpts) — RFC 6265; build REJECTS header &
+                                        attribute injection (Result)
+apps/web/pkg/web/cors.align             CorsPolicy / valid / allow_origin / vary_origin /
+                                        method_allowed — exact-origin match, wildcard+credentials
+                                        rejected
+apps/jwt/pkg/jwt.align                  encode_hs256 / decode_hs256 / time_claims_valid — alg-pinned,
+                                        constant-time compare, byte-identical to the jwt.io vector
+```
+
+Driver tests: `apps_web_router.rs` (7), `apps_web_serve.rs` (3, real socket), `apps_web_query.rs` (3),
+`apps_web_cookie.rs` (3), `apps_web_cors.rs` (3), `apps_jwt.rs` (3), `pkg_foundation.rs` (6),
+`struct_handle_fields.rs` (9), `struct_slice_fields.rs` (5), `fn_values.rs` (21).
+
+**The designed handler contract runs end-to-end over a real socket** (`apps_web_serve.rs`): radix
+dispatch -> `Ctx` owning the request handle -> `param_value` zero-copy capture -> the handler invoked
+THROUGH the `Route.handler` fn-value field -> a responder consuming the handle out of that field.
+Nothing there stands in for a missing compiler feature.
+
+## NEXT (in order)
+
+1. **`pkg.web` root + `serve()`** — the accept loop (`http.serve` -> `srv.accept()` -> dispatch ->
+   handler), automatic 404 / 405 (+`Allow`) / 400 / 500, and a loop that never dies per request.
+   Responders `json()` / `text()` / `status()` (each consumes `Ctx`). The per-method constructors
+   (`pkg.web.get/post/...`) exist in the tests' root stub — promote them into a real
+   `apps/web/pkg/web.align`.
+2. **Wire the radix tree over a route table.** `dispatch_routes` currently uses the LINEAR
+   `match_score` scan, because `tree_dispatch` takes `slice<str>` and a route table cannot be
+   projected to one (`array_builder` rejects `str` elements). Reading `.pattern` per route inside the
+   tree build closes it. A performance gap only — the differential test pins the two orderings equal.
+3. **`param(c, name)` sugar — NEEDS AN OWNER DECISION.** The design doc writes `web.param(c, "id")`,
+   but `Ctx` is Move, so passing it by value CONSUMES it; today a handler writes
+   `pkg.web.param(c.pattern, c.req.path(), "id")`. Closing this needs a borrow-parameter feature for
+   Move structs (a language addition), or a Copy-Ctx redesign that moves responding out of the
+   handler. Do not resolve it unilaterally.
+4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data; OAuth —
+   client flows are buildable now, validating a PUBLIC provider's token is blocked on RS256
+   (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.
+5. W3-W7 per the design doc: accessor surface, hardening matrix, the bench gate (`bench/web_router`,
+   `bench/web_e2e`), middleware-lite + SSE, the Fiber comparison.
+
+**Scope rule (owner, 2026-07-20 — also in Claude's memory):** `pkg.web` is a GENERAL REST/web
+framework. The LLM gateway is only its first consumer and is NEVER a reason to omit or defer a
+feature. Judge by "does a REST server commonly need this?", build it in the right layer.
+
+## Compiler work this session (all merged, all with tests)
+
+F1 field-eligibility: fn-value fields (#554), `slice<T>` view fields (#555), Move-handle fields
+(#556). F0 pkg-foundation import rules (#558). Then, each surfaced by writing the framework's real
+shapes:
+- **#562** moving a named owned local into a struct-literal field never nulled the source ->
+  double-free (inline temporaries hid it).
+- **#571** http-ctx receiver may be a field place; partial move of a Move-handle field; and
+  `NullStructField` zeroed every non-enum field as a 16-byte `{ptr,len}` — an 8-byte handle field
+  would have CLOBBERED the next field.
+- **#573** an owned argument passed through an INDIRECT call was never nulled -> double-free.
+- **#575** a fn VALUE may now return `Result<T, E>` (`FnTy.ret` Scalar -> Ty), widened to exactly
+  "scalars + Result"; also fixed `map_err` silently defaulting a non-scalar mapper return.
+- **#576** `store_array_elems` stored NOTHING for a non-struct-literal element — `[web.get(..),
+  web.post(..)]` left elements uninitialised (zeroed scalars, garbage `str`/fn pointers); and a fixed
+  struct array now coerces to `slice<Struct>`.
+
+std/web utilities: percent (#567), x-www-form-urlencoded + query lookup (#568), HTML escaping +
+cookies (#569), CORS (#570), JWT (#566).
+
+## Build / test notes
+
+Per-machine env (also in Claude's memory `macos-build-env`): `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm`,
+`LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config`,
+`LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib` on every cargo/alignc run. After
+changing `align_runtime`, run a plain `cargo build` before `alignc run` — user programs link the
+runtime staticlib. `align_runtime`'s ~9 failures here are the documented sandbox-only ones
+(`https_*` / `http_get_many` / `tcp_*` / `fs_read_dir` need real DNS/sockets/fds). Suites verified
+green this session: sema 151, m4 26, m5 172, struct_index 28, array_materialize 6, owned_structs 20,
+owned_structs_arrays 10, nested_structs 6, fn_values 21, par_map 14, analysis_coverage 23,
+m9_fs 26, m9_io 22, m10_cli 17, m10_encoding 16, m11_http 27, m11_http_server 8, m11_process 35,
+modules 36, cross_module_types 5, plus every `apps_*` suite above.
+
+Previous: **pkg.web W2 IN PROGRESS — the request pipeline runs end-to-end over a real
 socket.** `apps_web_serve.rs` drives: radix-router dispatch -> `Ctx` (a struct that OWNS the
 `http_request_ctx`) -> `param_value` zero-copy `:id` capture -> the handler invoked **through the
 `Route.handler` fn-value field** -> a responder that CONSUMES the handle out of that field. A clean
