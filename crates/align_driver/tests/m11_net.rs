@@ -392,14 +392,23 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     // message, and reads the echo back.
     for i in 0..2 {
         let msg = format!("client{i}\n");
+        // A wall-clock deadline, not a fixed retry count: 100 x 20 ms budgeted only ~2 s, which the
+        // server child can exceed purely from scheduling pressure when the whole suite runs in
+        // parallel (this test passes in isolation and failed only in full-suite runs). 30 s matches
+        // the other server tests in this repo (`apps_web_serve`, `apps_web_root`). A genuinely dead
+        // server still fails, just on its own stderr rather than on a load-dependent stopwatch.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut sock = None;
-        for _ in 0..100 {
+        loop {
             match TcpStream::connect(("127.0.0.1", port)) {
                 Ok(s) => {
                     sock = Some(s);
                     break;
                 }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(_) => break,
             }
         }
         let mut sock = match sock {
