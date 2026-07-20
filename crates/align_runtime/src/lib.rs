@@ -8168,7 +8168,91 @@ pub unsafe extern "C" fn align_rt_hex_decode(ptr: *const u8, len: i64, out: *mut
     unsafe { decode_into(decoded, out) }
 }
 
-/// Shared tail of the three decoders: on `Some(v)` publish an owned `buffer` handle and return `0`;
+/// An RFC 3986 §2.3 *unreserved* byte — the set percent-encoding leaves untouched.
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// Encoded length of `data` under percent-encoding: 1 byte per unreserved byte, 3 (`%XX`) per other.
+/// `None` on overflow (the caller aborts before allocating).
+fn percent_encoded_len(data: &[u8]) -> Option<usize> {
+    let mut n: usize = 0;
+    for &b in data {
+        n = n.checked_add(if is_unreserved(b) { 1 } else { 3 })?;
+    }
+    Some(n)
+}
+
+/// Write `data` percent-encoded into `out` (exactly [`percent_encoded_len`] bytes). Upper-case hex
+/// digits, which RFC 3986 §2.1 states producers SHOULD use.
+fn percent_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    assert_eq!(percent_encoded_len(data), Some(out.len()), "percent destination length mismatch");
+    let mut o = 0;
+    for &b in data {
+        if is_unreserved(b) {
+            out[o].write(b);
+            o += 1;
+        } else {
+            out[o].write(b'%');
+            out[o + 1].write(HEX[(b >> 4) as usize]);
+            out[o + 2].write(HEX[(b & 0x0f) as usize]);
+            o += 3;
+        }
+    }
+}
+
+/// Decode percent-escapes in `input`. A `%` must be followed by exactly two hex digits, else the
+/// whole input is invalid (`None`); any other byte passes through unchanged. This is the RFC 3986
+/// codec only — it deliberately does NOT map `+` to space, which is the distinct
+/// `application/x-www-form-urlencoded` rule.
+fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
+    let mut v = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            // Need both hex digits in range: indices i+1 and i+2 must exist.
+            if i + 2 >= input.len() {
+                return None;
+            }
+            let hi = hex_val(input[i + 1])?;
+            let lo = hex_val(input[i + 2])?;
+            v.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            v.push(input[i]);
+            i += 1;
+        }
+    }
+    Some(v)
+}
+
+/// `encoding.percent_encode(data)` — RFC 3986 percent-encoding of a URI component: every byte
+/// outside the unreserved set becomes `%XX`. Returns an owned `string`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_percent_encode(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let Some(out_len) = percent_encoded_len(data) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| percent_encode_into(data, out)) }
+}
+
+/// `encoding.percent_decode(s)` — RFC 3986 percent-decoding; a `%` not followed by two hex digits is
+/// `AL_INVALID`. Same out-slot contract as [`align_rt_base64_decode`]. Yields `bytes` (a decoded
+/// component need not be UTF-8), so a caller wanting text validates with `.as_str()`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_percent_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { decode_into(percent_decode_impl(bytes_view(ptr, len)), out) }
+}
+
+/// Shared tail of the decoders: on `Some(v)` publish an owned `buffer` handle and return `0`;
 /// on `None` leave `*out` null and return `AL_INVALID` (`Error.Invalid`).
 ///
 /// # Safety

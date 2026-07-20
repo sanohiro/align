@@ -1377,6 +1377,11 @@ pub enum EncodingKind {
     Base64Url,
     /// Lower-case hex (`hex_encode`); `hex_decode` accepts both cases.
     Hex,
+    /// RFC 3986 percent-encoding of a URI component: everything outside the unreserved set
+    /// (`A-Za-z0-9-._~`) becomes `%XX` (upper-case hex on encode; either case accepted on decode).
+    /// Deliberately NOT the `application/x-www-form-urlencoded` variant — that one additionally maps
+    /// `+` to space, a different codec that builds on this one.
+    Percent,
 }
 
 /// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)

@@ -2365,6 +2365,8 @@ encoding.base64url_encode(data: bytes) -> string        // URL-safe alphabet, no
 encoding.base64url_decode(s: str) -> Result<buffer, Error>
 encoding.hex_encode(data: bytes) -> string
 encoding.hex_decode(s: str) -> Result<buffer, Error>
+encoding.percent_encode(data: bytes) -> string          // RFC 3986 URI component; %XX, upper-case
+encoding.percent_decode(s: str) -> Result<buffer, Error> // `%` not followed by 2 hex -> Error.Invalid
 encoding.utf8_valid(b: bytes) -> bool                   // check before turning bytes into str
 ```
 

@@ -205,3 +205,63 @@ pub fn main() -> Result<(), Error> {
 ";
     assert!(check_errs("m10-utf8-valid-str", src), "utf8_valid on a str must be a type error");
 }
+
+// ── RFC 3986 percent-encoding (the URI-component codec) ───────────────────────────────────────
+
+/// `percent_encode` escapes every byte outside the unreserved set (`A-Za-z0-9-._~`) as upper-case
+/// `%XX`; `percent_decode` reverses it and passes unescaped bytes through. Multi-byte UTF-8 is
+/// escaped per byte, which is what a URI carries.
+#[test]
+fn percent_encode_decode_round_trip() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  print(encoding.percent_encode(\"a b&c=d/e?f\"))
+  print(encoding.percent_encode(\"safe-._~AZaz09\"))
+  print(encoding.percent_encode(\"日本\"))
+  d := encoding.percent_decode(\"a%20b%26c%3Dd\")?
+  print(d.bytes().as_str()?)
+  p := encoding.percent_decode(\"hello\")?
+  print(p.bytes().as_str()?)
+  orig := \"key=va lue/%?#&x\"
+  rt := encoding.percent_decode(encoding.percent_encode(orig))?
+  print(rt.bytes().as_str()? == orig)
+  return Ok(())
+}
+";
+    let out = build_and_run("m10-percent-rt", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a%20b%26c%3Dd%2Fe%3Ff\nsafe-._~AZaz09\n%E6%97%A5%E6%9C%AC\na b&c=d\nhello\ntrue\n"
+    );
+}
+
+/// A `%` that is not followed by two hex digits makes the whole input invalid (`Error.Invalid`) —
+/// a truncated escape, a single digit, and a non-hex digit are each rejected rather than guessed at.
+#[test]
+fn percent_decode_rejects_malformed_escapes() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.encoding
+fn bad(s: str) -> i64 = match encoding.percent_decode(s) {
+  Ok(_) => 1,
+  Err(_) => 0,
+}
+pub fn main() -> Result<(), Error> {
+  print(bad(\"%\"))
+  print(bad(\"%A\"))
+  print(bad(\"a%ZZb\"))
+  print(bad(\"ok%41\"))
+  return Ok(())
+}
+";
+    let out = build_and_run("m10-percent-bad", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n0\n1\n");
+}
