@@ -37,9 +37,9 @@ fn backend() -> bool {
     backend_available()
 }
 
-/// LLVM bitcode magic (`BC\xC0\xDE`). Used to self-document that a swapped-in blob still *parses* as
-/// bitcode, so the rejection can only be the content-digest check (not a parse failure).
-/// Whether `bytes` is an LLVM bitcode module, in either of the two container forms.
+/// Whether `bytes` is an LLVM bitcode module, in either of the two container forms. Used to
+/// self-document that a swapped-in blob still *parses* as bitcode, so the rejection under test can
+/// only be the content-digest check and not a parse failure.
 ///
 /// `BC\xC0\xDE` is raw bitcode. Darwin targets instead emit the **bitcode wrapper**, a 20-byte
 /// header whose magic is `0x0B17C0DE` (little-endian on disk: `de c0 17 0b`) followed by the raw
