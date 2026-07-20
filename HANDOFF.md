@@ -47,11 +47,16 @@ Nothing there stands in for a missing compiler feature.
 
 ## NEXT (in order)
 
-1. **`pkg.web` root + `serve()`** — the accept loop (`http.serve` -> `srv.accept()` -> dispatch ->
-   handler), automatic 404 / 405 (+`Allow`) / 400 / 500, and a loop that never dies per request.
-   Responders `json()` / `text()` / `status()` (each consumes `Ctx`). The per-method constructors
-   (`pkg.web.get/post/...`) exist in the tests' root stub — promote them into a real
-   `apps/web/pkg/web.align`.
+1. **`pkg.web` root + `serve()` — DONE.** `apps/web/pkg/web.align` is real: per-method constructors
+   (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the
+   responders `status` / `text` / `status_text` / `json` / `status_json` (each CONSUMES `Ctx`), the
+   `param` passthrough, and `serve(host, port, routes)` owning the accept loop with automatic 404 and
+   405 + `Allow` (new `router.allow_methods`, over a factored-out `router.best_path_route` that
+   `dispatch_routes` / `method_not_allowed` / `allow_methods` now share). Pinned by
+   `crates/align_driver/tests/apps_web_root.rs` (2 tests, real socket, server stays up across
+   requests). **Three things deviate from the design doc and need an owner call — see "Open
+   decisions" below:** the `web.json(c, x)` encode, the handler-`Err` 500, and (already known) the
+   `web.param(c, name)` spelling, which has now hit a HARDER wall than expected.
 2. **Wire the radix tree over a route table.** `dispatch_routes` currently uses the LINEAR
    `match_score` scan, because `tree_dispatch` takes `slice<str>` and a route table cannot be
    projected to one (`array_builder` rejects `str` elements). Reading `.pattern` per route inside the
@@ -66,6 +71,32 @@ Nothing there stands in for a missing compiler feature.
    (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.
 5. W3-W7 per the design doc: accessor surface, hardening matrix, the bench gate (`bench/web_router`,
    `bench/web_e2e`), middleware-lite + SSE, the Fiber comparison.
+
+## Open decisions for the owner (raised by building the root)
+
+1. **A zero-copy param cannot reach a consuming responder.** The designed handler
+   `id := web.param(...)  ; web.text(c, id)` is REJECTED: `id` is a view borrowed from `c`, and
+   passing `c` by value to the responder moves it, so MoveCheck reports "use of invalidated borrow".
+   It is safe in fact (the callee writes the body before consuming the handle) but the checker
+   cannot know the callee's internal order. Today a param handler must bypass the responders and
+   build the `http.response` itself (`rb.body(web.param(...))` then `c.req.respond(rb)`) — which is
+   what `apps_web_root.rs` does. This is the SAME borrow-parameter-for-Move-structs decision as the
+   `web.param(c, name)` spelling, but it now blocks the responder surface too, not just ergonomics.
+   Alternatives: a borrow parameter, a Copy `Ctx` with responding moved out of the handler, or
+   responders that take the param NAME. Not resolved unilaterally.
+2. **`web.json(c, x)` cannot encode `x`** — Align has no user-written generics, so the shipped
+   signature is `json(c, body: str)` and the handler writes `web.json(c, json.encode(m))`. Arguably
+   better (the encode's allocation stays visible — Nothing hidden), but it differs from
+   `docs/impl/pkg-design/web.md`, which should be corrected either way.
+3. **"handler Err -> 500" is not implementable** as designed: a handler takes `Ctx` by value, so by
+   the time it can fail it has already consumed the handle and the framework has nothing to respond
+   through. Shipped behavior: an `Err` is swallowed and the loop continues; a handler wanting a 500
+   sends one itself. Same root cause as (1).
+
+Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying (a listener-level
+fault, not a per-request one); classifying transient `ECONNABORTED`/`EMFILE` needs errno reaching
+Align's `Error`. And `web.group(prefix, routes)` is NOT shipped — it needs an `array_builder` over
+struct elements.
 
 **Scope rule (owner, 2026-07-20 — also in Claude's memory):** `pkg.web` is a GENERAL REST/web
 framework. The LLM gateway is only its first consumer and is NEVER a reason to omit or defer a

@@ -318,7 +318,12 @@ pub fn param_value(pattern: str, path: str, name: str) -> str {
 // SAME pattern as the winner and a matching method, so `GET /x` and `POST /x` coexist.
 //
 // Returns -1 for "no path matched" (a 404). `method_not_allowed` distinguishes the 405 case.
-pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {
+//
+// The index of the route whose PATTERN best matches `path`, ignoring the method entirely, or -1 if
+// no pattern matches. The shared first half of every table query: dispatch picks the method on this
+// path, `method_not_allowed` asks whether the path matched at all, and `allow_methods` collects the
+// method set registered on it. Priority is `match_score`'s: static > `:param` > `*wildcard`.
+pub fn best_path_route(routes: slice<pkg.web.types.Route>, path: str) -> i64 {
   n := routes.len()
   mut best := -1
   mut best_score := -1
@@ -333,6 +338,12 @@ pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: st
     }
     i = i + 1
   }
+  best
+}
+
+pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {
+  n := routes.len()
+  best := best_path_route(routes, path)
   if best < 0 {
     return -1
   }
@@ -360,14 +371,41 @@ pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path:
   if dispatch_routes(routes, method, path) >= 0 {
     return false
   }
+  best_path_route(routes, path) >= 0
+}
+
+// The `Allow` header value a 405 must carry (RFC 9110 §15.5.6): the comma-separated method set
+// registered on the pattern that `path` matched, in table order. Empty when no pattern matches at
+// all — that is the 404 case, where no `Allow` is owed. A route with an EMPTY method answers any
+// method, so it can never produce a 405; it therefore contributes nothing here (if one is on the
+// winning path, `dispatch_routes` already matched and this is never reached).
+//
+// Returns an owned `string`: the value is a join of route methods, so unlike every other router
+// entry point it cannot be a view into existing text. It is built once per 405 response — the
+// error path, not the hot path.
+pub fn allow_methods(routes: slice<pkg.web.types.Route>, path: str) -> string {
+  mut b := builder()
+  best := best_path_route(routes, path)
+  if best < 0 {
+    return b.to_string()
+  }
+  bw := routes[best]
+  winner := bw.pattern
   n := routes.len()
   mut i := 0
+  mut count := 0
   loop {
-    if i >= n { break false }
-    rq := routes[i]
-    if match_score(rq.pattern, path) >= 0 {
-      break true
+    if i >= n { break }
+    ri := routes[i]
+    if ri.pattern == winner {
+      m := ri.method
+      if m.len() > 0 {
+        if count > 0 { b.write(", ") }
+        b.write(m)
+        count = count + 1
+      }
     }
     i = i + 1
   }
+  b.to_string()
 }
