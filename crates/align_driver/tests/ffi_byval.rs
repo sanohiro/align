@@ -14,6 +14,11 @@
 //! `{i32,f32}` (1×INTEGER by the merge rule), a mixed `{i64,f64}` return (INTEGER,SSE → RAX,XMM0),
 //! single-register returns, a full param+return round trip, and the rejections (> 16-byte MEMORY,
 //! non-`layout(C)` struct).
+//!
+//! **This suite is x86-64-only**, because the feature is. On any other target codegen refuses to
+//! emit a by-value struct call at all, and `sysv_only_targets_fail_closed` is what runs instead —
+//! pinning that the refusal is a clear diagnostic rather than some other target's ABI applied
+//! silently.
 
 mod common;
 use common::*;
@@ -23,8 +28,17 @@ fn ok(src: &str) -> bool {
     !check(&mut sm, "ffi_byval", src).diags.has_errors()
 }
 
+/// By-value struct FFI is SysV-AMD64-only by design, so every test below is x86-64-only too — on
+/// any other target codegen refuses to emit the call at all (see `sysv_only_targets_fail_closed`,
+/// which is what runs there instead). Without the arch condition this whole suite fails on arm64
+/// against a compiler that is behaving exactly as specified.
 fn gated() -> bool {
-    backend_available() && cc_available()
+    sysv_target() && backend_available() && cc_available()
+}
+
+/// Whether this host is the one target where by-value struct passing is implemented.
+fn sysv_target() -> bool {
+    cfg!(target_arch = "x86_64")
 }
 
 #[test]
@@ -181,7 +195,7 @@ fn oversized_struct_param_is_rejected_in_codegen() {
     // pointer instead. It type-checks (the language accepts a `layout(C)` struct as an FFI type) but
     // codegen refuses to emit a wrong/unsupported ABI. Gated on the backend so an unrelated
     // target-machine failure can't masquerade as this rejection.
-    if !backend_available() {
+    if !(sysv_target() && backend_available()) {
         return;
     }
     let mut sm = SourceMap::new();
@@ -199,7 +213,7 @@ fn oversized_struct_param_is_rejected_in_codegen() {
 
 #[test]
 fn oversized_struct_return_is_rejected_in_codegen() {
-    if !backend_available() {
+    if !(sysv_target() && backend_available()) {
         return;
     }
     let mut sm = SourceMap::new();
@@ -281,7 +295,7 @@ fn pressure_fits_six_preceding_sse_boundary() {
 
 #[test]
 fn pressure_five_preceding_int_is_rejected() {
-    if !backend_available() {
+    if !(sysv_target() && backend_available()) {
         return;
     }
     // 5 preceding integer args (only R9 free) + `{i64,i64}` needs 2 GP → the struct would go to
@@ -300,7 +314,7 @@ fn pressure_five_preceding_int_is_rejected() {
 
 #[test]
 fn pressure_seven_preceding_sse_is_rejected() {
-    if !backend_available() {
+    if !(sysv_target() && backend_available()) {
         return;
     }
     // 7 preceding double args (only XMM7 free) + `{f64,f64}` needs 2 SSE → MEMORY. Rejected.
@@ -346,4 +360,39 @@ fn layout_c_struct_extern_type_checks() {
     // The positive sema surface: a `layout(C)` struct is accepted as both a parameter and a return
     // type (codegen enforces the SysV/target/size limits separately).
     assert!(ok("layout(C) Pt { a: i32, b: i32 }\nextern \"C\" fn f(p: Pt) -> Pt\nfn main() -> i32 { return 0 }\n"));
+}
+
+/// The other side of the same contract: on a target where by-value struct passing is NOT
+/// implemented, codegen must **fail closed** rather than emit some other target's ABI.
+///
+/// This is the assertion that runs where the suite above does not, and it is a real safety
+/// property, not a placeholder: silently applying the SysV eightbyte classification on AArch64
+/// (whose AAPCS rules differ) would produce a call that links fine and corrupts arguments at run
+/// time. The diagnostic must also name the offending target and the way out, since "your struct
+/// crosses the C boundary wrongly" is invisible otherwise.
+#[test]
+fn sysv_only_targets_fail_closed() {
+    if sysv_target() || !backend_available() {
+        return;
+    }
+    let mut sm = SourceMap::new();
+    // A 16-byte struct: well within SysV's register-passing range, so nothing but the TARGET can
+    // be the reason this is refused.
+    let src = "layout(C) Pair { a: i64, b: i64 }\nextern \"C\" fn g(p: Pair) -> i32\nfn main() -> i32 {\n  unsafe { return g(Pair { a: 1, b: 2 }) }\n}\n";
+    let checked = check(&mut sm, "byval-non-sysv", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "a `layout(C)` struct stays a valid FFI type at the language level on every target"
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let err = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false)
+        .expect_err("by-value struct FFI must be refused on a non-SysV target");
+    assert!(
+        err.contains("x86-64 SysV"),
+        "the diagnostic must say which ABI is the supported one:\n{err}"
+    );
+    assert!(
+        err.contains("pointer"),
+        "the diagnostic must point at the supported alternative:\n{err}"
+    );
 }
