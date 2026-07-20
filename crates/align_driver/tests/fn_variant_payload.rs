@@ -219,6 +219,21 @@ fn main() -> i32 = 0\n";
     );
 }
 
+/// The widening is scoped to sum-type variant payloads. A fn value is deliberately NOT admitted as an
+/// `Option`/`Result` payload (`ty_to_scalar(Ty::Fn)` stays `None`) — no consumer needs `Option<fn>`,
+/// and its ABI is untested. Pins that boundary.
+#[test]
+fn fn_not_admitted_as_option_payload() {
+    let src = "\
+fn f(x: i64) -> i64 = x + 1\n\
+fn get() -> Option<fn(i64) -> i64> = Some(f)\n\
+fn main() -> i32 = 0\n";
+    assert!(
+        check_errs("fnvar_opt", src),
+        "a fn value must still be refused as an Option payload"
+    );
+}
+
 /// Payload-type checking still rejects a fn whose SIGNATURE does not match the declared variant — the
 /// widening admits fn payloads, it does not make them structurally interchangeable.
 #[test]
