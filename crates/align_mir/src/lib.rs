@@ -3933,6 +3933,14 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     // The function type for the indirect call comes from the (sema-checked) arg types and the
     // call's result type — no signature table is threaded into MIR.
     let (param_tys, ops): (Vec<Ty>, Vec<Operand>) = args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
+    // A by-value owned argument is MOVED into the callee, exactly as in a direct call
+    // (`lower_direct_call`) — null the source so the caller's exit `Drop` doesn't free the buffer the
+    // callee now owns. Without this a bound owned local passed indirectly is double-freed (an inline
+    // temporary was safe only because it has no source local to null). No-op for a Copy / borrowed
+    // argument. An indirect call has no borrow-only intrinsics, so every argument transfers.
+    for a in args {
+        null_moved_source(b, a);
+    }
     let v = b.fresh_value(e.ty);
     inherit_borrow_owners(b, v, std::iter::once(&c).chain(ops.iter()));
     b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));

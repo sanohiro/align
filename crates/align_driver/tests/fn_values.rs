@@ -239,3 +239,33 @@ fn fn_field_beside_owned_field_drops_cleanly() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n7\n");
 }
+
+#[test]
+fn owned_local_moved_through_an_indirect_call_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // A by-value owned argument is MOVED into the callee through an INDIRECT call too, so the
+    // caller's source local must be nulled — otherwise the caller's exit Drop and the callee's both
+    // free the same buffer. An inline temporary was always safe (no source local to null); a BOUND
+    // local was double-freed. Here the callee additionally moves the handle out of its parameter,
+    // the pkg.web responder shape. A clean exit proves each buffer is freed exactly once.
+    let src = concat!(
+        "H { buf: buffer, tag: i64 }\n",
+        "R { handler: fn(H) -> i64 }\n",
+        "fn take(h: H) -> i64 {\n",
+        "  b := h.buf\n",
+        "  return h.tag\n",
+        "}\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  rs := [R { handler: take }]\n",
+        "  r := rs[0]\n",
+        "  c := H { buf: buffer(32), tag: 7 }\n",
+        "  print(r.handler(c))\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("fv-indirect-move", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
