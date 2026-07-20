@@ -219,6 +219,44 @@ fn main() -> i32 = 0\n";
     );
 }
 
+/// SOUNDNESS: a **capturing** closure stored in a fn-payload variant may NOT escape the frame. Its
+/// `env_ptr` points at a frame-local environment buffer, so returning the enum (or otherwise letting
+/// it outlive the frame) would be a use-after-free of the freed env. `region_of(Closure)` classifies a
+/// capturing closure as `Frame` (even when it captures only `Static` values like an `i64`), so the
+/// escape check rejects it. Without this the program compiled clean and returned garbage. The intended
+/// use — a route table of **non-capturing named** functions — stays legal (they are `Static`).
+#[test]
+fn capturing_closure_payload_cannot_escape_the_frame() {
+    let src = "\
+H { Cap(fn(i64) -> i64) }\n\
+fn make(base: i64) -> H = H.Cap(fn x: i64 { x + base })\n\
+fn main() -> i32 = 0\n";
+    assert!(
+        check_errs("fnvar_capescape", src),
+        "returning an enum whose fn payload is a frame-capturing closure must be rejected (UAF)"
+    );
+}
+
+/// The regression guard for the fix above: a capturing closure used ENTIRELY IN-FRAME (constructed,
+/// matched, and called without leaving the function) stays legal — `Frame` region only forbids
+/// escaping, not in-frame use.
+#[test]
+fn capturing_closure_payload_in_frame_is_legal() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+Wrap { C(fn(i64) -> i64) }\n\
+fn apply(base: i64, v: i64) -> i64 {\n\
+  h := Wrap.C(fn x: i64 { x + base })\n\
+  return match h { C(f) => f(v) }\n\
+}\n\
+fn main() -> i32 = apply(100, 7) as i32\n";
+    // 7 + 100 = 107 (< 256, so it is the exit code directly): the captured `base` is read correctly.
+    let out = build_and_run("fnvar_capinframe", src);
+    assert_eq!(out.status.code(), Some(107), "7 + 100 = 107; stderr {}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// The widening is scoped to sum-type variant payloads. A fn value is deliberately NOT admitted as an
 /// `Option`/`Result` payload (`ty_to_scalar(Ty::Fn)` stays `None`) — no consumer needs `Option<fn>`,
 /// and its ABI is untested. Pins that boundary.

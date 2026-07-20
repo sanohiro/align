@@ -5652,9 +5652,20 @@ impl<'a> EscapeCheck<'a> {
             // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
             // this must become the shorter of the break values' regions instead.)
             ExprKind::Loop { .. } => Region::Static,
+            // A closure `{fn_ptr, env_ptr}`: if it captures anything, codegen copies the captures into
+            // a **frame-local** environment buffer (see align_mir lowering), so the value lives no
+            // longer than the current frame — it must be `Frame`, NOT `Static`, even when every
+            // capture is itself `Static` (an `i64`/literal). Folding from `Region::Static` would call a
+            // Static-only-capturing closure returnable, but its env is on this frame; escaping it (as a
+            // struct fn-field or an enum `Scalar::Fn` payload that outlives the frame) is a
+            // use-after-free of the freed env. A capture that itself borrows (arena/frame) shortens it
+            // further. A **non-capturing** closure has a null env and is genuinely `Static` (returnable)
+            // — the same as a bare named-fn `FnValue`, which is why a fn-payload route table of named
+            // functions stays legal.
+            ExprKind::Closure { captures, .. } if captures.is_empty() => Region::Static,
             ExprKind::Closure { captures, .. } => captures
                 .iter()
-                .fold(Region::Static, |acc, c| acc.shorter(self.region_of(c, depth))),
+                .fold(Region::Frame, |acc, c| acc.shorter(self.region_of(c, depth))),
             // Producers that own their result, return a scalar, or otherwise carry no borrow
             // provenance are `Static`. Keep this arm explicit and exhaustive: adding a new HIR
             // expression must force its escape semantics to be classified here instead of falling
