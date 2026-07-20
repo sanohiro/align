@@ -176,18 +176,6 @@ fn cli_build_run_size_match_library_reference() {
 
     let proj = Proj::new("cli-equiv", &[("app.align", src)]);
 
-    // Library whole-program reference executable (lower_to_mir -> emit_object -> link at the CLI's
-    // default release/baseline), built at EXACTLY the paths the CLI will use — `app.o` and `app` in
-    // the project directory — and read into memory before the CLI overwrites them.
-    //
-    // Sharing the paths is what makes the comparison meaningful on macOS, and it took two tries to
-    // get right. A Mach-O executable embeds its own filename (in the ad-hoc code signature's
-    // identifier) AND the absolute path of every object it was linked from (the debug-map `OSO`
-    // stabs). So a reference built anywhere else differs from the CLI's output in those bytes no
-    // matter how identical the compilation was — first by the exe name, then, once that was
-    // matched, by all 22 `OSO` entries and 112 bytes of size. Reusing one path for both builds in
-    // turn holds every such input constant, leaving per-unit-vs-whole-program as the only variable
-    // — the same fix as `cache_codegen`'s gate7 (#579).
     // Library whole-program reference, emitted at exactly the path the CLI will use so nothing
     // path-dependent can differ, and read into memory before the CLI overwrites it.
     let obj = proj.dir.join("app.o");
