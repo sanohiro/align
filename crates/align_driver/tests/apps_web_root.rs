@@ -3,9 +3,10 @@
 //!
 //! What this pins is the whole designed surface running as one program: an application builds a
 //! route table out of `web.get`/`web.post`, hands it to `web.serve`, and writes handlers that
-//! respond through `web.text` / `web.json` / `web.status`. `serve` owns the accept loop, so the
-//! automatic responses are the framework's, not the app's — a 405 carries the `Allow` set for the
-//! matched path, and an unmatched path is a 404. Unlike `apps_web_serve.rs` (one request, then
+//! BUILD a response through `web.text` / `web.json` / `web.status` and hand it back. `serve` owns
+//! the accept loop AND the request handle, so every automatic response is the framework's — a 405
+//! carries the `Allow` set for the matched path, an unmatched path is a 404, and a handler that
+//! returns `Err` becomes a 500 (only expressible because the handle never left `serve`'s frame). Unlike `apps_web_serve.rs` (one request, then
 //! exit) the server here stays up across requests: the loop surviving request after request,
 //! including a handler that returns `Err`, is itself an assertion — every path consumes the
 //! request handle exactly once, and a double free would abort the process mid-suite.
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
 const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
 const WEB_ROOT: &str = include_str!("../../../apps/web/pkg/web.align");
+const QUERY: &str = include_str!("../../../apps/web/pkg/web/internal/query.align");
 
 fn free_loopback_port() -> u16 {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
@@ -51,35 +53,34 @@ fn exchange(port: u16, req: &[u8]) -> String {
 /// serve loop must survive.
 const APP: &str = "module main\n\
 import std.cli\n\
-import std.http\n\
 import pkg.web\n\
 import pkg.web.types\n\
 \n\
-fn list_models(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  return pkg.web.json(c, \"{\\\"models\\\":[]}\")\n\
+fn list_models(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.json(\"{\\\"models\\\":[]}\")\n\
 }\n\
 \n\
-fn get_model(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  rb := http.response(200)\n\
-  rb.header(\"Content-Type\", \"text/plain; charset=utf-8\")\n\
-  rb.body(pkg.web.param(c.pattern, c.req.path(), \"id\"))\n\
-  return c.req.respond(rb)\n\
+fn get_model(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.text(pkg.web.param(c, \"id\"))\n\
 }\n\
 \n\
-fn create_model(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  return pkg.web.status(c, 201)\n\
+fn search(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.text(pkg.web.query(c, \"q\"))\n\
 }\n\
 \n\
-fn replace_model(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  return pkg.web.status_json(c, 202, \"{\\\"queued\\\":true}\")\n\
+fn create_model(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.status(201)\n\
 }\n\
 \n\
-fn catch_all(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  return pkg.web.text(c, \"any\")\n\
+fn replace_model(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.status_json(202, \"{\\\"queued\\\":true}\")\n\
 }\n\
 \n\
-fn boom(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
-  pkg.web.status_text(c, 500, \"boom\")?\n\
+fn catch_all(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.text(\"any\")\n\
+}\n\
+\n\
+fn boom(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   return Err(Error.Invalid)\n\
 }\n\
 \n\
@@ -92,6 +93,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.post(\"/v1/models\", create_model),\n\
     pkg.web.get(\"/v1/models/:id\", get_model),\n\
     pkg.web.put(\"/v1/models/:id\", replace_model),\n\
+    pkg.web.get(\"/search\", search),\n\
     pkg.web.get(\"/boom\", boom),\n\
     pkg.web.any(\"/health\", catch_all),\n\
   ]\n\
@@ -119,6 +121,7 @@ fn start(name: &str) -> Server {
         name,
         &[
             ("pkg/web/internal/router.align", ROUTER),
+            ("pkg/web/internal/query.align", QUERY),
             ("pkg/web/types.align", TYPES),
             ("pkg/web.align", WEB_ROOT),
             ("main.align", APP),
@@ -171,11 +174,12 @@ fn the_serve_loop_answers_request_after_request() {
     );
     assert!(one.ends_with("\r\n\r\n42"), "one body: {one:?}");
 
-    // A handler that responds and THEN fails: the client still gets its response, and the loop
-    // keeps serving (the request below proves it).
+    // A handler that just FAILS, without ever building a response. Under the old shape this hung:
+    // the handler owned the request handle, so a failure left nothing to answer through. Now the
+    // framework holds it and answers 500 itself, and the loop keeps serving (the request below
+    // proves it).
     let boom = exchange(port, b"GET /boom HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(boom.starts_with("HTTP/1.1 500 "), "boom: {boom:?}");
-    assert!(boom.ends_with("\r\n\r\nboom"), "boom body: {boom:?}");
 
     // Still alive after all of the above.
     let again = exchange(port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
@@ -247,4 +251,38 @@ fn an_any_route_answers_every_method_and_status_json_carries_its_code() {
         "queued content type: {queued:?}"
     );
     assert!(queued.ends_with("{\"queued\":true}"), "queued body: {queued:?}");
+}
+
+#[test]
+fn a_query_string_does_not_break_routing() {
+    if !backend_available() {
+        return;
+    }
+    // REGRESSION. `ctx.path()` returns the raw request-TARGET, query string and all, and the first
+    // version of `serve` matched routes against it directly — so `/v1/models?limit=5` did not match
+    // the pattern `/v1/models` and every route answered 404 the moment a client sent a query. This
+    // is the shape essentially every real REST client uses.
+    let srv = start("web-root-query");
+    let port = srv.port;
+
+    let listed = exchange(port, b"GET /v1/models?limit=5 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(
+        listed.starts_with("HTTP/1.1 200 OK\r\n"),
+        "a query string must not change which route matches: {listed:?}"
+    );
+
+    // A `:param` capture still reads the path half only — the query must not leak into it.
+    let one = exchange(port, b"GET /v1/models/42?verbose=1 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(one.starts_with("HTTP/1.1 200 OK\r\n"), "param+query: {one:?}");
+    assert!(one.ends_with("\r\n\r\n42"), "the capture must be `42`, not `42?verbose=1`: {one:?}");
+
+    // And the query half is what `web.query` reads.
+    let found = exchange(port, b"GET /search?q=hello&n=2 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(found.starts_with("HTTP/1.1 200 OK\r\n"), "search: {found:?}");
+    assert!(found.ends_with("\r\n\r\nhello"), "query value: {found:?}");
+
+    // No query at all: the whole target is the path, and `web.query` finds nothing.
+    let empty = exchange(port, b"GET /search HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(empty.starts_with("HTTP/1.1 200 OK\r\n"), "no query: {empty:?}");
+    assert!(empty.ends_with("\r\n\r\n"), "an absent query reads as empty: {empty:?}");
 }

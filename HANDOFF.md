@@ -47,54 +47,70 @@ Nothing there stands in for a missing compiler feature.
 
 ## NEXT (in order)
 
-1. **`pkg.web` root + `serve()` — DONE.** `apps/web/pkg/web.align` is real: per-method constructors
+1. **`pkg.web` root + `serve()` — DONE, then rebuilt on the settled ownership model.** `apps/web/pkg/web.align` is real: per-method constructors
    (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the
    responders `status` / `text` / `status_text` / `json` / `status_json` (each CONSUMES `Ctx`), the
    `param` passthrough, and `serve(host, port, routes)` owning the accept loop with automatic 404 and
    405 + `Allow` (new `router.allow_methods`, over a factored-out `router.best_path_route` that
    `dispatch_routes` / `method_not_allowed` / `allow_methods` now share). Pinned by
    `crates/align_driver/tests/apps_web_root.rs` (2 tests, real socket, server stays up across
-   requests). **Three things deviate from the design doc and need an owner call — see "Open
-   decisions" below:** the `web.json(c, x)` encode, the handler-`Err` 500, and (already known) the
-   `web.param(c, name)` spelling, which has now hit a HARDER wall than expected.
+   requests). The ownership question this raised is SETTLED — see below; the surface described here has since
+   been rebuilt on it (`Ctx` Copy, handlers return a built response).
 2. **Wire the radix tree over a route table.** `dispatch_routes` currently uses the LINEAR
    `match_score` scan, because `tree_dispatch` takes `slice<str>` and a route table cannot be
    projected to one (`array_builder` rejects `str` elements). Reading `.pattern` per route inside the
    tree build closes it. A performance gap only — the differential test pins the two orderings equal.
-3. **`param(c, name)` sugar — NEEDS AN OWNER DECISION.** The design doc writes `web.param(c, "id")`,
-   but `Ctx` is Move, so passing it by value CONSUMES it; today a handler writes
-   `pkg.web.param(c.pattern, c.req.path(), "id")`. Closing this needs a borrow-parameter feature for
-   Move structs (a language addition), or a Copy-Ctx redesign that moves responding out of the
-   handler. Do not resolve it unilaterally.
+3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
+   `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
+   accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.
 4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data; OAuth —
    client flows are buildable now, validating a PUBLIC provider's token is blocked on RS256
    (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.
 5. W3-W7 per the design doc: accessor surface, hardening matrix, the bench gate (`bench/web_router`,
    `bench/web_e2e`), middleware-lite + SSE, the Fiber comparison.
 
-## Open decisions for the owner (raised by building the root)
+## SETTLED (owner, 2026-07-20): the FRAMEWORK owns the request handle
 
-1. **A zero-copy param cannot reach a consuming responder.** The designed handler
-   `id := web.param(...)  ; web.text(c, id)` is REJECTED: `id` is a view borrowed from `c`, and
-   passing `c` by value to the responder moves it, so MoveCheck reports "use of invalidated borrow".
-   It is safe in fact (the callee writes the body before consuming the handle) but the checker
-   cannot know the callee's internal order. Today a param handler must bypass the responders and
-   build the `http.response` itself (`rb.body(web.param(...))` then `c.req.respond(rb)`) — which is
-   what `apps_web_root.rs` does. This is the SAME borrow-parameter-for-Move-structs decision as the
-   `web.param(c, name)` spelling, but it now blocks the responder surface too, not just ergonomics.
-   Alternatives: a borrow parameter, a Copy `Ctx` with responding moved out of the handler, or
-   responders that take the param NAME. Not resolved unilaterally.
-2. **`web.json(c, x)` cannot encode `x`** — Align has no user-written generics, so the shipped
-   signature is `json(c, body: str)` and the handler writes `web.json(c, json.encode(m))`. Arguably
-   better (the encode's allocation stays visible — Nothing hidden), but it differs from
-   `docs/impl/pkg-design/web.md`, which should be corrected either way.
-3. **"handler Err -> 500" is not implementable** as designed: a handler takes `Ctx` by value, so by
-   the time it can fail it has already consumed the handle and the framework has nothing to respond
-   through. Shipped behavior: an `Err` is swallowed and the loop continues; a handler wanting a 500
-   sends one itself. Same root cause as (1).
+The three open decisions raised by building the root were all one question, and it is answered.
+`Ctx` is now a **Copy struct of views** (`method`, `path`, `query`, `pattern`) owning nothing; the
+request handle stays in `serve`; a handler is `fn(Ctx) -> Result<response_builder, Error>` that
+BUILDS a response and hands it back. All three dead ends dissolve:
 
-Recorded gaps from the PR-578 review, all belonging to the W4 hardening matrix rather than to this
-slice:
+- `web.param(c, "id")` / `web.query(c, name)` / `has_query` are the designed spelling now — a Copy
+  `Ctx` is not consumed by an accessor, and the whole W3 accessor surface is unblocked.
+- A handler reads a param and then responds, which the old shape rejected as a live borrow across
+  a move.
+- **`handler Err -> 500` works**, pinned over a real socket. `serve` still holds the connection when
+  the handler declines.
+
+Responders no longer take `c` and no longer respond — they build (`web.text(s)`, `web.json(body)`,
+`web.status(code)`, `web.status_text`, `web.status_json`).
+
+Compiler enabler shipped with it: **`response_builder` is now a nameable type and a legal
+`Option`/`Result` payload** (it was neither — unspellable, and refused by `scalar_arg` outright on
+the reasoning that no API would wrap one). Admitted on the same terms as `http_request_ctx`: a
+payload, never an array/slice/box element. `Scalar::is_move` had to learn it too — omitting it there
+classified the `Result` as Copy and leaked the payload silently (measured 17.5 MB at 200k dropped
+values vs 162 MB at 2M). `crates/align_driver/tests/response_builder_payload.rs`.
+
+Still open from that cluster, both unchanged by this decision:
+
+- **`web.json(c, x)` cannot encode `x`** — no user-written generics, so the signature is
+  `json(body: str)` and the handler writes `web.json(json.encode(m))`. Arguably better (the
+  encode's allocation stays visible), and the design doc now says so.
+- **Streaming/SSE needs its own escape hatch.** A handler that returns a built response cannot
+  stream; `respond_stream`/`http_stream` (M12) are untouched, and W6's SSE slice has to decide how a
+  handler opts into holding the connection.
+
+### Bug found and fixed while doing this
+
+**A query string 404'd every route.** `ctx.path()` returns the raw request-TARGET, query string
+included, and the first `serve` matched routes against it directly — so `GET /v1/models?limit=5` did
+not match the pattern `/v1/models`. Confirmed against the shipped #578 binary (200 without a query,
+404 with one). `pkg.web.internal.query.target_path` / `target_query` now split the target once per
+request; `apps_web_root.rs` pins it, including that a `:param` capture reads the path half only.
+
+### Recorded gaps from the PR-578 review, all W4 hardening
 
 - **No method-string validation.** `route()` and the per-method constructors accept any string, and
   `dispatch_routes` compares methods byte-exactly, so `web.route("get", ...)` silently never matches

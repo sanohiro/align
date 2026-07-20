@@ -3,12 +3,13 @@ module pkg.web
 import std.http
 import pkg.web.types
 import pkg.web.internal.router
+import pkg.web.internal.query
 
 // The `pkg.web` root: the surface an application writes against. Four groups, nothing else —
-// route constructors (build the table), `serve` (own the accept loop), responders (consume the
-// context), and accessors (read the request). There is no app object, no registration side effect
-// and no global state: a route table is an ordinary array VALUE of Copy structs that the caller
-// builds and hands to `serve`.
+// route constructors (build the table), `serve` (own the accept loop AND the request handle),
+// responders (build a response), and accessors (read the request). There is no app object, no
+// registration side effect and no global state: a route table is an ordinary array VALUE of Copy
+// structs that the caller builds and hands to `serve`.
 //
 // `Ctx` and `Route` themselves live in `pkg.web.types` — the internal router must name `Route` to
 // dispatch a table, so the root cannot own the type without an import cycle, and Align has no
@@ -18,101 +19,123 @@ import pkg.web.internal.router
 
 // The general form. Every per-method constructor below is this with the method spelled out; an
 // EMPTY method matches any method, which is how a catch-all is written.
-pub fn route(method: str, pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn route(method: str, pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   pkg.web.types.Route { method: method, pattern: pattern, handler: handler }
 
-pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("GET", pattern, handler)
 
-pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("POST", pattern, handler)
 
-pub fn put(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn put(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("PUT", pattern, handler)
 
-pub fn delete(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn delete(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("DELETE", pattern, handler)
 
-pub fn patch(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn patch(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("PATCH", pattern, handler)
 
-pub fn head(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn head(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("HEAD", pattern, handler)
 
-pub fn options(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn options(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("OPTIONS", pattern, handler)
 
 // Answers every method on `pattern` — the fallback/catch-all form.
-pub fn any(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =
+pub fn any(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("", pattern, handler)
+
+// ── Accessors ─────────────────────────────────────────────────────────────────────────────────
+//
+// All Pure, all take `Ctx` by value (it is Copy), all return zero-copy views into the request.
+// This is the designed spelling, and it is only writable because the handler does not own the
+// request handle — see `pkg.web.types.Ctx`.
+
+// The `:name` / `*name` capture for the matched route, as a view into the request path (`""` when
+// the matched pattern has no such parameter). Zero-allocation: it re-walks the matched pattern
+// rather than materializing a slot array.
+pub fn param(c: pkg.web.types.Ctx, name: str) -> str =
+  pkg.web.internal.router.param_value(c.pattern, c.path, name)
+
+// The raw (still percent-encoded) value of query parameter `name`, or `""` when absent. Zero-copy
+// and zero-allocation — an ESCAPED key is matched by decoding as the comparison walks.
+pub fn query(c: pkg.web.types.Ctx, name: str) -> str =
+  pkg.web.internal.query.raw(c.query, name)
+
+// Whether query parameter `name` is present at all — distinct from present-but-empty (`?debug` vs
+// `?debug=`), which `query` alone cannot tell apart.
+pub fn has_query(c: pkg.web.types.Ctx, name: str) -> bool =
+  pkg.web.internal.query.has(c.query, name)
 
 // ── Responders ────────────────────────────────────────────────────────────────────────────────
 //
-// Every responder CONSUMES `c` — it moves the request handle out of the context and writes the
-// response through it, so a handler responds exactly once by construction, and forgetting to
-// respond is a compile error (an unconsumed Move value) rather than a hung client.
+// A responder BUILDS a response; `serve` writes it. Nothing here touches the request handle, so a
+// handler can call an accessor and a responder in either order, as many times as it likes.
 
 // `code` with an empty body.
-pub fn status(c: pkg.web.types.Ctx, code: i64) -> Result<(), Error> {
+pub fn status(code: i64) -> Result<response_builder, Error> {
   rb := http.response(code)
-  return c.req.respond(rb)
+  return Ok(rb)
 }
 
 // `code` + `text/plain; charset=utf-8` + `s`.
-pub fn status_text(c: pkg.web.types.Ctx, code: i64, s: str) -> Result<(), Error> {
+pub fn status_text(code: i64, s: str) -> Result<response_builder, Error> {
   rb := http.response(code)
   rb.header("Content-Type", "text/plain; charset=utf-8")
   rb.body(s)
-  return c.req.respond(rb)
+  return Ok(rb)
 }
 
 // 200 + `text/plain; charset=utf-8` + `s`.
-pub fn text(c: pkg.web.types.Ctx, s: str) -> Result<(), Error> = status_text(c, 200, s)
+pub fn text(s: str) -> Result<response_builder, Error> = status_text(200, s)
 
 // `code` + `application/json` + `body`.
 //
-// `body` is the ENCODED document, not a value: Align has no user-written generics, so a
-// `json(c, x)` that encoded `x` itself is not expressible — and writing the encode at the call
-// site (`web.json(c, json.encode(m))`) is the better reading anyway, since the allocation that
-// encoding performs stays visible in the handler (Nothing hidden).
-pub fn status_json(c: pkg.web.types.Ctx, code: i64, body: str) -> Result<(), Error> {
+// `body` is the ENCODED document, not a value: Align has no user-written generics, so a `json(x)`
+// that encoded `x` itself is not expressible — and writing the encode at the call site
+// (`web.json(json.encode(m))`) is the better reading anyway, since the allocation that encoding
+// performs stays visible in the handler (Nothing hidden).
+pub fn status_json(code: i64, body: str) -> Result<response_builder, Error> {
   rb := http.response(code)
   rb.header("Content-Type", "application/json")
   rb.body(body)
-  return c.req.respond(rb)
+  return Ok(rb)
 }
 
 // 200 + `application/json` + `body`.
-pub fn json(c: pkg.web.types.Ctx, body: str) -> Result<(), Error> = status_json(c, 200, body)
-
-// ── Accessors ─────────────────────────────────────────────────────────────────────────────────
-
-// The `:name` / `*name` capture for the matched route, as a zero-copy view into the request path
-// (`""` when the matched pattern has no such parameter).
-//
-// The designed spelling is `web.param(c, name)`, which is not yet writable: `Ctx` is Move, so
-// passing it by value would CONSUME the context a handler still has to respond through. Closing
-// that needs a borrow-parameter feature for Move structs — an OWNER-LEVEL language decision, not
-// something this package settles. Until then a handler passes the two views it already holds.
-pub fn param(pattern: str, path: str, name: str) -> str =
-  pkg.web.internal.router.param_value(pattern, path, name)
+pub fn json(body: str) -> Result<response_builder, Error> = status_json(200, body)
 
 // ── Serving ───────────────────────────────────────────────────────────────────────────────────
 
-// Own the accept loop: bind `host:port`, then for each accepted request dispatch it against
-// `routes` and run the winning handler. Sequential (one request at a time) in v1 — concurrent
-// serving is the recorded, measured follow-up.
+// Run one handler and reduce its outcome to the response that will be written: what it built, or a
+// 500 when it declined. Both arms unify to a `response_builder`, so a request yields exactly one
+// response and a handler's failure is answered rather than dropped.
 //
-// Automatic responses, all of which consume the request handle exactly once:
-//   - no pattern matched                     -> 404 with an empty body
-//   - pattern matched, method did not        -> 405 with `Allow` listing the path's method set
+// A free function rather than a `match` inline in `serve`'s loop: yielding a match-arm binding as
+// the arm's value is reported as a use-after-move on the loop's back edge, so the match lives in a
+// frame the loop does not re-enter.
+fn answer(r: pkg.web.types.Route, c: pkg.web.types.Ctx) -> response_builder {
+  match r.handler(c) {
+    Ok(built) => built
+    Err(e) => http.response(500)
+  }
+}
+
+// Own the accept loop and the request handle: bind `host:port`, then for each accepted request
+// dispatch it against `routes`, call the winning handler, and WRITE what it returns. Sequential
+// (one request at a time) in v1 — concurrent serving is the recorded, measured follow-up.
 //
-// A handler's `Err` does NOT kill the loop: the next request is accepted normally. It also cannot
-// become a 500, and deliberately so — a handler takes `Ctx` by value, so by the time it can fail
-// it has already consumed the handle, and the framework has nothing left to respond through. A
-// handler that wants a 500 sends one (`web.status(c, 500)`) and returns `Ok`; its `Err` means "the
-// response is already written or already lost". The alternative — the framework holding the handle
-// and handing the handler a borrow — is the same borrow-parameter decision `param` is waiting on.
+// Automatic responses, all of which write the request handle exactly once:
+//   - no pattern matched              -> 404 with an empty body
+//   - pattern matched, method did not -> 405 with `Allow` listing the path's method set
+//   - the handler returned `Err`      -> 500 with an empty body
+//
+// That last one is the whole point of the framework holding the handle. When the handler owned it,
+// a handler that failed had already consumed it and there was nothing left to answer through, so a
+// failed request simply hung. Here the handler is a function that builds a value; if it declines,
+// `serve` still has the connection and answers.
 //
 // An `accept` failure, by contrast, IS returned: it is a listener-level fault, not a per-request
 // one, and spinning on a broken listener would be worse than surfacing it. Classifying transient
@@ -122,24 +145,36 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
   srv := http.serve(host, port)?
   loop {
     ctx := srv.accept()?
-    idx := pkg.web.internal.router.dispatch_routes(routes, ctx.method(), ctx.path())
+    // `ctx.path()` is the raw request-TARGET, query string included. Routing matches the path
+    // alone — without this split, `/v1/models?limit=5` never matches the pattern `/v1/models` and
+    // every route with a query 404s.
+    target := ctx.path()
+    path := pkg.web.internal.query.target_path(target)
+    idx := pkg.web.internal.router.dispatch_routes(routes, ctx.method(), path)
     if idx >= 0 {
       r := routes[idx]
-      c := pkg.web.types.Ctx { req: ctx, pattern: r.pattern }
-      r.handler(c) else {}
+      c := pkg.web.types.Ctx {
+        method: ctx.method(),
+        path: path,
+        query: pkg.web.internal.query.target_query(target),
+        pattern: r.pattern,
+      }
+      // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`, so
+      // handing both to one call would move the handle while a borrow of it is still live.
+      rb := answer(r, c)
+      ctx.respond(rb) else {}
     } else {
       // A 404 is the flood case (scanners, stale links), so it must not allocate: only once the
-      // path is known to have matched SOME pattern is the `Allow` join built.
-      matched := pkg.web.internal.router.best_path_route(routes, ctx.path())
+      // path is known to match some pattern is the `Allow` join built.
+      matched := pkg.web.internal.router.best_path_route(routes, path)
       if matched >= 0 {
-        allow := pkg.web.internal.router.allow_methods(routes, ctx.path())
-        c := pkg.web.types.Ctx { req: ctx, pattern: "" }
+        allow := pkg.web.internal.router.allow_methods(routes, path)
         rb := http.response(405)
         rb.header("Allow", allow)
-        c.req.respond(rb) else {}
+        ctx.respond(rb) else {}
       } else {
-        c := pkg.web.types.Ctx { req: ctx, pattern: "" }
-        status(c, 404) else {}
+        rb := http.response(404)
+        ctx.respond(rb) else {}
       }
     }
   }

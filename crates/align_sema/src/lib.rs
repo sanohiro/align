@@ -163,9 +163,17 @@ pub enum Scalar {
     /// A `http_request_ctx` payload (`Result<http_request_ctx, Error>` from `srv.accept()`). An owned
     /// **Move** handle (an accepted socket fd + a parsed-request byte buffer + offset table); the
     /// enclosing `Result`'s `Drop` closes the fd + frees the buffer. Opaque pointer, like
-    /// [`Scalar::HttpResponse`] — owned, never region-tracked. (There is no `Scalar::ResponseBuilder`: a
-    /// `response_builder` is returned directly by `http.response`, never inside an aggregate.)
+    /// [`Scalar::HttpResponse`] — owned, never region-tracked.
     HttpRequestCtx,
+    /// A `response_builder` payload (`Result<response_builder, Error>` — a handler that BUILDS a
+    /// response and hands it back rather than writing it, so the framework keeps the request handle
+    /// and can still answer when the handler fails). An owned **Move** handle (the status + header
+    /// list + body buffer); the enclosing `Result`'s `Drop` frees it. Opaque pointer, like
+    /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
+    ///
+    /// A payload only: still never an array/slice/box **element**, where an element read copies the
+    /// handle and both copies would free it.
+    ResponseBuilder,
     /// A `http_stream` payload (`Result<http_stream, Error>` from `ctx.respond_stream(rb)`). An owned
     /// **Move** handle (the streaming-response socket fd, lifted out of the ctx); the enclosing
     /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
@@ -179,7 +187,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder)
     }
 }
 
@@ -588,6 +596,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // / `srv.accept()`. (A `response_builder` is never a payload — it has no `Scalar`, `None` here.)
         Ty::HttpServer => Some(Scalar::HttpServer),
         Ty::HttpRequestCtx => Some(Scalar::HttpRequestCtx),
+        Ty::ResponseBuilder => Some(Scalar::ResponseBuilder),
         // A `http_stream` owned handle as the `Result` Ok payload of `ctx.respond_stream()`.
         Ty::HttpStream => Some(Scalar::HttpStream),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
@@ -656,6 +665,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpResponse => Ty::HttpResponse,
         Scalar::HttpServer => Ty::HttpServer,
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
+        Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
     }
 }
@@ -21039,11 +21049,14 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // payload (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener, `udp.bind` for
     // the socket) is fine, but never an array/slice/box element (a copied handle would
     // double-`close` its fd).
-    // A `response_builder` is never a payload (like `http request` / `buffer` — returned directly by
-    // `http.response`). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
+    // A `response_builder` follows `http_request_ctx`: it may ride a `Result` Ok payload — a handler
+    // that BUILDS a response and returns it (`fn(Ctx) -> Result<response_builder, Error>`) is how
+    // pkg.web keeps the request handle in the framework, so a failing handler can still be answered
+    // with a 500 — but never an array/slice/box element (a copied handle would double-free the
+    // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::ResponseBuilder) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -21406,6 +21419,19 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::HttpRequestCtx
+        }
+        // `response_builder` (`std.http`) — a response under construction, an owned Move handle
+        // (`http.response(code)`). A surface type name for the same reason `http_request_ctx` is
+        // one: it lets a handler BUILD a response and hand it back
+        // (`fn(Ctx) -> Result<response_builder, Error>`) instead of writing it, so the framework can
+        // keep the request handle and still answer when the handler fails. Its drop frees the
+        // partially built response exactly once, so an abandoned builder cannot leak.
+        "response_builder" => {
+            if !args.is_empty() {
+                diags.error("response_builder takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::ResponseBuilder
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {

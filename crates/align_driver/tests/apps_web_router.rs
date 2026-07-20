@@ -213,19 +213,20 @@ fn route_table_dispatches_by_method_and_separates_404_from_405() {
     let web_root = "module pkg.web\n\
 import pkg.web.types\n\
 import pkg.web.internal.router\n\
-pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =\n\
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
   pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
-pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =\n\
+pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
   pkg.web.types.Route { method: \"POST\", pattern: pattern, handler: handler }\n\
 pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 =\n\
   pkg.web.internal.router.dispatch_routes(routes, method, path)\n\
 pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool =\n\
   pkg.web.internal.router.method_not_allowed(routes, method, path)\n";
     let main = "module main\n\
+import std.http\n\
 import pkg.web\n\
 import pkg.web.types\n\
-fn h1(c: pkg.web.types.Ctx) -> Result<(), Error> = Ok(())\n\
-fn h2(c: pkg.web.types.Ctx) -> Result<(), Error> = Ok(())\n\
+fn h1(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = Ok(http.response(200))\n\
+fn h2(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = Ok(http.response(200))\n\
 fn main() -> Result<(), Error> {\n\
   routes := [\n\
     pkg.web.get(\"/v1/models\", h1),\n\

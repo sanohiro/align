@@ -7,9 +7,15 @@
 //! nulled so the struct's drop does not double-free it. A clean server exit is itself the assertion:
 //! a double-freed request handle would abort the process.
 //!
-//! This is the DESIGNED contract, end to end: `Route.handler` is `fn(Ctx) -> Result<(), Error>`, the
-//! route table holds it in a fn-value field, and the matched handler is invoked through that field
-//! (`r.handler(c)`) — nothing here is a stand-in for a missing compiler feature.
+//! **This pins COMPILER capabilities, not pkg.web's design.** The shape here — a Move struct that
+//! OWNS the request handle, with the responder consuming it — was pkg.web's first ownership model
+//! and has since been superseded: the framework holds the handle and handlers return a built
+//! response (`docs/impl/pkg-design/web.md`; `apps_web_root.rs` drives the current surface). What
+//! remains worth pinning, and what this suite is for, is that the compiler supports the shape at
+//! all: a Move-handle struct FIELD (F1(2)), a partial move out of it, the field nulled so the
+//! struct's drop cannot double-free, and a call through a fn-value field. Those are load-bearing
+//! for any framework, so they keep their own regression test even though pkg.web no longer uses
+//! this arrangement.
 
 mod common;
 use common::*;

@@ -62,6 +62,22 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
   views) never share a usage site, so one overloaded type would add an internal Parsed|Built branch
   to every getter for zero convergence gain. The symmetry that matters is by direction and holds:
   `response_builder` ≅ `request` (builders), `http_request_ctx` reads ≅ `response` reads (views).
+- **`response_builder` is a nameable type and a valid `Option`/`Result` payload** (2026-07-20). It
+  was originally neither: unspellable in source, and refused by `scalar_arg` outright, on the
+  reasoning that `http.response` returns one directly so no API would ever wrap it. pkg.web's
+  ownership decision needs exactly that — a handler that BUILDS a response and hands it back
+  (`fn(Ctx) -> Result<response_builder, Error>`) so the framework keeps the request handle and can
+  still answer when the handler fails. It is now admitted on the same terms as `http_request_ctx`:
+  legal as a payload, still refused as an array/slice/box element, where an element read copies the
+  handle and both copies would free it.
+
+  This is sound because the builder **owns every byte it holds and borrows nothing** —
+  `rb.header(name, value)` stores `String::from_utf8_lossy(..).into_owned()` and `rb.body(data)`
+  stores `data.to_vec()`. That is what lets a builder outlive the locals its header/body were built
+  from, and why it is not region-tracked. **A zero-copy `rb.body` would therefore be a breaking
+  change, not an optimization**; `response_builder_payload.rs` pins the copy semantics from both
+  sides (survival, and byte-exact bytes off the wire from a handler whose body came from a dead
+  local).
 - `ctx.method()/path()/header()/body()` return **views region-bound to ctx** (#297 arm), the exact
   read-duals of `resp.status()/header()/body()`.
 - `response` owns its header block + body buffer (Move); `resp.header()`/`resp.body()` return
