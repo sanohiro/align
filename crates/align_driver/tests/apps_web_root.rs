@@ -70,6 +70,14 @@ fn create_model(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
   return pkg.web.status(c, 201)\n\
 }\n\
 \n\
+fn replace_model(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
+  return pkg.web.status_json(c, 202, \"{\\\"queued\\\":true}\")\n\
+}\n\
+\n\
+fn catch_all(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
+  return pkg.web.text(c, \"any\")\n\
+}\n\
+\n\
 fn boom(c: pkg.web.types.Ctx) -> Result<(), Error> {\n\
   pkg.web.status_text(c, 500, \"boom\")?\n\
   return Err(Error.Invalid)\n\
@@ -83,7 +91,9 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.get(\"/v1/models\", list_models),\n\
     pkg.web.post(\"/v1/models\", create_model),\n\
     pkg.web.get(\"/v1/models/:id\", get_model),\n\
+    pkg.web.put(\"/v1/models/:id\", replace_model),\n\
     pkg.web.get(\"/boom\", boom),\n\
+    pkg.web.any(\"/health\", catch_all),\n\
   ]\n\
   return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes)\n\
 }\n";
@@ -193,15 +203,48 @@ fn an_unmatched_path_is_a_404_and_a_wrong_method_is_a_405_with_allow() {
         "405 allow set: {wrong:?}"
     );
 
-    // A parameterised pattern gets the same treatment — the method set comes from its own row, not
-    // from the static sibling's.
-    let wrong_param = exchange(port, b"PUT /v1/models/42 HTTP/1.1\r\nHost: h\r\n\r\n");
+    // A parameterised pattern gets the same treatment — the method set comes from its own row
+    // (GET + PUT), not from the static sibling's (GET + POST).
+    let wrong_param = exchange(port, b"DELETE /v1/models/42 HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(
         wrong_param.starts_with("HTTP/1.1 405 "),
         "405 param: {wrong_param:?}"
     );
     assert!(
-        wrong_param.contains("Allow: GET\r\n"),
+        wrong_param.contains("Allow: GET, PUT\r\n"),
         "405 param allow set: {wrong_param:?}"
     );
+}
+
+#[test]
+fn an_any_route_answers_every_method_and_status_json_carries_its_code() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-any");
+    let port = srv.port;
+
+    // `web.any` registers an EMPTY method, which `dispatch_routes` treats as matching anything —
+    // the catch-all form. Both a GET and a method nothing else in the table uses reach it.
+    for verb in [&b"GET"[..], &b"DELETE"[..]] {
+        let mut req = verb.to_vec();
+        req.extend_from_slice(b" /health HTTP/1.1\r\nHost: h\r\n\r\n");
+        let resp = exchange(port, &req);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "any {:?}: {resp:?}",
+            String::from_utf8_lossy(verb)
+        );
+        assert!(resp.ends_with("\r\n\r\nany"), "any body: {resp:?}");
+    }
+
+    // `web.put` reaches its own handler on a pattern it SHARES with a GET route, and
+    // `status_json` sends a non-200 code with the JSON content type.
+    let queued = exchange(port, b"PUT /v1/models/7 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(queued.starts_with("HTTP/1.1 202 "), "queued: {queued:?}");
+    assert!(
+        queued.contains("Content-Type: application/json\r\n"),
+        "queued content type: {queued:?}"
+    );
+    assert!(queued.ends_with("{\"queued\":true}"), "queued body: {queued:?}");
 }

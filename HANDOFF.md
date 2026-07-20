@@ -93,6 +93,23 @@ Nothing there stands in for a missing compiler feature.
    through. Shipped behavior: an `Err` is swallowed and the loop continues; a handler wanting a 500
    sends one itself. Same root cause as (1).
 
+Recorded gaps from the PR-578 review, all belonging to the W4 hardening matrix rather than to this
+slice:
+
+- **No method-string validation.** `route()` and the per-method constructors accept any string, and
+  `dispatch_routes` compares methods byte-exactly, so `web.route("get", ...)` silently never matches
+  a real `GET` request. Startup validation (uppercase token, known-method check) belongs with the
+  duplicate/ambiguous-pattern abort the design already calls for — none of which is implemented yet.
+- **HEAD is not RFC-correct.** `web.head()` exists, but neither `serve` nor std.http suppresses the
+  response body for a HEAD request (RFC 9110 §9.3.2), and a `GET` route does not automatically
+  answer `HEAD`. Both are the framework's job and are unimplemented.
+- **A handler's `Err` vanishes without a trace** — `serve` swallows it to keep the loop alive, with
+  no log line, so a handler failing in production is invisible. Needs the logging story W5+ owes.
+- **`allow_methods` can emit duplicates** (`"GET, GET"` for two GET routes on one pattern), which
+  the missing startup duplicate-route abort would otherwise have rejected.
+- **The automatic 404/405 send empty bodies**, where `docs/impl/pkg-design/web.md` specifies "fixed
+  minimal JSON bodies".
+
 Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying (a listener-level
 fault, not a per-request one); classifying transient `ECONNABORTED`/`EMFILE` needs errno reaching
 Align's `Error`. And `web.group(prefix, routes)` is NOT shipped — it needs an `array_builder` over

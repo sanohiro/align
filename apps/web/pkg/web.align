@@ -128,13 +128,17 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
       c := pkg.web.types.Ctx { req: ctx, pattern: r.pattern }
       r.handler(c) else {}
     } else {
-      allow := pkg.web.internal.router.allow_methods(routes, ctx.path())
-      c := pkg.web.types.Ctx { req: ctx, pattern: "" }
-      if allow.len() > 0 {
+      // A 404 is the flood case (scanners, stale links), so it must not allocate: only once the
+      // path is known to have matched SOME pattern is the `Allow` join built.
+      matched := pkg.web.internal.router.best_path_route(routes, ctx.path())
+      if matched >= 0 {
+        allow := pkg.web.internal.router.allow_methods(routes, ctx.path())
+        c := pkg.web.types.Ctx { req: ctx, pattern: "" }
         rb := http.response(405)
         rb.header("Allow", allow)
         c.req.respond(rb) else {}
       } else {
+        c := pkg.web.types.Ctx { req: ctx, pattern: "" }
         status(c, 404) else {}
       }
     }
