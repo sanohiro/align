@@ -138,9 +138,16 @@ fn gate3_baked_bitcode_symbol_set() {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Defined `align_rt_*` symbols == exactly the guarded four.
+    //
+    // The leading underscore is stripped here for the same reason it is stripped in the
+    // undefined-symbol check below: Mach-O/COFF C-mangling prepends one, so these list as
+    // `_align_rt_str_eq`. Without the strip this filter matched nothing on macOS and the gate read
+    // as "the baked bitcode defines no runtime symbols at all" — while the artifact was in fact
+    // exactly right (`llvm-nm` shows the guarded four and nothing else).
     let mut defined_rt: Vec<String> = defined
         .lines()
         .filter_map(|l| l.split_whitespace().last())
+        .map(|s| s.strip_prefix('_').unwrap_or(s))
         .filter(|s| s.starts_with("align_rt_"))
         .map(|s| s.to_string())
         .collect();
