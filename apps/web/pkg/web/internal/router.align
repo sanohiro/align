@@ -1,5 +1,7 @@
 module pkg.web.internal.router
 
+import pkg.web.types
+
 // pkg.web router core — pattern matching over '/'-separated path segments (W1 slice 1).
 //
 // A route pattern is `/`-separated; each segment is one of:
@@ -296,5 +298,70 @@ pub fn param_value(pattern: str, path: str, name: str) -> str {
     }
     pp = pe
     xp = xe
+  }
+}
+
+// ── Route-table dispatch (W2) ─────────────────────────────────────────────────────────────────
+
+// Dispatch a ROUTE TABLE: the index of the route that should answer `method` + `path`, or -1.
+//
+// Path matching is the radix walk above (static > `:param` > `*wildcard`); the method is then
+// checked on the winning path. A route whose `method` is empty answers any method, which is how a
+// fallback is written. Because the tree is keyed by path alone, two routes sharing a path but
+// differing in method are resolved here, after the walk: the table is scanned for a route with the
+// SAME pattern as the winner and a matching method, so `GET /x` and `POST /x` coexist.
+//
+// Returns -1 for "no path matched" (a 404). `method_not_allowed` distinguishes the 405 case.
+pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {
+  n := routes.len()
+  mut best := -1
+  mut best_score := -1
+  mut i := 0
+  loop {
+    if i >= n { break }
+    ri := routes[i]
+    s := match_score(ri.pattern, path)
+    if s > best_score {
+      best_score = s
+      best = i
+    }
+    i = i + 1
+  }
+  if best < 0 {
+    return -1
+  }
+  // The winning PATH is fixed; now pick the route on that path whose method matches (an empty
+  // method answers anything). Scanning in table order makes the first registered match win.
+  bw := routes[best]
+  winner := bw.pattern
+  mut j := 0
+  loop {
+    if j >= n { break -1 }
+    rj := routes[j]
+    if rj.pattern == winner {
+      m := rj.method
+      if m.len() == 0 || m == method {
+        break j
+      }
+    }
+    j = j + 1
+  }
+}
+
+// Whether `path` matches some route but NO route on that path accepts `method` — the 405 case, as
+// distinct from a 404. Lets the caller send `Allow` for the path's real method set.
+pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool {
+  if dispatch_routes(routes, method, path) >= 0 {
+    return false
+  }
+  n := routes.len()
+  mut i := 0
+  loop {
+    if i >= n { break false }
+    rq := routes[i]
+    if match_score(rq.pattern, path) >= 0 {
+      break true
+    }
+    i = i + 1
   }
 }

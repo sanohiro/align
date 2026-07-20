@@ -103,3 +103,33 @@ fn main() -> i32 {
 ";
     assert_eq!(build_and_run("arr-local", src).status.code(), Some(8));
 }
+
+#[test]
+fn struct_array_literal_with_call_elements_is_stored() {
+    if !backend_available() {
+        return;
+    }
+    // An array literal of STRUCTS whose elements are calls (not struct literals) — the route-table
+    // shape `[web.get(…), web.post(…)]`. The struct-array store used to handle only `StructLit`
+    // elements and silently stored NOTHING for any other, leaving the element uninitialised: a
+    // zeroed scalar and a garbage `str` pointer. Each element must round-trip.
+    let src = concat!(
+        "S { a: str, b: i64 }\n",
+        "fn mk(x: i64) -> S = S { a: \"made\", b: x }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  lit := [S { a: \"lit\", b: 1 }]\n",
+        "  l0 := lit[0]\n",
+        "  print(l0.a)\n",
+        "  calls := [mk(10), mk(20)]\n",
+        "  c0 := calls[0]\n",
+        "  c1 := calls[1]\n",
+        "  print(c0.b)\n",
+        "  print(c0.a)\n",
+        "  print(c1.b)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("arr-struct-call-elems", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "lit\n10\nmade\n20\n");
+}

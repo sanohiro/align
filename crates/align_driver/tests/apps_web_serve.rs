@@ -19,6 +19,8 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
+/// `pkg.web.types` — the dependency-free leaf holding `Ctx`/`Route`, which the router imports.
+const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
 
 /// A minimal `pkg.web` root wiring the internal router to the public shapes this test drives.
 /// The
@@ -111,6 +113,7 @@ fn run_server(name: &str, request: &[u8]) -> String {
         name,
         &[
             ("pkg/web/internal/router.align", ROUTER),
+            ("pkg/web/types.align", TYPES),
             ("pkg/web.align", WEB_ROOT),
             ("main.align", SERVER),
         ],

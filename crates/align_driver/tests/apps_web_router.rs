@@ -12,6 +12,8 @@ use common::*;
 
 /// The real, shipped router source.
 const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
+/// `pkg.web.types` — the dependency-free leaf holding `Ctx`/`Route`, which the router imports.
+const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
 
 /// A minimal `pkg.web` root that re-exports the internal router entry points under test (the full
 /// public surface — `get`/`serve`/`param`/… — is W2). Kept in the test (not the shipped tree) so the
@@ -26,6 +28,7 @@ pub fn param_value(pattern: str, path: str, name: str) -> str = pkg.web.internal
 fn web_project(entry_main: &str) -> Vec<(&'static str, String)> {
     vec![
         ("pkg/web/internal/router.align", ROUTER.to_string()),
+        ("pkg/web/types.align", TYPES.to_string()),
         ("pkg/web.align", WEB_ROOT.to_string()),
         ("main.align", entry_main.to_string()),
     ]
@@ -195,4 +198,59 @@ fn main() -> Result<(), Error> {\n\
     let out = run_web("web-param", main);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n7\n9\na/b/c\n0\n0\n");
+}
+
+// ── W2: method-aware route-table dispatch (404 vs 405) ────────────────────────────────────────
+
+/// The public shape: a table of `Route` values built by the per-method constructors, dispatched by
+/// (method, path). Two routes may share a path with different methods; a path that matches but has
+/// no route for the method is the 405 case, distinct from a 404.
+#[test]
+fn route_table_dispatches_by_method_and_separates_404_from_405() {
+    if !backend_available() {
+        return;
+    }
+    let web_root = "module pkg.web\n\
+import pkg.web.types\n\
+import pkg.web.internal.router\n\
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<(), Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"POST\", pattern: pattern, handler: handler }\n\
+pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 =\n\
+  pkg.web.internal.router.dispatch_routes(routes, method, path)\n\
+pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool =\n\
+  pkg.web.internal.router.method_not_allowed(routes, method, path)\n";
+    let main = "module main\n\
+import pkg.web\n\
+import pkg.web.types\n\
+fn h1(c: pkg.web.types.Ctx) -> Result<(), Error> = Ok(())\n\
+fn h2(c: pkg.web.types.Ctx) -> Result<(), Error> = Ok(())\n\
+fn main() -> Result<(), Error> {\n\
+  routes := [\n\
+    pkg.web.get(\"/v1/models\", h1),\n\
+    pkg.web.get(\"/v1/models/:id\", h2),\n\
+    pkg.web.post(\"/v1/models\", h1),\n\
+  ]\n\
+  print(pkg.web.dispatch(routes, \"GET\", \"/v1/models\"))\n\
+  print(pkg.web.dispatch(routes, \"POST\", \"/v1/models\"))\n\
+  print(pkg.web.dispatch(routes, \"GET\", \"/v1/models/42\"))\n\
+  print(pkg.web.dispatch(routes, \"DELETE\", \"/v1/models\"))\n\
+  print(pkg.web.method_not_allowed(routes, \"DELETE\", \"/v1/models\"))\n\
+  print(pkg.web.dispatch(routes, \"GET\", \"/nope\"))\n\
+  print(pkg.web.method_not_allowed(routes, \"GET\", \"/nope\"))\n\
+  return Ok(())\n\
+}\n";
+    let files: Vec<(&str, String)> = vec![
+        ("pkg/web/internal/router.align", ROUTER.to_string()),
+        ("pkg/web/types.align", TYPES.to_string()),
+        ("pkg/web.align", web_root.to_string()),
+        ("main.align", main.to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    let out = build_and_run_multi("web-methods", &refs, "main.align");
+    assert_eq!(out.status.code(), Some(0));
+    // GET/POST on the same path resolve to different routes; DELETE there is 405 (matched path, no
+    // method), while /nope is 404 (no path at all).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n2\n1\n-1\ntrue\n-1\nfalse\n");
 }
