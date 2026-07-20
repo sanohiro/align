@@ -1,0 +1,142 @@
+module pkg.jwt
+
+import std.encoding
+import std.crypto
+import core.json
+
+// pkg.jwt — JSON Web Tokens (RFC 7519) over the compact JWS serialization (RFC 7515), HS256.
+//
+// A token is `base64url(header) "." base64url(payload) "." base64url(HMAC-SHA256(secret, signing
+// input))`, every part unpadded per RFC 7515 §2 — which is exactly what `std.encoding.base64url_*`
+// produces. Claims stay JSON text at this boundary: `core.json` serializes them (`json.encode` in,
+// `json.decode` out), so this package owns only the token envelope and its signature.
+//
+// **Security posture.** Two classic JWT failures are closed by construction:
+//   - *Algorithm confusion* — verification never trusts the token's own `alg`. `decode_hs256`
+//     re-derives the signature with HS256 and additionally requires the header to declare `HS256`,
+//     so a token re-signed as `none` (or swapped to another family) is rejected, not accepted.
+//   - *Signature comparison timing* — the MAC check goes through `crypto.constant_time_equal`,
+//     never `==`, so a byte-by-byte early exit cannot leak the expected signature.
+// Only HS256 is offered: it is the one algorithm the current `std.crypto` can implement soundly.
+// Adding HS384/HS512 needs `hmac_sha384`/`hmac_sha512`; RS*/ES* need RSA/ECDSA — each is a real
+// addition to std.crypto, not something to fake here.
+
+// The canonical HS256 JOSE header. Encoded at use rather than hardcoded as base64 so the exact bytes
+// this package signs stay readable in source.
+HEADER_JSON := "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+
+// Sign `payload_json` with `secret` and return the compact JWS `header.payload.signature`.
+pub fn encode_hs256(payload_json: str, secret: str) -> string {
+  h := encoding.base64url_encode(HEADER_JSON)
+  p := encoding.base64url_encode(payload_json)
+  mut si := builder()
+  si.write(h)
+  si.write(".")
+  si.write(p)
+  signing_input := si.to_string()
+  sig := crypto.hmac_sha256(secret, signing_input)
+  mut t := builder()
+  t.write(signing_input)
+  t.write(".")
+  t.write(encoding.base64url_encode(sig[0..sig.len()]))
+  t.to_string()
+}
+
+// Verify a compact HS256 JWS with `secret` and return its payload JSON (owned).
+//
+// Rejects, in order: a token that is not exactly three base64url parts (`Error.Invalid`); a header
+// that does not declare `alg: "HS256"` — including `none` (`Error.Denied`); and a signature that
+// does not verify in constant time (`Error.Denied`). Undecodable base64url surfaces as the
+// encoding layer's own error.
+pub fn decode_hs256(token: str, secret: str) -> Result<string, Error> {
+  n := token.len()
+  i1 := match token.find(".") {
+    Some(i) => i,
+    None => -1,
+  }
+  if i1 < 0 {
+    return Err(Error.Invalid)
+  }
+  rest := token[i1 + 1 .. n]
+  r2 := match rest.find(".") {
+    Some(i) => i,
+    None => -1,
+  }
+  if r2 < 0 {
+    return Err(Error.Invalid)
+  }
+  i2 := i1 + 1 + r2
+  // A third '.' means this is not a compact JWS (a JWE has five parts) — refuse rather than guess.
+  tail := token[i2 + 1 .. n]
+  third := match tail.find(".") {
+    Some(_) => true,
+    None => false,
+  }
+  if third {
+    return Err(Error.Invalid)
+  }
+  h := token[0 .. i1]
+  p := token[i1 + 1 .. i2]
+  s := token[i2 + 1 .. n]
+
+  // Algorithm pinning: the header must itself say HS256 (we verify as HS256 regardless).
+  hb := encoding.base64url_decode(h)?
+  hj := hb.bytes().as_str()?
+  alg_ok := arena {
+    d := json.doc(hj)?
+    match d.get("alg").as_str() {
+      Some(a) => a == "HS256",
+      None => false,
+    }
+  }
+  if !alg_ok {
+    return Err(Error.Denied)
+  }
+
+  // Recompute the MAC over the exact signed bytes and compare in constant time.
+  mut si := builder()
+  si.write(h)
+  si.write(".")
+  si.write(p)
+  signing_input := si.to_string()
+  expected := crypto.hmac_sha256(secret, signing_input)
+  actual := encoding.base64url_decode(s)?
+  if !crypto.constant_time_equal(actual.bytes(), expected[0..expected.len()]) {
+    return Err(Error.Denied)
+  }
+
+  pb := encoding.base64url_decode(p)?
+  pj := pb.bytes().as_str()?
+  return Ok(pj.clone())
+}
+
+// Whether the standard time claims in `payload_json` admit `now_unix`: `exp` (expiry — the token is
+// valid strictly before it) and `nbf` (not-before) are honoured when present. Both are OPTIONAL in
+// RFC 7519 §4.1, so a payload carrying neither is valid; a payload that is not a JSON object is not.
+// Kept separate from `decode_hs256` because signature validity and claim validity are different
+// questions — a caller may want the claims of an expired-but-authentic token.
+// A claim that is ABSENT is fine (both are optional); a claim that is PRESENT but not a NumericDate
+// violates RFC 7519 §4.1 and makes the token untrustworthy rather than unconstrained — so `false`,
+// never "treat it as missing".
+pub fn time_claims_valid(payload_json: str, now_unix: i64) -> bool {
+  arena {
+    d := json.doc(payload_json) else { return false }
+    exp := d.get("exp")
+    exp_ok := match exp.kind() {
+      Missing => true,
+      _ => match exp.as_i64() {
+        Some(e) => now_unix < e,
+        None => false,
+      },
+    }
+    nbf := d.get("nbf")
+    nbf_ok := match nbf.kind() {
+      Missing => true,
+      _ => match nbf.as_i64() {
+        Some(nb) => now_unix >= nb,
+        None => false,
+      },
+    }
+    exp_ok && nbf_ok
+  }
+}
