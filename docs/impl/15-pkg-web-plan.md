@@ -99,7 +99,9 @@ DONE   sha256/512, hmac_sha256, argon2id,       std.crypto
 DONE   gzip / zstd                              std.compress
 DONE   JWT (HS256; alg-pinned, CT-compared)     pkg.jwt          (2026-07-20)
 DONE   URL/percent encode+decode (RFC 3986)     std.encoding     (2026-07-20)
-TODO   application/x-www-form-urlencoded        std or pkg.web   (builds on percent)
+DONE   application/x-www-form-urlencoded        std.encoding     (2026-07-20)
+DONE   query-string lookup (zero-alloc, escaped   pkg.web.internal.query (2026-07-20)
+       keys matched without materializing)
 TODO   multipart/form-data (uploads)            pkg.web or pkg
 TODO   Cookie parse / Set-Cookie build          pkg.web
 TODO   HTML escaping                            std.encoding (or the deferred `html` template)

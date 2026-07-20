@@ -265,3 +265,61 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n0\n1\n");
 }
+
+// ── application/x-www-form-urlencoded ─────────────────────────────────────────────────────────
+
+/// `form_encode`/`form_decode` are the HTML-form / query-string payload rule: space is `+`, every
+/// other non-unreserved byte is `%XX`. Encode one key or value at a time — the `=`/`&` joining them
+/// are structure, not data.
+#[test]
+fn form_encode_decode_round_trip() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  print(encoding.form_encode(\"a b&c=d\"))
+  print(encoding.form_encode(\"日本 語\"))
+  d := encoding.form_decode(\"a+b%26c%3Dd\")?
+  print(d.bytes().as_str()?)
+  p := encoding.form_decode(\"hello+world\")?
+  print(p.bytes().as_str()?)
+  orig := \"name=John Doe & Co/50%\"
+  rt := encoding.form_decode(encoding.form_encode(orig))?
+  print(rt.bytes().as_str()? == orig)
+  return Ok(())
+}
+";
+    let out = build_and_run("m10-form-rt", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a+b%26c%3Dd\n%E6%97%A5%E6%9C%AC+%E8%AA%9E\na b&c=d\nhello world\ntrue\n"
+    );
+}
+
+/// The two codecs differ in exactly one place: a space. `percent_encode` writes `%20` (RFC 3986),
+/// `form_encode` writes `+`; each decoder accepts `%20`, only `form_decode` reads `+` as a space.
+#[test]
+fn form_and_percent_differ_only_on_space() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  print(encoding.percent_encode(\"a b\"))
+  print(encoding.form_encode(\"a b\"))
+  p := encoding.percent_decode(\"a+b\")?
+  print(p.bytes().as_str()?)
+  f := encoding.form_decode(\"a+b\")?
+  print(f.bytes().as_str()?)
+  return Ok(())
+}
+";
+    let out = build_and_run("m10-form-vs-percent", src);
+    assert_eq!(out.status.code(), Some(0));
+    // percent leaves '+' alone (it is not an escape there); form reads it as a space.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a%20b\na+b\na+b\na b\n");
+}
