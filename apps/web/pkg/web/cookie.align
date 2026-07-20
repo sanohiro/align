@@ -65,9 +65,45 @@ pub fn get(header: str, name: str) -> str {
 //   same_site  — "Strict" / "Lax" / "None"; emitted when non-empty (CSRF defence)
 pub CookieOpts { path: str, max_age: i64, http_only: bool, secure: bool, same_site: str }
 
+// Whether `s` is safe to place inside a `Set-Cookie` header: no control byte (CR/LF/NUL and
+// friends, which would inject a whole header) and no ';' (which would inject an ATTRIBUTE). This is
+// the RFC 6265 cookie-octet restriction reduced to the bytes that actually break the grammar; high
+// bytes are left alone because real deployments do carry UTF-8 cookie values.
+fn header_safe(s: str) -> bool {
+  sb := s.bytes()
+  mut i := 0
+  loop {
+    if i >= sb.len() { break true }
+    c := sb[i] as i64
+    if c < 32 || c == 127 { break false }   // control bytes — CR/LF are header injection
+    if c == SEMI { break false }            // ';' — attribute injection
+    i = i + 1
+  }
+}
+
 // A `Set-Cookie` header VALUE (the part after `Set-Cookie: `) for `name`/`value` with `o`'s
 // attributes. The caller writes the header name, so this composes with any response builder.
-pub fn build(name: str, value: str, o: CookieOpts) -> string {
+//
+// `Err(Error.Invalid)` when any part would break the header grammar — a control byte (CR/LF is
+// header injection) or a ';' (attribute injection) in the name, value, path, or SameSite, or a
+// '='/space in the NAME (which would corrupt the name=value split). Building a Set-Cookie from
+// untrusted input is normal, so this is checked rather than trusted: silently emitting an injected
+// header would be a vulnerability, and silently stripping bytes would corrupt the value.
+pub fn build(name: str, value: str, o: CookieOpts) -> Result<string, Error> {
+  if !header_safe(name) || !header_safe(value) {
+    return Err(Error.Invalid)
+  }
+  if !header_safe(o.path) || !header_safe(o.same_site) {
+    return Err(Error.Invalid)
+  }
+  nb := name.bytes()
+  mut ni := 0
+  loop {
+    if ni >= nb.len() { break }
+    c := nb[ni] as i64
+    if c == EQ || c == SP { return Err(Error.Invalid) }
+    ni = ni + 1
+  }
   mut b := builder()
   b.write(name)
   b.write("=")
@@ -90,5 +126,5 @@ pub fn build(name: str, value: str, o: CookieOpts) -> string {
     b.write("; SameSite=")
     b.write(o.same_site)
   }
-  b.to_string()
+  return Ok(b.to_string())
 }
