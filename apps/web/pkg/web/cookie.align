@@ -1,0 +1,94 @@
+module pkg.web.cookie
+
+// pkg.web cookie support (RFC 6265). A **public** submodule, not `internal`: `CookieOpts` is part of
+// the API an application constructs, so it must be nameable by consumers (`pkg.web.cookie.CookieOpts`).
+//
+// Request side: read a value out of a `Cookie:` header (`a=1; b=2`) — zero-copy, a `str` view into
+// the header. Response side: build a `Set-Cookie` header value.
+//
+// Cookie values are **opaque octets** per RFC 6265 §4.1.1: no percent-decoding is applied here. An
+// application that URL-encodes its own values decodes them itself (`encoding.form_decode`), which
+// keeps this from guessing at an encoding the spec does not impose.
+
+// Byte constants (Align has no byte literals; these are the ASCII codes we scan for).
+SEMI := 59   // ';'
+EQ := 61     // '='
+SP := 32     // ' '
+
+// The value of cookie `name` in a `Cookie:` header value, or "" when absent. The result is a `str`
+// view into `header` — no allocation. Leading spaces after a ';' separator are skipped (the header
+// is conventionally written `a=1; b=2`).
+pub fn get(header: str, name: str) -> str {
+  hb := header.bytes()
+  n := header.len()
+  mut start := 0
+  loop {
+    if start > n {
+      break ""
+    }
+    // Skip the optional space(s) after the previous ';'.
+    loop {
+      if start >= n { break }
+      if hb[start] as i64 != SP { break }
+      start = start + 1
+    }
+    // The end of this `name=value` pair.
+    mut end := start
+    loop {
+      if end >= n { break }
+      if hb[end] as i64 == SEMI { break }
+      end = end + 1
+    }
+    // Split at the first '='.
+    mut eq := start
+    loop {
+      if eq >= end { break }
+      if hb[eq] as i64 == EQ { break }
+      eq = eq + 1
+    }
+    if header[start..eq] == name {
+      if eq >= end {
+        break ""
+      }
+      break header[eq + 1..end]
+    }
+    start = end + 1
+  }
+}
+
+// The attributes of a `Set-Cookie`. Every one is explicit — there are no hidden defaults, because a
+// silently-missing `HttpOnly` or `Secure` is a real vulnerability, not a convenience.
+//   path       — emitted when non-empty
+//   max_age    — emitted when >= 0 (0 expires the cookie immediately; use -1 for a session cookie)
+//   http_only  — hide from document.cookie (blunts XSS token theft)
+//   secure     — HTTPS only
+//   same_site  — "Strict" / "Lax" / "None"; emitted when non-empty (CSRF defence)
+pub CookieOpts { path: str, max_age: i64, http_only: bool, secure: bool, same_site: str }
+
+// A `Set-Cookie` header VALUE (the part after `Set-Cookie: `) for `name`/`value` with `o`'s
+// attributes. The caller writes the header name, so this composes with any response builder.
+pub fn build(name: str, value: str, o: CookieOpts) -> string {
+  mut b := builder()
+  b.write(name)
+  b.write("=")
+  b.write(value)
+  if o.path.len() > 0 {
+    b.write("; Path=")
+    b.write(o.path)
+  }
+  if o.max_age >= 0 {
+    ma := o.max_age
+    b.write(template "; Max-Age={ma}")
+  }
+  if o.http_only {
+    b.write("; HttpOnly")
+  }
+  if o.secure {
+    b.write("; Secure")
+  }
+  if o.same_site.len() > 0 {
+    b.write("; SameSite=")
+    b.write(o.same_site)
+  }
+  b.to_string()
+}

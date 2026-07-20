@@ -552,7 +552,9 @@ else `Code(errno)`). (`draft.md` §18.2, M9.)
 
 `std.encoding`: `base64`/`base64url`/`hex`/`percent` (RFC 3986 URI components — everything outside
 the unreserved set becomes `%XX`) / `form` (`application/x-www-form-urlencoded` — the same rule but
-space is `+`; encode one key or value at a time, the `=`/`&` joining them are structure) encode+decode
+space is `+`; encode one key or value at a time, the `=`/`&` joining them are structure) encode+decode,
+plus `html_escape` (encode-only: `& < > " '` become entities, making one output safe in both element
+text and a quoted attribute; reversing HTML needs a parser's full entity table, not a codec)
 (decode returns an owned `buffer` — no
 UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
 (non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no

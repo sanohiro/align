@@ -323,3 +323,31 @@ pub fn main() -> Result<(), Error> {
     // percent leaves '+' alone (it is not an escape there); form reads it as a space.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a%20b\na+b\na+b\na b\n");
 }
+
+// ── HTML escaping ─────────────────────────────────────────────────────────────────────────────
+
+/// `html_escape` neutralizes all five of `& < > " '`, so one escaped string is safe in BOTH element
+/// text and a quoted attribute — a caller never has to pick a context-specific variant (the mistake
+/// that produces XSS). Other bytes, including multi-byte UTF-8, pass through unchanged.
+#[test]
+fn html_escape_neutralizes_markup() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  print(encoding.html_escape(\"<script>alert('xss')</script>\"))
+  print(encoding.html_escape(\"a & b\"))
+  print(encoding.html_escape(\"say \\\"hi\\\"\"))
+  print(encoding.html_escape(\"plain 日本\"))
+  return Ok(())
+}
+";
+    let out = build_and_run("m10-html-escape", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;\na &amp; b\nsay &quot;hi&quot;\nplain 日本\n"
+    );
+}

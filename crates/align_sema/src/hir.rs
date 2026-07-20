@@ -1386,6 +1386,10 @@ pub enum EncodingKind {
     /// `+`, every other non-unreserved byte is `%XX`. One key or value at a time — the `=`/`&`
     /// joining them are structure, not data.
     Form,
+    /// HTML entity escaping (`encoding.html_escape`) — `& < > " '` become entities so one output is
+    /// safe in both element text and a quoted attribute. **Encode-only**: reversing HTML needs the
+    /// full named-character-reference table, which belongs to an HTML parser, not a codec.
+    Html,
 }
 
 /// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)

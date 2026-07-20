@@ -8227,6 +8227,70 @@ fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
     Some(v)
 }
 
+/// The HTML entity a byte must become, or `None` when it may be copied through. Escaping all five of
+/// `& < > " '` makes one output safe in BOTH an element-text and a quoted-attribute context, so a
+/// caller never has to pick a variant (the mistake that produces XSS). `'` uses the numeric `&#39;`
+/// because the named `&apos;` is not in HTML 4.
+fn html_entity(b: u8) -> Option<&'static [u8]> {
+    match b {
+        b'&' => Some(b"&amp;"),
+        b'<' => Some(b"&lt;"),
+        b'>' => Some(b"&gt;"),
+        b'"' => Some(b"&quot;"),
+        b'\'' => Some(b"&#39;"),
+        _ => None,
+    }
+}
+
+/// Escaped length of `data`; `None` on overflow (the caller aborts before allocating).
+fn html_escaped_len(data: &[u8]) -> Option<usize> {
+    let mut n: usize = 0;
+    for &b in data {
+        n = n.checked_add(html_entity(b).map_or(1, |e| e.len()))?;
+    }
+    Some(n)
+}
+
+/// Write `data` HTML-escaped into `out` (exactly [`html_escaped_len`] bytes).
+fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    assert_eq!(html_escaped_len(data), Some(out.len()), "html destination length mismatch");
+    let mut o = 0;
+    for &b in data {
+        match html_entity(b) {
+            Some(ent) => {
+                for &e in ent {
+                    out[o].write(e);
+                    o += 1;
+                }
+            }
+            None => {
+                out[o].write(b);
+                o += 1;
+            }
+        }
+    }
+}
+
+/// `encoding.html_escape(data)` — replace `& < > " '` with their HTML entities so the result is safe
+/// to interpolate into element text or a quoted attribute. Returns an owned `string`. Bytes are
+/// otherwise copied through, so valid UTF-8 in gives valid UTF-8 out.
+///
+/// There is deliberately no `html_unescape` here: reversing HTML means resolving the full named
+/// character reference set, which is an HTML *parser*'s table, not a codec's — a partial one would
+/// silently mis-decode. Escaping (the direction a server needs to emit safe output) is what belongs
+/// beside the other codecs.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_html_escape(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let Some(out_len) = html_escaped_len(data) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| html_escape_into(data, out)) }
+}
+
 /// Encoded length under `application/x-www-form-urlencoded`: identical to percent-encoding except a
 /// space costs 1 byte (`+`) rather than 3.
 fn form_encoded_len(data: &[u8]) -> Option<usize> {
