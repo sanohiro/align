@@ -386,6 +386,28 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      同 degree の固定スレッドプールを使う Rust ベースラインと比較する。正確な報告: 計測されたオーバーラップ
      係数 + マシンのコア数 + 同 degree での Rust との同等性 — ハードウェア非依存の 12.8× という主張ではない。
 
+**`respond_stream` の作り直し（pkg.web stream ルート向け）— 2026-07-21 設計、未出荷。**
+pkg.web のストリーミング設計（`docs/impl/pkg-design/web.md` → 「ストリーミング」）が消費者である。
+stream ハンドラの実行中も framework がリクエストコンテキストを所有し続けること、および head 確定前の
+4xx 窓を必要とする。変更は 3 点、いずれも pre-release の完全置換（M12 テストを更新、compat パス無し）:
+
+- **① 非消費レシーバ。** `ctx.respond_stream(rb) -> Result<http_stream, Error>` は `rb` **のみ**を
+  消費する。fd は従来どおり stream に持ち上げる; `ctx` は呼び出し側に残り **spent** となる: 以後の
+  `respond`/`respond_stream` は `Err`（abort ではない — bodied-rb の契約バグと違い、通常の制御フローで
+  到達し得る）; その Drop はパースバッファのみ解放し fd close はスキップ（持ち上げ済み）。これが
+  `Ctx` の view（path/query/**body** — LLM の pump はストリーミング中にプロンプトを読む）を pump
+  呼び出しの間ずっと有効に保つ。前例: `rb.header` は既に変異する非消費 bound receiver である。
+- **② 遅延 head。** `respond_stream` は rb を即時に検証する（header-only 契約、P6 ガード、
+  TE/Connection ポリシー — 不変、bodied rb は依然 abort）が、head の書き込みは行わず stream ハンドルに
+  直列化して保存し、最初の `send`（または `finish`）が書く。観測可能な変更: client は最初のイベントまで
+  何も見ない — fn doc に明記、③の対価である。
+- **③ `s.reject(rb) -> Result<(), Error>`。** 最初の send より前でのみ合法（以後は `Err`、poison には
+  触れない）: 保存済み head を破棄し、`rb` を完結した**通常**レスポンスとして書き（respond の
+  serializer、CL+body）、close する。stream を消費する。これが stream ルート唯一の stream 前
+  4xx/5xx 経路である — 検証は pump 内で行い、`reject` がそれに応える。
+- `send`/`finish`/Drop/poison の意味論は他は不変; `framed`（1.0/1.1）は従来どおり `respond_stream`
+  時点で選ばれ、保存 head に焼き込まれる。
+
 ## Known v1 limitations (Slice 2/3/5)
 
 - **HTTPS はクライアント側のみ(スライス 5)。** サーバ側 TLS は先送り — `http.serve` は平文であり、その
