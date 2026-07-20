@@ -402,6 +402,12 @@ The cache implementation is incomplete until this matrix is automated:
 | corrupted cache bytes | digest failure, eviction, automatic rebuild |
 | cache hit vs cold build | byte-identical output and identical execution |
 
+The last row is scoped to **one output path**: the executable's identity is compared cold-vs-hit at
+the same target filename, because on macOS the linker embeds the output file's name in the ad-hoc
+code signature, so two links differing only in destination name differ in bytes no matter what the
+cache did. Reproducibility across output *names* is not a property the cache can or should provide;
+holding the name fixed is what isolates the variable the gate is actually about.
+
 Add bounded cache eviction only after correctness and hit telemetry exist. Eviction policy is not an
 artifact-identity concern and must not complicate the first slice.
 

@@ -149,9 +149,17 @@ impl Emitted {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
     /// The linked executable bytes (for byte-identity gates).
+    ///
+    /// The output path is FIXED per project, not nonce'd like [`Self::run`]'s: a byte-identity gate
+    /// has to hold every input constant except the one under test (cold vs cache-hit), and the
+    /// output filename is an input to the linker. On macOS it lands in the ad-hoc code signature,
+    /// whose identifier is derived from the output file's name — so linking cold and hot to
+    /// `exe-{nonce}` made the two differ by exactly those name bytes, on every run, regardless of
+    /// the cache. Both links therefore write the same path; the first result is already read into
+    /// memory before the second overwrites it.
     fn exe_bytes(&self, proj: &Project, profile: Profile) -> Vec<u8> {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
-        let exe = proj.dir.join(format!("exe-{}", nonce()));
+        let exe = proj.dir.join("exe-byte-identity");
         link_objects(&obj_refs, &exe, &self.link_libs, profile).expect("link");
         std::fs::read(&exe).expect("read exe")
     }
