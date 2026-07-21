@@ -657,6 +657,124 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      するので、EOF まで読む client はサーバが終了するか容量の逼迫が parked コネクションを evict
      するまでブロックする。コネクション毎 1 リクエストの client は `Connection: close` を送る（driver
      テスト共有の `one_shot` ヘルパ）か、`Content-Length` で読みをフレーム化しなければならない。
+10. **`ctx.headers()` — 切り離したヘッダーテーブルのビュー — 2026-07-21 設計、未実装**
+    （消費者 = pkg.web の `web.header(c, name)`、`pkg-design/web.md` → 「ctx アクセサ」）。
+
+    **問題を正確に。** framework のリクエスト毎コンテキストは、**何も所有しないビューだけの Copy
+    struct** である — pkg.web の `Ctx` がその形をしているのには荷重のかかった理由がある（所有する
+    `Ctx` は自分自身のアクセサに消費されてしまい、失敗したハンドラは framework が 500 を返すために
+    なお必要とするハンドルを消費済みにしてしまう）。他のアクセサはどれも struct が運べるビューに乗る:
+    `method`/`path`/`query` は `str`、`body` は `slice<u8>` である。**ヘッダー lookup はそれができない。
+    名前はハンドラが問い合わせるまで分からないからである** — 借用される値は 1 つのスパンではなく、
+    パース済みテーブル全体である。したがって、framework が raw head のビューの上に RFC 9110 lookup を
+    再実装する（std.http が既に持つものの 2 つ目の実装 — One way に反する）か、std.http がテーブル
+    **そのもの**である値を借用として手渡すか、どちらかになる。本項はその値である。
+
+    - **① 表面。** `ctx.header(name)` は補完ではなく**置換**である — lookup の綴りを 1 つに保つため:
+      ```text
+      ctx.headers() -> http_headers        // a Copy, non-owning VIEW of the parsed header table;
+                                           // region-bound to ctx exactly like ctx.body()
+      hs.get(name: str) -> Option<str>     // RFC 9110 §5.1 case-insensitive lookup; the returned
+                                           // str views the request buffer, region-bound to `hs`
+      ```
+      `ctx.header(name)` は全呼び出し箇所で `ctx.headers().get(name)` になる（ドキュメント以外に Align の
+      呼び出し箇所は無い — 今日のコストはゼロで、機構が 1 つになる利益は永続する）。パース済みの
+      **レスポンス**は `resp.header(name)` のままである: 呼び出し側が既に所有している値からわざわざ
+      切り離す理由が無いし、ビュー型を共有するなら無関係な 2 つのランタイム struct を区別する判別子を
+      持たせる羽目になる。この非対称性は意図的なものであり、取り繕わずここに記録しておく。
+    - **② 表現 = ctx ポインタそのもの。** `align_rt_http_ctx_header` は既に `*const HttpRequestCtx` +
+      名前を取って `AlignStr` を書き出す — つまりビューは*同じポインタ*であり、`hs.get(name)` は
+      **既存の呼び出し**へ lower する。**ランタイムのコードは一切増えない**; `ctx.headers()` は ctx
+      オペランドの `Rvalue::Use` へ lower する。この enabler は丸ごと型システムの変更である。
+    - **③ 型 = `Ty::HttpHeaders` — Copy、非所有、region 追跡あり。** 倣うべき前例は Move ハンドルでは
+      なく `Ty::JsonDoc`/`Ty::JsonScanner`（Copy + `tracks_region` + `ty_may_borrow`）である。これは裸の
+      8 バイトポインタであり、今日の Copy 型にそういうものは 1 つも無いので、`ty_size_align` には
+      `(16, 8)` の catch-all ではなく専用の `(8, 8)` の腕が要る。
+    - **④ region の意味論 — 設計全体が懸かっている 1 行。** `region_of` の
+      `HttpCtxMethod | HttpCtxPath | HttpCtxHeader | HttpCtxBody` の腕は、結果を
+      `Frame.shorter(region_of(ctx))` で頭打ちにする。lookup がこれを継承すると、その頭打ちは
+      `fn header(c: Ctx, name: str) -> Option<str> = c.headers.get(name)` — pkg.web のラッパーであり、
+      そもそもの狙いそのもの — を**コンパイル時に拒否**させてしまう（「ローカルストレージを借用する
+      ビューは返せない」）。等価な `ctx.header` ラッパーを使い、今日のコンパイラ上で確認済み。したがって
+      2 つの操作は分離しなければならない:
+      - `ctx.headers()`（**新規**の `ExprKind::HttpCtxHeaders`）は頭打ちを保つ:
+        `Frame.shorter(region_of(ctx))`。ローカルのハンドルから作られたビューは、そのハンドルを所有する
+        フレームの外へは出られない。
+      - `hs.get(name)`（**既存**の `ExprKind::HttpCtxHeader`。そのオペランドをハンドルからビューへ
+        差し替える）は**継承**する: `region_of(hs)`。パラメータ経由 — 呼び出し側が呼び出しより長生き
+        すると証明できる場所 — ではこれが `Static` になり、ラッパーがコンパイルできる。これは
+        `str`/`slice` のビューがパラメータ経由で既に従っているのと全く同じ規則であり、新しい例外では
+        ない。
+    - **⑤ 新しい `Ty` がタダでは手に入らないソウンドネスのチェックリスト。** `Ty` の variant 追加が
+      コンパイラに強制されるのは**4 つ**のパスである（`ty_mentions_slice`、`tracks_region`、そして 2 つの
+      `ty_name`）。それ以外はすべて `matches!` のリストか、fail **open** する `_ =>` の腕である。
+      見落とすと致命的なものが 3 つあり、うち最初の 2 つは**ペア**である — どちらか一方だけでも同じ静かな
+      use-after-free を生む（`hs := ctx.headers()` … `ctx.respond(rb)?` … `hs.get("host")` が解放済み
+      バッファを読む）:
+      - **`ty_may_borrow`** — これが無いと `Let` はそのビューの借用 provenance を一切記録しない。
+      - **`borrow_sources_inner`** — その末尾は `_ => BorrowRoots::new()` なので、他の 8 つのパスが
+        網羅的であるにもかかわらず、ここでは新しい `ExprKind` が強制**されない**。`HttpCtxHeaders` は
+        ctx のストレージ root へ写像しなければならない。（既存の `HttpCtxHeader` の腕は既に
+        `storage_roots(operand)` を読んでおり変更不要 — 上の 2 つの追加があれば、`storage_roots` の
+        `_ => borrow_sources(e)` の落ち込みが一時ビューを正しく連鎖させる。）
+      - **`scalar_type` のポインタの腕** — 見落とすと `_ =>` が `int_type` の `_ => i32` へ落ち、
+        ポインタを黙って切り詰める。この全く同じバグは `Ty::Fn` で一度実際に起きている。
+      続いて: `is_field_ok`（さもないと `Ctx` がこれを運べない）、`resolve_type` —
+      `http_request_ctx`/`response_builder`/`http_stream` と同じく import 不要の**グローバル表面名**
+      として。`pkg.web.types` が設計どおり依存の無い葉のままでいられるようにするためである — そして
+      `ty_size_align`。**`ty_size_align` は安全性ではなく lint の精度である:** 唯一の消費者は
+      huge-struct-copy lint であり、実レイアウトは `scalar_type` + `field_abi_align`（`_ => 8`、既に
+      正しい）が決める。`Ty::HttpRequestCtx` — 出荷済みの struct フィールド型 — も今日まったく同じ
+      16 対 8 の過大報告をしていることに注意。両方を直し、`sema_and_codegen_struct_layout_agree` に行を
+      足す。あれは手書きのテーブルで、Move ハンドルにも `Ty::Fn` にも `Ty::Slice` フィールドにも行が無い。
+      あえて追加**しない**もの: `ty_is_move`、`is_owned_droppable`、`handle_free_fn`、
+      `null_moved_source`、`ty_owns_buffer_rec`（囲む struct を Move にしてはならない）、そして — 重要な
+      ことに — **`Scalar` variant は作らない**。これにより、fail-closed のデフォルトのままビューは
+      `Option`/`Result` のペイロードと配列要素から締め出される（専用の診断を用意する価値はある: 今日は
+      「must be a scalar (composite payloads are not supported yet)」と報告する。答えは正しいが筋書きが
+      違う）。
+    - **⑥ dispatch と effect、どちらも間違えやすい。** `"get"` は既に catch-all の腕
+      （`"get" if recv_ty != Ty::HttpClient => check_box_get`）が押さえており、`hs.get(name)` を
+      *"'get' takes no arguments"* の診断へ飲み込んでしまう — ビルド失敗ではなく単に悪いメッセージなので、
+      何も捕まえてくれない。新しい腕はその**上**、同じ理由で `json.doc` の腕が置かれているのとちょうど
+      同じ位置に置く。`check_http_ctx_method` が適用するレシーバの **place ゲート**（`Local | Field`）は
+      `ctx.headers()` には保ち（これは引き続き `srv.accept()?.headers()` を拒否する）、`hs.get(name)` には
+      **継承させない** — 規定の綴り `ctx.headers().get(name)` のレシーバは place ではなく、ビューは drop
+      すべきものを何も所有しないからである。MIR は `lower_expr` に新しいインラインの腕を足すのではなく
+      `lower_http` の dispatch リストを通す（`expr_depth` の余裕に関する注記、#296）。Effect は **Pure** —
+      ポインタのコピーであり、lookup は不変バッファの読み取り専用スキャンである。ヘッダーを読むハンドラが
+      `par_map`/`task_group` の下で合法であり続けられるのは、これによる。
+    - **⑦ v1 に入れないもの: 反復。** `hs.count()`/`hs.name(i)`/`hs.value(i)` は全ヘッダーを転送する
+      プロキシに役立つはずであり、ランタイムは既にスパンを持っている。却下ではなく先送りである: REST が
+      必要とするのは lookup であり、アクセサが 1 つ増えるたびに、fail open する `Ty` の掃きに晒される
+      ノードが 1 つ増える。列挙を必要とする消費者が現れたら、同じビュー上の兄弟ノード 3 つで済む —
+      新しい型は要らない。
+    - **⑧ 却下した代替案と、その理由。** *ヘッダーを `slice<str>` フィールドへ先に取り出す*（新しい
+      `Ty` が一切要らない）が最有力であり、2 つの点で負ける: ランタイムが持つのは `AlignStr` ではなく
+      オフセットのスパンなので、slice の実体化は**リクエストごとの割り当て**になる — しかも現在の性能
+      目標である 4.1 µs の予算の上で — そして lookup は pkg.web 側に住むことになり、2 つ目の RFC 9110
+      実装になる。*`Ctx` に `http_request_ctx` を借用させる*は最初から論外である: ハンドルは Move なので
+      `Ctx` が Move になり、`types.align` に記録された理由がすべて再来する。*切り離したリクエストビュー
+      全体へ一般化する*（1 つの値の上の `.method()/.path()/.body()`）は「これは一般化すべきでは?」という
+      自然な問いだが、今日は負ける: その 3 つは既にハンドル上で動くし、pkg.web の `path`/`query`/`pattern`
+      は素通しではなく**導出**されるので、どのみち `Ctx` は畳めない。そしてアクセサが 1 つ増えるたびに、
+      fail open する掃きを通るノードが 1 つ増える。名前がヘッダーの形のままなのは、それがこの型の用途
+      だからである。
+    - **テストマトリクス（仕様）:** パラメータ経由のラッパーがコンパイルでき、ビューを返せること
+      （分離を動機づけている性質そのもの）; **ローカル**のハンドルから作ったビューは、返すことも、
+      ループから `break` して出すことも、`serve` の反復をまたいで自分の ctx より長生きすることもできない
+      こと; `ctx.respond(rb)` の後の `hs.get()` はコンパイルエラーであること — ただし**裸のローカル**で。
+      囲む struct に `str` フィールドが 1 つでもあると、それが借用 root を供給して穴を覆い隠してしまう
+      からである; `ctx.respond_stream(rb)` の**後**に **stream の pump の中**で行う `hs.get()` は
+      **コンパイルでき、かつ動く**こと（この経路は ctx を借用し、決して解放しない）; 大文字小文字を無視
+      したヒット + ミス（`Option`）の pkg.web 経由 E2E; 配列要素 / `Option` ペイロードとしてのビューは
+      拒否されること; これを運ぶ `Ctx` が Copy のままであること（drop は出ず、二重 free も無い）、および
+      sema と codegen が一致することを assert する struct レイアウトの行。
+    - **⑨ `ctx.header(name)` の削除掃き。** Align の呼び出し箇所はどこにも無い（`.align` ファイルにも、
+      Rust に埋め込まれたテストプログラムにも）— 確認済み。変わるのは: 本ファイル（§ Signatures +
+      Slice breakdown）、その ja ミラー、`docs/open-questions.md`、そしてコンパイラ側 — メソッド dispatch
+      の腕、`check_http_ctx_method` の `"header"` ケース、そして "try method / path / header / …" の
+      サジェスト文字列。`rb.header` / `r.header` / `resp.header` はレシーバが違うので残る。
 
 ## Known v1 limitations (Slice 2/3/5)
 

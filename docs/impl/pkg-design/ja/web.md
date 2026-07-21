@@ -135,7 +135,7 @@ web.serve(host, port, routes, workers) -> Result<(), Error>
 web.param(c, name)   -> str              // :param キャプチャ（固定スロット配列。total —
                                          //   パターンにない名前は起動時検出可能なバグ）
 web.query(c, name)   -> Option<str>      // std.http クエリ床（RFC 3986 percent-decode 済み）
-web.header(c, name)  -> Option<str>      // 未出荷 — 下の注記を参照
+web.header(c, name)  -> Option<str>      // 未出荷 — enabler は設計済み、下の注記を参照
 web.body(c)          -> slice<u8>        // 2026-07-21 出荷: `Ctx.body` が zero-copy view を運ぶ
 web.body_str(c)      -> Result<str, Error>    //   body_str = `.as_str()`(検証済み view)
 //   JSON 入力: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json、view デコード
@@ -143,7 +143,14 @@ web.body_str(c)      -> Result<str, Error>    //   body_str = `.as_str()`(検証
 //   ヘッダー lookup は `body` のような単一の保存 view には乗らない。raw head の view フィールド +
 //   pkg.web 側の RFC 9110 lookup(std.http の lookup の複製 — One way に反する)か、パース済み
 //   ヘッダーテーブルを切り離した view として公開する std.http enabler(理想形 — 例:Ctx が運べる
-//   view 値としての `ctx.headers()`)が要る。enabler を先に設計すること。第二の lookup は出荷しない。
+//   view 値としての `ctx.headers()`)が要る。
+//   **enabler は 2026-07-21 に設計済み — `std-design/http.md` の item 10。** 切り離した view が勝った:
+//   `ctx.headers() -> http_headers`(Copy で region 束縛の非所有 view。その表現は ctx ポインタ
+//   **そのもの**なので、`hs.get(name)` は既存のランタイム lookup を再利用し、ランタイムのコードは
+//   一切増えない)、`Ctx` はこれをもう 1 つのフィールドとして運び、
+//   `web.header(c, name) = c.headers.get(name)` が転送する。pkg.web は自前の lookup を**一切**出荷
+//   しない。lookup の綴りを 1 つに保つため、`ctx.header(name)` は std.http 側で
+//   `ctx.headers().get(name)` に**置換**される。
 
 // レスポンダ（Pure。レスポンスを**組み立てる**だけでリクエストハンドルに触れないので、ハンドラは
 // アクセサとレスポンダを任意の順序で何度でも呼べる）

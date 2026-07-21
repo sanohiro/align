@@ -61,11 +61,29 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **`web.header(c, name)` — the most visible REST hole.** Still not shipped, and NOT ordinary
-   work: an arbitrary-name lookup cannot ride a single stored view, so it needs a std.http enabler
-   (a detached headers-view value the Copy `Ctx` can carry). **Design the enabler first**, in
-   `std-design/http.md`; do not duplicate the lookup in pkg.web. The note is already in
-   `pkg-design/web.md` (ctx accessors block).
+1. **`web.header(c, name)` — enabler DESIGNED 2026-07-21 (`std-design/http.md` item 10);
+   IMPLEMENTATION is the next step.** The detached view won: `ctx.headers() -> http_headers`, a
+   Copy, region-bound, non-owning view **whose representation is the ctx pointer**, so `hs.get(name)`
+   lowers to the runtime lookup that already exists — **the enabler adds no runtime code at all**.
+   `ctx.header(name)` is REPLACED by `ctx.headers().get(name)` (no Align call sites today, so one
+   spelling costs nothing); `Ctx` carries the view as one more field and `web.header` forwards.
+   Two things the design turns on, both measured on today's compiler, not assumed:
+   - **The region rule must SPLIT.** `region_of`'s `HttpCtx*` arm caps at `Frame.shorter(ctx)`;
+     inherited by the lookup that cap rejects the pkg.web wrapper outright (verified). So
+     `ctx.headers()` keeps the cap (a view minted from a local handle stays in the frame) and
+     `hs.get(name)` inherits `region_of(hs)` — `Static` through a parameter, exactly as `str`
+     and `slice` views already behave there.
+   - **A new `Ty` is only forced through FOUR passes** (`ty_mentions_slice`, `tracks_region`, two
+     `ty_name`s); everything else fails OPEN. Three fatal misses: `ty_may_borrow` **and**
+     `borrow_sources_inner` (a PAIR — either one alone gives the same silent use-after-free when
+     `hs.get()` follows `ctx.respond(rb)`; note `borrow_sources_inner` is the one pass out of nine
+     that a new `ExprKind` does NOT force, and a struct with `str` fields masks the hole, so the test
+     must use a bare local), and `scalar_type`'s pointer arm (falls through to `i32`, the bug
+     `Ty::Fn` already had). No `Scalar` variant, which keeps the view out of payloads and array
+     elements fail-closed. Item 10 carries the full checklist, the dispatch/effect traps (`"get"` is
+     already claimed by the box-`get` catch-all; the place-gate must NOT be inherited; Pure), the
+     rejected alternatives, and the test matrix. An adversarial pass over the design found no escape
+     route the shipped machinery does not already close.
 2. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
    is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
    `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize

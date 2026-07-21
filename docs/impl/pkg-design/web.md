@@ -149,7 +149,7 @@ web.param(c, name)   -> str              // named :param capture (fixed slot arr
                                          //   a name not in the pattern is a startup-checkable
                                          //   bug → abort at tree build if statically absent)
 web.query(c, name)   -> Option<str>      // std.http query floor (percent-decoded per RFC 3986)
-web.header(c, name)  -> Option<str>      // NOT SHIPPED YET — see the note below
+web.header(c, name)  -> Option<str>      // NOT SHIPPED YET — enabler DESIGNED, see the note below
 web.body(c)          -> slice<u8>        // SHIPPED 2026-07-21: `Ctx.body` carries the zero-copy
 web.body_str(c)      -> Result<str, Error>    //   view; body_str = `.as_str()` (validated view)
 //   JSON in: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json, view-decoding
@@ -158,7 +158,12 @@ web.body_str(c)      -> Result<str, Error>    //   view; body_str = `.as_str()` 
 //   either a raw-head `str`/`slice<u8>` view field + a pkg.web-side RFC 9110 lookup (duplicating
 //   std.http's, against One way), or a std.http enabler exposing the parsed header table to a
 //   detached view (the ideal shape — e.g. `ctx.headers()` as a view value the Ctx can carry).
-//   Design the enabler first; do not ship a second lookup.
+//   **ENABLER DESIGNED 2026-07-21 — `std-design/http.md` item 10.** The detached view won:
+//   `ctx.headers() -> http_headers` (a Copy, region-bound, non-owning view whose representation IS
+//   the ctx pointer, so `hs.get(name)` reuses the existing runtime lookup and adds no runtime code
+//   at all), `Ctx` carries it as one more field, and `web.header(c, name) = c.headers.get(name)`
+//   forwards. pkg.web ships NO lookup of its own. `ctx.header(name)` is REPLACED by
+//   `ctx.headers().get(name)` in std.http so the lookup keeps one spelling.
 
 // responders (Pure; they BUILD a response — they do not touch the request handle, so a handler may
 // call accessors and responders in any order)

@@ -673,6 +673,124 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      the parked connection. One-request-per-connection clients must say `Connection: close` (the
      driver tests' shared `one_shot` helper) or frame their read by `Content-Length`.
 
+10. **`ctx.headers()` — the detached header-table view — DESIGNED 2026-07-21, not yet built**
+    (consumer = `pkg.web`'s `web.header(c, name)`, `pkg-design/web.md` → ctx accessors).
+
+    **The problem, precisely.** A framework's per-request context is a **Copy struct of views that
+    owns nothing** — pkg.web's `Ctx` exists in that shape for load-bearing reasons (an owning `Ctx`
+    would be consumed by its own accessors, and a failed handler would have consumed the handle the
+    framework still needs to answer 500 through). Every other accessor rides a view the struct can
+    carry: `method`/`path`/`query` are `str`, `body` is `slice<u8>`. **A header lookup cannot,
+    because the name is not known until the handler asks** — the value being borrowed is the whole
+    parsed table, not one span. So either the framework re-implements RFC 9110 lookup over a raw
+    head view (a second implementation of something std.http already has — against One way), or
+    std.http hands out a value that IS the table, borrowed. This is that value.
+
+    - **① Surface.** `ctx.header(name)` is **replaced** — not supplemented — so the lookup has one
+      spelling:
+      ```text
+      ctx.headers() -> http_headers        // a Copy, non-owning VIEW of the parsed header table;
+                                           // region-bound to ctx exactly like ctx.body()
+      hs.get(name: str) -> Option<str>     // RFC 9110 §5.1 case-insensitive lookup; the returned
+                                           // str views the request buffer, region-bound to `hs`
+      ```
+      `ctx.header(name)` becomes `ctx.headers().get(name)` at every call site (there are no Align
+      ones outside the docs — this costs nothing today and buys one mechanism forever). The parsed
+      **response** keeps `resp.header(name)`: nothing needs to detach it from a value the caller
+      already owns, and a shared view type would have to carry a discriminant for two unrelated
+      runtime structs. That asymmetry is deliberate and recorded here rather than papered over.
+    - **② Representation: the ctx pointer itself.** `align_rt_http_ctx_header` already takes
+      `*const HttpRequestCtx` + the name and writes an `AlignStr` — so the view is *the same
+      pointer*, and `hs.get(name)` lowers to **the existing call**. **No runtime code is added at
+      all**; `ctx.headers()` lowers to `Rvalue::Use` of the ctx operand. The whole enabler is a
+      type-system change.
+    - **③ The type: `Ty::HttpHeaders` — Copy, non-owning, region-tracked.** The precedent to copy is
+      `Ty::JsonDoc`/`Ty::JsonScanner` (Copy + `tracks_region` + `ty_may_borrow`), not the Move
+      handles. It is a bare 8-byte pointer, which no Copy type is today, so `ty_size_align` needs its
+      own `(8, 8)` arm rather than the `(16, 8)` catch-all.
+    - **④ Region semantics — the one line the whole design turns on.** `region_of`'s
+      `HttpCtxMethod | HttpCtxPath | HttpCtxHeader | HttpCtxBody` arm caps the result at
+      `Frame.shorter(region_of(ctx))`. Inherited by the lookup, that cap makes
+      `fn header(c: Ctx, name: str) -> Option<str> = c.headers.get(name)` — the pkg.web wrapper, and
+      the whole point — **reject at compile time** ("cannot return a view that borrows local
+      storage"). Verified on today's compiler with the equivalent `ctx.header` wrapper. So the two
+      operations must be split:
+      - `ctx.headers()` (**new** `ExprKind::HttpCtxHeaders`) keeps the cap: `Frame.shorter(region_of(ctx))`.
+        A view minted from a local handle cannot leave the frame that owns the handle.
+      - `hs.get(name)` (the **existing** `ExprKind::HttpCtxHeader`, its operand re-pointed from the
+        handle to the view) **inherits**: `region_of(hs)`. Through a parameter — where the caller
+        provably outlives the call — that is `Static`, and the wrapper compiles. This is exactly the
+        rule `str`/`slice` views already follow through parameters; it is not a new exception.
+    - **⑤ The soundness checklist a new `Ty` does NOT get for free.** Adding a `Ty` variant is
+      compiler-forced through **four** passes (`ty_mentions_slice`, `tracks_region`, and the two
+      `ty_name`s). Everything else is a `matches!` list or a `_ =>` arm that fails **open**. Three
+      are fatal if missed, and the first two are a PAIR — either one alone produces the same silent
+      use-after-free (`hs := ctx.headers()` … `ctx.respond(rb)?` … `hs.get("host")` reading a freed
+      buffer):
+      - **`ty_may_borrow`** — without it the `Let` records no borrow provenance for the view at all.
+      - **`borrow_sources_inner`** — its tail is `_ => BorrowRoots::new()`, so a new `ExprKind` is
+        NOT forced here even though the other eight passes are exhaustive. `HttpCtxHeaders` must map
+        to the ctx's storage roots. (The existing `HttpCtxHeader` arm already reads
+        `storage_roots(operand)` and needs no change — `storage_roots`'s `_ => borrow_sources(e)`
+        fallthrough then chains a temporary view correctly, given the two additions above.)
+      - **`scalar_type`'s pointer arm** — miss it and the `_ =>` falls through to `int_type`'s
+        `_ => i32`, silently truncating a pointer. This exact bug already happened once for
+        `Ty::Fn`.
+      Then: `is_field_ok` (or `Ctx` cannot carry it), `resolve_type` — as a **global surface name**,
+      no import required, like `http_request_ctx`/`response_builder`/`http_stream`, so that
+      `pkg.web.types` stays the dependency-free leaf it is designed to be — and `ty_size_align`.
+      **`ty_size_align` is lint precision, not safety:** its only consumer is the huge-struct-copy
+      lint; the real layout comes from `scalar_type` + `field_abi_align` (`_ => 8`, already right).
+      Note `Ty::HttpRequestCtx` — a shipped struct-field type — has the same 16-vs-8 over-report
+      today; fix both, and add rows to `sema_and_codegen_struct_layout_agree`, which is a
+      hand-written table with no row for a Move-handle, `Ty::Fn`, or `Ty::Slice` field either.
+      Deliberately **not** added: `ty_is_move`, `is_owned_droppable`, `handle_free_fn`,
+      `null_moved_source`, `ty_owns_buffer_rec` (it must not make its enclosing struct Move), and —
+      importantly — **no `Scalar` variant**, which keeps the view out of `Option`/`Result` payloads
+      and array elements by fail-closed default (worth a tailored diagnostic: today it reports
+      "must be a scalar (composite payloads are not supported yet)", which is the right answer with
+      the wrong story).
+    - **⑥ Dispatch and effect, both easy to get wrong.** `"get"` is already claimed by a catch-all
+      arm (`"get" if recv_ty != Ty::HttpClient => check_box_get`), which would swallow `hs.get(name)`
+      into a *"'get' takes no arguments"* diagnostic — a bad message, not a build failure, so nothing
+      catches it. The new arm goes **above** it, exactly where the `json.doc` arm sits for the same
+      reason. The receiver **place-gate** (`Local | Field`) that `check_http_ctx_method` applies must
+      be kept for `ctx.headers()` (it still rejects `srv.accept()?.headers()`) and **not** inherited
+      by `hs.get(name)` — the mandated spelling `ctx.headers().get(name)` has a non-place receiver,
+      and the view owns nothing to drop. MIR routes through the `lower_http` dispatch list, not a new
+      inline arm in `lower_expr` (the `expr_depth` headroom note, #296). Effect: **Pure** — a pointer
+      copy, and the lookup is a read-only scan of an immutable buffer, which is what lets a handler
+      reading headers stay legal under `par_map`/`task_group`.
+    - **⑦ Not in v1: iteration.** `hs.count()`/`hs.name(i)`/`hs.value(i)` would serve a proxy that
+      forwards every header, and the runtime already has the spans. It is deferred, not rejected:
+      lookup is the REST need, and each accessor is another node in a `Ty` sweep that fails open. If
+      a consumer needs enumeration, it is three sibling nodes on the same view — no new type.
+    - **⑧ Alternatives, rejected with reasons.** *Pre-extract the headers into a `slice<str>` field*
+      (no new `Ty` at all) is the strongest one and loses twice: the runtime holds offset spans, not
+      `AlignStr`s, so materializing the slice is **an allocation per request** — on the 4.1 µs budget
+      that is the current perf target — and the lookup would then live in pkg.web, a second RFC 9110
+      implementation. *Let `Ctx` borrow the `http_request_ctx`* is dead on arrival: the handle is
+      Move, so `Ctx` becomes Move and every reason recorded in `types.align` reappears.
+      *Generalize to a full detached request view* (`.method()/.path()/.body()` on one value) is the
+      natural "shouldn't this generalize?" question and loses today: those three already work on the
+      handle, pkg.web's `path`/`query`/`pattern` are DERIVED rather than passed through, so `Ctx`
+      would not collapse anyway, and each extra accessor is another node through a sweep that fails
+      open. The name stays header-shaped because that is what it is for.
+    - **Test matrix (spec):** wrapper-through-parameter compiles and returns the view (the property
+      that motivates the split); a view minted from a LOCAL handle cannot be returned, nor `break`
+      out of a loop, nor survive its ctx across a `serve` iteration; `hs.get()` after
+      `ctx.respond(rb)` is a compile error — on a **bare local**, since any `str` field in an
+      enclosing struct supplies a borrow root and masks the hole; `hs.get()` inside a **stream pump**
+      AFTER `ctx.respond_stream(rb)` must **compile and work** (that path borrows the ctx and never
+      frees it); case-insensitive hit + miss (`Option`) E2E through pkg.web; the view as an array
+      element / `Option` payload is rejected; a `Ctx` carrying it stays Copy (no drop emitted, no
+      double free) with a struct-layout row asserting sema and codegen agree.
+    - **⑨ Removal sweep for `ctx.header(name)`.** Zero Align call sites anywhere (no `.align` file,
+      no Rust-embedded test program) — confirmed. What changes: this file (§ surface + Slice
+      breakdown), its ja mirror, `docs/open-questions.md`, and the compiler sites — the method
+      dispatch arm, `check_http_ctx_method`'s `"header"` case, and the "try method / path / header /
+      …" suggestion string. `rb.header` / `r.header` / `resp.header` are different receivers and stay.
+
 ## Known v1 limitations (Slice 2/3/5)
 
 - **HTTPS is CLIENT-SIDE ONLY (Slice 5).** Server-side TLS is deferred — `http.serve` is plaintext,
