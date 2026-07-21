@@ -585,3 +585,147 @@ fn main() -> i32 {
          `arena_end`). If it now checks, borrow liveness gained the ownership bit — flip this."
     );
 }
+
+// --- The other half of a loop iteration's drop set: MIR's HIDDEN owners. A Move value with no
+// binding of its own (`"…".clone()`, a call result, a just-materialized array) gets a synthetic
+// owner slot whose cleanup joins the innermost loop frame, so it is freed by the same two edges as
+// a named local. Sema records those as `BorrowRoot::IterTemp(depth)` — the source has no `LocalId`
+// to name, which is exactly why the first cut of the scope-end-drop rule missed it.
+
+#[test]
+fn a_view_of_an_unbound_temporary_dies_at_the_iteration_edge() {
+    // No helper function, no std handle, no `unsafe`: this printed freed heap bytes.
+    let src = "\
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    print(keep)
+    keep = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\".clone()
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-loop-temp-clone", src);
+    assert!(
+        diags.contains("it borrows a temporary value created inside the loop"),
+        "a view of an unbound Move temporary must be rejected at the iteration edge, and say so \
+         (the source has no name to report): {diags}"
+    );
+}
+
+#[test]
+fn every_shape_that_materializes_a_temporary_owner_is_covered() {
+    // One assertion per way to produce an unbound Move value that a view can point into: a direct
+    // call, a view-returning call *over* a temporary, `?`-unwrapping one, and a materialized array
+    // sliced in place. All four printed garbage before the `IterTemp` root existed.
+    let cases: [(&str, &str); 4] = [
+        ("call", "keep = mk(\"AAAAAAAAAAAAAAAAAAAAAAAA\")"),
+        ("view-of-temp", "keep = identity(mk(\"AAAAAAAAAAAAAAAAAAAAAAAA\"))"),
+        ("try", "keep = mkr(\"AAAAAAAAAAAAAAAAAAAAAAAA\")?"),
+        ("array-slice", "ks = [1, 2, 3].map(dbl).to_array()[..]"),
+    ];
+    for (name, assign) in cases {
+        let (decl, read) = if name == "array-slice" {
+            ("mut ks: slice<i64> := [0][..]", "print(ks[0])")
+        } else {
+            ("mut keep: str := \"start\"", "print(keep)")
+        };
+        let src = format!(
+            "fn mk(a: str) -> string = a.clone()\n\
+             fn identity(s: str) -> str = s\n\
+             fn mkr(a: str) -> Result<string, Error> = Ok(a.clone())\n\
+             fn dbl(x: i64) -> i64 = x * 2\n\
+             fn run() -> Result<i32, Error> {{\n  {decl}\n  mut n := 0\n  loop {{\n    {assign}\n    \
+             n = n + 1\n    if n > 3 {{ break }}\n  }}\n  {read}\n  return Ok(0)\n}}\n\
+             fn main() -> i32 = 0\n"
+        );
+        assert!(
+            check_errs(&format!("borrow-loop-temp-{name}"), &src),
+            "the `{name}` temporary must not outlive its iteration"
+        );
+    }
+}
+
+#[test]
+fn a_temporary_created_outside_a_loop_lives_to_function_exit() {
+    // The control for the depth rule: with no loop, the hidden owner is dropped only by the exit
+    // cleanup, and nothing outlives that — so binding a view to a bare temporary stays legal.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  v: str := mk(\"hello\")
+  print(v)
+  return v.len() as i32
+}
+";
+    assert!(!check_errs("borrow-temp-no-loop", src));
+
+    // ...and inside a loop, a temporary used only within the iteration that created it is fine too.
+    let same_pass = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut n := 0
+  loop {
+    v: str := mk(\"hello\")
+    n = n + v.len() as i32
+    if n > 100 { break }
+  }
+  return n
+}
+";
+    assert!(!check_errs("borrow-temp-same-iteration", same_pass));
+}
+
+/// **KNOWN OVER-REJECTION, PRE-EXISTING — pinned here because the loop rule widened its reach.**
+///
+/// `ch[0]` is a `{ptr,len}` view into `data`, not into the chunks header: dropping (or reassigning)
+/// `ch` frees the header array only, and the bytes `keep` points at belong to `data`, which
+/// outlives both. `local_owns_view_storage` nevertheless counts a `DynSliceArray` local as owning
+/// its elements' storage, so the header contributes itself as a root and any end of its generation
+/// invalidates the element views.
+///
+/// This predates the scope-end-drop rule — the plain reassignment below is rejected on the same
+/// path `MoveCheck` has always had — but that rule made the far more common loop shape hit it too.
+/// The fix belongs with `local_owns_view_storage`, not here; changing it is a type-class question
+/// (which owned containers actually own the bytes their elements view) that deserves its own slice.
+#[test]
+fn over_rejects_a_view_into_the_source_of_a_dropped_chunks_header() {
+    // Pre-existing: no loop, just a reassignment of the header.
+    let reassign = "\
+fn dbl(x: i64) -> i64 = x * 2
+fn main() -> i32 {
+  data := [1, 2, 3, 4].map(dbl).to_array()
+  mut ch := data.chunks(2)
+  keep := ch[0]
+  ch = data.chunks(2)
+  return keep[0] as i32
+}
+";
+    assert!(
+        check_errs("borrow-chunks-reassign-over-reject", reassign),
+        "KNOWN OVER-REJECTION (pre-existing): `keep` views `data`, which is still live. If this now \
+         checks, `local_owns_view_storage` stopped over-claiming the header — flip both assertions."
+    );
+
+    // The loop shape the scope-end-drop rule exposed, same root cause.
+    let in_loop = "\
+fn dbl(x: i64) -> i64 = x * 2
+fn main() -> i32 {
+  data := [1, 2, 3, 4].map(dbl).to_array()
+  mut keep: slice<i64> := data[..]
+  mut n := 0
+  loop {
+    ch := data.chunks(2)
+    keep = ch[0]
+    n = n + 1
+    if n > 3 { break }
+  }
+  return keep[0] as i32
+}
+";
+    assert!(check_errs("borrow-chunks-loop-over-reject", in_loop));
+}

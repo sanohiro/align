@@ -2023,19 +2023,37 @@ loop {
 }
 ```
 
-**The fix mirrors MIR's actual drop points, and there is exactly one class of them inside a
-function.** `emit_drop_if_live` is emitted at: function exit (nothing follows), an `Assign`'s
-drop-of-old (already covered by the move path), a hidden owner after a **scalar-only** consumer (a
-view-returning consumer keeps the owner alive by construction), and the `loop` per-iteration set
-`loop_iter_drops` = `drop_locals ∩ body_locals`, at the **back-edge** and at **every `break`**.
-`MoveCheck::loop_moves` therefore ends the borrow generation of exactly that set — computed by
-`iteration_drops` from the shared `needs_drop_flag` boundary predicate that builds `Fn::drop_locals`,
-so sema cannot drift from MIR — on the state that reaches the loop head (probe pass + every fixpoint
-round) and on each `break` snapshot. The `break` invalidation applies to the snapshot only, since the
-statements this pass still walks after a `break` belong to the iteration that has not dropped yet.
-`BorrowState::invalid` now records *how* each generation ended (`BorrowEnd::Consumed` / `Dropped`) so
-the diagnostic says which; the join merges per owner by `Ord` (`Consumed` < `Dropped`), keeping it
-commutative for the fixpoint.
+**The fix mirrors MIR's actual drop points, and an iteration frees TWO kinds of storage — the second
+was missed by the first cut and caught by the adversarial review.** `emit_drop_if_live` is emitted
+at: function exit (nothing follows), an `Assign`'s drop-of-old (already covered by the move path),
+a hidden owner after a **scalar-only** consumer (a view-returning consumer keeps that owner alive),
+and the `loop` per-iteration set at the **back-edge** and at **every `break`**. That set is *not*
+just `drop_locals ∩ body_locals`: `Builder::new_synthetic_owner` also pushes the hidden owner of
+every **unbound Move temporary** into the innermost loop frame, and `lower_loop` deliberately
+re-reads the final frame at the back-edge for exactly that reason. A temporary has no `LocalId`, so a
+rule keyed on locals cannot see it:
+
+```align
+mut keep: str := "start"
+loop {
+  print(keep)
+  keep = "AAAA…".clone()   // the clone is a temporary — freed at the back-edge and at `break`
+}
+```
+
+`MoveCheck` therefore ends **both** at every iteration edge. `BorrowRoots` became a set of
+`BorrowRoot::Local(id) | IterTemp(depth)`: the named half comes from `iteration_drops` via the shared
+`needs_drop_flag` predicate that builds `Fn::drop_locals`, and the anonymous half from
+`temp_owner_root`, which applies MIR's own materialization condition — `needs_drop_flag` **+
+`may_need_synthetic_owner`**, the latter moved into sema so both stages share one definition. Depth
+is all the identity a temporary needs: every temporary at a given loop depth is freed by that loop's
+two edges. Outside any loop the hidden owner lives to function exit, so no root is recorded there.
+The invalidation runs on the state that reaches the loop head (probe pass + every fixpoint round) and
+on each `break` snapshot — the latter to the snapshot only, since the statements this pass still
+walks after a `break` belong to the iteration that has not dropped yet. `BorrowState::invalid`
+records *how* each generation ended (`BorrowEnd::Consumed` / `Dropped`) so the diagnostic says which,
+and names the source when it has a name; the join merges per root by `Ord` (`Consumed` < `Dropped`),
+keeping it commutative for the fixpoint.
 
 **Two claims in the original write-up were wrong, and the corrections matter more than the bug.**
 ① "The inner scope need not be a loop — an `arena {}` block does it too" is **false**, in both
@@ -2071,15 +2089,26 @@ in the checked-HIR escape CFG (#461–#464), which already carries regions, allo
 loop fixpoints. Pinned as `over_rejects_a_view_of_an_arena_allocated_loop_local` in
 `tests/borrow_liveness.rs`; flip it when the analysis moves.
 
+**A second, pre-existing over-rejection the loop rule widened**, also pinned
+(`over_rejects_a_view_into_the_source_of_a_dropped_chunks_header`): `ch[0]` is a `{ptr,len}` view
+into the *source* array, not into the chunks header, yet `local_owns_view_storage` counts a
+`DynSliceArray` local as owning its elements' storage — so ending the header's generation invalidates
+the element views. Rejected on plain reassignment long before this change; the loop rule only made
+the common shape hit it. The fix belongs with `local_owns_view_storage` (which owned containers
+actually own the bytes their elements view — a type-class question), not with borrow liveness.
+
 The variant where the loop **consumes** the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
 shipped serve loop was always safe) was already rejected by the move path. Coverage: the flipped
 `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
-`known_hole_scope_end_drop_…`) in `tests/http_headers_view.rs`, plus six tests in
-`tests/borrow_liveness.rs` — back-edge, `break` edge, and the controls that keep the rule from
-over-rejecting: same-iteration use, a source declared outside the loop, an inner `break` that must
-drop only the inner body's locals, and an owned local *moved out* by `break` (its flag is cleared, so
-it is not a freed source). Mutation-checked: neutering `invalidate_iteration_drops` fails exactly the
-four positive tests and no control.
+`known_hole_scope_end_drop_…`) in `tests/http_headers_view.rs`, plus eleven tests in
+`tests/borrow_liveness.rs` — back-edge, `break` edge, all four temporary-materializing shapes (a
+call, a view-returning call *over* a temporary, `?` on one, a materialized array sliced in place),
+and the controls that keep the rule from over-rejecting: same-iteration use of a local and of a
+temporary, a temporary outside any loop, a source declared outside the loop, an inner `break` that
+must drop only the inner body's locals, and an owned local *moved out* by `break` (its flag is
+cleared, so it is not a freed source). Mutation-checked in three places — neutering
+`invalidate_iteration_drops`, `temp_owner_root`, or the `IterTemp` arm of the edge each fails exactly
+the corresponding positive tests and no control.
 
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`

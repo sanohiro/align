@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -2234,21 +2234,6 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
             block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
         }
         _ => lowered_drop_flag(b, e, operand),
-    }
-}
-
-/// Whether a borrowing use can select a fresh owned value. Direct bound places are borrowed; a
-/// block is transparent. Control-flow nodes are conservatively eligible and their per-path runtime
-/// temporary bit prevents a bound arm from being dropped.
-fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
-    match &e.kind {
-        hir::ExprKind::Local(_)
-        | hir::ExprKind::Field { .. }
-        | hir::ExprKind::TupleIndex { .. }
-        | hir::ExprKind::Index { .. }
-        | hir::ExprKind::ElemField { .. } => false,
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block.value.as_ref().is_some_and(|value| may_need_synthetic_owner(value)),
-        _ => true,
     }
 }
 

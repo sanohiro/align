@@ -76,17 +76,31 @@ when its source was moved or reassigned; it never noticed the source being **fre
 assigned out of a loop body to a longer-lived local read the previous iteration's freed buffer. No
 `unsafe`, no std handle: `mut keep: str := "start"` + `loop { print(keep); owned := mk("hello"); keep
 = owned }` printed heap garbage on `main`.
-- **The fix is a mirror of MIR, not a new policy.** MIR emits exactly one class of early drop inside
-  a function: a `loop`'s per-iteration set (`loop_iter_drops` = `drop_locals ∩ body_locals`) at the
-  **back-edge** and at **every `break`**. (The other `emit_drop_if_live` sites are function exit —
-  nothing follows; an `Assign`'s drop-of-old — already the move path's; and a hidden owner after a
-  *scalar-only* consumer — a view-returning consumer keeps its owner alive by construction.)
-  `loop_moves` now ends that set's borrow generation on the state reaching the loop head (probe +
-  every fixpoint round) and on each `break` snapshot. The drop set comes from `needs_drop_flag`, the
-  same shared predicate that builds `Fn::drop_locals`, so sema cannot drift from MIR.
+- **The fix is a mirror of MIR, not a new policy** — and an iteration frees **two** kinds of
+  storage, which is where the first cut of this fix was wrong (see the correction below). Named:
+  `drop_locals ∩ body_locals`. Anonymous: `Builder::new_synthetic_owner` pushes the hidden owner of
+  every **unbound Move temporary** into the innermost loop frame too, and `lower_loop` re-reads the
+  final frame at the back-edge for exactly that reason. Both are freed at the **back-edge** and at
+  **every `break`**. (The other `emit_drop_if_live` sites are function exit — nothing follows; an
+  `Assign`'s drop-of-old — already the move path's; and a hidden owner after a *scalar-only*
+  consumer — a view-returning consumer keeps its owner alive.) `MoveCheck` now ends both:
+  `BorrowRoots` is a set of `BorrowRoot::Local(id) | IterTemp(depth)`, the named half from
+  `iteration_drops` via the shared `needs_drop_flag` predicate behind `Fn::drop_locals`, the
+  anonymous half from `temp_owner_root` via MIR's own materialization condition (`needs_drop_flag` +
+  `may_need_synthetic_owner`, the latter **moved into sema** so the two stages share one definition).
+  Depth is all the identity a temporary needs — every temporary at a depth dies on that loop's two
+  edges; outside a loop the hidden owner lives to function exit, so nothing is recorded.
 - `BorrowState::invalid` records **how** each generation ended (`Consumed` / `Dropped`) so the
-  diagnostic names the right cause; the join merges per owner by `Ord`, keeping it commutative for
-  the fixpoint.
+  diagnostic names the right cause, and names the source when it *has* a name (a temporary's message
+  instead says to bind the owned value to a local outside the loop); the join merges per root by
+  `Ord`, keeping it commutative for the fixpoint.
+- **The first cut of THIS fix shipped a false claim, and the adversarial reviewer killed it.** The
+  commit message asserted "MIR emits exactly one class of early drop" and that hidden owners are safe
+  "by construction". Both wrong: `keep = "AAAA…".clone()` inside a loop — no helper, no std handle —
+  still printed freed heap bytes after the first cut, as did a call result, a view-returning call
+  over a temporary, a `?`-unwrapped one, and a materialized array sliced in place. **A drop-site
+  enumeration is a claim to verify against the emitter, not to reason out.** The mandatory
+  independent adversarial pass is what caught it; do not skip it.
 - **Two claims in the original write-up were wrong, and that is the reusable lesson** (same shape as
   the #597 test-hang guess): ① the `arena {}` variant is **not an instance of this bug** — a
   heap-owned local bound inside `arena {}` is dropped at *function* exit (`emit-mir` shows the drop
@@ -104,13 +118,21 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   not breakage). The real fix is the recorded structural follow-up — borrow liveness belongs in the
   checked-HIR escape CFG (#461–#464), which already has regions, provenance, and loop fixpoints.
   Pinned as `over_rejects_a_view_of_an_arena_allocated_loop_local`.
+- **A second, pre-existing over-rejection the loop rule widened**, also pinned: `ch[0]` views the
+  *source* array, not the chunks header, yet `local_owns_view_storage` counts a `DynSliceArray` local
+  as owning its elements' storage — so ending the header's generation kills the element views. It is
+  rejected on plain reassignment with no loop in sight (verified), so the loop rule only made the
+  common shape hit it; the fix belongs with `local_owns_view_storage`.
+  Pinned as `over_rejects_a_view_into_the_source_of_a_dropped_chunks_header`.
 - Tests: the flipped `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
-  `known_hole_scope_end_drop_…`), plus six in `tests/borrow_liveness.rs` — back-edge, `break` edge,
-  and the controls that keep the rule from over-rejecting: same-iteration use, a source declared
+  `known_hole_scope_end_drop_…`), plus eleven in `tests/borrow_liveness.rs` — back-edge, `break`
+  edge, all four temporary shapes, and the controls that keep the rule from over-rejecting:
+  same-iteration use of a local and of a temporary, a temporary outside any loop, a source declared
   outside the loop, an inner `break` dropping only the inner body's locals, and an owned local
-  **moved out** by `break`. Mutation-checked (neutering the invalidation fails exactly the four
-  positive tests, no control). Whole workspace green, clippy clean; **zero false positives** — the
-  only test the fix broke was the pinned known hole.
+  **moved out** by `break`. Mutation-checked in three places (the local set, `temp_owner_root`, and
+  the `IterTemp` edge arm), each failing exactly its own positive tests and no control. Whole
+  workspace green (2597 passed), clippy clean; **zero false positives** — the only pre-existing test
+  the fix broke was the pinned known hole.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
 (`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->
