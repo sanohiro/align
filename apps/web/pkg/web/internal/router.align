@@ -25,23 +25,37 @@ pub fn seg_end(s: str, start: i64) -> i64 {
 }
 
 // A specificity score >= 0 if `path` matches `pattern`, or -1 if it does not. A higher score is a
-// more specific match: each segment folds into `score * 3 + w` left-to-right with w = 2 (static),
-// 1 (`:param`); a `*wildcard` ends the walk without adding, so a wildcard match always scores below
-// a static/param match that reaches further. The `* 3` positional fold makes an earlier static beat
-// a later one, i.e. static > param > wildcard is decided left-to-right (no backtracking), exactly
-// as the radix tree walks it. Distinct patterns that both match one path always get distinct scores
-// (they must differ in some segment's kind or literal), so `dispatch` never ties.
+// more specific match. The score is **fixed-width base-3, left-aligned to the PATH's segment count
+// D**: position i (left to right) carries weight w_i * 3^(D-1-i) with w = 2 (static), 1 (`:param`),
+// and 0 for the `*wildcard` position and everything it absorbs. Fixed width is what makes the
+// comparison LEXICOGRAPHIC left-to-right — the first position where two matching patterns differ
+// decides, regardless of how deep either continues — so static > `:param` > `*wildcard` at the
+// first divergence is exactly the radix tree's backtracking try-order, and `dispatch`'s max equals
+// the walk's first success. (The earlier fold left a wildcard match un-shifted — a MAGNITUDE
+// comparison — so a deep all-param chain outranked `/assets/*file` on `/assets/logo`, which both
+// the tree and the httprouter/matchit/Fiber reference route to the wildcard row; the #591
+// re-review caught it, and the shift restores the documented left-to-right intent.) Distinct
+// patterns that both match one path score distinctly unless they differ only in parameter NAMES —
+// effective duplicates, where first-registered wins on both sides.
 //
-// The `* 3` fold grows the score as ~3^depth, so it assumes a realistically bounded path depth (a
-// depth beyond ~39 segments would wrap i64 — Align's defined two's-complement wrap — and could then
-// mis-rank; real URLs are a handful of segments deep). This is a property of the scoring *oracle*
-// only; the radix tree walks segment-by-segment and carries no such bound.
+// Weights occupy 3^depth, so the oracle assumes a realistically bounded path depth (beyond ~39
+// segments the i64 wraps — Align's defined two's-complement wrap — and could mis-rank; real URLs
+// are a handful of segments deep). Oracle-only property; the tree walk carries no such bound.
 pub fn match_score(pattern: str, path: str) -> i64 {
   plen := pattern.len()
   xlen := path.len()
+  // D = the path's total segment count (the fixed score width).
+  mut d := 0
+  mut t := 0
+  loop {
+    if t >= xlen { break }
+    t = seg_end(path, t + 1)
+    d = d + 1
+  }
   mut pp := 0
   mut xp := 0
   mut score := 0
+  mut k := 0
   loop {
     p_done := pp >= plen
     x_done := xp >= xlen
@@ -55,9 +69,17 @@ pub fn match_score(pattern: str, path: str) -> i64 {
     pseg := pattern[pp + 1 .. pe]
     xseg := path[xp + 1 .. xe]
     if pseg.starts_with("*") {
-      // Trailing wildcard: it absorbs the remainder of the path (which is non-empty here, since
-      // `x_done` was false). Lowest priority — the walk stops without folding in a segment weight.
-      break score
+      // Trailing wildcard: it absorbs the remainder of the path (non-empty here, since `x_done`
+      // was false) at weight 0. Left-align: shift the folded prefix over the D - k zero positions
+      // the wildcard covers, so the comparison stays lexicographic (see the header comment).
+      mut sh := score
+      mut rem := d - k
+      loop {
+        if rem <= 0 { break }
+        sh = sh * 3
+        rem = rem - 1
+      }
+      break sh
     }
     if pseg.starts_with(":") {
       // A `:param` matches exactly one NON-empty segment.
@@ -72,6 +94,7 @@ pub fn match_score(pattern: str, path: str) -> i64 {
         break -1
       }
     }
+    k = k + 1
     pp = pe
     xp = xe
   }
@@ -110,13 +133,16 @@ pub fn dispatch(patterns: slice<str>, path: str) -> i64 {
 //
 // The walk tries static > `:param` > `*wildcard` at every node **with backtracking** (matchit
 // semantics): if the preferred branch dead-ends deeper in the path, the walk unwinds and tries the
-// next alternative. First success = the oracle's max `match_score`: the score fold is base-3
-// left-to-right lexicographic on segment weights (static 2 > param 1 > wildcard stop), so at the
-// first node where two matching routes diverge the static one outranks the param one outranks the
-// wildcard regardless of what follows — exactly the walk's try order. (The earlier no-backtracking
-// walk silently 404'd route sets like {`/a/featured`, `/a/:id/versions`} on `/a/featured/versions`,
-// where the linear oracle — production dispatch before the tree — matched; backtracking restores
-// oracle equivalence for EVERY table, so no route-set shape needs a build-time ambiguity abort.)
+// next alternative. First success = the oracle's max `match_score`: the score is fixed-width
+// base-3 on segment weights (static 2 > param 1 > wildcard 0, left-aligned to the path's depth),
+// i.e. LEXICOGRAPHIC left-to-right — at the first node where two matching routes diverge the
+// static one outranks the param one outranks the wildcard regardless of what follows, exactly the
+// walk's try order. (Two #591-review findings shaped this: the no-backtracking walk silently 404'd
+// {`/a/featured`, `/a/:id/versions`} on `/a/featured/versions`, which the linear oracle —
+// production dispatch before the tree — matched, so the walk backtracks; and the oracle's original
+// un-shifted fold was a MAGNITUDE comparison that sent `/assets/logo` to `/:cat/:slug` over
+// `/assets/*file`, against the httprouter/matchit/Fiber reference, so the oracle is left-aligned.
+// Equivalence now holds for EVERY table — no build-time ambiguity abort is needed.)
 
 // An `array<i64>` of length `m` filled with `v` — the SoA column allocator (`array_builder` is the
 // only runtime-sized array constructor; a fixed literal can't take a runtime length).

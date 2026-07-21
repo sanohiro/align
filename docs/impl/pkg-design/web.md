@@ -209,12 +209,17 @@ child (capture the segment view into the fixed slot array `params[i]`), else the
 beats param beats wildcard at EVERY node, **with backtracking** (matchit semantics — settled
 2026-07-21 by the #591 review): when the preferred branch dead-ends deeper in the path, the walk
 unwinds and tries the next alternative, so `{/a/featured, /a/:id/versions}` routes
-`/a/featured/versions` to the `:id` row. Try-order priority + the score fold's base-3
-left-to-right dominance make first-success equal the linear oracle's max `match_score` for EVERY
-table — no route-set shape needs a build-time ambiguity abort (an earlier draft said
-no-backtracking + abort; that abort would have rejected exactly such realistic tables, and the
-linear scan — production dispatch before the tree — already matched them). Duplicate
-(method, path) rows and conflicting param names remain build-time aborts.
+`/a/featured/versions` to the `:id` row. The oracle's `match_score` is **fixed-width base-3,
+left-aligned to the path's segment count** (static 2 / param 1 / wildcard 0, the wildcard's
+absorbed positions zero-filled) — i.e. genuinely lexicographic left-to-right, which makes the
+walk's first success equal the oracle's max for EVERY table, so no route-set shape needs a
+build-time ambiguity abort. (Two review findings settled this: an earlier draft said
+no-backtracking + abort, but that abort would have rejected exactly such realistic tables, and
+the linear scan — production dispatch before the tree — already matched them; and the oracle's
+original un-shifted fold compared MAGNITUDES, ranking `/:cat/:slug` over `/assets/*file` on
+`/assets/logo` against the httprouter/matchit/Fiber reference — the left-alignment fixed the
+oracle to the documented left-to-right intent.) Duplicate (method, path) rows and conflicting
+param names remain build-time aborts.
 `web.param(c, "name")` = linear scan of the ≤ n_params name views (n is tiny; no map).
 
 ## Prerequisites (compiler / std — the 土台)

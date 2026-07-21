@@ -70,14 +70,23 @@ Nothing there stands in for a missing compiler feature.
    by design decision (settled by the #591 adversarial review):** the earlier no-backtracking walk
    silently 404'd `{/a/featured, /a/:id/versions}` on `/a/featured/versions` — a set the linear
    scan (production before the tree) matched — and the once-planned build-time ambiguity abort
-   would have rejected that realistic table outright. Priority try-order + the base-3 score fold
-   make first-success == max `match_score` for EVERY table, so no ambiguity abort is needed
+   would have rejected that realistic table outright. **A second review finding then fixed the
+   ORACLE:** the original `match_score` fold compared MAGNITUDES (a wildcard match stayed
+   un-shifted), so a deep param chain outranked a static-prefix wildcard — `/:cat/:slug` beat
+   `/assets/*file` on `/assets/logo`, against the httprouter/matchit/Fiber reference AND the
+   fold's own documented left-to-right intent. `match_score` is now **fixed-width base-3,
+   left-aligned to the path's segment count** (wildcard = 0 at its position, absorbed positions
+   zero-filled → the folded prefix shifts by `3^(D-k)`), making it genuinely lexicographic;
+   first-success == max `match_score` now holds for EVERY table (the re-reviewer's 154-case fuzz
+   found the mismatch class; its fixtures are pinned), so no ambiguity abort is needed
    (duplicate-route / param-name-conflict aborts remain future W4 work). The W1 `slice<str>`
    `tree_dispatch` was REMOVED outright (one walker, one semantics). Tests:
-   `best_path_route_tree_agrees_with_the_linear_oracle` (incl. backtracking paths + same-pattern
-   GET/POST rows + the empty table) and `best_path_route_backtracks_from_a_static_dead_end`
-   (absolute indices). The build is still per call; hoisting the columns into `serve`'s scope
-   (build once, match per request over borrowed slices) is the remaining recorded follow-up.
+   `best_path_route_tree_agrees_with_the_linear_oracle` (backtracking paths + wildcard-vs-chain
+   rows + same-pattern GET/POST rows + the empty table),
+   `best_path_route_backtracks_from_a_static_dead_end`, and
+   `static_prefix_wildcard_outranks_a_param_chain` (absolute indices both sides). The build is
+   still per call; hoisting the columns into `serve`'s scope (build once, match per request over
+   borrowed slices) is the remaining recorded follow-up.
 3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
    `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
    accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.

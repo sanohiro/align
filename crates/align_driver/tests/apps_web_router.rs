@@ -67,7 +67,10 @@ fn match_score_semantics() {
     if !backend_available() {
         return;
     }
-    // match_score is the per-route reference: >= 0 (more specific = higher) on a match, -1 otherwise.
+    // match_score is the per-route reference: >= 0 (more specific = higher) on a match, -1
+    // otherwise. The score is fixed-width base-3, left-aligned to the path's segment count — a
+    // wildcard row's folded prefix is shifted over the zero positions it absorbs, so comparison is
+    // lexicographic left-to-right.
     let main = "module main\n\
 import pkg.web\n\
 fn main() -> Result<(), Error> {\n\
@@ -77,12 +80,15 @@ fn main() -> Result<(), Error> {\n\
   print(pkg.web.match_score(\"/a/:x\", \"/a/\"))                    // -1 (:param rejects an empty seg)\n\
   print(pkg.web.match_score(\"/a/\", \"/a\"))                       // -1 (trailing slash is exact)\n\
   print(pkg.web.match_score(\"/a/b\", \"/a\"))                      // -1 (path too short)\n\
-  print(pkg.web.match_score(\"/x/*rest\", \"/x/a/b\"))              //  2 (wildcard scores below param)\n\
+  print(pkg.web.match_score(\"/x/*rest\", \"/x/a/b\"))              // 18 (x=2 shifted over 2 zero segs)\n\
+  print(pkg.web.match_score(\"/x/:a/:b\", \"/x/a/b\"))              // 22 (beats the wildcard's 18...)\n\
+  print(pkg.web.match_score(\"/assets/*f\", \"/assets/logo\"))      //  6 (static 2 shifted once...)\n\
+  print(pkg.web.match_score(\"/:cat/:slug\", \"/assets/logo\"))     //  4 (...loses to the static+wild 6)\n\
   return Ok(())\n\
 }\n";
     let out = run_web("web-score", main);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n8\n7\n-1\n-1\n-1\n2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n8\n7\n-1\n-1\n-1\n18\n22\n6\n4\n");
 }
 
 #[test]
@@ -192,9 +198,11 @@ fn main() -> Result<(), Error> {\n\
 /// The route-TABLE radix tree (`best_path_route`, the production dispatch path) agrees with the
 /// linear `match_score` oracle (`best_path_route_linear`) on every path, including same-pattern
 /// rows that differ only in method (both sides must return the FIRST such row: shared leaf /
-/// strict `>`) and the BACKTRACKING shapes the adversarial review of #591 surfaced — a static
-/// branch that dead-ends where a sibling `:param` (or `*wildcard`) branch matches deeper
-/// (`/v1/models/featured/versions`, `/files/special/deep`).
+/// strict `>`) and the two shapes the #591 adversarial reviews surfaced: BACKTRACKING (a static
+/// branch that dead-ends where a sibling `:param`/`*wildcard` branch matches deeper —
+/// `/v1/models/featured/versions`, `/files/special/deep`) and the WILDCARD-vs-PARAM-CHAIN rank
+/// (`/assets/*file` must beat `/:cat/:slug` on `/assets/logo` — the un-shifted magnitude oracle
+/// disagreed with the tree and the httprouter/matchit reference until the fixed-width fix).
 #[test]
 fn best_path_route_tree_agrees_with_the_linear_oracle() {
     if !backend_available() {
@@ -241,8 +249,10 @@ fn main() -> Result<(), Error> {\n\
     pkg.web.get(\"/users/:uid/posts/:pid\", h),\n\
     pkg.web.get(\"/health\", h),\n\
     pkg.web.get(\"/files/special\", h),\n\
+    pkg.web.get(\"/assets/*file\", h),\n\
+    pkg.web.get(\"/:cat/:slug\", h),\n\
   ]\n\
-  paths := [\"/\", \"/v1/models\", \"/v1/models/42\", \"/v1/models/featured\", \"/v1/models/42/versions\", \"/files/a/b/c\", \"/files/x\", \"/users/7/posts/9\", \"/health\", \"/nope\", \"/v1\", \"/v1/models/\", \"/users/7/posts\", \"/files\", \"/v1/models/featured/versions\", \"/files/special\", \"/files/special/deep\"]\n\
+  paths := [\"/\", \"/v1/models\", \"/v1/models/42\", \"/v1/models/featured\", \"/v1/models/42/versions\", \"/files/a/b/c\", \"/files/x\", \"/users/7/posts/9\", \"/health\", \"/nope\", \"/v1\", \"/v1/models/\", \"/users/7/posts\", \"/files\", \"/v1/models/featured/versions\", \"/files/special\", \"/files/special/deep\", \"/assets/logo\", \"/x/y\", \"/assets/a/b\"]\n\
   mut mism := 0\n\
   mut i := 0\n\
   loop {\n\
@@ -316,4 +326,56 @@ fn main() -> Result<(), Error> {\n\
     let out = build_and_run_multi("web-table-backtrack", &refs, "main.align");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n1\n1\n2\n3\n-1\n");
+}
+
+/// The wildcard-vs-param-chain rank, ABSOLUTELY (the second #591 review finding): a static prefix
+/// reaching a `*wildcard` outranks a fully-dynamic `:param` chain at the same paths — the
+/// httprouter/matchit/Fiber semantics the tree walks natively and the left-aligned oracle now
+/// scores (`/assets/*file` 6 > `/:cat/:slug` 4 on `/assets/logo`). With an EQUAL static prefix the
+/// param branch still beats the wildcard (`/x/:a/:b` 22 > `/x/*rest` 18).
+#[test]
+fn static_prefix_wildcard_outranks_a_param_chain() {
+    if !backend_available() {
+        return;
+    }
+    let web_root = "module pkg.web\n\
+import pkg.web.types\n\
+import pkg.web.internal.router\n\
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+pub fn best(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
+  pkg.web.internal.router.best_path_route(routes, path)\n\
+pub fn best_linear(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
+  pkg.web.internal.router.best_path_route_linear(routes, path)\n";
+    let main = "module main\n\
+import std.http\n\
+import pkg.web\n\
+import pkg.web.types\n\
+fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = Ok(http.response(200))\n\
+fn main() -> Result<(), Error> {\n\
+  routes := [\n\
+    pkg.web.get(\"/assets/*file\", h),\n\
+    pkg.web.get(\"/:cat/:slug\", h),\n\
+    pkg.web.get(\"/x/*rest\", h),\n\
+    pkg.web.get(\"/x/:a/:b\", h),\n\
+  ]\n\
+  print(pkg.web.best(routes, \"/assets/logo\"))        // 0 (static+wildcard beats the param chain)\n\
+  print(pkg.web.best_linear(routes, \"/assets/logo\")) // 0 (the left-aligned oracle agrees)\n\
+  print(pkg.web.best(routes, \"/assets/a/b\"))         // 0 (3 segs: only the wildcard matches)\n\
+  print(pkg.web.best(routes, \"/x/y\"))                // 2 (static x + *rest = 6 beats :cat/:slug = 4)\n\
+  print(pkg.web.best_linear(routes, \"/x/y\"))         // 2\n\
+  print(pkg.web.best(routes, \"/x/a/b\"))              // 3 (equal static prefix: params beat wildcard)\n\
+  print(pkg.web.best_linear(routes, \"/x/a/b\"))       // 3\n\
+  return Ok(())\n\
+}\n";
+    let files: Vec<(&str, String)> = vec![
+        ("pkg/web/internal/router.align", ROUTER.to_string()),
+        ("pkg/web/types.align", TYPES.to_string()),
+        ("pkg/web.align", web_root.to_string()),
+        ("main.align", main.to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    let out = build_and_run_multi("web-wild-vs-params", &refs, "main.align");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n0\n2\n2\n3\n3\n");
 }
