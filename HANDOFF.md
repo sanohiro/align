@@ -9,7 +9,9 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
-(#595) — the hard streaming ordering constraint is LIFTED.** The three designed slices all landed in one arc:
+(#595) — the hard streaming ordering constraint is LIFTED** — plus **#597, `accept`'s
+transient-errno classification: a worker no longer dies over a dropped connection, a pending network
+error, or a full fd table (see "DONE 2026-07-21" under NEXT).** The three designed slices all landed in one arc:
 ① std.http `http.serve_shared` (`SO_REUSEPORT` sibling op; `ExprKind`/`Rvalue::HttpServe` gained a
 `shared: bool` FIELD, not a variant, so no analysis pass changed), ② std.http keep-alive entirely
 inside `accept`/`respond` (one `Arc<Mutex<ParkSlot>>` per server handle; eligibility = 1.1 + no
@@ -41,7 +43,9 @@ closes that connection and keeps waiting, exactly as the parked path already did
 `accept(2)` failure returns. (Pre-existing since M11 — prefork is what made it systemic.) ⑥ the
 readiness scan rotates, because "parked first" let busy keep-alive clients starve the listener
 outright (its `SO_REUSEPORT` queue has no sibling to drain it). ⑦ a capacity valve on the listener
-path, so idle keep-alive clients cannot pin every slot until `EMFILE`. ⑧ the worker cap is
+path, so idle keep-alive clients cannot pin every slot until `EMFILE` — **removed again in #597**,
+which showed the park-time valve already bounds the set and this one only ever killed warm
+connections for requests that never join it (see the #597 entry below). ⑧ the worker cap is
 `cpu_count() + 1` (the pool PLUS the caller) — and the prefork tests, which hardcoded 4 workers,
 would have aborted on any CI runner with fewer cores. ⑨ `respond_stream` rejects the bodiless
 statuses too. ⑩ a body set on a bodiless status is now `Err`, not silently dropped (the same
@@ -57,27 +61,83 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **`accept`'s transient-errno classification — the last path where a worker still dies.**
-   `http_accept_conn` returns ANY `accept(2)` failure, and `pkg.web`'s `srv.accept()?` ends the
-   worker on it. `EINTR` is already retried; what is not: **`ECONNABORTED`** (the client vanished
-   between SYN and accept — pure noise, retry immediately) and **`EMFILE`/`ENFILE`** (fd exhaustion
-   — retrying blindly spins). The shape to build: on `EMFILE`, **evict a parked keep-alive
-   connection** (the set is right there and idle connections are exactly the fds to give back),
-   then retry; if the set is empty, back off briefly rather than spin. That turns the one remaining
-   self-inflicted server death into a degradation. Testable by spawning a child with a low
-   `RLIMIT_NOFILE`. This is small, well-scoped, and it closes a hole the adversarial rounds kept
-   circling.
-2. **`web.header(c, name)` — the most visible REST hole.** Still not shipped, and NOT ordinary
+1. **`web.header(c, name)` — the most visible REST hole.** Still not shipped, and NOT ordinary
    work: an arbitrary-name lookup cannot ride a single stored view, so it needs a std.http enabler
    (a detached headers-view value the Copy `Ctx` can carry). **Design the enabler first**, in
    `std-design/http.md`; do not duplicate the lookup in pkg.web. The note is already in
    `pkg-design/web.md` (ctx accessors block).
-3. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
+2. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
    is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
    `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
    buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
-4. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
+3. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
+
+**DONE 2026-07-21 — `accept`'s transient-errno classification (#597).** `http_accept_conn` used to
+return ANY `accept(2)` failure and `pkg.web`'s `srv.accept()?` ended the worker on it. One decision
+function (`classify_accept_error`) now owns the whole policy — `Again` / `NoFds` / `Fatal` — and the
+noise half (`accept_errno_is_noise`) is shared with std.net's `tcp_accept`, which had the identical
+hole. **No errno reaches Align's `Error`**: the classification lives entirely under `accept`, so no
+language surface changed. **The adversarial round is where this got its real shape — read the fixes,
+not just the feature:**
+- **The retry must be a WAIT, not a re-`accept` in place.** The first cut looped inside
+  `http_accept_conn`. On a blocking listener that parks the thread in `accept` — and the parked
+  keep-alive connections share that one `poll`, so a single client connecting and resetting would
+  have stalled every warm client until an unrelated new connection arrived. `http_accept_conn` now
+  does exactly ONE `accept`; `Again` returns to the caller's wait loop.
+- **`ECONNABORTED` is the wrong errno to lean on for Linux.** Linux usually completes the handshake
+  and reports a reset later; what it DOES hand back from `accept` is the connection's
+  already-pending network error (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`,
+  `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH` — accept(2) says to treat them like `EAGAIN`). All
+  eight are now noise; without them the fix mostly covered a BSD event.
+- **Which connection exhaustion spends, and how fast.** The reclaim reads this wait's `revents` and
+  takes the coldest parked connection *with no readable request* (closing one whose next request has
+  already arrived drops it silently), falling back to the coldest when all are readable. And it is
+  **paced at one per 10 ms of waiting** (state per `accept` call — the only place a burn-down could
+  run): prefork workers share the descriptor table but each owns a separate parked set, so the fds a
+  worker lacks are usually a sibling's — unpaced, one worker would burn its whole warm set in a
+  tight loop over pressure it did not cause.
+- **The accept-time capacity valve is GONE** (round 3). Moving it after the accept — the round-2 fix
+  — left it with no upside: the parked set is bounded where it GROWS (`respond` evicts the coldest
+  when parking into a full set), so what an accept-side valve still did was kill a warm connection
+  for a request that never joins the set (`Connection: close`, malformed, a client that vanishes
+  after the handshake), permanently shrinking the warm set. Round 3 also showed **no test observed
+  it at all** — deleting it outright left the suite green — so the removal ships with a regression
+  test that pins it (a one-shot request at capacity costs nobody their connection), and that test
+  fails FAST rather than hanging, which the first version of it did.
+  **Two things the removal does cost, recorded because round 4 caught the claim being absolute:**
+  ① the valve was also the only path that reaped a **zombie parked connection** — a peer that
+  vanished without a FIN is silent, so `poll` never reports it and no eviction fires while traffic
+  stays one-shot. `accept` now sets **`SO_KEEPALIVE`** on every connection (parity with the net
+  rail), so the kernel's probes turn such a connection into a hangup this loop closes — slow (hours,
+  by system default) but bounded, and `NoFds` reclaims immediately under real pressure. ② the
+  worst-case descriptor count per worker goes from MAX to **MAX + 1** (parked MAX plus the in-flight
+  connection), i.e. 257 in production, +1 per worker. #595's stated reason for the valve (`EMFILE`
+  from idle clients pinning every slot) was never its own: the park-time valve bounds the set at the
+  same MAX either way.
+- **The child-process E2E was fail-open**: `libtest` exits 0 when a filter matches nothing, so a
+  rename would have left the child running no test with the parent still green. It now pipes the
+  child's output and asserts the harness's own "1 passed" (and prints both streams on failure).
+
+Tests: the classification table (incl. the pending-network family), the reclaim-choice + pacing
+unit, and the out-of-process E2E under a lowered `RLIMIT_NOFILE`. Both the E2E and the fail-open
+guard are mutation-checked (reclassifying `EMFILE` as fatal fails the E2E; a renamed test trips the
+guard).
+
+**A pre-existing test hang, diagnosed and fixed here (and a lesson about recording a guess).** A
+runtime-suite run wedged during this arc; the first write-up in this file called it unexplained,
+unreproducible in 13 runs, and "most likely the known port/`SO_REUSEPORT` collision class". **All
+three were wrong** — the third adversarial round reproduced it 4 times in 15 runs **on `main`** and
+found the actual cause: `http_server_rejects_malformed_then_keeps_serving` spawned its malformed
+client and its good client as two threads, so the SYN arrival order was a race; when the good one
+landed first, the test's single `accept` served it and the malformed connection was never accepted
+or closed, leaving that client's `read_to_end` blocked forever. Fixed at the root: `raw_http_client`
+now connects and sends **on the calling thread** (a loopback `connect` completes the handshake
+before returning, so arrival order follows call order) and only the read waits on a thread. Measured
+A/B on this box, running the test binary directly with the `http_` filter 15 times each: **5/15 runs
+hung with the old helper, 0/15 with the new one** (an independent reproduction on the same tree hung
+4/15 — same conclusion, different sample). A guess written into the record is worse than no record — it
+costs the next reader a wrong prior.
 
 - **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the
   attempt.** Align does exactly one syscall more than the floor (`poll` before the read), so the
@@ -382,10 +442,10 @@ request; `apps_web_root.rs` pins it, including that a `:param` capture reads the
 - **A handler's `Err` still vanishes without a trace** — `serve` swallows it to keep the loop
   alive, with no log line. Needs the logging story W5+ owes (unchanged).
 
-Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying (a listener-level
-fault, not a per-request one); classifying transient `ECONNABORTED`/`EMFILE` needs errno reaching
-Align's `Error`. And `web.group(prefix, routes)` is NOT shipped — it needs an `array_builder` over
-struct elements.
+Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying — but that now
+means only a genuine listener-level fault, since #597 classifies the transient errnos inside
+`accept` itself (no errno needed to reach Align's `Error` after all). And `web.group(prefix, routes)`
+is NOT shipped — it needs an `array_builder` over struct elements.
 
 **Scope rule (owner, 2026-07-20 — also in Claude's memory):** `pkg.web` is a GENERAL REST/web
 framework. The LLM gateway is only its first consumer and is NEVER a reason to omit or defer a

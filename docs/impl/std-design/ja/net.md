@@ -71,6 +71,18 @@ syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECO
 部分的な read/write は、再利用する reader/writer 側がすでに正しく処理している。ストリーム途中のコネクション
 リセットは read/write の Error として表面化する。
 
+**`l.accept()` だけは例外であり、それは意図的である: inbound コネクション 1 本の失敗は、listener の失敗
+ではない。** `accept(2)` は両者を同じ errno で報告するので、コネクションを記述しているほうは返さずに内部で
+リトライする — `EINTR`、`ECONNABORTED`（client が SYN と accept の間で諦めた）、そして Linux では
+accept(2) が名指ししている、接続にすでに保留されているネットワークエラー（`ENETDOWN`、`EPROTO`、
+`ENOPROTOOPT`、`EHOSTDOWN`、`ENONET`、`EHOSTUNREACH`、`EOPNOTSUPP`、`ENETUNREACH`）— man page が
+「EAGAIN と同様にリトライして扱え」と述べているものである。したがって `loop { c := l.accept()? … }` と
+書かれた accept ループは、client 1 本の行儀の悪さで終わらされることはない — 上記の errno が `connect` では
+`Error.Code` に届くのに、ここでは届かない理由はまさにこれである。それ以外はすべて、fd の枯渇
+（`EMFILE`/`ENFILE`）も含めて**返す**: 素の listener は回収できる idle コネクションを持たないので、その判断は
+呼び出し側のものであり続ける。（std.http のサーバ側レールはこのノイズ規則を共有し、さらに枯渇からも回復
+する — http.md item 9 — あちらは parked コネクションの集合を実際に持っているからである。）
+
 ## Concurrency model
 
 記録済みの基盤（レール）(open-questions「Network std rails」)は、デフォルトでコネクションを再利用する(keepalive

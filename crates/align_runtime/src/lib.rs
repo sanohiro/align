@@ -931,10 +931,12 @@ pub unsafe extern "C" fn align_rt_tcp_listener_free(l: *mut TcpListener) {
 /// success, else the `accept` errno mapped through [`io_error_to_status`]; leaves `*out = null` on
 /// failure.
 ///
-/// Unlike `connect`, an `EINTR`-interrupted `accept` is **retried** rather than surfaced as an `Err`:
-/// an accept loop is the common server shape, and a signal that merely interrupts the blocking wait
-/// (no connection consumed) should not tear down the loop. (This is the deliberate asymmetry with
-/// [`align_rt_tcp_connect`], which lets `EINTR` fail that address and move on.)
+/// Unlike `connect`, the noise errnos of [`accept_errno_is_noise`] are **retried** rather than
+/// surfaced as an `Err`: an accept loop is the common server shape, and neither an interrupted wait
+/// nor a client that gave up before being accepted should tear it down. (This is the deliberate
+/// asymmetry with [`align_rt_tcp_connect`], which lets `EINTR` fail that address and move on.)
+/// Descriptor exhaustion IS surfaced here — unlike the HTTP server rail, a raw listener holds
+/// nothing it could give back, so the decision belongs to the Align caller.
 ///
 /// # Safety
 /// `l` must be null or a valid `TcpListener` pointer; `out` must point to a writable `*mut TcpConn`
@@ -962,11 +964,56 @@ pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut
             return 0;
         }
         let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue; // EINTR: a signal interrupted the wait before a connection — retry.
+        if accept_errno_is_noise(&e) {
+            continue; // noise (EINTR / ECONNABORTED / a pending network error): nothing was consumed
         }
         return io_error_to_status(&e);
     }
+}
+
+/// The **already-pending network errors** of the connection being accepted, which Linux reports as
+/// the `accept(2)` errno rather than on the new socket — accept(2) is explicit that an application
+/// "should ... treat them like EAGAIN by retrying". Each describes THE CONNECTION that failed, not
+/// the listener, so they belong with the noise. Linux values; other BSDs surface these on the
+/// connection itself, so the list is empty there.
+///
+/// (`EOPNOTSUPP` doubles as "this socket is not `SOCK_STREAM`" — a permanent condition that would
+/// retry forever. Unreachable from the language surface: every listener comes from `tcp.listen`,
+/// `http.serve` or `http.serve_shared`, and all three create stream sockets.)
+#[cfg(target_os = "linux")]
+const ACCEPT_PENDING_NET_ERRNOS: &[i32] = &[
+    64,  // ENONET
+    71,  // EPROTO
+    92,  // ENOPROTOOPT
+    95,  // EOPNOTSUPP
+    100, // ENETDOWN
+    101, // ENETUNREACH
+    112, // EHOSTDOWN
+    113, // EHOSTUNREACH
+];
+#[cfg(not(target_os = "linux"))]
+const ACCEPT_PENDING_NET_ERRNOS: &[i32] = &[];
+
+/// Whether an `accept(2)` failure is NOISE rather than a failure — the one rule shared by every
+/// accept loop in this runtime (net's [`align_rt_tcp_accept`] and http's [`http_accept_conn`]).
+///
+/// - `EINTR` — a signal merely interrupted the blocking wait; no connection was consumed.
+/// - `ECONNABORTED` — the client vanished between its SYN and the `accept`, so the connection that
+///   would have been returned no longer exists. Nothing failed and the next one is already waiting;
+///   surfacing it would let any client end a server's accept loop by connecting and immediately
+///   resetting.
+/// - [`ACCEPT_PENDING_NET_ERRNOS`] — a pending network error of that one connection.
+///
+/// All of them mean "wait for a connection again", which is what keeps an accept loop written as
+/// `l.accept()?` correct. **"Again" is a wait, not a re-`accept` in place:** on a blocking listener,
+/// calling `accept` straight back would park the thread there — and the HTTP rail, which waits on
+/// its parked keep-alive connections in the SAME `poll` as the listener, would stop serving them
+/// until an unrelated new connection arrived. The retry belongs in the caller's wait loop.
+fn accept_errno_is_noise(e: &std::io::Error) -> bool {
+    if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) {
+        return true;
+    }
+    e.raw_os_error().is_some_and(|n| ACCEPT_PENDING_NET_ERRNOS.contains(&n))
 }
 
 // --- udp.bind / send_to / recv_from (std.net Slice 4) -----------------------------------------
@@ -14434,9 +14481,9 @@ const POLLNVAL: i16 = 0x0020;
 /// connection evicted the previous one, so a client told "persistent" lost its next request.
 #[cfg(not(test))]
 const HTTP_MAX_PARKED_CONNS: usize = 256;
-/// The unit tests drive the capacity valves (eviction at park time and at accept time), which at 256
-/// would mean 512 open fds and a fight with the process rlimit. The number is a policy constant, not
-/// a behaviour: the driver E2E suites run the production value.
+/// The unit tests drive the capacity valve (eviction at park time), which at 256 would mean 512 open
+/// fds and a fight with the process rlimit. The number is a policy constant, not a behaviour: the
+/// driver E2E suites run the production value.
 #[cfg(test)]
 const HTTP_MAX_PARKED_CONNS: usize = 4;
 
@@ -14955,27 +15002,112 @@ unsafe fn http_wait_parked_or_listener(fds: &mut Vec<PollFd>, listener: i32, cur
     }
 }
 
-/// Accept one new connection on `lfd` (cloexec, `EINTR`-retried) and set the per-connection socket
-/// options. Returns the connected fd or a mapped status.
+// The two descriptor-exhaustion errnos. Both come from the original BSD numbering and are identical
+// on Linux and macOS/BSD; `std::io::ErrorKind` has no stable variant for either, so they are matched
+// on the raw errno (`ECONNABORTED` does have one — `ConnectionAborted` — and is matched by kind).
+/// The SYSTEM-wide descriptor table is full.
+const ENFILE: i32 = 23;
+/// This PROCESS has reached its descriptor limit (`RLIMIT_NOFILE`).
+const EMFILE: i32 = 24;
+
+/// Why an `accept(2)` did not yield a connection — the whole failure policy as three cases.
+enum AcceptFail {
+    /// Noise ([`accept_errno_is_noise`]): nothing was consumed and nothing is wrong. **Go back to
+    /// the WAIT**, not straight back into `accept` — see that function's note.
+    Again,
+    /// `EMFILE`/`ENFILE` — out of descriptors. The listener is healthy and the condition is
+    /// transient by nature (connections close), so the caller gives a descriptor back — spending a
+    /// parked keep-alive connection, which is the idle fd it owns — and retries instead of dying.
+    /// Blind retrying would spin at 100% CPU; returning would kill the accept loop.
+    NoFds,
+    /// A real listener-level failure (a closed/invalid listener, `EBADF`, …), already mapped to a
+    /// status. This is the only kind of `accept` failure a serve loop should ever see.
+    Fatal(i32),
+}
+
+/// How long to wait before retrying an `accept` that hit `EMFILE`/`ENFILE`. Short enough to recover
+/// promptly, long enough that a permanently exhausted table costs ~100 wakeups/s instead of a
+/// spinning core — and it paces [`http_yield_for_fds`]'s spending of warm connections.
+const HTTP_ACCEPT_NO_FDS_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Give one descriptor back after an `accept` hit `EMFILE`/`ENFILE`, by closing one parked
+/// keep-alive connection. Returns whether one was reclaimed; `false` means the caller must back off
+/// instead — there is nothing of ours left to spend.
+///
+/// **Which one:** the coldest (front — the same end the capacity valve takes) *among those with no
+/// readable request*. `polled` carries this wait's `revents`, so a connection whose next request has
+/// ALREADY ARRIVED is skipped: closing it would drop a request the client will never see answered,
+/// which is a different and worse thing than dropping an idle connection. If every parked
+/// connection is readable the coldest is spent anyway — an exhausted table must still make progress.
+fn http_relieve_fd_pressure(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled: &[PollFd]) -> bool {
+    let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
+    let ParkSlot::Live(fds) = &mut *slot else { return false };
+    if fds.is_empty() {
+        return false;
+    }
+    let has_request = |fd: i32| polled.iter().any(|p| p.fd == fd && p.revents & POLLIN != 0);
+    let pick = fds.iter().position(|&fd| !has_request(fd)).unwrap_or(0);
+    unsafe { close(fds.remove(pick)) };
+    true
+}
+
+/// The `EMFILE`/`ENFILE` valve, shared by both `accept` sites: spend **at most one** parked
+/// connection per backoff interval, then retry.
+///
+/// The bound is what keeps the recovery from being worse than the failure. Prefork workers share
+/// the PROCESS descriptor table but each owns a SEPARATE parked set, so the descriptors a worker is
+/// short of are usually a sibling's — and `ENFILE` is system-wide, where giving back our own may not
+/// help at all. Reclaiming on every retry would let one worker burn its entire warm set (up to
+/// [`HTTP_MAX_PARKED_CONNS`]) in a tight loop while the pressure came from elsewhere. One
+/// connection per 10 ms recovers a self-inflicted shortage promptly and degrades gently otherwise.
+///
+/// `spent` is the caller's per-call state: `true` means a connection was already given up since the
+/// last time we waited.
+fn http_yield_for_fds(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled: &[PollFd], spent: &mut bool) {
+    if !*spent && http_relieve_fd_pressure(park, polled) {
+        *spent = true;
+    } else {
+        std::thread::sleep(HTTP_ACCEPT_NO_FDS_BACKOFF);
+        *spent = false;
+    }
+}
+
+/// The `accept(2)` errno policy in one decision ([`accept_errno_is_noise`]'s half is shared with the
+/// net rail).
+fn classify_accept_error(e: &std::io::Error) -> AcceptFail {
+    if accept_errno_is_noise(e) {
+        return AcceptFail::Again;
+    }
+    match e.raw_os_error() {
+        Some(EMFILE) | Some(ENFILE) => AcceptFail::NoFds,
+        _ => AcceptFail::Fatal(io_error_to_status(e)),
+    }
+}
+
+/// Accept one new connection on `lfd` (cloexec) and set the per-connection socket options. Returns
+/// the connected fd or a [`classify_accept_error`] verdict — including `Again`, which this function
+/// deliberately does NOT act on itself: retrying in place would block on the listener and stop the
+/// caller from polling its parked keep-alive connections.
 ///
 /// # Safety
 /// `lfd` must be a valid listening socket.
-unsafe fn http_accept_conn(lfd: i32) -> Result<i32, i32> {
-    let fd = loop {
-        let f = unsafe { cloexec_accept(lfd) };
-        if f >= 0 {
-            break f;
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(io_error_to_status(&e));
-    };
+unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
+    let fd = unsafe { cloexec_accept(lfd) };
+    if fd < 0 {
+        return Err(classify_accept_error(&std::io::Error::last_os_error()));
+    }
     // Disable Nagle so the response tail is sent immediately (http.md R4); best-effort.
     let on: i32 = 1;
     unsafe {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
+    // TCP keepalive — parity with the net rail's `accept`, and the ONLY thing that ever reaps a
+    // parked connection whose peer vanished WITHOUT a FIN (a NAT timeout, a powered-off client).
+    // Such a connection is silent, so `poll` never reports it and no eviction path is reached while
+    // traffic stays one-shot; the kernel's probes eventually turn it into a hangup this loop closes.
+    // Slow (hours, by the system default) but bounded — and it costs nothing on a live connection.
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
     }
     // macOS/BSD: suppress SIGPIPE per-socket for the response write (Linux uses MSG_NOSIGNAL on `send`).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -14995,13 +15127,18 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, i32> {
 /// unchanged.** With nothing parked this is a plain blocking `accept(2)`, exactly as before.
 /// Otherwise it waits on {…parked, listener} with a rotating preference (warm connections usually
 /// win; the listener still gets its turn, so it cannot be starved), and a new connection leaves the
-/// parked set alone unless it is at capacity, where the coldest parked connection makes room. A
-/// parked connection that hangs up or sends a malformed request is closed and the call looks again:
-/// the death of a warm connection is not an application-visible event.
+/// parked set alone — the set is bounded at the end where it grows, in `respond`. A parked
+/// connection that hangs up or sends a malformed request is closed and the call looks again: the
+/// death of a warm connection is not an application-visible event.
 ///
 /// **A malformed request never surfaces.** It is a per-request fault — the listener is healthy — so
 /// this closes that connection and waits for the next one. Only a real `accept(2)` failure returns
 /// an error, which is what makes `srv.accept()?` in a serve loop correct.
+///
+/// **Nor does a transient `accept(2)` errno** ([`AcceptFail`]): the noise errnos go back to the
+/// wait above, and `EMFILE`/`ENFILE` spend one idle parked connection per backoff interval
+/// ([`http_yield_for_fds`]) and retry. Each of those would otherwise end the caller's loop — and
+/// under prefork, every worker in turn — over a condition the listener will outlive.
 ///
 /// # Safety
 /// `srv` must be a valid `HttpServer` (or null); `out` must point to a writable `*mut HttpRequestCtx`
@@ -15017,6 +15154,9 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
     }
     let lfd = unsafe { (*srv).fd };
     let park = unsafe { (*srv).park.clone() };
+    // Whether this call has already spent a warm connection on descriptor pressure since it last
+    // waited — see `http_yield_for_fds`.
+    let mut spent_for_fds = false;
     loop {
         // Build the poll set IN PLACE, reusing the server's scratch buffer: at capacity this runs
         // once per request on the hot path, and a fresh `Vec` per call (twice — one clone of the
@@ -15035,7 +15175,16 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
         let fd = if parked_n == 0 {
             match unsafe { http_accept_conn(lfd) } {
                 Ok(fd) => fd,
-                Err(status) => return status,
+                Err(AcceptFail::Fatal(status)) => return status,
+                // Nothing is parked, so "wait again" is simply another blocking `accept`.
+                Err(AcceptFail::Again) => continue,
+                Err(AcceptFail::NoFds) => {
+                    // The set looked empty when this iteration built its poll array, but a ctx on
+                    // another thread may have parked since — so try to reclaim either way, and only
+                    // wait when there is genuinely nothing of ours to give back.
+                    http_yield_for_fds(&park, &[], &mut spent_for_fds);
+                    continue;
+                }
             }
         } else {
             let start = unsafe { &mut (*srv).poll_cursor };
@@ -15066,23 +15215,28 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                         }
                     }
                 }
-                // A new connection, or a `poll` failure to fall back from. The parked set survives
-                // — a new client does not cost a warm one its connection — EXCEPT at capacity,
-                // where the coldest parked connection makes room. Without that valve, idle
-                // keep-alive clients would pin `HTTP_MAX_PARKED_CONNS` fds per worker until they
-                // hung up, and `accept` would start failing `EMFILE` against the process rlimit.
+                // A new connection, or a `poll` failure to fall back from. **The parked set is left
+                // alone**: a new client never costs a warm one its connection here. The set is
+                // bounded where it GROWS — `respond` evicts the coldest when it parks into a full
+                // set — so accept needs no valve of its own, and one here could only ever fire for
+                // a connection that will not join the set at all (a `Connection: close` request, a
+                // malformed one, a client that vanishes after the handshake), permanently shrinking
+                // the warm set for nothing. Real descriptor pressure has its own answer below:
+                // `NoFds` spends an idle connection only when `accept` actually ran out of fds.
                 ParkedWait::Listener | ParkedWait::Failed => {
-                    if parked_n >= HTTP_MAX_PARKED_CONNS {
-                        let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-                        if let ParkSlot::Live(fds) = &mut *slot
-                            && fds.len() >= HTTP_MAX_PARKED_CONNS
-                        {
-                            unsafe { close(fds.remove(0)) };
-                        }
-                    }
                     match unsafe { http_accept_conn(lfd) } {
                         Ok(fd) => fd,
-                        Err(status) => return status,
+                        Err(AcceptFail::Fatal(status)) => return status,
+                        // Back to the `poll` — the connection this wait promised is gone, but a
+                        // parked client's next request may be waiting right now. Re-`accept`ing in
+                        // place would block on the listener and starve exactly those.
+                        Err(AcceptFail::Again) => continue,
+                        Err(AcceptFail::NoFds) => {
+                            // Out of descriptors with connections parked: one of them is the
+                            // descriptor to spend. This wait's `revents` say which are idle.
+                            http_yield_for_fds(&park, &scratch[..parked_n], &mut spent_for_fds);
+                            continue;
+                        }
                     }
                 }
             }
@@ -25548,10 +25702,14 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// A raw-socket client that sends `req` and returns the full response bytes the server wrote.
     fn raw_http_client(port: u16, req: &[u8]) -> std::thread::JoinHandle<Vec<u8>> {
         use std::io::{Read, Write};
-        let req = req.to_vec();
+        // Connect and send ON THIS THREAD: a loopback `connect` completes the handshake before it
+        // returns, so the connection is in the listener's queue by the time this function does.
+        // Only the read waits on a worker thread. Doing the connect there too made the ARRIVAL
+        // ORDER of two clients a race — and a test that expects `accept` to reach the second one
+        // hangs forever when they land the other way round.
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        sock.write_all(req).expect("write request");
         std::thread::spawn(move || {
-            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            sock.write_all(&req).expect("write request");
             let mut resp = Vec::new();
             let _ = sock.read_to_end(&mut resp); // server closes after respond → read to EOF
             resp
@@ -25865,11 +26023,11 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_http_server_free(srv) };
     }
 
-    /// The capacity valves. The parked set is bounded, so SOMETHING must give when it fills: at park
-    /// time (a response arriving with the set full) and at accept time (a new connection arriving
-    /// with the set full — without that valve, idle keep-alive clients would pin every slot until
-    /// they hung up, and `accept` would eventually fail `EMFILE`). Both close the COLDEST
-    /// connection — the one served longest ago — and leave the rest alive.
+    /// The capacity valve. The parked set is bounded, so something must give when a response arrives
+    /// with the set full: `respond` closes the COLDEST connection — the one served longest ago — and
+    /// parks the new one in its place, leaving the rest alive. It sits where the set GROWS, which is
+    /// why `accept` needs no valve of its own (one there would also fire for connections that never
+    /// join the set).
     #[test]
     fn http_keepalive_capacity_evicts_the_coldest_connection() {
         use std::io::{Read, Write};
@@ -25892,7 +26050,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             socks.push(sock);
             bufs.push(buf);
         }
-        // ① Accept-time valve: a NEW connection with the set full closes the coldest (client 0).
+        // ① A NEW connection arrives with the set full. Accept leaves the set alone; the valve fires
+        //    when the new connection is PARKED, closing the coldest (client 0) to make room.
         let mut newc = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         newc.set_read_timeout(Some(std::time::Duration::from_secs(20))).expect("timeout");
         newc.write_all(b"GET /new HTTP/1.1\r\nHost: h\r\n\r\n").expect("write");
@@ -25906,6 +26065,24 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         socks[1].write_all(b"GET /still HTTP/1.1\r\nHost: h\r\n\r\n").expect("client 1 is still alive");
         assert_eq!(unsafe { serve_one_echo(srv, 200, "s") }, 0);
         assert!(read_framed_response(&mut socks[1], &mut bufs[1], false).contains("X-Path: /still\r\n"));
+        // ③ A ONE-SHOT request (`Connection: close`) with the set still full costs nobody their
+        //    connection — it is never parked, so nothing has to make room for it. An accept-time
+        //    valve fired here too, permanently shrinking the warm set for a connection that never
+        //    joined it; the set is bounded where it grows instead. `socks[2]` is the coldest
+        //    survivor after ② moved client 1 to the back — which needs at least three clients.
+        const { assert!(HTTP_MAX_PARKED_CONNS >= 3, "steps ② and ③ index into the filled set") };
+        let one_shot = raw_http_client(port, b"GET /once HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "o") }, 0);
+        assert!(String::from_utf8_lossy(&one_shot.join().unwrap()).contains("X-Path: /once\r\n"));
+        // Probed the same way as ①, and for the same reason it must FAIL FAST: an evicted
+        // connection is closed (`Ok(0)`), a live one has nothing to say (a read timeout). Asserting
+        // by round-trip instead would hang the runner on a regression, waiting on a server that is
+        // blocked in `accept` for a client whose connection was just closed.
+        socks[2].set_read_timeout(Some(std::time::Duration::from_millis(500))).expect("timeout");
+        assert!(
+            matches!(socks[2].read(&mut probe), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "the coldest parked connection survived a one-shot request"
+        );
         unsafe { align_rt_http_server_free(srv) };
     }
 
@@ -25945,6 +26122,249 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let text = String::from_utf8(next.join().unwrap()).unwrap();
         assert!(text.contains("X-Path: /next\r\n"), "the fresh connection is served: {text:?}");
         unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// `accept(2)`'s errno policy, in one place: which failures are noise to retry, which are
+    /// recoverable descriptor exhaustion, and which are real listener faults the serve loop must be
+    /// handed. Misclassifying any of the first two kills a worker — and under prefork, every worker
+    /// in turn — over a condition the listener outlives.
+    #[test]
+    fn http_accept_classifies_transient_errnos() {
+        const EINTR: i32 = 4;
+        const EBADF: i32 = 9;
+        #[cfg(target_os = "linux")]
+        const ECONNABORTED: i32 = 103;
+        #[cfg(not(target_os = "linux"))]
+        const ECONNABORTED: i32 = 53; // macOS/BSD
+        // Noise: the interrupted wait, the client that gave up — and, on Linux, every
+        // already-pending network error accept(2) tells applications to retry on. The last group is
+        // the one that actually fires in production: Linux usually completes the handshake and
+        // reports a reset connection later, so `ECONNABORTED` out of `accept` is mostly a BSD event.
+        let noise: Vec<i32> = [EINTR, ECONNABORTED].into_iter().chain(ACCEPT_PENDING_NET_ERRNOS.iter().copied()).collect();
+        for errno in noise {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(matches!(classify_accept_error(&e), AcceptFail::Again), "errno {errno} is retried, never surfaced");
+            // The net rail's `tcp_accept` loop shares this half of the rule — one predicate, both
+            // accept loops.
+            assert!(accept_errno_is_noise(&e), "net retries errno {errno} too");
+        }
+        #[cfg(target_os = "linux")]
+        assert!(ACCEPT_PENDING_NET_ERRNOS.contains(&100), "ENETDOWN is in the accept(2) retry list");
+        for errno in [EMFILE, ENFILE] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(matches!(classify_accept_error(&e), AcceptFail::NoFds), "errno {errno} is recoverable exhaustion");
+            // Exhaustion is NOT shared with net: a raw listener holds nothing to give back, so the
+            // decision stays its Align caller's.
+            assert!(!accept_errno_is_noise(&e), "net surfaces errno {errno}");
+        }
+        // A genuine listener fault still reaches the caller, mapped exactly as before.
+        let bad = std::io::Error::from_raw_os_error(EBADF);
+        let status = io_error_to_status(&bad);
+        assert!(matches!(classify_accept_error(&bad), AcceptFail::Fatal(s) if s == status), "EBADF is fatal");
+    }
+
+    /// **Which connection descriptor pressure spends.** The parked set is ordered coldest-first, but
+    /// "coldest" is the wrong pick when that connection has already sent its next request: closing
+    /// it drops a request the client will never see answered. The wait's `revents` are right there,
+    /// so the valve skips readable connections — and falls back to the coldest when every one of
+    /// them is readable, because an exhausted table must still make progress.
+    #[test]
+    fn http_fd_reclaim_prefers_a_connection_with_no_pending_request() {
+        // Holds four sockets open across the assertions — the module's fd-quiet convention.
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::os::fd::IntoRawFd;
+        let port = free_loopback_port();
+        let l = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind");
+        let mut conns = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..2 {
+            conns.push(std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+            parked.push(l.accept().expect("accept").0.into_raw_fd());
+        }
+        let (cold, warm) = (parked[0], parked[1]);
+        let live = |p: &std::sync::Arc<std::sync::Mutex<ParkSlot>>| match &*p.lock().unwrap() {
+            ParkSlot::Live(fds) => fds.clone(),
+            ParkSlot::Dead => Vec::new(),
+        };
+        let park = std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Live(vec![cold, warm])));
+        // `cold` is the front of the set but its next request has arrived; `warm` is idle.
+        let polled = [
+            PollFd { fd: cold, events: POLLIN, revents: POLLIN },
+            PollFd { fd: warm, events: POLLIN, revents: 0 },
+        ];
+        assert!(http_relieve_fd_pressure(&park, &polled), "a descriptor was reclaimed");
+        assert_eq!(live(&park), vec![cold], "the idle connection was spent, not the one with a request");
+        // Nothing idle left: the coldest goes anyway rather than failing to make room.
+        assert!(http_relieve_fd_pressure(&park, &polled), "progress is still made");
+        assert!(live(&park).is_empty());
+        // An empty set reclaims nothing — the caller must back off instead.
+        assert!(!http_relieve_fd_pressure(&park, &polled));
+
+        // And the valve PACES it: one connection per backoff interval, so a worker short of
+        // descriptors a sibling is holding cannot burn its whole warm set in a tight loop.
+        let mut conns2 = Vec::new();
+        let mut set = Vec::new();
+        for _ in 0..2 {
+            conns2.push(std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+            set.push(l.accept().expect("accept").0.into_raw_fd());
+        }
+        let park = std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Live(set)));
+        let mut spent = false;
+        http_yield_for_fds(&park, &[], &mut spent);
+        assert!(spent && live(&park).len() == 1, "the first shortage spends one connection immediately");
+        let t = std::time::Instant::now();
+        http_yield_for_fds(&park, &[], &mut spent);
+        assert!(!spent && live(&park).len() == 1, "the second waits instead of spending another");
+        assert!(t.elapsed() >= HTTP_ACCEPT_NO_FDS_BACKOFF, "and it waited: {:?}", t.elapsed());
+        http_yield_for_fds(&park, &[], &mut spent);
+        assert!(spent && live(&park).is_empty(), "after the wait, one more may be spent");
+    }
+
+    /// Lower this PROCESS's descriptor limit so "the table is full" is reachable in a handful of
+    /// opens. Only ever called in the out-of-process child below; only the SOFT limit moves, and
+    /// only downward, so nothing needs privilege. 64-bit Linux only — `struct rlimit` is declared
+    /// here with 64-bit `rlim_t` fields rather than pulling in a libc dependency.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn set_nofile_limit(soft: u64) {
+        #[repr(C)]
+        struct RLimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
+        const RLIMIT_NOFILE: i32 = 7; // Linux (`rlim_t` = `unsigned long`)
+        unsafe extern "C" {
+            fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+            fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        }
+        let mut lim = RLimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { getrlimit(RLIMIT_NOFILE, &mut lim) }, 0, "getrlimit(NOFILE)");
+        lim.rlim_cur = soft.min(lim.rlim_cur).min(lim.rlim_max);
+        assert_eq!(unsafe { setrlimit(RLIMIT_NOFILE, &lim) }, 0, "setrlimit(NOFILE)");
+    }
+
+    /// The scenario, run inside the child: one parked connection, a pending one, and a full
+    /// descriptor table.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn run_fd_exhausted_accept() {
+        use std::io::{Read, Write};
+        set_nofile_limit(96);
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+
+        // A is served once and then goes quiet — parked, holding one server-side descriptor.
+        let mut a = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect A");
+        a.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        a.write_all(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n").expect("write A");
+        let mut abuf = Vec::new();
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "a") }, 0);
+        assert!(read_framed_response(&mut a, &mut abuf, false).ends_with("a"), "A is parked");
+
+        // B connects and sends BEFORE the table fills (a client needs a descriptor too); its
+        // connection then waits in the listener's backlog.
+        let mut b = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect B");
+        b.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        b.write_all(b"GET /b HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n").expect("write B");
+
+        // Fill the descriptor table: from here `accept(2)` can only fail with EMFILE.
+        let mut hogs = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => hogs.push(f),
+                Err(e) => {
+                    assert!(matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)), "the table filled for the expected reason: {e}");
+                    break;
+                }
+            }
+        }
+
+        // The serve loop survives: the coldest parked connection is spent to make room, and the
+        // pending request is answered.
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "b") }, 0, "EMFILE must not end the accept loop");
+        let mut btext = Vec::new();
+        b.read_to_end(&mut btext).expect("read B");
+        let btext = String::from_utf8_lossy(&btext).into_owned();
+        assert!(btext.contains("X-Path: /b\r\n"), "B was served: {btext:?}");
+        // A paid for it — reclaiming an idle keep-alive connection is exactly the intended
+        // degradation.
+        let mut probe = [0u8; 1];
+        assert!(matches!(a.read(&mut probe), Ok(0)), "the coldest parked connection was closed to make room");
+        drop(hogs);
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// **Descriptor exhaustion is a degradation, not a death.** With the table full, `accept` gives
+    /// a descriptor back — the coldest parked keep-alive connection, precisely an idle fd — and
+    /// retries, so the waiting client is still served. Before the classification, `EMFILE` surfaced
+    /// as an `Err`, `srv.accept()?` returned, and under prefork every worker died in turn.
+    ///
+    /// Runs OUT OF PROCESS with a lowered `RLIMIT_NOFILE`: the limit is per-process, so exhausting
+    /// the test binary's own table would break every test running beside it.
+    #[test]
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn http_accept_survives_fd_exhaustion() {
+        const CHILD: &str = "ALIGN_HTTP_EMFILE_CHILD";
+        const NAME: &str = "tests::http_accept_survives_fd_exhaustion";
+        if std::env::var_os(CHILD).is_some() {
+            run_fd_exhausted_accept();
+            return;
+        }
+        // The parent momentarily opens the child's stdio pipes — the module's fd-quiet convention
+        // covers exactly that window against the fd-counting leak tests.
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Piped, not null: a failing child's assertion has to reach the runner, and the parent reads
+        // the harness's own summary back (see the fail-open guard below).
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drain both pipes on their own threads from the start. Reading only after the child exits
+        // would deadlock a child that outgrew the pipe buffer (a deep backtrace under
+        // `RUST_BACKTRACE=full`) into the watchdog, and report it as "did not recover" — the one
+        // diagnosis it isn't. The joins below are unbounded, which is safe only because the child
+        // is the sole holder of the write ends: it spawns threads, never processes, so killing it
+        // always closes them. A child that ever spawns one needs a bounded read instead.
+        fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                if let Some(mut r) = pipe {
+                    let _ = r.read_to_string(&mut buf);
+                }
+                buf
+            })
+        }
+        let out_reader = drain(child.stdout.take());
+        let err_reader = drain(child.stderr.take());
+        // A regressed classification blocks the child in `accept` forever rather than failing, so
+        // the wait is bounded (the nested-par_map watchdog shape).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let exited = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                // Killing closes the pipes, so the readers finish and their output still reaches
+                // the panic message below.
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let out = out_reader.join().unwrap();
+        let err = err_reader.join().unwrap();
+        let Some(status) = exited else {
+            panic!("accept did not recover from descriptor exhaustion before the watchdog deadline\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        };
+        assert!(status.success(), "fd-exhaustion child failed with {status}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        // **Fail-open guard.** `libtest` exits 0 when a filter matches NOTHING, so a rename of this
+        // test (or of its module) would leave the child running no test at all and the parent green.
+        // The harness's own summary is the proof that the scenario ran.
+        assert!(out.contains("1 passed"), "the child ran the scenario (is `{NAME}` still this test's path?):\n{out}");
     }
 
     /// Keep-alive must not leak fds: many requests over one parked connection, plus the eviction and
