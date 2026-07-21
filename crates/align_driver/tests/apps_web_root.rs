@@ -84,6 +84,17 @@ fn boom(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   return Err(Error.Invalid)\n\
 }\n\
 \n\
+fn echo(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  b := pkg.web.body(c)\n\
+  if b.len() == 0 {\n\
+    return pkg.web.status_text(400, \"empty\")\n\
+  }\n\
+  match pkg.web.body_str(c) {\n\
+    Ok(s) => pkg.web.text(s)\n\
+    Err(e) => pkg.web.status_text(400, \"not utf-8\")\n\
+  }\n\
+}\n\
+\n\
 pub fn main(args: array<str>) -> Result<(), Error> {\n\
   cmd := cli.command(\"srv\")\n\
   cmd.flag_i64(\"port\", 0)\n\
@@ -96,6 +107,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.get(\"/search\", search),\n\
     pkg.web.get(\"/boom\", boom),\n\
     pkg.web.any(\"/health\", catch_all),\n\
+    pkg.web.post(\"/echo\", echo),\n\
   ]\n\
   return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes)\n\
 }\n";
@@ -285,4 +297,36 @@ fn a_query_string_does_not_break_routing() {
     let empty = exchange(port, b"GET /search HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(empty.starts_with("HTTP/1.1 200 OK\r\n"), "no query: {empty:?}");
     assert!(empty.ends_with("\r\n\r\n"), "an absent query reads as empty: {empty:?}");
+}
+
+/// W3 body accessors: `web.body(c)` (raw byte view) and `web.body_str(c)` (UTF-8-validated view),
+/// driven end-to-end — the body is a zero-copy view carried in the Copy `Ctx`, so a handler reads
+/// it while `serve` still owns the request handle.
+#[test]
+fn body_and_body_str_read_the_request_body() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-body");
+    let port = srv.port;
+
+    // A UTF-8 body echoes back through `body_str` -> `web.text`.
+    let ok = exchange(port, b"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nhello body");
+    assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "echo: {ok:?}");
+    assert!(ok.ends_with("\r\n\r\nhello body"), "the body must round-trip: {ok:?}");
+
+    // A bodyless POST reads as an EMPTY view (`web.body(c).len() == 0`), answered 400 by the handler.
+    let empty = exchange(port, b"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n");
+    assert!(empty.starts_with("HTTP/1.1 400 Bad Request\r\n"), "empty body: {empty:?}");
+    assert!(empty.ends_with("\r\n\r\nempty"), "the handler's empty-body answer: {empty:?}");
+
+    // Invalid UTF-8 bytes: `web.body(c)` sees them (len > 0), `web.body_str(c)` returns Err, and
+    // the handler answers 400 — the validating view is the boundary, not an abort.
+    let bad = exchange(port, b"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n\xff\xfe");
+    assert!(bad.starts_with("HTTP/1.1 400 Bad Request\r\n"), "invalid utf-8: {bad:?}");
+    assert!(bad.ends_with("\r\n\r\nnot utf-8"), "the handler's utf-8 answer: {bad:?}");
+
+    // The server survived all three (the loop is still up) — a GET after them still answers.
+    let alive = exchange(port, b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(alive.starts_with("HTTP/1.1 200 OK\r\n"), "server alive after body requests: {alive:?}");
 }
