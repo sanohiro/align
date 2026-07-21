@@ -87,9 +87,16 @@ Nothing there stands in for a missing compiler feature.
    `static_prefix_wildcard_outranks_a_param_chain` (absolute indices both sides). The build is
    still per call; hoisting the columns into `serve`'s scope (build once, match per request over
    borrowed slices) is the remaining recorded follow-up.
-3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
-   `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
-   accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.
+3. **`param(c, name)` sugar — DONE; W3 body accessors — DONE (2026-07-21).** Settled by the
+   Copy-`Ctx` redesign below; `web.param(c, "id")`, `web.query(c, name)` and `has_query` are shipped
+   in the designed spelling. `web.body(c)` / `web.body_str(c)` are shipped too: `Ctx` gained a
+   `body: slice<u8>` view field (filled once by `serve` from `ctx.body()`), `body_str` is
+   `.as_str()` — pinned E2E in `apps_web_root.rs::body_and_body_str_read_the_request_body` (echo /
+   empty-400 / invalid-UTF-8-400). **`web.header(c, name)` is NOT shipped and is not ordinary
+   work:** an arbitrary-name lookup cannot ride a single stored view; it needs a std.http enabler
+   (a detached headers-view value the Copy `Ctx` can carry) — the design note is in
+   `pkg-design/web.md` (ctx accessors block). Design the enabler first; do not duplicate the
+   lookup in pkg.web.
 4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data; OAuth —
    client flows are buildable now, validating a PUBLIC provider's token is blocked on RS256
    (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.

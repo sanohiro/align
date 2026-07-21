@@ -146,10 +146,16 @@ web.param(c, name)   -> str              // named :param capture (fixed slot arr
                                          //   a name not in the pattern is a startup-checkable
                                          //   bug → abort at tree build if statically absent)
 web.query(c, name)   -> Option<str>      // std.http query floor (percent-decoded per RFC 3986)
-web.header(c, name)  -> Option<str>
-web.body(c)          -> slice<u8>
-web.body_str(c)      -> Result<str, Error>    // UTF-8-validated view
+web.header(c, name)  -> Option<str>      // NOT SHIPPED YET — see the note below
+web.body(c)          -> slice<u8>        // SHIPPED 2026-07-21: `Ctx.body` carries the zero-copy
+web.body_str(c)      -> Result<str, Error>    //   view; body_str = `.as_str()` (validated view)
 //   JSON in: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json, view-decoding
+//   `web.header` blocker (recorded 2026-07-21): the Copy `Ctx` owns nothing, and an
+//   arbitrary-name header lookup cannot ride a single stored view the way `body` does — it needs
+//   either a raw-head `str`/`slice<u8>` view field + a pkg.web-side RFC 9110 lookup (duplicating
+//   std.http's, against One way), or a std.http enabler exposing the parsed header table to a
+//   detached view (the ideal shape — e.g. `ctx.headers()` as a view value the Ctx can carry).
+//   Design the enabler first; do not ship a second lookup.
 
 // responders (Pure; they BUILD a response — they do not touch the request handle, so a handler may
 // call accessors and responders in any order)

@@ -23,7 +23,11 @@ module pkg.web.types
 //
 // `pattern` is the matched route's pattern — Static text from the route table — which is what lets
 // `param` read a capture back out of the path without a per-request slot array.
-pub Ctx { method: str, path: str, query: str, pattern: str }
+//
+// `body` is the request body as a zero-copy `slice<u8>` view into the request buffer (empty for a
+// bodyless request), read once by `serve` when it builds the Ctx — `web.body(c)` returns it and
+// `web.body_str(c)` UTF-8-validates it into a `str` view.
+pub Ctx { method: str, path: str, query: str, pattern: str, body: slice<u8> }
 
 // One route: the method it answers, the pattern it matches, and the handler to run. A **Copy**
 // struct — `str` views of literal text, plus a fn value — so a route table is an ordinary array

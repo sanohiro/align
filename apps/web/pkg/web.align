@@ -69,6 +69,18 @@ pub fn query(c: pkg.web.types.Ctx, name: str) -> str =
 pub fn has_query(c: pkg.web.types.Ctx, name: str) -> bool =
   pkg.web.internal.query.has(c.query, name)
 
+// The request body as a zero-copy byte view into the request buffer — empty for a bodyless
+// request. The raw form: a JSON handler goes through `body_str` instead.
+pub fn body(c: pkg.web.types.Ctx) -> slice<u8> = c.body
+
+// The request body UTF-8-validated into a `str` view (still zero-copy — `.as_str()` validates in
+// place). `Err` on invalid UTF-8, which a handler typically answers with a 400 — or propagates
+// with `?`, which `serve` turns into a 500.
+pub fn body_str(c: pkg.web.types.Ctx) -> Result<str, Error> {
+  b := c.body
+  b.as_str()
+}
+
 // ── Responders ────────────────────────────────────────────────────────────────────────────────
 //
 // A responder BUILDS a response; `serve` writes it. Nothing here touches the request handle, so a
@@ -158,6 +170,7 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
         path: path,
         query: pkg.web.internal.query.target_query(target),
         pattern: r.pattern,
+        body: ctx.body(),
       }
       // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`, so
       // handing both to one call would move the handle while a borrow of it is still live.
