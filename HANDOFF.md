@@ -208,7 +208,9 @@ request; `apps_web_root.rs` pins it, including that a `:param` capture reads the
   well-formedness (leading `/`, named `:`/`*` segments, `*` tail-only, no param name twice) and
   the duplicate-claim aborts the design called for — same method twice, or any row after an
   any-method route on the same PATH CLAIM (param names don't affect a claim: `/a/:x` ≡ `/a/:y`).
-  Specific-then-`any` stays legal. `apps_web_validate.rs` (8 aborts + the legal-shadow serve).
+  A Stream row must carry a non-empty `stream_type` (else a blank `Content-Type:` — and "" is the
+  invariant the HEAD fallback reads as "a Respond row"). Specific-then-`any` stays legal.
+  `apps_web_validate.rs` (9 aborts + the legal-shadow serve).
 - **HEAD is RFC-correct — DONE.** std.http `respond` suppresses the body for a HEAD request at the
   protocol boundary (Content-Length kept, RFC 9110 §9.3.2), and `serve` routes HEAD-with-no-row to
   the path's GET handler (Respond rows only; stream-only GET keeps HEAD at 405).

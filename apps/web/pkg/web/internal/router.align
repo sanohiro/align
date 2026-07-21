@@ -321,6 +321,24 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
       b.write("\" must start with \"/\"")
       break b.to_string()
     }
+    // A stream route's head is built by `serve` from `stream_type`; an empty one would emit a
+    // blank `Content-Type:` header — and `stream_type == ""` is also the invariant `serve`'s
+    // HEAD→GET fallback uses to mean "a Respond row", so a Stream row must never carry it.
+    stream_row := match ri.handler {
+      Respond(h) => false
+      Stream(p) => true
+    }
+    if stream_row && ri.stream_type.len() == 0 {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" (")
+      b.write(m)
+      b.write(" ")
+      b.write(pat)
+      b.write(") is a stream route with an empty content type")
+      break b.to_string()
+    }
     // Per-segment checks + the intra-pattern duplicate-name check (the outer/inner cursor walk is
     // quadratic in SEGMENTS of one pattern — a handful; startup-only).
     mut cur := 0

@@ -450,7 +450,9 @@ timeouts/backpressure — each waits for a consumer.
 - **W4 — hardening.** First slice SHIPPED 2026-07-21: **startup table validation**
   (`router.validate`, pure diagnosis; `serve` prints to stderr + `process.abort()` before binding
   — the error policy's "startup abort, not Err"): known uppercase method or `""`, leading-`/`
-  pattern, named `:`/`*` segments, `*` tail-only, no parameter name twice in a pattern, and no
+  pattern, named `:`/`*` segments, `*` tail-only, no parameter name twice in a pattern, a
+  non-empty `stream_type` on every Stream row (an empty one would emit a blank `Content-Type:`,
+  and `stream_type == ""` is the invariant the HEAD fallback reads as "a Respond row"), and no
   duplicate PATH CLAIM the later row can never win — same method twice (also what duplicated the
   405 `Allow` join) or any row after an any-method route on that claim; parameter names don't
   affect a claim (`/a/:x` ≡ `/a/:y`). Specific-then-`any` on one pattern stays legal (the fallback
@@ -459,7 +461,7 @@ timeouts/backpressure — each waits for a consumer.
   HEAD with no explicit row to the path's GET handler (Respond rows only — a stream head has no
   HEAD form, so stream-only GET keeps HEAD at 405). **Automatic 404/405/500 carry the fixed
   minimal JSON bodies** (`{"error":"not found"}` / `"method not allowed"` / `"internal error"`,
-  `Content-Type: application/json`). Tests: `apps_web_validate.rs` (8 aborts + the legal-shadow
+  `Content-Type: application/json`). Tests: `apps_web_validate.rs` (9 aborts + the legal-shadow
   serve), `apps_web_root.rs` HEAD/body matrix, runtime serializer unit. Remaining W4: route-tree
   edge matrix (deep paths, long segments, empty table), malformed-request matrix, keepalive
   reuse, and the handler-`Err` logging story (W5+).

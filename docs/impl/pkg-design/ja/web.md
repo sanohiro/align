@@ -429,7 +429,9 @@ heartbeat/keep-alive コメント、`event:`/`id:` フィールド + `Last-Event
   （`router.validate`、純粋な診断。`serve` は bind 前に stderr へ出力 + `process.abort()`
   — エラーポリシーの「起動時 abort、Err にしない」）: 既知の大文字メソッドまたは `""`、先頭 `/`
   のパターン、名前付き `:`/`*` セグメント、`*` は tail のみ、1 パターン内で同じパラメータ名を
-  二度使わない、そして後続の行が決して勝てない PATH CLAIM の重複なし — 同一メソッド二度
+  二度使わない、すべての Stream 行に空でない `stream_type`（空だと空欄の `Content-Type:` を
+  送出してしまう上、`stream_type == ""` は HEAD フォールバックが「Respond 行」と読む不変条件）、
+  そして後続の行が決して勝てない PATH CLAIM の重複なし — 同一メソッド二度
   （405 `Allow` join を重複させていたのもこれ）や、その claim に対する any-method ルートより後の
   任意の行。パラメータ名は claim に影響しない（`/a/:x` ≡ `/a/:y`）。1 パターン上の
   specific-then-`any` は合法のまま（フォールバック方向）。**HEAD は RFC 準拠**（9110 §9.3.2）:
@@ -438,7 +440,7 @@ heartbeat/keep-alive コメント、`event:`/`id:` フィールド + `Last-Event
   ルーティングする（Respond 行のみ — stream head に HEAD 形はないので、stream 専用 GET は
   HEAD を 405 のままにする）。**自動 404/405/500 は固定の最小 JSON ボディを持つ**
   （`{"error":"not found"}` / `"method not allowed"` / `"internal error"`、
-  `Content-Type: application/json`）。テスト: `apps_web_validate.rs`（8 つの abort +
+  `Content-Type: application/json`）。テスト: `apps_web_validate.rs`（9 つの abort +
   合法シャドウの serve）、`apps_web_root.rs` の HEAD/body マトリクス、runtime シリアライザ
   ユニット。W4 の残り: route-tree 端例マトリクス（深いパス、長セグメント、空テーブル）、
   不正リクエストマトリクス、keepalive 再利用、そしてハンドラ `Err` のロギングストーリー

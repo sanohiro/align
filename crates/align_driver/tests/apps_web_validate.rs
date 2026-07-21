@@ -206,3 +206,59 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "fallback served: {resp:?}");
     assert!(resp.ends_with("\r\n\r\nany"), "the any row answered: {resp:?}");
 }
+
+/// A stream route must carry a content type: `serve` builds the stream head from `stream_type`
+/// (an empty one would emit a blank `Content-Type:`), and `stream_type == ""` is the invariant
+/// the HEAD→GET fallback reads as "a Respond row" — so an empty-typed stream row is a startup
+/// abort, keeping the invariant total.
+#[test]
+fn a_stream_route_with_an_empty_content_type_aborts() {
+    if !backend_available() {
+        return;
+    }
+    let main_src = "module main\n\
+import pkg.web\n\
+import pkg.web.types\n\
+\n\
+fn pump(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {\n\
+  s.finish()\n\
+}\n\
+\n\
+pub fn main() -> Result<(), Error> {\n\
+  routes := [\n\
+    pkg.web.stream(\"POST\", \"/x\", \"\", pump),\n\
+  ]\n\
+  return pkg.web.serve(\"127.0.0.1\", 0, routes)\n\
+}\n";
+    let built = build_exe_multi(
+        "web-val-streamct",
+        &[
+            ("pkg/web/internal/router.align", ROUTER),
+            ("pkg/web/internal/query.align", QUERY),
+            ("pkg/web/types.align", TYPES),
+            ("pkg/web.align", WEB_ROOT),
+            ("main.align", main_src),
+        ],
+        "main.align",
+    );
+    let mut child = std::process::Command::new(&built.exe)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("an empty-typed stream route must abort at startup");
+            }
+        }
+    };
+    let mut err = String::new();
+    child.stderr.take().expect("stderr piped").read_to_string(&mut err).expect("read stderr");
+    assert!(!status.success(), "must abort, got {status:?}");
+    assert!(err.contains("stream route with an empty content type"), "diagnosis: {err:?}");
+}
