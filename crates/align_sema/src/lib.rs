@@ -7970,36 +7970,53 @@ impl<'a> MoveCheck<'a> {
         .then_some(BorrowRoot::IterTemp(depth))
     }
 
-    /// Storage roots owned by `e`. A view local forwards its already-flattened provenance; a local
-    /// that owns viewable storage also contributes itself. Caller-owned slice parameters
-    /// intentionally produce no intra-frame root — this pass only invalidates storage whose
-    /// lifetime this function controls.
+    /// Storage roots a **borrower of `e`** depends on. A view local forwards its already-flattened
+    /// provenance; a local that owns viewable storage also contributes itself. Caller-owned slice
+    /// parameters intentionally produce no intra-frame root — this pass only invalidates storage
+    /// whose lifetime this function controls.
+    ///
+    /// This — not [`Self::borrow_sources`] — is where a fresh unbound Move value contributes its
+    /// hidden-owner root, because this is exactly the borrowing position: MIR mints the synthetic
+    /// owner (`lower_borrowed_owned`) only when such a value is borrowed (a `str`/slice borrow, a
+    /// view-producing method receiver, a `str`/slice call argument, a `json` input), and every one
+    /// of those reaches its operand through here. A materializing consumer (`.to_array()`,
+    /// `.map(...)`, a struct/array literal that *owns* its result) recurses through `borrow_sources`
+    /// instead, moving the value into the named target rather than borrowing it — so it must NOT get
+    /// a temp root, which is the whole reason the two functions differ (see the FP fixed in the
+    /// second review round: `names = src.map(up).to_array()` moved into an owning `array<str>`).
     fn storage_roots(&self, e: &Expr) -> BorrowRoots {
+        let mut roots = BorrowRoots::new();
+        // A view of a fresh owned temporary (`str` borrow of a `.clone()`, a slice of a
+        // just-materialized array, a `json.doc` over a returned string) is rooted in MIR's hidden
+        // owner, which the innermost loop frees each pass. `temp_owner_root` is `None` for a bound
+        // place (`Local`/`Field`/`Index`/…), so those arms below are unaffected.
+        if let Some(temp) = self.temp_owner_root(e) {
+            roots.insert(temp);
+        }
         match &e.kind {
-            ExprKind::Local(id) => self.local_storage_roots(*id),
+            ExprKind::Local(id) => roots.extend(self.local_storage_roots(*id)),
             ExprKind::Field { root, .. }
             | ExprKind::SoaColumn { base: root, .. }
             | ExprKind::ArrayGroupAgg { base: root, .. }
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
             | ExprKind::ArrayDictEncode { base: root, .. }
-            | ExprKind::IndexField { base: root, .. } => self.local_storage_roots(*root),
+            | ExprKind::IndexField { base: root, .. } => roots.extend(self.local_storage_roots(*root)),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
-            | ExprKind::TupleIndex { recv, .. } => self.storage_roots(recv),
-            _ => self.borrow_sources(e),
+            | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
+            _ => roots.extend(self.borrow_sources(e)),
         }
+        roots
     }
 
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
+    /// Note: this returns the roots of views **contained in** `e`, and deliberately does *not* add
+    /// `e`'s own hidden-owner temp root — that belongs to a borrow of `e` and is added by
+    /// [`Self::storage_roots`]. A borrow-producing arm below therefore routes its borrowed operand
+    /// through `storage_roots`, while a materializing/moving arm routes through `borrow_sources`.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
         let mut roots = BorrowRoots::new();
-        // A fresh owned value with no binding still owns storage — MIR's hidden owner. A view of it
-        // (a `str` borrow of a `.clone()`, a slice of a just-materialized array, a `json.doc` over a
-        // returned string) is rooted in that owner, which the innermost loop frees each pass.
-        if let Some(temp) = self.temp_owner_root(e) {
-            roots.insert(temp);
-        }
         if !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums) {
             return roots;
         }
@@ -8074,7 +8091,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
-            | ExprKind::JsonDecodeStructArray { input, .. } => self.borrow_sources(input),
+            | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
             ExprKind::JsonDecodeSoa { input, struct_id } => {
                 let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
                     s.fields
@@ -8082,7 +8099,7 @@ impl<'a> MoveCheck<'a> {
                         .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums))
                 });
                 if borrows_input {
-                    self.borrow_sources(input)
+                    self.storage_roots(input)
                 } else {
                     BorrowRoots::new()
                 }
@@ -8092,7 +8109,7 @@ impl<'a> MoveCheck<'a> {
             // a scalar-only union borrows nothing.
             ExprKind::JsonDecodeUnion { input, enum_id } => {
                 if ty_may_borrow(Ty::Enum(*enum_id), self.structs, self.tuples, self.enums) {
-                    self.borrow_sources(input)
+                    self.storage_roots(input)
                 } else {
                     BorrowRoots::new()
                 }
@@ -8102,13 +8119,13 @@ impl<'a> MoveCheck<'a> {
             // receiver doc's roots. So a use past the input's liveness is caught (#460), like the
             // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
             // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
-            ExprKind::JsonDoc { input } => self.borrow_sources(input),
+            ExprKind::JsonDoc { input } => self.storage_roots(input),
             ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocElems { doc } => {
-                self.borrow_sources(doc)
+                self.storage_roots(doc)
             }
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
             // past the input's liveness is caught.
-            ExprKind::JsonScan { input, .. } => self.borrow_sources(input),
+            ExprKind::JsonScan { input, .. } => self.storage_roots(input),
             ExprKind::Call { args, .. } => {
                 let mut roots = BorrowRoots::new();
                 for arg in args {

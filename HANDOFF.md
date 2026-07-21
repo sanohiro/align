@@ -94,13 +94,20 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   diagnostic names the right cause, and names the source when it *has* a name (a temporary's message
   instead says to bind the owned value to a local outside the loop); the join merges per root by
   `Ord`, keeping it commutative for the fixpoint.
-- **The first cut of THIS fix shipped a false claim, and the adversarial reviewer killed it.** The
-  commit message asserted "MIR emits exactly one class of early drop" and that hidden owners are safe
-  "by construction". Both wrong: `keep = "AAAA…".clone()` inside a loop — no helper, no std handle —
-  still printed freed heap bytes after the first cut, as did a call result, a view-returning call
-  over a temporary, a `?`-unwrapped one, and a materialized array sliced in place. **A drop-site
-  enumeration is a claim to verify against the emitter, not to reason out.** The mandatory
-  independent adversarial pass is what caught it; do not skip it.
+- **Where the temp root is ATTRIBUTED matters as much as the condition.** MIR mints the hidden owner
+  only where a fresh Move value is *borrowed* (`lower_borrowed_owned`); a value **moved** into a
+  local that owns it transfers its storage to that named local, and nothing joins the loop's drop
+  set. The first attempt added the root in `borrow_sources` — which every consumer reaches — and so
+  rejected the ordinary `names = src.map(up).to_array()` rebuild-each-pass idiom. It now comes from
+  `storage_roots`, which *is* the borrowing position (every borrow producer routes its operand
+  through it; a materializer recurses through `borrow_sources` and gets nothing).
+- **This fix shipped a false claim TWICE, and both times the adversarial reviewer killed it.** Round
+  1's commit message asserted "MIR emits exactly one class of early drop" and that hidden owners are
+  safe "by construction" — both wrong, and `keep = "AAAA…".clone()` in a loop still printed freed
+  heap bytes. Round 2's placement of the fix then over-rejected a common idiom. **A drop-site
+  enumeration is a claim to verify against the emitter, not to reason out**, and a new root's
+  *attribution point* needs the same treatment. The mandatory independent adversarial pass is what
+  caught both; do not skip it.
 - **Two claims in the original write-up were wrong, and that is the reusable lesson** (same shape as
   the #597 test-hang guess): ① the `arena {}` variant is **not an instance of this bug** — a
   heap-owned local bound inside `arena {}` is dropped at *function* exit (`emit-mir` shows the drop
@@ -125,14 +132,16 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   common shape hit it; the fix belongs with `local_owns_view_storage`.
   Pinned as `over_rejects_a_view_into_the_source_of_a_dropped_chunks_header`.
 - Tests: the flipped `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
-  `known_hole_scope_end_drop_…`), plus eleven in `tests/borrow_liveness.rs` — back-edge, `break`
-  edge, all four temporary shapes, and the controls that keep the rule from over-rejecting:
-  same-iteration use of a local and of a temporary, a temporary outside any loop, a source declared
-  outside the loop, an inner `break` dropping only the inner body's locals, and an owned local
-  **moved out** by `break`. Mutation-checked in three places (the local set, `temp_owner_root`, and
-  the `IterTemp` edge arm), each failing exactly its own positive tests and no control. Whole
-  workspace green (2597 passed), clippy clean; **zero false positives** — the only pre-existing test
-  the fix broke was the pinned known hole.
+  `known_hole_scope_end_drop_…`), plus thirteen in `tests/borrow_liveness.rs` — back-edge, `break`
+  edge, all four temporary shapes, a `json` view over a temporary and over a dropped loop-body
+  input, and the controls that keep the rule from over-rejecting: a fresh value **moved into an
+  owning local** (array and Move-struct forms), same-iteration use of a local and of a temporary, a
+  temporary outside any loop, a source declared outside the loop, an inner `break` dropping only the
+  inner body's locals, and an owned local **moved out** by `break`. Mutation-checked in five places
+  (the local set, `temp_owner_root`, the `IterTemp` edge arm, the `storage_roots` attribution, and
+  *restoring* the attribution to `borrow_sources`), each failing exactly its own tests. Whole
+  workspace green (2603 passed), clippy clean; **zero false positives** — the only pre-existing test
+  the whole arc broke was the pinned known hole.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
 (`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->

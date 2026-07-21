@@ -2048,6 +2048,19 @@ loop {
 `may_need_synthetic_owner`**, the latter moved into sema so both stages share one definition. Depth
 is all the identity a temporary needs: every temporary at a given loop depth is freed by that loop's
 two edges. Outside any loop the hidden owner lives to function exit, so no root is recorded there.
+
+**Where that root is attributed matters as much as the condition, and getting it wrong cost a false
+positive** (caught by the second adversarial round). MIR mints the hidden owner only where a fresh
+Move value is *borrowed* (`lower_borrowed_owned`); a value **moved** into a local that owns it
+transfers its storage to that named local instead, and nothing joins the loop's drop set. Attributing
+the root in `borrow_sources` — reached by every consumer — therefore rejected the ordinary
+`names = src.map(up).to_array()` rebuild-each-pass idiom, whose `array<str>` is owned by `names` and
+whose element views point at an outer `src`. The root now comes from `storage_roots`, which *is* the
+borrowing position: every borrow producer (a `str`/slice borrow, a view-producing method receiver, a
+`str`/slice call argument — the coercion node wraps those — and a `json` input) routes its operand
+through it, while a materializing consumer recurses through `borrow_sources` and gets nothing. The
+two functions now carry that distinction explicitly, and the json arms were routed to `storage_roots`
+for the same consistency.
 The invalidation runs on the state that reaches the loop head (probe pass + every fixpoint round) and
 on each `break` snapshot — the latter to the snapshot only, since the statements this pass still
 walks after a `break` belong to the iteration that has not dropped yet. `BorrowState::invalid`
@@ -2103,12 +2116,14 @@ shipped serve loop was always safe) was already rejected by the move path. Cover
 `known_hole_scope_end_drop_…`) in `tests/http_headers_view.rs`, plus eleven tests in
 `tests/borrow_liveness.rs` — back-edge, `break` edge, all four temporary-materializing shapes (a
 call, a view-returning call *over* a temporary, `?` on one, a materialized array sliced in place),
-and the controls that keep the rule from over-rejecting: same-iteration use of a local and of a
-temporary, a temporary outside any loop, a source declared outside the loop, an inner `break` that
-must drop only the inner body's locals, and an owned local *moved out* by `break` (its flag is
-cleared, so it is not a freed source). Mutation-checked in three places — neutering
-`invalidate_iteration_drops`, `temp_owner_root`, or the `IterTemp` arm of the edge each fails exactly
-the corresponding positive tests and no control.
+a `json` view over a temporary and over a dropped loop-body input, and the controls that keep the
+rule from over-rejecting: a fresh value **moved into an owning local** (array and Move-struct forms),
+same-iteration use of a local and of a temporary, a temporary outside any loop, a source declared
+outside the loop, an inner `break` that must drop only the inner body's locals, and an owned local
+*moved out* by `break` (its flag is cleared, so it is not a freed source). Mutation-checked in five
+places — neutering `invalidate_iteration_drops`, `temp_owner_root`, the `IterTemp` arm of the edge,
+or the `storage_roots` attribution, and *restoring* the attribution to `borrow_sources` — each fails
+exactly the corresponding tests and nothing else.
 
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`

@@ -729,3 +729,108 @@ fn main() -> i32 {
 ";
     assert!(check_errs("borrow-chunks-loop-over-reject", in_loop));
 }
+
+/// **The borrow-vs-move split, and the false positive that proved it is needed.**
+///
+/// A hidden owner exists only where MIR *borrows* a fresh Move value (`lower_borrowed_owned`).
+/// Moving one into a local that OWNS it transfers the storage to that named local instead — nothing
+/// joins the loop's drop set. `names` below is declared outside the loop and owns its array; the
+/// array's `str` elements view `src`, which also outlives the loop. Nothing is freed at the
+/// back-edge, and the program prints `aa` / `bb`.
+///
+/// The first cut of the temporary rule added the root at the top of `borrow_sources`, which every
+/// materializing consumer also reaches — so this idiom ("rebuild a collection each pass, use the
+/// latest after the loop") was rejected. The root now comes from `storage_roots`, the borrowing
+/// position, which a move never passes through.
+#[test]
+fn a_move_into_an_owning_local_is_not_a_borrow_of_a_temporary() {
+    let src = "\
+fn up(s: str) -> str = s
+fn main() -> i32 {
+  src := [\"aa\", \"bb\"]
+  mut names: array<str> := src.map(up).to_array()
+  mut n := 0
+  loop {
+    names = src.map(up).to_array()
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(names[0])
+  return names[1].len() as i32
+}
+";
+    let diags = check_diagnostics("borrow-loop-move-into-owner", src);
+    assert!(
+        !diags.contains("invalidated borrow"),
+        "a fresh array MOVED into an owning local is not a borrowed temporary: {diags}"
+    );
+
+    // The same shape one step further: a struct that owns a `string` and views a `str`.
+    let owned_struct = "\
+Rec { name: string, tag: str }
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  tag := \"t\"
+  mut r := Rec { name: mk(\"a\"), tag: tag }
+  mut n := 0
+  loop {
+    r = Rec { name: mk(\"b\"), tag: tag }
+    n = n + 1
+    if n > 3 { break }
+  }
+  return r.name.len() as i32
+}
+";
+    assert!(!check_errs("borrow-loop-move-struct-into-owner", owned_struct));
+}
+
+#[test]
+fn a_json_view_over_a_temporary_input_dies_at_the_iteration_edge() {
+    // The borrowing side of the same split: `json.doc` VIEWS its input, so a doc over a temporary
+    // — or over a `string` local the iteration drops — cannot outlive the pass that made it.
+    let over_temp = "\
+import core.json
+fn mk(a: str) -> string = a.clone()
+fn main() -> Result<(), Error> {
+  arena {
+    mut keep: str := \"x\"
+    mut n := 0
+    loop {
+      d := json.doc(mk(\"{\\\"a\\\": \\\"hello world\\\"}\"))?
+      keep = d.get(\"a\").as_str() else { \"\" }
+      n = n + 1
+      if n > 3 { break }
+    }
+    print(keep)
+  }
+  return Ok(())
+}
+";
+    assert!(check_errs("borrow-json-temp-input", over_temp));
+
+    // Same, with the input bound to a loop-body local — reported against the name.
+    let over_local = "\
+import core.json
+fn mk(a: str) -> string = a.clone()
+fn main() -> Result<(), Error> {
+  arena {
+    mut keep: str := \"x\"
+    mut n := 0
+    loop {
+      src := mk(\"{\\\"a\\\": \\\"hello world\\\"}\")
+      d := json.doc(src)?
+      keep = d.get(\"a\").as_str() else { \"\" }
+      n = n + 1
+      if n > 3 { break }
+    }
+    print(keep)
+  }
+  return Ok(())
+}
+";
+    let diags = check_diagnostics("borrow-json-local-input", over_local);
+    assert!(
+        diags.contains("its source 'src' was dropped at the end of the loop iteration"),
+        "a doc over a dropped loop-body input must be rejected against that name: {diags}"
+    );
+}
