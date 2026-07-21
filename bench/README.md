@@ -36,6 +36,13 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   then *all* of B over a >cache working set produces wildly wrong ratios
   (the second kernel benefits from a warm-ish cache / settled clocks). This trap once made an
   identical-machine-code kernel look "20× slower" — it was a measurement artifact.
+- **A difference of two large measurements carries both their noises.** `web_e2e` reports "Align's
+  protocol path above the floor" by subtracting two ~70 µs end-to-end numbers, each stable to ~1% —
+  so the 4 µs difference is stable to ~35% (measured: 3.3 / 3.9 / 4.8 on adjacent runs). Anything
+  smaller than that spread cannot be priced there however many times you run it. When the quantity
+  you care about is a small difference, **measure it directly**: `bench/http_path` prices the same
+  path in-process on an exact allocation count and the server thread's own CPU time, gets ±1.3%, and
+  agrees with `web_e2e`'s absolute number — which is what makes both trustworthy.
 - **When the result disappoints, autopsy — don't guess.** If a mechanism that *should* win comes back
   flat or slower, do not reason about the cause from intuition: build an **absolute-ms breakdown** that
   starts from the fast variant and adds one realistic cost at a time (stage-1 alone → + materialize →

@@ -112,5 +112,14 @@ Two things to carry forward rather than re-derive:
 2. **The remaining 4.1 µs is not one syscall.** With the poll unremovable this way, what is left to
    attack is allocation and copying: `http_read_request` starts a fresh `Vec` per request, the
    header spans are a fresh `Vec`, the builder holds `String`s, and the response is serialized into
-   another fresh buffer. That is four-plus allocations on a path whose whole budget is 4.1 µs, and
-   `bench/web_e2e` at `CONNS=1` can price each one.
+   another fresh buffer. **Measured since: 14 allocations and 770 bytes per request**, on a path
+   whose whole budget is 4.1 µs.
+
+**Correction (2026-07-22): the last sentence of that point used to say `bench/web_e2e` at `CONNS=1`
+can price each one. It cannot.** The "above the floor" figure is a *difference of two ~70 µs
+measurements*, so it carries both their noises: three adjacent baseline runs give **3.3 / 3.9 / 4.8
+µs/req**, a 1.5 µs spread on a 4.0 µs signal — larger than the whole allocation budget. Per-run req/s
+at one connection really is stable to ~1%; the derived difference is not, and that distinction is the
+lesson. **`bench/http_path` is the instrument for this work**: it prices the same path in-process on
+an exact allocation count (zero noise) plus the server thread's own CPU time (±1.3% at 200k
+iterations), and its 4.3 µs above its own floor agrees with the 4.0–4.1 µs here.
