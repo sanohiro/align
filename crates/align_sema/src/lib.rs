@@ -4363,7 +4363,7 @@ impl EffectScan<'_> {
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
             // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
             // so an effect *inside* the operands is still counted.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.impure_direct = true;
                 self.expr(host);
                 self.expr(port);
@@ -6872,7 +6872,7 @@ impl<'a> EscapeCheck<'a> {
             // `respond` returns `Result<(), Error>`. The `ctx.*` view getters' escapes are caught by
             // `region_of` / `slice_is_local`, not here. Just recurse to catch an escape *inside* the
             // operands.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.walk(host, depth);
                 self.walk(port, depth);
             }
@@ -7480,7 +7480,7 @@ impl UnnecessaryHeapScan {
                 self.visit(max_concurrency);
             }
             // `std.http` (Slice 4) — no heap-narrowing pattern of its own; recurse into the operands.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.visit(host);
                 self.visit(port);
             }
@@ -8972,7 +8972,7 @@ impl<'a> MoveCheck<'a> {
             // (borrowed); the ctx getters read `ctx` (borrowed). `respond`, though, **consumes BOTH**
             // `ctx` and `rb` (the runtime frees them — like `request`'s `req`); a use-after-move of
             // either is caught here, and the MIR nulls both slots so the exit `Drop` doesn't double-free.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.expr(host, moved, false, false);
                 self.expr(port, moved, false, false);
             }
@@ -12489,7 +12489,15 @@ impl<'a, 't> Checker<'a, 't> {
             // the receiver type below.
             if module == "http" && method == "serve" {
                 self.require_import("std.http", "http.serve", span);
-                return self.check_http_serve(args, span);
+                return self.check_http_serve(args, false, span);
+            }
+            // `http.serve_shared(host, port)` — the prefork sibling of `http.serve`: same bind, plus
+            // `SO_REUSEPORT` so several live listeners may share ONE port (http.md item 9 ①). Kept a
+            // separate op, not a flag: `http.serve` must keep failing loudly on an accidental second
+            // bind — sharing a port is an explicit decision, visible at the call site.
+            if module == "http" && method == "serve_shared" {
+                self.require_import("std.http", "http.serve_shared", span);
+                return self.check_http_serve(args, true, span);
             }
             if module == "http" && method == "response" {
                 self.require_import("std.http", "http.response", span);
@@ -18311,11 +18319,16 @@ impl<'a, 't> Checker<'a, 't> {
     /// `http.serve(host, port)` — bind a listening socket, yielding `Result<http_server, Error>`
     /// ([`Ty::HttpServer`] Ok payload). `host` is a `str` (empty → wildcard); `port` is an `i64`. A
     /// module function (dispatched like `tcp.listen`). Impure (opens a socket).
-    fn check_http_serve(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+    ///
+    /// `shared` = the sibling op `http.serve_shared(host, port)`: the same bind plus `SO_REUSEPORT`,
+    /// so N prefork workers may each own their own listener on ONE port (http.md item 9 ①). Only the
+    /// runtime call differs — same arity, same types, same effects.
+    fn check_http_serve(&mut self, args: &[ast::Expr], shared: bool, span: Span) -> Expr {
+        let name = if shared { "http.serve_shared" } else { "http.serve" };
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 2 {
             self.diags
-                .error(format!("'http.serve' expects 2 arguments (the host and port), got {}", args.len()), span);
+                .error(format!("'{name}' expects 2 arguments (the host and port), got {}", args.len()), span);
             return err;
         }
         let host = self.check_str_init(&args[0]);
@@ -18325,11 +18338,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if !port.ty.is_int_like() {
             self.diags
-                .error(format!("'http.serve' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
+                .error(format!("'{name}' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
             return err;
         }
         Expr {
-            kind: ExprKind::HttpServe { host: Box::new(host), port: Box::new(port) },
+            kind: ExprKind::HttpServe { host: Box::new(host), port: Box::new(port), shared },
             ty: Ty::Result(Scalar::HttpServer, Scalar::Enum(self.error_enum_id)),
             span,
         }
@@ -20425,7 +20438,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(urls);
                 self.finalize_expr(max_concurrency);
             }
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
             }

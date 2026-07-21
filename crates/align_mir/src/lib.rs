@@ -980,7 +980,11 @@ pub enum Rvalue {
     /// `http.serve(host, port)` — bind a listening socket: the runtime writes an owned `http_server`
     /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
     /// `Error`). The caller branches `Ok(http_server)` / `Err`. Impure.
-    HttpServe { host: Operand, port: Operand, out: Slot },
+    ///
+    /// `shared` selects the prefork sibling `http.serve_shared` (`SO_REUSEPORT` on the listener,
+    /// http.md item 9 ①) — a field, not a variant, so every pass keeps treating it as `http.serve`;
+    /// only the runtime symbol codegen calls differs.
+    HttpServe { host: Operand, port: Operand, out: Slot, shared: bool },
     /// `srv.accept()` — accept + parse one request: the runtime writes an owned `http_request_ctx`
     /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
     /// `Error`). The caller branches `Ok(http_request_ctx)` / `Err`. Impure.
@@ -9017,11 +9021,11 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         // `http.serve(host, port)` → `Result<http_server, Error>` (shared out-slot + i32-status
         // lowering, `ok_ty = HttpServer`). `host`/`port` are read.
-        hir::ExprKind::HttpServe { host, port } => {
+        hir::ExprKind::HttpServe { host, port, shared } => {
             let out = b.new_slot(Ty::HttpServer);
             let h = lower_expr(b, host);
             let p = lower_expr(b, port);
-            lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out }, out, Ty::HttpServer, e.ty)
+            lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out, shared: *shared }, out, Ty::HttpServer, e.ty)
         }
         // `srv.accept()` → `Result<http_request_ctx, Error>` (`ok_ty = HttpRequestCtx`). `server` is
         // borrowed (a server accepts many).

@@ -8,7 +8,33 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-21, **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
+_Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE — the
+hard streaming ordering constraint is LIFTED.** The three designed slices all landed in one arc:
+① std.http `http.serve_shared` (`SO_REUSEPORT` sibling op; `ExprKind`/`Rvalue::HttpServe` gained a
+`shared: bool` FIELD, not a variant, so no analysis pass changed), ② std.http keep-alive entirely
+inside `accept`/`respond` (one `Arc<Mutex<ParkSlot>>` per server handle; eligibility = 1.1 + no
+`Connection: close` + no residual; `poll({parked, listener})` preferring parked; no `Connection`
+header on a persistent response; `HttpServer::drop` marks the cell `Dead`), and ③ pkg.web prefork —
+`serve(host, port, routes, workers)` with `workers == 1` inline (strict bind, zero threads) and
+`>= 2` spawning `task_group` workers that each bind their own listener. **No compiler enabler was
+needed**, exactly as probed: the worker's bind is an ordinary value-carrying
+`if shared { http.serve_shared(…)? } else { http.serve(…)? }`. **Behavioral consequence for every
+caller/test:** an eligible 1.1 request now leaves the connection OPEN, so a read-to-EOF client must
+send `Connection: close` (driver tests share `common::one_shot`) or frame by `Content-Length`.
+**One settled amendment fell out of the implementation:** `respond` used to emit `Content-Length`
+only when a body was SET, so a bodiless `200` was framed "until close" — un-keep-alive-able and
+indistinguishable from a truncated stream. Every response whose status may carry a body is now
+framed either way (the set length, or `0`); `1xx`/`204`/`304` still get no framing header. Keep-alive
+therefore depends only on the REQUEST, and `web.status(201)` stays on the connection.
+Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver `m11_http_server.rs`
+(serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
+`apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
+worker while the others answer — the property the sequential loop could not have; `workers < 1`
+abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
+`workers = cores`), then W7 Fiber. Remaining W4 test matrices (route-tree edges / malformed
+requests) fold into it. Earlier context follows._
+
+_Previously: **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
 ENABLERS 1–5 ALL COMPLETE (#593); W4 HARDENING SLICE 1 COMPLETE (#594).** #593 = the pkg.web
 streaming wiring (`Handler` Respond/Stream sum type in the ONE route table, `web.sse`/`web.stream`,
 serve's stream arm, std.http `s.send_event` — surface revised from the sketched

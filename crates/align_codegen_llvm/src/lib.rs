@@ -2241,6 +2241,11 @@ fn build_module<'c>(
         module.add_function("align_rt_http_serve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // The `SO_REUSEPORT` prefork sibling (http.md item 9 ①) — identical ABI to `http_serve`.
+        "http_serve_shared".to_string(),
+        module.add_function("align_rt_http_serve_shared", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         "http_server_free".to_string(),
         module.add_function("align_rt_http_server_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
@@ -7581,13 +7586,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // i32 status (null `out` first, like the client); `respond` returns i32 (no out); the ctx
             // getters return a `{ptr,len}` view (or write one to `out` for `header`); `response` allocates
             // a builder; `rb_header`/`rb_body` are void; a header/body/status is passed by value.
-            Rvalue::HttpServe { host, port, out } => {
+            Rvalue::HttpServe { host, port, out, shared } => {
                 let (hp, hl) = self.split_str(host)?;
                 let port_v = self.operand(port);
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let callee = if *shared { self.funcs["http_serve_shared"] } else { self.funcs["http_serve"] };
                 self.builder
-                    .build_call(self.funcs["http_serve"], &[hp.into(), hl.into(), port_v.into(), out_ptr.into()], "httpserve")
+                    .build_call(callee, &[hp.into(), hl.into(), port_v.into(), out_ptr.into()], "httpserve")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_serve returns i32 status")
             }

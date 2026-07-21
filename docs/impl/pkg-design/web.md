@@ -100,7 +100,7 @@ fn main() -> Result<(), Error> {
     web.get("/v1/models/:id", get_model),
     web.post("/v1/chat/completions", chat),
   ]
-  web.serve("127.0.0.1", 8080, routes)
+  web.serve("127.0.0.1", 8080, routes, 4)
 }
 ```
 
@@ -134,12 +134,15 @@ web.patch(pattern, handler)   -> route
 // grouping (pure data: prefix + routes → prefixed routes; no closures involved)
 web.group(prefix, routes)     -> array<route>
 
-// serving — Impure; sequential accept v1 (concurrency is the recorded, measured follow-up)
-web.serve(host, port, routes) -> Result<(), Error>
-//   startup: build + validate the radix tree (duplicate/ambiguous → abort with the pattern).
+// serving — Impure; `workers` request loops (prefork, SO_REUSEPORT — see "Concurrent serve")
+web.serve(host, port, routes, workers) -> Result<(), Error>
+//   startup: validate the table (malformed → abort with the pattern); `workers < 1` aborts too.
 //   per request: parse (std.http, zero-copy) → split the request-target into path + query →
 //   radix dispatch → handler → WRITE what it returned. Automatic responses: no path match → 404,
 //   path-but-not-method → 405 (with Allow), handler Err → 500. The loop never dies per-request.
+//   `workers == 1` runs that loop inline on the calling thread (no threads at all); `>= 2` spawns
+//   that many workers, each with its OWN listener. A connection is kept alive inside std.http, so
+//   the loop shape is identical either way.
 
 // ctx accessors (all Pure; all return views region-bound to c)
 web.param(c, name)   -> str              // named :param capture (fixed slot array; total —
@@ -379,13 +382,15 @@ match r.handler {
   handler Err — the W4 logging story covers both.
 - The loop never dies per request, unchanged.
 
-### Ordering constraint (hard)
+### Ordering constraint (hard) — LIFTED 2026-07-21
 
-v1 `serve` is sequential — **an open stream starves every other client**. Streaming must land
-together with (or after) the recorded concurrent-serve follow-up; shipping it on the sequential
-loop is test-only. This is an ordering note, not a design dependency: nothing above changes shape
-with concurrency. (The follow-up is now DESIGNED — "Concurrent serve (prefork)" below: a stream
-occupies one of `W` workers, so the gate becomes a visible sizing decision.)
+v1 `serve` was sequential — **an open stream starved every other client** — so streaming shipped
+test-only, gated on the concurrent-serve follow-up. That follow-up is now SHIPPED ("Concurrent
+serve (prefork)" below): a stream occupies exactly one of `W` workers and the other `W - 1` keep
+serving, which turns the gate into a visible sizing decision (`workers >= expected concurrent
+streams + 1`). Pinned by `crates/align_driver/tests/apps_web_prefork.rs`
+(`a_held_open_stream_occupies_one_worker_while_the_others_serve`). Nothing in the streaming design
+changed shape with concurrency, exactly as this note predicted.
 
 ### Enablers (probed 2026-07-21; in implementation order)
 
@@ -430,8 +435,9 @@ occupies one of `W` workers, so the gate becomes a visible sizing decision.)
    `Ok(s) => pump(c, s)`). E2E: `crates/align_driver/tests/apps_web_stream.rs` (3 — SSE frames +
    mid-pump `param`/`has_query`/`body` reads, the reject 4xx window with the loop surviving, and
    one-table coexistence: stream-route 405 `Allow` + 404), `m12_http_stream.rs` (+1 `send_event`),
-   runtime unit framing test, and a sema regression pin for the MoveCheck fix. **Still test-only**:
-   production streaming remains gated on concurrent serve (the hard ordering note above).
+   runtime unit framing test, and a sema regression pin for the MoveCheck fix. **No longer
+   test-only**: concurrent serve shipped the same day (the prefork section below), so the hard
+   ordering note is lifted and a stream costs one worker, not the server.
 
 ### Backlog (recorded, not v1)
 
@@ -439,7 +445,7 @@ Heartbeat/keep-alive comments, `event:`/`id:` fields + `Last-Event-ID` resume, m
 `send_event` data splitting, per-request head customization on stream routes, and stream
 timeouts/backpressure — each waits for a consumer.
 
-## Concurrent serve (prefork) + connection keep-alive — designed 2026-07-21, lands W5-pre
+## Concurrent serve (prefork) + connection keep-alive — designed + SHIPPED 2026-07-21
 
 **The problem, twice over.** v1 `serve` is one blocking loop: an open SSE/chat stream starves
 every other client (the hard ordering note above — production streaming is gated on this), and
@@ -495,17 +501,23 @@ the single parked slot, poll preference, the no-pipelining rule, the `Connection
 drop-order safety) is std.http item 9 — `docs/impl/std-design/http.md`. pkg.web's serve loop is
 byte-identical before and after; only the prefork wrapper above is pkg-side work.
 
-### Slices (implementation order, next session)
+### Slices (implementation order)
 
-1. **std.http `http.serve_shared(host, port)`** — the `SO_REUSEPORT` listener as a SIBLING op
+1. **std.http `http.serve_shared(host, port)`** — DONE. The `SO_REUSEPORT` listener as a SIBLING op
    (`http.serve` keeps strict-bind semantics: an accidental double server must still fail
    loudly; reuse is an explicit choice, the `respond`/`respond_stream` sibling precedent).
-2. **std.http keep-alive** (item 9: parked slot + poll + eligibility; independently testable
-   against the v1 sequential serve — keep-alive lands before prefork).
-3. **pkg.web prefork** (`serve` signature change + the `workers == 1` inline path + the
-   `task_group` wrapper; update every serve call site outright, no compat).
+2. **std.http keep-alive** — DONE (item 9 ②: parked slot + poll + eligibility, tested against the
+   sequential serve before prefork existed). **One behavioral consequence for every caller:** an
+   eligible 1.1 request leaves the connection open, so a read-to-EOF client must now send
+   `Connection: close` (the driver tests' shared `one_shot` helper) or frame by `Content-Length`.
+3. **pkg.web prefork** — DONE. `serve(host, port, routes, workers)`, the `workers == 1` inline
+   path (strict bind, zero threads), the `task_group` wrapper, and every call site updated
+   outright. The worker body is the factored-out `worker(host, port, routes, shared)`, whose bind
+   line is `srv := if shared { http.serve_shared(…)? } else { http.serve(…)? }` — an ordinary
+   value-carrying `if`, so no new nameable `http_server` type was needed. Needed NO compiler
+   enabler, as probed.
 4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
-   only now is the Fiber comparison honest.
+   only now is the Fiber comparison honest. THE REMAINING SLICE.
 
 ## Slices (F3 of the plan)
 
@@ -531,14 +543,16 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   HEAD form, so stream-only GET keeps HEAD at 405). **Automatic 404/405/500 carry the fixed
   minimal JSON bodies** (`{"error":"not found"}` / `"method not allowed"` / `"internal error"`,
   `Content-Type: application/json`). Tests: `apps_web_validate.rs` (9 aborts + the legal-shadow
-  serve), `apps_web_root.rs` HEAD/body matrix, runtime serializer unit. Remaining W4: route-tree
-  edge matrix (deep paths, long segments, empty table), malformed-request matrix, keepalive
-  reuse, and the handler-`Err` logging story (W5+).
+  serve), `apps_web_root.rs` HEAD/body matrix, runtime serializer unit. Keep-alive reuse is
+  SHIPPED (std.http item 9 ②; `apps_web_root.rs` keep-alive E2E). Remaining W4: route-tree
+  edge matrix (deep paths, long segments, empty table), malformed-request matrix, and the
+  handler-`Err` logging story (W5+).
 - **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
   (≈ zero overhead required) — the performance contract becomes a pinned regression.
 - **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
-  **WIRED and pinned E2E** (enabler 5 above, 2026-07-21) but production-gated on concurrent serve
-  (now DESIGNED — the prefork section above); middleware-lite remains designed-only.
+  **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
+  prefork section above), so a stream costs one worker instead of the whole server.
+  Middleware-lite remains designed-only.
 - **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
   numbers and the gap analysis in this doc.
 

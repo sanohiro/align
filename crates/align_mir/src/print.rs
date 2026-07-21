@@ -618,7 +618,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(urls),
             operand_str(max_concurrency)
         ),
-        Rvalue::HttpServe { host, port, out } => format!("http_serve({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::HttpServe { host, port, out, shared } => format!(
+            "{}({}, {}, -> _{out})",
+            if *shared { "http_serve_shared" } else { "http_serve" },
+            operand_str(host),
+            operand_str(port)
+        ),
         Rvalue::HttpAccept { server, out } => format!("http_accept({}, -> _{out})", operand_str(server)),
         Rvalue::HttpCtxMethod { ctx } => format!("http_ctx_method({})", operand_str(ctx)),
         Rvalue::HttpCtxPath { ctx } => format!("http_ctx_path({})", operand_str(ctx)),

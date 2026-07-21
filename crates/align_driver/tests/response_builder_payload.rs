@@ -29,6 +29,8 @@ fn free_loopback_port() -> u16 {
 }
 
 fn exchange(port: u16, req: &[u8]) -> String {
+    // One request per connection: keep-alive would leave the socket parked and this read blocked.
+    let req = &one_shot(req)[..];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
