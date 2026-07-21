@@ -61,11 +61,25 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
+1. **Borrow liveness must end at scope-end DROP, not only at MOVE — a real use-after-free, no
+   `unsafe` required.** Found adversarially while implementing `ctx.headers()` (#598) and recorded
+   in `open-questions.md` next to #460, whose dataflow should own the fix. `MoveCheck` invalidates a
+   view when its owning source is moved or reassigned; it does not notice a Move handle bound in an
+   INNER SCOPE — a loop body, an `arena {}` block — being dropped when that scope closes, and
+   `Region::Frame` cannot tell "this frame" from "this iteration". A view assigned out to a
+   longer-lived local then reads freed memory. **General to every view over a Move handle**
+   (reproduced on a plain `str` from `ctx.path()`, on main, long before #598), and the shipped
+   `serve` loops are safe only because `respond` MOVES the handle each pass. This outranks the perf
+   items below: it is the one open item where the language accepts a program it must reject.
+   `known_hole_scope_end_drop_does_not_invalidate_a_view` pins today's unsound acceptance for both
+   the `http_headers` and the `str` case — when the fix lands, both assertions flip and the
+   `known_hole_` prefix goes. Design first (it is a dataflow/semantics change touching every view),
+   then implement.
+2. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
    is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
    `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
    buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
-2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
+3. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
