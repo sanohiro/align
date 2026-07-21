@@ -52,18 +52,33 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
-abort). **NEXT: close W7 with Fiber, then the 4.1 µs protocol path.** W5's e2e gate is **MET** and W7 is
-**PARTIAL** — both measured 2026-07-21 with a load generator built for the job (one thread per
-connection; the first version drove connections round-robin and measured itself at ~33k req/s,
-quoted nowhere now).
+abort).
 
-- **W5:** pkg.web costs **0.8 µs/request** over the same responses written directly on `std.http`
-  (CONNS=1 ping-pong; 0.98–1.00× at 32 connections). **Align's whole protocol path is 4.1 µs/req**
-  above a minimal-Rust floor — so dispatch (35 ns) is **0.9% of Align's own path**, and
-  `bench/web_router`'s remaining levers are worth ~0.1%. **Do not spend on the router.** The 4.1 µs
-  is the budget; the two candidates inside it are the `poll` syscall keep-alive adds per request and
-  sharing one buffer between the parse and the response write. (No `strace`/`perf` on this box —
-  the floor server in `bench/web_e2e` is how the path gets priced without them.)
+**NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
+READMEs):**
+
+1. **`accept`'s transient-errno classification — the last path where a worker still dies.**
+   `http_accept_conn` returns ANY `accept(2)` failure, and `pkg.web`'s `srv.accept()?` ends the
+   worker on it. `EINTR` is already retried; what is not: **`ECONNABORTED`** (the client vanished
+   between SYN and accept — pure noise, retry immediately) and **`EMFILE`/`ENFILE`** (fd exhaustion
+   — retrying blindly spins). The shape to build: on `EMFILE`, **evict a parked keep-alive
+   connection** (the set is right there and idle connections are exactly the fds to give back),
+   then retry; if the set is empty, back off briefly rather than spin. That turns the one remaining
+   self-inflicted server death into a degradation. Testable by spawning a child with a low
+   `RLIMIT_NOFILE`. This is small, well-scoped, and it closes a hole the adversarial rounds kept
+   circling.
+2. **`web.header(c, name)` — the most visible REST hole.** Still not shipped, and NOT ordinary
+   work: an arbitrary-name lookup cannot ride a single stored view, so it needs a std.http enabler
+   (a detached headers-view value the Copy `Ctx` can carry). **Design the enabler first**, in
+   `std-design/http.md`; do not duplicate the lookup in pkg.web. The note is already in
+   `pkg-design/web.md` (ctx accessors block).
+3. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
+   is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
+   `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
+   buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
+4. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
+   middleware-lite (W6, designed only), multipart.
+
 - **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the
   attempt.** Align does exactly one syscall more than the floor (`poll` before the read), so the
   first cut was a speculative non-blocking `recv` on the most-recently-served connection, falling
