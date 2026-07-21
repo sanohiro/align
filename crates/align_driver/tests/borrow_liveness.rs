@@ -544,3 +544,44 @@ fn main() -> i32 {
 ";
     assert!(!check_errs("borrow-loop-break-moves-owned", src));
 }
+
+/// **KNOWN OVER-REJECTION — pinned so its fix is noticed. Not unsound; the safe direction.**
+///
+/// The scope-end-drop rule keys on the *type* boundary predicate `needs_drop_flag` (what puts a
+/// local in `Fn::drop_locals`), because `MoveCheck` runs **before** `EscapeCheck` and therefore
+/// cannot see the individual-vs-arena ownership bit. An array allocated **inside an enclosing
+/// `arena {}`** is arena-owned: its runtime drop flag is never set, MIR's back-edge
+/// `emit_drop_if_live` folds away, and nothing is freed until `arena_end`. So the view below stays
+/// valid for the whole arena and this program is rejected although it is safe.
+///
+/// The same shape with a **heap**-owned source (a `string` from `.clone()`, which is malloc'd even
+/// inside an arena) is a genuine use-after-free and *must* stay rejected — the two are
+/// indistinguishable to a type-level predicate, which is why the rule takes the conservative side.
+///
+/// The real fix is the recorded structural follow-up: borrow liveness belongs in the checked-HIR
+/// escape CFG, which already carries regions, ownership provenance, and loop fixpoints. When it
+/// moves there, flip this assertion.
+#[test]
+fn over_rejects_a_view_of_an_arena_allocated_loop_local() {
+    let src = "\
+fn main() -> i32 {
+  mut n := 0
+  arena {
+    mut keep: slice<i64> := [7, 7, 7][..]
+    loop {
+      xs := [1, 2, 3].map(fn v: i64 { v + n }).to_array()
+      keep = xs[..]
+      n = n + 1
+      if n > 3 { break }
+    }
+    print(keep[0])
+  }
+  return 0
+}
+";
+    assert!(
+        check_errs("borrow-arena-loop-over-reject", src),
+        "KNOWN OVER-REJECTION: this is safe (the array lives in the enclosing arena, freed only at \
+         `arena_end`). If it now checks, borrow liveness gained the ownership bit — flip this."
+    );
+}

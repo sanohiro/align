@@ -2048,6 +2048,29 @@ program with no use-after-free in it. ② The `http_headers` case was described 
 `str` case; both are the same shape- and allocator-dependent UB, and the `str` case reproduces on a
 plain `string` with no std handle anywhere.
 
+**The one cost, pinned as a test rather than hidden: an over-rejection on arena-owned loop locals.**
+The rule keys on the *type* predicate `needs_drop_flag`, because `MoveCheck` runs **before**
+`EscapeCheck` and so cannot see the individual-vs-arena ownership bit. An array allocated inside an
+enclosing `arena {}` is arena-owned — its drop flag is never set, MIR's back-edge drop folds away,
+nothing is freed until `arena_end` — yet a view of it assigned out of the loop is now rejected:
+
+```align
+arena {
+  mut keep: slice<i64> := [7, 7, 7][..]
+  loop { xs := [1, 2, 3].map(…).to_array(); keep = xs[..]; … }   // safe, but rejected
+  print(keep[0])
+}
+```
+
+The same shape with a **heap**-owned source (a `string`, malloc'd even inside an arena — verified by
+running it) is a genuine use-after-free that must stay rejected, and the two are indistinguishable to
+a type-level predicate. Conservative is the right side to err on (inconvenience, not breakage), and
+approximating the ownership bit inside `MoveCheck` would be a second mechanism for something that
+already has one. **The real fix is the structural follow-up recorded above**: borrow liveness belongs
+in the checked-HIR escape CFG (#461–#464), which already carries regions, allocation provenance, and
+loop fixpoints. Pinned as `over_rejects_a_view_of_an_arena_allocated_loop_local` in
+`tests/borrow_liveness.rs`; flip it when the analysis moves.
+
 The variant where the loop **consumes** the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
 shipped serve loop was always safe) was already rejected by the move path. Coverage: the flipped
 `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was

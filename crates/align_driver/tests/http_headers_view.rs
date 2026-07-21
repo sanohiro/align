@@ -171,9 +171,9 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
 /// borrow. This is the loop-fixpoint half of `MoveCheck`'s borrow flow: the read comes *before* the
 /// assignment in source order, so only the back-edge join catches it.
 ///
-/// **What this does NOT cover:** a ctx that is merely DROPPED at the end of the iteration rather
-/// than moved. See `known_hole_scope_end_drop_does_not_invalidate_a_view` below — that is a
-/// pre-existing gap in `MoveCheck`, not specific to this type.
+/// **The sibling case** — a ctx that is merely DROPPED at the end of the iteration rather than
+/// moved — is `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` below. It was a
+/// `MoveCheck` gap until 2026-07-22 and was never specific to this type.
 #[test]
 fn a_consumed_ctx_invalidates_a_view_held_across_a_serve_iteration() {
     let src = "\

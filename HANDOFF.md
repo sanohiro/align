@@ -94,6 +94,16 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   that genuinely is arena-allocated is already rejected by the region rule's `decl_depth` check.
   ② `http_headers` is not reliably louder than `str`; both are shape- and allocator-dependent UB.
   Verify a UB claim by running it, not by reasoning from the type.
+- **The one cost, pinned as a test rather than hidden.** The rule keys on the *type* predicate
+  `needs_drop_flag`, because `MoveCheck` runs BEFORE `EscapeCheck` and cannot see the
+  individual-vs-arena ownership bit. An array allocated inside an enclosing `arena {}` is
+  arena-owned — flag never set, back-edge drop folded away, nothing freed until `arena_end` — yet a
+  view of it assigned out of the loop is now rejected. The same shape with a heap-owned source (a
+  `string`, malloc'd even inside an arena) is a real use-after-free that must stay rejected, and the
+  two are indistinguishable to a type-level predicate. Conservative is the right side (inconvenience,
+  not breakage). The real fix is the recorded structural follow-up — borrow liveness belongs in the
+  checked-HIR escape CFG (#461–#464), which already has regions, provenance, and loop fixpoints.
+  Pinned as `over_rejects_a_view_of_an_arena_allocated_loop_local`.
 - Tests: the flipped `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
   `known_hole_scope_end_drop_…`), plus six in `tests/borrow_liveness.rs` — back-edge, `break` edge,
   and the controls that keep the rule from over-rejecting: same-iteration use, a source declared
