@@ -8,8 +8,8 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE — the
-hard streaming ordering constraint is LIFTED.** The three designed slices all landed in one arc:
+_Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
+(#595) — the hard streaming ordering constraint is LIFTED.** The three designed slices all landed in one arc:
 ① std.http `http.serve_shared` (`SO_REUSEPORT` sibling op; `ExprKind`/`Rvalue::HttpServe` gained a
 `shared: bool` FIELD, not a variant, so no analysis pass changed), ② std.http keep-alive entirely
 inside `accept`/`respond` (one `Arc<Mutex<ParkSlot>>` per server handle; eligibility = 1.1 + no
@@ -53,7 +53,11 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
 abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
-`workers = cores`), then W7 Fiber. Remaining W4 test matrices (route-tree edges / malformed
+`workers = process.cpu_count()`), then W7 Fiber. **Process note worth keeping:** the arc was
+reviewed THREE times (the pre-PR checklist, then two independent adversarial passes) and each pass
+found real defects in the previous one's output — round 2 found seven, including a pre-existing
+`accept` contract bug that let one malformed request kill a pkg.web server. Review the FIXES, not
+just the feature. Remaining W4 test matrices (route-tree edges / malformed
 requests) fold into it. Earlier context follows._
 
 _Previously: **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
