@@ -978,8 +978,8 @@ pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut
 /// connection itself, so the list is empty there.
 ///
 /// (`EOPNOTSUPP` doubles as "this socket is not `SOCK_STREAM`" — a permanent condition that would
-/// retry forever. Unreachable from the language surface: `tcp.listen` and `http.serve` are the only
-/// sources of a listener and both create stream sockets.)
+/// retry forever. Unreachable from the language surface: every listener comes from `tcp.listen`,
+/// `http.serve` or `http.serve_shared`, and all three create stream sockets.)
 #[cfg(target_os = "linux")]
 const ACCEPT_PENDING_NET_ERRNOS: &[i32] = &[
     64,  // ENONET
@@ -15207,30 +15207,17 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                         }
                     }
                 }
-                // A new connection, or a `poll` failure to fall back from. The parked set survives
-                // — a new client does not cost a warm one its connection — EXCEPT at capacity,
-                // where the coldest parked connection makes room for the one just accepted.
-                // Without that valve, idle keep-alive clients would pin `HTTP_MAX_PARKED_CONNS`
-                // fds per worker until they hung up, and `accept` would start failing `EMFILE`
-                // against the process rlimit.
+                // A new connection, or a `poll` failure to fall back from. **The parked set is left
+                // alone**: a new client never costs a warm one its connection here. The set is
+                // bounded where it GROWS — `respond` evicts the coldest when it parks into a full
+                // set — so accept needs no valve of its own, and one here could only ever fire for
+                // a connection that will not join the set at all (a `Connection: close` request, a
+                // malformed one, a client that vanishes after the handshake), permanently shrinking
+                // the warm set for nothing. Real descriptor pressure has its own answer below:
+                // `NoFds` spends an idle connection only when `accept` actually ran out of fds.
                 ParkedWait::Listener | ParkedWait::Failed => {
                     match unsafe { http_accept_conn(lfd) } {
-                        Ok(fd) => {
-                            // Make room — but only now that a connection really did arrive. Doing
-                            // it before the `accept` spent a warm connection even when the accept
-                            // turned out to be noise (nothing accepted) or exhaustion (which spends
-                            // one of its own right below): a client that connects and vanishes
-                            // would have cost a warm client its connection for nothing.
-                            if parked_n >= HTTP_MAX_PARKED_CONNS {
-                                let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-                                if let ParkSlot::Live(fds) = &mut *slot
-                                    && fds.len() >= HTTP_MAX_PARKED_CONNS
-                                {
-                                    unsafe { close(fds.remove(0)) };
-                                }
-                            }
-                            fd
-                        }
+                        Ok(fd) => fd,
                         Err(AcceptFail::Fatal(status)) => return status,
                         // Back to the `poll` — the connection this wait promised is gone, but a
                         // parked client's next request may be waiting right now. Re-`accept`ing in
@@ -25707,10 +25694,14 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// A raw-socket client that sends `req` and returns the full response bytes the server wrote.
     fn raw_http_client(port: u16, req: &[u8]) -> std::thread::JoinHandle<Vec<u8>> {
         use std::io::{Read, Write};
-        let req = req.to_vec();
+        // Connect and send ON THIS THREAD: a loopback `connect` completes the handshake before it
+        // returns, so the connection is in the listener's queue by the time this function does.
+        // Only the read waits on a worker thread. Doing the connect there too made the ARRIVAL
+        // ORDER of two clients a race — and a test that expects `accept` to reach the second one
+        // hangs forever when they land the other way round.
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        sock.write_all(req).expect("write request");
         std::thread::spawn(move || {
-            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            sock.write_all(&req).expect("write request");
             let mut resp = Vec::new();
             let _ = sock.read_to_end(&mut resp); // server closes after respond → read to EOF
             resp
@@ -26024,11 +26015,11 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_http_server_free(srv) };
     }
 
-    /// The capacity valves. The parked set is bounded, so SOMETHING must give when it fills: at park
-    /// time (a response arriving with the set full) and at accept time (a new connection arriving
-    /// with the set full — without that valve, idle keep-alive clients would pin every slot until
-    /// they hung up, and `accept` would eventually fail `EMFILE`). Both close the COLDEST
-    /// connection — the one served longest ago — and leave the rest alive.
+    /// The capacity valve. The parked set is bounded, so something must give when a response arrives
+    /// with the set full: `respond` closes the COLDEST connection — the one served longest ago — and
+    /// parks the new one in its place, leaving the rest alive. It sits where the set GROWS, which is
+    /// why `accept` needs no valve of its own (one there would also fire for connections that never
+    /// join the set).
     #[test]
     fn http_keepalive_capacity_evicts_the_coldest_connection() {
         use std::io::{Read, Write};
@@ -26051,7 +26042,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             socks.push(sock);
             bufs.push(buf);
         }
-        // ① Accept-time valve: a NEW connection with the set full closes the coldest (client 0).
+        // ① A NEW connection arrives with the set full. Accept leaves the set alone; the valve fires
+        //    when the new connection is PARKED, closing the coldest (client 0) to make room.
         let mut newc = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         newc.set_read_timeout(Some(std::time::Duration::from_secs(20))).expect("timeout");
         newc.write_all(b"GET /new HTTP/1.1\r\nHost: h\r\n\r\n").expect("write");
@@ -26065,6 +26057,23 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         socks[1].write_all(b"GET /still HTTP/1.1\r\nHost: h\r\n\r\n").expect("client 1 is still alive");
         assert_eq!(unsafe { serve_one_echo(srv, 200, "s") }, 0);
         assert!(read_framed_response(&mut socks[1], &mut bufs[1], false).contains("X-Path: /still\r\n"));
+        // ③ A ONE-SHOT request (`Connection: close`) with the set still full costs nobody their
+        //    connection — it is never parked, so nothing has to make room for it. An accept-time
+        //    valve fired here too, permanently shrinking the warm set for a connection that never
+        //    joined it; the set is bounded where it grows instead. `socks[2]` is the coldest
+        //    survivor after ② moved client 1 to the back.
+        let one_shot = raw_http_client(port, b"GET /once HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "o") }, 0);
+        assert!(String::from_utf8_lossy(&one_shot.join().unwrap()).contains("X-Path: /once\r\n"));
+        // Probed the same way as ①, and for the same reason it must FAIL FAST: an evicted
+        // connection is closed (`Ok(0)`), a live one has nothing to say (a read timeout). Asserting
+        // by round-trip instead would hang the runner on a regression, waiting on a server that is
+        // blocked in `accept` for a client whose connection was just closed.
+        socks[2].set_read_timeout(Some(std::time::Duration::from_millis(500))).expect("timeout");
+        assert!(
+            matches!(socks[2].read(&mut probe), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "the coldest parked connection survived a one-shot request"
+        );
         unsafe { align_rt_http_server_free(srv) };
     }
 
@@ -26307,7 +26316,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // Drain both pipes on their own threads from the start. Reading only after the child exits
         // would deadlock a child that outgrew the pipe buffer (a deep backtrace under
         // `RUST_BACKTRACE=full`) into the watchdog, and report it as "did not recover" — the one
-        // diagnosis it isn't.
+        // diagnosis it isn't. The joins below are unbounded, which is safe only because the child
+        // is the sole holder of the write ends: it spawns threads, never processes, so killing it
+        // always closes them. A child that ever spawns one needs a bounded read instead.
         fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
             std::thread::spawn(move || {
                 let mut buf = String::new();
@@ -26322,26 +26333,23 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // A regressed classification blocks the child in `accept` forever rather than failing, so
         // the wait is bounded (the nested-par_map watchdog shape).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let timed_out = loop {
+        let exited = loop {
             if let Some(status) = child.try_wait().unwrap() {
-                break Err(status);
+                break Some(status);
             }
             if std::time::Instant::now() >= deadline {
                 // Killing closes the pipes, so the readers finish and their output still reaches
                 // the panic message below.
                 child.kill().unwrap();
                 child.wait().unwrap();
-                break Ok(());
+                break None;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let out = out_reader.join().unwrap();
         let err = err_reader.join().unwrap();
-        let status = match timed_out {
-            Ok(()) => panic!(
-                "accept did not recover from descriptor exhaustion before the watchdog deadline\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
-            ),
-            Err(status) => status,
+        let Some(status) = exited else {
+            panic!("accept did not recover from descriptor exhaustion before the watchdog deadline\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
         };
         assert!(status.success(), "fd-exhaustion child failed with {status}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
         // **Fail-open guard.** `libtest` exits 0 when a filter matches NOTHING, so a rename of this

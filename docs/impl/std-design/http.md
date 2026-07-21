@@ -555,10 +555,15 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      - **`srv.accept()`**: nothing parked → plain `accept(2)`, as today. Otherwise
        `poll({…parked, listener}, infinite)`; a parked connection readable → claim it out of the
        set and parse the NEXT request from it (a fresh parse buffer — zero-copy views stay
-       per-request); listener readable → take the new connection, leaving the parked set
-       untouched **unless it is at capacity**, where the coldest parked connection makes room
-       (without that valve idle keep-alive clients pin every slot until they hang up, and
-       `accept` eventually fails `EMFILE`). The readiness scan starts at a **rotating** index
+       per-request); listener readable → take the new connection, **leaving the parked set
+       untouched** — the set is bounded where it grows (`respond` evicts the coldest when parking
+       into a full one), so accept needs no valve of its own, and one there would also fire for
+       connections that never join the set at all. Genuine descriptor pressure is answered by the
+       `NoFds` path above, which spends a connection only when `accept` actually ran out of fds.
+       (An accept-time valve WAS shipped in #595 and removed in #597 for exactly this reason: it
+       killed a warm connection for every `Connection: close` or malformed request that arrived at
+       capacity, permanently shrinking the warm set, and no test observed it.) The readiness scan
+       starts at a **rotating** index
        rather than always preferring parked: a "parked first" scan lets busy keep-alive clients
        starve the listener outright — with its own `SO_REUSEPORT` queue no sibling worker can
        drain it, so new connections would sit until the backlog dropped SYNs. Parked EOF / parse
@@ -599,10 +604,10 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
          the descriptors a worker lacks are usually a sibling's (and `ENFILE` is system-wide, where
          giving back our own may not help at all) — unpaced, one worker would burn its entire warm
          set in a tight loop over pressure it did not cause. The pacing state is per `accept` call,
-         which is exactly where a burn-down could happen: a call that keeps failing to accept cannot
-         spend a second connection without first waiting. (It resets when a call returns, but a call
-         only returns by handing back a request — there is no loop left to bound.) With nothing left
-         to spend it just backs off.
+         which is exactly where a burn-down could run: a call that keeps failing to accept cannot
+         spend a second connection without first waiting. (It resets when the call returns — but a
+         call returns only by handing back a request or by failing `Fatal`, and neither is a loop.)
+         With nothing left to spend it just backs off.
        - **Anything else → `Fatal`**, returned unchanged: a genuine listener-level fault is the
          only `accept` failure a serve loop should ever see.
 
