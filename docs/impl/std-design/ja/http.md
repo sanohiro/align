@@ -45,7 +45,14 @@ srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes 
                                              // before accepting a new one (item 9 ②) — same surface
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
-ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
+ctx.headers() -> http_headers                // the parsed header table as a Copy, non-owning VIEW
+                                             // (region-bound to ctx, like ctx.body(); item 10).
+                                             // A struct field type, so a Copy per-request context
+                                             // can carry it — `http_headers` is a GLOBAL type name
+hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive lookup; the returned
+                                             // str views the request buffer and INHERITS `hs`'s
+                                             // region (so a wrapper taking the view through a
+                                             // parameter compiles — item 10 ④)
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -221,8 +228,10 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    所有する Move ハンドル。`HttpResponse` の R1 の鏡像 — head の終端まで 32 KiB ずつストリーミング read +
    Content-Length によるボディフレーミング。Incomplete/Invalid の分岐と 256 KiB-head / 128-header /
    1 GiB-body の上限を再利用する。不正なリクエストはそのコネクションを閉じて `Error.Invalid` を返し、
-   リスナーは生き続ける)。`ctx.method()/path()`(`str` ビュー)、`ctx.header(name)`(大文字小文字を無視する
-   `Option<str>` ビュー)、`ctx.body()`(`slice<u8>` ビュー)— すべて `ctx` にリージョン束縛される(#297)。
+   リスナーは生き続ける)。`ctx.method()/path()`(`str` ビュー)、`ctx.headers()`(パース済みヘッダー
+   テーブルの Copy な `http_headers` ビュー。大文字小文字を無視する `Option<str>` の lookup は
+   `hs.get(name)` — item 10 であり、`ctx.header(name)` を**置換した**)、`ctx.body()`(`slice<u8>`
+   ビュー)— すべて `ctx` にリージョン束縛される(#297)。
    `http.response(status)` -> `response_builder`(Move。パース済みの `response` とは別の Ty + 表示名)+
    `rb.header(name, value)`(バインド済みレシーバ、P6 の CR/LF/NUL は **abort**)+ `rb.body(data)`(任意)。
    `ctx.respond(rb) -> Result<(), Error>`(ctx と rb の **両方を消費する** — `cl.request(req)` と同様に
@@ -657,8 +666,10 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      するので、EOF まで読む client はサーバが終了するか容量の逼迫が parked コネクションを evict
      するまでブロックする。コネクション毎 1 リクエストの client は `Connection: close` を送る（driver
      テスト共有の `one_shot` ヘルパ）か、`Content-Length` で読みをフレーム化しなければならない。
-10. **`ctx.headers()` — 切り離したヘッダーテーブルのビュー — 2026-07-21 設計、未実装**
-    （消費者 = pkg.web の `web.header(c, name)`、`pkg-design/web.md` → 「ctx アクセサ」）。
+10. **`ctx.headers()` — 切り離したヘッダーテーブルのビュー — 2026-07-21 出荷**（ブランチ
+    `http-headers-view`。消費者 = pkg.web の `web.header(c, name)`、`pkg-design/web.md` →
+    「ctx アクセサ」）。以下の設計はその記録である。①–⑨ は書かれたとおりに出荷され、末尾の
+    **What actually shipped** が、実装が設計の書いていないことを教えた 4 箇所を記録している。
 
     **問題を正確に。** framework のリクエスト毎コンテキストは、**何も所有しないビューだけの Copy
     struct** である — pkg.web の `Ctx` がその形をしているのには荷重のかかった理由がある（所有する
@@ -775,6 +786,48 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
       Slice breakdown）、その ja ミラー、`docs/open-questions.md`、そしてコンパイラ側 — メソッド dispatch
       の腕、`check_http_ctx_method` の `"header"` ケース、そして "try method / path / header / …" の
       サジェスト文字列。`rb.header` / `r.header` / `resp.header` はレシーバが違うので残る。
+    - **実際に出荷されたもの（2026-07-21）— 設計が不完全だった箇所も含めて。** ①–⑧ は設計どおり:
+      `Ty::HttpHeaders`（Copy、`tracks_region`、`ty_may_borrow`、`Scalar` 無し、専用の `(8, 8)` の腕）、
+      `Rvalue::Use` へ lower する `ExprKind::HttpCtxHeaders`、既存の `HttpCtxHeader` ノードのビューへの
+      差し替え、region の分離（`headers()` は `Frame` で頭打ち、`get` は継承）、`check_box_get` の上に
+      置いた `hs.get` の dispatch の腕、Pure、そして新しいランタイムコードは **ゼロ**。
+      `Ty::HttpRequestCtx` の 16 対 8 の過大報告も一緒に直り、`sema_and_codegen_struct_layout_agree` には
+      Move ハンドルのフィールド、`http_headers` のフィールド、`Ty::Fn` のフィールド、`slice<T>` の
+      フィールド、そして pkg.web の `Ctx` そのものの形の行が加わった。設計自身の記述に対する訂正が 4 つ:
+      - **⑤ は新しい `ExprKind` に対してコンパイラが強制するパスを数え落としている。** `region_of` と
+        `slice_is_local` はどちらも `ExprKind` に対して網羅的であり、したがって設計全体が懸かっている
+        当の *region* の規則は fail open ではなく **fail-closed** である。fail open な表面は、⑤ が `Ty`
+        レベルで挙げているもの（`ty_may_borrow`、`scalar_type`）と、⑤ が正しく特定している唯一の
+        `ExprKind` の末尾（`borrow_sources_inner`）だけである。それぞれを mutation-check した:
+        `ty_may_borrow` か `borrow_sources_inner` の腕を落とすと、裸のローカルでの `respond` 後 use の
+        テスト **と** 反復をまたぐテストの両方が捕まえる。`scalar_type` の腕を落とすと pkg.web の E2E が
+        全滅する。`tracks_region`・`region_of`・`slice_is_local` を落とすとビルドが通らない。
+      - **⑤ の「専用の診断」は 1 箇所ではなく 2 箇所必要だった。** `payload_scalar` は 2 つある —
+        `what` ラベルを取る自由関数版と、`Checker` のメソッド版 — で、メソッド版は全呼び出し元に対して
+        `"Option payload"` をハードコードしていた。そのため*配列要素*としての拒否が自分を Option の
+        ペイロードだと名乗っていた。メソッドは今やチェック中の位置を引数に取り、この型に限らず
+        すべての型についてこの既存の誤ラベルを直している。
+      - **テストマトリクスの「`serve` の反復をまたいで自分の ctx より長生きすることはできない」は
+        半分しか正しくなく、残り半分は既存の穴である。** `MoveCheck` が借用の世代を終わらせるのは
+        所有者が**ムーブまたは再代入**されたときであって、内側スコープの終端で **drop** されたときでは
+        ない。そして `Region::Frame` は「このフレーム」と「この反復」を区別できない。pkg.web の形が
+        安全なのは `ctx.respond(rb)` が毎回ハンドルを**ムーブする**からであり、そのケースは拒否される。
+        しかし ctx をただ drop させるだけの内側スコープ（ループ本体や `arena {}` ブロック）は、その後続へ
+        ビューを漏らす。これは Move ハンドル上のあらゆるビューに共通であり（`ctx.path()` の素の `str` でも
+        同一に再現する）、item 10 が変えるのは被害半径だけで、しかもそれも当てにはならない: ここでは
+        宙に浮いた値が解放済みの `http_request_ctx` ポインタそのものであり、`align_rt_http_ctx_header` が
+        それを参照してオフセットテーブルを辿るのでループの形は abort する — 一方 `arena {}` の形は
+        もっともらしい答えを表示して 0 で終了する。形状依存の UB であって、寄りかかれるような派手な
+        失敗の仕方ではない。`known_hole_scope_end_drop_does_not_invalidate_a_view` として pin し、
+        `docs/open-questions.md` に **Open** として記録した（#460 の隣。その dataflow が修正を所有すべき
+        である）。ここではあえて直さない: このスライスが持ち込んだものでも広げたものでもなく、
+        スコープ終端の drop で借用の世代を終わらせるのはそれ自体が 1 つの設計だからである。
+      - **⑨ のサジェスト文字列は、削除した名前には届かない。** ctx メソッドの dispatch の腕は名前で
+        ガードされている（`"method" | "path" | "headers" | …`）ので、`ctx.header(x)` は
+        `check_http_ctx_method` に到達せず、"try …" のリストではなく汎用の *"unknown method
+        '.header()' on http_request_ctx"* を受け取る。文字列自体は更新した（ガードのリストに**入って
+        いる**未知のメソッドには引き続き役立つ）が、古い綴りの呼び出し側が目にする移行のヒントは汎用の
+        ものである。許容できる: 移行すべき呼び出し箇所は 1 つも無かった。
 
 ## Known v1 limitations (Slice 2/3/5)
 
@@ -860,3 +913,13 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
 - Move の拒否 + 束縛していないレシーバの拒否
 - import が必須であること
 - `bench/http_client` の数値を Rust ベースラインに照らして記録する(R6 — 完了はベンチマークでゲートする)
+- item 10 — `ctx.headers()`: パラメータ経由のラッパーがコンパイルでき、かつ E2E でテーブルを読める。
+  **ローカル**のハンドルから作ったビューは、return / `break` / struct への包み込み / ctx を**消費する**
+  serve の反復をまたぐ保持、のいずれでも拒否される(pkg.web の形。drop だけの変種は既存の `MoveCheck` の
+  穴で、`known_hole_scope_end_drop_does_not_invalidate_a_view` として pin 済み)。`ctx.respond(rb)` の後の
+  `hs.get()` は**裸のローカル**で拒否される(囲む struct の `str` フィールドが穴を覆い隠す)。
+  `ctx.respond_stream(rb)` の後の `hs.get()` はコンパイルでき、かつ動く。大文字小文字を無視したヒット +
+  ミスの `pkg.web` 経由 E2E。`Option`/`Result` のペイロードとして、また配列要素としてのビューは拒否される。
+  これを運ぶ struct は Copy のまま(drop は出ない)で、`sema_and_codegen_struct_layout_agree` に行がある。
+  (`crates/align_driver/tests/http_headers_view.rs` +
+  `apps_web_root.rs::web_header_reads_the_request_header_table`)

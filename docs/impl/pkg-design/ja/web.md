@@ -135,22 +135,23 @@ web.serve(host, port, routes, workers) -> Result<(), Error>
 web.param(c, name)   -> str              // :param キャプチャ（固定スロット配列。total —
                                          //   パターンにない名前は起動時検出可能なバグ）
 web.query(c, name)   -> Option<str>      // std.http クエリ床（RFC 3986 percent-decode 済み）
-web.header(c, name)  -> Option<str>      // 未出荷 — enabler は設計済み、下の注記を参照
+web.header(c, name)  -> Option<str>      // 2026-07-21 出荷: RFC 9110 §5.1 大文字小文字を無視
 web.body(c)          -> slice<u8>        // 2026-07-21 出荷: `Ctx.body` が zero-copy view を運ぶ
 web.body_str(c)      -> Result<str, Error>    //   body_str = `.as_str()`(検証済み view)
 //   JSON 入力: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json、view デコード
-//   `web.header` のブロッカー(2026-07-21 記録): Copy の `Ctx` は何も所有せず、任意名の
-//   ヘッダー lookup は `body` のような単一の保存 view には乗らない。raw head の view フィールド +
-//   pkg.web 側の RFC 9110 lookup(std.http の lookup の複製 — One way に反する)か、パース済み
-//   ヘッダーテーブルを切り離した view として公開する std.http enabler(理想形 — 例:Ctx が運べる
-//   view 値としての `ctx.headers()`)が要る。
-//   **enabler は 2026-07-21 に設計済み — `std-design/http.md` の item 10。** 切り離した view が勝った:
+//   `web.header` は std.http の enabler(`std-design/http.md` の item 10)に乗り、それと一緒に
+//   出荷された。解いた問題: Copy の `Ctx` は何も所有せず、任意名のヘッダー lookup は `body` のような
+//   単一の保存 view には乗らない — ヘッダー**名**はハンドラが問い合わせるまで分からないので、借用
+//   される値はパース済みテーブル全体だからである。候補は 2 つあった: raw head の `str`/`slice<u8>`
+//   view フィールド + pkg.web 側の RFC 9110 lookup(std.http の lookup の複製で One way に反し、
+//   テーブルの実体化にリクエスト毎の割り当てが要る)か、パース済みテーブルを切り離した view として
+//   公開する std.http enabler か。切り離した view が勝った:
 //   `ctx.headers() -> http_headers`(Copy で region 束縛の非所有 view。その表現は ctx ポインタ
 //   **そのもの**なので、`hs.get(name)` は既存のランタイム lookup を再利用し、ランタイムのコードは
 //   一切増えない)、`Ctx` はこれをもう 1 つのフィールドとして運び、
 //   `web.header(c, name) = c.headers.get(name)` が転送する。pkg.web は自前の lookup を**一切**出荷
 //   しない。lookup の綴りを 1 つに保つため、`ctx.header(name)` は std.http 側で
-//   `ctx.headers().get(name)` に**置換**される。
+//   `ctx.headers().get(name)` に**置換された**。
 
 // レスポンダ（Pure。レスポンスを**組み立てる**だけでリクエストハンドルに触れないので、ハンドラは
 // アクセサとレスポンダを任意の順序で何度でも呼べる）
@@ -167,8 +168,8 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 ```text
 // 型
 web.Ctx    — リクエスト毎コンテキスト: view だけを持つ **Copy** struct（method, path, query,
-             およびマッチしたパターン）。何も所有しない — リクエストハンドルは `serve` に留まり、
-             view はハンドラ呼び出しの間有効である。
+             マッチしたパターン、body の view、および切り離したヘッダーテーブルの view）。何も所有
+             しない — リクエストハンドルは `serve` に留まり、view はハンドラ呼び出しの間有効である。
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```

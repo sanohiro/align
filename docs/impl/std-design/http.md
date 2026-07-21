@@ -684,7 +684,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 10. **`ctx.headers()` — the detached header-table view — SHIPPED 2026-07-21** (branch
     `http-headers-view`; consumer = `pkg.web`'s `web.header(c, name)`, `pkg-design/web.md` → ctx
     accessors). The design below is the record; ①–⑨ shipped as written, and **What actually shipped**
-    at the end records the three places implementation taught something the design did not say.
+    at the end records the four places implementation taught something the design did not say.
 
     **The problem, precisely.** A framework's per-request context is a **Copy struct of views that
     owns nothing** — pkg.web's `Ctx` exists in that shape for load-bearing reasons (an owning `Ctx`
@@ -807,7 +807,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
       inherit on `get`), the `hs.get` dispatch arm above `check_box_get`, Pure, and **zero** new
       runtime code. `Ty::HttpRequestCtx`'s 16-vs-8 over-report is fixed with it, and
       `sema_and_codegen_struct_layout_agree` gained rows for a Move-handle field, a `http_headers`
-      field, a `Ty::Fn` field, a `slice<T>` field and the pkg.web `Ctx` shape itself. Three
+      field, a `Ty::Fn` field, a `slice<T>` field and the pkg.web `Ctx` shape itself. Four
       corrections to the design's own account:
       - **⑤ under-counts the compiler-forced passes for the new `ExprKind`.** `region_of` and
         `slice_is_local` are both exhaustive over `ExprKind`, so the *region* rule — the one the
