@@ -14481,9 +14481,9 @@ const POLLNVAL: i16 = 0x0020;
 /// connection evicted the previous one, so a client told "persistent" lost its next request.
 #[cfg(not(test))]
 const HTTP_MAX_PARKED_CONNS: usize = 256;
-/// The unit tests drive the capacity valves (eviction at park time and at accept time), which at 256
-/// would mean 512 open fds and a fight with the process rlimit. The number is a policy constant, not
-/// a behaviour: the driver E2E suites run the production value.
+/// The unit tests drive the capacity valve (eviction at park time), which at 256 would mean 512 open
+/// fds and a fight with the process rlimit. The number is a policy constant, not a behaviour: the
+/// driver E2E suites run the production value.
 #[cfg(test)]
 const HTTP_MAX_PARKED_CONNS: usize = 4;
 
@@ -15101,6 +15101,14 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
     unsafe {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
     }
+    // TCP keepalive — parity with the net rail's `accept`, and the ONLY thing that ever reaps a
+    // parked connection whose peer vanished WITHOUT a FIN (a NAT timeout, a powered-off client).
+    // Such a connection is silent, so `poll` never reports it and no eviction path is reached while
+    // traffic stays one-shot; the kernel's probes eventually turn it into a hangup this loop closes.
+    // Slow (hours, by the system default) but bounded — and it costs nothing on a live connection.
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
     // macOS/BSD: suppress SIGPIPE per-socket for the response write (Linux uses MSG_NOSIGNAL on `send`).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe {
@@ -15119,9 +15127,9 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
 /// unchanged.** With nothing parked this is a plain blocking `accept(2)`, exactly as before.
 /// Otherwise it waits on {…parked, listener} with a rotating preference (warm connections usually
 /// win; the listener still gets its turn, so it cannot be starved), and a new connection leaves the
-/// parked set alone unless it is at capacity, where the coldest parked connection makes room. A
-/// parked connection that hangs up or sends a malformed request is closed and the call looks again:
-/// the death of a warm connection is not an application-visible event.
+/// parked set alone — the set is bounded at the end where it grows, in `respond`. A parked
+/// connection that hangs up or sends a malformed request is closed and the call looks again: the
+/// death of a warm connection is not an application-visible event.
 ///
 /// **A malformed request never surfaces.** It is a per-request fault — the listener is healthy — so
 /// this closes that connection and waits for the next one. Only a real `accept(2)` failure returns
@@ -26061,7 +26069,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         //    connection — it is never parked, so nothing has to make room for it. An accept-time
         //    valve fired here too, permanently shrinking the warm set for a connection that never
         //    joined it; the set is bounded where it grows instead. `socks[2]` is the coldest
-        //    survivor after ② moved client 1 to the back.
+        //    survivor after ② moved client 1 to the back — which needs at least three clients.
+        const { assert!(HTTP_MAX_PARKED_CONNS >= 3, "steps ② and ③ index into the filled set") };
         let one_shot = raw_http_client(port, b"GET /once HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
         assert_eq!(unsafe { serve_one_echo(srv, 200, "o") }, 0);
         assert!(String::from_utf8_lossy(&one_shot.join().unwrap()).contains("X-Path: /once\r\n"));

@@ -43,7 +43,9 @@ closes that connection and keeps waiting, exactly as the parked path already did
 `accept(2)` failure returns. (Pre-existing since M11 — prefork is what made it systemic.) ⑥ the
 readiness scan rotates, because "parked first" let busy keep-alive clients starve the listener
 outright (its `SO_REUSEPORT` queue has no sibling to drain it). ⑦ a capacity valve on the listener
-path, so idle keep-alive clients cannot pin every slot until `EMFILE`. ⑧ the worker cap is
+path, so idle keep-alive clients cannot pin every slot until `EMFILE` — **removed again in #597**,
+which showed the park-time valve already bounds the set and this one only ever killed warm
+connections for requests that never join it (see the #597 entry below). ⑧ the worker cap is
 `cpu_count() + 1` (the pool PLUS the caller) — and the prefork tests, which hardcoded 4 workers,
 would have aborted on any CI runner with fewer cores. ⑨ `respond_stream` rejects the bodiless
 statuses too. ⑩ a body set on a bodiless status is now `Err`, not silently dropped (the same
@@ -96,13 +98,23 @@ not just the feature:**
   worker lacks are usually a sibling's — unpaced, one worker would burn its whole warm set in a
   tight loop over pressure it did not cause.
 - **The accept-time capacity valve is GONE** (round 3). Moving it after the accept — the round-2 fix
-  — left it with no upside at all: the parked set is bounded where it GROWS (`respond` evicts the
-  coldest when parking into a full set), so the only thing an accept-side valve still did was kill a
-  warm connection for a request that never joins the set (`Connection: close`, malformed, a client
-  that vanishes after the handshake), permanently shrinking the warm set. Round 3 also showed **no
-  test observed it at all** — deleting it outright left the suite green — so the removal ships with
-  a regression test that pins it (a one-shot request at capacity costs nobody their connection), and
-  that test fails FAST rather than hanging, which the first version of it did.
+  — left it with no upside: the parked set is bounded where it GROWS (`respond` evicts the coldest
+  when parking into a full set), so what an accept-side valve still did was kill a warm connection
+  for a request that never joins the set (`Connection: close`, malformed, a client that vanishes
+  after the handshake), permanently shrinking the warm set. Round 3 also showed **no test observed
+  it at all** — deleting it outright left the suite green — so the removal ships with a regression
+  test that pins it (a one-shot request at capacity costs nobody their connection), and that test
+  fails FAST rather than hanging, which the first version of it did.
+  **Two things the removal does cost, recorded because round 4 caught the claim being absolute:**
+  ① the valve was also the only path that reaped a **zombie parked connection** — a peer that
+  vanished without a FIN is silent, so `poll` never reports it and no eviction fires while traffic
+  stays one-shot. `accept` now sets **`SO_KEEPALIVE`** on every connection (parity with the net
+  rail), so the kernel's probes turn such a connection into a hangup this loop closes — slow (hours,
+  by system default) but bounded, and `NoFds` reclaims immediately under real pressure. ② the
+  worst-case descriptor count per worker goes from MAX to **MAX + 1** (parked MAX plus the in-flight
+  connection), i.e. 257 in production, +1 per worker. #595's stated reason for the valve (`EMFILE`
+  from idle clients pinning every slot) was never its own: the park-time valve bounds the set at the
+  same MAX either way.
 - **The child-process E2E was fail-open**: `libtest` exits 0 when a filter matches nothing, so a
   rename would have left the child running no test with the parent still green. It now pipes the
   child's output and asserts the harness's own "1 passed" (and prints both streams on failure).
@@ -123,7 +135,8 @@ or closed, leaving that client's `read_to_end` blocked forever. Fixed at the roo
 now connects and sends **on the calling thread** (a loopback `connect` completes the handshake
 before returning, so arrival order follows call order) and only the read waits on a thread. Measured
 A/B on this box, running the test binary directly with the `http_` filter 15 times each: **5/15 runs
-hung before the fix, 0/15 after.** A guess written into the record is worse than no record — it
+hung with the old helper, 0/15 with the new one** (an independent reproduction on the same tree hung
+4/15 — same conclusion, different sample). A guess written into the record is worse than no record — it
 costs the next reader a wrong prior.
 
 - **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the

@@ -559,11 +559,16 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        untouched** — the set is bounded where it grows (`respond` evicts the coldest when parking
        into a full one), so accept needs no valve of its own, and one there would also fire for
        connections that never join the set at all. Genuine descriptor pressure is answered by the
-       `NoFds` path above, which spends a connection only when `accept` actually ran out of fds.
+       `NoFds` path below, which spends a connection only when `accept` actually ran out of fds.
        (An accept-time valve WAS shipped in #595 and removed in #597 for exactly this reason: it
        killed a warm connection for every `Connection: close` or malformed request that arrived at
-       capacity, permanently shrinking the warm set, and no test observed it.) The readiness scan
-       starts at a **rotating** index
+       capacity, permanently shrinking the warm set, and no test observed it. Its one real service —
+       reaping a parked connection whose peer vanished WITHOUT a FIN, which is silent and so never
+       reported by `poll` — is now `SO_KEEPALIVE`, set on every accepted connection: the kernel's
+       probes turn such a connection into a hangup this loop closes. Hours, not milliseconds, but
+       bounded; under real descriptor pressure `NoFds` reclaims immediately. The cost of the removal
+       is the worst-case descriptor count per worker: MAX parked **+ 1** in flight.) The readiness
+       scan starts at a **rotating** index
        rather than always preferring parked: a "parked first" scan lets busy keep-alive clients
        starve the listener outright — with its own `SO_REUSEPORT` queue no sibling worker can
        drain it, so new connections would sit until the backlog dropped SYNs. Parked EOF / parse
@@ -628,7 +633,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        srv — heavier, and wrong for the free-standing-handle model shipped in item 4).
    - **Test matrix (spec):** two requests over one connection E2E (same socket, both 200, views
      correct per request); `Connection: close` request honored; 1.0 closed; pipelined
-     (residual) request answered-then-closed; parked fd evicted by a new connection; parked EOF
+     (residual) request answered-then-closed; the coldest parked fd evicted when a new connection is
+     PARKED into a full set (arriving is not enough — see the valve note above); parked EOF
      recovery; stream/reject conns always closed; HEAD (suppressed body) + keep-alive compose;
      keepalive × pkg.web serve E2E (loop unchanged); `serve_shared` double-bind succeeds while
      plain `serve` double-bind still fails; prefork E2E — W workers, concurrent clients, one
@@ -647,8 +653,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
      `http.serve`), and `http.serve_shared` dispatches through the same `check_http_serve`. Tests:
      11 runtime keep-alive units (two-requests-one-connection, the three ineligibility rules, HEAD
-     composition, new traffic NOT evicting a parked connection, both capacity valves evicting the
-     coldest, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
+     composition, new traffic NOT evicting a parked connection, the park-time capacity valve evicting
+     the coldest — and a one-shot request at capacity evicting NOBODY (#597, the removed accept-time
+     valve), parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
      rejecting a set body, an interim response never parking, and four clients parked at once) +
      the `serve_shared` double-bind unit + the three `accept`-errno units (the classification table
      including the pending-network family; the reclaim choosing an idle connection over one with a
