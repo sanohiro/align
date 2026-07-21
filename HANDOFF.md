@@ -9,15 +9,21 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-21, **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
-ENABLERS 1–5 ALL COMPLETE — #589 (`http_stream` nameable, fn value as enum variant payload via new
-`Scalar::Fn`, indirect-call Move-param soundness; + a capturing-closure frame-escape UAF fixed at
-`region_of(Closure)`), the std.http `respond_stream` rework (http.md item 8 ①–③: ctx borrowed +
-spent, lazy head, `s.reject(rb)`; M12 tests replaced outright), and the pkg.web wiring (enabler 5:
-`Handler` Respond/Stream sum type in the ONE route table, `web.sse`/`web.stream`, serve's stream
-arm, std.http `s.send_event` — surface revised from the sketched `web.send_event(s, …)` free fn,
-which cannot borrow a Move handle; + a MoveCheck loop-back-edge false positive on match-arm
-bindings fixed). Production streaming remains gated on concurrent serve (the wiring is pinned E2E
-on the sequential loop).**
+ENABLERS 1–5 ALL COMPLETE (#593); W4 HARDENING SLICE 1 COMPLETE (#594).** #593 = the pkg.web
+streaming wiring (`Handler` Respond/Stream sum type in the ONE route table, `web.sse`/`web.stream`,
+serve's stream arm, std.http `s.send_event` — surface revised from the sketched
+`web.send_event(s, …)` free fn, which cannot borrow a Move handle) + TWO paired MoveCheck fixes
+(the loop-back-edge false positive on match-arm bindings, and the adversarial-review hole it
+unshielded: extracting a Move payload now marks the Local scrutinee moved). #594 = startup
+route-table validation (10 abort diagnoses incl. the Stream-row empty-content-type invariant
+guard), RFC-9110 §9.3.2 HEAD (std.http respond suppresses the body keeping CL; serve routes
+HEAD→GET for Respond rows), and the fixed minimal JSON 404/405/500 bodies. **NEXT (the recorded
+big arc): concurrent serve + server-side keepalive — one accept-loop redesign covering both; it
+gates production streaming AND the W5 bench/Fiber comparison. Remaining W4 test matrices
+(route-tree edges / malformed requests) fold into it.** Earlier context: #589 (`http_stream`
+nameable, fn value as enum variant payload via new `Scalar::Fn`, indirect-call Move-param
+soundness; + a capturing-closure frame-escape UAF fixed at `region_of(Closure)`) and the std.http
+`respond_stream` rework (http.md item 8 ①–③)._
 
 ## Where pkg.web stands
 
