@@ -364,7 +364,9 @@ match r.handler {
 
 v1 の `serve` は逐次 — **開いた stream は他の全 client を飢えさせる**。ストリーミングは記録済みの
 並行 serve フォローアップと同時（または後）に着地しなければならない; 逐次ループの上で出荷するのは
-テスト専用である。これは順序の注記であって設計依存ではない: 上記のどれも並行化で形を変えない。
+テスト専用である。これは順序の注記であって設計依存ではない: 上記のどれも並行化で形を変えない。（フォローアップは
+今や**設計済み** — 下の「並行 serve（prefork）」: stream は `W` ワーカーの 1 つを占有するので、
+ゲートは可視のサイジング判断になる。）
 
 ### Enabler（2026-07-21 探査済み; 実装順）
 
@@ -416,6 +418,75 @@ heartbeat/keep-alive コメント、`event:`/`id:` フィールド + `Last-Event
 `send_event` data の分割、stream ルートのリクエスト毎 head カスタマイズ、stream の
 タイムアウト/バックプレッシャ — いずれも消費者を待つ。
 
+## 並行 serve（prefork）+ コネクション keep-alive — 2026-07-21 設計、W5-pre で着地
+
+**問題は二重にある。** v1 の `serve` は 1 本のブロッキングループである: 開いた SSE/chat stream は
+他の全 client を飢えさせ（上のハード順序注記 — 本番ストリーミングはこれにゲートされている）、
+コネクション毎 1 リクエストは W5/W7 ベンチを無意味にする（keep-alive された Fiber はリクエストを
+計測するが、リクエスト毎に close する Align は TCP ハンドシェイクを計測してしまう）。1 つの設計が
+両方を覆う。
+
+### 設計: 共有状態ではなく prefork
+
+`serve` は可視のワーカー数を得る。`W` 個のワーカーがそれぞれ同一ポート上で**自分専用の**リスナーを
+所有し（`SO_REUSEPORT` — fasthttp/nginx の prefork 系譜）、各々が既存の逐次リクエストループを
+そのまま走らせる。カーネルが到来コネクションを複数のリスナーに振り分ける。
+
+```text
+pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // シグネチャの完全変更
+//   workers == 1  -> 今日のループそのまま、呼び出しスレッド上（task_group なし、スレッド 0）
+//   workers >= 2  -> task_group { spawn W workers }; 各ワーカー: 自身の http.serve_shared
+//                    リスナー + 不変の accept/dispatch/respond ループ
+//   workers <  1  -> 起動時 abort（validate クラス: プログラマの設定エラー）
+```
+
+- **パラメータによる Nothing hidden:** スレッド生成はどの呼び出し箇所でも可視である — `serve(...,
+  4)` はソース上で 4 スレッドと言っている。`serve` 内の `spawn` は普通の pkg レベル Align
+  （`task_group { spawn(fn { worker(...) }) }`）であって、ランタイムの魔法ではない。
+- **構築上、共有可変状態なし。** 代替案 — 1 つのリスナーハンドルを N ワーカーで共有する — は言語
+  自身に拒否された: Move の `http server` ハンドルは N 個のクロージャに値でキャプチャできず、借用は
+  `spawn` を越えない。`SO_REUSEPORT` はその共有を解消する: 各ワーカーは自分の Move リスナー、自分の
+  parked keep-alive スロット、自分のリクエストループを所有する — ロックゼロ、競合ゼロ、`spawn` の値
+  キャプチャが既に強制している「共有可変状態なし」規則そのものである（draft §Task Group）。
+- **唯一の共有入力は route テーブル** — Copy 行の `slice<Route>` で、各ワーカーへ値で（16 バイトの
+  view ディスクリプタとして）キャプチャされる; 背後の配列は region により構造化 `task_group` より
+  長生きする。**2026-07-21 探査済み: この形状全体は今日そのままコンパイルされ正しく動く** —
+  Impure な spawn 本体、slice view + 自分のワーカー index をそれぞれキャプチャするループ spawn された
+  ワーカー、実スレッド上での fn 値 `Route.handler` を通した間接呼び出し、`wait()?`。**コンパイラ
+  enabler は存在しない**; このアークは std.http 作業のみである。
+- **エラーセマンティクス（部分的な degradation）。** リスナーレベルの障害に当たったワーカーは自分の
+  `Err` を返して死ぬ; 他のワーカーは serve を続ける。`wait()?` は全タスクを join するので、`serve` が
+  返る — 最初のエラーとともに — のは**全**ワーカーが死んだときだけである。リクエスト毎の障害は
+  ワーカーを決して殺さない（不変）。過渡的な `ECONNABORTED`/`EMFILE` の分類フォローアップは不変で
+  あり、ここではより価値が高くなる。
+- **ストリーミング解禁。** 開いた stream はちょうど自分のワーカーを占有する; `W - 1` は serve を
+  続ける。本番ストリーミングのゲートは「十分なワーカー数で走らせる」— アプリのソース上で可視の容量
+  判断 — になる。目安のサイジング規則として `workers >= 想定同時ストリーム数 + 1` を fn doc に
+  記録する。
+- **サイジング:** ベンチゲートは `workers = cores` で走らせる; fn doc はこれをデフォルトとして推奨
+  する。
+
+### keep-alive は完全に std.http に乗る
+
+リクエストループは keep-alive のために変わらない — `srv.accept()` が新規コネクションを accept する
+前に、kept-alive コネクションから次のリクエストを yield することを覚えるだけであり、`ctx.respond`
+が適格なコネクションを close する代わりに返すことを覚えるだけである。プロトコル設計の全容
+（適格性、単一の parked スロット、poll 優先、no-pipelining 規則、`Connection` ヘッダ変更、drop 順序
+安全性）は std.http item 9 — `docs/impl/std-design/http.md`。pkg.web の serve ループは前後でバイト
+単位で同一であり、上の prefork ラッパーだけが pkg 側の作業である。
+
+### スライス（実装順、次セッション）
+
+1. **std.http `http.serve_shared(host, port)`** — `SO_REUSEPORT` リスナーを兄弟演算として
+   （`http.serve` は strict-bind セマンティクスを保つ: 誤った二重サーバは依然として大声で失敗
+   すべき; reuse は明示的な選択であり、`respond`/`respond_stream` の兄弟の前例）。
+2. **std.http keep-alive**（item 9: parked スロット + poll + 適格性; v1 の逐次 serve に対して独立に
+   テスト可能 — keep-alive は prefork より先に着地する）。
+3. **pkg.web prefork**（`serve` のシグネチャ変更 + `workers == 1` のインラインパス + `task_group`
+   ラッパー; すべての serve 呼び出し箇所を完全更新、compat なし）。
+4. **W5 ベンチゲート**（`bench/web_router` + `bench/web_e2e` を keep-alive 化、`workers = cores`）—
+   ここで初めて Fiber 比較が正直になる。
+
 ## スライス（計画の F3）
 
 - **W1 — router コア。** パターン解析 + 検証。**radix tree**（static/param/wildcard ノード、
@@ -449,7 +520,7 @@ heartbeat/keep-alive コメント、`event:`/`id:` フィールド + `Last-Event
   ゼロオーバーヘッド必須）— パフォーマンス契約を回帰固定。
 - **W6 — middleware-lite + ストリーミング** — 両方 **設計済み**（上のセクション、2026-07-21）。
   ストリーミングは **配線済みで E2E 固定済み**（上の enabler 5、2026-07-21）だが本番は並行 serve に
-  ゲート; middleware-lite は設計のみのまま。
+  ゲート（今や**設計済み** — 上の prefork セクション）; middleware-lite は設計のみのまま。
 - **W7 — 外部比較。** 同一マシン Fiber（Go）の plaintext + JSON echo ベンチ。数値とギャップ分析を
   本書に記録。
 

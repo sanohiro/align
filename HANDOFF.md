@@ -17,10 +17,24 @@ serve's stream arm, std.http `s.send_event` — surface revised from the sketche
 unshielded: extracting a Move payload now marks the Local scrutinee moved). #594 = startup
 route-table validation (10 abort diagnoses incl. the Stream-row empty-content-type invariant
 guard), RFC-9110 §9.3.2 HEAD (std.http respond suppresses the body keeping CL; serve routes
-HEAD→GET for Respond rows), and the fixed minimal JSON 404/405/500 bodies. **NEXT (the recorded
-big arc): concurrent serve + server-side keepalive — one accept-loop redesign covering both; it
-gates production streaming AND the W5 bench/Fiber comparison. Remaining W4 test matrices
-(route-tree edges / malformed requests) fold into it.** Earlier context: #589 (`http_stream`
+HEAD→GET for Respond rows), and the fixed minimal JSON 404/405/500 bodies. **NEXT: concurrent serve + server-side keepalive —
+DESIGNED 2026-07-21 (this session), implementation is the next session's work.** The design:
+`pkg-design/web.md` → "Concurrent serve (prefork) + connection keep-alive" and
+`std-design/http.md` item 9. Shape: `serve(host, port, routes, workers)` (outright signature
+change; `workers == 1` = today's loop inline, `>= 2` = `task_group`-spawned prefork workers,
+EACH owning its own `SO_REUSEPORT` listener — no shared Move handle, no locks); keep-alive lives
+entirely in std.http (`accept`/`respond` semantics: per-server parked slot, poll prefer-parked
+with new-traffic eviction so NO idle timeout, eligibility = 1.1 + no `Connection: close` + no
+residual bytes, Arc'd slot for ctx/server drop-order safety; `respond_stream`/`reject` keep
+close-always). **PROBED: the pkg-side prefork shape needs NO compiler enabler** — Impure spawn
+bodies, loop-spawned workers capturing the `slice<Route>` view + fn-field indirect calls on real
+threads all run correctly today. **Implementation order: ① `http.serve_shared` (sibling op) →
+② std.http keep-alive (testable on the sequential loop) → ③ pkg.web prefork (serve signature,
+all call sites outright) → ④ W5 bench gate (keep-alive'd, `workers = cores`) → Fiber (W7).**
+Remaining W4 test matrices (route-tree edges / malformed requests) fold into ④'s hardening.
+(Housekeeping, found while mirroring: `ja/http.md` has pre-existing drift — item 7's SSE
+streaming body was never mirrored and the recent items use an unnumbered-bold style; items 8–9
+followed the local style. A ja/http.md re-sync pass is owed, separate from any feature work.) Earlier context: #589 (`http_stream`
 nameable, fn value as enum variant payload via new `Scalar::Fn`, indirect-call Move-param
 soundness; + a capturing-closure frame-escape UAF fixed at `region_of(Closure)`) and the std.http
 `respond_stream` rework (http.md item 8 ①–③)._

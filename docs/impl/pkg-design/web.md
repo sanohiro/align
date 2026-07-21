@@ -384,7 +384,8 @@ match r.handler {
 v1 `serve` is sequential — **an open stream starves every other client**. Streaming must land
 together with (or after) the recorded concurrent-serve follow-up; shipping it on the sequential
 loop is test-only. This is an ordering note, not a design dependency: nothing above changes shape
-with concurrency.
+with concurrency. (The follow-up is now DESIGNED — "Concurrent serve (prefork)" below: a stream
+occupies one of `W` workers, so the gate becomes a visible sizing decision.)
 
 ### Enablers (probed 2026-07-21; in implementation order)
 
@@ -438,6 +439,74 @@ Heartbeat/keep-alive comments, `event:`/`id:` fields + `Last-Event-ID` resume, m
 `send_event` data splitting, per-request head customization on stream routes, and stream
 timeouts/backpressure — each waits for a consumer.
 
+## Concurrent serve (prefork) + connection keep-alive — designed 2026-07-21, lands W5-pre
+
+**The problem, twice over.** v1 `serve` is one blocking loop: an open SSE/chat stream starves
+every other client (the hard ordering note above — production streaming is gated on this), and
+one-request-per-connection makes the W5/W7 bench meaningless (a keep-alive'd Fiber measures
+requests; a close-per-request Align would measure TCP handshakes). One design covers both.
+
+### The design: prefork, not shared state
+
+`serve` gains a visible worker count. `W` workers each own their **own** listener on the same
+port (`SO_REUSEPORT` — the fasthttp/nginx prefork lineage) and each run the EXISTING sequential
+request loop, unchanged. The kernel balances incoming connections across the listeners.
+
+```text
+pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright signature change
+//   workers == 1  -> exactly today's loop, on the calling thread (no task_group, zero threads)
+//   workers >= 2  -> task_group { spawn W workers }; each worker: its OWN http.serve_shared
+//                    listener + the unchanged accept/dispatch/respond loop
+//   workers <  1  -> startup abort (the validate class: a programmer-config error)
+```
+
+- **Nothing hidden, by parameter:** thread creation is visible at every call site — `serve(...,
+  4)` says four threads in the source. `spawn` inside `serve` is ordinary pkg-level Align
+  (`task_group { spawn(fn { worker(...) }) }`), not runtime magic.
+- **No shared mutable state, by construction.** The alternative — one listener handle shared by
+  N workers — was rejected by the language itself: a Move `http server` handle cannot be
+  captured by value into N closures, and no borrow crosses a `spawn`. `SO_REUSEPORT` dissolves
+  the sharing: each worker owns its own Move listener, its own parked keep-alive slot, its own
+  request loop — zero locks, zero contention, the same "no shared mutable state" rule `spawn`'s
+  by-value capture already enforces (draft §Task Group).
+- **The route table is the only shared input** — a `slice<Route>` of Copy rows, captured by
+  value (a 16-byte view descriptor) into each worker; the backing array outlives the structured
+  `task_group` by regions. **Probed 2026-07-21: this whole shape compiles and runs correctly
+  TODAY** — Impure spawn bodies, loop-spawned workers each capturing the slice view + their
+  worker index, indirect calls through the fn-value `Route.handler` on real threads, `wait()?`.
+  **There is no compiler enabler**; the arc is std.http work only.
+- **Error semantics (partial degradation).** A worker that hits a listener-level fault returns
+  its `Err` and dies; the other workers keep serving. `wait()?` joins ALL tasks, so `serve`
+  returns — with the first error — only when EVERY worker has died. Per-request faults never
+  kill a worker (unchanged). The transient-`ECONNABORTED`/`EMFILE` classification follow-up is
+  unchanged and becomes more valuable here.
+- **Streaming unblocked.** An open stream occupies exactly its own worker; `W - 1` keep
+  serving. Production streaming's gate becomes "run with enough workers", a visible capacity
+  decision in the app's source — record `workers >= expected concurrent streams + 1` as the
+  sizing rule of thumb in the fn doc.
+- **Sizing:** the bench gate runs `workers = cores`; the fn doc recommends it as the default.
+
+### Keep-alive rides entirely in std.http
+
+The request loop does not change for keep-alive — `srv.accept()` simply learns to yield the
+next request from a kept-alive connection before accepting a new one, and `ctx.respond` learns
+to hand an eligible connection back instead of closing it. The full protocol design (eligibility,
+the single parked slot, poll preference, the no-pipelining rule, the `Connection` header change,
+drop-order safety) is std.http item 9 — `docs/impl/std-design/http.md`. pkg.web's serve loop is
+byte-identical before and after; only the prefork wrapper above is pkg-side work.
+
+### Slices (implementation order, next session)
+
+1. **std.http `http.serve_shared(host, port)`** — the `SO_REUSEPORT` listener as a SIBLING op
+   (`http.serve` keeps strict-bind semantics: an accidental double server must still fail
+   loudly; reuse is an explicit choice, the `respond`/`respond_stream` sibling precedent).
+2. **std.http keep-alive** (item 9: parked slot + poll + eligibility; independently testable
+   against the v1 sequential serve — keep-alive lands before prefork).
+3. **pkg.web prefork** (`serve` signature change + the `workers == 1` inline path + the
+   `task_group` wrapper; update every serve call site outright, no compat).
+4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
+   only now is the Fiber comparison honest.
+
 ## Slices (F3 of the plan)
 
 - **W1 — router core.** Pattern parse + validation; the **radix tree** (static/param/wildcard
@@ -468,8 +537,8 @@ timeouts/backpressure — each waits for a consumer.
 - **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
   (≈ zero overhead required) — the performance contract becomes a pinned regression.
 - **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
-  **WIRED and pinned E2E** (enabler 5 above, 2026-07-21) but production-gated on concurrent serve;
-  middleware-lite remains designed-only.
+  **WIRED and pinned E2E** (enabler 5 above, 2026-07-21) but production-gated on concurrent serve
+  (now DESIGNED — the prefork section above); middleware-lite remains designed-only.
 - **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
   numbers and the gap analysis in this doc.
 

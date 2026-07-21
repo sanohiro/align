@@ -496,6 +496,55 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      framing unit (framed empty/non-empty + raw), `m12_http_stream.rs` `send_event` E2E, and the
      pkg.web `apps_web_stream.rs` suite.
 
+9. **Prefork listener + server-side connection keep-alive — DESIGNED 2026-07-21 (implementation
+   next session; consumer = pkg.web concurrent serve, `pkg-design/web.md` → "Concurrent serve").**
+   Two std changes; keep-alive lands first (independently testable on the v1 sequential loop).
+   - **① `http.serve_shared(host, port) -> Result<http server, Error>`** — identical to
+     `http.serve` plus `SO_REUSEPORT` on the listener, so N workers each bind their OWN listener
+     on one port and the kernel balances connections. A SIBLING op, not a flag: `http.serve`
+     keeps strict-bind semantics (an accidental second server must still fail loudly; port
+     sharing is an explicit choice — the `respond`/`respond_stream` sibling precedent, no bool
+     traps). Portability: Linux balances properly; macOS accepts the option for TCP with
+     unspecified distribution quality — record, don't gate (the bench box is Linux).
+   - **② Connection keep-alive, entirely inside `accept`/`respond` — the loop shape is
+     unchanged for every caller.** One **parked slot per server handle** (the v1
+     one-conn-at-a-time posture, made explicit):
+     - **Eligibility** (computed at parse time, carried on the ctx): the request is HTTP/1.1,
+       has no `Connection: close` header, and left **no residual bytes** past its own body in
+       the parse buffer (a pipelining client is answered then closed — residual carry-over is
+       deliberately NOT built; real keep-alive clients await the response, so residual ≈ never).
+       1.0 keep-alive (legacy `Connection: keep-alive`) is not supported — close, as today.
+     - **`ctx.respond`**: eligible + write succeeded → the fd is PARKED into the server's slot
+       instead of closed, and the auto `Connection: close` header is **omitted** (absence = 
+       persistent is the 1.1 default; fasthttp does the same — leanest bytes on the bench path).
+       Ineligible → `Connection: close` + close, exactly today. `respond_stream`, `reject`, and
+       every error path keep today's close-always semantics (a stream's terminator is its close;
+       the reject window is an error path — recorded, not worth a second framing mode).
+     - **`srv.accept()`**: no parked fd → plain `accept(2)`, as today. Parked fd present →
+       `poll({parked, listener}, infinite)`; parked readable → parse the NEXT request from it
+       (a fresh parse buffer — zero-copy views stay per-request); listener-only readable → take
+       the new connection and CLOSE the parked one (single slot: an idle keep-alive client is
+       evicted by new traffic, so no idle timeout is needed — an idle parked fd with no new
+       traffic just blocks in poll, which IS accept's normal idle state). Both readable →
+       prefer parked (drain the warm client; the fairness caveat is bounded by prefork's other
+       workers and the trusted-network posture — recorded). Parked EOF / parse error → close
+       it, fall through to `accept(2)`. The `accept` surface and `Result` are unchanged.
+     - **Drop-order safety (the one sharp edge):** the ctx must not park into a freed server.
+       The slot is a runtime-internal refcounted cell (`Arc<Mutex<Option<fd>>>`) held by the
+       server handle AND cloned into each ctx at accept — one refcount bump per request, no
+       user-visible allocation, uncontended by construction (prefork gives every worker its own
+       server handle, so the mutex never crosses threads). Server dropped first → the cell is
+       marked dead and `respond` just closes; ctx dropped first → refcount releases. No sema/
+       region surface is added for a runtime lifetime detail (rejected: tying ctx's region to
+       srv — heavier, and wrong for the free-standing-handle model shipped in item 4).
+   - **Test matrix (spec):** two requests over one connection E2E (same socket, both 200, views
+     correct per request); `Connection: close` request honored; 1.0 closed; pipelined
+     (residual) request answered-then-closed; parked fd evicted by a new connection; parked EOF
+     recovery; stream/reject conns always closed; HEAD (suppressed body) + keep-alive compose;
+     keepalive × pkg.web serve E2E (loop unchanged); `serve_shared` double-bind succeeds while
+     plain `serve` double-bind still fails; prefork E2E — W workers, concurrent clients, one
+     held-open stream while others answer.
+
 ## Known v1 limitations (Slice 2/3/5)
 
 - **HTTPS is CLIENT-SIDE ONLY (Slice 5).** Server-side TLS is deferred — `http.serve` is plaintext,
