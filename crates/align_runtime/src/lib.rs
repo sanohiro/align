@@ -15291,7 +15291,8 @@ pub unsafe extern "C" fn align_rt_http_ctx_path(ctx: *const HttpRequestCtx) -> A
     AlignStr { ptr, len: c.target_len as i64 }
 }
 
-/// `ctx.header(name)` — a case-insensitive header lookup (request header names are case-insensitive).
+/// `hs.get(name)` — a case-insensitive header lookup (request header names are case-insensitive).
+/// `ctx` is the `http_headers` view, whose representation IS this pointer (std-design/http.md item 10).
 /// Writes a `str` **view** into the ctx buffer to `*out` and returns `1` when present, else `0` leaving
 /// `*out` untouched. The first matching header wins. Mirrors [`align_rt_http_resp_header`].
 ///

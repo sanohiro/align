@@ -995,8 +995,10 @@ pub enum Rvalue {
     /// `ctx`'s buffer (region-bound to `ctx`). Pure.
     HttpCtxMethod { ctx: Operand },
     HttpCtxPath { ctx: Operand },
-    /// `ctx.header(name)` — a case-insensitive request-header lookup on `ctx`, writing a `str` **view**
-    /// `{ptr,len}` (region-bound to `ctx`) to `out` and returning an `i32` present flag (1/0). Pure.
+    /// `hs.get(name)` — a case-insensitive request-header lookup through a `http_headers` view,
+    /// writing a `str` **view** `{ptr,len}` to `out` and returning an `i32` present flag (1/0). Pure.
+    /// The `ctx` operand is the view itself, whose representation IS the `http_request_ctx` pointer
+    /// (http.md item 10 ②), so the runtime call is unchanged from when this was `ctx.header(name)`.
     HttpCtxHeader { ctx: Operand, name: Operand, out: Slot },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** `{ptr,len}` into `ctx`'s buffer
     /// (region-bound to `ctx`). Pure.
@@ -3324,6 +3326,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpAccept { .. }
         | hir::ExprKind::HttpCtxMethod { .. }
         | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeaders { .. }
         | hir::ExprKind::HttpCtxHeader { .. }
         | hir::ExprKind::HttpCtxBody { .. }
         | hir::ExprKind::HttpResponseBuilder { .. }
@@ -9055,8 +9058,17 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::HttpCtxPath { ctx: cx }));
             Operand::Value(v)
         }
-        // `ctx.header(name)` → `Option<str>` (out-slot + i32 present flag; see below).
-        hir::ExprKind::HttpCtxHeader { ctx, name } => lower_http_ctx_header(b, ctx, name, e.ty),
+        // `ctx.headers()` → a `Rvalue::Use` of the ctx operand: the header-table view IS the ctx
+        // pointer (http.md item 10 ②), so this is a pointer copy and adds no runtime call at all.
+        hir::ExprKind::HttpCtxHeaders { ctx } => {
+            let cx = lower_expr(b, ctx);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Use(cx)));
+            Operand::Value(v)
+        }
+        // `hs.get(name)` → `Option<str>` (out-slot + i32 present flag; see below). The `headers`
+        // operand is the same pointer `ctx` was, so the existing runtime call is reused verbatim.
+        hir::ExprKind::HttpCtxHeader { headers, name } => lower_http_ctx_header(b, headers, name, e.ty),
         // `ctx.body()` → a `slice<u8>` view `{ptr,len}` into the ctx buffer (region-bound to `ctx`).
         hir::ExprKind::HttpCtxBody { ctx } => {
             let cx = lower_expr(b, ctx);
@@ -9292,13 +9304,15 @@ fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, r
     Operand::Value(r)
 }
 
-/// `ctx.header(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns an
-/// `i32` present flag; branch `Some(<view>)` / `None`. The view borrows `ctx` (region-bound in sema).
-/// The exact read-dual of [`lower_http_resp_header`]. Out-of-line for `expr_depth` headroom.
+/// `hs.get(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns an
+/// `i32` present flag; branch `Some(<view>)` / `None`. `headers` is a `http_headers` view whose
+/// representation IS the `http_request_ctx` pointer, so `align_rt_http_ctx_header` takes it
+/// unchanged. The view borrows the request buffer (region-bound in sema — it inherits `headers`'s
+/// region). The exact read-dual of [`lower_http_resp_header`]. Out-of-line for `expr_depth` headroom.
 #[inline(never)]
-fn lower_http_ctx_header(b: &mut Builder, ctx: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_http_ctx_header(b: &mut Builder, headers: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
-    let cx = lower_expr(b, ctx);
+    let cx = lower_expr(b, headers);
     let nm = lower_expr(b, name);
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::HttpCtxHeader { ctx: cx, name: nm, out }));
@@ -10011,6 +10025,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpClient => "http client".to_string(),
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
+        Ty::HttpHeaders => "http_headers".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),

@@ -2861,8 +2861,12 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
-        // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream => ctx.ptr_type(AddressSpace::default()).into(),
+        // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer. A
+        // `http_headers` view rides here too (http.md item 10 ②/⑤): it is Copy and owns nothing, but
+        // its representation IS the `http_request_ctx` pointer, so it must lower to `ptr`. Missing
+        // this arm is silent: the `_ =>` below falls through to `int_type`'s own `_ => i32`, which
+        // truncates a pointer to 4 bytes — the exact bug that already happened once for `Ty::Fn`.
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -10395,6 +10399,30 @@ mod tests {
             sdef("SEnum1", false, &[Ty::Enum(0), i(64, true)]),          // reorder: i64 then enum
             sdef("SEnumStr", false, &[Ty::Enum(1)]),                     // { i32, {ptr,len} , i64 }
             sdef("SEnumObj", false, &[Ty::Bool, Ty::Enum(2)]),           // reorder: enum then bool
+            // The three field types the table had no row for, all valid per `is_field_ok`: a
+            // **Move-handle** field (`Ctx { req: http_request_ctx }`, F1②) and a **`http_headers`**
+            // view field (`Ctx { headers: http_headers }`, http.md item 10) are BARE 8-byte pointers —
+            // the cases the `_ => (16, 8)` catch-all used to over-report by 8 bytes — while a
+            // `Ty::Fn` closure field and a `slice<T>` view field really are 16 bytes. Mixed with an
+            // i8 so the reorder path is exercised too.
+            sdef("HandleField", false, &[i(8, true), Ty::HttpRequestCtx]),   // { ptr, i8 } → (16, 8)
+            sdef("HeadersField", false, &[i(8, true), Ty::HttpHeaders]),     // { ptr, i8 } → (16, 8)
+            sdef("BothPtrs", false, &[Ty::HttpRequestCtx, Ty::Bool, Ty::HttpHeaders]), // (24, 8)
+            sdef("FnField", false, &[Ty::Bool, Ty::Fn(0)]),                 // { {ptr,ptr}, i8 } → (24, 8)
+            sdef("SliceField", false, &[Ty::Bool, Ty::Slice(align_sema::Scalar::Str)]), // (24, 8)
+            // The pkg.web `Ctx` shape itself: four `str` views + a `slice<u8>` + the header view.
+            sdef(
+                "WebCtx",
+                false,
+                &[
+                    Ty::Str,
+                    Ty::Str,
+                    Ty::Str,
+                    Ty::Str,
+                    Ty::Slice(align_sema::Scalar::Int(IntTy { bits: 8, signed: false })),
+                    Ty::HttpHeaders,
+                ],
+            ),
         ];
 
         // Sum-type layouts referenced by the `SEnum*` fields above. Built exactly as codegen builds

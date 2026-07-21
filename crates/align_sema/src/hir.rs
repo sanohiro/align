@@ -1202,10 +1202,20 @@ pub enum ExprKind {
     /// `ctx.path()` — the request target (origin-form path) as a `str` **view** into `ctx`'s buffer (the
     /// `ty` is [`crate::Ty::Str`]), region-bound to `ctx`. `ctx` is a bound local. Pure.
     HttpCtxPath { ctx: Box<Expr> },
-    /// `ctx.header(name)` — a **case-insensitive** request-header lookup on `ctx`, yielding
-    /// `Option<str>` (the `ty`) whose `str` is a **view** into `ctx`'s buffer (region-bound to `ctx`).
-    /// `ctx` is a bound local; `name` is borrowed. Pure. The read-dual of [`HttpRespHeader`].
-    HttpCtxHeader { ctx: Box<Expr>, name: Box<Expr> },
+    /// `ctx.headers()` — a **detached view of the parsed header table** ([`crate::Ty::HttpHeaders`],
+    /// the `ty`): a Copy, non-owning value whose representation IS the ctx pointer, so this lowers to
+    /// a plain `Rvalue::Use` of the ctx operand and adds no runtime code (http.md item 10 ②).
+    /// Region-bound to `ctx` exactly like [`HttpCtxBody`] — `Frame.shorter(region_of(ctx))`, so a view
+    /// minted from a local handle cannot leave the frame that owns the handle. `ctx` is a bound
+    /// [`crate::Ty::HttpRequestCtx`] local (or a field of one). Pure.
+    HttpCtxHeaders { ctx: Box<Expr> },
+    /// `hs.get(name)` — a **case-insensitive** (RFC 9110 §5.1) request-header lookup on a
+    /// [`crate::Ty::HttpHeaders`] view, yielding `Option<str>` (the `ty`) whose `str` is a **view** into
+    /// the request buffer. Its region **inherits** `headers`'s (NOT `Frame`-capped): through a
+    /// parameter the caller provably outlives the call, which is what lets the pkg.web wrapper
+    /// `fn header(c: Ctx, name: str) -> Option<str> = c.headers.get(name)` compile (http.md item 10 ④).
+    /// `name` is borrowed. Pure. The read-dual of [`HttpRespHeader`].
+    HttpCtxHeader { headers: Box<Expr>, name: Box<Expr> },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** into `ctx`'s buffer (the `ty` is
     /// [`crate::Ty::Slice`] of `u8`), region-bound to `ctx`. `ctx` is a bound local. Pure. The read-dual
     /// of [`HttpRespBody`].

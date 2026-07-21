@@ -491,7 +491,8 @@ pub enum Ty {
     /// A `http_request_ctx` (`std.http`) — one accepted request, the `Ok` payload of `srv.accept()`'s
     /// `Result<http_request_ctx, Error>`. An owned **Move** handle owning the accepted socket fd + the
     /// parsed request (ONE byte buffer + offset table, zero-copy http.md R1), `Drop`-closed/freed.
-    /// `ctx.method()`/`path()` return `str` **views**; `ctx.header(name)` an `Option<str>` view;
+    /// `ctx.method()`/`path()` return `str` **views**; `ctx.headers()` a Copy [`Ty::HttpHeaders`] view
+    /// of the parsed header table (look up with `hs.get(name)` for an `Option<str>`);
     /// `ctx.body()` a `slice<u8>` view — all region-bound to `ctx` (#297). `ctx.respond(rb)` **consumes**
     /// both `ctx` and `rb` (writes + closes the fd). Opaque pointer.
     HttpRequestCtx,
@@ -512,6 +513,17 @@ pub enum Ty {
     /// **Impure** (network).
     /// Opaque pointer.
     HttpStream,
+    /// A `http_headers` (`std.http`) — a **detached view of one request's parsed header table**,
+    /// minted by `ctx.headers()` (http.md item 10). **Copy, non-owning, region-tracked** — the
+    /// `json.doc` lane, never a Move handle: it owns nothing, is never dropped, and never makes its
+    /// enclosing struct Move (which is the whole point — pkg.web's Copy `Ctx` carries it as a field).
+    /// Its representation IS the `http_request_ctx` pointer (a **bare 8-byte pointer** — the only Copy
+    /// type that is one, hence its own `ty_size_align` arm), so `ctx.headers()` lowers to a pointer
+    /// copy and `hs.get(name)` reuses the existing `align_rt_http_ctx_header` call: no runtime code is
+    /// added at all. Region-bound to the ctx it was minted from; `hs.get(name)` yields an `Option<str>`
+    /// view that **inherits** the view's region. Deliberately has **no `Scalar` variant**, which keeps
+    /// it out of `Option`/`Result` payloads and array/slice/box elements by fail-closed default.
+    HttpHeaders,
     /// A `json.doc` (`core.json`, J4) — the schema-unknown lazy document view. A **Copy**
     /// `{ tape, node }` handle laid out like a slice (`{ptr, i64}`): `tape` addresses the
     /// arena-resident tape (built by `json.doc(s)?`), `node` is a tape index (`< 0` == `Missing`).
@@ -768,6 +780,9 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        // A `http_headers` view is a bare ctx pointer, not a `slice<T>`; like `json.doc` below, its
+        // escape is enforced through `tracks_region`, not `mentions_slice`.
+        | Ty::HttpHeaders
         // A `json.doc` is a `{tape,node}` handle, not a `slice<T>` payload; its escape is enforced
         // through `tracks_region`, not `mentions_slice`.
         | Ty::JsonDoc
@@ -798,6 +813,11 @@ pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], en
         | Ty::Reader
         | Ty::Writer
         | Ty::Soa(_)
+        // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
+        // buffer, so a `Let` binding it must record the ctx's borrow provenance. Without this arm no
+        // provenance is recorded at all and `ctx.respond(rb)` never invalidates the view (http.md
+        // item 10 ⑤ — one half of the fatal pair, with `borrow_sources_inner`).
+        | Ty::HttpHeaders
         // A `json.doc` handle borrows the arena tape + the JSON input, like a `soa` view (J4).
         | Ty::JsonDoc
         // A `json.scanner<Row>` borrows the JSON input view it streams over (J5).
@@ -985,6 +1005,12 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting
             let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
             (align_up(payload_off + psz, pal), pal)
         }
+        // A **bare 8-byte pointer** field. Codegen lowers both of these to a plain `ptr`
+        // (`scalar_type`'s pointer arm), so the `(16, 8)` catch-all below over-reports them by 8
+        // bytes — harmless for safety (the real layout comes from `scalar_type` + `field_abi_align`),
+        // but the huge-struct-copy lint is this function's consumer and it should see the truth.
+        // `sema_and_codegen_struct_layout_agree` pins both against the real LLVM ABI.
+        Ty::HttpRequestCtx | Ty::HttpHeaders => (8, 8),
         // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
         // (A struct can hold only scalar / `str` / `Option` / nested-struct fields today; the rest are
         // a defensive default.)
@@ -4406,9 +4432,15 @@ impl EffectScan<'_> {
                 self.expr(rb);
                 self.expr(data);
             }
-            ExprKind::HttpCtxMethod { ctx } | ExprKind::HttpCtxPath { ctx } | ExprKind::HttpCtxBody { ctx } => self.expr(ctx),
-            ExprKind::HttpCtxHeader { ctx, name } => {
-                self.expr(ctx);
+            // `ctx.headers()` is a pointer copy and `hs.get(name)` a read-only scan of an immutable
+            // buffer, so both stay **Pure** (http.md item 10 ⑥) — which is what lets a handler that
+            // reads headers remain legal inside a `par_map` / `task_group` closure.
+            ExprKind::HttpCtxMethod { ctx }
+            | ExprKind::HttpCtxPath { ctx }
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => self.expr(ctx),
+            ExprKind::HttpCtxHeader { headers, name } => {
+                self.expr(headers);
                 self.expr(name);
             }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
@@ -5081,6 +5113,9 @@ impl<'a> EscapeCheck<'a> {
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
             Ty::Soa(_) => true,
+            // A `http_headers` view borrows the request context's parsed buffer, so it is
+            // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
+            Ty::HttpHeaders => true,
             // A `json.doc` view borrows the arena tape + the JSON input (min of the two), so it is
             // region-tracked — it (and any str/sub-doc read of it) must not outlive either (J4).
             Ty::JsonDoc => true,
@@ -5566,14 +5601,23 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
                 Region::Frame.shorter(self.region_of(resp, depth))
             }
-            // `ctx.method()`/`path()`/`header(name)`/`body()` are the read-duals: `str` / `slice<u8>`
-            // **views** into the `http_request_ctx` handle's owned buffer (freed at frame exit), so —
-            // like the `resp.*` views above — they are `Frame`-regioned and bound to `ctx` (or shorter
-            // if `ctx` is arena-scoped). An escape past `ctx`'s `Drop` reads freed memory (#297).
+            // `ctx.method()`/`path()`/`body()`/`headers()` are the read-duals: `str` / `slice<u8>` /
+            // header-table **views** into the `http_request_ctx` handle's owned buffer (freed at frame
+            // exit), so — like the `resp.*` views above — they are `Frame`-regioned and bound to `ctx`
+            // (or shorter if `ctx` is arena-scoped). An escape past `ctx`'s `Drop` reads freed memory
+            // (#297). `headers()` rides the same cap: a header view minted from a LOCAL handle cannot
+            // leave the frame that owns the handle (http.md item 10 ④).
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
-            | ExprKind::HttpCtxHeader { ctx, .. }
-            | ExprKind::HttpCtxBody { ctx } => Region::Frame.shorter(self.region_of(ctx, depth)),
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => Region::Frame.shorter(self.region_of(ctx, depth)),
+            // `hs.get(name)` **inherits** its receiver's region instead of re-capping at `Frame` — the
+            // one line the whole `ctx.headers()` design turns on (http.md item 10 ④). Through a
+            // parameter (`fn header(c: Ctx, name: str) = c.headers.get(name)`) the caller provably
+            // outlives the call, so the view is `Static` there and the wrapper compiles; minted from a
+            // local handle the receiver is already `Frame`-capped by the arm above, so the lookup is
+            // too. This is the rule `str`/`slice` views already follow through parameters.
+            ExprKind::HttpCtxHeader { headers, .. } => self.region_of(headers, depth),
             // `c.reader()` / `c.writer()` borrow the `tcp_conn`'s fd (`owns_fd: false` — only `c`'s
             // `Drop` closes it), so — like `BufferBytes` / `CliGetStr` — the returned stream is
             // region-bound to `c`: `Frame` (or shorter if `c` lives in an arena). It must not escape
@@ -6088,6 +6132,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpAccept { .. }
             | ExprKind::HttpCtxMethod { .. }
             | ExprKind::HttpCtxPath { .. }
+            // Neither the header-table view nor a lookup through it is a `slice`, so neither can be a
+            // *local-backed slice*: `http_headers` is a bare pointer and `hs.get(name)` yields an
+            // `Option<str>`. Their escape is governed by `tracks_region` + `region_of` instead.
+            | ExprKind::HttpCtxHeaders { .. }
             | ExprKind::HttpCtxHeader { .. }
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
@@ -6906,9 +6954,12 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(rb, depth);
                 self.walk(data, depth);
             }
-            ExprKind::HttpCtxMethod { ctx } | ExprKind::HttpCtxPath { ctx } | ExprKind::HttpCtxBody { ctx } => self.walk(ctx, depth),
-            ExprKind::HttpCtxHeader { ctx, name } => {
-                self.walk(ctx, depth);
+            ExprKind::HttpCtxMethod { ctx }
+            | ExprKind::HttpCtxPath { ctx }
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => self.walk(ctx, depth),
+            ExprKind::HttpCtxHeader { headers, name } => {
+                self.walk(headers, depth);
                 self.walk(name, depth);
             }
             // `std.crypto` — `constant_time_equal` returns a Copy `bool` (borrows nothing); `random`
@@ -7514,9 +7565,12 @@ impl UnnecessaryHeapScan {
                 self.visit(rb);
                 self.visit(data);
             }
-            ExprKind::HttpCtxMethod { ctx } | ExprKind::HttpCtxPath { ctx } | ExprKind::HttpCtxBody { ctx } => self.visit(ctx),
-            ExprKind::HttpCtxHeader { ctx, name } => {
-                self.visit(ctx);
+            ExprKind::HttpCtxMethod { ctx }
+            | ExprKind::HttpCtxPath { ctx }
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => self.visit(ctx),
+            ExprKind::HttpCtxHeader { headers, name } => {
+                self.visit(headers);
                 self.visit(name);
             }
             // `std.crypto` — recurse into the subexpressions (no heap-narrowing pattern of its own).
@@ -7890,8 +7944,15 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpRespBody { resp: buffer }
             | ExprKind::HttpCtxMethod { ctx: buffer }
             | ExprKind::HttpCtxPath { ctx: buffer }
-            | ExprKind::HttpCtxHeader { ctx: buffer, .. }
             | ExprKind::HttpCtxBody { ctx: buffer }
+            // `ctx.headers()` carries the ctx's storage provenance (http.md item 10 ⑤): this tail is
+            // `_ => BorrowRoots::new()`, so a new node is NOT compiler-forced here even though the
+            // other passes are exhaustive — and without this arm `hs := ctx.headers()` records no
+            // borrow at all, so `ctx.respond(rb)` would not invalidate it and a later `hs.get(…)`
+            // would read a freed buffer. `hs.get(name)` reads its receiver's roots, which chains
+            // through `storage_roots`'s `_ => borrow_sources(e)` fallthrough for a temporary view.
+            | ExprKind::HttpCtxHeaders { ctx: buffer }
+            | ExprKind::HttpCtxHeader { headers: buffer, .. }
             | ExprKind::ConnReader { conn: buffer }
             | ExprKind::ConnWriter { conn: buffer } => self.storage_roots(buffer),
             // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
@@ -9011,11 +9072,12 @@ impl<'a> MoveCheck<'a> {
                 self.expr(rb, moved, false, false);
                 self.expr(data, moved, false, false);
             }
-            ExprKind::HttpCtxMethod { ctx } | ExprKind::HttpCtxPath { ctx } | ExprKind::HttpCtxBody { ctx } => {
-                self.expr(ctx, moved, false, false)
-            }
-            ExprKind::HttpCtxHeader { ctx, name } => {
-                self.expr(ctx, moved, false, false);
+            ExprKind::HttpCtxMethod { ctx }
+            | ExprKind::HttpCtxPath { ctx }
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => self.expr(ctx, moved, false, false),
+            ExprKind::HttpCtxHeader { headers, name } => {
+                self.expr(headers, moved, false, false);
                 self.expr(name, moved, false, false);
             }
             // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
@@ -12134,7 +12196,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let arg = self.check_expr(&args[0], inner_expected);
         self.reject_move_enum_payload(arg.ty, "Some", args[0].span);
-        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        let scalar = self.payload_scalar(arg.ty, "Option payload", args[0].span);
         let ty = Ty::Option(scalar);
         self.constrain(ty, expected, span);
         Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty, span }
@@ -12160,15 +12222,19 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Resolve a type to a concrete payload [`Scalar`], defaulting inference vars and
-    /// reporting non-scalar payloads (M2 restriction).
-    fn payload_scalar(&mut self, ty: Ty, span: Span) -> Scalar {
+    /// reporting non-scalar payloads (M2 restriction). `what` names the position being checked
+    /// (`"Option payload"` / `"array element"` / …) — it used to say "Option payload" for every
+    /// caller, which mislabelled an array literal's element as a payload.
+    fn payload_scalar(&mut self, ty: Ty, what: &str, span: Span) -> Scalar {
         let f = self.finalize(ty);
         match ty_to_scalar(f) {
             Some(s) => s,
             None => {
-                if f != Ty::Error {
+                if f == Ty::HttpHeaders {
+                    self.diags.error(http_headers_placement_error(what), span);
+                } else if f != Ty::Error {
                     self.diags
-                        .error(format!("Option payload must be a scalar (composite payloads are not supported yet), got {}", ty_name(f)), span);
+                        .error(format!("{what} must be a scalar (composite payloads are not supported yet), got {}", ty_name(f)), span);
                 }
                 Scalar::Int(IntTy { bits: 64, signed: true })
             }
@@ -12988,6 +13054,14 @@ impl<'a, 't> Checker<'a, 't> {
             "kind" | "get" | "at" | "key" | "elems" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
                 self.check_json_doc_method(recv_expr, method, args, span)
             }
+            // `hs.get(name)` on a `http_headers` view (http.md item 10 ⑥) — the RFC 9110 §5.1
+            // case-insensitive request-header lookup. Type-guarded and placed **above** the catch-all
+            // `get` arm below for the same reason the `json.doc` arm is: `check_box_get` would
+            // otherwise swallow it into a "'get' takes no arguments" diagnostic — a bad message, not a
+            // build failure, so nothing would catch it. The receiver may be a temporary: a
+            // `http_headers` is Copy, owns nothing and is never dropped, so the mandated spelling
+            // `ctx.headers().get(name)` needs no place-gate (unlike `ctx.headers()` itself).
+            "get" if recv_ty == Ty::HttpHeaders => self.check_http_headers_get(recv_expr, args, span),
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
             // http-client arm below; `check_box_get` otherwise swallows it with a box-only error).
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
@@ -13034,8 +13108,8 @@ impl<'a, 't> Checker<'a, 't> {
             // (`srv.accept()` on an `http_server` is dispatched by the early `method == "accept"`
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
             // Request-context getters + `respond` on an `http_request_ctx`: `ctx.method()` / `ctx.path()`
-            // / `ctx.header(name)` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
-            "method" | "path" | "header" | "body" | "respond" | "respond_stream" if recv_ty == Ty::HttpRequestCtx => {
+            // / `ctx.headers()` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
+            "method" | "path" | "headers" | "body" | "respond" | "respond_stream" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
             }
             // Response-builder methods on a `response_builder`: `rb.header(name, value)` / `rb.body(data)`
@@ -13497,7 +13571,7 @@ impl<'a, 't> Checker<'a, 't> {
                 ));
             }
         }
-        let scalar = self.payload_scalar(elem_ty, span);
+        let scalar = self.payload_scalar(elem_ty, "array element", span);
         Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar), pooled: false }, ty: Ty::Array(scalar, n), span }
     }
 
@@ -15612,7 +15686,7 @@ impl<'a, 't> Checker<'a, 't> {
         // annotation path is guarded in `resolve_type`, but inference here must reject the same
         // set or codegen's `scalar_bytes` hits `unreachable!`): a Move scalar (`string`/`array`),
         // a `Struct` (codegen can't size a struct box), or a `str` view (not boxable).
-        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        let scalar = self.payload_scalar(arg.ty, "`heap.new` payload", args[0].span);
         let reject = match scalar {
             _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
             Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
@@ -18417,10 +18491,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `ctx.method()` / `ctx.path()` / `ctx.header(name)` / `ctx.body()` / `ctx.respond(rb)` on an
+    /// `ctx.method()` / `ctx.path()` / `ctx.headers()` / `ctx.body()` / `ctx.respond(rb)` on an
     /// `http_request_ctx` ([`Ty::HttpRequestCtx`]), the receiver already evaluated. The receiver must be
-    /// a bound local (the v1 gate). `method`/`path` yield a `str` **view**; `header` an `Option<str>`
-    /// view; `body` a `slice<u8>` view — all region-bound to `ctx` (the `region_of` / `slice_is_local`
+    /// a bound local (the v1 gate). `method`/`path` yield a `str` **view**; `headers` a
+    /// [`Ty::HttpHeaders`] view of the parsed header table (look up through it with `hs.get(name)`);
+    /// `body` a `slice<u8>` view — all region-bound to `ctx` (the `region_of` / `slice_is_local`
     /// arms reject an escape). `respond(rb)` **consumes both** `ctx` and its `rb` ([`Ty::ResponseBuilder`])
     /// and yields `Result<(), Error>` (Impure).
     fn check_http_ctx_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
@@ -18455,20 +18530,12 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::HttpCtxPath { ctx: Box::new(recv_expr) }, ty: Ty::Str, span }
             }
-            "header" => {
-                if args.len() != 1 {
-                    self.diags.error(format!("'.header()' takes 1 argument (the header name), got {}", args.len()), span);
+            "headers" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.headers()' takes no arguments, got {}", args.len()), span);
                     return err;
                 }
-                let name = self.check_str_init(&args[0]);
-                if name.ty == Ty::Error {
-                    return err;
-                }
-                Expr {
-                    kind: ExprKind::HttpCtxHeader { ctx: Box::new(recv_expr), name: Box::new(name) },
-                    ty: Ty::Option(Scalar::Str),
-                    span,
-                }
+                Expr { kind: ExprKind::HttpCtxHeaders { ctx: Box::new(recv_expr) }, ty: Ty::HttpHeaders, span }
             }
             "body" => {
                 if !args.is_empty() {
@@ -18526,9 +18593,36 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / header / body / respond / respond_stream)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / respond / respond_stream)"), span);
                 err
             }
+        }
+    }
+
+    /// `hs.get(name)` on a `http_headers` ([`Ty::HttpHeaders`]) view, the receiver already evaluated —
+    /// the RFC 9110 §5.1 case-insensitive request-header lookup, yielding `Option<str>` whose `str`
+    /// views the request buffer (http.md item 10 ①).
+    ///
+    /// Deliberately **no receiver place-gate**: the `Local | Field` gate `check_http_ctx_method`
+    /// applies exists so a *temporary owned handle* is never used (nothing would drop it), and a
+    /// `http_headers` is Copy, owns nothing and is never dropped. Inheriting the gate would reject the
+    /// mandated spelling `ctx.headers().get(name)`, whose receiver is by construction not a place.
+    /// Region safety is carried by [`Self::region_of`]'s `HttpCtxHeader` arm (inherit the receiver's
+    /// region) plus the `Frame` cap the receiver already picked up at `ctx.headers()`.
+    fn check_http_headers_get(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(format!("'.get()' takes 1 argument (the header name), got {}", args.len()), span);
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        if name.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::HttpCtxHeader { headers: Box::new(recv_expr), name: Box::new(name) },
+            ty: Ty::Option(Scalar::Str),
+            span,
         }
     }
 
@@ -19378,7 +19472,7 @@ impl<'a, 't> Checker<'a, 't> {
         let is_ok = name == "Ok";
         let arg = self.check_expr(&args[0], if is_ok { ok_exp } else { err_exp });
         self.reject_move_enum_payload(arg.ty, name, args[0].span);
-        let arg_scalar = self.payload_scalar(arg.ty, args[0].span);
+        let arg_scalar = self.payload_scalar(arg.ty, if is_ok { "Result ok payload" } else { "Result err payload" }, args[0].span);
 
         // The other arm's scalar must be known from context; otherwise we cannot form
         // a complete Result type (M2 limitation).
@@ -20484,9 +20578,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(rb);
                 self.finalize_expr(data);
             }
-            ExprKind::HttpCtxMethod { ctx } | ExprKind::HttpCtxPath { ctx } | ExprKind::HttpCtxBody { ctx } => self.finalize_expr(ctx),
-            ExprKind::HttpCtxHeader { ctx, name } => {
-                self.finalize_expr(ctx);
+            ExprKind::HttpCtxMethod { ctx }
+            | ExprKind::HttpCtxPath { ctx }
+            | ExprKind::HttpCtxBody { ctx }
+            | ExprKind::HttpCtxHeaders { ctx } => self.finalize_expr(ctx),
+            ExprKind::HttpCtxHeader { headers, name } => {
+                self.finalize_expr(headers);
                 self.finalize_expr(name);
             }
             ExprKind::CryptoCtEqual { a, b } => {
@@ -21024,6 +21121,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::HttpClient => "http client".to_string(),
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
+        Ty::HttpHeaders => "http_headers".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
@@ -21214,6 +21312,14 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
         );
+        return None;
+    }
+    // A `http_headers` view has deliberately no `Scalar` variant (http.md item 10 ⑤): it is kept out
+    // of payloads and elements by fail-closed default. The generic "must be a scalar" message below
+    // would be the right answer with the wrong story — the view is not an unimplemented composite,
+    // it is a value that only ever lives in a local or a struct field.
+    if ty == Ty::HttpHeaders {
+        diags.error(http_headers_placement_error(what), span);
         return None;
     }
     match ty_to_scalar(ty) {
@@ -21573,6 +21679,18 @@ fn resolve_type(
             }
             Ty::HttpRequestCtx
         }
+        // `http_headers` (`std.http`) — a detached, Copy, non-owning view of one request's parsed
+        // header table (`ctx.headers()`, http.md item 10). A **global** surface name — no `import
+        // std.http` required, like `http_request_ctx` / `response_builder` / `http_stream` — which is
+        // what keeps `pkg.web.types` the dependency-free leaf module it is designed to be while its
+        // Copy `Ctx` carries the view as a field.
+        "http_headers" => {
+            if !args.is_empty() {
+                diags.error("http_headers takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::HttpHeaders
+        }
         // `response_builder` (`std.http`) — a response under construction, an owned Move handle
         // (`http.response(code)`). A surface type name for the same reason `http_request_ctx` is
         // one: it lets a handler BUILD a response and hand it back
@@ -21859,6 +21977,16 @@ pub fn is_move_handle(ty: Ty) -> bool {
     )
 }
 
+/// The tailored rejection for a [`Ty::HttpHeaders`] in a payload / element position. The view has
+/// deliberately no [`Scalar`] variant (http.md item 10 ⑤), so the generic "must be a scalar" message
+/// would be the right answer with the wrong story: it is not an unimplemented composite, it is a
+/// value that only ever lives in a local or a struct field.
+fn http_headers_placement_error(what: &str) -> String {
+    format!(
+        "{what} cannot be `http_headers` — a request header-table view lives in a local (`hs := ctx.headers()`) or a struct field (`Ctx {{ headers: http_headers }}`), never in an Option/Result payload or an array/slice/box element"
+    )
+}
+
 /// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
 /// `string`, or a nested struct.
 fn is_field_ok(ty: Ty) -> bool {
@@ -21884,6 +22012,13 @@ fn is_field_ok(ty: Ty) -> bool {
         // handle arm → the null-safe `*_free`; `ty_owns_buffer_rec` already classifies the struct as
         // Move). The admitted set matches codegen's `handle_free_fn`.
         _ if is_move_handle(ty) => true,
+        // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
+        // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no
+        // heap (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays **Copy** — a Move
+        // `Ctx` would be consumed by its own accessors) and needs no drop. It region-ties the
+        // enclosing struct to the request buffer: `region_of(StructLit)` folds in each field's region,
+        // so a `Ctx` built from a local ctx handle cannot outlive it.
+        Ty::HttpHeaders => true,
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
         // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
