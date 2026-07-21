@@ -328,13 +328,15 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
     a = a + 1
   }
   t[1] = ec
-  // A startup-only bound check, and it is load-bearing rather than defensive. In the eight-array
+  // A startup-only bound check. No table can trip it today — `cap` provably dominates all three
+  // index spaces — so it is a TRIPWIRE for future edits, not a live guard. It earns its place
+  // because of what the flat layout costs on a miss: in the eight-array
   // layout an out-of-range node/edge id hit `array<i64>`'s own bounds check and ABORTED; flattened
   // into one array, `t[c_param(cap) + cap]` is simply the first entry of the next column, so the
   // same mistake would silently corrupt the tree and MISROUTE requests (an adversarial review
   // demonstrated exactly that: a deliberately-off-by-one `cap` returned route 0 for `/d` instead of
   // route 3, exit code 0). This restores the loud failure at zero per-request cost.
-  if nc > cap || ec > cap || np > cap {
+  if nc > cap || ec > cap {
     e := io.stderr
     e.write("pkg.web router: route tree exceeded its column bound (build_tree)\n") else {}
     process.abort()

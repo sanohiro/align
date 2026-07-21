@@ -72,8 +72,10 @@ fn main() {
     println!("  {:<32} {:>12} {:>12} {:>10}", "shape", "framework", "hand-written", "ratio");
     let mut worst = 0.0f64;
     for (name, shape, _) in shapes {
-        // Interleave per shape: timing all of A then all of B lets the second side run on a warmer
-        // cache and settled clocks (`bench/README.md` methodology).
+        // A and B are measured adjacently per shape (not all shapes of A, then all of B), so the
+        // two sides of a printed ratio share their clock state. Within a side the 7 trials are
+        // consecutive — full per-trial A/B alternation is the stricter form `bench/README.md`
+        // describes, and is worth doing if these ratios ever get close enough to argue about.
         let a = ns_per_op(fw, shape, n, trials);
         let b = ns_per_op(hw, shape, n, trials);
         let ratio = a / b;

@@ -35,10 +35,10 @@ RT_DIR="$(cd ../.. && pwd)/target/release"
 # Assemble the module tree in a temp dir: the SHIPPED pkg.web sources + the bench-only window.
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
-mkdir -p "$BUILD/pkg/web/internal"
-cp ../../apps/web/pkg/web.align "$BUILD/pkg/"
-cp ../../apps/web/pkg/web/types.align "$BUILD/pkg/web/"
-cp ../../apps/web/pkg/web/internal/router.align ../../apps/web/pkg/web/internal/query.align "$BUILD/pkg/web/internal/"
+mkdir -p "$BUILD/pkg"
+# Copy the WHOLE shipped package, not an enumerated subset — the subset compiled only as long as
+# `web.align` happened not to import `cookie.align` / `cors.align`, which is drift waiting to happen.
+cp -r ../../apps/web/pkg/. "$BUILD/pkg/"
 cp align/bench_window.align "$BUILD/pkg/web/bench.align"
 cp align/kernel.align "$BUILD/kernel.align"
 
@@ -47,8 +47,10 @@ cp align/kernel.align "$BUILD/kernel.align"
 ( cd "$BUILD" && "$ALIGNC" emit-obj kernel.align --target-cpu "$align_tgt" \
     --export fw --export hw --export fw_big >/dev/null )
 
-# One object per module; link them all.
-OBJS="$(ls "$BUILD"/*.o | tr '\n' ':')"
+# One object per module; link them all. Built by globbing, not by parsing `ls`: `:` is the separator
+# build.rs splits on, so a TMPDIR containing one would otherwise produce silently bogus paths.
+OBJS=""
+for o in "$BUILD"/*.o; do OBJS="$OBJS$o:"; done
 
 echo "target: $mode"
 ALIGN_KERNEL_OBJS="$OBJS" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release
