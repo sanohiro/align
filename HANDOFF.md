@@ -27,7 +27,8 @@ apps/web/pkg/web/types.align            Ctx (Move, owns http_request_ctx) + Rout
                                         needs both, so neither can define them (import cycle), and
                                         Align has no re-exports (D9).
 apps/web/pkg/web/internal/router.align  seg_end / match_score / dispatch (linear oracle) /
-                                        tree_dispatch (flat SoA radix tree, differential-tested) /
+                                        best_path_route (flat SoA radix tree built over the ROUTE
+                                        TABLE + backtracking tree_walk, differential-tested) /
                                         param_value (zero-copy :param + *wildcard capture) /
                                         dispatch_routes + method_not_allowed (method-aware, 404 vs 405)
 apps/web/pkg/web/internal/query.align   raw / has / key_matches — zero-alloc query lookup; an ESCAPED
@@ -61,10 +62,31 @@ Nothing there stands in for a missing compiler feature.
    `crates/align_driver/tests/apps_web_root.rs` (2 tests, real socket, server stays up across
    requests). The ownership question this raised is SETTLED — see below; the surface described here has since
    been rebuilt on it (`Ctx` Copy, handlers return a built response).
-2. **Wire the radix tree over a route table.** `dispatch_routes` currently uses the LINEAR
-   `match_score` scan, because `tree_dispatch` takes `slice<str>` and a route table cannot be
-   projected to one (`array_builder` rejects `str` elements). Reading `.pattern` per route inside the
-   tree build closes it. A performance gap only — the differential test pins the two orderings equal.
+2. **Wire the radix tree over a route table — DONE (2026-07-21, #591).** `best_path_route` is now
+   the SoA radix build reading `routes[r].pattern` directly (edge labels = zero-copy
+   `(route, start, end)` triples) + the recursive **backtracking** `tree_walk` (matchit semantics),
+   so `dispatch_routes` / `method_not_allowed` / `allow_methods` all go through the tree; the old
+   linear scan survives as `best_path_route_linear`, the differential oracle. **The walk backtracks
+   by design decision (settled by the #591 adversarial review):** the earlier no-backtracking walk
+   silently 404'd `{/a/featured, /a/:id/versions}` on `/a/featured/versions` — a set the linear
+   scan (production before the tree) matched — and the once-planned build-time ambiguity abort
+   would have rejected that realistic table outright. **A second review finding then fixed the
+   ORACLE:** the original `match_score` fold compared MAGNITUDES (a wildcard match stayed
+   un-shifted), so a deep param chain outranked a static-prefix wildcard — `/:cat/:slug` beat
+   `/assets/*file` on `/assets/logo`, against the httprouter/matchit/Fiber reference AND the
+   fold's own documented left-to-right intent. `match_score` is now **fixed-width base-3,
+   left-aligned to the path's segment count** (wildcard = 0 at its position, absorbed positions
+   zero-filled → the folded prefix shifts by `3^(D-k)`), making it genuinely lexicographic;
+   first-success == max `match_score` now holds for EVERY table (the re-reviewer's 154-case fuzz
+   found the mismatch class; its fixtures are pinned), so no ambiguity abort is needed
+   (duplicate-route / param-name-conflict aborts remain future W4 work). The W1 `slice<str>`
+   `tree_dispatch` was REMOVED outright (one walker, one semantics). Tests:
+   `best_path_route_tree_agrees_with_the_linear_oracle` (backtracking paths + wildcard-vs-chain
+   rows + same-pattern GET/POST rows + the empty table),
+   `best_path_route_backtracks_from_a_static_dead_end`, and
+   `static_prefix_wildcard_outranks_a_param_chain` (absolute indices both sides). The build is
+   still per call; hoisting the columns into `serve`'s scope (build once, match per request over
+   borrowed slices) is the remaining recorded follow-up.
 3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
    `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
    accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.

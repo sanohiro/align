@@ -25,23 +25,37 @@ pub fn seg_end(s: str, start: i64) -> i64 {
 }
 
 // A specificity score >= 0 if `path` matches `pattern`, or -1 if it does not. A higher score is a
-// more specific match: each segment folds into `score * 3 + w` left-to-right with w = 2 (static),
-// 1 (`:param`); a `*wildcard` ends the walk without adding, so a wildcard match always scores below
-// a static/param match that reaches further. The `* 3` positional fold makes an earlier static beat
-// a later one, i.e. static > param > wildcard is decided left-to-right (no backtracking), exactly
-// as the radix tree walks it. Distinct patterns that both match one path always get distinct scores
-// (they must differ in some segment's kind or literal), so `dispatch` never ties.
+// more specific match. The score is **fixed-width base-3, left-aligned to the PATH's segment count
+// D**: position i (left to right) carries weight w_i * 3^(D-1-i) with w = 2 (static), 1 (`:param`),
+// and 0 for the `*wildcard` position and everything it absorbs. Fixed width is what makes the
+// comparison LEXICOGRAPHIC left-to-right — the first position where two matching patterns differ
+// decides, regardless of how deep either continues — so static > `:param` > `*wildcard` at the
+// first divergence is exactly the radix tree's backtracking try-order, and `dispatch`'s max equals
+// the walk's first success. (The earlier fold left a wildcard match un-shifted — a MAGNITUDE
+// comparison — so a deep all-param chain outranked `/assets/*file` on `/assets/logo`, which both
+// the tree and the httprouter/matchit/Fiber reference route to the wildcard row; the #591
+// re-review caught it, and the shift restores the documented left-to-right intent.) Distinct
+// patterns that both match one path score distinctly unless they differ only in parameter NAMES —
+// effective duplicates, where first-registered wins on both sides.
 //
-// The `* 3` fold grows the score as ~3^depth, so it assumes a realistically bounded path depth (a
-// depth beyond ~39 segments would wrap i64 — Align's defined two's-complement wrap — and could then
-// mis-rank; real URLs are a handful of segments deep). This is a property of the scoring *oracle*
-// only; the radix tree walks segment-by-segment and carries no such bound.
+// Weights occupy 3^depth, so the oracle assumes a realistically bounded path depth (beyond ~39
+// segments the i64 wraps — Align's defined two's-complement wrap — and could mis-rank; real URLs
+// are a handful of segments deep). Oracle-only property; the tree walk carries no such bound.
 pub fn match_score(pattern: str, path: str) -> i64 {
   plen := pattern.len()
   xlen := path.len()
+  // D = the path's total segment count (the fixed score width).
+  mut d := 0
+  mut t := 0
+  loop {
+    if t >= xlen { break }
+    t = seg_end(path, t + 1)
+    d = d + 1
+  }
   mut pp := 0
   mut xp := 0
   mut score := 0
+  mut k := 0
   loop {
     p_done := pp >= plen
     x_done := xp >= xlen
@@ -55,9 +69,17 @@ pub fn match_score(pattern: str, path: str) -> i64 {
     pseg := pattern[pp + 1 .. pe]
     xseg := path[xp + 1 .. xe]
     if pseg.starts_with("*") {
-      // Trailing wildcard: it absorbs the remainder of the path (which is non-empty here, since
-      // `x_done` was false). Lowest priority — the walk stops without folding in a segment weight.
-      break score
+      // Trailing wildcard: it absorbs the remainder of the path (non-empty here, since `x_done`
+      // was false) at weight 0. Left-align: shift the folded prefix over the D - k zero positions
+      // the wildcard covers, so the comparison stays lexicographic (see the header comment).
+      mut sh := score
+      mut rem := d - k
+      loop {
+        if rem <= 0 { break }
+        sh = sh * 3
+        rem = rem - 1
+      }
+      break sh
     }
     if pseg.starts_with(":") {
       // A `:param` matches exactly one NON-empty segment.
@@ -72,6 +94,7 @@ pub fn match_score(pattern: str, path: str) -> i64 {
         break -1
       }
     }
+    k = k + 1
     pp = pe
     xp = xe
   }
@@ -97,39 +120,29 @@ pub fn dispatch(patterns: slice<str>, path: str) -> i64 {
   }
 }
 
-// ── The flat SoA radix tree (W1 slice 2) ──────────────────────────────────────────────────────
+// ── The flat SoA radix tree ───────────────────────────────────────────────────────────────────
 //
 // The dispatch design (not an optimization — the linear scan above is only the differential oracle).
 // The route table compiles into flat **struct-of-arrays** i64 columns (Align can't build a runtime-
 // sized array<struct>, and SoA is the idiomatic "soa/tape/offset-table" move anyway): a node table
 // (`n_param`/`n_wild`/`n_leaf`) and an edge table (`e_par`/`e_child` + a zero-copy label as
-// `(e_pat, e_start, e_end)` = `patterns[e_pat][e_start..e_end]`, so no label is ever allocated).
-// Build and match live in one function so the columns never cross a call boundary (serve builds them
-// once in its own scope and matches in its request loop — no owned-array-struct passing needed).
+// `(e_pat, e_start, e_end)` = a view into that route's pattern, so no label is ever allocated).
+// The build lives in `best_path_route` (per call for now; hoisting the columns into `serve`'s scope
+// is the recorded follow-up) and the walk in `tree_walk`, which takes the columns as borrowed
+// slices — the owned columns never leave the builder's scope.
 //
-// The walk is static > `:param` > `*wildcard` at every node with NO backtracking, exactly as the
-// oracle scores it — so `tree_dispatch` and `dispatch` agree for every non-backtracking route set
-// (the differential test pins this). A route set whose match would REQUIRE backtracking (a static
-// miss a param path would have saved) is out of scope for v1 and is a build-time abort in a later
-// slice; realistic REST tables never need it.
-
-// Total number of '/'-separated segments across every pattern — the upper bound on node/edge count.
-pub fn count_segs(patterns: slice<str>) -> i64 {
-  n := patterns.len()
-  mut total := 0
-  mut r := 0
-  loop {
-    if r >= n { break total }
-    p := patterns[r]
-    mut c := 0
-    loop {
-      if c >= p.len() { break }
-      c = seg_end(p, c + 1)
-      total = total + 1
-    }
-    r = r + 1
-  }
-}
+// The walk tries static > `:param` > `*wildcard` at every node **with backtracking** (matchit
+// semantics): if the preferred branch dead-ends deeper in the path, the walk unwinds and tries the
+// next alternative. First success = the oracle's max `match_score`: the score is fixed-width
+// base-3 on segment weights (static 2 > param 1 > wildcard 0, left-aligned to the path's depth),
+// i.e. LEXICOGRAPHIC left-to-right — at the first node where two matching routes diverge the
+// static one outranks the param one outranks the wildcard regardless of what follows, exactly the
+// walk's try order. (Two #591-review findings shaped this: the no-backtracking walk silently 404'd
+// {`/a/featured`, `/a/:id/versions`} on `/a/featured/versions`, which the linear oracle —
+// production dispatch before the tree — matched, so the walk backtracks; and the oracle's original
+// un-shifted fold was a MAGNITUDE comparison that sent `/assets/logo` to `/:cat/:slug` over
+// `/assets/*file`, against the httprouter/matchit/Fiber reference, so the oracle is left-aligned.
+// Equivalence now holds for EVERY table — no build-time ambiguity abort is needed.)
 
 // An `array<i64>` of length `m` filled with `v` — the SoA column allocator (`array_builder` is the
 // only runtime-sized array constructor; a fixed literal can't take a runtime length).
@@ -144,126 +157,51 @@ pub fn filled(m: i64, v: i64) -> array<i64> {
   b.build()
 }
 
-// Build the radix tree from `patterns` and match `path` against it in one pass. Returns the index of
-// the winning route, or -1 if none matches. O(total segments) to build + O(path depth) to match.
-pub fn tree_dispatch(patterns: slice<str>, path: str) -> i64 {
-  cap := count_segs(patterns) + 2
-  // Node columns: for node i, the param-child node index / the wildcard route index / the route
-  // index ending exactly here (each -1 when absent). Node 0 is the root.
-  mut n_param := filled(cap, -1)
-  mut n_wild := filled(cap, -1)
-  mut n_leaf := filled(cap, -1)
-  // Edge columns: parent node, child node, and the label as a zero-copy (pattern, start, end) slice.
-  mut e_par := filled(cap, -1)
-  mut e_child := filled(cap, -1)
-  mut e_pat := filled(cap, -1)
-  mut e_start := filled(cap, -1)
-  mut e_end := filled(cap, -1)
-  mut nc := 1
-  mut ec := 0
-  // --- build: insert each route segment-by-segment ---
-  np := patterns.len()
-  mut r := 0
-  loop {
-    if r >= np { break }
-    pat := patterns[r]
-    mut node := 0
-    mut cur := 0
-    loop {
-      if cur >= pat.len() {
-        // The route ends at this node (first writer wins; a duplicate (method,path) is a build
-        // abort in a later slice).
-        if n_leaf[node] == -1 { n_leaf[node] = r }
-        break
-      }
-      ss := cur + 1
-      se := seg_end(pat, ss)
-      seg := pat[ss..se]
-      if seg.starts_with("*") {
-        if n_wild[node] == -1 { n_wild[node] = r }
-        break
-      }
-      if seg.starts_with(":") {
-        if n_param[node] == -1 {
-          n_param[node] = nc
-          nc = nc + 1
-        }
-        node = n_param[node]
-        cur = se
-      } else {
-        // A literal: follow the existing static edge with this label, else add one + a child node.
-        mut child := -1
-        mut j := 0
-        loop {
-          if j >= ec { break }
-          if e_par[j] == node {
-            lab := patterns[e_pat[j]][e_start[j]..e_end[j]]
-            if lab == seg {
-              child = e_child[j]
-              break
-            }
-          }
-          j = j + 1
-        }
-        if child == -1 {
-          child = nc
-          nc = nc + 1
-          e_par[ec] = node
-          e_child[ec] = child
-          e_pat[ec] = r
-          e_start[ec] = ss
-          e_end[ec] = se
-          ec = ec + 1
-        }
-        node = child
-        cur = se
-      }
-    }
-    r = r + 1
+// The recursive tree walk from `node` with `cur` bytes of `path` consumed: try the static edge for
+// the current segment first, then the `:param` child (non-empty segments only), then the trailing
+// `*wildcard` — unwinding to the next alternative when a deeper branch returns -1 (backtracking).
+// Returns the winning route index, or -1. Recursion depth = remaining path segments. The columns
+// are borrowed slices; labels resolve zero-copy through `routes[e_pat[j]].pattern`.
+fn tree_walk(
+  routes: slice<pkg.web.types.Route>,
+  n_param: slice<i64>, n_wild: slice<i64>, n_leaf: slice<i64>,
+  e_par: slice<i64>, e_child: slice<i64>,
+  e_pat: slice<i64>, e_start: slice<i64>, e_end: slice<i64>,
+  ec: i64, path: str, node: i64, cur: i64) -> i64 {
+  if cur >= path.len() {
+    return n_leaf[node]
   }
-  // --- match: walk the tree for `path`, static > param > wildcard, no backtracking ---
-  mut node2 := 0
-  mut cur2 := 0
-  mut result := -1
+  ss := cur + 1
+  se := seg_end(path, ss)
+  seg := path[ss..se]
+  mut child := -1
+  mut j := 0
   loop {
-    if cur2 >= path.len() {
-      result = n_leaf[node2]
-      break
-    }
-    ss := cur2 + 1
-    se := seg_end(path, ss)
-    seg := path[ss..se]
-    mut child := -1
-    mut j := 0
-    loop {
-      if j >= ec { break }
-      if e_par[j] == node2 {
-        lab := patterns[e_pat[j]][e_start[j]..e_end[j]]
-        if lab == seg {
-          child = e_child[j]
-          break
-        }
-      }
-      j = j + 1
-    }
-    if child != -1 {
-      node2 = child
-      cur2 = se
-    } else {
-      if n_param[node2] != -1 && se > ss {
-        node2 = n_param[node2]
-        cur2 = se
-      } else {
-        if n_wild[node2] != -1 {
-          result = n_wild[node2]
-          break
-        }
-        result = -1
+    if j >= ec { break }
+    if e_par[j] == node {
+      rl := routes[e_pat[j]]
+      lp := rl.pattern
+      lab := lp[e_start[j]..e_end[j]]
+      if lab == seg {
+        child = e_child[j]
         break
       }
+    }
+    j = j + 1
+  }
+  if child != -1 {
+    r := tree_walk(routes, n_param, n_wild, n_leaf, e_par, e_child, e_pat, e_start, e_end, ec, path, child, se)
+    if r != -1 {
+      return r
     }
   }
-  result
+  if n_param[node] != -1 && se > ss {
+    r2 := tree_walk(routes, n_param, n_wild, n_leaf, e_par, e_child, e_pat, e_start, e_end, ec, path, n_param[node], se)
+    if r2 != -1 {
+      return r2
+    }
+  }
+  n_wild[node]
 }
 
 // ── Parameter capture (W2 bridge) ─────────────────────────────────────────────────────────────
@@ -303,12 +241,123 @@ pub fn param_value(pattern: str, path: str, name: str) -> str {
 
 // ── Route-table dispatch (W2) ─────────────────────────────────────────────────────────────────
 
+// Total number of '/'-separated segments across every route's pattern — the upper bound on the
+// tree's node/edge count (the build reads `.pattern` off the table, so the count does too).
+pub fn count_route_segs(routes: slice<pkg.web.types.Route>) -> i64 {
+  n := routes.len()
+  mut total := 0
+  mut r := 0
+  loop {
+    if r >= n { break total }
+    rr := routes[r]
+    p := rr.pattern
+    mut c := 0
+    loop {
+      if c >= p.len() { break }
+      c = seg_end(p, c + 1)
+      total = total + 1
+    }
+    r = r + 1
+  }
+}
+
 // The index of the route whose PATTERN best matches `path`, ignoring the method entirely, or -1 if
 // no pattern matches. The shared first half of every table query: `dispatch_routes` picks the method
 // on this path, `method_not_allowed` asks whether the path matched at all, and `allow_methods`
 // collects the method set registered on it. Priority is `match_score`'s: static > `:param` >
 // `*wildcard`.
+//
+// The SoA radix build over the table — each pattern is read out of `routes[r].pattern` (a table
+// cannot be projected to a `slice<str>`: `array_builder` rejects `str` elements), and an edge label
+// is the zero-copy triple `(route, start, end)` into that route's pattern — followed by the
+// backtracking `tree_walk`. Two routes sharing a pattern (differing in method) share a leaf; the
+// FIRST registered wins, exactly as the linear oracle's strict `>` keeps the first max. The build
+// is per call for now; hoisting the columns into `serve`'s scope (build once, match per request
+// over borrowed slices) is the recorded follow-up.
 pub fn best_path_route(routes: slice<pkg.web.types.Route>, path: str) -> i64 {
+  cap := count_route_segs(routes) + 2
+  mut n_param := filled(cap, -1)
+  mut n_wild := filled(cap, -1)
+  mut n_leaf := filled(cap, -1)
+  mut e_par := filled(cap, -1)
+  mut e_child := filled(cap, -1)
+  mut e_pat := filled(cap, -1)
+  mut e_start := filled(cap, -1)
+  mut e_end := filled(cap, -1)
+  mut nc := 1
+  mut ec := 0
+  // --- build: insert each route's pattern segment-by-segment (read off the table) ---
+  np := routes.len()
+  mut r := 0
+  loop {
+    if r >= np { break }
+    rr := routes[r]
+    pat := rr.pattern
+    mut node := 0
+    mut cur := 0
+    loop {
+      if cur >= pat.len() {
+        if n_leaf[node] == -1 { n_leaf[node] = r }
+        break
+      }
+      ss := cur + 1
+      se := seg_end(pat, ss)
+      seg := pat[ss..se]
+      if seg.starts_with("*") {
+        if n_wild[node] == -1 { n_wild[node] = r }
+        break
+      }
+      if seg.starts_with(":") {
+        if n_param[node] == -1 {
+          n_param[node] = nc
+          nc = nc + 1
+        }
+        node = n_param[node]
+        cur = se
+      } else {
+        mut child := -1
+        mut j := 0
+        loop {
+          if j >= ec { break }
+          if e_par[j] == node {
+            rl := routes[e_pat[j]]
+            lp := rl.pattern
+            lab := lp[e_start[j]..e_end[j]]
+            if lab == seg {
+              child = e_child[j]
+              break
+            }
+          }
+          j = j + 1
+        }
+        if child == -1 {
+          child = nc
+          nc = nc + 1
+          e_par[ec] = node
+          e_child[ec] = child
+          e_pat[ec] = r
+          e_start[ec] = ss
+          e_end[ec] = se
+          ec = ec + 1
+        }
+        node = child
+        cur = se
+      }
+    }
+    r = r + 1
+  }
+  // --- match: the backtracking walk over the finished columns (borrowed as explicit slices) ---
+  tree_walk(
+    routes,
+    n_param[0..cap], n_wild[0..cap], n_leaf[0..cap],
+    e_par[0..cap], e_child[0..cap], e_pat[0..cap], e_start[0..cap], e_end[0..cap],
+    ec, path, 0, 0)
+}
+
+// The linear reference scan `best_path_route` is differential-tested against (`match_score` over
+// every row, strict `>` so the first max wins — the same route the tree's first-writer-wins leaf
+// returns). Oracle only; production dispatch goes through the tree above.
+pub fn best_path_route_linear(routes: slice<pkg.web.types.Route>, path: str) -> i64 {
   n := routes.len()
   mut best := -1
   mut best_score := -1
@@ -328,17 +377,13 @@ pub fn best_path_route(routes: slice<pkg.web.types.Route>, path: str) -> i64 {
 
 // Dispatch a ROUTE TABLE: the index of the route that should answer `method` + `path`, or -1.
 //
-// Path matching uses `match_score` (the linear reference scan) rather than `tree_dispatch`, because
-// the tree builder takes a `slice<str>` of patterns and a route TABLE cannot be projected to one
-// without materializing an `array<str>` (which `array_builder` cannot build — `str` views are not a
-// valid element). Wiring the radix tree directly over a `slice<Route>` — reading `.pattern` per
-// route inside the build — is the follow-up; the two agree by construction (the differential test
-// pins `tree_dispatch` against this same `match_score` ordering), so this is a performance gap, not
-// a semantic one. Priority is unchanged: static > `:param` > `*wildcard`. The method is then
-// checked on the winning path. A route whose `method` is empty answers any method, which is how a
-// fallback is written. Because the tree is keyed by path alone, two routes sharing a path but
-// differing in method are resolved here, after the walk: the table is scanned for a route with the
-// SAME pattern as the winner and a matching method, so `GET /x` and `POST /x` coexist.
+// Path matching goes through `best_path_route` — the RADIX TREE built directly over the table
+// (reading `.pattern` per route), differential-pinned against `best_path_route_linear`'s
+// `match_score` ordering. Priority: static > `:param` > `*wildcard`. The method is then checked on
+// the winning path. A route whose `method` is empty answers any method, which is how a fallback is
+// written. Because the tree is keyed by path alone, two routes sharing a path but differing in
+// method are resolved here, after the walk: the table is scanned for a route with the SAME pattern
+// as the winner and a matching method, so `GET /x` and `POST /x` coexist.
 //
 // Returns -1 for "no path matched" (a 404). `method_not_allowed` distinguishes the 405 case.
 pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {
