@@ -530,12 +530,17 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    `workers = cores` sizing is now writable. `apps_web_prefork.rs` counts the listeners actually
    bound (`/proc/net/tcp`), so "spawned W tasks" can never again be mistaken for "W loops run".
 4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
-   only now is the Fiber comparison honest. THE REMAINING SLICE. **A first measurement (2026-07-21)
-   already found the blocker: dispatch costs 1319 ns/op on a 6-route table and 708 ns/op on a
-   2-route one — it scales with TABLE SIZE, because `best_path_route` rebuilds the radix structure
-   per call.** That contradicts contract item 3 ("a startup-built radix structure … no per-request
-   pattern parsing"), so the recorded hoist (build once in `serve`, match per request over borrowed
-   slices) is a W5 prerequisite, not a follow-up.
+   only now is the Fiber comparison honest. THE REMAINING SLICE. **Its first measurement
+   (2026-07-21) found and fixed the blocker before any bench file existed:** dispatch cost
+   1319 ns/op on a 6-route table and 708 ns/op on a 2-route one — scaling with TABLE SIZE, because
+   `best_path_route` rebuilt the radix structure per call, contradicting contract item 3 ("a
+   startup-built radix structure … no per-request pattern parsing"). The tree is now built ONCE by
+   `router.build_tree(routes)` in `worker`, before the accept loop, as a single flat `array<i64>`
+   (offset header + eight contiguous columns), and matched per request by `tree_best_path` —
+   **57.3 ns/op at 6 routes, 55.4 ns/op at 2**, i.e. a 23× drop and now FLAT in table size, which is
+   the property the contract actually asks for. `dispatch_routes` / `method_not_allowed` /
+   `allow_methods` take the built tree; `best_path_route` remains as the build-and-match convenience
+   for the differential tests.
 
 ## Slices (F3 of the plan)
 

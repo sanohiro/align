@@ -57,13 +57,16 @@ abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, k
 taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed
 BEFORE the bench is meaningful:**
 
-- **Measured** (release runtime, 6-route realistic table, best of 7 × 200k dispatches):
-  **1319 ns/op**. Shrinking the SAME table to 2 routes drops it to **708 ns/op** — dispatch cost
-  scales with the number of ROUTES, which is the signature of the per-call radix build. A
-  startup-built structure is O(path segments) and flat in table size. (Contract item 3: "a
-  startup-built radix structure … No per-request pattern parsing".) The recorded follow-up
-  ("hoist the columns into `serve`'s scope — build once, match per request over borrowed slices")
-  is therefore a W5 PREREQUISITE, not a nice-to-have; expect roughly an order of magnitude.
+- **Measured, then FIXED (the hoist is DONE — 2026-07-21).** Before: 1319 ns/op over a 6-route
+  table, 708 ns/op over a 2-route one (release runtime, best of 7 × 200k dispatches) — cost scaling
+  with the number of ROUTES, the signature of the per-call radix build. After hoisting the build
+  out of the request path: **57.3 ns/op at 6 routes, 55.4 ns/op at 2** — a **23× drop**, and now
+  **flat in table size**, which is what contract item 3 actually asks for ("a startup-built radix
+  structure … No per-request pattern parsing"). Shape: `router.build_tree(routes)` returns ONE flat
+  `array<i64>` (header `[cap, ec]` + eight contiguous columns — the soa/tape/offset-table move),
+  `worker` builds it once before the accept loop, and `dispatch_routes` / `method_not_allowed` /
+  `allow_methods` / `tree_best_path` all take that borrowed tree. `best_path_route(routes, path)`
+  survives as the build-and-match convenience the differential oracle tests use.
 - **The bench shape is probed and works** — this is the awkward part, so don't re-derive it:
   `dispatch_routes` is an INTERNAL module, so neither `main` nor a bench module outside `pkg.web`
   may import it (D7). The working arrangement is a **window module in the BENCH TREE ONLY**,

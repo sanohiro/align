@@ -157,51 +157,167 @@ pub fn filled(m: i64, v: i64) -> array<i64> {
   b.build()
 }
 
+// ── The built route tree (hoisted at serve() startup) ─────────────────────────────────────────
+//
+// ONE owned `array<i64>` holding an offset header plus eight contiguous columns — the same design
+// move as `soa` / the JSON tape / every other offset table in Align: one allocation, no pointer
+// chasing, cache-line-friendly walks.
+//
+//   [0] cap                  entries per column (= total pattern segments + 2)
+//   [1] ec                   live edge count
+//   [2 + k*cap .. +cap]      column k, in this order:
+//                            0 n_param  1 n_wild  2 n_leaf  3 e_par
+//                            4 e_child  5 e_pat   6 e_start 7 e_end
+//
+// Node columns are indexed by node id; edge columns by edge id. An edge LABEL is the zero-copy
+// triple `(e_pat, e_start, e_end)` — a route index plus a byte range into that route's pattern —
+// so the tree stores no strings at all.
+//
+// **Why this is a separate build step.** Through W4 the columns were rebuilt inside every dispatch:
+// measured at 1319 ns/op over a 6-route table and 708 ns/op over a 2-route one — cost scaling with
+// the number of ROUTES, which is exactly what performance-contract item 3 forbids (dispatch is
+// O(path segments) and flat in table size; the tree is built and checked ONCE at `serve()`).
+
+// Column bases into the flat tree, for a tree whose per-column length is `cap`.
+fn c_param(cap: i64) -> i64 = 2
+fn c_wild(cap: i64) -> i64 = 2 + cap
+fn c_leaf(cap: i64) -> i64 = 2 + 2 * cap
+fn c_epar(cap: i64) -> i64 = 2 + 3 * cap
+fn c_echild(cap: i64) -> i64 = 2 + 4 * cap
+fn c_epat(cap: i64) -> i64 = 2 + 5 * cap
+fn c_estart(cap: i64) -> i64 = 2 + 6 * cap
+fn c_eend(cap: i64) -> i64 = 2 + 7 * cap
+
+// Build the radix tree over the route table: insert each route's pattern segment-by-segment, read
+// straight out of `routes[r].pattern` (a table cannot be projected to a `slice<str>` —
+// `array_builder` rejects `str` elements). Two routes sharing a pattern (differing in method) share
+// a leaf; the FIRST registered wins, exactly as the linear oracle's strict `>` keeps the first max.
+// Called ONCE per serve loop; the result is matched against per request by `tree_best_path`.
+pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
+  cap := count_route_segs(routes) + 2
+  mut t := filled(2 + 8 * cap, -1)
+  t[0] = cap
+  npar := c_param(cap)
+  nwil := c_wild(cap)
+  nlea := c_leaf(cap)
+  epar := c_epar(cap)
+  echi := c_echild(cap)
+  epat := c_epat(cap)
+  esta := c_estart(cap)
+  eend := c_eend(cap)
+  mut nc := 1
+  mut ec := 0
+  np := routes.len()
+  mut r := 0
+  loop {
+    if r >= np { break }
+    rr := routes[r]
+    pat := rr.pattern
+    mut node := 0
+    mut cur := 0
+    loop {
+      if cur >= pat.len() {
+        if t[nlea + node] == -1 { t[nlea + node] = r }
+        break
+      }
+      ss := cur + 1
+      se := seg_end(pat, ss)
+      seg := pat[ss..se]
+      if seg.starts_with("*") {
+        if t[nwil + node] == -1 { t[nwil + node] = r }
+        break
+      }
+      if seg.starts_with(":") {
+        if t[npar + node] == -1 {
+          t[npar + node] = nc
+          nc = nc + 1
+        }
+        node = t[npar + node]
+        cur = se
+      } else {
+        mut child := -1
+        mut j := 0
+        loop {
+          if j >= ec { break }
+          if t[epar + j] == node {
+            rl := routes[t[epat + j]]
+            lp := rl.pattern
+            lab := lp[t[esta + j]..t[eend + j]]
+            if lab == seg {
+              child = t[echi + j]
+              break
+            }
+          }
+          j = j + 1
+        }
+        if child == -1 {
+          child = nc
+          nc = nc + 1
+          t[epar + ec] = node
+          t[echi + ec] = child
+          t[epat + ec] = r
+          t[esta + ec] = ss
+          t[eend + ec] = se
+          ec = ec + 1
+        }
+        node = child
+        cur = se
+      }
+    }
+    r = r + 1
+  }
+  t[1] = ec
+  t
+}
+
 // The recursive tree walk from `node` with `cur` bytes of `path` consumed: try the static edge for
 // the current segment first, then the `:param` child (non-empty segments only), then the trailing
 // `*wildcard` — unwinding to the next alternative when a deeper branch returns -1 (backtracking).
-// Returns the winning route index, or -1. Recursion depth = remaining path segments. The columns
-// are borrowed slices; labels resolve zero-copy through `routes[e_pat[j]].pattern`.
-fn tree_walk(
-  routes: slice<pkg.web.types.Route>,
-  n_param: slice<i64>, n_wild: slice<i64>, n_leaf: slice<i64>,
-  e_par: slice<i64>, e_child: slice<i64>,
-  e_pat: slice<i64>, e_start: slice<i64>, e_end: slice<i64>,
-  ec: i64, path: str, node: i64, cur: i64) -> i64 {
+// Returns the winning route index, or -1. Recursion depth = remaining path segments. `t` is the
+// built tree, borrowed; labels resolve zero-copy through `routes[e_pat[j]].pattern`.
+fn tree_walk(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str, node: i64, cur: i64) -> i64 {
+  cap := t[0]
+  ec := t[1]
+  nwil := c_wild(cap)
   if cur >= path.len() {
-    return n_leaf[node]
+    return t[c_leaf(cap) + node]
   }
   ss := cur + 1
   se := seg_end(path, ss)
   seg := path[ss..se]
+  epar := c_epar(cap)
+  epat := c_epat(cap)
+  esta := c_estart(cap)
+  eend := c_eend(cap)
   mut child := -1
   mut j := 0
   loop {
     if j >= ec { break }
-    if e_par[j] == node {
-      rl := routes[e_pat[j]]
+    if t[epar + j] == node {
+      rl := routes[t[epat + j]]
       lp := rl.pattern
-      lab := lp[e_start[j]..e_end[j]]
+      lab := lp[t[esta + j]..t[eend + j]]
       if lab == seg {
-        child = e_child[j]
+        child = t[c_echild(cap) + j]
         break
       }
     }
     j = j + 1
   }
   if child != -1 {
-    r := tree_walk(routes, n_param, n_wild, n_leaf, e_par, e_child, e_pat, e_start, e_end, ec, path, child, se)
+    r := tree_walk(routes, t, path, child, se)
     if r != -1 {
       return r
     }
   }
-  if n_param[node] != -1 && se > ss {
-    r2 := tree_walk(routes, n_param, n_wild, n_leaf, e_par, e_child, e_pat, e_start, e_end, ec, path, n_param[node], se)
+  npar := c_param(cap)
+  if t[npar + node] != -1 && se > ss {
+    r2 := tree_walk(routes, t, path, t[npar + node], se)
     if r2 != -1 {
       return r2
     }
   }
-  n_wild[node]
+  t[nwil + node]
 }
 
 // ── Parameter capture (W2 bridge) ─────────────────────────────────────────────────────────────
@@ -461,91 +577,19 @@ pub fn count_route_segs(routes: slice<pkg.web.types.Route>) -> i64 {
 // collects the method set registered on it. Priority is `match_score`'s: static > `:param` >
 // `*wildcard`.
 //
-// The SoA radix build over the table — each pattern is read out of `routes[r].pattern` (a table
-// cannot be projected to a `slice<str>`: `array_builder` rejects `str` elements), and an edge label
-// is the zero-copy triple `(route, start, end)` into that route's pattern — followed by the
-// backtracking `tree_walk`. Two routes sharing a pattern (differing in method) share a leaf; the
-// FIRST registered wins, exactly as the linear oracle's strict `>` keeps the first max. The build
-// is per call for now; hoisting the columns into `serve`'s scope (build once, match per request
-// over borrowed slices) is the recorded follow-up.
+// Takes the tree BUILT ONCE by `build_tree` — matching is all that happens per request (contract
+// item 3). Cost is O(path segments) plus the edge scan at each node; it does not grow with the
+// number of routes.
+pub fn tree_best_path(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str) -> i64 =
+  tree_walk(routes, t, path, 0, 0)
+
+// Build-and-match in one call: the convenience form for a caller that has no serve loop to hoist
+// into — the differential tests, and one-shot lookups. Production dispatch goes through
+// `build_tree` once + `tree_best_path` per request; using this on a request path would put the
+// build back in the hot loop.
 pub fn best_path_route(routes: slice<pkg.web.types.Route>, path: str) -> i64 {
-  cap := count_route_segs(routes) + 2
-  mut n_param := filled(cap, -1)
-  mut n_wild := filled(cap, -1)
-  mut n_leaf := filled(cap, -1)
-  mut e_par := filled(cap, -1)
-  mut e_child := filled(cap, -1)
-  mut e_pat := filled(cap, -1)
-  mut e_start := filled(cap, -1)
-  mut e_end := filled(cap, -1)
-  mut nc := 1
-  mut ec := 0
-  // --- build: insert each route's pattern segment-by-segment (read off the table) ---
-  np := routes.len()
-  mut r := 0
-  loop {
-    if r >= np { break }
-    rr := routes[r]
-    pat := rr.pattern
-    mut node := 0
-    mut cur := 0
-    loop {
-      if cur >= pat.len() {
-        if n_leaf[node] == -1 { n_leaf[node] = r }
-        break
-      }
-      ss := cur + 1
-      se := seg_end(pat, ss)
-      seg := pat[ss..se]
-      if seg.starts_with("*") {
-        if n_wild[node] == -1 { n_wild[node] = r }
-        break
-      }
-      if seg.starts_with(":") {
-        if n_param[node] == -1 {
-          n_param[node] = nc
-          nc = nc + 1
-        }
-        node = n_param[node]
-        cur = se
-      } else {
-        mut child := -1
-        mut j := 0
-        loop {
-          if j >= ec { break }
-          if e_par[j] == node {
-            rl := routes[e_pat[j]]
-            lp := rl.pattern
-            lab := lp[e_start[j]..e_end[j]]
-            if lab == seg {
-              child = e_child[j]
-              break
-            }
-          }
-          j = j + 1
-        }
-        if child == -1 {
-          child = nc
-          nc = nc + 1
-          e_par[ec] = node
-          e_child[ec] = child
-          e_pat[ec] = r
-          e_start[ec] = ss
-          e_end[ec] = se
-          ec = ec + 1
-        }
-        node = child
-        cur = se
-      }
-    }
-    r = r + 1
-  }
-  // --- match: the backtracking walk over the finished columns (borrowed as explicit slices) ---
-  tree_walk(
-    routes,
-    n_param[0..cap], n_wild[0..cap], n_leaf[0..cap],
-    e_par[0..cap], e_child[0..cap], e_pat[0..cap], e_start[0..cap], e_end[0..cap],
-    ec, path, 0, 0)
+  t := build_tree(routes)
+  tree_best_path(routes, t[..], path)
 }
 
 // The linear reference scan `best_path_route` is differential-tested against (`match_score` over
@@ -580,9 +624,9 @@ pub fn best_path_route_linear(routes: slice<pkg.web.types.Route>, path: str) -> 
 // as the winner and a matching method, so `GET /x` and `POST /x` coexist.
 //
 // Returns -1 for "no path matched" (a 404). `method_not_allowed` distinguishes the 405 case.
-pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {
+pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, t: slice<i64>, method: str, path: str) -> i64 {
   n := routes.len()
-  best := best_path_route(routes, path)
+  best := tree_best_path(routes, t, path)
   if best < 0 {
     return -1
   }
@@ -606,11 +650,11 @@ pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, method: str, path: st
 
 // Whether `path` matches some route but NO route on that path accepts `method` — the 405 case, as
 // distinct from a 404. Lets the caller send `Allow` for the path's real method set.
-pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool {
-  if dispatch_routes(routes, method, path) >= 0 {
+pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, t: slice<i64>, method: str, path: str) -> bool {
+  if dispatch_routes(routes, t, method, path) >= 0 {
     return false
   }
-  best_path_route(routes, path) >= 0
+  tree_best_path(routes, t, path) >= 0
 }
 
 // The `Allow` header value a 405 must carry (RFC 9110 §15.5.6): the comma-separated method set
@@ -622,9 +666,9 @@ pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path:
 // Returns an owned `string`: the value is a join of route methods, so unlike every other router
 // entry point it cannot be a view into existing text. It is built once per 405 response — the
 // error path, not the hot path.
-pub fn allow_methods(routes: slice<pkg.web.types.Route>, path: str) -> string {
+pub fn allow_methods(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str) -> string {
   mut b := builder()
-  best := best_path_route(routes, path)
+  best := tree_best_path(routes, t, path)
   if best < 0 {
     return b.to_string()
   }
