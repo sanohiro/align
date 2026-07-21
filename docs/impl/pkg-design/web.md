@@ -206,9 +206,15 @@ the root; at each node try static edges (binary search on the segment) FIRST, el
 child (capture the segment view into the fixed slot array `params[i]`), else the wildcard leaf
 (capture the uneaten remainder incl. `/`s); at the end, the leaf's method row gives the handler
 (present → dispatch; absent but row non-empty → 405 + Allow from the row; no leaf → 404). Static
-beats param beats wildcard at EVERY node, with NO backtracking — like matchit/httprouter, a
-pattern set whose match would require backtracking (a static miss that a param path would have
-saved) is detected and **aborted at build time**, keeping the runtime walk strictly linear.
+beats param beats wildcard at EVERY node, **with backtracking** (matchit semantics — settled
+2026-07-21 by the #591 review): when the preferred branch dead-ends deeper in the path, the walk
+unwinds and tries the next alternative, so `{/a/featured, /a/:id/versions}` routes
+`/a/featured/versions` to the `:id` row. Try-order priority + the score fold's base-3
+left-to-right dominance make first-success equal the linear oracle's max `match_score` for EVERY
+table — no route-set shape needs a build-time ambiguity abort (an earlier draft said
+no-backtracking + abort; that abort would have rejected exactly such realistic tables, and the
+linear scan — production dispatch before the tree — already matched them). Duplicate
+(method, path) rows and conflicting param names remain build-time aborts.
 `web.param(c, "name")` = linear scan of the ≤ n_params name views (n is tiny; no map).
 
 ## Prerequisites (compiler / std — the 土台)

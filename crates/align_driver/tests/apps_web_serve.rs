@@ -37,7 +37,7 @@ const WEB_ROOT: &str = "module pkg.web\n\
 import pkg.web.internal.router\n\
 pub Ctx { req: http_request_ctx, pattern: str }\n\
 pub Route { pattern: str, handler: fn(Ctx) -> Result<(), Error> }\n\
-pub fn dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.tree_dispatch(patterns, path)\n\
+pub fn dispatch(patterns: slice<str>, path: str) -> i64 = pkg.web.internal.router.dispatch(patterns, path)\n\
 pub fn param(pattern: str, path: str, name: str) -> str = pkg.web.internal.router.param_value(pattern, path, name)\n";
 
 fn free_loopback_port() -> u16 {

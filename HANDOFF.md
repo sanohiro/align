@@ -27,7 +27,8 @@ apps/web/pkg/web/types.align            Ctx (Move, owns http_request_ctx) + Rout
                                         needs both, so neither can define them (import cycle), and
                                         Align has no re-exports (D9).
 apps/web/pkg/web/internal/router.align  seg_end / match_score / dispatch (linear oracle) /
-                                        tree_dispatch (flat SoA radix tree, differential-tested) /
+                                        best_path_route (flat SoA radix tree built over the ROUTE
+                                        TABLE + backtracking tree_walk, differential-tested) /
                                         param_value (zero-copy :param + *wildcard capture) /
                                         dispatch_routes + method_not_allowed (method-aware, 404 vs 405)
 apps/web/pkg/web/internal/query.align   raw / has / key_matches — zero-alloc query lookup; an ESCAPED
@@ -61,15 +62,22 @@ Nothing there stands in for a missing compiler feature.
    `crates/align_driver/tests/apps_web_root.rs` (2 tests, real socket, server stays up across
    requests). The ownership question this raised is SETTLED — see below; the surface described here has since
    been rebuilt on it (`Ctx` Copy, handlers return a built response).
-2. **Wire the radix tree over a route table — DONE (2026-07-21).** `best_path_route` is now the SoA
-   radix build+match reading `routes[r].pattern` directly (edge labels = zero-copy
-   `(route, start, end)` triples into the table's patterns), so `dispatch_routes` /
-   `method_not_allowed` / `allow_methods` all go through the tree; the old linear scan survives as
-   `best_path_route_linear`, the differential oracle
-   (`apps_web_router.rs::best_path_route_tree_agrees_with_the_linear_oracle`, incl. same-pattern
-   GET/POST rows — shared leaf first-writer-wins == strict-`>` first max). The build is still per
-   call; hoisting the columns into `serve`'s scope (build once, match per request over borrowed
-   slices) is the remaining recorded follow-up.
+2. **Wire the radix tree over a route table — DONE (2026-07-21, #591).** `best_path_route` is now
+   the SoA radix build reading `routes[r].pattern` directly (edge labels = zero-copy
+   `(route, start, end)` triples) + the recursive **backtracking** `tree_walk` (matchit semantics),
+   so `dispatch_routes` / `method_not_allowed` / `allow_methods` all go through the tree; the old
+   linear scan survives as `best_path_route_linear`, the differential oracle. **The walk backtracks
+   by design decision (settled by the #591 adversarial review):** the earlier no-backtracking walk
+   silently 404'd `{/a/featured, /a/:id/versions}` on `/a/featured/versions` — a set the linear
+   scan (production before the tree) matched — and the once-planned build-time ambiguity abort
+   would have rejected that realistic table outright. Priority try-order + the base-3 score fold
+   make first-success == max `match_score` for EVERY table, so no ambiguity abort is needed
+   (duplicate-route / param-name-conflict aborts remain future W4 work). The W1 `slice<str>`
+   `tree_dispatch` was REMOVED outright (one walker, one semantics). Tests:
+   `best_path_route_tree_agrees_with_the_linear_oracle` (incl. backtracking paths + same-pattern
+   GET/POST rows + the empty table) and `best_path_route_backtracks_from_a_static_dead_end`
+   (absolute indices). The build is still per call; hoisting the columns into `serve`'s scope
+   (build once, match per request over borrowed slices) is the remaining recorded follow-up.
 3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
    `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
    accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.
