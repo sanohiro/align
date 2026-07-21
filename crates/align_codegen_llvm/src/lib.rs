@@ -10399,7 +10399,7 @@ mod tests {
             sdef("SEnum1", false, &[Ty::Enum(0), i(64, true)]),          // reorder: i64 then enum
             sdef("SEnumStr", false, &[Ty::Enum(1)]),                     // { i32, {ptr,len} , i64 }
             sdef("SEnumObj", false, &[Ty::Bool, Ty::Enum(2)]),           // reorder: enum then bool
-            // The three field types the table had no row for, all valid per `is_field_ok`: a
+            // The field types the table had no row for, all valid per `is_field_ok`: a
             // **Move-handle** field (`Ctx { req: http_request_ctx }`, F1②) and a **`http_headers`**
             // view field (`Ctx { headers: http_headers }`, http.md item 10) are BARE 8-byte pointers —
             // the cases the `_ => (16, 8)` catch-all used to over-report by 8 bytes — while a
