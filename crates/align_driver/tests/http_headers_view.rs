@@ -171,9 +171,9 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
 /// borrow. This is the loop-fixpoint half of `MoveCheck`'s borrow flow: the read comes *before* the
 /// assignment in source order, so only the back-edge join catches it.
 ///
-/// **What this does NOT cover:** a ctx that is merely DROPPED at the end of the iteration rather
-/// than moved. See `known_hole_scope_end_drop_does_not_invalidate_a_view` below — that is a
-/// pre-existing gap in `MoveCheck`, not specific to this type.
+/// **The sibling case** — a ctx that is merely DROPPED at the end of the iteration rather than
+/// moved — is `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` below. It was a
+/// `MoveCheck` gap until 2026-07-22 and was never specific to this type.
 #[test]
 fn a_consumed_ctx_invalidates_a_view_held_across_a_serve_iteration() {
     let src = "\
@@ -198,28 +198,23 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
     );
 }
 
-/// **KNOWN HOLE — pre-existing, not introduced by item 10, pinned here so its fix is noticed.**
+/// **The scope-end-drop half of borrow liveness — was a KNOWN HOLE, FIXED.**
 ///
-/// `MoveCheck` invalidates a borrow when its owner is **moved or reassigned**
+/// `MoveCheck` used to end a borrow generation only when its owner was **moved or reassigned**
 /// (`invalidate_storage` / `invalidate_owner`), and `Region::Frame` cannot distinguish "this frame"
-/// from "this loop iteration". Neither notices a Move handle bound INSIDE a loop body being
-/// **dropped at the end of the iteration**. So a view assigned out to a longer-lived local survives
-/// into the next pass and reads freed memory. Both assertions below therefore assert the CURRENT,
-/// UNSOUND acceptance.
+/// from "this loop iteration". Neither noticed a Move handle bound INSIDE a loop body being
+/// **dropped at the end of the iteration**, so a view assigned out to a longer-lived local survived
+/// into the next pass and read freed memory. `loop_moves` now applies the loop's per-iteration drop
+/// set (`iteration_drops`, the same `needs_drop_flag` boundary predicate MIR's `loop_iter_drops`
+/// uses) to the back-edge state and to every `break` snapshot.
 ///
-/// This is a general escape-analysis gap, not a `http_headers` one: the second case is a plain
-/// `str` from `ctx.path()` and it compiles identically (verified by running both — the `str` version
-/// reads a freed buffer and prints stale lengths). The `http_headers` version CAN be louder, because
-/// the dangling value IS the freed `http_request_ctx` pointer and `align_rt_http_ctx_header`
-/// dereferences it to walk the offset table: in the loop shape above it aborts. That is not a
-/// guarantee — with the drop coming from an `arena {}` scope instead, the same shape prints a
-/// plausible answer and exits 0. Shape- and allocator-dependent UB, like the `str` case.
-///
-/// **When the gap is fixed, both `assert!(!check_errs(...))` below flip to `assert!(check_errs(...))`
-/// and this test loses its `known_hole_` prefix.** Tracked in `docs/open-questions.md` (Open → the
-/// external soundness audit's structural follow-ups).
+/// The gap was never a `http_headers` one: the second case is a plain `str` from `ctx.path()` and it
+/// compiled identically (the `str` version read a freed buffer and printed stale lengths). The
+/// `http_headers` version could be louder, because the dangling value IS the freed
+/// `http_request_ctx` pointer that `align_rt_http_ctx_header` dereferences to walk the offset
+/// table — but that was never a guarantee, only shape- and allocator-dependent UB.
 #[test]
-fn known_hole_scope_end_drop_does_not_invalidate_a_view() {
+fn a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected() {
     // The header-table view. `ctx` is dropped at the end of each iteration, never moved.
     let headers = "\
 import std.http
@@ -235,10 +230,12 @@ fn run(fallback: http_headers) -> Result<(), Error> {
 }
 pub fn main() -> Result<(), Error> { return Ok(()) }
 ";
+    let diags = check_diagnostics("http-headers-scope-end-drop", headers);
     assert!(
-        !check_errs("http-headers-scope-end-drop", headers),
-        "KNOWN HOLE: this SHOULD be rejected. If it now is, the MoveCheck scope-end-drop gap was \
-         fixed — flip this assertion and drop the known_hole_ prefix."
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("was dropped at the end of the loop iteration"),
+        "a header view outliving the ctx dropped at the end of its iteration must be rejected, \
+         with the drop-specific wording: {diags}"
     );
 
     // The same shape with a plain `str` view, which predates item 10 entirely — the proof that the
@@ -257,9 +254,9 @@ fn run(fallback: str) -> Result<(), Error> {
 pub fn main() -> Result<(), Error> { return Ok(()) }
 ";
     assert!(
-        !check_errs("http-str-view-scope-end-drop", str_view),
-        "KNOWN HOLE (pre-existing): a `str` view outliving its dropped ctx SHOULD be rejected too. \
-         If it now is, fix the header-table case in the same pass."
+        check_errs("http-str-view-scope-end-drop", str_view),
+        "a `str` view outliving its dropped ctx must be rejected too — the gap was MoveCheck's, \
+         not this type's"
     );
 }
 

@@ -1240,6 +1240,49 @@ pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], 
     is_owned_droppable(ty, structs, enums) || ty_tuple_is_move(ty, tuples)
 }
 
+/// The **single** decision about which wrappers a borrow sees straight through to the value inside.
+/// A block contributes no storage of its own: borrowing `{ inner }` borrows exactly what borrowing
+/// `inner` would. `arena {}` / `task_group {}` are deliberately absent — their value is bound to a
+/// region, which is the escape check's business, not a transparent forward.
+///
+/// Every consumer of this fact goes through here, so adding a wrapper updates them together.
+/// Two consumers exist: [`may_need_synthetic_owner`] (does MIR mint a hidden owner?) and
+/// `MoveCheck::storage_roots` (which storage does a borrower depend on?). They MUST agree: where the
+/// predicate says "not a temporary" because it saw through a wrapper, `storage_roots` has to reach
+/// the same place, or the wrapper records no root at all and the borrow silently becomes untracked —
+/// which is exactly what `keep = { inner }` did before this was single-sourced.
+pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
+    match &e.kind {
+        hir::ExprKind::Block(b) | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
+/// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
+/// bound places are borrowed from their binding instead; a block is transparent to its value (see
+/// [`borrow_transparent_value`]). Control-flow nodes are conservatively eligible and their per-path
+/// runtime temporary bit prevents a bound arm from being dropped.
+///
+/// The second half of MIR's `lower_borrowed_owned` condition, with [`needs_drop_flag`] — shared
+/// here so `MoveCheck`'s borrow liveness ends a temporary's generation at exactly the loop edge
+/// where MIR frees it (the hidden owner joins the innermost loop's per-iteration drops).
+pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
+    if let Some(inner) = borrow_transparent_value(e) {
+        return may_need_synthetic_owner(inner);
+    }
+    match &e.kind {
+        hir::ExprKind::Local(_)
+        | hir::ExprKind::Field { .. }
+        | hir::ExprKind::TupleIndex { .. }
+        | hir::ExprKind::Index { .. }
+        | hir::ExprKind::ElemField { .. } => false,
+        // A block with no value is Unit: nothing to borrow, so nothing to own.
+        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => false,
+        _ => true,
+    }
+}
+
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
@@ -3549,6 +3592,7 @@ pub fn check_program_with_effects(
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
+            loop_iter_drops: Vec::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -7764,6 +7808,10 @@ struct MoveCheck<'a> {
     borrows: BorrowState,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
+    /// Per-iteration owned locals of each enclosing `loop` (innermost last) — the locals MIR drops
+    /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
+    /// generation exactly as the back-edge does.
+    loop_iter_drops: Vec<Vec<LocalId>>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -7777,16 +7825,46 @@ enum MovedKey {
 
 type MovedSet = std::collections::HashSet<MovedKey>;
 
-type BorrowRoots = std::collections::BTreeSet<LocalId>;
+/// A storage generation a view may point into. Not every one has a name: MIR gives an **unbound
+/// Move temporary** a hidden owner slot (`new_synthetic_owner`) whose cleanup joins the innermost
+/// active loop, so `keep = "…".clone()` inside a `loop` borrows storage that the back-edge frees
+/// even though no local ever held it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BorrowRoot {
+    /// A named local's storage. Ordered first so a diagnostic prefers the root it can name.
+    Local(LocalId),
+    /// The hidden owner of a Move temporary materialized at loop depth `d` (1 = the outermost
+    /// loop's body). Depth is all the identity needed: every temporary at a given depth is freed by
+    /// the same two edges — that loop's back-edge and its `break`s.
+    IterTemp(u32),
+}
+
+type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
+
+/// How a borrow source's storage generation ended. Only the diagnostic wording depends on this —
+/// both endings kill every view rooted in that source.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BorrowEnd {
+    /// The source was moved away, reassigned, or reallocated in place.
+    Consumed,
+    /// The source's storage was **freed** where its binding scope ended — the per-iteration drop a
+    /// `loop` emits at its back-edge and at every `break` for owned locals declared in its body.
+    Dropped,
+}
+
+/// Which ended source generations a borrower depends on, and how each ended. `Ord` on
+/// [`BorrowEnd`] makes the join's per-owner merge commutative (`Consumed` < `Dropped`, so a source
+/// that was consumed on one path and dropped on another reports the consumption).
+type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 
 /// Flow-sensitive provenance for locals that borrow storage owned by other locals. `sources`
 /// stores the flattened owner roots of each live borrower. `invalid` records which source
-/// generation was moved, replaced, or potentially reallocated on at least one path reaching the
-/// current point.
+/// generation ended — moved, replaced, potentially reallocated, or dropped at its scope's end — on
+/// at least one path reaching the current point.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
-    invalid: std::collections::HashMap<LocalId, BorrowRoots>,
+    invalid: std::collections::HashMap<LocalId, EndedRoots>,
 }
 
 impl BorrowState {
@@ -7799,12 +7877,20 @@ impl BorrowState {
         }
     }
 
-    fn invalidate_owner(&mut self, owner: LocalId) {
+    /// End every source generation matching `ended`. One entry point for both endings: a named
+    /// local being consumed, and a whole class of roots (a loop depth's temporaries plus its owned
+    /// locals) being dropped at an iteration edge.
+    fn invalidate_matching(&mut self, how: BorrowEnd, ended: impl std::ops::Fn(BorrowRoot) -> bool) {
         for (&borrower, roots) in &self.sources {
-            if roots.contains(&owner) {
-                self.invalid.entry(borrower).or_default().insert(owner);
+            for &root in roots.iter().filter(|&&r| ended(r)) {
+                let entry = self.invalid.entry(borrower).or_default().entry(root).or_insert(how);
+                *entry = (*entry).min(how);
             }
         }
+    }
+
+    fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
+        self.invalidate_matching(how, |r| r == BorrowRoot::Local(owner));
     }
 
     fn join(a: &Self, b: &Self) -> Self {
@@ -7813,7 +7899,11 @@ impl BorrowState {
             out.sources.entry(local).or_default().extend(roots);
         }
         for (&local, roots) in &b.invalid {
-            out.invalid.entry(local).or_default().extend(roots);
+            let into = out.invalid.entry(local).or_default();
+            for (&owner, &how) in roots {
+                let entry = into.entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
+            }
         }
         out
     }
@@ -7882,38 +7972,87 @@ impl<'a> MoveCheck<'a> {
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
         if self.local_owns_view_storage(id) {
-            roots.insert(id);
+            roots.insert(BorrowRoot::Local(id));
         }
         roots
     }
 
-    /// Storage roots owned by `e`. A view local forwards its already-flattened provenance; a local
-    /// that owns viewable storage also contributes itself. Caller-owned slice parameters
-    /// intentionally produce no intra-frame root — this pass only invalidates storage whose
-    /// lifetime this function controls.
+    /// The hidden-owner root of an **unbound Move temporary**, when one is materialized here. This
+    /// is MIR's own condition (`lower_borrowed_owned`: [`needs_drop_flag`] +
+    /// [`may_need_synthetic_owner`]) so the two stages cannot disagree about which expressions own
+    /// storage that has no name. Outside a `loop` the hidden owner lives to function exit — nothing
+    /// outlives that — so only a temporary created inside one gets a root.
+    fn temp_owner_root(&self, e: &Expr) -> Option<BorrowRoot> {
+        let depth = self.loop_iter_drops.len() as u32;
+        (depth > 0
+            && needs_drop_flag(e.ty, self.structs, self.tuples, self.enums)
+            && may_need_synthetic_owner(e))
+        .then_some(BorrowRoot::IterTemp(depth))
+    }
+
+    /// Storage roots a **borrower of `e`** depends on. A view local forwards its already-flattened
+    /// provenance; a local that owns viewable storage also contributes itself. Caller-owned slice
+    /// parameters intentionally produce no intra-frame root — this pass only invalidates storage
+    /// whose lifetime this function controls.
+    ///
+    /// This — not [`Self::borrow_sources`] — is where a fresh unbound Move value contributes its
+    /// hidden-owner root, because this is exactly the borrowing position: MIR mints the synthetic
+    /// owner (`lower_borrowed_owned`) only when such a value is borrowed (a `str`/slice borrow, a
+    /// view-producing method receiver, a `str`/slice call argument, a `json` input), and every one
+    /// of those reaches its operand through here. A materializing consumer (`.to_array()`,
+    /// `.map(...)`, a struct/array literal that *owns* its result) recurses through `borrow_sources`
+    /// instead, moving the value into the named target rather than borrowing it — so it must NOT get
+    /// a temp root, which is the whole reason the two functions differ (see the FP fixed in the
+    /// second review round: `names = src.map(up).to_array()` moved into an owning `array<str>`).
     fn storage_roots(&self, e: &Expr) -> BorrowRoots {
+        // Borrowing through a wrapper borrows what is inside it — the SAME set
+        // [`may_need_synthetic_owner`] sees through, single-sourced in `borrow_transparent_value` so
+        // the two cannot drift. Without this, a block recorded no root at all (neither `IterTemp`,
+        // since the predicate correctly said "not a temporary", nor the place's `Local`, since the
+        // `_` arm below short-circuits on a non-borrowing owned type) and `keep = { inner }` slipped
+        // a use-after-free past the whole rule. Recursing is exactly equivalent to handling it here:
+        // a wrapper has its value's type, so `temp_owner_root` agrees on both.
+        if let Some(inner) = borrow_transparent_value(e) {
+            return self.storage_roots(inner);
+        }
+        let mut roots = BorrowRoots::new();
+        // A view of a fresh owned temporary (`str` borrow of a `.clone()`, a slice of a
+        // just-materialized array, a `json.doc` over a returned string) is rooted in MIR's hidden
+        // owner, which the innermost loop frees each pass. `temp_owner_root` is `None` for a bound
+        // place (`Local`/`Field`/`Index`/…), so those arms below are unaffected.
+        if let Some(temp) = self.temp_owner_root(e) {
+            roots.insert(temp);
+        }
         match &e.kind {
-            ExprKind::Local(id) => self.local_storage_roots(*id),
+            ExprKind::Local(id) => roots.extend(self.local_storage_roots(*id)),
             ExprKind::Field { root, .. }
             | ExprKind::SoaColumn { base: root, .. }
             | ExprKind::ArrayGroupAgg { base: root, .. }
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
             | ExprKind::ArrayDictEncode { base: root, .. }
-            | ExprKind::IndexField { base: root, .. } => self.local_storage_roots(*root),
+            | ExprKind::IndexField { base: root, .. } => roots.extend(self.local_storage_roots(*root)),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
-            | ExprKind::TupleIndex { recv, .. } => self.storage_roots(recv),
-            _ => self.borrow_sources(e),
+            | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
+            // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
+            // this match — `borrow_transparent_value` forwarded it above.)
+            ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
+            _ => roots.extend(self.borrow_sources(e)),
         }
+        roots
     }
 
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
+    /// Note: this returns the roots of views **contained in** `e`, and deliberately does *not* add
+    /// `e`'s own hidden-owner temp root — that belongs to a borrow of `e` and is added by
+    /// [`Self::storage_roots`]. A borrow-producing arm below therefore routes its borrowed operand
+    /// through `storage_roots`, while a materializing/moving arm routes through `borrow_sources`.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
-        if !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums) {
-            return BorrowRoots::new();
-        }
         let mut roots = BorrowRoots::new();
+        if !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums) {
+            return roots;
+        }
         if let Some(stages) = pipeline_stages(&e.kind) {
             for capture in stage_capture_exprs(stages) {
                 roots.extend(self.borrow_sources(capture));
@@ -7985,7 +8124,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
-            | ExprKind::JsonDecodeStructArray { input, .. } => self.borrow_sources(input),
+            | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
             ExprKind::JsonDecodeSoa { input, struct_id } => {
                 let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
                     s.fields
@@ -7993,7 +8132,7 @@ impl<'a> MoveCheck<'a> {
                         .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums))
                 });
                 if borrows_input {
-                    self.borrow_sources(input)
+                    self.storage_roots(input)
                 } else {
                     BorrowRoots::new()
                 }
@@ -8003,7 +8142,7 @@ impl<'a> MoveCheck<'a> {
             // a scalar-only union borrows nothing.
             ExprKind::JsonDecodeUnion { input, enum_id } => {
                 if ty_may_borrow(Ty::Enum(*enum_id), self.structs, self.tuples, self.enums) {
-                    self.borrow_sources(input)
+                    self.storage_roots(input)
                 } else {
                     BorrowRoots::new()
                 }
@@ -8013,13 +8152,13 @@ impl<'a> MoveCheck<'a> {
             // receiver doc's roots. So a use past the input's liveness is caught (#460), like the
             // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
             // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
-            ExprKind::JsonDoc { input } => self.borrow_sources(input),
+            ExprKind::JsonDoc { input } => self.storage_roots(input),
             ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocElems { doc } => {
-                self.borrow_sources(doc)
+                self.storage_roots(doc)
             }
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
             // past the input's liveness is caught.
-            ExprKind::JsonScan { input, .. } => self.borrow_sources(input),
+            ExprKind::JsonScan { input, .. } => self.storage_roots(input),
             ExprKind::Call { args, .. } => {
                 let mut roots = BorrowRoots::new();
                 for arg in args {
@@ -8109,43 +8248,105 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn invalidate_owner(&mut self, owner: LocalId) {
-        self.borrows.invalidate_owner(owner);
+        self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
     }
 
+    /// End every generation `storage` owns — a reallocating mutation invalidates views of the
+    /// buffer whatever names it. A temporary root reaching here is left alone: the operation
+    /// replaces the *named* storage, not the hidden owner, which only its loop edge frees.
     fn invalidate_storage(&mut self, storage: &Expr) {
-        for owner in self.storage_roots(storage) {
-            self.invalidate_owner(owner);
+        for root in self.storage_roots(storage) {
+            if let BorrowRoot::Local(owner) = root {
+                self.invalidate_owner(owner);
+            }
         }
+    }
+
+    /// Whether MIR emits a drop for this local — the same boundary predicate that builds
+    /// `Fn::drop_locals`, so sema's scope-end invalidation covers exactly the locals whose storage
+    /// is actually freed. A local outside this set is never dropped early, so views into it stay
+    /// live.
+    fn is_dropped_local(&self, id: LocalId) -> bool {
+        self.f
+            .locals
+            .get(id as usize)
+            .is_some_and(|l| needs_drop_flag(l.ty, self.structs, self.tuples, self.enums))
+    }
+
+    /// End the borrow generation of everything a `loop` iteration frees: the owned locals its body
+    /// declares (`drops`, from [`Self::iteration_drops`] — MIR's `loop_iter_drops`) **and** every
+    /// hidden owner of a Move temporary created at this depth or deeper (MIR pushes those into the
+    /// innermost loop frame too). A view of either that was assigned out to a longer-lived binding
+    /// points at freed storage past this edge. Declaration order within `drops` is irrelevant: a
+    /// local not yet bound on this path has no live borrower to invalidate.
+    fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
+        state.invalidate_matching(BorrowEnd::Dropped, |root| match root {
+            BorrowRoot::Local(id) => drops.contains(&id),
+            // Deeper temporaries are already dead — an inner loop's own edges ended them — but
+            // saying so here keeps the rule independent of that ordering.
+            BorrowRoot::IterTemp(d) => d >= depth,
+        });
+    }
+
+    /// The owned locals a `loop` body drops per iteration, in `body_locals` order.
+    fn iteration_drops(&self, body_locals: &std::ops::Range<LocalId>) -> Vec<LocalId> {
+        body_locals.clone().filter(|&id| self.is_dropped_local(id)).collect()
     }
 
     fn check_borrow_use(&mut self, local: LocalId, span: Span) {
         let Some(owners) = self.borrows.invalid.get(&local) else { return };
-        let Some(owner) = owners.iter().next().copied() else { return };
+        // `BorrowRoot::Local` sorts first, so a named source is reported in preference to an
+        // anonymous temporary when a borrower depends on both.
+        let Some((root, how)) = owners.iter().next().map(|(&r, &h)| (r, h)) else { return };
         let borrower = self
             .f
             .locals
             .get(local as usize)
             .map_or("<borrow>", |l| l.name.as_str());
-        let source = self
-            .f
-            .locals
-            .get(owner as usize)
-            .map_or("<source>", |l| l.name.as_str());
-        self.diags.error(
-            format!(
-                "use of invalidated borrow '{borrower}': its source '{source}' was moved or reassigned (or its storage was reallocated); create a new view from the current source"
+        let msg = match (root, how) {
+            (BorrowRoot::Local(owner), _) => {
+                let source = self
+                    .f
+                    .locals
+                    .get(owner as usize)
+                    .map_or("<source>", |l| l.name.as_str());
+                let why = match how {
+                    BorrowEnd::Consumed => {
+                        "was moved or reassigned (or its storage was reallocated); create a new view from the current source"
+                    }
+                    BorrowEnd::Dropped => {
+                        "was dropped at the end of the loop iteration that declared it; a view cannot outlive the value it borrows"
+                    }
+                };
+                format!("use of invalidated borrow '{borrower}': its source '{source}' {why}")
+            }
+            (BorrowRoot::IterTemp(_), _) => format!(
+                "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; bind the owned value to a local declared outside the loop and borrow that instead"
             ),
-            span,
-        );
+        };
+        self.diags.error(msg, span);
     }
 
     /// Loop-back use-after-move analysis for `loop { body }`. See the call site in `expr` for the
     /// full rationale. Kept `#[inline(never)]` so its large locals do not enlarge the recursive
     /// `expr` stack frame.
     #[inline(never)]
-    fn loop_moves(&mut self, body: &Block, moved: &mut MovedSet) {
+    fn loop_moves(
+        &mut self,
+        body: &Block,
+        body_locals: &std::ops::Range<LocalId>,
+        moved: &mut MovedSet,
+    ) {
         let entry = moved.clone();
         let entry_borrows = self.borrows.clone();
+        // The owned locals this body declares. They are freed on every edge that leaves an
+        // iteration — the back-edge below and each `break` (see the `Stmt::Break` arm) — so the
+        // state that reaches the loop head, and the state after the loop, must treat every view
+        // rooted in one of them as dead.
+        let drops = self.iteration_drops(body_locals);
+        self.loop_iter_drops.push(drops.clone());
+        // Depth AFTER the push: the loop being walked is the one whose edges free these.
+        let depth = self.loop_iter_drops.len() as u32;
         // Probe pass: discover which locals a fall-through iteration moves, with diagnostics
         // suppressed by swapping in a throwaway sink (restored after).
         let mut probe = entry.clone();
@@ -8157,7 +8358,8 @@ impl<'a> MoveCheck<'a> {
         self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
         self.loop_borrow_breaks.pop();
-        let probe_borrows = self.borrows.clone();
+        let mut probe_borrows = self.borrows.clone();
+        Self::invalidate_iteration_drops(&mut probe_borrows, &drops, depth);
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
         // `return`s). Conditional `break`/`return` moves are already excluded from `probe` by the
         // `if`/`match` diverging-branch join; but if the body *always* diverges (an unconditional
@@ -8186,10 +8388,9 @@ impl<'a> MoveCheck<'a> {
                 self.block(body, &mut probe_state, false, false);
                 self.loop_breaks.pop();
                 self.loop_borrow_breaks.pop();
-                let next = BorrowState::join(
-                    &head,
-                    &BorrowState::join(&entry_borrows, &self.borrows),
-                );
+                let mut end = self.borrows.clone();
+                Self::invalidate_iteration_drops(&mut end, &drops, depth);
+                let next = BorrowState::join(&head, &BorrowState::join(&entry_borrows, &end));
                 if next == head {
                     break head;
                 }
@@ -8208,6 +8409,7 @@ impl<'a> MoveCheck<'a> {
             .loop_borrow_breaks
             .pop()
             .expect("loop borrow-break frame balanced");
+        self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
         // leave `moved` unchanged.
@@ -8310,8 +8512,18 @@ impl<'a> MoveCheck<'a> {
                     if let Some(frame) = self.loop_breaks.last_mut() {
                         frame.push(moved.clone());
                     }
+                    // This edge leaves the innermost loop, which drops its per-iteration owned
+                    // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them is
+                    // dead in the code that follows the loop. The invalidation applies to the
+                    // snapshot only: statements after a `break` are dead code, but this pass still
+                    // walks them, and they belong to the iteration that has not dropped yet.
+                    let mut at_break = self.borrows.clone();
+                    if let Some(drops) = self.loop_iter_drops.last() {
+                        let depth = self.loop_iter_drops.len() as u32;
+                        Self::invalidate_iteration_drops(&mut at_break, drops, depth);
+                    }
                     if let Some(frame) = self.loop_borrow_breaks.last_mut() {
-                        frame.push(self.borrows.clone());
+                        frame.push(at_break);
                     }
                 }
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
@@ -8700,7 +8912,7 @@ impl<'a> MoveCheck<'a> {
             // Extracted into an `#[inline(never)]` helper so its large locals — a `Diagnostics` sink
             // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
             // chain would otherwise overflow the stack; see `expr_depth` test).
-            ExprKind::Loop { body, .. } => self.loop_moves(body, moved),
+            ExprKind::Loop { body, body_locals, .. } => self.loop_moves(body, body_locals, moved),
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.

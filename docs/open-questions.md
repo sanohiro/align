@@ -2006,39 +2006,152 @@ mutation, diagnostics, and safe materialization cases in `tests/borrow_liveness.
 escape-flow structural refactor subsequently completed at the checked-HIR boundary through
 #461–#464; this fix supplied the neighboring borrow-state dataflow rather than that migration.
 
-**Borrow liveness ends at MOVE, not at scope-end DROP — OPEN (found 2026-07-21, adversarially, while
-implementing `ctx.headers()`).** #460's shared borrow state above invalidates a view when its owning
-source is **moved or reassigned** (`invalidate_storage` / `invalidate_owner`). It does **not** notice
-the other way a source's storage ends: a Move handle bound inside an inner scope — a loop body, most
-of all — being **dropped when that scope closes**. `Region::Frame` cannot help, because it does not
-distinguish "this frame" from "this iteration". So a view assigned out to a longer-lived local
-survives into the next pass and reads freed memory:
+**Borrow liveness ends at MOVE, not at scope-end DROP — FIXED (found 2026-07-21 adversarially while
+implementing `ctx.headers()`; fixed 2026-07-22).** #460's shared borrow state invalidated a view when
+its owning source was **moved or reassigned** (`invalidate_storage` / `invalidate_owner`). It did
+**not** notice the other way a source's storage ends: an owned local bound inside a `loop` body being
+**dropped when the iteration closes**. `Region::Frame` cannot help, because it does not distinguish
+"this frame" from "this iteration". So a view assigned out to a longer-lived local survived into the
+next pass and read freed memory — no `unsafe`, no std handle required:
 
 ```align
-mut keep := fallback
+mut keep: str := "start"
 loop {
-  print(keep.len())          // reads the PREVIOUS iteration's freed request buffer
-  ctx := srv.accept()?       // dropped at end of iteration — never moved
-  keep = ctx.path()
+  print(keep)              // read the PREVIOUS iteration's freed buffer (printed heap garbage)
+  owned := mk("hello")     // dropped at end of iteration — never moved
+  keep = owned
 }
 ```
 
-It is **general to every view over a Move handle**, not to any one type, and **the inner scope need
-not be a loop** — an `arena {}` block whose handle is dropped at its end does the same. Reproduced on
-a plain `str` from `ctx.path()` (reads a freed buffer, prints stale lengths) and on the
-`http_headers` view from `ctx.headers()`, where the dangling value IS the freed `http_request_ctx`
-pointer that the runtime dereferences to walk the offset table: in the loop shape that aborts, in the
-`arena {}` shape it prints a plausible answer and exits 0. Shape- and allocator-dependent UB either
-way — not a type that fails loudly. The variant where the loop DOES consume the handle
-(`ctx.respond(rb)?` — the pkg.web shape, so every shipped serve loop is safe) is correctly rejected
-by the existing move path.
+**The fix mirrors MIR's actual drop points, and an iteration frees TWO kinds of storage — the second
+was missed by the first cut and caught by the adversarial review.** `emit_drop_if_live` is emitted
+at: function exit (nothing follows), an `Assign`'s drop-of-old (already covered by the move path),
+a hidden owner after a **scalar-only** consumer (a view-returning consumer keeps that owner alive),
+and the `loop` per-iteration set at the **back-edge** and at **every `break`**. That set is *not*
+just `drop_locals ∩ body_locals`: `Builder::new_synthetic_owner` also pushes the hidden owner of
+every **unbound Move temporary** into the innermost loop frame, and `lower_loop` deliberately
+re-reads the final frame at the back-edge for exactly that reason. A temporary has no `LocalId`, so a
+rule keyed on locals cannot see it:
 
-Pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view` in
-`crates/align_driver/tests/http_headers_view.rs`, which asserts the current unsound acceptance for
-both the `http_headers` and the `str` case; when the gap is fixed, both assertions flip. The fix
-belongs with #460's dataflow — end a borrow generation at the owner's scope-end drop, not only at its
-move — and is deliberately **not** folded into the `ctx.headers()` slice, which neither introduced
-nor widened it.
+```align
+mut keep: str := "start"
+loop {
+  print(keep)
+  keep = "AAAA…".clone()   // the clone is a temporary — freed at the back-edge and at `break`
+}
+```
+
+`MoveCheck` therefore ends **both** at every iteration edge. `BorrowRoots` became a set of
+`BorrowRoot::Local(id) | IterTemp(depth)`: the named half comes from `iteration_drops` via the shared
+`needs_drop_flag` predicate that builds `Fn::drop_locals`, and the anonymous half from
+`temp_owner_root`, which applies MIR's own materialization condition — `needs_drop_flag` **+
+`may_need_synthetic_owner`**, the latter moved into sema so both stages share one definition. Depth
+is all the identity a temporary needs: every temporary at a given loop depth is freed by that loop's
+two edges. Outside any loop the hidden owner lives to function exit, so no root is recorded there.
+
+**Where that root is attributed matters as much as the condition, and getting it wrong cost a false
+positive** (caught by the second adversarial round). MIR mints the hidden owner only where a fresh
+Move value is *borrowed* (`lower_borrowed_owned`); a value **moved** into a local that owns it
+transfers its storage to that named local instead, and nothing joins the loop's drop set. Attributing
+the root in `borrow_sources` — reached by every consumer — therefore rejected the ordinary
+`names = src.map(up).to_array()` rebuild-each-pass idiom, whose `array<str>` is owned by `names` and
+whose element views point at an outer `src`. The root now comes from `storage_roots`, which *is* the
+borrowing position: every borrow producer (a `str`/slice borrow, a view-producing method receiver, a
+`str`/slice call argument — the coercion node wraps those — and a `json` input) routes its operand
+through it, while a materializing consumer recurses through `borrow_sources` and gets nothing. The
+two functions now carry that distinction explicitly, and the json arms were routed to `storage_roots`
+for the same consistency (behaviour-neutral, verified: every json operand is already `str`-typed or
+coercion-wrapped).
+
+**The paired invariant, and the hole that proved it: `storage_roots` must be transparent through
+exactly the constructs `may_need_synthetic_owner` is transparent through.** That predicate recurses
+into a `{ }` / `unsafe { }` block's value — a block whose value is a bound place borrows the place
+and mints no hidden owner — but `storage_roots` had no block arm, so it fell to a `borrow_sources`
+tail that short-circuits on an owned, non-borrowing type. A block therefore recorded **no root at
+all**: not `IterTemp` (correctly not a temporary) and not the place's `Local`. `keep = { inner }`
+walked past the entire rule and printed freed heap bytes, two characters from the rejected
+`keep = inner` — and it had slipped every earlier revision of this fix. The decision is now
+**single-sourced** in `borrow_transparent_value`, which both consumers call, so adding a wrapper
+updates them together instead of relying on a comment. `arena {}` / `task_group {}` are transparent
+in *neither*, so they stay covered by the `IterTemp` path. **Remaining structural weakness, recorded
+not fixed:** both functions still end in a `_` catch-all, so a future variant that *should* be
+transparent compiles fine while being neither — the "new IR variant skips a pass" class. Making
+`storage_roots` dispatch bound places through an exhaustive, wildcard-free helper would compile-force
+it; that belongs with the structural follow-up below, not bolted onto this slice.
+
+**A third over-rejection, pinned** (`over_rejects_a_control_flow_borrow_over_outer_bound_places`):
+`may_need_synthetic_owner` is conservatively `true` for the wrappers whose *runtime* value can still
+be a bound place — `if`, `match`, `else`-unwrap, `arena {}`, `task_group {}` — so
+`keep = if c { a } else { b }` over sources declared outside the loop mints a spurious `IterTemp`.
+`emit-mir` shows the owner's temporary flag stored `false` on every bound-arm path, so no drop is
+emitted at either edge. Same family as the arena and chunks pins: a static shape predicate in sema
+against a per-path runtime flag in MIR that `MoveCheck` cannot see. The workaround (borrow the arms
+as `str` views first) is accepted and runs.
+The invalidation runs on the state that reaches the loop head (probe pass + every fixpoint round) and
+on each `break` snapshot — the latter to the snapshot only, since the statements this pass still
+walks after a `break` belong to the iteration that has not dropped yet. `BorrowState::invalid`
+records *how* each generation ended (`BorrowEnd::Consumed` / `Dropped`) so the diagnostic says which,
+and names the source when it has a name; the join merges per root by `Ord` (`Consumed` < `Dropped`),
+keeping it commutative for the fixpoint.
+
+**Two claims in the original write-up were wrong, and the corrections matter more than the bug.**
+① "The inner scope need not be a loop — an `arena {}` block does it too" is **false**, in both
+directions: a heap-owned local bound inside `arena {}` is *not* freed at the block's end (MIR drops
+it at function exit — `emit-mir` shows `drop _3` after `arena_end`, and the shape prints the correct
+string, i.e. nothing was freed), while storage that genuinely *is* arena-allocated is already
+rejected by the region rule's `decl_depth` check ("this value is bound to an arena block and cannot
+escape it"). The `arena` shape "printing a plausible answer" was not allocator luck — it was a
+program with no use-after-free in it. ② The `http_headers` case was described as louder than the
+`str` case; both are the same shape- and allocator-dependent UB, and the `str` case reproduces on a
+plain `string` with no std handle anywhere.
+
+**The one cost, pinned as a test rather than hidden: an over-rejection on arena-owned loop locals.**
+The rule keys on the *type* predicate `needs_drop_flag`, because `MoveCheck` runs **before**
+`EscapeCheck` and so cannot see the individual-vs-arena ownership bit. An array allocated inside an
+enclosing `arena {}` is arena-owned — its drop flag is never set, MIR's back-edge drop folds away,
+nothing is freed until `arena_end` — yet a view of it assigned out of the loop is now rejected:
+
+```align
+arena {
+  mut keep: slice<i64> := [7, 7, 7][..]
+  loop { xs := [1, 2, 3].map(…).to_array(); keep = xs[..]; … }   // safe, but rejected
+  print(keep[0])
+}
+```
+
+The same shape with a **heap**-owned source (a `string`, malloc'd even inside an arena — verified by
+running it) is a genuine use-after-free that must stay rejected, and the two are indistinguishable to
+a type-level predicate. Conservative is the right side to err on (inconvenience, not breakage), and
+approximating the ownership bit inside `MoveCheck` would be a second mechanism for something that
+already has one. **The real fix is the structural follow-up recorded above**: borrow liveness belongs
+in the checked-HIR escape CFG (#461–#464), which already carries regions, allocation provenance, and
+loop fixpoints. Pinned as `over_rejects_a_view_of_an_arena_allocated_loop_local` in
+`tests/borrow_liveness.rs`; flip it when the analysis moves.
+
+**A second, pre-existing over-rejection the loop rule widened**, also pinned
+(`over_rejects_a_view_into_the_source_of_a_dropped_chunks_header`): `ch[0]` is a `{ptr,len}` view
+into the *source* array, not into the chunks header, yet `local_owns_view_storage` counts a
+`DynSliceArray` local as owning its elements' storage — so ending the header's generation invalidates
+the element views. Rejected on plain reassignment long before this change; the loop rule only made
+the common shape hit it. The fix belongs with `local_owns_view_storage` (which owned containers
+actually own the bytes their elements view — a type-class question), not with borrow liveness.
+
+The variant where the loop **consumes** the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
+shipped serve loop was always safe) was already rejected by the move path. Coverage: the flipped
+`a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
+`known_hole_scope_end_drop_…`) in `tests/http_headers_view.rs`, plus eleven tests in
+`tests/borrow_liveness.rs` — back-edge, `break` edge, all four temporary-materializing shapes (a
+call, a view-returning call *over* a temporary, `?` on one, a materialized array sliced in place),
+a `json` view over a temporary and over a dropped loop-body input, six block-laundering shapes
+(bare / declaration-inside / `unsafe` / through a call / nested / a struct field reached through
+one), and the controls that keep the rule from over-rejecting: a block over a source that outlives
+the loop, a fresh value **moved into an owning local** (array and Move-struct forms),
+same-iteration use of a local and of a temporary, a temporary outside any loop, a source declared
+outside the loop, an inner `break` that must drop only the inner body's locals, and an owned local
+*moved out* by `break` (its flag is cleared, so it is not a freed source). Mutation-checked in six
+places — neutering `invalidate_iteration_drops`, `temp_owner_root`, the `IterTemp` arm of the edge,
+the `storage_roots` attribution, or the block-transparency arm, and *restoring* the attribution to
+`borrow_sources` — each fails exactly the corresponding tests and nothing else.
 
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`

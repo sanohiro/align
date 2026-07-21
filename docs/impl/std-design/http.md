@@ -823,22 +823,21 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
         `"Option payload"` for every caller, so an *array element* rejection reported itself as an
         Option payload. The method now takes the position it is checking, which fixes that
         pre-existing mislabel for every type, not just this one.
-      - **The test matrix's "cannot survive its ctx across a `serve` iteration" is only half true, and
-        the other half is a pre-existing hole.** `MoveCheck` ends a borrow generation when the owner
-        is **moved or reassigned**, not when it is **dropped at an inner scope's end**, and
-        `Region::Frame` cannot tell "this frame" from "this iteration". The pkg.web shape is safe
-        because `ctx.respond(rb)` MOVES the handle every pass — that case is rejected. But an inner
-        scope that merely lets the ctx drop (a loop body, or an `arena {}` block) leaks the view into
-        what follows, and this is general to every view over a Move handle (reproduced identically on
-        a plain `str` from `ctx.path()`). Item 10 changes only the blast radius, and not reliably:
-        here the dangling value IS the freed `http_request_ctx` pointer, which
-        `align_rt_http_ctx_header` dereferences to walk the offset table, so the loop shape aborts —
-        while the `arena {}` shape prints a plausible answer and exits 0. Shape-dependent UB, not a
-        loud failure mode to lean on. Pinned as
-        `known_hole_scope_end_drop_does_not_invalidate_a_view` and recorded as **Open** in
-        `docs/open-questions.md` (next to #460, whose dataflow should own the fix). Deliberately not
-        fixed here: it is neither introduced nor widened by this slice, and ending a borrow generation
-        at scope-end drop is its own design.
+      - **The test matrix's "cannot survive its ctx across a `serve` iteration" was only half true,
+        and the other half was a pre-existing hole — FIXED 2026-07-22, not in this slice.**
+        `MoveCheck` used to end a borrow generation when the owner was **moved or reassigned**, not
+        when it was **dropped at the end of a loop iteration**, and `Region::Frame` cannot tell "this
+        frame" from "this iteration". The pkg.web shape was always safe because `ctx.respond(rb)`
+        MOVES the handle every pass — that case was already rejected. A loop body that merely lets
+        the ctx drop leaked the view into the next pass, general to every view over a Move handle
+        (reproduced identically on a plain `str` from `ctx.path()`, and on a plain `string` with no
+        std handle in sight). `loop_moves` now ends the generation of the loop's per-iteration drop
+        set at the back-edge and at every `break`; see `docs/open-questions.md` next to #460. **Two
+        claims here were wrong**: the `arena {}` variant is not an instance of the bug at all (a
+        heap-owned local inside `arena {}` is dropped at *function* exit — `emit-mir` shows the drop
+        after `arena_end` — and genuinely arena-allocated storage is already caught by the region
+        rule), and this type is not reliably louder than a `str`: both are shape- and
+        allocator-dependent UB.
       - **⑨'s suggestion string is unreachable for the removed name — so the removed name got its
         own arm.** The ctx-method dispatch arm is name-guarded (`"method" | "path" | "headers" | …`),
         so `ctx.header(x)` never reaches `check_http_ctx_method`, and the "try …" list it would have
@@ -937,8 +936,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 - `bench/http_client` numbers recorded vs a Rust baseline (R6 — completion is benchmark-gated)
 - item 10 — `ctx.headers()`: the wrapper-through-a-parameter compiles AND reads the table E2E; a
   view from a LOCAL handle rejected on return / `break` / wrapped in a struct / held across a serve
-  iteration **that consumes the ctx** (the pkg.web shape — the drop-only variant is the pre-existing
-  `MoveCheck` hole pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view`); `hs.get()` after `ctx.respond(rb)` rejected **on a bare local** (a `str` field in an
+  iteration **that consumes the ctx** (the pkg.web shape) and across one that merely **drops** it
+  (`a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` — the flipped known hole,
+  fixed 2026-07-22); `hs.get()` after `ctx.respond(rb)` rejected **on a bare local** (a `str` field in an
   enclosing struct masks the hole); `hs.get()` after `ctx.respond_stream(rb)` compiles and works;
   case-insensitive hit + miss E2E through `pkg.web`; the view rejected as an `Option`/`Result`
   payload and as an array element; a struct carrying it stays Copy (no drop emitted) with a
