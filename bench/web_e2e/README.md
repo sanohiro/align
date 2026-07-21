@@ -86,3 +86,31 @@ Caveats, because a benchmark without them is advertising:
 - **32 connections is a small load.** Fiber's published figures use hundreds; the ordering here may
   not hold at that scale, and neither side was tuned (no `GOGC`, no socket tuning, default backlog).
 - Go 1.26.5, Fiber v2. Align at `--target-cpu native`, release profile.
+
+## Negative result: the speculative read does not pay (2026-07-21)
+
+Align's request path does exactly ONE syscall more than the floor server — `poll({parked, listener})`
+before the read — so the obvious first cut at the 4.1 µs was to skip it: try a non-blocking
+`recv(MSG_DONTWAIT)` on the most-recently-served connection first, feed whatever it returns straight
+into the parse, and only `poll` on a miss. Implemented, tested, measured, **reverted**.
+
+- **At `CONNS=1` it cannot win by construction.** The client is synchronous, so when the server
+  returns to `accept` the next request has not been sent yet: the speculative read always misses and
+  costs an extra syscall before the `poll` it was meant to replace. Measured 4.1 → 3.9 µs, inside
+  the noise.
+- **Under load it did not win either, and the harness cannot currently prove a 5% effect.** Adjacent
+  A/B at 32 workers / 32 connections: with 371.8k, without 392.5k, then with again 437.9k — the same
+  build varying by 18% run to run swamps the difference. (An earlier 491.5k reading, taken when the
+  box was quieter, would have made this look like a 24% regression had it been used as the baseline;
+  it was not, because the comparison was re-taken adjacently. Do that.)
+
+Two things to carry forward rather than re-derive:
+
+1. **`CONNS=1` ping-pong is the tool for protocol-path work here, not throughput.** Its numbers were
+   stable to ~1% across runs while the 32-connection figures moved by 18%. Price a change against
+   the floor at one connection; use throughput only for effects large enough to survive that noise.
+2. **The remaining 4.1 µs is not one syscall.** With the poll unremovable this way, what is left to
+   attack is allocation and copying: `http_read_request` starts a fresh `Vec` per request, the
+   header spans are a fresh `Vec`, the builder holds `String`s, and the response is serialized into
+   another fresh buffer. That is four-plus allocations on a path whose whole budget is 4.1 µs, and
+   `bench/web_e2e` at `CONNS=1` can price each one.

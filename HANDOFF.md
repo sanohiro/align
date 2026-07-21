@@ -64,6 +64,19 @@ quoted nowhere now).
   is the budget; the two candidates inside it are the `poll` syscall keep-alive adds per request and
   sharing one buffer between the parse and the response write. (No `strace`/`perf` on this box —
   the floor server in `bench/web_e2e` is how the path gets priced without them.)
+- **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the
+  attempt.** Align does exactly one syscall more than the floor (`poll` before the read), so the
+  first cut was a speculative non-blocking `recv` on the most-recently-served connection, falling
+  back to `poll` on a miss. It cannot win at `CONNS=1` by construction (a synchronous client has not
+  sent yet, so the read always misses and costs an extra syscall), and under load the harness could
+  not resolve it: adjacent A/B at 32 workers gave with 371.8k, without 392.5k, with-again 437.9k —
+  **the same build varies 18% run to run**, which swamps a 5% effect. Reverted rather than shipped
+  unproven; the negative result and both lessons are in `bench/web_e2e/README.md`. **The lessons:**
+  (a) `CONNS=1` ping-pong is the tool for protocol-path work on this box — stable to ~1% where
+  throughput moves 18%; (b) what is actually left in the 4.1 µs is ALLOCATION, not the syscall —
+  `http_read_request` starts a fresh `Vec` per request, the header spans another, the builder holds
+  `String`s, and the response serializes into a third. Four-plus allocations on a 4.1 µs budget, and
+  the CONNS=1 harness can price each.
 - **W7: DONE.** Same box, same generator, same request, **both sides prefork** (Fiber's own
   throughput recommendation and the analogue of `serve(..., workers)`): **pkg.web 491,505 req/s vs
   Fiber-prefork 374,393 — 1.31×**, 1.19× on single-connection latency (70.2 vs 81.2 µs), 2.5× at the
