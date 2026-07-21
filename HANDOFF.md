@@ -61,10 +61,15 @@ Nothing there stands in for a missing compiler feature.
    `crates/align_driver/tests/apps_web_root.rs` (2 tests, real socket, server stays up across
    requests). The ownership question this raised is SETTLED — see below; the surface described here has since
    been rebuilt on it (`Ctx` Copy, handlers return a built response).
-2. **Wire the radix tree over a route table.** `dispatch_routes` currently uses the LINEAR
-   `match_score` scan, because `tree_dispatch` takes `slice<str>` and a route table cannot be
-   projected to one (`array_builder` rejects `str` elements). Reading `.pattern` per route inside the
-   tree build closes it. A performance gap only — the differential test pins the two orderings equal.
+2. **Wire the radix tree over a route table — DONE (2026-07-21).** `best_path_route` is now the SoA
+   radix build+match reading `routes[r].pattern` directly (edge labels = zero-copy
+   `(route, start, end)` triples into the table's patterns), so `dispatch_routes` /
+   `method_not_allowed` / `allow_methods` all go through the tree; the old linear scan survives as
+   `best_path_route_linear`, the differential oracle
+   (`apps_web_router.rs::best_path_route_tree_agrees_with_the_linear_oracle`, incl. same-pattern
+   GET/POST rows — shared leaf first-writer-wins == strict-`>` first max). The build is still per
+   call; hoisting the columns into `serve`'s scope (build once, match per request over borrowed
+   slices) is the remaining recorded follow-up.
 3. **`param(c, name)` sugar — DONE.** Settled by the Copy-`Ctx` redesign below; `web.param(c, "id")`,
    `web.query(c, name)` and `has_query` are shipped in the designed spelling. The rest of the W3
    accessor surface (`header`, `body`, `body_str`) is now unblocked and is ordinary work.

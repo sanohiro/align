@@ -255,3 +255,77 @@ fn main() -> Result<(), Error> {\n\
     // method), while /nope is 404 (no path at all).
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n2\n1\n-1\ntrue\n-1\nfalse\n");
 }
+
+/// The route-TABLE radix tree (`best_path_route`, the production dispatch path) agrees with the
+/// linear `match_score` oracle (`best_path_route_linear`) on every path — the table dual of
+/// `tree_dispatch_agrees_with_the_linear_oracle`, including same-pattern rows that differ only in
+/// method (both sides must return the FIRST such row: shared leaf / strict `>`).
+#[test]
+fn best_path_route_tree_agrees_with_the_linear_oracle() {
+    if !backend_available() {
+        return;
+    }
+    let web_root = "module pkg.web\n\
+import pkg.web.types\n\
+import pkg.web.internal.router\n\
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"POST\", pattern: pattern, handler: handler }\n\
+pub fn best(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
+  pkg.web.internal.router.best_path_route(routes, path)\n\
+pub fn best_linear(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
+  pkg.web.internal.router.best_path_route_linear(routes, path)\n";
+    let main = "module main\n\
+import std.http\n\
+import pkg.web\n\
+import pkg.web.types\n\
+fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = Ok(http.response(200))\n\
+fn check(routes: slice<pkg.web.types.Route>, path: str, idx: i64) -> i64 {\n\
+  a := pkg.web.best_linear(routes, path)\n\
+  b := pkg.web.best(routes, path)\n\
+  if a == b {\n\
+    0\n\
+  } else {\n\
+    print(-999)\n\
+    print(idx)\n\
+    print(a)\n\
+    print(b)\n\
+    1\n\
+  }\n\
+}\n\
+fn main() -> Result<(), Error> {\n\
+  routes := [\n\
+    pkg.web.get(\"/\", h),\n\
+    pkg.web.get(\"/v1/models\", h),\n\
+    pkg.web.post(\"/v1/models\", h),\n\
+    pkg.web.get(\"/v1/models/:id\", h),\n\
+    pkg.web.get(\"/v1/models/featured\", h),\n\
+    pkg.web.get(\"/v1/models/:id/versions\", h),\n\
+    pkg.web.get(\"/files/*path\", h),\n\
+    pkg.web.get(\"/users/:uid/posts/:pid\", h),\n\
+    pkg.web.get(\"/health\", h),\n\
+  ]\n\
+  paths := [\"/\", \"/v1/models\", \"/v1/models/42\", \"/v1/models/featured\", \"/v1/models/42/versions\", \"/files/a/b/c\", \"/files/x\", \"/users/7/posts/9\", \"/health\", \"/nope\", \"/v1\", \"/v1/models/\", \"/users/7/posts\", \"/files\"]\n\
+  mut mism := 0\n\
+  mut i := 0\n\
+  loop {\n\
+    if i >= paths.len() { break }\n\
+    mism = mism + check(routes, paths[i], i)\n\
+    i = i + 1\n\
+  }\n\
+  print(mism)\n\
+  return Ok(())\n\
+}\n";
+    let files: Vec<(&str, String)> = vec![
+        ("pkg/web/internal/router.align", ROUTER.to_string()),
+        ("pkg/web/types.align", TYPES.to_string()),
+        ("pkg/web.align", web_root.to_string()),
+        ("main.align", main.to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    let out = build_and_run_multi("web-table-tree-diff", &refs, "main.align");
+    assert_eq!(out.status.code(), Some(0));
+    // "0" alone = every path agreed (a mismatch prints a -999 block before it).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
