@@ -1,6 +1,8 @@
 module pkg.web
 
 import std.http
+import std.io
+import std.process
 import pkg.web.types
 import pkg.web.internal.router
 import pkg.web.internal.query
@@ -147,8 +149,19 @@ pub fn json(body: str) -> Result<response_builder, Error> = status_json(200, bod
 fn answer(h: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>, c: pkg.web.types.Ctx) -> response_builder {
   match h(c) {
     Ok(built) => built
-    Err(e) => http.response(500)
+    Err(e) => auto_response(500, "{\"error\":\"internal error\"}")
   }
+}
+
+// One framework-generated response (the 404/405/500 family): `code` + the fixed minimal JSON body
+// the design's error policy specifies. Application error vocabularies stay app policy via
+// `web.status_json`; these bodies exist so a bare curl of a missing path shows WHAT happened
+// rather than a silent empty 404.
+fn auto_response(code: i64, body: str) -> response_builder {
+  rb := http.response(code)
+  rb.header("Content-Type", "application/json")
+  rb.body(body)
+  rb
 }
 
 // Own the accept loop and the request handle: bind `host:port`, then for each accepted request
@@ -170,6 +183,16 @@ fn answer(h: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>, c: pkg.we
 // accept errors (`ECONNABORTED`, `EMFILE`) as retryable needs errno reaching Align's `Error`, and
 // is recorded as a follow-up.
 pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result<(), Error> {
+  // A malformed route table is a PROGRAMMER error, aborted before the port is even bound (the
+  // design's error policy: startup abort, not Err — nothing should start serving a table that
+  // cannot behave as written). The message names the offending route.
+  bad := pkg.web.internal.router.validate(routes)
+  if bad.len() > 0 {
+    e := io.stderr
+    e.write(bad) else {}
+    e.write("\n") else {}
+    process.abort()
+  }
   srv := http.serve(host, port)?
   loop {
     ctx := srv.accept()?
@@ -178,11 +201,25 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
     // every route with a query 404s.
     target := ctx.path()
     path := pkg.web.internal.query.target_path(target)
-    idx := pkg.web.internal.router.dispatch_routes(routes, ctx.method(), path)
+    method := ctx.method()
+    mut idx := pkg.web.internal.router.dispatch_routes(routes, method, path)
+    // RFC 9110 §9.3.2: HEAD is GET without the response body. An explicit HEAD route won above;
+    // otherwise the path's GET handler answers, and std.http's `respond` suppresses the body for
+    // a HEAD request (its Content-Length still sent). Stream rows are excluded — a stream head
+    // has no meaningful HEAD form, so a stream-only GET keeps HEAD at 405.
+    if idx < 0 && method == "HEAD" {
+      gidx := pkg.web.internal.router.dispatch_routes(routes, "GET", path)
+      if gidx >= 0 {
+        rg := routes[gidx]
+        if rg.stream_type == "" {
+          idx = gidx
+        }
+      }
+    }
     if idx >= 0 {
       r := routes[idx]
       c := pkg.web.types.Ctx {
-        method: ctx.method(),
+        method: method,
         path: path,
         query: pkg.web.internal.query.target_query(target),
         pattern: r.pattern,
@@ -218,16 +255,17 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
         }
       }
     } else {
-      // A 404 is the flood case (scanners, stale links), so it must not allocate: only once the
-      // path is known to match some pattern is the `Allow` join built.
+      // A 404 is the flood case (scanners, stale links), so the `Allow` join is built only once
+      // the path is known to match some pattern. Bodies are the error policy's fixed minimal
+      // JSON; a HEAD request gets them suppressed by std.http's respond (CL kept).
       matched := pkg.web.internal.router.best_path_route(routes, path)
       if matched >= 0 {
         allow := pkg.web.internal.router.allow_methods(routes, path)
-        rb := http.response(405)
+        rb := auto_response(405, "{\"error\":\"method not allowed\"}")
         rb.header("Allow", allow)
         ctx.respond(rb) else {}
       } else {
-        rb := http.response(404)
+        rb := auto_response(404, "{\"error\":\"not found\"}")
         ctx.respond(rb) else {}
       }
     }

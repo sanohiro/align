@@ -201,21 +201,25 @@ not match the pattern `/v1/models`. Confirmed against the shipped #578 binary (2
 404 with one). `pkg.web.internal.query.target_path` / `target_query` now split the target once per
 request; `apps_web_root.rs` pins it, including that a `:param` capture reads the path half only.
 
-### Recorded gaps from the PR-578 review, all W4 hardening
+### Recorded gaps from the PR-578 review — W4 slice 1 SHIPPED 2026-07-21 closes most
 
-- **No method-string validation.** `route()` and the per-method constructors accept any string, and
-  `dispatch_routes` compares methods byte-exactly, so `web.route("get", ...)` silently never matches
-  a real `GET` request. Startup validation (uppercase token, known-method check) belongs with the
-  duplicate/ambiguous-pattern abort the design already calls for — none of which is implemented yet.
-- **HEAD is not RFC-correct.** `web.head()` exists, but neither `serve` nor std.http suppresses the
-  response body for a HEAD request (RFC 9110 §9.3.2), and a `GET` route does not automatically
-  answer `HEAD`. Both are the framework's job and are unimplemented.
-- **A handler's `Err` vanishes without a trace** — `serve` swallows it to keep the loop alive, with
-  no log line, so a handler failing in production is invisible. Needs the logging story W5+ owes.
-- **`allow_methods` can emit duplicates** (`"GET, GET"` for two GET routes on one pattern), which
-  the missing startup duplicate-route abort would otherwise have rejected.
-- **The automatic 404/405 send empty bodies**, where `docs/impl/pkg-design/web.md` specifies "fixed
-  minimal JSON bodies".
+- **Method-string validation — DONE.** `router.validate` (pure diagnosis) + `serve` startup abort
+  (stderr + `process.abort()` before binding): known uppercase method or "" only; plus pattern
+  well-formedness (leading `/`, named `:`/`*` segments, `*` tail-only, no param name twice) and
+  the duplicate-claim aborts the design called for — same method twice, or any row after an
+  any-method route on the same PATH CLAIM (param names don't affect a claim: `/a/:x` ≡ `/a/:y`).
+  A Stream row must carry a non-empty `stream_type` (else a blank `Content-Type:` — and "" is the
+  invariant the HEAD fallback reads as "a Respond row"). Specific-then-`any` stays legal.
+  `apps_web_validate.rs` (9 aborts + the legal-shadow serve).
+- **HEAD is RFC-correct — DONE.** std.http `respond` suppresses the body for a HEAD request at the
+  protocol boundary (Content-Length kept, RFC 9110 §9.3.2), and `serve` routes HEAD-with-no-row to
+  the path's GET handler (Respond rows only; stream-only GET keeps HEAD at 405).
+- **`allow_methods` duplicates — DONE** by construction: the duplicate-route abort makes a
+  same-method pair on one claim unrepresentable.
+- **404/405 empty bodies — DONE.** The automatic 404/405/500 now carry the design's fixed minimal
+  JSON bodies (`{"error":"not found"}` / `"method not allowed"` / `"internal error"`).
+- **A handler's `Err` still vanishes without a trace** — `serve` swallows it to keep the loop
+  alive, with no log line. Needs the logging story W5+ owes (unchanged).
 
 Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying (a listener-level
 fault, not a per-request one); classifying transient `ECONNABORTED`/`EMFILE` needs errno reaching
