@@ -8668,6 +8668,10 @@ impl<'a> MoveCheck<'a> {
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
                 let scrutinee_roots = self.borrow_sources(scrutinee);
+                let scrutinee_local = match &scrutinee.kind {
+                    ExprKind::Local(id) => Some(*id),
+                    _ => None,
+                };
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
@@ -8686,6 +8690,20 @@ impl<'a> MoveCheck<'a> {
                         // fixpoint, and the next iteration's freshly bound value is rejected as
                         // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
                         clear_moved(&mut m, *binding);
+                        // And extracting a MOVE payload moves it OUT of the scrutinee: MIR nulls
+                        // the scrutinee's payload slot at arm entry (the binding owns the buffer
+                        // now), so a Local scrutinee becomes whole-moved in this arm's state —
+                        // using or re-matching it would read the nulled payload as a silent wrong
+                        // result. Tag-only / Copy-payload arms extract nothing owned and leave it
+                        // live; the arm join then makes the post-match state "moved iff some
+                        // taken arm extracted", the standard may-analysis. (Found by the #593
+                        // adversarial review: the arm-entry `clear_moved` above had unshielded
+                        // this pre-existing hole's loop form.)
+                        if let Some(sl) = scrutinee_local
+                            && self.is_move(*binding)
+                        {
+                            m.insert(MovedKey::Whole(sl));
+                        }
                     }
                     self.expr(&a.body, &mut m, consuming, direct);
                     if hir_expr_diverges(&a.body) {
@@ -22726,6 +22744,28 @@ mod tests {
             "fn eat(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  loop {\n    match Ok(\"x\".clone()) {\n      Ok(s) => { n := eat(s); m := eat(s); print(n + m) }\n      Err(e) => {}\n    }\n    break\n  }\n  return 0\n}\n",
         );
         assert!(d2.has_errors(), "consuming the same arm binding twice in one entry must still be rejected");
+    }
+
+    #[test]
+    fn extracting_a_move_payload_marks_the_local_scrutinee_moved() {
+        // Extracting a Move payload nulls the scrutinee's payload slot in MIR (the arm binding
+        // owns the buffer), so re-matching the same Local scrutinee would silently read the
+        // nulled payload (wrong result, no crash). The #593 adversarial review showed the
+        // arm-entry clear_moved unshielded this pre-existing hole's loop form; both forms must
+        // now be rejected on the SCRUTINEE.
+        let (_p, d) = check(
+            "fn eat(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  opt := Some(\"x\".clone())\n  mut i := 0\n  loop {\n    if i >= 3 { break }\n    match opt {\n      Some(s) => print(eat(s))\n      None => {}\n    }\n    i = i + 1\n  }\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "re-matching a Move-payload scrutinee across loop iterations must be rejected");
+        let (_q, d2) = check(
+            "fn main() -> i32 {\n  opt := Some(\"x\".clone())\n  match opt {\n    Some(s) => print(s.len())\n    None => {}\n  }\n  match opt {\n    Some(s) => print(s.len())\n    None => {}\n  }\n  return 0\n}\n",
+        );
+        assert!(d2.has_errors(), "re-matching after a Move-payload extraction must be rejected even without a loop");
+        // Copy payloads extract nothing owned — re-matching stays legal.
+        let (_r, d3) = check(
+            "fn main() -> i32 {\n  opt := Some(42)\n  match opt { Some(v) => print(v), None => {} }\n  match opt { Some(v) => print(v + 1), None => {} }\n  return 0\n}\n",
+        );
+        assert!(!d3.has_errors(), "a Copy-payload scrutinee is not moved by extraction");
     }
 
     #[test]

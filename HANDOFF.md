@@ -177,10 +177,15 @@ Still open from that cluster, both unchanged by this decision:
      `data: {data}\n\n` as ONE write sharing the lazy-head buffer, `send_event("")` = a legal
      empty event (`HttpStreamSend` gained `event: bool` — same variant, no new-variant sweep;
      runtime `align_rt_http_stream_send_event` over the shared `http_stream_send_parts`).
-     **MoveCheck fix en route:** a match-arm binding consumed inside a `loop` body was a false
-     "use of moved value" on the back-edge fixpoint (arm bindings never `clear_moved` on
-     (re)initialization, unlike `Let`) — exactly serve's `Ok(s) => pump(c, s)`; fixed + sema
-     regression pin. Tests: `apps_web_stream.rs` (3 E2E: SSE frames + mid-pump
+     **MoveCheck fixes en route (two, paired):** ① a match-arm binding consumed inside a `loop`
+     body was a false "use of moved value" on the back-edge fixpoint (arm bindings never
+     `clear_moved` on (re)initialization, unlike `Let`) — exactly serve's `Ok(s) => pump(c, s)`;
+     ② the #593 adversarial review then found ① had unshielded a PRE-EXISTING hole's loop form:
+     extracting a MOVE payload never marked the Local scrutinee moved, so re-matching a consumed
+     scrutinee (loop or plain double-match) was accepted and silently read the MIR-nulled payload
+     (wrong result, no crash). Now the scrutinee is whole-moved in any arm that extracts a Move
+     payload (Copy/tag-only arms leave it live; may-join across arms). Both directions
+     regression-pinned in sema. Tests: `apps_web_stream.rs` (3 E2E: SSE frames + mid-pump
      `param`/`has_query`/`body`, reject 4xx window + loop survival, one-table 404/405-Allow with
      stream rows), `m12_http_stream.rs` (+1, now 14), runtime framing unit.
   **Hard ordering note: production streaming needs concurrent serve first** (an open stream starves
