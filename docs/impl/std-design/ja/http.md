@@ -561,15 +561,37 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
        死んでいた; prefork では worker ごとに 1 本ずつでサーバ全体が落ちた。エラーを返すのは実際の
        `accept(2)` の失敗だけであり、それこそが serve ループにおける `srv.accept()?` を正しくする。
      - **一時的な `accept(2)` の errno も表に出ない** — 同じ論法をシステムコール自体に適用したもので
-       あり、worker がまだ死にうる最後の経路だった。分類ひとつで全てが決まる: `EINTR` と
-       **`ECONNABORTED`**（client が SYN と `accept` の間に消えており、返るはずだったコネクションは
-       もう存在しない — 純然たるノイズであり、さもなければ client は繋いで即座に reset するだけで
-       worker を殺せてしまう）は即座にリトライする; **`EMFILE`/`ENFILE`** は回復可能な fd の枯渇な
-       ので、`accept` は **fd を 1 つ空ける — 最も冷たい parked keep-alive コネクションを閉じる**（まさに
-       idle な fd であり、容量の弁と同じ選択である）— そしてリトライする。回収できる parked が無い
-       ときは、自分の所有物ではない fd テーブルの上で spin するのではなく 10 ms バックオフする。
-       それ以外は listener 水準の真の障害であり、そのまま返す。結果として、従来はサーバが死んでいた
-       ところが劣化（待っている 1 本を捌くために暖まったコネクション 1 本を費やす）で済む。
+       ある。分類ひとつ（`classify_accept_error`）が、3 つのケースで全てを決める:
+       - **ノイズ → `Again`。** `EINTR`; **`ECONNABORTED`**（client が SYN と `accept` の間に消えて
+         おり、返るはずだったコネクションはもう存在しない — さもなければ client は繋いで即座に reset
+         するだけで worker を殺せてしまう）; そして Linux では、accept(2) が明示的に「EAGAIN と同様に
+         リトライして扱え」と述べている**接続にすでに保留されているネットワークエラー**（`ENETDOWN`,
+         `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`,
+         `ENETUNREACH`）— いずれも listener ではなく**そのコネクション**を記述している。Linux で実際に
+         飛ぶのはこの最後の一群のほうである（Linux は通常ハンドシェイクを完了させ、reset は後から
+         報告する）; `accept` からの `ECONNABORTED` はおおむね BSD の事象である。**`Again` は待機へ
+         戻る。その場で `accept` をやり直すことは決してしない** — listener は blocking なので、その場で
+         リトライするとスレッドがそこに張り付き、（同じ `poll` を共有する）parked keep-alive
+         コネクションは無関係な新規コネクションが来るまで捌かれなくなる。ゆえに `http_accept_conn` は
+         `accept` をちょうど 1 回だけ行い、リトライは呼び出し側のループが持つ。
+       - **`EMFILE`/`ENFILE` → `NoFds`**、回復可能な fd の枯渇: `accept` は fd を 1 つ返してやり、
+         リトライする。**どの 1 本を手放すかは、この待機の `revents` から選ぶ**: **リクエストが読めて
+         いない**最も冷たい parked コネクション — 次のリクエストが既に届いているものを閉じれば、client が
+         答えを受け取れないリクエストを落とすことになる — であり、全てが readable なら最も冷たいものを
+         そのまま手放す。枯渇したテーブルでも前進はしなければならないからである。さらにこれは
+         **10 ms あたり 1 本にペーシングされる**（`http_yield_for_fds`）: prefork のワーカーはプロセスの
+         fd テーブルを共有する一方、parked 集合は**別々に**持つので、足りない fd はたいてい兄弟のもので
+         あり（`ENFILE` に至ってはシステム全体で、自分の分を返しても全く効かないことがある）、
+         ペーシングが無ければ 1 ワーカーは自分が招いたのではない逼迫のもとで、暖まった集合をタイト
+         ループで一気に焼き尽くす。手放せるものが尽きたら、ただバックオフする。
+       - **それ以外 → `Fatal`**、そのまま返す: listener 水準の真の障害こそ、serve ループが目にすべき
+         唯一の `accept` の失敗である。
+
+       結果として、従来はサーバが死んでいたところが劣化（待っているリクエストを捌くために、暖まった
+       コネクションを 10 ms あたり高々 1 本費やす）で済む。**規則のノイズ側の半分は std.net の
+       `tcp_accept` と共有する述語 1 つ**である — あちらにも全く同じ穴があったし、accept ループは
+       accept ループである。枯渇側は共有し**ない**: 素の listener は返してやれる parked 集合を持たない
+       ので、その判断は `net` の呼び出し側が持ち続ける。
      - **interim（`1xx`）レスポンスは決して park しない** — 完全なレスポンスではないので、それを受け
        取った client は最終レスポンスを待つ。コネクションは keep-alive 以前と同様に close する。
      - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。集合は
@@ -592,18 +614,22 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      後者は `HttpServer::drop` が設定し、park 中の fd を**すべて**閉じる）; 適格性は
      `http_read_request` で計算し（`http_request_wants_close` + 残余チェック）ctx に載せる;
      `align_rt_http_accept` は `http_wait_parked_or_listener`（新しい `poll(2)` extern）+
-     `http_accept_conn` を中心に再構成。その失敗は `classify_accept_error`（`AcceptFail::NoFds` か
-     `Fatal` か）を通し、枯渇時は `http_relieve_fd_pressure` へ回す;
-     `http_serialize_head(rb, persistent)` は keep-alive 経路で
+     `http_accept_conn`（1 回の呼び出しにつき `accept` はちょうど 1 回）を中心に再構成。その失敗は
+     `classify_accept_error`（`Again`/`NoFds`/`Fatal`。ノイズ側の半分は net 側と共有する述語
+     `accept_errno_is_noise`）を通し、枯渇時は `http_yield_for_fds` → `http_relieve_fd_pressure` へ
+     回す; `http_serialize_head(rb, persistent)` は keep-alive 経路で
      `Connection` 行を省く。言語側: `ExprKind::HttpServe`/`Rvalue::HttpServe` が `shared: bool` を得た
      （variant ではなく**フィールド** — 全解析パスは引き続き `http.serve` として扱う）、
      `http.serve_shared` は同じ `check_http_serve` を通って dispatch する。テスト: ランタイムの
      keep-alive unit 10 本（1 コネクション 2 リクエスト、3 つの不適格規則、HEAD との合成、eviction、
      parked EOF の回復、fd 衛生、ボディなしレスポンスのフレーミング、ボディを持てないステータスが
      セット済みボディを抑制すること、interim レスポンスが park しないこと、4 クライアント同時 park）
-     + `serve_shared` の二重 bind unit + `accept` の errno unit 2 本（分類テーブル、および
-     `RLIMIT_NOFILE` を下げた別プロセスでの fd 枯渇 E2E: fd テーブルが満杯の状態でも parked
-     コネクションが回収され、待っているリクエストは変わらず応答される）;
+     + `serve_shared` の二重 bind unit + `accept` の errno unit 3 本（保留ネットワークエラー族を含む
+     分類テーブル; リクエストが待っているものより idle なコネクションを選ぶ回収と、バックオフ 1 回
+     につき 1 本のペーシング; および `RLIMIT_NOFILE` を下げた別プロセスでの fd 枯渇 E2E — fd テーブル
+     が満杯の状態でも parked コネクションが回収され、待っているリクエストは変わらず応答される。
+     libtest の「フィルタ不一致でも exit 0」に対しては、子プロセス自身の "1 passed" サマリを
+     assert して fail-open を塞いでいる）;
      driver の `m11_http_server.rs`（`serve_shared` E2E + ゲート）、
      `apps_web_root.rs`（keep-alive × pkg.web のループ。2 番目の client が 1 番目からコネクションを
      奪わないことを含む）、`apps_web_prefork.rs`（同時 client、`/proc/net/tcp` から読み出した

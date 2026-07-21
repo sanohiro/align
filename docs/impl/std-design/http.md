@@ -575,16 +575,39 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        per worker took the whole server down. Only a real `accept(2)` failure returns an error,
        which is what makes `srv.accept()?` correct in a serve loop.
      - **Nor does a transient `accept(2)` errno** — the same argument, applied to the syscall
-       itself, and the last path where a worker could still die. One classification decides all of
-       it: `EINTR` and **`ECONNABORTED`** (the client vanished between its SYN and the `accept`, so
-       the connection that would have been returned no longer exists — pure noise, and otherwise a
-       client could kill a worker by connecting and immediately resetting) retry immediately;
-       **`EMFILE`/`ENFILE`** are recoverable descriptor exhaustion, so `accept` **gives a
-       descriptor back — the coldest parked keep-alive connection**, precisely an idle fd, the same
-       choice the capacity valve makes — and retries; with nothing parked to reclaim it backs off
-       10 ms rather than spinning on a table it does not own. Everything else is a genuine
-       listener-level fault and is returned. The result is a degradation (one warm connection is
-       spent to serve the waiting one) where the server previously died.
+       itself. One classification (`classify_accept_error`) decides all of it, in three cases:
+       - **Noise → `Again`.** `EINTR`; **`ECONNABORTED`** (the client vanished between its SYN and
+         the `accept`, so the connection that would have been returned no longer exists — and
+         otherwise a client could kill a worker by connecting and immediately resetting); and, on
+         Linux, the **already-pending network errors** accept(2) explicitly says to "treat like
+         EAGAIN by retrying" (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`,
+         `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`) — each describes THE CONNECTION, not the
+         listener. That last group is the one that actually fires on Linux, which usually completes
+         the handshake and reports a reset later; `ECONNABORTED`-from-`accept` is mostly a BSD
+         event. **`Again` returns to the WAIT, never to an immediate re-`accept`** — the listener
+         is blocking, so retrying in place would park the thread there and stop the parked
+         keep-alive connections (which share that one `poll`) from being served until an unrelated
+         new connection arrived. `http_accept_conn` therefore performs exactly ONE `accept` and the
+         retry lives in the caller's loop.
+       - **`EMFILE`/`ENFILE` → `NoFds`**, recoverable descriptor exhaustion: `accept` gives a
+         descriptor back and retries. **Which one it spends is chosen from this wait's `revents`:**
+         the coldest parked connection *with no readable request* — closing one whose next request
+         has already arrived would drop a request the client never sees answered — falling back to
+         the coldest outright if every one is readable, because an exhausted table must still make
+         progress. It is **paced at one connection per 10 ms** (`http_yield_for_fds`): prefork
+         workers share the process descriptor table but each owns a SEPARATE parked set, so the
+         descriptors a worker lacks are usually a sibling's (and `ENFILE` is system-wide, where
+         giving back our own may not help at all) — unpaced, one worker would burn its entire warm
+         set in a tight loop over pressure it did not cause. With nothing left to spend it just
+         backs off.
+       - **Anything else → `Fatal`**, returned unchanged: a genuine listener-level fault is the
+         only `accept` failure a serve loop should ever see.
+
+       The result is a degradation (at most one warm connection per 10 ms is spent to serve the
+       waiting request) where the server previously died. The **noise half of the rule is one
+       predicate shared with std.net's `tcp_accept`** — it had the identical hole, and an accept
+       loop is an accept loop. Exhaustion is NOT shared: a raw listener holds no parked set to give
+       back from, so `net`'s caller keeps that decision.
      - **An interim (`1xx`) response never parks** — it is not a complete response, so a client
        that got one waits for the final one; the connection closes, as before keep-alive.
      - **Drop-order safety (the one sharp edge):** the ctx must not park into a freed server.
@@ -607,8 +630,10 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      the latter set by `HttpServer::drop`, which also closes every still-parked fd); eligibility
      computed in `http_read_request` (`http_request_wants_close` + the residual check) and carried on
      the ctx; `align_rt_http_accept` restructured around `http_wait_parked_or_listener` (a new
-     `poll(2)` extern) + `http_accept_conn`, whose failures go through `classify_accept_error`
-     (`AcceptFail::NoFds` vs `Fatal`) and, on exhaustion, `http_relieve_fd_pressure`;
+     `poll(2)` extern) + `http_accept_conn` (exactly ONE `accept` per call), whose failures go
+     through `classify_accept_error` (`Again`/`NoFds`/`Fatal`, its noise half the
+     `accept_errno_is_noise` predicate shared with the net rail) and, on exhaustion,
+     `http_yield_for_fds` → `http_relieve_fd_pressure`;
      `http_serialize_head(rb, persistent)` omitting the
      `Connection` line on the keep-alive path. Language: `ExprKind::HttpServe`/`Rvalue::HttpServe`
      gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
@@ -617,9 +642,12 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      composition, new traffic NOT evicting a parked connection, both capacity valves evicting the
      coldest, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
      rejecting a set body, an interim response never parking, and four clients parked at once) +
-     the `serve_shared` double-bind unit + the two `accept`-errno units (the classification table,
-     and an out-of-process descriptor-exhaustion E2E under a lowered `RLIMIT_NOFILE`: with the table
-     full the parked connection is reclaimed and the pending request still answered);
+     the `serve_shared` double-bind unit + the three `accept`-errno units (the classification table
+     including the pending-network family; the reclaim choosing an idle connection over one with a
+     request waiting, and the one-per-backoff pacing; and an out-of-process descriptor-exhaustion
+     E2E under a lowered `RLIMIT_NOFILE` — with the table full the parked connection is reclaimed
+     and the pending request still answered, guarded against libtest's exit-0-on-no-match by
+     asserting the child's own "1 passed" summary);
      driver `m11_http_server.rs` (`serve_shared` E2E + gates),
      `apps_web_root.rs` (keep-alive × the pkg.web loop, a second client not costing the first its
      connection, and a malformed request not killing the loop), and `apps_web_prefork.rs`

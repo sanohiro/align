@@ -10,8 +10,8 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
 (#595) — the hard streaming ordering constraint is LIFTED** — plus **#597, `accept`'s
-transient-errno classification, which closes the last path where a worker could still die (see
-"DONE 2026-07-21" under NEXT).** The three designed slices all landed in one arc:
+transient-errno classification: a worker no longer dies over a dropped connection, a pending network
+error, or a full fd table (see "DONE 2026-07-21" under NEXT).** The three designed slices all landed in one arc:
 ① std.http `http.serve_shared` (`SO_REUSEPORT` sibling op; `ExprKind`/`Rvalue::HttpServe` gained a
 `shared: bool` FIELD, not a variant, so no analysis pass changed), ② std.http keep-alive entirely
 inside `accept`/`respond` (one `Arc<Mutex<ParkSlot>>` per server handle; eligibility = 1.1 + no
@@ -71,19 +71,37 @@ READMEs):**
 3. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
-**DONE 2026-07-21 — `accept`'s transient-errno classification (#597), the last path where a worker
-still died.** `http_accept_conn` used to return ANY `accept(2)` failure and `pkg.web`'s
-`srv.accept()?` ended the worker on it. One decision function (`classify_accept_error`) now owns the
-whole policy: `EINTR` **and `ECONNABORTED`** (the client vanished between its SYN and the accept —
-pure noise; otherwise a client could kill a worker by connecting and immediately resetting) retry;
-**`EMFILE`/`ENFILE`** are recoverable exhaustion, so `accept` gives a descriptor back — closing the
-COLDEST parked keep-alive connection, exactly the idle fd to reclaim, the same choice the capacity
-valve makes — and retries; with nothing parked it backs off 10 ms rather than spinning; everything
-else is a genuine listener fault and is returned. **No errno reaches Align's `Error`** — the whole
-classification lives under `accept`, so no language surface changed. Tests: the classification table
-as a unit, plus an out-of-process E2E under a lowered `RLIMIT_NOFILE` (parked connection + pending
-request + a full fd table → the parked one is spent and the pending request is still answered);
-mutation-checked (reclassifying `EMFILE` as fatal fails it).
+**DONE 2026-07-21 — `accept`'s transient-errno classification (#597).** `http_accept_conn` used to
+return ANY `accept(2)` failure and `pkg.web`'s `srv.accept()?` ended the worker on it. One decision
+function (`classify_accept_error`) now owns the whole policy — `Again` / `NoFds` / `Fatal` — and the
+noise half (`accept_errno_is_noise`) is shared with std.net's `tcp_accept`, which had the identical
+hole. **No errno reaches Align's `Error`**: the classification lives entirely under `accept`, so no
+language surface changed. **The adversarial round is where this got its real shape — read the fixes,
+not just the feature:**
+- **The retry must be a WAIT, not a re-`accept` in place.** The first cut looped inside
+  `http_accept_conn`. On a blocking listener that parks the thread in `accept` — and the parked
+  keep-alive connections share that one `poll`, so a single client connecting and resetting would
+  have stalled every warm client until an unrelated new connection arrived. `http_accept_conn` now
+  does exactly ONE `accept`; `Again` returns to the caller's wait loop.
+- **`ECONNABORTED` is the wrong errno to lean on for Linux.** Linux usually completes the handshake
+  and reports a reset later; what it DOES hand back from `accept` is the connection's
+  already-pending network error (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`,
+  `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH` — accept(2) says to treat them like `EAGAIN`). All
+  eight are now noise; without them the fix mostly covered a BSD event.
+- **Which connection exhaustion spends, and how fast.** The reclaim reads this wait's `revents` and
+  takes the coldest parked connection *with no readable request* (closing one whose next request has
+  already arrived drops it silently), falling back to the coldest when all are readable. And it is
+  **paced at one per 10 ms**: prefork workers share the descriptor table but each owns a separate
+  parked set, so the fds a worker lacks are usually a sibling's — unpaced, one worker would burn its
+  whole warm set in a tight loop over pressure it did not cause.
+- **The child-process E2E was fail-open**: `libtest` exits 0 when a filter matches nothing, so a
+  rename would have left the child running no test with the parent still green. It now pipes the
+  child's output and asserts the harness's own "1 passed" (and prints both streams on failure).
+
+Tests: the classification table (incl. the pending-network family), the reclaim-choice + pacing
+unit, and the out-of-process E2E under a lowered `RLIMIT_NOFILE`. Both the E2E and the fail-open
+guard are mutation-checked (reclassifying `EMFILE` as fatal fails the E2E; a renamed test trips the
+guard).
 
 - **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the
   attempt.** Align does exactly one syscall more than the floor (`poll` before the read), so the
