@@ -53,6 +53,13 @@ fn main() {
         assert_eq!(b, want, "hand-written dispatch for {name} must resolve to route {want}, got {b}");
     }
 
+    // The scaling shapes need the same anchor: a `fw_big` that started missing early would read as
+    // an IMPROVED scaling ratio with nothing to catch it.
+    for (shape, want) in [(0i64, 0i64), (1, 127), (2, -1)] {
+        let got = unsafe { fw_big(shape, 1) };
+        assert_eq!(got, want, "fw_big shape {shape} must resolve to route {want}, got {got}");
+    }
+
     // Warm both sides (first-call page-ins, the tree build) before any measurement.
     for (_, shape, _) in shapes {
         unsafe {

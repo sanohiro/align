@@ -165,11 +165,15 @@ pub fn filled(m: i64, v: i64) -> array<i64> {
 // move as `soa` / the JSON tape / every other offset table in Align: one allocation, no pointer
 // chasing, cache-line-friendly walks.
 //
-//   [0] cap                  entries per column (= total pattern segments + 2)
-//   [1] ec                   live edge count
+//   [0] cap                  entries per column (= total pattern segments + route count + 2, one
+//                            bound covering all three index spaces: node ids, edge ids, and route
+//                            indices — `r_next` is keyed by the last of those)
+//   [1] ec                   live edge count (written at the end of the build; nothing reads it —
+//                            kept as the build's own record of how many edges exist)
 //   [2 + k*cap .. +cap]      column k, in this order:
-//                            0 n_param  1 n_wild  2 n_leaf  3 e_par
-//                            4 e_child  5 e_pat   6 e_start 7 e_end
+//                            0 n_param  1 n_wild   2 n_leaf  3 n_efirst
+//                            4 e_child  5 e_pat    6 e_start 7 e_end
+//                            8 e_next   9 r_next  10 n_elast
 //
 // Node columns are indexed by node id; edge columns by edge id. An edge LABEL is the zero-copy
 // triple `(e_pat, e_start, e_end)` — a route index plus a byte range into that route's pattern —
@@ -200,6 +204,7 @@ fn c_estart(cap: i64) -> i64 = 2 + 6 * cap
 fn c_eend(cap: i64) -> i64 = 2 + 7 * cap
 fn c_enext(cap: i64) -> i64 = 2 + 8 * cap
 fn c_rnext(cap: i64) -> i64 = 2 + 9 * cap
+fn c_elast(cap: i64) -> i64 = 2 + 10 * cap
 
 // Build the radix tree over the route table: insert each route's pattern segment-by-segment, read
 // straight out of `routes[r].pattern` (a table cannot be projected to a `slice<str>` —
@@ -214,7 +219,7 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
   // it, but `build_tree` is reachable without `validate`, e.g. from the differential tests) has
   // `count_route_segs == 0` and any number of routes.
   cap := count_route_segs(routes) + routes.len() + 2
-  mut t := filled(2 + 10 * cap, -1)
+  mut t := filled(2 + 11 * cap, -1)
   t[0] = cap
   npar := c_param(cap)
   nwil := c_wild(cap)
@@ -226,6 +231,7 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
   eend := c_eend(cap)
   enex := c_enext(cap)
   rnex := c_rnext(cap)
+  elas := c_elast(cap)
   mut nc := 1
   mut ec := 0
   np := routes.len()
@@ -276,10 +282,19 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
           t[epat + ec] = r
           t[esta + ec] = ss
           t[eend + ec] = se
-          // Link the new edge at the head of this node's chain. Labels at a node are unique (this
-          // very loop deduped them), so chain order cannot change which edge matches.
-          t[enex + ec] = t[efir + node]
-          t[efir + node] = ec
+          // Append at the TAIL of this node's chain, keeping REGISTRATION order. Order cannot
+          // change which edge matches (labels at a node are unique — the loop above deduped them),
+          // but it decides how many labels a request compares before its own: prepending made a
+          // node's first-registered child its LAST candidate, and an adversarial review measured
+          // exactly that — `/r0` in a flat 128-route namespace went 23.7 -> 394.5 ns/op (16.6x
+          // SLOWER) while `/r127` got 34x faster. First-registered routes are the ones an app puts
+          // first (`/health`, `/metrics`, …), so the tail is the correct end.
+          if t[efir + node] == -1 {
+            t[efir + node] = ec
+          } else {
+            t[enex + t[elas + node]] = ec
+          }
+          t[elas + node] = ec
           ec = ec + 1
         }
         node = child
@@ -299,7 +314,12 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
     loop {
       if b >= np { break }
       rb := routes[b]
-      if rb.pattern == ra.pattern {
+      // `same_claim`, NOT string equality: the tree matches by segment SHAPE, so `/u/:id` and
+      // `/u/:uid` land on the same leaf and are the same path claim. Chaining by string left the
+      // second one unreachable — `[get("/u/:id"), post("/u/:uid")]` answered `POST /u/7` with a
+      // 405 whose `Allow` said `GET`, and an `any` fallback spelled with a different parameter
+      // name was silently dead. Both tables pass `validate`.
+      if same_claim(rb.pattern, ra.pattern) {
         t[rnex + a] = b
         break
       }

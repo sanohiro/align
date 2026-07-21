@@ -61,13 +61,22 @@ BEFORE the bench is meaningful:**
   table, 708 ns/op over a 2-route one (release runtime, best of 7 × 200k dispatches) — cost scaling
   with the number of ROUTES, the signature of the per-call radix build. After hoisting the build
   out of the request path: **1319 → 57 ns/op**, a **23× drop**. Then the two O(table) scans inside
-  dispatch went too (per-node edge chains + a same-pattern route chain, both built once). **Item 3
-  is still NOT literally met and `bench/web_router` now GATES it:** its scaling row measures the
-  same shapes over 6 and 128 routes and reports **2.84×**, not 1.00×. The remaining levers are the
-  per-node sibling scan (linked chain + a string compare per sibling — wants a first-byte bucket or
-  a sorted edge run) and the per-edge `Route` struct copy forced by `routes[i].pattern` being
-  rejected through a `slice<struct>` (compiler-side lever). The `:param` row is already 1.11×. Shape: `router.build_tree(routes)` returns ONE flat
-  `array<i64>` (header `[cap, ec]` + eight contiguous columns — the soa/tape/offset-table move),
+  dispatch went too (per-node edge chains + a same-CLAIM route chain, both built once). **Item 3 is
+  still NOT met**, and `bench/web_router` reports the slope (6-route vs 128-route). **Read its
+  README before touching this** — a fourth adversarial round showed the row conflates three
+  variables: the small table's static path is 2 segments and the large one's is 3 (1.35× of pure
+  depth), and each shape lands at a different chain position; depth-matched and head-positioned the
+  128-route table is FLAT (49.9 vs 57.0 ns). It is a report, not a gate, until it measures the SAME
+  path against both tables and reports both chain ends — that redesign is the next step here. The
+  real remaining lever is the **per-node sibling scan**: a node's static edges are a linked chain
+  with a string compare each, so a miss on a flat 128-route namespace still costs ~0.4 µs and the
+  per-route slope is UNCHANGED by the chains (the chain IS the node's children). Wants a first-byte
+  bucket or a sorted edge run. Second lever: the per-edge `Route` struct copy forced by
+  `routes[i].pattern` being rejected through a `slice<struct>` (compiler-side). **One regression was
+  caught there and fixed:** edges were appended at the chain HEAD, making first-registered routes
+  the LAST candidate — `/r0` in a flat 128-route namespace went 23.7 → 394.5 ns/op (16.6× slower)
+  before the tail-append fix. Shape: `router.build_tree(routes)` returns ONE flat
+  `array<i64>` (header + ELEVEN contiguous columns — the soa/tape/offset-table move),
   `worker` builds it once before the accept loop, and `dispatch_routes` / `method_not_allowed` /
   `allow_methods` / `tree_best_path` all take that borrowed tree. `best_path_route(routes, path)`
   survives as the build-and-match convenience the differential oracle tests use.
