@@ -8,7 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-20 (session close), **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE.**
+_Last updated: 2026-07-21 (session close), **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE;
+streaming COMPILER ENABLERS 1–3 COMPLETE (#589 — `http_stream` nameable, fn value as enum variant
+payload via new `Scalar::Fn`, indirect-call Move-param soundness; + a capturing-closure frame-escape
+UAF fixed at `region_of(Closure)`, which also closed the pre-existing struct fn-field vector).
+Streaming enablers 4–5 (std.http `respond_stream` rework, pkg.web `Handler` wiring) NOT YET — and
+production streaming is gated on concurrent serve.**
 
 ## Where pkg.web stands
 
