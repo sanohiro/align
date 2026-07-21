@@ -52,7 +52,7 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
-abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
+abort). **NEXT: W5 — the bench gate (#596 merged: the hoist, the dispatch chains and `bench/web_router` are IN; what remains is below)** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
 `workers = process.cpu_count()`), then W7 Fiber. **W5 IS ALREADY PAYING OFF — a first measurement
 taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed
 BEFORE the bench is meaningful:**
