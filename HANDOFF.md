@@ -61,35 +61,38 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **`web.header(c, name)` — enabler DESIGNED 2026-07-21 (`std-design/http.md` item 10);
-   IMPLEMENTATION is the next step.** The detached view won: `ctx.headers() -> http_headers`, a
-   Copy, region-bound, non-owning view **whose representation is the ctx pointer**, so `hs.get(name)`
-   lowers to the runtime lookup that already exists — **the enabler adds no runtime code at all**.
-   `ctx.header(name)` is REPLACED by `ctx.headers().get(name)` (no Align call sites today, so one
-   spelling costs nothing); `Ctx` carries the view as one more field and `web.header` forwards.
-   Two things the design turns on, both measured on today's compiler, not assumed:
-   - **The region rule must SPLIT.** `region_of`'s `HttpCtx*` arm caps at `Frame.shorter(ctx)`;
-     inherited by the lookup that cap rejects the pkg.web wrapper outright (verified). So
-     `ctx.headers()` keeps the cap (a view minted from a local handle stays in the frame) and
-     `hs.get(name)` inherits `region_of(hs)` — `Static` through a parameter, exactly as `str`
-     and `slice` views already behave there.
-   - **A new `Ty` is only forced through FOUR passes** (`ty_mentions_slice`, `tracks_region`, two
-     `ty_name`s); everything else fails OPEN. Three fatal misses: `ty_may_borrow` **and**
-     `borrow_sources_inner` (a PAIR — either one alone gives the same silent use-after-free when
-     `hs.get()` follows `ctx.respond(rb)`; note `borrow_sources_inner` is the one pass out of nine
-     that a new `ExprKind` does NOT force, and a struct with `str` fields masks the hole, so the test
-     must use a bare local), and `scalar_type`'s pointer arm (falls through to `i32`, the bug
-     `Ty::Fn` already had). No `Scalar` variant, which keeps the view out of payloads and array
-     elements fail-closed. Item 10 carries the full checklist, the dispatch/effect traps (`"get"` is
-     already claimed by the box-`get` catch-all; the place-gate must NOT be inherited; Pure), the
-     rejected alternatives, and the test matrix. An adversarial pass over the design found no escape
-     route the shipped machinery does not already close.
-2. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
+1. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
    is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
    `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
    buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
-3. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
+2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
+
+**DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
+(`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->
+http_headers`, a Copy, region-bound, non-owning view **whose representation is the ctx pointer**, so
+`hs.get(name)` lowers to the runtime lookup that already existed — **the enabler added no runtime
+code at all**. `ctx.header(name)` is REPLACED by `ctx.headers().get(name)` (there were no Align call
+sites, so one spelling cost nothing); `Ctx` carries the view as one more field and `web.header`
+forwards. pkg.web ships no lookup of its own.
+- **The region rule SPLITS**, which is the whole design: `ctx.headers()` keeps the `Frame` cap
+  (a view minted from a local handle stays in the frame — no return, no `break`, no surviving a
+  serve iteration) and `hs.get(name)` **inherits** `region_of(hs)`, so through a parameter it is
+  `Static` and the pkg.web wrapper compiles. Re-capping the lookup was mutation-checked: it breaks
+  every pkg.web E2E.
+- **Where the design's own fail-open account was wrong (recorded in item 10 "What actually
+  shipped"):** `region_of` and `slice_is_local` are exhaustive over `ExprKind`, so the region rule
+  is fail-CLOSED, not fail-open; the real fail-open set is `ty_may_borrow`, `scalar_type`'s pointer
+  arm, and `borrow_sources_inner`. All three mutation-checked against the test matrix. Two smaller
+  finds: there are TWO `payload_scalar`s and the `Checker` one mislabelled every rejection as an
+  "Option payload" (now takes the position it checks); and the ctx-method dispatch arm is
+  name-guarded, so `ctx.header(x)` never reaches the "try method / path / …" suggestion string.
+- `Ty::HttpRequestCtx`'s 16-vs-8 `ty_size_align` over-report was fixed alongside, and
+  `sema_and_codegen_struct_layout_agree` gained the rows it never had for a Move-handle field, a
+  `Ty::Fn` field, a `slice<T>` field, the new view field, and the pkg.web `Ctx` shape.
+- Tests: `crates/align_driver/tests/http_headers_view.rs` (the full item-10 matrix) +
+  `apps_web_root.rs::web_header_reads_the_request_header_table` (case-insensitive hit / folded hit /
+  absent-is-`None` / present-but-empty-is-`Some("")`).
 
 **DONE 2026-07-21 — `accept`'s transient-errno classification (#597).** `http_accept_conn` used to
 return ANY `accept(2)` failure and `pkg.web`'s `srv.accept()?` ended the worker on it. One decision
@@ -335,11 +338,10 @@ Nothing there stands in for a missing compiler feature.
    in the designed spelling. `web.body(c)` / `web.body_str(c)` are shipped too: `Ctx` gained a
    `body: slice<u8>` view field (filled once by `serve` from `ctx.body()`), `body_str` is
    `.as_str()` — pinned E2E in `apps_web_root.rs::body_and_body_str_read_the_request_body` (echo /
-   empty-400 / invalid-UTF-8-400). **`web.header(c, name)` is NOT shipped and is not ordinary
-   work:** an arbitrary-name lookup cannot ride a single stored view; it needs a std.http enabler
-   (a detached headers-view value the Copy `Ctx` can carry) — the design note is in
-   `pkg-design/web.md` (ctx accessors block). Design the enabler first; do not duplicate the
-   lookup in pkg.web.
+   empty-400 / invalid-UTF-8-400). **`web.header(c, name)` — DONE 2026-07-21**, on the std.http
+   enabler `ctx.headers()` (`std-design/http.md` item 10): an arbitrary-name lookup cannot ride a
+   single stored view, so `Ctx` carries the detached header-table view and `web.header` forwards to
+   `c.headers.get(name)`. pkg.web duplicates no lookup.
 4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data; OAuth —
    client flows are buildable now, validating a PUBLIC provider's token is blocked on RS256
    (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.

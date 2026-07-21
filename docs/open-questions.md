@@ -3770,7 +3770,7 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
   arms), not a stopgap awaiting a router. No router is on this runway's critical path.
 - **`std.http` protocol floor, consumer-gated:** query-string parse + percent-decode
   (`ctx.query(name) -> Option<str>` — RFC 3986 has one correct answer → std, the sibling of
-  `ctx.header`) and an SSE event-framing helper (WHATWG-defined) join `std.http` when the
+  `ctx.headers().get(name)`) and an SSE event-framing helper (WHATWG-defined) join `std.http` when the
   gateway or a successor actually needs them; server keepalive lands invisibly per the existing
   plan. The boundary rule: protocol (spec-defined, one correct answer) may enter std;
   convention/policy may not.
