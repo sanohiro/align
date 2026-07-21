@@ -2006,6 +2006,37 @@ mutation, diagnostics, and safe materialization cases in `tests/borrow_liveness.
 escape-flow structural refactor subsequently completed at the checked-HIR boundary through
 #461–#464; this fix supplied the neighboring borrow-state dataflow rather than that migration.
 
+**Borrow liveness ends at MOVE, not at scope-end DROP — OPEN (found 2026-07-21, adversarially, while
+implementing `ctx.headers()`).** #460's shared borrow state above invalidates a view when its owning
+source is **moved or reassigned** (`invalidate_storage` / `invalidate_owner`). It does **not** notice
+the other way a source's storage ends: a Move handle bound inside an inner scope — a loop body, most
+of all — being **dropped when that scope closes**. `Region::Frame` cannot help, because it does not
+distinguish "this frame" from "this iteration". So a view assigned out to a longer-lived local
+survives into the next pass and reads freed memory:
+
+```align
+mut keep := fallback
+loop {
+  print(keep.len())          // reads the PREVIOUS iteration's freed request buffer
+  ctx := srv.accept()?       // dropped at end of iteration — never moved
+  keep = ctx.path()
+}
+```
+
+This is **general to every view over a Move handle**, not to any one type: reproduced on a plain
+`str` from `ctx.path()` (reads a freed buffer, prints stale lengths) and on the `http_headers` view
+from `ctx.headers()` (which **aborts** — the dangling value IS the freed `http_request_ctx` pointer
+and the runtime dereferences it to walk the offset table, so the same UB is loud rather than silent).
+The variant where the loop DOES consume the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
+shipped serve loop is safe) is correctly rejected by the existing move path.
+
+Pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view` in
+`crates/align_driver/tests/http_headers_view.rs`, which asserts the current unsound acceptance for
+both the `http_headers` and the `str` case; when the gap is fixed, both assertions flip. The fix
+belongs with #460's dataflow — end a borrow generation at the owner's scope-end drop, not only at its
+move — and is deliberately **not** folded into the `ctx.headers()` slice, which neither introduced
+nor widened it.
+
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`
 previously passed `check`: a frame-local array's slice escaped inside a `Result`/`Option` wrapper,

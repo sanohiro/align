@@ -823,6 +823,20 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
         `"Option payload"` for every caller, so an *array element* rejection reported itself as an
         Option payload. The method now takes the position it is checking, which fixes that
         pre-existing mislabel for every type, not just this one.
+      - **The test matrix's "cannot survive its ctx across a `serve` iteration" is only half true, and
+        the other half is a pre-existing hole.** `MoveCheck` ends a borrow generation when the owner
+        is **moved or reassigned**, not when it is **dropped at an inner scope's end**, and
+        `Region::Frame` cannot tell "this frame" from "this iteration". The pkg.web shape is safe
+        because `ctx.respond(rb)` MOVES the handle every pass — that case is rejected. But a loop that
+        merely lets the ctx drop leaks the view into the next iteration, and this is general to every
+        view over a Move handle (reproduced identically on a plain `str` from `ctx.path()`). The one
+        thing item 10 changes is the blast radius: here the dangling value IS the freed
+        `http_request_ctx` pointer, which `align_rt_http_ctx_header` dereferences to walk the offset
+        table, so the same UB aborts instead of reading stale bytes. Pinned as
+        `known_hole_scope_end_drop_does_not_invalidate_a_view` and recorded as **Open** in
+        `docs/open-questions.md` (next to #460, whose dataflow should own the fix). Deliberately not
+        fixed here: it is neither introduced nor widened by this slice, and ending a borrow generation
+        at scope-end drop is its own design.
       - **⑨'s suggestion string is unreachable for the removed name.** The ctx-method dispatch arm
         is name-guarded (`"method" | "path" | "headers" | …`), so `ctx.header(x)` never reaches
         `check_http_ctx_method` and gets the generic *"unknown method '.header()' on
@@ -919,7 +933,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 - `bench/http_client` numbers recorded vs a Rust baseline (R6 — completion is benchmark-gated)
 - item 10 — `ctx.headers()`: the wrapper-through-a-parameter compiles AND reads the table E2E; a
   view from a LOCAL handle rejected on return / `break` / wrapped in a struct / held across a serve
-  iteration; `hs.get()` after `ctx.respond(rb)` rejected **on a bare local** (a `str` field in an
+  iteration **that consumes the ctx** (the pkg.web shape — the drop-only variant is the pre-existing
+  `MoveCheck` hole pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view`); `hs.get()` after `ctx.respond(rb)` rejected **on a bare local** (a `str` field in an
   enclosing struct masks the hole); `hs.get()` after `ctx.respond_stream(rb)` compiles and works;
   case-insensitive hit + miss E2E through `pkg.web`; the view rejected as an `Option`/`Result`
   payload and as an array element; a struct carrying it stays Copy (no drop emitted) with a

@@ -165,12 +165,17 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
     assert!(check_errs("http-headers-escape-break", brk), "breaking a view of a local handle out of a loop must be rejected");
 }
 
-/// A view cannot survive its ctx **across a serve iteration**: assigning it to a local declared
-/// outside the loop and reading it on the NEXT pass is a use of an invalidated borrow. This is the
-/// loop-fixpoint case — the read comes *before* the assignment in source order, so only the
-/// borrow-flow join catches it.
+/// A view cannot survive its ctx across a serve iteration **when the ctx is CONSUMED in that
+/// iteration** — the pkg.web shape, where `ctx.respond(rb)` ends every pass. Assigning the view to a
+/// local declared outside the loop and reading it on the NEXT pass is a use of an invalidated
+/// borrow. This is the loop-fixpoint half of `MoveCheck`'s borrow flow: the read comes *before* the
+/// assignment in source order, so only the back-edge join catches it.
+///
+/// **What this does NOT cover:** a ctx that is merely DROPPED at the end of the iteration rather
+/// than moved. See `known_hole_scope_end_drop_does_not_invalidate_a_view` below — that is a
+/// pre-existing gap in `MoveCheck`, not specific to this type.
 #[test]
-fn a_view_cannot_survive_its_ctx_across_a_serve_iteration() {
+fn a_consumed_ctx_invalidates_a_view_held_across_a_serve_iteration() {
     let src = "\
 import std.http
 fn run(fallback: http_headers) -> Result<(), Error> {
@@ -190,6 +195,70 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
     assert!(
         check_errs("http-headers-cross-iteration", src),
         "a view held across a serve iteration must be rejected (its ctx is gone)"
+    );
+}
+
+/// **KNOWN HOLE — pre-existing, not introduced by item 10, pinned here so its fix is noticed.**
+///
+/// `MoveCheck` invalidates a borrow when its owner is **moved or reassigned**
+/// (`invalidate_storage` / `invalidate_owner`), and `Region::Frame` cannot distinguish "this frame"
+/// from "this loop iteration". Neither notices a Move handle bound INSIDE a loop body being
+/// **dropped at the end of the iteration**. So a view assigned out to a longer-lived local survives
+/// into the next pass and reads freed memory. Both assertions below therefore assert the CURRENT,
+/// UNSOUND acceptance.
+///
+/// This is a general escape-analysis gap, not a `http_headers` one: the second case is a plain
+/// `str` from `ctx.path()` and it compiles identically (verified by running both — the `str` version
+/// reads a freed buffer and prints stale lengths; the `http_headers` version aborts, because the
+/// dangling value IS the freed `http_request_ctx` pointer and `align_rt_http_ctx_header`
+/// dereferences it to walk the offset table). That difference in blast radius is the only thing item
+/// 10 changed here, and it is worth recording: for this type the hole is loud, not silent.
+///
+/// **When the gap is fixed, both `assert!(!check_errs(...))` below flip to `assert!(check_errs(...))`
+/// and this test loses its `known_hole_` prefix.** Tracked in `docs/open-questions.md` (Open → the
+/// external soundness audit's structural follow-ups).
+#[test]
+fn known_hole_scope_end_drop_does_not_invalidate_a_view() {
+    // The header-table view. `ctx` is dropped at the end of each iteration, never moved.
+    let headers = "\
+import std.http
+fn run(fallback: http_headers) -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  mut keep := fallback
+  loop {
+    h := keep.get(\"host\") else { \"\" }
+    print(h.len())
+    ctx := srv.accept()?
+    keep = ctx.headers()
+  }
+}
+pub fn main() -> Result<(), Error> { return Ok(()) }
+";
+    assert!(
+        !check_errs("http-headers-scope-end-drop", headers),
+        "KNOWN HOLE: this SHOULD be rejected. If it now is, the MoveCheck scope-end-drop gap was \
+         fixed — flip this assertion and drop the known_hole_ prefix."
+    );
+
+    // The same shape with a plain `str` view, which predates item 10 entirely — the proof that the
+    // gap is `MoveCheck`'s, not this type's.
+    let str_view = "\
+import std.http
+fn run(fallback: str) -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  mut keep := fallback
+  loop {
+    print(keep.len())
+    ctx := srv.accept()?
+    keep = ctx.path()
+  }
+}
+pub fn main() -> Result<(), Error> { return Ok(()) }
+";
+    assert!(
+        !check_errs("http-str-view-scope-end-drop", str_view),
+        "KNOWN HOLE (pre-existing): a `str` view outliving its dropped ctx SHOULD be rejected too. \
+         If it now is, fix the header-table case in the same pass."
     );
 }
 
