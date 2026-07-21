@@ -15014,6 +15014,14 @@ fn http_serialize_head(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
 /// ([`http_serialize_head`]) plus `Content-Length` (iff a body was set) + the blank line + the body.
 /// `Err(AL_INVALID)` on a bad status / caller framing header (delegated to the head serializer).
 fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
+    http_serialize_response_inner(rb, false)
+}
+
+/// The body-suppressing form behind [`http_serialize_response`]: with `suppress_body` the
+/// `Content-Length` of the (unsent) body is still written — RFC 9110 §9.3.2's HEAD contract: same
+/// headers a GET would get, no body bytes. Only `respond` passes `true` (for a HEAD request);
+/// every other caller goes through the plain wrapper.
+fn http_serialize_response_inner(rb: &ResponseBuilder, suppress_body: bool) -> Result<Vec<u8>, i32> {
     let mut buf = http_serialize_head(rb)?;
     if let Some(body) = &rb.body {
         buf.extend_from_slice(b"Content-Length: ");
@@ -15021,7 +15029,9 @@ fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
-    if let Some(body) = &rb.body {
+    if !suppress_body
+        && let Some(body) = &rb.body
+    {
         buf.extend_from_slice(body);
     }
     Ok(buf)
@@ -15032,6 +15042,8 @@ fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
 /// them in, nulling both caller slots — the runtime frees them). Returns `0` on success, else a mapped
 /// status (`AL_INVALID` for a bad status / caller framing header, or the `send` errno) — the fd is
 /// closed on **every** path (via the ctx `Drop`). SIGPIPE-safe (`MSG_NOSIGNAL` / `SO_NOSIGPIPE`).
+/// **A HEAD request gets the body suppressed** (its `Content-Length` still sent — RFC 9110 §9.3.2),
+/// so responding to HEAD through an ordinary bodied builder is RFC-correct by construction.
 ///
 /// # Safety
 /// `ctx` a pointer from [`align_rt_http_accept`] (moved in — freed here), or null; `rb` a pointer from
@@ -15050,7 +15062,12 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     if c.fd < 0 {
         return AL_INVALID;
     }
-    let bytes = match http_serialize_response(&r) {
+    // RFC 9110 §9.3.2: a HEAD response carries the same headers the GET would have — including
+    // the body's `Content-Length` — but MUST NOT send the body bytes. Enforced here, at the
+    // protocol boundary, so every caller (incl. a framework routing HEAD to a GET handler) is
+    // RFC-correct without a body-stripping surface on the builder.
+    let head_only = c.buf.get(c.method_start..c.method_start + c.method_len) == Some(&b"HEAD"[..]);
+    let bytes = match http_serialize_response_inner(&r, head_only) {
         Ok(b) => b,
         Err(s) => return s, // `c` drops → the accepted fd is closed
     };
@@ -25217,6 +25234,21 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     }
 
     /// An out-of-range status is rejected at respond; the builder's Option body drives Content-Length.
+    #[test]
+    fn http_serialize_response_head_suppression_keeps_content_length() {
+        // The HEAD form (RFC 9110 §9.3.2): the body's Content-Length is still written, the body
+        // bytes are not; a body-less builder is unchanged.
+        let rb = ResponseBuilder { status: 200, headers: vec![], body: Some(b"hello".to_vec()) };
+        let full = http_serialize_response_inner(&rb, false).unwrap();
+        let head = http_serialize_response_inner(&rb, true).unwrap();
+        let full_s = String::from_utf8(full.clone()).unwrap();
+        assert!(full_s.contains("Content-Length: 5\r\n") && full_s.ends_with("hello"));
+        let head_s = String::from_utf8(head.clone()).unwrap();
+        assert!(head_s.contains("Content-Length: 5\r\n"), "HEAD keeps the CL: {head_s:?}");
+        assert!(head_s.ends_with("\r\n\r\n"), "HEAD sends no body bytes: {head_s:?}");
+        assert_eq!(&full[..head.len()], &head[..], "HEAD = the GET response minus the body bytes");
+    }
+
     #[test]
     fn http_serialize_response_status_and_body_framing() {
         // Header-only (no body) → no Content-Length; a set-but-empty body → Content-Length: 0.

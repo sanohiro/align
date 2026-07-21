@@ -48,7 +48,9 @@ rb := http.response(status: i64)             // response_builder (Move — owns 
 rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
 rb.body(data: bytes)                         // optional — a header-only response is legal
 ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
-                                             // closes the accepted fd (v1: one request per conn)
+                                             // closes the accepted fd (v1: one request per conn);
+                                             // a HEAD request gets the body SUPPRESSED, its
+                                             // Content-Length kept (RFC 9110 §9.3.2; W4)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
 cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>
 ```
@@ -216,7 +218,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    value)` (bound receiver, P6 CR/LF/NUL **abort**) + `rb.body(data)` (optional); `ctx.respond(rb) ->
    Result<(), Error>` (**consumes BOTH** ctx and rb — MIR nulls both slots like `cl.request(req)`;
    serialize = status line + headers + auto Content-Length iff a body was set; ONE write, R4;
-   MSG_NOSIGNAL/SO_NOSIGPIPE; closes the fd, v1 one-request-per-conn). The **NEW**
+   MSG_NOSIGNAL/SO_NOSIGPIPE; closes the fd, v1 one-request-per-conn). **W4 (2026-07-21):
+   `respond` to a HEAD request suppresses the body bytes and keeps their `Content-Length` (RFC
+   9110 §9.3.2) — enforced at the protocol boundary so any caller answering HEAD through a bodied
+   builder (incl. pkg.web's HEAD→GET routing) is RFC-correct by construction; `respond_stream` /
+   `reject` are unchanged (a stream has no HEAD form).** The **NEW**
    `http_parse_request_head` for `METHOD SP target SP HTTP/1.1` implements all five inbound smuggling
    guards below. **Three new Move types** (`http_server`/`http_request_ctx`/`response_builder`) took
    the full Gate-1 twin-mirror sweep (Ty + Scalar for the two Result payloads; `response_builder` is

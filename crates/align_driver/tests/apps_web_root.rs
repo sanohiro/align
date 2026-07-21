@@ -330,3 +330,46 @@ fn body_and_body_str_read_the_request_body() {
     let alive = exchange(port, b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(alive.starts_with("HTTP/1.1 200 OK\r\n"), "server alive after body requests: {alive:?}");
 }
+
+/// W4: HEAD is GET without the response body (RFC 9110 §9.3.2) — an explicit HEAD route wins,
+/// otherwise the path's GET handler answers with the body suppressed by std.http's `respond`
+/// (Content-Length kept); and the automatic 404/405/500 responses carry the error policy's fixed
+/// minimal JSON bodies.
+#[test]
+fn head_is_get_without_the_body_and_auto_responses_carry_json() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-head");
+    let port = srv.port;
+
+    // HEAD on a GET route: the GET handler runs, the head is byte-identical to the GET response's
+    // head — Content-Type and the body's Content-Length included — and NO body bytes follow.
+    let get = exchange(port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    let head = exchange(port, b"HEAD /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "head: {head:?}");
+    assert!(head.contains("Content-Length: 13\r\n"), "HEAD keeps the body's CL: {head:?}");
+    assert!(head.ends_with("\r\n\r\n"), "HEAD sends no body bytes: {head:?}");
+    assert!(get.strip_suffix("{\"models\":[]}") == Some(head.as_str()), "HEAD = GET minus the body: {get:?} vs {head:?}");
+
+    // A path whose pattern has no GET row keeps HEAD at 405 (no fallback to invent one).
+    let no_get = exchange(port, b"HEAD /echo HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(no_get.starts_with("HTTP/1.1 405 "), "HEAD on a POST-only path: {no_get:?}");
+    assert!(no_get.contains("Allow: POST\r\n"), "405 allow: {no_get:?}");
+
+    // The automatic responses carry fixed minimal JSON bodies (the design's error policy).
+    let missing = exchange(port, b"GET /nope HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(missing.contains("Content-Type: application/json\r\n"), "404 CT: {missing:?}");
+    assert!(missing.ends_with("{\"error\":\"not found\"}"), "404 body: {missing:?}");
+    let wrong = exchange(port, b"DELETE /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(wrong.contains("Allow: GET, POST\r\n"), "405 keeps Allow: {wrong:?}");
+    assert!(wrong.ends_with("{\"error\":\"method not allowed\"}"), "405 body: {wrong:?}");
+    let boom = exchange(port, b"GET /boom HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(boom.ends_with("{\"error\":\"internal error\"}"), "500 body: {boom:?}");
+
+    // A HEAD to a missing path: the 404's JSON body is suppressed too, its CL kept.
+    let head_missing = exchange(port, b"HEAD /nope HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(head_missing.starts_with("HTTP/1.1 404 "), "HEAD 404: {head_missing:?}");
+    assert!(head_missing.contains("Content-Length: 21\r\n"), "HEAD 404 CL: {head_missing:?}");
+    assert!(head_missing.ends_with("\r\n\r\n"), "HEAD 404 has no body: {head_missing:?}");
+}

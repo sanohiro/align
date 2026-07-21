@@ -425,8 +425,24 @@ heartbeat/keep-alive コメント、`event:`/`id:` フィールド + `Last-Event
   自動 404/405/400/500。`group`。統合テストは in-process サーバパターン
   （`crates/align_driver/tests/m11_http.rs`）。
 - **W3 — アクセサ + レスポンダ。** param/query/header/body/body_str、json/status_json/text/status。
-- **W4 — 堅牢化。** route-tree 端例マトリクス（衝突、深いパス、長セグメント、空テーブル、`*`
-  tail、メソッド集合）。不正リクエストマトリクス。keepalive 再利用。
+- **W4 — 堅牢化。** 第 1 スライス 2026-07-21 出荷: **起動時テーブル検証**
+  （`router.validate`、純粋な診断。`serve` は bind 前に stderr へ出力 + `process.abort()`
+  — エラーポリシーの「起動時 abort、Err にしない」）: 既知の大文字メソッドまたは `""`、先頭 `/`
+  のパターン、名前付き `:`/`*` セグメント、`*` は tail のみ、1 パターン内で同じパラメータ名を
+  二度使わない、そして後続の行が決して勝てない PATH CLAIM の重複なし — 同一メソッド二度
+  （405 `Allow` join を重複させていたのもこれ）や、その claim に対する any-method ルートより後の
+  任意の行。パラメータ名は claim に影響しない（`/a/:x` ≡ `/a/:y`）。1 パターン上の
+  specific-then-`any` は合法のまま（フォールバック方向）。**HEAD は RFC 準拠**（9110 §9.3.2）:
+  std.http の `respond` は HEAD リクエストに対しプロトコル境界でボディを抑制する
+  （`Content-Length` は送出したまま）。`serve` は明示行のない HEAD をそのパスの GET ハンドラへ
+  ルーティングする（Respond 行のみ — stream head に HEAD 形はないので、stream 専用 GET は
+  HEAD を 405 のままにする）。**自動 404/405/500 は固定の最小 JSON ボディを持つ**
+  （`{"error":"not found"}` / `"method not allowed"` / `"internal error"`、
+  `Content-Type: application/json`）。テスト: `apps_web_validate.rs`（8 つの abort +
+  合法シャドウの serve）、`apps_web_root.rs` の HEAD/body マトリクス、runtime シリアライザ
+  ユニット。W4 の残り: route-tree 端例マトリクス（深いパス、長セグメント、空テーブル）、
+  不正リクエストマトリクス、keepalive 再利用、そしてハンドラ `Err` のロギングストーリー
+  （W5+）。
 - **W5 — router/e2e ベンチゲート。** `bench/web_router` + `bench/web_e2e`（素の std.http 比 ≈
   ゼロオーバーヘッド必須）— パフォーマンス契約を回帰固定。
 - **W6 — middleware-lite + ストリーミング** — 両方 **設計済み**（上のセクション、2026-07-21）。

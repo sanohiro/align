@@ -48,7 +48,9 @@ rb := http.response(status: i64)             // response_builder (Move — owns 
 rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
 rb.body(data: bytes)                         // optional — a header-only response is legal
 ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
-                                             // closes the accepted fd (v1: one request per conn)
+                                             // closes the accepted fd (v1: one request per conn);
+                                             // a HEAD request gets the body SUPPRESSED, its
+                                             // Content-Length kept (RFC 9110 §9.3.2; W4)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
 cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>
 ```
@@ -219,7 +221,11 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `ctx.respond(rb) -> Result<(), Error>`(ctx と rb の **両方を消費する** — `cl.request(req)` と同様に
    MIR が両スロットを null にする。シリアライズ = ステータス行 + ヘッダー + ボディがセットされた場合にのみ
    自動 Content-Length。1 回の write、R4。MSG_NOSIGNAL/SO_NOSIGPIPE。fd を閉じる、v1 は 1 コネクション
-   1 リクエスト)。`METHOD SP target SP HTTP/1.1` 向けの **新規** `http_parse_request_head` が、下記の
+   1 リクエスト)。**W4 (2026-07-21): HEAD リクエストに対する `respond` はボディバイトを抑制し、その
+   `Content-Length` は保持する(RFC 9110 §9.3.2)** — プロトコル境界で強制されるため、bodied ビルダーで
+   HEAD に応答する呼び出し側(pkg.web の HEAD→GET ルーティングを含む)はすべて構築上 RFC 準拠になる。
+   `respond_stream` / `reject` は不変(stream に HEAD 形は無い)。`METHOD SP target SP HTTP/1.1`
+   向けの **新規** `http_parse_request_head` が、下記の
    5 つの inbound スマグリング対策をすべて実装する。**3 つの新しい Move 型**
    (`http_server`/`http_request_ctx`/`response_builder`)は Gate-1 の twin-mirror スイープ一式を通した
    (2 つの Result ペイロード向けの Ty + Scalar。`response_builder` は `http request` と同じく Ty のみ。

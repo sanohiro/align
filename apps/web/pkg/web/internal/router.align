@@ -239,6 +239,182 @@ pub fn param_value(pattern: str, path: str, name: str) -> str {
   }
 }
 
+// ── Startup table validation (W4) ─────────────────────────────────────────────────────────────
+//
+// A route table is data the PROGRAMMER wrote, so a malformed table is a startup abort, never a
+// per-request error (the design doc's error policy). `validate` is the pure diagnosis half: it
+// returns "" for a well-formed table, or one message describing the FIRST problem found. `serve`
+// prints it to stderr and aborts before binding — the process never starts serving a table that
+// cannot behave as written.
+
+// Whether `m` is a method a route may register: the uppercase tokens the per-method constructors
+// produce, or "" (an `any` route). `dispatch_routes` compares methods byte-exactly, so
+// `web.route("get", ...)` would silently never match a real GET request — rejected here instead.
+fn method_known(m: str) -> bool =
+  m == "" || m == "GET" || m == "POST" || m == "PUT" || m == "DELETE"
+    || m == "PATCH" || m == "HEAD" || m == "OPTIONS"
+
+// Whether patterns `a` and `b` claim the same paths: byte-equal segments, with any `:name`
+// matching any `:name` and any `*name` matching any `*name` (parameter NAMES don't affect what a
+// pattern matches — `/a/:x` and `/a/:y` are the same claim, so a second registration of either
+// kind is dead weight the table should not carry).
+fn same_claim(a: str, b: str) -> bool {
+  mut ap := 0
+  mut bp := 0
+  alen := a.len()
+  blen := b.len()
+  loop {
+    a_done := ap >= alen
+    b_done := bp >= blen
+    if a_done && b_done { break true }
+    if a_done { break false }
+    if b_done { break false }
+    ae := seg_end(a, ap + 1)
+    be := seg_end(b, bp + 1)
+    aseg := a[ap + 1 .. ae]
+    bseg := b[bp + 1 .. be]
+    if aseg.starts_with(":") {
+      if !bseg.starts_with(":") { break false }
+    } else {
+      if aseg.starts_with("*") {
+        // A tail wildcard absorbs everything after it, so two wildcard tails claim alike.
+        break bseg.starts_with("*")
+      }
+      if bseg.starts_with(":") { break false }
+      if bseg.starts_with("*") { break false }
+      if aseg != bseg { break false }
+    }
+    ap = ae
+    bp = be
+  }
+}
+
+// The first problem in `routes`, or "" when the table is well-formed. Checked per route: a known
+// method; a pattern that starts with "/"; `:`/`*` segments with non-empty names, `*` only in the
+// tail segment, and no name used twice in one pattern. Checked per pair: no two routes making the
+// same path claim where the second can never win — the same method twice (a duplicate; also the
+// source of a duplicated 405 `Allow` join), or anything after an `any` route on that claim (an
+// empty method answers every method first, so the later row is unreachable).
+pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
+  n := routes.len()
+  mut i := 0
+  loop {
+    if i >= n { break "".clone() }
+    ri := routes[i]
+    m := ri.method
+    pat := ri.pattern
+    if !method_known(m) {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" has unknown method \"")
+      b.write(m)
+      b.write("\" (use the uppercase token, or \"\" for any)")
+      break b.to_string()
+    }
+    if pat.len() == 0 || !pat.starts_with("/") {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" pattern \"")
+      b.write(pat)
+      b.write("\" must start with \"/\"")
+      break b.to_string()
+    }
+    // Per-segment checks + the intra-pattern duplicate-name check (the outer/inner cursor walk is
+    // quadratic in SEGMENTS of one pattern — a handful; startup-only).
+    mut cur := 0
+    mut seg_err := ""
+    loop {
+      if cur >= pat.len() { break }
+      ss := cur + 1
+      se := seg_end(pat, ss)
+      seg := pat[ss..se]
+      if seg.starts_with(":") || seg.starts_with("*") {
+        name := seg[1 .. seg.len()]
+        if name.len() == 0 {
+          seg_err = "a parameter segment needs a name"
+          break
+        }
+        if seg.starts_with("*") && se < pat.len() {
+          seg_err = "a *wildcard must be the last segment"
+          break
+        }
+        // The same name twice ambiguates `param(c, name)` — scan the segments before this one.
+        mut prev := 0
+        loop {
+          if prev >= cur { break }
+          ps := prev + 1
+          pe := seg_end(pat, ps)
+          pseg := pat[ps..pe]
+          if pseg.starts_with(":") || pseg.starts_with("*") {
+            if pseg[1 .. pseg.len()] == name {
+              seg_err = "the same parameter name twice"
+              break
+            }
+          }
+          prev = pe
+        }
+        if seg_err.len() > 0 { break }
+      }
+      cur = se
+    }
+    if seg_err.len() > 0 {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" pattern \"")
+      b.write(pat)
+      b.write("\": ")
+      b.write(seg_err)
+      break b.to_string()
+    }
+    // Pair checks against every LATER route (first-registered wins is the dispatch rule, so the
+    // later row of a clashing pair is the dead one).
+    mut j := i + 1
+    mut pair_err := ""
+    mut pair_at := 0
+    loop {
+      if j >= n { break }
+      rj := routes[j]
+      if same_claim(pat, rj.pattern) {
+        if m == rj.method {
+          pair_err = "duplicate route"
+          pair_at = j
+          break
+        }
+        if m == "" {
+          pair_err = "unreachable route (an earlier any-method route claims these paths)"
+          pair_at = j
+          break
+        }
+      }
+      j = j + 1
+    }
+    if pair_err.len() > 0 {
+      rj := routes[pair_at]
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(pair_at)
+      b.write(" (")
+      b.write(rj.method)
+      b.write(" ")
+      b.write(rj.pattern)
+      b.write(") is a ")
+      b.write(pair_err)
+      b.write(" of route ")
+      b.write_int(i)
+      b.write(" (")
+      b.write(m)
+      b.write(" ")
+      b.write(pat)
+      b.write(")")
+      break b.to_string()
+    }
+    i = i + 1
+  }
+}
+
 // ── Route-table dispatch (W2) ─────────────────────────────────────────────────────────────────
 
 // Total number of '/'-separated segments across every route's pattern — the upper bound on the
