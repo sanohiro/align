@@ -64,11 +64,17 @@ quoted nowhere now).
   is the budget; the two candidates inside it are the `poll` syscall keep-alive adds per request and
   sharing one buffer between the parse and the response write. (No `strace`/`perf` on this box —
   the floor server in `bench/web_e2e` is how the path gets priced without them.)
-- **W7:** **pkg.web 491,505 req/s (32 workers) vs Go `net/http` 82,910 (32 cores) — 5.9×**, and
-  1.47× on single-connection latency. **Not closed:** the reference is Fiber, which needs Go ≥ 1.16
-  (`io/fs`) and does not build here (1.15.8), so the control is stdlib `net/http`. Install a newer
-  Go, rebuild `bench/web_e2e/go` against Fiber, re-run `EXTERNAL=`. Also worth re-running under an
-  independent generator (`wrk`/`oha`, neither installed) before quoting these anywhere external.
+- **W7: DONE.** Same box, same generator, same request, **both sides prefork** (Fiber's own
+  throughput recommendation and the analogue of `serve(..., workers)`): **pkg.web 491,505 req/s vs
+  Fiber-prefork 374,393 — 1.31×**, 1.19× on single-connection latency (70.2 vs 81.2 µs), 2.5× at the
+  p99 tail (210 vs 533 µs); 5.9× Go `net/http`. In protocol-path terms against the minimal-Rust
+  floor: **Align 4.1 µs/req, Fiber 17.9 µs, net/http 37.7 µs.** Fiber's DEFAULT (non-prefork) mode
+  is 4.3× slower than its own prefork mode — worth knowing before reading anyone's Fiber numbers.
+  Caveats live with the numbers in `bench/web_e2e/README.md`: our own generator (no `wrk`/`oha` on
+  this box, held identically against all five servers), WSL2 loopback inflating the 63 µs floor,
+  32 connections is a small load, neither side tuned. Go 1.26.5 / Fiber v2 (`bench/web_e2e/go`,
+  `-stdlib` and `-prefork` switch the mode).
+
 (#596 merged: the hoist, the dispatch chains and `bench/web_router`.) (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
 `workers = process.cpu_count()`), then W7 Fiber. **W5 IS ALREADY PAYING OFF — a first measurement
 taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed

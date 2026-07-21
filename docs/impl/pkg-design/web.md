@@ -595,13 +595,14 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
   prefork section above), so a stream costs one worker instead of the whole server.
   Middleware-lite remains designed-only.
-- **W7 — the external comparison. PARTIAL.** Same box, same generator, same request:
-  **pkg.web 491,505 req/s (32 workers) vs Go `net/http` 82,910 (32 cores) — 5.9×**; and 1.47× on
-  single-connection latency (70.2 vs 102.5 µs). Align's protocol path costs 4.1 µs above the floor
-  where Go's costs 37.7 µs. **Not closed:** the reference is Fiber, which needs Go ≥ 1.16 and does
-  not build on this box (1.15.8) — `net/http` is the stand-in. The generator is ours (`wrk`/`oha`
-  are not installed) though held identically against both sides, and WSL2 loopback inflates the
-  floor for everyone. Numbers and caveats: `bench/web_e2e/README.md`.
+- **W7 — the external comparison. DONE.** Same box, same generator, same request, both sides in
+  their prefork configuration (Fiber's own throughput recommendation, and the analogue of
+  `serve(..., workers)`): **pkg.web 491,505 req/s vs Fiber-prefork 374,393 — 1.31×**, plus 1.19× on
+  single-connection latency (70.2 vs 81.2 µs) and 2.5× at the p99 tail (210 vs 533 µs). Against Go's
+  `net/http`: 5.9×. In protocol-path terms, measured against a minimal-Rust floor: **Align 4.1 µs
+  per request, Fiber 17.9 µs, net/http 37.7 µs.** Numbers, the non-prefork Fiber row (4.3× slower
+  than its own prefork mode), and the caveats — our own generator rather than `wrk`, WSL2 loopback,
+  32 connections is a small load, neither side tuned — are in `bench/web_e2e/README.md`.
 
 ## Pitfalls
 

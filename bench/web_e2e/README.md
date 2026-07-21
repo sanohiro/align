@@ -55,26 +55,34 @@ exactly why the ping-pong *differences*, not the absolute req/s, are the result 
 
 ### W7 — the external comparison
 
-```
-                                 conns      req/s     p50 µs
-  pkg.web        (32 workers)       32     491505       44.8
-  Go net/http    (32 cores)         32      82910      141.0
+Same box, same generator, same request, same 3-route table shape. Fiber is the reference `pkg.web`
+was designed against; **both sides run their prefork configuration**, which is Fiber's own
+recommendation for throughput and the direct analogue of `web.serve(..., workers)`.
 
-  pkg.web        (1 worker)          1      14239       70.2
-  Go net/http    (all cores)         1       9702      102.5
+```
+                                     1 conn                  32 conns
+  server                        req/s   p50 µs        req/s   p50 µs   p99 µs
+  pkg.web       (32 workers)    14239     70.2       491505     44.8    210.1
+  Fiber prefork (32 procs)      11945     81.2       374393     52.9    533.4
+  Fiber         (goroutines)    11900     83.7        86582    127.5   6564.1
+  Go net/http   (32 cores)       9702    102.5        82910    141.0   1837.0
+  floor (minimal Rust)          15294     63.3            —        —        —
 ```
 
-**pkg.web is 5.9× Go's `net/http` on throughput and 1.47× on single-connection latency**, same box,
-same generator, same request. Align's protocol path costs 4.1 µs above the floor; Go's costs 37.7 µs.
+**pkg.web is 1.31× Fiber-prefork on throughput, 1.19× on single-connection latency, and 2.5× better
+at the p99 tail** (210 µs vs 533 µs) — and 5.9× Go's `net/http`. Against the floor: Align's whole
+protocol path costs 4.1 µs per request where Fiber's costs 17.9 µs and `net/http`'s 37.7 µs.
+
+Fiber's non-prefork number is included because it is what `fiber.New()` gives you by default, and
+the 4.3× gap between its two configurations is the more useful lesson than either number alone.
 
 Caveats, because a benchmark without them is advertising:
 
-- **This is `net/http`, not Fiber.** Fiber is the reference `pkg.web` was designed against, and it
-  needs Go ≥ 1.16 (`io/fs`); this box has 1.15.8, so Fiber does not build here. `net/http` is a fair
-  and widely-deployed control, but the W7 line in `pkg-design/web.md` is not closed until Fiber runs.
-- **Go got all 32 cores; Align was given 32 workers** for the throughput row (and 8 in `run.sh`'s
-  default sweep, where it still beat Go's all-core number by 2.2×).
-- **The generator is ours**, not `wrk`/`oha` — neither is installed. It is held identically against
-  both sides, and one thread per connection removes the cap the first version had, but an
-  independent generator is worth re-running under before quoting these numbers anywhere external.
-- **WSL2 loopback** inflates the floor for everyone.
+- **The generator is ours** — `wrk`/`oha` are not installed on this box. It is held identically
+  against every server here and drives one thread per connection, but an independent generator is
+  worth re-running under before these numbers are quoted externally.
+- **WSL2 loopback** inflates the floor (63 µs round-trip) for everyone, which compresses the
+  1-connection ratios. The 32-connection column is where the servers, not the transport, dominate.
+- **32 connections is a small load.** Fiber's published figures use hundreds; the ordering here may
+  not hold at that scale, and neither side was tuned (no `GOGC`, no socket tuning, default backlog).
+- Go 1.26.5, Fiber v2. Align at `--target-cpu native`, release profile.
