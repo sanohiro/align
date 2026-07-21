@@ -86,7 +86,9 @@ forwards. pkg.web ships no lookup of its own.
   arm, and `borrow_sources_inner`. All three mutation-checked against the test matrix. Two smaller
   finds: there are TWO `payload_scalar`s and the `Checker` one mislabelled every rejection as an
   "Option payload" (now takes the position it checks); and the ctx-method dispatch arm is
-  name-guarded, so `ctx.header(x)` never reaches the "try method / path / …" suggestion string.
+  name-guarded, so `ctx.header(x)` never reaches the "try method / path / …" suggestion string —
+  which is why the removed name now has its own arm that ERRORS with the replacement spelled out
+  (a diagnostic; it resolves nothing).
 - `Ty::HttpRequestCtx`'s 16-vs-8 `ty_size_align` over-report was fixed alongside, and
   `sema_and_codegen_struct_layout_agree` gained the rows it never had for a Move-handle field, a
   `Ty::Fn` field, a `slice<T>` field, the new view field, and the pkg.web `Ctx` shape.

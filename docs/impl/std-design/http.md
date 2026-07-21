@@ -839,12 +839,14 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
         `docs/open-questions.md` (next to #460, whose dataflow should own the fix). Deliberately not
         fixed here: it is neither introduced nor widened by this slice, and ending a borrow generation
         at scope-end drop is its own design.
-      - **⑨'s suggestion string is unreachable for the removed name.** The ctx-method dispatch arm
-        is name-guarded (`"method" | "path" | "headers" | …`), so `ctx.header(x)` never reaches
-        `check_http_ctx_method` and gets the generic *"unknown method '.header()' on
-        http_request_ctx"* instead of the "try …" list. The string was updated anyway (it still
-        serves an unknown method that IS in the guard list), but the migration hint a caller of the
-        old spelling sees is the generic one. Acceptable: there were no call sites to migrate.
+      - **⑨'s suggestion string is unreachable for the removed name — so the removed name got its
+        own arm.** The ctx-method dispatch arm is name-guarded (`"method" | "path" | "headers" | …`),
+        so `ctx.header(x)` never reaches `check_http_ctx_method`, and the "try …" list it would have
+        landed in is not where a caller of the old spelling arrives; the generic *"unknown method"*
+        was. Review round 1 asked for the hint to be real, so a `"header" if recv_ty ==
+        Ty::HttpRequestCtx` arm now **errors** with the replacement spelled out — it resolves
+        nothing, so it is a diagnostic, not a compat path. (The suggestion string was updated too; it
+        still serves an unknown method that IS in the guard list.)
 
 ## Known v1 limitations (Slice 2/3/5)
 

@@ -2866,7 +2866,12 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // its representation IS the `http_request_ctx` pointer, so it must lower to `ptr`. Missing
         // this arm is silent: the `_ =>` below falls through to `int_type`'s own `_ => i32`, which
         // truncates a pointer to 4 bytes — the exact bug that already happened once for `Ty::Fn`.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
+        // Derived from `is_move_handle`, not re-listed: sema's `ty_size_align` answers 8 bytes off
+        // that same predicate, and a hand-copied list here would let a future handle type land in
+        // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
+        // table happens to have a row.
+        Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
+        _ if align_sema::is_move_handle(ty) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
