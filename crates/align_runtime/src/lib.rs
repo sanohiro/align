@@ -976,6 +976,10 @@ pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut
 /// "should ... treat them like EAGAIN by retrying". Each describes THE CONNECTION that failed, not
 /// the listener, so they belong with the noise. Linux values; other BSDs surface these on the
 /// connection itself, so the list is empty there.
+///
+/// (`EOPNOTSUPP` doubles as "this socket is not `SOCK_STREAM`" — a permanent condition that would
+/// retry forever. Unreachable from the language surface: `tcp.listen` and `http.serve` are the only
+/// sources of a listener and both create stream sockets.)
 #[cfg(target_os = "linux")]
 const ACCEPT_PENDING_NET_ERRNOS: &[i32] = &[
     64,  // ENONET
@@ -15123,9 +15127,9 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
 /// this closes that connection and waits for the next one. Only a real `accept(2)` failure returns
 /// an error, which is what makes `srv.accept()?` in a serve loop correct.
 ///
-/// **Nor does a transient `accept(2)` errno** ([`AcceptFail`]): `EINTR` and `ECONNABORTED` retry
-/// immediately, and `EMFILE`/`ENFILE` reclaim a parked keep-alive connection (or, with nothing
-/// parked, back off briefly) and retry. Each of those would otherwise end the caller's loop — and
+/// **Nor does a transient `accept(2)` errno** ([`AcceptFail`]): the noise errnos go back to the
+/// wait above, and `EMFILE`/`ENFILE` spend one idle parked connection per backoff interval
+/// ([`http_yield_for_fds`]) and retry. Each of those would otherwise end the caller's loop — and
 /// under prefork, every worker in turn — over a condition the listener will outlive.
 ///
 /// # Safety
@@ -15205,20 +15209,28 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                 }
                 // A new connection, or a `poll` failure to fall back from. The parked set survives
                 // — a new client does not cost a warm one its connection — EXCEPT at capacity,
-                // where the coldest parked connection makes room. Without that valve, idle
-                // keep-alive clients would pin `HTTP_MAX_PARKED_CONNS` fds per worker until they
-                // hung up, and `accept` would start failing `EMFILE` against the process rlimit.
+                // where the coldest parked connection makes room for the one just accepted.
+                // Without that valve, idle keep-alive clients would pin `HTTP_MAX_PARKED_CONNS`
+                // fds per worker until they hung up, and `accept` would start failing `EMFILE`
+                // against the process rlimit.
                 ParkedWait::Listener | ParkedWait::Failed => {
-                    if parked_n >= HTTP_MAX_PARKED_CONNS {
-                        let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-                        if let ParkSlot::Live(fds) = &mut *slot
-                            && fds.len() >= HTTP_MAX_PARKED_CONNS
-                        {
-                            unsafe { close(fds.remove(0)) };
-                        }
-                    }
                     match unsafe { http_accept_conn(lfd) } {
-                        Ok(fd) => fd,
+                        Ok(fd) => {
+                            // Make room — but only now that a connection really did arrive. Doing
+                            // it before the `accept` spent a warm connection even when the accept
+                            // turned out to be noise (nothing accepted) or exhaustion (which spends
+                            // one of its own right below): a client that connects and vanishes
+                            // would have cost a warm client its connection for nothing.
+                            if parked_n >= HTTP_MAX_PARKED_CONNS {
+                                let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
+                                if let ParkSlot::Live(fds) = &mut *slot
+                                    && fds.len() >= HTTP_MAX_PARKED_CONNS
+                                {
+                                    unsafe { close(fds.remove(0)) };
+                                }
+                            }
+                            fd
+                        }
                         Err(AcceptFail::Fatal(status)) => return status,
                         // Back to the `poll` — the connection this wait promised is gone, but a
                         // parked client's next request may be waiting right now. Re-`accept`ing in
@@ -26292,28 +26304,45 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        // Drain both pipes on their own threads from the start. Reading only after the child exits
+        // would deadlock a child that outgrew the pipe buffer (a deep backtrace under
+        // `RUST_BACKTRACE=full`) into the watchdog, and report it as "did not recover" — the one
+        // diagnosis it isn't.
+        fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                if let Some(mut r) = pipe {
+                    let _ = r.read_to_string(&mut buf);
+                }
+                buf
+            })
+        }
+        let out_reader = drain(child.stdout.take());
+        let err_reader = drain(child.stderr.take());
         // A regressed classification blocks the child in `accept` forever rather than failing, so
         // the wait is bounded (the nested-par_map watchdog shape).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let status = loop {
+        let timed_out = loop {
             if let Some(status) = child.try_wait().unwrap() {
-                break status;
+                break Err(status);
             }
             if std::time::Instant::now() >= deadline {
+                // Killing closes the pipes, so the readers finish and their output still reaches
+                // the panic message below.
                 child.kill().unwrap();
                 child.wait().unwrap();
-                panic!("accept did not recover from descriptor exhaustion before the watchdog deadline");
+                break Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        use std::io::Read as _;
-        let (mut out, mut err) = (String::new(), String::new());
-        if let Some(s) = child.stdout.as_mut() {
-            let _ = s.read_to_string(&mut out);
-        }
-        if let Some(s) = child.stderr.as_mut() {
-            let _ = s.read_to_string(&mut err);
-        }
+        let out = out_reader.join().unwrap();
+        let err = err_reader.join().unwrap();
+        let status = match timed_out {
+            Ok(()) => panic!(
+                "accept did not recover from descriptor exhaustion before the watchdog deadline\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+            ),
+            Err(status) => status,
+        };
         assert!(status.success(), "fd-exhaustion child failed with {status}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
         // **Fail-open guard.** `libtest` exits 0 when a filter matches NOTHING, so a rename of this
         // test (or of its module) would leave the child running no test at all and the parent green.

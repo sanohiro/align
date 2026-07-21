@@ -70,6 +70,19 @@ consumer needs to branch on them), ENOENT-class DNS failure → a resolve-specif
 or `Error.Code`. Partial read/write handled by the reused reader/writer (already correct).
 Connection reset mid-stream surfaces as a read/write Error.
 
+**`l.accept()` is the exception, and deliberately so: a failure of ONE inbound connection is not a
+failure of the listener.** `accept(2)` reports both through the same errno, so the ones that
+describe the connection are retried internally instead of being returned — `EINTR`, `ECONNABORTED`
+(the client gave up between its SYN and the accept), and on Linux the already-pending network
+errors accept(2) names (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`,
+`EOPNOTSUPP`, `ENETUNREACH`), which it says to "treat like EAGAIN by retrying". So an accept loop
+written `loop { c := l.accept()? … }` cannot be ended by one client misbehaving — which is the
+whole point of the errno above reaching `Error.Code` on `connect` but not here. Everything else,
+including descriptor exhaustion (`EMFILE`/`ENFILE`), IS returned: a raw listener owns no idle
+connections it could reclaim, so that decision stays the caller's. (std.http's server rail shares
+this noise rule and additionally recovers from exhaustion — http.md item 9 — because it does own a
+parked-connection set.)
+
 ## Concurrency model
 
 The recorded rail (open-questions "Network std rails"): connection reuse by default (keepalive

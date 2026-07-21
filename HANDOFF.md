@@ -91,9 +91,11 @@ not just the feature:**
 - **Which connection exhaustion spends, and how fast.** The reclaim reads this wait's `revents` and
   takes the coldest parked connection *with no readable request* (closing one whose next request has
   already arrived drops it silently), falling back to the coldest when all are readable. And it is
-  **paced at one per 10 ms**: prefork workers share the descriptor table but each owns a separate
-  parked set, so the fds a worker lacks are usually a sibling's — unpaced, one worker would burn its
-  whole warm set in a tight loop over pressure it did not cause.
+  **paced at one per 10 ms of waiting** (state per `accept` call — the only place a burn-down could
+  run): prefork workers share the descriptor table but each owns a separate parked set, so the fds a
+  worker lacks are usually a sibling's — unpaced, one worker would burn its whole warm set in a
+  tight loop over pressure it did not cause. The capacity valve also moved to AFTER a successful
+  accept, so a connection that turns out to be noise no longer costs a warm client its connection.
 - **The child-process E2E was fail-open**: `libtest` exits 0 when a filter matches nothing, so a
   rename would have left the child running no test with the parent still green. It now pipes the
   child's output and asserts the harness's own "1 passed" (and prints both streams on failure).
@@ -102,6 +104,16 @@ Tests: the classification table (incl. the pending-network family), the reclaim-
 unit, and the out-of-process E2E under a lowered `RLIMIT_NOFILE`. Both the E2E and the fail-open
 guard are mutation-checked (reclassifying `EMFILE` as fatal fails the E2E; a renamed test trips the
 guard).
+
+**One unexplained test hang, recorded rather than hand-waved:** during this arc a single
+`cargo test -p align_runtime --lib -- http_` run wedged with two live test threads, both named
+`tests::http_ser*` (the name is truncated at 15 chars), two sockets open, no child process — i.e. a
+server test blocked in `accept` for a client connection that never arrived. It did **not** reproduce
+in 13 subsequent runs (10 × the full runtime lib suite + 3 × the same filter), and the tests in
+question are not on the changed path (they never park a connection, so they take the plain blocking
+`accept` branch, whose behaviour this arc leaves identical). Most likely the known
+port/`SO_REUSEPORT` collision class this repo has hardened before (#457) — recorded here so the next
+occurrence is a second data point rather than a first.
 
 - **The 4.1 µs protocol path — first attempt made, REVERTED, and the method matters more than the
   attempt.** Align does exactly one syscall more than the floor (`poll` before the read), so the

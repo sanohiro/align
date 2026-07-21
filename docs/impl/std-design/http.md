@@ -594,17 +594,20 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
          the coldest parked connection *with no readable request* — closing one whose next request
          has already arrived would drop a request the client never sees answered — falling back to
          the coldest outright if every one is readable, because an exhausted table must still make
-         progress. It is **paced at one connection per 10 ms** (`http_yield_for_fds`): prefork
-         workers share the process descriptor table but each owns a SEPARATE parked set, so the
-         descriptors a worker lacks are usually a sibling's (and `ENFILE` is system-wide, where
+         progress. It is **paced at one connection per 10 ms of waiting** (`http_yield_for_fds`):
+         prefork workers share the process descriptor table but each owns a SEPARATE parked set, so
+         the descriptors a worker lacks are usually a sibling's (and `ENFILE` is system-wide, where
          giving back our own may not help at all) — unpaced, one worker would burn its entire warm
-         set in a tight loop over pressure it did not cause. With nothing left to spend it just
-         backs off.
+         set in a tight loop over pressure it did not cause. The pacing state is per `accept` call,
+         which is exactly where a burn-down could happen: a call that keeps failing to accept cannot
+         spend a second connection without first waiting. (It resets when a call returns, but a call
+         only returns by handing back a request — there is no loop left to bound.) With nothing left
+         to spend it just backs off.
        - **Anything else → `Fatal`**, returned unchanged: a genuine listener-level fault is the
          only `accept` failure a serve loop should ever see.
 
-       The result is a degradation (at most one warm connection per 10 ms is spent to serve the
-       waiting request) where the server previously died. The **noise half of the rule is one
+       The result is a degradation (a warm connection is spent, paced, to serve the waiting request)
+       where the server previously died. The **noise half of the rule is one
        predicate shared with std.net's `tcp_accept`** — it had the identical hole, and an accept
        loop is an accept loop. Exhaustion is NOT shared: a raw listener holds no parked set to give
        back from, so `net`'s caller keeps that decision.

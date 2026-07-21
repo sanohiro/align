@@ -493,8 +493,8 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
   returns — with the first error — only when EVERY worker has died. Per-request faults never
   kill a worker (unchanged). **Transient `accept(2)` errnos never surface either** (shipped in
   std.http, http.md item 9): `EINTR`/`ECONNABORTED`/the pending-network family go back to the wait,
-  and `EMFILE`/`ENFILE` spend an idle parked keep-alive connection — at most one per 10 ms, since
-  the workers share a descriptor table but not their parked sets — and retry. So "a listener-level
+  and `EMFILE`/`ENFILE` spend an idle parked keep-alive connection — paced at one per 10 ms of
+  waiting, since the workers share a descriptor table but not their parked sets — and retry. So "a listener-level
   fault" now means exactly that: a worker no longer dies because a client dropped its connection
   before being accepted, or because the fd table filled up. No errno reaches Align's `Error` for
   it; the classification lives entirely under `accept`.
