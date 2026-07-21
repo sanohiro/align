@@ -965,7 +965,7 @@ pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut
         }
         let e = std::io::Error::last_os_error();
         if accept_errno_is_noise(&e) {
-            continue; // EINTR / ECONNABORTED: nothing was consumed — retry.
+            continue; // noise (EINTR / ECONNABORTED / a pending network error): nothing was consumed
         }
         return io_error_to_status(&e);
     }
