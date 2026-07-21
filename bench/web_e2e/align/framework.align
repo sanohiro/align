@@ -1,0 +1,31 @@
+module main
+
+import std.cli
+import pkg.web
+import pkg.web.types
+
+// The framework server: a route table handed to `web.serve`, which owns the accept loop, the
+// dispatch, and the response write. Three routes so the table is not degenerate; the bench only
+// drives `/plaintext`.
+
+fn plaintext(c: pkg.web.types.Ctx) -> Result<response_builder, Error> =
+  pkg.web.text("Hello, World!")
+
+fn json_route(c: pkg.web.types.Ctx) -> Result<response_builder, Error> =
+  pkg.web.json("{\"message\":\"Hello, World!\"}")
+
+fn echo_id(c: pkg.web.types.Ctx) -> Result<response_builder, Error> =
+  pkg.web.text(pkg.web.param(c, "id"))
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  cmd := cli.command("framework")
+  cmd.flag_i64("port", 0)
+  cmd.flag_i64("workers", 1)
+  p := cmd.parse(args)?
+  routes := [
+    pkg.web.get("/plaintext", plaintext),
+    pkg.web.get("/json", json_route),
+    pkg.web.get("/item/:id", echo_id),
+  ]
+  return pkg.web.serve("127.0.0.1", p.get_i64("port"), routes, p.get_i64("workers"))
+}

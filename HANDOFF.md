@@ -52,7 +52,18 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
-abort). **NEXT: W5 — the bench gate (#596 merged: the hoist, the dispatch chains and `bench/web_router` are IN; what remains is below)** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
+abort). **NEXT: W7 / the load generator — because W5's e2e gate is MET and it reprioritised the rest.**
+`bench/web_e2e` (built 2026-07-21) drives pkg.web and a hand-written `std.http` accept loop over
+keep-alive'd loopback connections: **1.032× at one worker, 0.971× at eight** — framework overhead is
+inside the noise. Crucially it also priced the router work: a request is ~30 µs, dispatch is 35 ns,
+so **the router is 0.1% of a request** and `bench/web_router`'s remaining levers (sibling index, the
+per-edge `Route` struct copy) are worth ~0.1% — do NOT prioritise them over the protocol path. What
+is still owed is an honest ABSOLUTE throughput number: the e2e harness's ~33k req/s is client-bound
+(4 threads driving connections round-robin), so it must not be quoted as capacity; a real load
+generator (`wrk`/`oha`) is the next thing to build, and it is the same tool W7's Fiber comparison
+needs. Two protocol-path candidates that harness would price: the `poll` syscall keep-alive adds per
+request, and sharing one buffer between the parse and the response write.
+(#596 merged: the hoist, the dispatch chains and `bench/web_router`.) (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
 `workers = process.cpu_count()`), then W7 Fiber. **W5 IS ALREADY PAYING OFF — a first measurement
 taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed
 BEFORE the bench is meaningful:**

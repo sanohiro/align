@@ -1,0 +1,64 @@
+module main
+
+import std.cli
+import std.http
+import std.process
+
+// The control: the same responses written directly against the `std.http` server primitive, with no
+// framework in between — one accept loop, an if/else on the path, one `respond`. This is the
+// "what does pkg.web COST" baseline: identical protocol work (keep-alive, framing, HEAD), identical
+// runtime, everything the framework adds removed.
+//
+// It mirrors `serve`'s prefork shape so the two are comparable at any worker count.
+
+fn worker(host: str, port: i64, shared: bool) -> Result<(), Error> {
+  srv := if shared { http.serve_shared(host, port)? } else { http.serve(host, port)? }
+  loop {
+    ctx := srv.accept()?
+    path := ctx.path()
+    if path == "/plaintext" {
+      rb := http.response(200)
+      rb.header("Content-Type", "text/plain; charset=utf-8")
+      rb.body("Hello, World!")
+      ctx.respond(rb) else {}
+    } else {
+      if path == "/json" {
+        rb := http.response(200)
+        rb.header("Content-Type", "application/json")
+        rb.body("{\"message\":\"Hello, World!\"}")
+        ctx.respond(rb) else {}
+      } else {
+        rb := http.response(404)
+        rb.header("Content-Type", "application/json")
+        rb.body("{\"error\":\"not found\"}")
+        ctx.respond(rb) else {}
+      }
+    }
+  }
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  cmd := cli.command("raw")
+  cmd.flag_i64("port", 0)
+  cmd.flag_i64("workers", 1)
+  p := cmd.parse(args)?
+  host := "127.0.0.1"
+  port := p.get_i64("port")
+  workers := p.get_i64("workers")
+  if workers < 1 {
+    process.abort()
+  }
+  if workers == 1 {
+    return worker(host, port, false)
+  }
+  task_group {
+    mut i := 0
+    loop {
+      if i >= workers { break }
+      spawn(fn { worker(host, port, true) })
+      i = i + 1
+    }
+    wait()?
+  }
+  return Ok(())
+}

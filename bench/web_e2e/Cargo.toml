@@ -1,0 +1,15 @@
+[package]
+name = "web-e2e-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the parent Align workspace: this is a pure client, it links nothing of Align's.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

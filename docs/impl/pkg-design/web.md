@@ -582,8 +582,14 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   SHIPPED (std.http item 9 ②; `apps_web_root.rs` keep-alive E2E). Remaining W4: route-tree
   edge matrix (deep paths, long segments, empty table), malformed-request matrix, and the
   handler-`Err` logging story (W5+).
-- **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
-  (≈ zero overhead required) — the performance contract becomes a pinned regression.
+- **W5 — the router/e2e bench gate.** Both benches exist. **`bench/web_e2e` MEETS its gate:**
+  pkg.web vs the same responses written directly on `std.http` is 1.03× at one worker and 0.97× at
+  eight — inside the harness's noise, i.e. the framework costs nothing measurable. **That result
+  also reprioritises `bench/web_router`:** a request costs ~30 µs and dispatch costs 35 ns, so the
+  router is **0.1% of a request** and its remaining levers (sibling index, the per-edge struct copy)
+  are worth ~0.1% at this table size. What W5 still owes is an honest ABSOLUTE number — the e2e
+  harness's ~33k req/s is client-bound, not a server capacity — which is the same load generator W7
+  needs.
 - **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
   **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
   prefork section above), so a stream costs one worker instead of the whole server.
