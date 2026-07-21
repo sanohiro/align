@@ -53,7 +53,29 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
 abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
-`workers = process.cpu_count()`), then W7 Fiber. **Process note worth keeping:** the arc was
+`workers = process.cpu_count()`), then W7 Fiber. **W5 IS ALREADY PAYING OFF — a first measurement
+taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed
+BEFORE the bench is meaningful:**
+
+- **Measured** (release runtime, 6-route realistic table, best of 7 × 200k dispatches):
+  **1319 ns/op**. Shrinking the SAME table to 2 routes drops it to **708 ns/op** — dispatch cost
+  scales with the number of ROUTES, which is the signature of the per-call radix build. A
+  startup-built structure is O(path segments) and flat in table size. (Contract item 3: "a
+  startup-built radix structure … No per-request pattern parsing".) The recorded follow-up
+  ("hoist the columns into `serve`'s scope — build once, match per request over borrowed slices")
+  is therefore a W5 PREREQUISITE, not a nice-to-have; expect roughly an order of magnitude.
+- **The bench shape is probed and works** — this is the awkward part, so don't re-derive it:
+  `dispatch_routes` is an INTERNAL module, so neither `main` nor a bench module outside `pkg.web`
+  may import it (D7). The working arrangement is a **window module in the BENCH TREE ONLY**,
+  `pkg/web/bench.align` (`module pkg.web.bench`, one `pub fn dispatch(routes, method, path)`
+  forwarding to `router.dispatch_routes`) — legal because D7 admits any importer under `pkg.web.`
+  — plus a `main`-unit kernel that builds the table with the public constructors and loops.
+  `alignc emit-obj kernel.align --export dispatch_bench` then writes one object per unit
+  (`--export` is entry-unit only, which is why the kernel, not the window module, holds the
+  exported fn); link all six objects + `libalign_runtime.so`. The shipped package stays clean —
+  `run.sh` copies `apps/web/pkg/**` into the bench tree and drops the window module in.
+  A scratch reproduction lived at `scratchpad/wr/` (gone with the session; the recipe above is
+  the durable part). **Process note worth keeping:** the arc was
 reviewed THREE times (the pre-PR checklist, then two independent adversarial passes) and each pass
 found real defects in the previous one's output — round 2 found seven, including a pre-existing
 `accept` contract bug that let one malformed request kill a pkg.web server. Review the FIXES, not

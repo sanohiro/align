@@ -530,7 +530,12 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    `workers = cores` sizing is now writable. `apps_web_prefork.rs` counts the listeners actually
    bound (`/proc/net/tcp`), so "spawned W tasks" can never again be mistaken for "W loops run".
 4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
-   only now is the Fiber comparison honest. THE REMAINING SLICE.
+   only now is the Fiber comparison honest. THE REMAINING SLICE. **A first measurement (2026-07-21)
+   already found the blocker: dispatch costs 1319 ns/op on a 6-route table and 708 ns/op on a
+   2-route one — it scales with TABLE SIZE, because `best_path_route` rebuilds the radix structure
+   per call.** That contradicts contract item 3 ("a startup-built radix structure … no per-request
+   pattern parsing"), so the recorded hoist (build once in `serve`, match per request over borrowed
+   slices) is a W5 prerequisite, not a follow-up.
 
 ## Slices (F3 of the plan)
 
