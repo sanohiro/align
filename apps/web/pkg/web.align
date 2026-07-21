@@ -17,10 +17,10 @@ import pkg.web.internal.query
 
 // ── Route constructors ────────────────────────────────────────────────────────────────────────
 
-// The general form. Every per-method constructor below is this with the method spelled out; an
-// EMPTY method matches any method, which is how a catch-all is written.
+// The general unary form. Every per-method constructor below is this with the method spelled out;
+// an EMPTY method matches any method, which is how a catch-all is written.
 pub fn route(method: str, pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
-  pkg.web.types.Route { method: method, pattern: pattern, handler: handler }
+  pkg.web.types.Route { method: method, pattern: pattern, stream_type: "", handler: pkg.web.types.Handler.Respond(handler) }
 
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("GET", pattern, handler)
@@ -46,6 +46,22 @@ pub fn options(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_b
 // Answers every method on `pattern` — the fallback/catch-all form.
 pub fn any(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("", pattern, handler)
+
+// The general STREAM form: the pump holds the connection and writes incrementally through the
+// `http_stream` it owns (`s.send` / `s.send_event`, then `s.finish()` — or `s.reject(rb)` before
+// the first send, the pre-stream 4xx window). `content_type` becomes the stream head's
+// `Content-Type`. Stream routes live in the same table as unary routes: same radix dispatch, same
+// method resolution, same 405 `Allow` contribution.
+pub fn stream(method: str, pattern: str, content_type: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), Error>) -> pkg.web.types.Route =
+  pkg.web.types.Route { method: method, pattern: pattern, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump) }
+
+// A Server-Sent Events route: method GET (EventSource always GETs), `Content-Type:
+// text/event-stream`. The pump writes WHATWG event frames with `s.send_event(data)` — SSE event
+// framing is std.http's (`http_stream`'s), not duplicated here: a pkg-level free fn cannot borrow
+// a Move handle, so a `web.send_event(s, …)` wrapper would consume the very stream the pump still
+// has to finish.
+pub fn sse(pattern: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), Error>) -> pkg.web.types.Route =
+  stream("GET", pattern, "text/event-stream", pump)
 
 // ── Accessors ─────────────────────────────────────────────────────────────────────────────────
 //
@@ -121,15 +137,15 @@ pub fn json(body: str) -> Result<response_builder, Error> = status_json(200, bod
 
 // ── Serving ───────────────────────────────────────────────────────────────────────────────────
 
-// Run one handler and reduce its outcome to the response that will be written: what it built, or a
-// 500 when it declined. Both arms unify to a `response_builder`, so a request yields exactly one
-// response and a handler's failure is answered rather than dropped.
+// Run one unary handler and reduce its outcome to the response that will be written: what it
+// built, or a 500 when it declined. Both arms unify to a `response_builder`, so a request yields
+// exactly one response and a handler's failure is answered rather than dropped.
 //
-// A free function rather than a `match` inline in `serve`'s loop: yielding a match-arm binding as
-// the arm's value is reported as a use-after-move on the loop's back edge, so the match lives in a
-// frame the loop does not re-enter.
-fn answer(r: pkg.web.types.Route, c: pkg.web.types.Ctx) -> response_builder {
-  match r.handler(c) {
+// (Historical note: this was originally forced out of `serve`'s loop by a MoveCheck false
+// positive on match-arm bindings at the loop back edge, fixed with the streaming wiring. It stays
+// a free function because naming the Err->500 policy reads better than an inline match.)
+fn answer(h: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>, c: pkg.web.types.Ctx) -> response_builder {
+  match h(c) {
     Ok(built) => built
     Err(e) => http.response(500)
   }
@@ -172,10 +188,35 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
         pattern: r.pattern,
         body: ctx.body(),
       }
-      // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`, so
-      // handing both to one call would move the handle while a borrow of it is still live.
-      rb := answer(r, c)
-      ctx.respond(rb) else {}
+      match r.handler {
+        Respond(h) => {
+          // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`,
+          // so handing both to one call would move the handle while a borrow of it is still live.
+          rb := answer(h, c)
+          ctx.respond(rb) else {}
+        }
+        Stream(pump) => {
+          // The framework builds the stream head; the pump never sees a builder. The head is LAZY
+          // (std.http item 8 ②): nothing is written until the pump's first send, so the pump can
+          // still `s.reject(rb)` with a complete normal response — its pre-stream 4xx window.
+          rb := http.response(200)
+          rb.header("Content-Type", r.stream_type)
+          // A cached stream is nonsense; always set.
+          rb.header("Cache-Control", "no-cache")
+          match ctx.respond_stream(rb) {
+            Ok(s) => {
+              // The pump OWNS the stream (finish/reject consume it; a dropped stream just closes).
+              // `c`'s views stay valid for the whole call: `ctx` stays here, borrowed and spent.
+              // An `Err` after the head is committed has nothing left to answer through — the
+              // stream ends and the loop moves on (the W4+ logging story covers the trace).
+              pump(c, s) else {}
+            }
+            // `respond_stream` failing means the builder was invalid or the client is already
+            // gone — either way there is no stream; serve the next request.
+            Err(e) => {}
+          }
+        }
+      }
     } else {
       // A 404 is the flood case (scanners, stale links), so it must not allocate: only once the
       // path is known to match some pattern is the `Allow` join built.

@@ -1231,12 +1231,15 @@ pub enum ExprKind {
     /// bad status is `Error.Invalid` and leaves the ctx unspent. A 1.0 request gets close-delimited
     /// raw framing (no chunked). **Impure** (network I/O).
     HttpRespondStream { ctx: Box<Expr>, rb: Box<Expr> },
-    /// `s.send(chunk)` — write one streamed chunk (one chunk frame in framed/1.1 mode, or raw payload
-    /// bytes in 1.0 mode) to the stream `s` ([`crate::Ty::HttpStream`]), yielding `Result<(), Error>`
-    /// (the `ty`). `send("")` is a no-op returning `Ok` (an empty chunk is the terminator). `s` is a
-    /// bound local, **borrowed** (mutated in place — the poison latch), not consumed; `chunk` is a byte
-    /// view. **Impure** (network I/O).
-    HttpStreamSend { stream: Box<Expr>, chunk: Box<Expr> },
+    /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk (one chunk frame in
+    /// framed/1.1 mode, or raw payload bytes in 1.0 mode) to the stream `s`
+    /// ([`crate::Ty::HttpStream`]), yielding `Result<(), Error>` (the `ty`). With `event` set the
+    /// payload is wrapped as one WHATWG SSE frame `data: {data}\n\n` inside the SAME single write
+    /// (`send_event("")` is a legal empty event, never the chunked terminator); without it,
+    /// `send("")` is a no-op returning `Ok` (an empty chunk is the terminator). `s` is a bound
+    /// local, **borrowed** (mutated in place — the poison latch), not consumed; the payload is a
+    /// byte view. **Impure** (network I/O).
+    HttpStreamSend { stream: Box<Expr>, chunk: Box<Expr>, event: bool },
     /// `s.finish()` — the sole clean terminator: write `0\r\n\r\n` (framed mode) + close, yielding
     /// `Result<(), Error>` (the `ty`). **Consumes** `s` ([`crate::Ty::HttpStream`]) — the runtime frees
     /// it. A poisoned stream (a prior failed `send`) skips the terminal write and returns `Err`.

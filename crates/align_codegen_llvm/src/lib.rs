@@ -2300,6 +2300,10 @@ fn build_module<'c>(
         module.add_function("align_rt_http_stream_send", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
     );
     funcs.insert(
+        "http_stream_send_event".to_string(),
+        module.add_function("align_rt_http_stream_send_event", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
         "http_stream_finish".to_string(),
         module.add_function("align_rt_http_stream_finish", ctx.i32_type().fn_type(&[ptr.into()], false), None),
     );
@@ -7669,11 +7673,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond_stream returns i32 status")
             }
-            Rvalue::HttpStreamSend { stream, chunk } => {
+            Rvalue::HttpStreamSend { stream, chunk, event } => {
                 let s = self.operand(stream).into_pointer_value();
                 let (dp, dl) = self.split_str(chunk)?;
+                let f = if *event { "http_stream_send_event" } else { "http_stream_send" };
                 self.builder
-                    .build_call(self.funcs["http_stream_send"], &[s.into(), dp.into(), dl.into()], "httpstreamsend")
+                    .build_call(self.funcs[f], &[s.into(), dp.into(), dl.into()], "httpstreamsend")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_send returns i32 status")
             }

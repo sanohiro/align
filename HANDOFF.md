@@ -9,11 +9,15 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-21, **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
-ENABLERS 1–4 COMPLETE — #589 (`http_stream` nameable, fn value as enum variant payload via new
+ENABLERS 1–5 ALL COMPLETE — #589 (`http_stream` nameable, fn value as enum variant payload via new
 `Scalar::Fn`, indirect-call Move-param soundness; + a capturing-closure frame-escape UAF fixed at
-`region_of(Closure)`) and the std.http `respond_stream` rework (http.md item 8 ①–③: ctx borrowed +
-spent, lazy head, `s.reject(rb)`; M12 tests replaced outright). Enabler 5 (pkg.web `Handler`
-wiring) NOT YET — and production streaming is gated on concurrent serve.**
+`region_of(Closure)`), the std.http `respond_stream` rework (http.md item 8 ①–③: ctx borrowed +
+spent, lazy head, `s.reject(rb)`; M12 tests replaced outright), and the pkg.web wiring (enabler 5:
+`Handler` Respond/Stream sum type in the ONE route table, `web.sse`/`web.stream`, serve's stream
+arm, std.http `s.send_event` — surface revised from the sketched `web.send_event(s, …)` free fn,
+which cannot borrow a Move handle; + a MoveCheck loop-back-edge false positive on match-arm
+bindings fixed). Production streaming remains gated on concurrent serve (the wiring is pinned E2E
+on the sequential loop).**
 
 ## Where pkg.web stands
 
@@ -161,8 +165,24 @@ Still open from that cluster, both unchanged by this decision:
      answers with a complete normal response — the pre-stream 4xx window. New
      `ExprKind`/`Rvalue::HttpStreamReject` wired through every pass; `m12_http_stream.rs` replaced
      outright (13 tests incl. spent-ctx-Err, reject-400, late-reject-Err E2E) + runtime unit tests.
-  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`) — NOT YET, **now unblocked**
-     (the real `fn(Ctx, http_stream)` receiver shape is verifiable against the shipped enabler 4).
+  5. pkg.web wiring — **DONE (2026-07-21):** `Handler { Respond(fn(Ctx) -> Result<response_builder,
+     Error>), Stream(fn(Ctx, http_stream) -> Result<(), Error>) }` + `Route.stream_type` in
+     `types.align` (Route stays Copy — a fn-only enum is Copy); `web.stream(method, pattern,
+     content_type, pump)` + `web.sse(pattern, pump)` (GET, text/event-stream); serve's stream arm
+     (framework builds the lazy head: Content-Type from the route + `Cache-Control: no-cache`,
+     then `Ok(s) => pump(c, s) else {}`). **`send_event` shipped as the std.http METHOD
+     `s.send_event(data)`** — the sketched `web.send_event(s, data)` free fn is unimplementable
+     (a pkg free fn takes a Move handle by value; only std bound receivers borrow — the io.copy
+     restriction class) and SSE framing was already a committed std.http floor item; WHATWG
+     `data: {data}\n\n` as ONE write sharing the lazy-head buffer, `send_event("")` = a legal
+     empty event (`HttpStreamSend` gained `event: bool` — same variant, no new-variant sweep;
+     runtime `align_rt_http_stream_send_event` over the shared `http_stream_send_parts`).
+     **MoveCheck fix en route:** a match-arm binding consumed inside a `loop` body was a false
+     "use of moved value" on the back-edge fixpoint (arm bindings never `clear_moved` on
+     (re)initialization, unlike `Let`) — exactly serve's `Ok(s) => pump(c, s)`; fixed + sema
+     regression pin. Tests: `apps_web_stream.rs` (3 E2E: SSE frames + mid-pump
+     `param`/`has_query`/`body`, reject 4xx window + loop survival, one-table 404/405-Allow with
+     stream rows), `m12_http_stream.rs` (+1, now 14), runtime framing unit.
   **Hard ordering note: production streaming needs concurrent serve first** (an open stream starves
   the sequential v1 loop); the design is independent of it, the shipping is not. The middleware
   section was also rewritten for the settled ownership model (`Option<response_builder>` verdict —
