@@ -101,6 +101,14 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   rejected the ordinary `names = src.map(up).to_array()` rebuild-each-pass idiom. It now comes from
   `storage_roots`, which *is* the borrowing position (every borrow producer routes its operand
   through it; a materializer recurses through `borrow_sources` and gets nothing).
+- **A wrapper must not launder a borrow — the third round's find, and the sharpest one.**
+  `may_need_synthetic_owner` is transparent through `{ }` / `unsafe { }`; `storage_roots` was not, so
+  a block recorded NO root at all — not `IterTemp` (correctly not a temporary) and not the place's
+  `Local` (the fallback short-circuits on an owned type). `keep = { inner }` walked past the entire
+  rule and printed freed heap, two characters from the rejected `keep = inner`, and it had slipped
+  every earlier revision of this fix. One arm fixes it; **the invariant — `storage_roots` must be
+  transparent through exactly what `may_need_synthetic_owner` is transparent through — is now
+  written next to both functions**, because that pairing is the only thing keeping them agreeing.
 - **This fix shipped a false claim TWICE, and both times the adversarial reviewer killed it.** Round
   1's commit message asserted "MIR emits exactly one class of early drop" and that hidden owners are
   safe "by construction" — both wrong, and `keep = "AAAA…".clone()` in a loop still printed freed
@@ -134,14 +142,15 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
 - Tests: the flipped `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
   `known_hole_scope_end_drop_…`), plus thirteen in `tests/borrow_liveness.rs` — back-edge, `break`
   edge, all four temporary shapes, a `json` view over a temporary and over a dropped loop-body
-  input, and the controls that keep the rule from over-rejecting: a fresh value **moved into an
-  owning local** (array and Move-struct forms), same-iteration use of a local and of a temporary, a
-  temporary outside any loop, a source declared outside the loop, an inner `break` dropping only the
-  inner body's locals, and an owned local **moved out** by `break`. Mutation-checked in five places
-  (the local set, `temp_owner_root`, the `IterTemp` edge arm, the `storage_roots` attribution, and
-  *restoring* the attribution to `borrow_sources`), each failing exactly its own tests. Whole
-  workspace green (2603 passed), clippy clean; **zero false positives** — the only pre-existing test
-  the whole arc broke was the pinned known hole.
+  input, six block-laundering shapes, and the controls that keep the rule from over-rejecting: a
+  fresh value **moved into an owning local** (array and Move-struct forms), a block over a source
+  that outlives the loop, same-iteration use of a local and of a temporary, a temporary outside any
+  loop, a source declared outside the loop, an inner `break` dropping only the inner body's locals,
+  and an owned local **moved out** by `break`. Mutation-checked in six places (the local set,
+  `temp_owner_root`, the `IterTemp` edge arm, the `storage_roots` attribution, the block-transparency
+  arm, and *restoring* the attribution to `borrow_sources`), each failing exactly its own tests.
+  Whole workspace green (2603 passed), clippy clean; **zero false positives** — the only pre-existing
+  test the whole arc broke was the pinned known hole.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
 (`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->

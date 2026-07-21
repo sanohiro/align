@@ -1249,6 +1249,11 @@ pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], 
 /// The second half of MIR's `lower_borrowed_owned` condition, with [`needs_drop_flag`] — shared
 /// here so `MoveCheck`'s borrow liveness ends a temporary's generation at exactly the loop edge
 /// where MIR frees it (the hidden owner joins the innermost loop's per-iteration drops).
+///
+/// **`MoveCheck::storage_roots` must be transparent through exactly the constructs this function is
+/// transparent through.** Where this returns `false` the borrow reaches an underlying place, and
+/// `storage_roots` must reach that place too — otherwise a wrapper records no root at all and the
+/// borrow becomes untracked (which `Block`/`Unsafe` once did).
 pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::Local(_)
@@ -8004,6 +8009,18 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
             | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
+            // **This arm and [`may_need_synthetic_owner`] must stay in lockstep.** That predicate is
+            // transparent through a block — a block whose value is a bound place borrows the place
+            // and mints no hidden owner — so without the same transparency here, a block returns
+            // neither an `IterTemp` root (the predicate said no) nor the place's `Local` root (the
+            // `_` arm's `borrow_sources` short-circuits on a non-borrowing owned type). Zero roots,
+            // and `keep = { inner }` slipped a use-after-free past the whole rule. `arena`/
+            // `task_group` blocks are deliberately NOT transparent, in either function.
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+                if let Some(v) = &b.value {
+                    roots.extend(self.storage_roots(v));
+                }
+            }
             _ => roots.extend(self.borrow_sources(e)),
         }
         roots

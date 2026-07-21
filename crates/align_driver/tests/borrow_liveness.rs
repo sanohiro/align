@@ -834,3 +834,75 @@ fn main() -> Result<(), Error> {
         "a doc over a dropped loop-body input must be rejected against that name: {diags}"
     );
 }
+
+/// **A wrapper must not launder a borrow.** `may_need_synthetic_owner` is transparent through
+/// `{ }` / `unsafe { }` — a block whose value is a bound place borrows that place and mints no
+/// hidden owner — so `storage_roots` has to reach the same place. Until it did, a block recorded
+/// **no** root at all: not `IterTemp` (the predicate correctly said "not a temporary") and not the
+/// place's `Local` (the fallback's `borrow_sources` short-circuits on an owned, non-borrowing type).
+/// `keep = { inner }` therefore walked straight past the whole scope-end-drop rule and printed freed
+/// heap bytes — two characters away from the rejected `keep = inner`.
+///
+/// `arena {}` / `task_group {}` are deliberately NOT transparent in either function, so they are
+/// covered by the `IterTemp` path instead (over-approximately, but soundly).
+#[test]
+fn a_block_wrapper_does_not_launder_a_view_of_a_dropped_source() {
+    let cases: [(&str, &str); 5] = [
+        ("bare", "keep = { inner }"),
+        ("decl-inside", "keep = { made := mk(\"AAAAAAAAAAAAAAAA\"); made }"),
+        ("unsafe", "keep = unsafe { inner }"),
+        ("through-call", "keep = identity({ inner })"),
+        ("nested", "keep = { { { inner } } }"),
+    ];
+    for (name, assign) in cases {
+        let src = format!(
+            "fn mk(a: str) -> string = a.clone()\n\
+             fn identity(s: str) -> str = s\n\
+             fn main() -> i32 {{\n  mut keep: str := \"start\"\n  mut n := 0\n  loop {{\n    \
+             inner := mk(\"AAAAAAAAAAAAAAAA\")\n    {assign}\n    n = n + 1\n    \
+             if n > 3 {{ break }}\n  }}\n  print(keep)\n  return 0\n}}\n"
+        );
+        assert!(
+            check_errs(&format!("borrow-block-launder-{name}"), &src),
+            "a `{name}` block wrapper must not hide that the borrow's source dies with the iteration"
+        );
+    }
+
+    // A place *reached through* a block — the field of a Move struct the iteration drops.
+    let field = "\
+Holder { text: string }
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    h := Holder { text: mk(\"AAAAAAAAAAAAAAAA\") }
+    keep = { h.text }
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    assert!(check_errs("borrow-block-launder-field", field));
+
+    // The control: a block over a source that OUTLIVES the loop stays legal — transparency must not
+    // turn into blanket rejection.
+    let ok = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  outer := mk(\"hello\")
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    keep = { outer }
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    assert!(!check_errs("borrow-block-outer-source", ok));
+}
