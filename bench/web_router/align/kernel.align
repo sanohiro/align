@@ -1,0 +1,251 @@
+module main
+
+import pkg.web
+import pkg.web.types
+import pkg.web.bench
+
+// The kernel holds every exported entry point, because `--export` is entry-unit only.
+//
+// Two dispatchers over the SAME six-route table, timed on the same four request shapes:
+//
+//   `fw` — the shipped framework router: the radix tree built ONCE (as `serve` does), then matched
+//          per request, with priority order (static > :param > *wildcard) and the method table
+//          behind it.
+//   `hw` — what the app would write by hand with no framework at all: a whole-path `==` chain with
+//          two `starts_with` prefixes for the parameterised routes. It resolves LESS than the
+//          router does (no capture, no priority resolution, no `Allow` set), so it is the fastest
+//          honest control for this table.
+//
+// **The request path must be runtime data** (`bench/README.md`: "Runtime data, never literals").
+// With the path spelled as a literal at the call site, the hand-written chain constant-folds to its
+// answer and "measures" an empty loop — the first version of this bench read 2.5 ns/op for the
+// static shape, i.e. the loop counter alone. Both sides therefore take an opaque `shape` and index
+// a path table with it, which no constant folding can see through.
+
+fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = pkg.web.text("x")
+
+// The hand-written control. Route indices match the table below, so both sides return the same
+// number for the same request — the harness asserts that before timing anything.
+fn hand_match(method: str, path: str) -> i64 {
+  if path == "/v1/models" {
+    if method == "GET" { return 0 }
+    if method == "POST" { return 1 }
+    return -1
+  }
+  if path == "/v1/chat/completions" {
+    if method == "GET" { return 3 }
+    return -1
+  }
+  if path == "/health" {
+    if method == "GET" { return 4 }
+    return -1
+  }
+  if path.starts_with("/v1/models/") {
+    if method == "GET" { return 2 }
+    return -1
+  }
+  if path.starts_with("/assets/") {
+    if method == "GET" { return 5 }
+    return -1
+  }
+  return -1
+}
+
+// `shape`: 0 static hit, 1 `:param` hit, 2 `*wildcard` hit, 3 miss. Out of range answers the miss
+// path rather than aborting on an out-of-bounds index.
+fn path_of(paths: slice<str>, shape: i64) -> str {
+  if shape < 0 || shape >= paths.len() {
+    return paths[3]
+  }
+  return paths[shape]
+}
+
+// The framework dispatch loop: table + tree built ONCE outside it, exactly as `serve` does.
+pub fn fw(shape: i64, n: i64) -> i64 {
+  routes := [
+    pkg.web.get("/v1/models", h),
+    pkg.web.post("/v1/models", h),
+    pkg.web.get("/v1/models/:id", h),
+    pkg.web.get("/v1/chat/completions", h),
+    pkg.web.get("/health", h),
+    pkg.web.get("/assets/*file", h),
+  ]
+  paths := ["/v1/models", "/v1/models/42", "/assets/css/site.css", "/v2/nope"]
+  path := path_of(paths, shape)
+  tree := pkg.web.bench.build(routes)
+  mut acc := 0
+  mut i := 0
+  loop {
+    if i >= n { break acc }
+    acc = acc + pkg.web.bench.dispatch(routes, tree[..], "GET", path)
+    i = i + 1
+  }
+}
+
+// The hand-written control loop, same shapes, same runtime-selected path.
+pub fn hw(shape: i64, n: i64) -> i64 {
+  paths := ["/v1/models", "/v1/models/42", "/assets/css/site.css", "/v2/nope"]
+  path := path_of(paths, shape)
+  mut acc := 0
+  mut i := 0
+  loop {
+    if i >= n { break acc }
+    acc = acc + hand_match("GET", path)
+    i = i + 1
+  }
+}
+
+// ── The scaling gate ──────────────────────────────────────────────────────────────────────────
+//
+// The same dispatch over a 128-route table (8 groups x 8 resources x {static, :param}). Contract
+// item 3 says dispatch is O(path segments) and FLAT in table size, so `fw_big` must land on
+// `fw`'s numbers — not on `fw`'s numbers plus a per-route slope. An adversarial review measured
+// the pre-chain implementation at ~0.85 ns per route (44 ns at 8 routes, 453 ns at 512), which a
+// six-route bench could not resolve at all; this shape is what makes the property a gate rather
+// than a claim in prose.
+//
+// `shape`: 0 = a static hit on the FIRST route, 1 = a `:param` hit on the LAST group, 2 = a miss.
+// The first two are the interesting ends — a linear scan finds route 0 immediately and the last
+// one only after the whole table.
+pub fn fw_big(shape: i64, n: i64) -> i64 {
+  routes := [
+    pkg.web.get("/api/g0/res0", h),
+    pkg.web.get("/api/g0/res0/:id", h),
+    pkg.web.get("/api/g0/res1", h),
+    pkg.web.get("/api/g0/res1/:id", h),
+    pkg.web.get("/api/g0/res2", h),
+    pkg.web.get("/api/g0/res2/:id", h),
+    pkg.web.get("/api/g0/res3", h),
+    pkg.web.get("/api/g0/res3/:id", h),
+    pkg.web.get("/api/g0/res4", h),
+    pkg.web.get("/api/g0/res4/:id", h),
+    pkg.web.get("/api/g0/res5", h),
+    pkg.web.get("/api/g0/res5/:id", h),
+    pkg.web.get("/api/g0/res6", h),
+    pkg.web.get("/api/g0/res6/:id", h),
+    pkg.web.get("/api/g0/res7", h),
+    pkg.web.get("/api/g0/res7/:id", h),
+    pkg.web.get("/api/g1/res0", h),
+    pkg.web.get("/api/g1/res0/:id", h),
+    pkg.web.get("/api/g1/res1", h),
+    pkg.web.get("/api/g1/res1/:id", h),
+    pkg.web.get("/api/g1/res2", h),
+    pkg.web.get("/api/g1/res2/:id", h),
+    pkg.web.get("/api/g1/res3", h),
+    pkg.web.get("/api/g1/res3/:id", h),
+    pkg.web.get("/api/g1/res4", h),
+    pkg.web.get("/api/g1/res4/:id", h),
+    pkg.web.get("/api/g1/res5", h),
+    pkg.web.get("/api/g1/res5/:id", h),
+    pkg.web.get("/api/g1/res6", h),
+    pkg.web.get("/api/g1/res6/:id", h),
+    pkg.web.get("/api/g1/res7", h),
+    pkg.web.get("/api/g1/res7/:id", h),
+    pkg.web.get("/api/g2/res0", h),
+    pkg.web.get("/api/g2/res0/:id", h),
+    pkg.web.get("/api/g2/res1", h),
+    pkg.web.get("/api/g2/res1/:id", h),
+    pkg.web.get("/api/g2/res2", h),
+    pkg.web.get("/api/g2/res2/:id", h),
+    pkg.web.get("/api/g2/res3", h),
+    pkg.web.get("/api/g2/res3/:id", h),
+    pkg.web.get("/api/g2/res4", h),
+    pkg.web.get("/api/g2/res4/:id", h),
+    pkg.web.get("/api/g2/res5", h),
+    pkg.web.get("/api/g2/res5/:id", h),
+    pkg.web.get("/api/g2/res6", h),
+    pkg.web.get("/api/g2/res6/:id", h),
+    pkg.web.get("/api/g2/res7", h),
+    pkg.web.get("/api/g2/res7/:id", h),
+    pkg.web.get("/api/g3/res0", h),
+    pkg.web.get("/api/g3/res0/:id", h),
+    pkg.web.get("/api/g3/res1", h),
+    pkg.web.get("/api/g3/res1/:id", h),
+    pkg.web.get("/api/g3/res2", h),
+    pkg.web.get("/api/g3/res2/:id", h),
+    pkg.web.get("/api/g3/res3", h),
+    pkg.web.get("/api/g3/res3/:id", h),
+    pkg.web.get("/api/g3/res4", h),
+    pkg.web.get("/api/g3/res4/:id", h),
+    pkg.web.get("/api/g3/res5", h),
+    pkg.web.get("/api/g3/res5/:id", h),
+    pkg.web.get("/api/g3/res6", h),
+    pkg.web.get("/api/g3/res6/:id", h),
+    pkg.web.get("/api/g3/res7", h),
+    pkg.web.get("/api/g3/res7/:id", h),
+    pkg.web.get("/api/g4/res0", h),
+    pkg.web.get("/api/g4/res0/:id", h),
+    pkg.web.get("/api/g4/res1", h),
+    pkg.web.get("/api/g4/res1/:id", h),
+    pkg.web.get("/api/g4/res2", h),
+    pkg.web.get("/api/g4/res2/:id", h),
+    pkg.web.get("/api/g4/res3", h),
+    pkg.web.get("/api/g4/res3/:id", h),
+    pkg.web.get("/api/g4/res4", h),
+    pkg.web.get("/api/g4/res4/:id", h),
+    pkg.web.get("/api/g4/res5", h),
+    pkg.web.get("/api/g4/res5/:id", h),
+    pkg.web.get("/api/g4/res6", h),
+    pkg.web.get("/api/g4/res6/:id", h),
+    pkg.web.get("/api/g4/res7", h),
+    pkg.web.get("/api/g4/res7/:id", h),
+    pkg.web.get("/api/g5/res0", h),
+    pkg.web.get("/api/g5/res0/:id", h),
+    pkg.web.get("/api/g5/res1", h),
+    pkg.web.get("/api/g5/res1/:id", h),
+    pkg.web.get("/api/g5/res2", h),
+    pkg.web.get("/api/g5/res2/:id", h),
+    pkg.web.get("/api/g5/res3", h),
+    pkg.web.get("/api/g5/res3/:id", h),
+    pkg.web.get("/api/g5/res4", h),
+    pkg.web.get("/api/g5/res4/:id", h),
+    pkg.web.get("/api/g5/res5", h),
+    pkg.web.get("/api/g5/res5/:id", h),
+    pkg.web.get("/api/g5/res6", h),
+    pkg.web.get("/api/g5/res6/:id", h),
+    pkg.web.get("/api/g5/res7", h),
+    pkg.web.get("/api/g5/res7/:id", h),
+    pkg.web.get("/api/g6/res0", h),
+    pkg.web.get("/api/g6/res0/:id", h),
+    pkg.web.get("/api/g6/res1", h),
+    pkg.web.get("/api/g6/res1/:id", h),
+    pkg.web.get("/api/g6/res2", h),
+    pkg.web.get("/api/g6/res2/:id", h),
+    pkg.web.get("/api/g6/res3", h),
+    pkg.web.get("/api/g6/res3/:id", h),
+    pkg.web.get("/api/g6/res4", h),
+    pkg.web.get("/api/g6/res4/:id", h),
+    pkg.web.get("/api/g6/res5", h),
+    pkg.web.get("/api/g6/res5/:id", h),
+    pkg.web.get("/api/g6/res6", h),
+    pkg.web.get("/api/g6/res6/:id", h),
+    pkg.web.get("/api/g6/res7", h),
+    pkg.web.get("/api/g6/res7/:id", h),
+    pkg.web.get("/api/g7/res0", h),
+    pkg.web.get("/api/g7/res0/:id", h),
+    pkg.web.get("/api/g7/res1", h),
+    pkg.web.get("/api/g7/res1/:id", h),
+    pkg.web.get("/api/g7/res2", h),
+    pkg.web.get("/api/g7/res2/:id", h),
+    pkg.web.get("/api/g7/res3", h),
+    pkg.web.get("/api/g7/res3/:id", h),
+    pkg.web.get("/api/g7/res4", h),
+    pkg.web.get("/api/g7/res4/:id", h),
+    pkg.web.get("/api/g7/res5", h),
+    pkg.web.get("/api/g7/res5/:id", h),
+    pkg.web.get("/api/g7/res6", h),
+    pkg.web.get("/api/g7/res6/:id", h),
+    pkg.web.get("/api/g7/res7", h),
+    pkg.web.get("/api/g7/res7/:id", h),
+  ]
+  paths := ["/api/g0/res0", "/api/g7/res7/42", "/api/zz/nope/42", "/api/zz/nope/42"]
+  path := path_of(paths, shape)
+  tree := pkg.web.bench.build(routes)
+  mut acc := 0
+  mut i := 0
+  loop {
+    if i >= n { break acc }
+    acc = acc + pkg.web.bench.dispatch(routes, tree[..], "GET", path)
+    i = i + 1
+  }
+}

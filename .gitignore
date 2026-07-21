@@ -31,6 +31,9 @@ target
 # bench build artifacts
 bench/kernels.o
 bench/harness
+# `alignc emit-obj` writes one object per module into the CWD (bench/web_router/run.sh emits into a
+# temp tree, but a manual run in the bench dir leaves them behind).
+bench/*/*.o
 ll_out/
 *.ll
 

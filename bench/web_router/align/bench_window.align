@@ -1,0 +1,15 @@
+module pkg.web.bench
+
+import pkg.web.types
+import pkg.web.internal.router
+
+// A window onto the internal router so a benchmark can time dispatch directly. `dispatch_routes`
+// lives in `pkg.web.internal.*`, which the pkg-foundation D7 rule makes importable only from within
+// `pkg.web` — so this module has to sit under `pkg.web.` to see it. It exists ONLY in the bench
+// tree: `run.sh` copies the shipped `apps/web/pkg/**` sources next to it, and the package that
+// ships has no bench module.
+pub fn build(routes: slice<pkg.web.types.Route>) -> array<i64> =
+  pkg.web.internal.router.build_tree(routes)
+
+pub fn dispatch(routes: slice<pkg.web.types.Route>, t: slice<i64>, method: str, path: str) -> i64 =
+  pkg.web.internal.router.dispatch_routes(routes, t, method, path)

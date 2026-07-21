@@ -60,9 +60,13 @@ BEFORE the bench is meaningful:**
 - **Measured, then FIXED (the hoist is DONE — 2026-07-21).** Before: 1319 ns/op over a 6-route
   table, 708 ns/op over a 2-route one (release runtime, best of 7 × 200k dispatches) — cost scaling
   with the number of ROUTES, the signature of the per-call radix build. After hoisting the build
-  out of the request path: **57.3 ns/op at 6 routes, 55.4 ns/op at 2** — a **23× drop**, and now
-  **flat in table size**, which is what contract item 3 actually asks for ("a startup-built radix
-  structure … No per-request pattern parsing"). Shape: `router.build_tree(routes)` returns ONE flat
+  out of the request path: **1319 → 57 ns/op**, a **23× drop**. Then the two O(table) scans inside
+  dispatch went too (per-node edge chains + a same-pattern route chain, both built once). **Item 3
+  is still NOT literally met and `bench/web_router` now GATES it:** its scaling row measures the
+  same shapes over 6 and 128 routes and reports **2.84×**, not 1.00×. The remaining levers are the
+  per-node sibling scan (linked chain + a string compare per sibling — wants a first-byte bucket or
+  a sorted edge run) and the per-edge `Route` struct copy forced by `routes[i].pattern` being
+  rejected through a `slice<struct>` (compiler-side lever). The `:param` row is already 1.11×. Shape: `router.build_tree(routes)` returns ONE flat
   `array<i64>` (header `[cap, ec]` + eight contiguous columns — the soa/tape/offset-table move),
   `worker` builds it once before the accept loop, and `dispatch_routes` / `method_not_allowed` /
   `allow_methods` / `tree_best_path` all take that borrowed tree. `best_path_route(routes, path)`

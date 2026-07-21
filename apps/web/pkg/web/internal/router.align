@@ -1,5 +1,7 @@
 module pkg.web.internal.router
 
+import std.io
+import std.process
 import pkg.web.types
 
 // pkg.web router core — pattern matching over '/'-separated path segments (W1 slice 1).
@@ -125,11 +127,11 @@ pub fn dispatch(patterns: slice<str>, path: str) -> i64 {
 // The dispatch design (not an optimization — the linear scan above is only the differential oracle).
 // The route table compiles into flat **struct-of-arrays** i64 columns (Align can't build a runtime-
 // sized array<struct>, and SoA is the idiomatic "soa/tape/offset-table" move anyway): a node table
-// (`n_param`/`n_wild`/`n_leaf`) and an edge table (`e_par`/`e_child` + a zero-copy label as
-// `(e_pat, e_start, e_end)` = a view into that route's pattern, so no label is ever allocated).
-// The build lives in `best_path_route` (per call for now; hoisting the columns into `serve`'s scope
-// is the recorded follow-up) and the walk in `tree_walk`, which takes the columns as borrowed
-// slices — the owned columns never leave the builder's scope.
+// (`n_param`/`n_wild`/`n_leaf`/`n_efirst`) and an edge table (`e_child`/`e_next` + a zero-copy label
+// as `(e_pat, e_start, e_end)` = a view into that route's pattern, so no label is ever allocated),
+// all inside ONE owned `array<i64>`. The build is `build_tree`, called ONCE by `serve` before its
+// accept loop; the walk is `tree_walk`, which takes that array borrowed. See the layout block above
+// `build_tree` for the column order and why the bound check at the end of the build is load-bearing.
 //
 // The walk tries static > `:param` > `*wildcard` at every node **with backtracking** (matchit
 // semantics): if the preferred branch dead-ends deeper in the path, the walk unwinds and tries the
@@ -179,14 +181,25 @@ pub fn filled(m: i64, v: i64) -> array<i64> {
 // O(path segments) and flat in table size; the tree is built and checked ONCE at `serve()`).
 
 // Column bases into the flat tree, for a tree whose per-column length is `cap`.
+//
+// Node columns (indexed by node id): `param`/`wild` children, the `leaf` route, and `efirst` — the
+// head of this node's own static-edge chain. Edge columns (by edge id): the child node, the label
+// triple, and `enext` — the next edge sharing this parent. Route columns (by route index): `rnext`,
+// the next route registered on the SAME pattern.
+//
+// The three chains are what make dispatch O(path segments): without `efirst`/`enext` a walk scans
+// EVERY edge at every node, and without `rnext` the method phase scans EVERY route with a string
+// compare — both O(table), which is what the contract forbids.
 fn c_param(cap: i64) -> i64 = 2
 fn c_wild(cap: i64) -> i64 = 2 + cap
 fn c_leaf(cap: i64) -> i64 = 2 + 2 * cap
-fn c_epar(cap: i64) -> i64 = 2 + 3 * cap
+fn c_efirst(cap: i64) -> i64 = 2 + 3 * cap
 fn c_echild(cap: i64) -> i64 = 2 + 4 * cap
 fn c_epat(cap: i64) -> i64 = 2 + 5 * cap
 fn c_estart(cap: i64) -> i64 = 2 + 6 * cap
 fn c_eend(cap: i64) -> i64 = 2 + 7 * cap
+fn c_enext(cap: i64) -> i64 = 2 + 8 * cap
+fn c_rnext(cap: i64) -> i64 = 2 + 9 * cap
 
 // Build the radix tree over the route table: insert each route's pattern segment-by-segment, read
 // straight out of `routes[r].pattern` (a table cannot be projected to a `slice<str>` —
@@ -194,17 +207,25 @@ fn c_eend(cap: i64) -> i64 = 2 + 7 * cap
 // a leaf; the FIRST registered wins, exactly as the linear oracle's strict `>` keeps the first max.
 // Called ONCE per serve loop; the result is matched against per request by `tree_best_path`.
 pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
-  cap := count_route_segs(routes) + 2
-  mut t := filled(2 + 8 * cap, -1)
+  // ONE bound for every column, because the columns are indexed by three different things: node
+  // ids and edge ids (both bounded by the total segment count — each segment creates at most one
+  // node and one edge) and ROUTE indices (`rnext`). Sizing by segments alone would be a live
+  // overflow: a table of routes whose patterns have no segments at all (`""` — `validate` rejects
+  // it, but `build_tree` is reachable without `validate`, e.g. from the differential tests) has
+  // `count_route_segs == 0` and any number of routes.
+  cap := count_route_segs(routes) + routes.len() + 2
+  mut t := filled(2 + 10 * cap, -1)
   t[0] = cap
   npar := c_param(cap)
   nwil := c_wild(cap)
   nlea := c_leaf(cap)
-  epar := c_epar(cap)
+  efir := c_efirst(cap)
   echi := c_echild(cap)
   epat := c_epat(cap)
   esta := c_estart(cap)
   eend := c_eend(cap)
+  enex := c_enext(cap)
+  rnex := c_rnext(cap)
   mut nc := 1
   mut ec := 0
   np := routes.len()
@@ -236,28 +257,29 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
         cur = se
       } else {
         mut child := -1
-        mut j := 0
+        mut j := t[efir + node]
         loop {
-          if j >= ec { break }
-          if t[epar + j] == node {
-            rl := routes[t[epat + j]]
-            lp := rl.pattern
-            lab := lp[t[esta + j]..t[eend + j]]
-            if lab == seg {
-              child = t[echi + j]
-              break
-            }
+          if j < 0 { break }
+          rl := routes[t[epat + j]]
+          lp := rl.pattern
+          lab := lp[t[esta + j]..t[eend + j]]
+          if lab == seg {
+            child = t[echi + j]
+            break
           }
-          j = j + 1
+          j = t[enex + j]
         }
         if child == -1 {
           child = nc
           nc = nc + 1
-          t[epar + ec] = node
           t[echi + ec] = child
           t[epat + ec] = r
           t[esta + ec] = ss
           t[eend + ec] = se
+          // Link the new edge at the head of this node's chain. Labels at a node are unique (this
+          // very loop deduped them), so chain order cannot change which edge matches.
+          t[enex + ec] = t[efir + node]
+          t[efir + node] = ec
           ec = ec + 1
         }
         node = child
@@ -266,7 +288,37 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
     }
     r = r + 1
   }
+  // The same-pattern route chain: from each route, the next route registered on the SAME pattern.
+  // The method phase walks this instead of scanning the whole table with a string compare per row.
+  // O(routes^2) string compares here, once, at startup — never per request.
+  mut a := 0
+  loop {
+    if a >= np { break }
+    ra := routes[a]
+    mut b := a + 1
+    loop {
+      if b >= np { break }
+      rb := routes[b]
+      if rb.pattern == ra.pattern {
+        t[rnex + a] = b
+        break
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
   t[1] = ec
+  // A startup-only bound check, and it is load-bearing rather than defensive. In the eight-array
+  // layout an out-of-range node/edge id hit `array<i64>`'s own bounds check and ABORTED; flattened
+  // into one array, `t[c_param(cap) + cap]` is simply the first entry of the next column, so the
+  // same mistake would silently corrupt the tree and MISROUTE requests (an adversarial review
+  // demonstrated exactly that: a deliberately-off-by-one `cap` returned route 0 for `/d` instead of
+  // route 3, exit code 0). This restores the loud failure at zero per-request cost.
+  if nc > cap || ec > cap || np > cap {
+    e := io.stderr
+    e.write("pkg.web router: route tree exceeded its column bound (build_tree)\n") else {}
+    process.abort()
+  }
   t
 }
 
@@ -277,7 +329,6 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
 // built tree, borrowed; labels resolve zero-copy through `routes[e_pat[j]].pattern`.
 fn tree_walk(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str, node: i64, cur: i64) -> i64 {
   cap := t[0]
-  ec := t[1]
   nwil := c_wild(cap)
   if cur >= path.len() {
     return t[c_leaf(cap) + node]
@@ -285,24 +336,28 @@ fn tree_walk(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str, node:
   ss := cur + 1
   se := seg_end(path, ss)
   seg := path[ss..se]
-  epar := c_epar(cap)
   epat := c_epat(cap)
   esta := c_estart(cap)
   eend := c_eend(cap)
+  enex := c_enext(cap)
+  // Only THIS node's static edges, off its own chain — not the whole edge table.
   mut child := -1
-  mut j := 0
+  mut j := t[c_efirst(cap) + node]
   loop {
-    if j >= ec { break }
-    if t[epar + j] == node {
-      rl := routes[t[epat + j]]
-      lp := rl.pattern
-      lab := lp[t[esta + j]..t[eend + j]]
-      if lab == seg {
-        child = t[c_echild(cap) + j]
-        break
-      }
+    if j < 0 { break }
+    // NOTE: this binds the whole `Route` (four 16-byte views) just to read `.pattern`, on the
+    // hottest path in the framework. `routes[i].pattern` — the projection that would avoid the
+    // copy — is rejected: "'arr[i].pattern' needs a struct array or soa, got slice<struct>".
+    // Field projection through a `slice<struct>` index is recorded compiler backlog; it is worth
+    // real ns here (see `bench/web_router/README.md`).
+    rl := routes[t[epat + j]]
+    lp := rl.pattern
+    lab := lp[t[esta + j]..t[eend + j]]
+    if lab == seg {
+      child = t[c_echild(cap) + j]
+      break
     }
-    j = j + 1
+    j = t[enex + j]
   }
   if child != -1 {
     r := tree_walk(routes, t, path, child, se)
@@ -615,7 +670,8 @@ pub fn best_path_route_linear(routes: slice<pkg.web.types.Route>, path: str) -> 
 
 // Dispatch a ROUTE TABLE: the index of the route that should answer `method` + `path`, or -1.
 //
-// Path matching goes through `best_path_route` — the RADIX TREE built directly over the table
+// Path matching goes through `tree_best_path` over the tree `build_tree` produced — the RADIX TREE
+// built directly over the table
 // (reading `.pattern` per route), differential-pinned against `best_path_route_linear`'s
 // `match_score` ordering. Priority: static > `:param` > `*wildcard`. The method is then checked on
 // the winning path. A route whose `method` is empty answers any method, which is how a fallback is
@@ -625,26 +681,24 @@ pub fn best_path_route_linear(routes: slice<pkg.web.types.Route>, path: str) -> 
 //
 // Returns -1 for "no path matched" (a 404). `method_not_allowed` distinguishes the 405 case.
 pub fn dispatch_routes(routes: slice<pkg.web.types.Route>, t: slice<i64>, method: str, path: str) -> i64 {
-  n := routes.len()
   best := tree_best_path(routes, t, path)
   if best < 0 {
     return -1
   }
   // The winning PATH is fixed; now pick the route on that path whose method matches (an empty
-  // method answers anything). Scanning in table order makes the first registered match win.
-  bw := routes[best]
-  winner := bw.pattern
-  mut j := 0
+  // method answers anything). `best` is the FIRST route registered on that pattern and `rnext`
+  // chains the rest in table order, so this walks only the methods of the matched path — the first
+  // registered match still wins, without a single pattern comparison.
+  rnex := c_rnext(t[0])
+  mut j := best
   loop {
-    if j >= n { break -1 }
+    if j < 0 { break -1 }
     rj := routes[j]
-    if rj.pattern == winner {
-      m := rj.method
-      if m.len() == 0 || m == method {
-        break j
-      }
+    m := rj.method
+    if m.len() == 0 || m == method {
+      break j
     }
-    j = j + 1
+    j = t[rnex + j]
   }
 }
 
@@ -672,23 +726,19 @@ pub fn allow_methods(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: st
   if best < 0 {
     return b.to_string()
   }
-  bw := routes[best]
-  winner := bw.pattern
-  n := routes.len()
-  mut i := 0
+  rnex := c_rnext(t[0])
+  mut i := best
   mut count := 0
   loop {
-    if i >= n { break }
+    if i < 0 { break }
     ri := routes[i]
-    if ri.pattern == winner {
-      m := ri.method
-      if m.len() > 0 {
-        if count > 0 { b.write(", ") }
-        b.write(m)
-        count = count + 1
-      }
+    m := ri.method
+    if m.len() > 0 {
+      if count > 0 { b.write(", ") }
+      b.write(m)
+      count = count + 1
     }
-    i = i + 1
+    i = t[rnex + i]
   }
   b.to_string()
 }

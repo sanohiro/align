@@ -536,11 +536,17 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    `best_path_route` rebuilt the radix structure per call, contradicting contract item 3 ("a
    startup-built radix structure … no per-request pattern parsing"). The tree is now built ONCE by
    `router.build_tree(routes)` in `worker`, before the accept loop, as a single flat `array<i64>`
-   (offset header + eight contiguous columns), and matched per request by `tree_best_path` —
-   **57.3 ns/op at 6 routes, 55.4 ns/op at 2**, i.e. a 23× drop and now FLAT in table size, which is
-   the property the contract actually asks for. `dispatch_routes` / `method_not_allowed` /
-   `allow_methods` take the built tree; `best_path_route` remains as the build-and-match convenience
-   for the differential tests.
+   (offset header + ten contiguous columns), and matched per request by `tree_best_path` —
+   **1319 → 57 ns/op**, a 23× drop. The two O(table) scans inside dispatch went with it (per-node
+   edge chains + a same-pattern route chain, both built once). `dispatch_routes` /
+   `method_not_allowed` / `allow_methods` take the built tree; `best_path_route` remains as the
+   build-and-match convenience for the differential tests. **Item 3 is still not literally met, and
+   `bench/web_router` now GATES it rather than asserting it:** its scaling row measures the same
+   shapes over 6 and 128 routes and reports **2.84×**, not 1.00×. Two levers remain, both recorded
+   in that bench's README — the per-node sibling scan (a node's static edges are a linked chain with
+   a string compare each; a first-byte bucket or a sorted edge run would make it O(1)/O(log)), and
+   the per-edge `Route` struct copy forced by `routes[i].pattern` being rejected through a
+   `slice<struct>`. The `:param` row is already 1.11×, which is what the static rows should be.
 
 ## Slices (F3 of the plan)
 
