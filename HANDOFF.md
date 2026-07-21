@@ -106,9 +106,18 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   a block recorded NO root at all — not `IterTemp` (correctly not a temporary) and not the place's
   `Local` (the fallback short-circuits on an owned type). `keep = { inner }` walked past the entire
   rule and printed freed heap, two characters from the rejected `keep = inner`, and it had slipped
-  every earlier revision of this fix. One arm fixes it; **the invariant — `storage_roots` must be
-  transparent through exactly what `may_need_synthetic_owner` is transparent through — is now
-  written next to both functions**, because that pairing is the only thing keeping them agreeing.
+  every earlier revision of this fix. The decision is now **single-sourced in
+  `borrow_transparent_value`**, which both consumers call, so adding a wrapper updates them together
+  rather than relying on a comment to keep them agreeing. Both still end in a `_` catch-all, so a
+  future variant that *should* be transparent would compile while being neither — compile-forcing
+  that (an exhaustive, wildcard-free place dispatch) is recorded with the structural follow-up.
+- **A third over-rejection, pinned** (`over_rejects_a_control_flow_borrow_over_outer_bound_places`):
+  `keep = if c { a } else { b }` over sources declared OUTSIDE the loop is rejected, because
+  `may_need_synthetic_owner` is conservatively `true` for `if`/`match`/`else`-unwrap/`arena`/
+  `task_group`, whose runtime value can still be a bound place. `emit-mir` shows the owner's
+  temporary flag stored `false` on every bound-arm path — no drop at either edge. Same family as the
+  arena and chunks pins: a static shape predicate against a per-path runtime flag sema cannot see.
+  Workaround (borrow the arms as `str` views first) is accepted and runs.
 - **This fix shipped a false claim TWICE, and both times the adversarial reviewer killed it.** Round
   1's commit message asserted "MIR emits exactly one class of early drop" and that hidden owners are
   safe "by construction" — both wrong, and `keep = "AAAA…".clone()` in a loop still printed freed
@@ -149,7 +158,7 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   and an owned local **moved out** by `break`. Mutation-checked in six places (the local set,
   `temp_owner_root`, the `IterTemp` edge arm, the `storage_roots` attribution, the block-transparency
   arm, and *restoring* the attribution to `borrow_sources`), each failing exactly its own tests.
-  Whole workspace green (2603 passed), clippy clean; **zero false positives** — the only pre-existing
+  Whole workspace green (2605 passed), clippy clean; **zero false positives** — the only pre-existing
   test the whole arc broke was the pinned known hole.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`

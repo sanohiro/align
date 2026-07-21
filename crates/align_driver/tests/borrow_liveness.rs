@@ -906,3 +906,63 @@ fn main() -> i32 {
 ";
     assert!(!check_errs("borrow-block-outer-source", ok));
 }
+
+/// **KNOWN OVER-REJECTION — the third of the family, pinned so a reader doesn't assume otherwise.**
+///
+/// `may_need_synthetic_owner` is conservatively `true` for the wrappers whose *runtime* value can
+/// still be a bound place — `if`, `match`, `else`-unwrap, `arena {}`, `task_group {}` — so borrowing
+/// one over sources declared OUTSIDE the loop mints a spurious `IterTemp`. MIR proves it safe: the
+/// synthetic owner's temporary flag is stored `false` on every bound-arm path, so the drop-if-live
+/// folds away and neither loop edge emits a drop (the only drops are the sources at function exit).
+///
+/// This is the same family as the arena and chunks pins: sema uses a static shape predicate where
+/// MIR gates the free on a per-path runtime flag (`temporary_drop_flag`) that `MoveCheck` cannot
+/// see. Deliberately conservative — making the arms already-`str` views is accepted and runs.
+/// Widening it means giving borrow liveness the ownership bit, i.e. the recorded structural
+/// follow-up (borrow liveness in the checked-HIR escape CFG).
+#[test]
+fn over_rejects_a_control_flow_borrow_over_outer_bound_places() {
+    let if_over_outer = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  a := mk(\"AAAA-OUTER\")
+  b := mk(\"BBBB-OUTER\")
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    keep = if n > 1 { a } else { b }
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    assert!(
+        check_errs("borrow-if-over-outer-places", if_over_outer),
+        "KNOWN OVER-REJECTION: both arms are outer locals, so nothing is freed at the edge. If this \
+         now checks, borrow liveness gained the per-path ownership bit — flip this assertion."
+    );
+
+    // The workaround, and the control that the rule is not simply rejecting all `if`-borrows: with
+    // the arms already `str` views there is no owned value to mint an owner for.
+    let via_views = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  a := mk(\"AAAA-OUTER\")
+  b := mk(\"BBBB-OUTER\")
+  va: str := a
+  vb: str := b
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    keep = if n > 1 { va } else { vb }
+    n = n + 1
+    if n > 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    assert!(!check_errs("borrow-if-over-outer-views", via_views));
+}

@@ -1240,30 +1240,45 @@ pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], 
     is_owned_droppable(ty, structs, enums) || ty_tuple_is_move(ty, tuples)
 }
 
+/// The **single** decision about which wrappers a borrow sees straight through to the value inside.
+/// A block contributes no storage of its own: borrowing `{ inner }` borrows exactly what borrowing
+/// `inner` would. `arena {}` / `task_group {}` are deliberately absent — their value is bound to a
+/// region, which is the escape check's business, not a transparent forward.
+///
+/// Every consumer of this fact goes through here, so adding a wrapper updates them together.
+/// Two consumers exist: [`may_need_synthetic_owner`] (does MIR mint a hidden owner?) and
+/// `MoveCheck::storage_roots` (which storage does a borrower depend on?). They MUST agree: where the
+/// predicate says "not a temporary" because it saw through a wrapper, `storage_roots` has to reach
+/// the same place, or the wrapper records no root at all and the borrow silently becomes untracked —
+/// which is exactly what `keep = { inner }` did before this was single-sourced.
+pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
+    match &e.kind {
+        hir::ExprKind::Block(b) | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
+        _ => None,
+    }
+}
+
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
 /// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
-/// bound places are borrowed from their binding instead; a block is transparent to its value.
-/// Control-flow nodes are conservatively eligible and their per-path runtime temporary bit prevents
-/// a bound arm from being dropped.
+/// bound places are borrowed from their binding instead; a block is transparent to its value (see
+/// [`borrow_transparent_value`]). Control-flow nodes are conservatively eligible and their per-path
+/// runtime temporary bit prevents a bound arm from being dropped.
 ///
 /// The second half of MIR's `lower_borrowed_owned` condition, with [`needs_drop_flag`] — shared
 /// here so `MoveCheck`'s borrow liveness ends a temporary's generation at exactly the loop edge
 /// where MIR frees it (the hidden owner joins the innermost loop's per-iteration drops).
-///
-/// **`MoveCheck::storage_roots` must be transparent through exactly the constructs this function is
-/// transparent through.** Where this returns `false` the borrow reaches an underlying place, and
-/// `storage_roots` must reach that place too — otherwise a wrapper records no root at all and the
-/// borrow becomes untracked (which `Block`/`Unsafe` once did).
 pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
+    if let Some(inner) = borrow_transparent_value(e) {
+        return may_need_synthetic_owner(inner);
+    }
     match &e.kind {
         hir::ExprKind::Local(_)
         | hir::ExprKind::Field { .. }
         | hir::ExprKind::TupleIndex { .. }
         | hir::ExprKind::Index { .. }
         | hir::ExprKind::ElemField { .. } => false,
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
-            block.value.as_ref().is_some_and(|value| may_need_synthetic_owner(value))
-        }
+        // A block with no value is Unit: nothing to borrow, so nothing to own.
+        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => false,
         _ => true,
     }
 }
@@ -7990,6 +8005,16 @@ impl<'a> MoveCheck<'a> {
     /// a temp root, which is the whole reason the two functions differ (see the FP fixed in the
     /// second review round: `names = src.map(up).to_array()` moved into an owning `array<str>`).
     fn storage_roots(&self, e: &Expr) -> BorrowRoots {
+        // Borrowing through a wrapper borrows what is inside it — the SAME set
+        // [`may_need_synthetic_owner`] sees through, single-sourced in `borrow_transparent_value` so
+        // the two cannot drift. Without this, a block recorded no root at all (neither `IterTemp`,
+        // since the predicate correctly said "not a temporary", nor the place's `Local`, since the
+        // `_` arm below short-circuits on a non-borrowing owned type) and `keep = { inner }` slipped
+        // a use-after-free past the whole rule. Recursing is exactly equivalent to handling it here:
+        // a wrapper has its value's type, so `temp_owner_root` agrees on both.
+        if let Some(inner) = borrow_transparent_value(e) {
+            return self.storage_roots(inner);
+        }
         let mut roots = BorrowRoots::new();
         // A view of a fresh owned temporary (`str` borrow of a `.clone()`, a slice of a
         // just-materialized array, a `json.doc` over a returned string) is rooted in MIR's hidden
@@ -8009,18 +8034,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
             | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
-            // **This arm and [`may_need_synthetic_owner`] must stay in lockstep.** That predicate is
-            // transparent through a block — a block whose value is a bound place borrows the place
-            // and mints no hidden owner — so without the same transparency here, a block returns
-            // neither an `IterTemp` root (the predicate said no) nor the place's `Local` root (the
-            // `_` arm's `borrow_sources` short-circuits on a non-borrowing owned type). Zero roots,
-            // and `keep = { inner }` slipped a use-after-free past the whole rule. `arena`/
-            // `task_group` blocks are deliberately NOT transparent, in either function.
-            ExprKind::Block(b) | ExprKind::Unsafe(b) => {
-                if let Some(v) = &b.value {
-                    roots.extend(self.storage_roots(v));
-                }
-            }
+            // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
+            // this match — `borrow_transparent_value` forwarded it above.)
+            ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
             _ => roots.extend(self.borrow_sources(e)),
         }
         roots

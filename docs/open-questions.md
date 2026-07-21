@@ -2070,9 +2070,23 @@ and mints no hidden owner — but `storage_roots` had no block arm, so it fell t
 tail that short-circuits on an owned, non-borrowing type. A block therefore recorded **no root at
 all**: not `IterTemp` (correctly not a temporary) and not the place's `Local`. `keep = { inner }`
 walked past the entire rule and printed freed heap bytes, two characters from the rejected
-`keep = inner` — and it had slipped every earlier revision of this fix. Both functions now carry the
-invariant in their doc comments. `arena {}` / `task_group {}` are transparent in *neither*, so they
-stay covered by the `IterTemp` path.
+`keep = inner` — and it had slipped every earlier revision of this fix. The decision is now
+**single-sourced** in `borrow_transparent_value`, which both consumers call, so adding a wrapper
+updates them together instead of relying on a comment. `arena {}` / `task_group {}` are transparent
+in *neither*, so they stay covered by the `IterTemp` path. **Remaining structural weakness, recorded
+not fixed:** both functions still end in a `_` catch-all, so a future variant that *should* be
+transparent compiles fine while being neither — the "new IR variant skips a pass" class. Making
+`storage_roots` dispatch bound places through an exhaustive, wildcard-free helper would compile-force
+it; that belongs with the structural follow-up below, not bolted onto this slice.
+
+**A third over-rejection, pinned** (`over_rejects_a_control_flow_borrow_over_outer_bound_places`):
+`may_need_synthetic_owner` is conservatively `true` for the wrappers whose *runtime* value can still
+be a bound place — `if`, `match`, `else`-unwrap, `arena {}`, `task_group {}` — so
+`keep = if c { a } else { b }` over sources declared outside the loop mints a spurious `IterTemp`.
+`emit-mir` shows the owner's temporary flag stored `false` on every bound-arm path, so no drop is
+emitted at either edge. Same family as the arena and chunks pins: a static shape predicate in sema
+against a per-path runtime flag in MIR that `MoveCheck` cannot see. The workaround (borrow the arms
+as `str` views first) is accepted and runs.
 The invalidation runs on the state that reaches the loop head (probe pass + every fixpoint round) and
 on each `break` snapshot — the latter to the snapshot only, since the statements this pass still
 walks after a `break` belong to the iteration that has not dropped yet. `BorrowState::invalid`
