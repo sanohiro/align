@@ -118,8 +118,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
 
 fn run_server(name: &str, request: &[u8]) -> String {
     let port = free_loopback_port();
-    let built = build_exe("srv-rb", SERVER);
-    let _ = name;
+    // The basename MUST be per-test: `build_exe` derives the executable path from it (plus the
+    // pid), and these tests run concurrently in one binary. Sharing one name made both build and
+    // spawn the SAME file — one spawned while the other was still writing it (`ETXTBSY`), or after
+    // the other's `TempArtifacts` drop had deleted it (`NotFound`). Both were observed on `main`.
+    let built = build_exe(&format!("srv-rb-{name}"), SERVER);
     let mut child = std::process::Command::new(&built.exe)
         .args(["--port", &port.to_string()])
         .spawn()
