@@ -95,13 +95,14 @@ forwards. pkg.web ships no lookup of its own.
   absent-is-`None` / present-but-empty-is-`Some("")`).
 - **A PRE-EXISTING soundness hole surfaced by the adversarial pass, recorded Open, deliberately not
   fixed here:** `MoveCheck` ends a borrow generation when the owner is **moved or reassigned**, never
-  when it is **dropped at an inner scope's end** — so a view assigned out of a loop body whose Move
-  handle merely drops (rather than being consumed) survives into the next iteration and reads freed
-  memory. General to every view over a Move handle: reproduced identically on a plain `str` from
-  `ctx.path()`. Every shipped `serve` loop is safe because `ctx.respond(rb)` MOVES the handle each
-  pass, which the existing move path rejects. Item 10 changes only the blast radius — the dangling
-  value here IS the freed `http_request_ctx` pointer, and the runtime dereferences it, so the UB
-  aborts instead of reading stale bytes. Pinned as
+  when it is **dropped at an inner scope's end** — so a view assigned out of an inner scope whose
+  Move handle merely drops (rather than being consumed) survives it and reads freed memory. The
+  scope need not be a loop: an `arena {}` block does it too. General to every view over a Move
+  handle: reproduced identically on a plain `str` from `ctx.path()`. Every shipped `serve` loop is
+  safe because `ctx.respond(rb)` MOVES the handle each pass, which the existing move path rejects.
+  Item 10 changes only the blast radius, and not reliably — the dangling value here IS the freed
+  `http_request_ctx` pointer and the runtime dereferences it, so the loop shape aborts while the
+  `arena {}` shape prints a plausible answer and exits 0. Pinned as
   `known_hole_scope_end_drop_does_not_invalidate_a_view` (asserts the current unsound acceptance for
   BOTH the header view and the `str` case; flip both when fixed) and written up in
   `open-questions.md` next to #460, whose dataflow should own the fix.

@@ -209,10 +209,11 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
 ///
 /// This is a general escape-analysis gap, not a `http_headers` one: the second case is a plain
 /// `str` from `ctx.path()` and it compiles identically (verified by running both — the `str` version
-/// reads a freed buffer and prints stale lengths; the `http_headers` version aborts, because the
-/// dangling value IS the freed `http_request_ctx` pointer and `align_rt_http_ctx_header`
-/// dereferences it to walk the offset table). That difference in blast radius is the only thing item
-/// 10 changed here, and it is worth recording: for this type the hole is loud, not silent.
+/// reads a freed buffer and prints stale lengths). The `http_headers` version CAN be louder, because
+/// the dangling value IS the freed `http_request_ctx` pointer and `align_rt_http_ctx_header`
+/// dereferences it to walk the offset table: in the loop shape above it aborts. That is not a
+/// guarantee — with the drop coming from an `arena {}` scope instead, the same shape prints a
+/// plausible answer and exits 0. Shape- and allocator-dependent UB, like the `str` case.
 ///
 /// **When the gap is fixed, both `assert!(!check_errs(...))` below flip to `assert!(check_errs(...))`
 /// and this test loses its `known_hole_` prefix.** Tracked in `docs/open-questions.md` (Open → the
@@ -291,6 +292,52 @@ pub fn main() -> Result<(), Error> {
     assert!(
         diags.contains("use of invalidated borrow 'hs'"),
         "a lookup through a view whose ctx was consumed by `respond` must be rejected: {diags}"
+    );
+
+    // **The other half of the pair, and the half that was NOT covered.** Above, the invalidated
+    // binding is the VIEW; here it is the `str` the lookup returned, which borrows the same buffer
+    // one step further out. That provenance comes from `borrow_sources_inner`'s
+    // `HttpCtxHeader { headers: buffer, .. }` arm — a `_ => BorrowRoots::new()` tail means deleting
+    // that arm is silent, and the case above still passes without it (its root comes from the
+    // `HttpCtxHeaders` arm instead). Adversarial review caught exactly that: one arm of the pair had
+    // no test at all.
+    let via_result = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  ctx := srv.accept()?
+  hs := ctx.headers()
+  v := hs.get(\"host\") else { \"\" }
+  rb := http.response(200)
+  ctx.respond(rb)?
+  print(v.len())
+  return Ok(())
+}
+";
+    let diags = check_diagnostics("http-headers-result-after-respond", via_result);
+    assert!(
+        diags.contains("use of invalidated borrow 'v'"),
+        "the `str` a lookup returned is dead once the ctx is consumed, too: {diags}"
+    );
+
+    // And the same through the mandated chained spelling, where the view is a temporary and the
+    // chain has to be walked to reach the ctx (`storage_roots`'s `_ => borrow_sources(e)` tail).
+    let chained = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  ctx := srv.accept()?
+  v := ctx.headers().get(\"host\") else { \"\" }
+  rb := http.response(200)
+  ctx.respond(rb)?
+  print(v.len())
+  return Ok(())
+}
+";
+    let diags = check_diagnostics("http-headers-chained-after-respond", chained);
+    assert!(
+        diags.contains("use of invalidated borrow 'v'"),
+        "a temporary view's lookup result is tracked back to the ctx as well: {diags}"
     );
 }
 
@@ -468,7 +515,10 @@ pub fn main() -> Result<(), Error> {
 }
 ";
     let diags = check_diagnostics("http-headers-old-spelling", src);
-    assert!(diags.contains("'.header()'"), "`ctx.header(name)` must no longer resolve: {diags}");
+    assert!(
+        diags.contains("`ctx.header(name)` was replaced by `ctx.headers().get(name)`"),
+        "the removed spelling must say where the lookup went, not just 'unknown method': {diags}"
+    );
     // ...and the suggestion list a bad ctx method gets now names `headers`, not `header`.
     let arity = "\
 import std.http

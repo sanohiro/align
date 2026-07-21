@@ -10406,6 +10406,11 @@ mod tests {
             // `Ty::Fn` closure field and a `slice<T>` view field really are 16 bytes. Mixed with an
             // i8 so the reorder path is exercised too.
             sdef("HandleField", false, &[i(8, true), Ty::HttpRequestCtx]),   // { ptr, i8 } → (16, 8)
+            // A SECOND Move handle, because `ty_size_align` answers the whole family through
+            // `is_move_handle` and `scalar_type` lowers all of them to `ptr`: one row per arm would
+            // pin only the arm it names, and this table is hand-written — nothing else notices a
+            // family member drifting.
+            sdef("ReaderField", false, &[i(8, true), Ty::Reader]),           // { ptr, i8 } → (16, 8)
             sdef("HeadersField", false, &[i(8, true), Ty::HttpHeaders]),     // { ptr, i8 } → (16, 8)
             sdef("BothPtrs", false, &[Ty::HttpRequestCtx, Ty::Bool, Ty::HttpHeaders]), // (24, 8)
             sdef("FnField", false, &[Ty::Bool, Ty::Fn(0)]),                 // { {ptr,ptr}, i8 } → (24, 8)

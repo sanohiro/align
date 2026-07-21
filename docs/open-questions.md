@@ -2023,12 +2023,15 @@ loop {
 }
 ```
 
-This is **general to every view over a Move handle**, not to any one type: reproduced on a plain
-`str` from `ctx.path()` (reads a freed buffer, prints stale lengths) and on the `http_headers` view
-from `ctx.headers()` (which **aborts** — the dangling value IS the freed `http_request_ctx` pointer
-and the runtime dereferences it to walk the offset table, so the same UB is loud rather than silent).
-The variant where the loop DOES consume the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
-shipped serve loop is safe) is correctly rejected by the existing move path.
+It is **general to every view over a Move handle**, not to any one type, and **the inner scope need
+not be a loop** — an `arena {}` block whose handle is dropped at its end does the same. Reproduced on
+a plain `str` from `ctx.path()` (reads a freed buffer, prints stale lengths) and on the
+`http_headers` view from `ctx.headers()`, where the dangling value IS the freed `http_request_ctx`
+pointer that the runtime dereferences to walk the offset table: in the loop shape that aborts, in the
+`arena {}` shape it prints a plausible answer and exits 0. Shape- and allocator-dependent UB either
+way — not a type that fails loudly. The variant where the loop DOES consume the handle
+(`ctx.respond(rb)?` — the pkg.web shape, so every shipped serve loop is safe) is correctly rejected
+by the existing move path.
 
 Pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view` in
 `crates/align_driver/tests/http_headers_view.rs`, which asserts the current unsound acceptance for

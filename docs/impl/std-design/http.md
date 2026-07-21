@@ -827,12 +827,14 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
         the other half is a pre-existing hole.** `MoveCheck` ends a borrow generation when the owner
         is **moved or reassigned**, not when it is **dropped at an inner scope's end**, and
         `Region::Frame` cannot tell "this frame" from "this iteration". The pkg.web shape is safe
-        because `ctx.respond(rb)` MOVES the handle every pass — that case is rejected. But a loop that
-        merely lets the ctx drop leaks the view into the next iteration, and this is general to every
-        view over a Move handle (reproduced identically on a plain `str` from `ctx.path()`). The one
-        thing item 10 changes is the blast radius: here the dangling value IS the freed
-        `http_request_ctx` pointer, which `align_rt_http_ctx_header` dereferences to walk the offset
-        table, so the same UB aborts instead of reading stale bytes. Pinned as
+        because `ctx.respond(rb)` MOVES the handle every pass — that case is rejected. But an inner
+        scope that merely lets the ctx drop (a loop body, or an `arena {}` block) leaks the view into
+        what follows, and this is general to every view over a Move handle (reproduced identically on
+        a plain `str` from `ctx.path()`). Item 10 changes only the blast radius, and not reliably:
+        here the dangling value IS the freed `http_request_ctx` pointer, which
+        `align_rt_http_ctx_header` dereferences to walk the offset table, so the loop shape aborts —
+        while the `arena {}` shape prints a plausible answer and exits 0. Shape-dependent UB, not a
+        loud failure mode to lean on. Pinned as
         `known_hole_scope_end_drop_does_not_invalidate_a_view` and recorded as **Open** in
         `docs/open-questions.md` (next to #460, whose dataflow should own the fix). Deliberately not
         fixed here: it is neither introduced nor widened by this slice, and ending a borrow generation

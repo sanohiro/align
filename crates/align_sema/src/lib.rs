@@ -1005,12 +1005,14 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting
             let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
             (align_up(payload_off + psz, pal), pal)
         }
-        // A **bare 8-byte pointer** field. Codegen lowers both of these to a plain `ptr`
-        // (`scalar_type`'s pointer arm), so the `(16, 8)` catch-all below over-reports them by 8
-        // bytes — harmless for safety (the real layout comes from `scalar_type` + `field_abi_align`),
-        // but the huge-struct-copy lint is this function's consumer and it should see the truth.
-        // `sema_and_codegen_struct_layout_agree` pins both against the real LLVM ABI.
-        Ty::HttpRequestCtx | Ty::HttpHeaders => (8, 8),
+        // A **bare 8-byte pointer** field: every Move handle, plus the Copy `http_headers` view whose
+        // representation IS one. Codegen lowers all of them to a plain `ptr` (`scalar_type`'s pointer
+        // arm), so the `(16, 8)` catch-all below over-reports them by 8 bytes — harmless for safety
+        // (the real layout comes from `scalar_type` + `field_abi_align`), but the huge-struct-copy
+        // lint is this function's consumer and it should see the truth. Keep this arm and that one in
+        // step; `sema_and_codegen_struct_layout_agree` pins them against the real LLVM ABI.
+        Ty::HttpHeaders => (8, 8),
+        _ if is_move_handle(ty) => (8, 8),
         // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
         // (A struct can hold only scalar / `str` / `Option` / nested-struct fields today; the rest are
         // a defensive default.)
@@ -13111,6 +13113,18 @@ impl<'a, 't> Checker<'a, 't> {
             // / `ctx.headers()` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
             "method" | "path" | "headers" | "body" | "respond" | "respond_stream" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
+            }
+            // The old spelling. `ctx.header(name)` was replaced by `ctx.headers().get(name)` (item 10
+            // ①) — with no call sites to migrate, so this is not a compat path but a diagnostic:
+            // without it the name-guarded arm above simply misses and the generic "unknown method"
+            // says nothing about where the lookup went. Kept deliberately narrow: receiver type +
+            // exact name.
+            "header" if recv_ty == Ty::HttpRequestCtx => {
+                self.diags.error(
+                    "`ctx.header(name)` was replaced by `ctx.headers().get(name)`: the lookup goes through the header-table view, which a framework's request context can carry by value".to_string(),
+                    span,
+                );
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
             // Response-builder methods on a `response_builder`: `rb.header(name, value)` / `rb.body(data)`
             // mutate the builder in place. Type-guarded, same as the `http request` builder methods.
