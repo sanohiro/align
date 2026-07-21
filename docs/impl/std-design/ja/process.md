@@ -21,7 +21,21 @@ ch.kill(sig: i64) -> Result<(), Error>
 process.exec(cmd: str, args: array<str>) -> Result<(), Error>   // replace current image (execvp; returns only on error)
 process.exit(code: i64)               // run cleanup, then exit — see below
 process.abort()                        // immediate _exit, NO cleanup
+process.cpu_count() -> i64            // parallelism available to THIS process (>= 1); see below
 ```
+
+## `process.cpu_count()` — 出荷済み 2026-07-21
+
+**このプロセスに**利用可能な並列度である。すなわち CPU affinity と cgroup クォータで制限された後の
+コア数(`std::thread::available_parallelism`)であって、マシンの生のコア数では決してない。常に
+`>= 1` — OS が答えられなければ `1` にフォールバックするので、エラー経路も `Option` も無い。
+**Impure**(マシンの状態を観測する)。
+
+`std.env` ではなくここに置くのは、これが環境ブロックの性質ではなく実行中プロセスの性質だからである。
+存在理由は、**`task_group` の worker 数を照らし合わせるべき数がこれである**という点にある: ランタイムの
+タスクプールはまさにこの値をもとにサイズが決まるので、これより大きな「決して戻らないタスク」の集合を
+作ると、あふれた分のタスクは起動しないまま残る。`pkg.web.serve` の `workers` パラメータはこれを超えると
+abort し、推奨サイジング(`workers = process.cpu_count()`)はこれが存在して初めて書けるようになった。
 
 ## Type & ownership classification
 

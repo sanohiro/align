@@ -218,6 +218,19 @@ fn keep_alive_serves_many_requests_over_one_connection() {
     sock.set_read_timeout(Some(Duration::from_millis(400))).expect("probe timeout");
     let mut probe = [0u8; 1];
     assert!(!matches!(sock.read(&mut probe), Ok(0)), "the connection is parked, not closed");
+
+    // A SECOND client does not cost the first its connection: the server parks a set, not one slot.
+    // (With a single slot this second connect would have closed `sock`, and the request below would
+    // have hit a dead socket — the failure mode a keep-alive client cannot safely retry.)
+    let mut sock2 = TcpStream::connect(("127.0.0.1", srv.port)).expect("second client");
+    sock2.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    let mut buf2 = Vec::new();
+    sock2.write_all(b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n").expect("write");
+    assert!(read_framed(&mut sock2, &mut buf2).ends_with("any"), "the new client is served");
+    sock.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    sock.write_all(b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n")
+        .expect("the first connection must still be alive");
+    assert!(read_framed(&mut sock, &mut buf).ends_with("{\"models\":[]}"), "client 1 survived client 2");
 }
 
 #[test]

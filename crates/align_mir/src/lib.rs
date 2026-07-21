@@ -821,6 +821,8 @@ pub enum Rvalue {
     EnvSet { name: Operand, value: Operand },
     /// `time.now()` — wall-clock UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64`. Impure.
     TimeNow,
+    /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
+    ProcessCpuCount,
     /// `time.instant()` — monotonic-clock nanoseconds (`CLOCK_MONOTONIC`), an `i64`. Impure.
     TimeInstant,
     /// `time.sleep(ns)` — suspend the thread for `ns` nanoseconds (negative = no-op). Yields no
@@ -3080,6 +3082,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::TimeInstant => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::TimeInstant));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ProcessCpuCount => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ProcessCpuCount));
             Operand::Value(v)
         }
         // `time.sleep(ns)` → `()`; emit the void call and yield unit.

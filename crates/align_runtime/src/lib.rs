@@ -9560,6 +9560,16 @@ pub unsafe extern "C" fn align_rt_env_set(nptr: *const u8, nlen: i64, vptr: *con
     }
 }
 
+/// `process.cpu_count()` — the parallelism actually available to THIS process: cores as limited by
+/// CPU affinity and cgroup quota, never the raw machine core count (`std::thread::available_
+/// parallelism`, the same source `par_pool` sizes itself from — which is what makes it the right
+/// number for a `task_group` worker count). Falls back to `1` when the OS cannot answer, so the
+/// value is always `>= 1` and callers need no error path.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_process_cpu_count() -> i64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as i64)
+}
+
 /// `time.now()` — wall-clock time as UNIX-epoch nanoseconds (`CLOCK_REALTIME` via `SystemTime`). A
 /// clock set before the epoch yields a negative count. (`i128` ns is truncated to `i64` — good until
 /// ~year 2262.)
@@ -14415,9 +14425,18 @@ struct PollFd {
 const POLLIN: i16 = 0x0001;
 const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
 
-/// The **parked keep-alive connection** of one server handle (http.md item 9 ②) — exactly ONE slot,
-/// matching the v1 one-connection-at-a-time posture.
+/// How many kept-alive connections ONE server handle may hold at once. `poll` costs O(parked) per
+/// `accept`, and every parked connection is an open fd, so the set is bounded; at capacity the
+/// least-recently-served connection is evicted (closed) to make room. A single slot — the shape this
+/// started as — would have made keep-alive useless the moment a second client appeared: every new
+/// connection evicted the previous one, so a client told "persistent" lost its next request.
+const HTTP_MAX_PARKED_CONNS: usize = 256;
+
+/// The **parked keep-alive connections** of one server handle (http.md item 9 ②): the connections
+/// that have been answered and are waiting for their next request. Serving is still strictly one
+/// request at a time — these are idle, not in flight.
 ///
 /// It is refcounted (`Arc`) and cloned into every `HttpRequestCtx` at `accept`, because the ctx
 /// outlives no server *by contract* but may outlive it *in practice*: the language frees locals in
@@ -14428,10 +14447,8 @@ const POLLHUP: i16 = 0x0010;
 /// The mutex is uncontended by construction: prefork gives each worker its OWN server handle, and a
 /// worker's ctx never crosses a thread. It exists for soundness, not for sharing.
 enum ParkSlot {
-    /// Live and empty — an eligible `respond` may park its connection here.
-    Empty,
-    /// Live, holding one kept-alive connection fd. `accept` polls it alongside the listener.
-    Parked(i32),
+    /// Live: the parked fds, oldest-served first (so the front is the eviction candidate).
+    Live(Vec<i32>),
     /// The owning server has been dropped: never park again (the fd would leak — nothing left to
     /// close it).
     Dead,
@@ -14459,8 +14476,10 @@ impl Drop for HttpServer {
         // POISONED mutex must not skip this (that would leak the parked fd and leave the cell
         // live) — take the guard either way, like every other lock site here.
         let mut slot = self.park.lock().unwrap_or_else(|e| e.into_inner());
-        if let ParkSlot::Parked(fd) = *slot {
-            unsafe { close(fd) };
+        if let ParkSlot::Live(fds) = &*slot {
+            for &fd in fds {
+                unsafe { close(fd) };
+            }
         }
         *slot = ParkSlot::Dead;
     }
@@ -14562,7 +14581,7 @@ unsafe fn http_serve_impl(host_ptr: *const u8, host_len: i64, port: i64, out: *m
     // Lift the fd out of the net `TcpListener` box (no `Drop` → the fd stays open, no leak of the box).
     let fd = unsafe { Box::from_raw(listener) }.fd;
     unsafe {
-        *out = Box::into_raw(Box::new(HttpServer { fd, park: std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Empty)) }))
+        *out = Box::into_raw(Box::new(HttpServer { fd, park: std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Live(Vec::new()))) }))
     };
     0
 }
@@ -14860,29 +14879,33 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
 }
 
 /// Which side of the keep-alive wait became ready — the decision [`align_rt_http_accept`] makes when
-/// a parked connection exists.
+/// parked connections exist.
 enum ParkedWait {
-    /// The parked connection has data (or hung up) — drain the warm client first, by design (both
-    /// ready ⇒ parked wins; the fairness caveat is bounded by prefork's other workers).
-    Parked,
-    /// Only the listener is ready — take the new connection and close the parked one (single slot).
+    /// This parked connection has data (or hung up) — serve the warm client, by design (parked wins
+    /// over a new connection; the fairness caveat is bounded by prefork's other workers).
+    Parked(i32),
+    /// Only the listener is ready — take the new connection; the parked ones stay parked.
     Listener,
-    /// `poll` itself failed — treat as "no usable parked connection": close it and fall back to a
-    /// plain blocking `accept`.
+    /// `poll` itself failed — fall back to a plain blocking `accept` (the parked set is left alone;
+    /// a genuinely broken fd resolves to a read error the next time it is chosen).
     Failed,
 }
 
-/// Wait until either the parked keep-alive connection or the listener is ready (http.md item 9 ②).
-/// Blocks indefinitely — an idle parked fd with no new traffic simply parks in `poll`, which IS
-/// `accept`'s normal idle state, so no idle timeout is needed. `EINTR` is retried.
+/// Wait until a parked keep-alive connection or the listener is ready (http.md item 9 ②). Blocks
+/// indefinitely — parked fds with no traffic simply wait in `poll`, which IS `accept`'s normal idle
+/// state, so no idle timeout is needed. `EINTR` is retried.
+///
+/// `POLLNVAL` is watched alongside `POLLHUP`/`POLLERR`: without it an invalid fd would report a
+/// revent no branch matches and this loop would spin at 100% CPU forever. On the parked side it
+/// resolves to a read error (close + move on); on the listener side it degrades to a blocking
+/// `accept`, which surfaces the error properly.
 ///
 /// # Safety
-/// `parked` and `listener` must be valid open fds.
-unsafe fn http_wait_parked_or_listener(parked: i32, listener: i32) -> ParkedWait {
-    let mut fds = [
-        PollFd { fd: parked, events: POLLIN, revents: 0 },
-        PollFd { fd: listener, events: POLLIN, revents: 0 },
-    ];
+/// `parked` and `listener` must be open fds.
+unsafe fn http_wait_parked_or_listener(parked: &[i32], listener: i32) -> ParkedWait {
+    const READY: i16 = POLLIN | POLLHUP | POLLERR | POLLNVAL;
+    let mut fds: Vec<PollFd> = parked.iter().map(|&fd| PollFd { fd, events: POLLIN, revents: 0 }).collect();
+    fds.push(PollFd { fd: listener, events: POLLIN, revents: 0 });
     loop {
         let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, -1) };
         if rc < 0 {
@@ -14895,12 +14918,12 @@ unsafe fn http_wait_parked_or_listener(parked: i32, listener: i32) -> ParkedWait
         if rc == 0 {
             continue; // no timeout was requested — spurious; keep waiting
         }
-        // Prefer the parked connection, including its hangup/error conditions (those resolve to a
-        // read error below, which closes it and falls through to a fresh accept).
-        if fds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-            return ParkedWait::Parked;
+        // Prefer a warm connection, including its hangup/error conditions (those resolve to a read
+        // error below, which closes that connection and lets `accept` try again).
+        if let Some(hit) = fds[..parked.len()].iter().find(|p| p.revents & READY != 0) {
+            return ParkedWait::Parked(hit.fd);
         }
-        if fds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+        if fds[parked.len()].revents & READY != 0 {
             return ParkedWait::Listener;
         }
     }
@@ -14965,45 +14988,55 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
     let lfd = unsafe { (*srv).fd };
     let park = unsafe { (*srv).park.clone() };
     loop {
-        // Take the parked connection out of the slot for the duration of this call: it is either
-        // served (and re-parked by `respond`) or closed here — never left behind for a second taker.
-        let parked = {
-            let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-            match *slot {
-                ParkSlot::Parked(fd) => {
-                    *slot = ParkSlot::Empty;
-                    Some(fd)
-                }
-                _ => None,
+        // Snapshot the parked fds. They stay PARKED while polling — only the one actually chosen is
+        // taken out (below), so nothing is left dangling if this call returns early.
+        let parked: Vec<i32> = {
+            let slot = park.lock().unwrap_or_else(|e| e.into_inner());
+            match &*slot {
+                ParkSlot::Live(fds) => fds.clone(),
+                ParkSlot::Dead => Vec::new(),
             }
         };
-        let fd = match parked {
-            Some(pfd) => match unsafe { http_wait_parked_or_listener(pfd, lfd) } {
-                ParkedWait::Parked => match unsafe { http_read_request(pfd) } {
-                    Ok(mut ctx) => {
-                        ctx.park = Some(park);
-                        unsafe { *out = Box::into_raw(Box::new(ctx)) };
-                        return 0;
-                    }
-                    Err(_) => {
-                        // EOF (the client is done with the connection) or a malformed follow-up
-                        // request: close the warm connection and wait for a fresh one instead.
-                        unsafe { close(pfd) };
-                        continue;
-                    }
-                },
-                ParkedWait::Listener | ParkedWait::Failed => {
-                    unsafe { close(pfd) }; // single slot: new traffic evicts the idle client
-                    match unsafe { http_accept_conn(lfd) } {
-                        Ok(fd) => fd,
-                        Err(status) => return status,
-                    }
-                }
-            },
-            None => match unsafe { http_accept_conn(lfd) } {
+        let fd = if parked.is_empty() {
+            match unsafe { http_accept_conn(lfd) } {
                 Ok(fd) => fd,
                 Err(status) => return status,
-            },
+            }
+        } else {
+            match unsafe { http_wait_parked_or_listener(&parked, lfd) } {
+                ParkedWait::Parked(pfd) => {
+                    // Claim it: remove it from the set before reading, so it is owned by exactly one
+                    // path. If it is already gone (a concurrent free), start over.
+                    let claimed = {
+                        let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
+                        match &mut *slot {
+                            ParkSlot::Live(fds) => fds.iter().position(|&f| f == pfd).map(|i| fds.remove(i)),
+                            ParkSlot::Dead => None,
+                        }
+                    };
+                    let Some(pfd) = claimed else { continue };
+                    match unsafe { http_read_request(pfd) } {
+                        Ok(mut ctx) => {
+                            ctx.park = Some(park);
+                            unsafe { *out = Box::into_raw(Box::new(ctx)) };
+                            return 0;
+                        }
+                        Err(_) => {
+                            // EOF (the client is done with the connection) or a malformed follow-up
+                            // request: close that connection and look again — a warm connection
+                            // dying is not an application-visible event.
+                            unsafe { close(pfd) };
+                            continue;
+                        }
+                    }
+                }
+                // A new connection, or a `poll` failure to fall back from. The parked set is
+                // untouched either way: a new client no longer costs a warm one its connection.
+                ParkedWait::Listener | ParkedWait::Failed => match unsafe { http_accept_conn(lfd) } {
+                    Ok(fd) => fd,
+                    Err(status) => return status,
+                },
+            }
         };
         return match unsafe { http_read_request(fd) } {
             Ok(mut ctx) => {
@@ -15297,26 +15330,29 @@ fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
 /// every other caller goes through the plain wrapper.
 ///
 /// **Every response this renders is self-delimiting.** A set body frames as its length (a
-/// set-but-empty body as `0`); a body that was never set frames as `Content-Length: 0` unless the
-/// status is one that cannot carry a body at all (`1xx`/`204`/`304`, which are self-delimiting by
-/// definition). The alternative — emitting no framing header — makes the message body "everything
-/// until the connection closes" (RFC 9112 §6.3), which both forbids keep-alive on that connection
-/// and leaves a plain `http.response(200)` looking like a truncated stream. There is no legitimate
-/// use for an unframed `respond`; close-delimited framing is `respond_stream`'s 1.0 mode.
+/// set-but-empty body as `0`); a body that was never set frames as `Content-Length: 0`. The
+/// alternative — emitting no framing header — makes the message body "everything until the
+/// connection closes" (RFC 9112 §6.3), which both forbids keep-alive on that connection and leaves a
+/// plain `http.response(200)` looking like a truncated stream. There is no legitimate use for an
+/// unframed `respond`; close-delimited framing is `respond_stream`'s 1.0 mode.
+///
+/// A status that cannot carry a body (`1xx`/`204`/`304`) gets **neither the framing header nor the
+/// body bytes**, whatever the builder holds: RFC 9112 §6.3 terminates such a response at the first
+/// empty line regardless of its fields, so a body set on one would be read by the client as the
+/// START OF THE NEXT RESPONSE on a kept-alive connection. Suppressing it here is the same
+/// protocol-boundary treatment HEAD already gets (`suppress_body`), which keeps every caller —
+/// including a framework passing a generic builder through — correct by construction.
 fn http_serialize_response_inner(rb: &ResponseBuilder, suppress_body: bool, persistent: bool) -> Result<Vec<u8>, i32> {
     let mut buf = http_serialize_head(rb, persistent)?;
-    let content_length = match &rb.body {
-        Some(body) => Some(body.len()),
-        None if http_status_allows_a_body(rb.status) => Some(0),
-        None => None,
-    };
-    if let Some(n) = content_length {
+    let bodiless_status = !http_status_allows_a_body(rb.status);
+    if !bodiless_status {
         buf.extend_from_slice(b"Content-Length: ");
-        buf.extend_from_slice(n.to_string().as_bytes());
+        buf.extend_from_slice(rb.body.as_ref().map_or(0, |b| b.len()).to_string().as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
     if !suppress_body
+        && !bodiless_status
         && let Some(body) = &rb.body
     {
         buf.extend_from_slice(body);
@@ -15361,35 +15397,38 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     // protocol boundary, so every caller (incl. a framework routing HEAD to a GET handler) is
     // RFC-correct without a body-stripping surface on the builder.
     let head_only = c.buf.get(c.method_start..c.method_start + c.method_len) == Some(&b"HEAD"[..]);
-    // Persistent iff the request was eligible AND the server's slot is still live. Decided BEFORE
-    // serializing: the `Connection` header must agree with what actually happens to the fd.
-    let park = match c.keep_alive {
-        true => c.park.take().filter(|p| !matches!(*p.lock().unwrap_or_else(|e| e.into_inner()), ParkSlot::Dead)),
+    // Persistent iff the request was eligible, the response is a FINAL one (a 1xx is interim — a
+    // client would wait for the real response that never comes, so it closes as before), and the
+    // server is still alive. Decided BEFORE serializing: the `Connection` header must agree with
+    // what actually happens to the fd, so the decision is made under the same lock that parks it —
+    // there is no window in which the response promises persistence and the fd is then closed.
+    let park = match c.keep_alive && r.status >= 200 {
+        true => c.park.take(),
         false => None,
     };
-    let bytes = match http_serialize_response_inner(&r, head_only, park.is_some()) {
+    let mut slot = park.as_ref().map(|p| p.lock().unwrap_or_else(|e| e.into_inner()));
+    let persistent = matches!(slot.as_deref(), Some(ParkSlot::Live(_)));
+    let bytes = match http_serialize_response_inner(&r, head_only, persistent) {
         Ok(b) => b,
         Err(s) => return s, // `c` drops → the accepted fd is closed
     };
     // One SIGPIPE-safe write of the whole response.
     let status = unsafe { http_send_all(c.fd, &bytes) };
     if status == 0
-        && let Some(park) = park
+        && persistent
+        && let Some(guard) = slot.as_mut()
+        && let ParkSlot::Live(fds) = &mut **guard
     {
-        let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-        match *slot {
-            // Live and empty — hand the connection back to the server and stop owning the fd, so the
-            // ctx `Drop` below leaves it open for the next `accept`.
-            ParkSlot::Empty => {
-                *slot = ParkSlot::Parked(c.fd);
-                c.fd = -1;
-            }
-            // The server died between the eligibility check and here, or (impossible under the
-            // one-conn-at-a-time posture, but total by construction) something else is already
-            // parked: close this connection rather than leak or evict.
-            ParkSlot::Dead | ParkSlot::Parked(_) => {}
+        // At capacity, the least-recently-served connection makes room (a served connection goes to
+        // the back, so the front is the coldest). Then hand this one back and stop owning the fd, so
+        // the ctx `Drop` below leaves it open for the next `accept`.
+        if fds.len() >= HTTP_MAX_PARKED_CONNS {
+            unsafe { close(fds.remove(0)) };
         }
+        fds.push(c.fd);
+        c.fd = -1;
     }
+    drop(slot);
     // `c` (and its fd, unless parked above) drops at scope end → the connection is closed. `r`'s
     // buffers likewise drop here.
     status
@@ -25509,11 +25548,17 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 sock.write_all(r).expect("write request");
                 out.push(read_framed_response(&mut sock, &mut buf, r.starts_with(b"HEAD ")));
             }
-            // Open or closed? A short-timeout read: EOF (`Ok(0)`) = the server closed; a timeout =
-            // the connection is still there, i.e. parked for keep-alive.
+            // Open or closed? A short-timeout read: EOF (`Ok(0)`) means the server closed, and so
+            // does a RESET — a close with unread bytes still in the server's receive queue (the
+            // pipelined case) sends RST rather than FIN, and reading that is `ECONNRESET`, not EOF.
+            // A timeout means the connection is still there, i.e. parked for keep-alive.
             sock.set_read_timeout(Some(std::time::Duration::from_millis(400))).expect("probe timeout");
             let mut probe = [0u8; 1];
-            let still_open = !matches!(sock.read(&mut probe), Ok(0));
+            let still_open = match sock.read(&mut probe) {
+                Ok(0) => false,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => false,
+                _ => true,
+            };
             (out, still_open)
         })
     }
@@ -25538,6 +25583,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// its own zero-copy views.
     #[test]
     fn http_keepalive_serves_two_requests_on_one_connection() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
         let mut srv: *mut HttpServer = std::ptr::null_mut();
@@ -25562,6 +25610,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// an explicit `Connection: close`, an HTTP/1.0 request, and a pipelined (residual-bytes) client.
     #[test]
     fn http_keepalive_ineligible_requests_are_closed() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (label, req) in [
             ("explicit close", b"GET /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n".to_vec()),
             ("http/1.0", b"GET /x HTTP/1.0\r\nHost: h\r\n\r\n".to_vec()),
@@ -25587,6 +25638,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// and a `204` — which cannot carry a body — needs no framing header at all. Both stay alive.
     #[test]
     fn http_keepalive_keeps_a_bodiless_response_framed_and_alive() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
         let mut srv: *mut HttpServer = std::ptr::null_mut();
@@ -25614,10 +25668,95 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_http_server_free(srv) };
     }
 
+    /// A status that cannot carry a body suppresses BOTH the framing header and any body bytes the
+    /// builder holds — otherwise those bytes would be read as the start of the NEXT response on a
+    /// kept-alive connection (RFC 9112 §6.3 terminates a 1xx/204/304 at the first empty line
+    /// whatever its fields say). `web.status_text(204, …)` is the reachable spelling.
+    #[test]
+    fn http_bodiless_status_suppresses_a_body_that_was_set() {
+        for status in [204i64, 304, 100, 199] {
+            let rb = ResponseBuilder { status, headers: vec![], body: Some(b"XYZ".to_vec()) };
+            let out = String::from_utf8(http_serialize_response(&rb).unwrap()).unwrap();
+            assert!(!out.to_ascii_lowercase().contains("content-length"), "{status} emits no CL: {out:?}");
+            assert!(out.ends_with("\r\n\r\n"), "{status} sends no body bytes: {out:?}");
+        }
+        // The next status up carries the body normally — the rule is exactly the RFC's set.
+        let ok = ResponseBuilder { status: 205, headers: vec![], body: Some(b"XYZ".to_vec()) };
+        let out = String::from_utf8(http_serialize_response(&ok).unwrap()).unwrap();
+        assert!(out.contains("Content-Length: 3\r\n") && out.ends_with("XYZ"), "205 keeps its body: {out:?}");
+    }
+
+    /// A 1xx is an INTERIM response: a client that got one waits for the final response, so the
+    /// connection must not be parked (it would wait forever) — it closes, as before keep-alive.
+    #[test]
+    fn http_keepalive_never_parks_an_interim_response() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        let client = keepalive_client(port, vec![b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec()]);
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        assert_eq!(unsafe { align_rt_http_respond(ctx, align_rt_http_response_new(100)) }, 0);
+        let (resps, still_open) = client.join().unwrap();
+        assert!(!still_open, "an interim response closes the connection");
+        assert!(resps[0].contains("Connection: close\r\n"), "and says so: {:?}", resps[0]);
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// Several clients keep their connections at once: the parked SET means a new connection no
+    /// longer costs a warm one its connection (the single-slot shape would have closed client A the
+    /// moment B connected, so A's second request would have hit a dead socket).
+    #[test]
+    fn http_keepalive_holds_many_connections_at_once() {
+        // Holds 8 fds at once (4 client sockets + their parked peers), which would inflate the
+        // fd-count assertions in the leak tests — share their serialization lock.
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        // Four clients each do a request, then (after all four are parked) a second one.
+        let mut socks: Vec<std::net::TcpStream> = Vec::new();
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..4 {
+            use std::io::Write;
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).expect("timeout");
+            sock.write_all(format!("GET /c{i} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            assert_eq!(unsafe { serve_one_echo(srv, 200, "one") }, 0);
+            let resp = read_framed_response(&mut sock, &mut buf, false);
+            assert!(resp.contains(&format!("X-Path: /c{i}\r\n")), "client {i} first: {resp:?}");
+            socks.push(sock);
+            bufs.push(buf);
+        }
+        // All four are parked now. Each sends a SECOND request on its ORIGINAL connection.
+        for (i, sock) in socks.iter_mut().enumerate() {
+            use std::io::Write;
+            sock.write_all(format!("GET /again{i} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes())
+                .expect("the connection must still be alive");
+        }
+        for _ in 0..4 {
+            assert_eq!(unsafe { serve_one_echo(srv, 200, "two") }, 0);
+        }
+        for (i, sock) in socks.iter_mut().enumerate() {
+            let resp = read_framed_response(sock, &mut bufs[i], false);
+            assert!(resp.ends_with("two"), "client {i} was served a second time: {resp:?}");
+        }
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
     /// A HEAD request composes with keep-alive: the body is suppressed (its `Content-Length` still
     /// sent), the connection is parked, and the next request is served off it.
     #[test]
     fn http_keepalive_composes_with_head() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
         let mut srv: *mut HttpServer = std::ptr::null_mut();
@@ -25640,6 +25779,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// (so no idle timeout is needed), and the new client is served.
     #[test]
     fn http_keepalive_parked_connection_is_evicted_by_new_traffic() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
         let mut srv: *mut HttpServer = std::ptr::null_mut();
@@ -25664,6 +25806,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// dead connection and blocks for a fresh one, which it serves normally.
     #[test]
     fn http_keepalive_recovers_from_a_parked_connection_eof() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use std::io::{Read, Write};
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
@@ -25875,6 +26020,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// later strict bind either.
     #[test]
     fn http_serve_shared_allows_a_second_listener_where_serve_does_not() {
+        // The fd-count leak tests sample the PROCESS fd table, so every test that holds sockets
+        // open across a wait shares their serialization lock (the module's fd-quiet convention).
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let port = free_loopback_port();
         let (hp, hl) = view_of("127.0.0.1");
 

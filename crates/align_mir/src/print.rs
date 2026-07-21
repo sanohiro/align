@@ -527,6 +527,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::EnvGet { name, out } => format!("env_get({}, -> _{out})", operand_str(name)),
         Rvalue::EnvSet { name, value } => format!("env_set({}, {})", operand_str(name), operand_str(value)),
         Rvalue::TimeNow => "time_now()".to_string(),
+        Rvalue::ProcessCpuCount => "process_cpu_count()".to_string(),
         Rvalue::TimeInstant => "time_instant()".to_string(),
         Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),
         Rvalue::EncodingEncode { kind, data } => format!("encode_{kind:?}({})", operand_str(data)),

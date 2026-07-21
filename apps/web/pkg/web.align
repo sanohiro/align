@@ -280,9 +280,15 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
 //                    and the STRICT `http.serve` bind (a second server on the port still fails).
 //   workers >= 2  -> `workers` prefork workers, each with its own SO_REUSEPORT listener.
 //   workers <  1  -> a startup abort (the validate class: a programmer-config error).
+//   workers >  process.cpu_count() -> the SAME startup abort. A worker here never returns, and
+//                    `task_group` runs its tasks on a pool sized by the available parallelism, so
+//                    tasks past that count would never start at all. Aborting keeps the promise this
+//                    parameter makes — `serve(..., 4)` really is four request loops — instead of
+//                    silently serving with fewer than the source says.
 //
-// Sizing: `workers = cores` is the default to reach for. An open stream occupies its worker for the
-// whole generation, so a streaming app wants `workers >= expected concurrent streams + 1`.
+// Sizing: `workers = process.cpu_count()` is the default to reach for. An open stream occupies its
+// worker for the whole generation, so a streaming app wants `workers >= expected concurrent streams
+// + 1` — and, given the cap, a machine with cores to match.
 //
 // Error semantics (partial degradation): a worker that hits a listener-level fault returns its `Err`
 // and dies while the others keep serving; `wait()?` joins ALL of them, so `serve` returns — with the
@@ -302,6 +308,15 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>, workers: 
   if workers < 1 {
     e := io.stderr
     e.write("pkg.web.serve: workers must be at least 1\n") else {}
+    process.abort()
+  }
+  // A worker loop never returns, and `task_group` schedules its tasks on a pool sized by the
+  // available parallelism — so more workers than that would simply never start. Refuse rather than
+  // silently run fewer request loops than the call site says.
+  cores := process.cpu_count()
+  if workers > cores {
+    e := io.stderr
+    e.write("pkg.web.serve: workers exceeds the available parallelism (process.cpu_count()); a worker past that never starts\n") else {}
     process.abort()
   }
   if workers == 1 {

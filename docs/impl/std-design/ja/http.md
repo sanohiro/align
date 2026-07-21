@@ -507,8 +507,13 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      ポータビリティ: Linux は適切に振り分ける; macOS は TCP に対しこのオプションを受け付けるが分配品質
      は未規定 — 記録するだけでゲートしない（ベンチ機は Linux）。
    - **② コネクション keep-alive は完全に `accept`/`respond` の内側で — ループ形状はどの呼び出し側に
-     とっても不変。** サーバハンドル毎に 1 つの **parked スロット**（v1 の一度に 1 コネクションの姿勢
-     を明示化したもの）:
+     とっても不変。** サーバハンドル毎に **上限つきの parked 集合**（256 コネクション。満杯時は最も
+     長く使われていないものを close して空きを作る）。設計当初は単一スロット — 「v1 の一度に 1
+     コネクションの姿勢を明示化したもの」— だったが、これは**実装中に是正した**: 1 スロットでは新規
+     コネクションが毎回それまでのものを evict するので、「このコネクションは持続する」と告げられた
+     ばかりの client が次のリクエストを失う（POST では client 側で安全に再試行できない失敗である）。
+     処理は依然として厳密に一度 1 リクエストずつであり、park されたコネクションは idle であって
+     in-flight ではない:
      - **適格性**（パース時に計算され ctx に載る）: リクエストが HTTP/1.1 であり、`Connection: close`
        ヘッダを持たず、パースバッファ内に自分のボディを越える**残余バイトを残さない**こと（パイプ
        ライン化する client には応答してから close する — 残余の持ち越しは意図的に**作らない**; 本物の
@@ -522,22 +527,28 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
        `200` は「コネクションが閉じるまで」という枠付けになっていた — keep-alive できず、しかもワイヤ上で
        切り詰められた stream と区別がつかない。**完全に改めた:** ボディを持ちうるステータスのレスポンスは
        どちらの場合もフレーミングされる（セットされた長さ、またはボディ未設定なら `0`）; `1xx`/`204`/`304`
-       はボディを持たないので、従来どおりフレーミングヘッダを付けない。したがって keep-alive の可否は
-       **リクエストだけ**で決まり、ボディなしのレスポンス（`web.status(201)`）も close を強制せずコネク
-       ションに留まる。`respond_stream`、`reject`、および全エラーパスは
+       はボディを持たないので、**フレーミングヘッダも、ビルダが保持しているボディバイトも出さない** —
+       この種のレスポンスはフィールドが何を言っていようと最初の空行で終端するので、そこにボディを付けると
+       keep-alive されたコネクション上では**次のレスポンスの先頭**として読まれてしまう。この抑制は HEAD が
+       既に受けているのと同じプロトコル境界での扱いである。したがって keep-alive の可否は**リクエストだけ**
+       で決まり、ボディなしのレスポンス（`web.status(201)`）もコネクションに留まる。
+       `respond_stream`、`reject`、および全エラーパスは
        従来の常時 close セマンティクスを保つ（stream の終端子はその close であり、reject 窓はエラー
        パス — 2 つ目のフレーミングモードに値しない、記録のみ）。
-     - **`srv.accept()`**: parked fd なし → 従来どおり素の `accept(2)`。parked fd あり →
-       `poll({parked, listener}, infinite)`; parked が readable → そこから**次の**リクエストをパース
-       （新しいパースバッファ — zero-copy view はリクエスト毎に保たれる）; listener のみ readable →
-       新規コネクションを取り、parked を close する（単一スロット: idle な keep-alive client は新規
-       トラフィックで evict されるので idle タイムアウトは不要 — 新規トラフィックのない idle な
-       parked fd は poll でブロックするだけで、それが accept の通常の idle 状態そのもの）。両方
-       readable → parked を優先（暖まった client を drain する; 公平性の caveat は prefork の他ワーカー
-       と信頼済みネットワークの姿勢で境界づけられる — 記録）。parked EOF / パースエラー → それを
-       close し、`accept(2)` へフォールスルー。`accept` の表面と `Result` は不変。
-     - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。スロットは
-       ランタイム内部の refcount セル（`Arc<Mutex<Option<fd>>>`）であり、サーバハンドルが保持し**かつ**
+     - **`srv.accept()`**: park が空 → 従来どおり素の `accept(2)`。そうでなければ
+       `poll({…parked, listener}, infinite)`; park されたコネクションが readable → それを集合から
+       **取り出し**、そこから**次の**リクエストをパースする（新しいパースバッファ — zero-copy view は
+       リクエスト毎に保たれる）; listener のみ readable → 新規コネクションを取り、**park 集合には手を
+       触れない**。両方 readable → 暖まったコネクションを優先（公平性の caveat は prefork の他ワーカー
+       と信頼済みネットワークの姿勢で境界づけられる — 記録）。parked の EOF / パースエラー → その 1 本を
+       close して見直す。idle タイムアウトは無い: idle な parked fd は `poll` で待つだけであり、それが
+       accept の通常の idle 状態そのものである。そして容量が逼迫すれば最も冷たいものが evict される。
+       `POLLNVAL` は `POLLHUP`/`POLLERR` と並べて監視する — これが無いと無効な fd がどの分岐にも当たら
+       ない revent を返し、待機ループが spin してしまう。`accept` の表面と `Result` は不変。
+     - **interim（`1xx`）レスポンスは決して park しない** — 完全なレスポンスではないので、それを受け
+       取った client は最終レスポンスを待つ。コネクションは keep-alive 以前と同様に close する。
+     - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。集合は
+       ランタイム内部の refcount セル（`Arc<Mutex<ParkSlot>>`）であり、サーバハンドルが保持し**かつ**
        accept 時に各 ctx へ clone される — リクエスト毎に refcount を 1 つ bump するだけで、ユーザに
        見える割り当てはなく、構築上 uncontended（prefork が全ワーカーに自分のサーバハンドルを与える
        ので、mutex はスレッドを決して跨がない）。サーバが先に drop → セルは dead としてマークされ
@@ -552,21 +563,24 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      `serve` の二重 bind は依然として失敗する; prefork E2E — W ワーカー、同時 client、他が応答する間に
      1 つの held-open stream。
    - **出荷記録。** ランタイム: 共有 `tcp_listen_impl(…, reuseport)` の背後に置いた `SO_REUSEPORT` +
-     `align_rt_http_serve_shared`; parked スロットは `Arc<Mutex<ParkSlot>>`（`Empty`/`Parked(fd)`/
-     `Dead`。最後の状態は `HttpServer::drop` が設定し、park 中の fd も閉じる）; 適格性は
+     `align_rt_http_serve_shared`; parked 集合は `Arc<Mutex<ParkSlot>>`（`Live(Vec<fd>)`/`Dead`。
+     後者は `HttpServer::drop` が設定し、park 中の fd を**すべて**閉じる）; 適格性は
      `http_read_request` で計算し（`http_request_wants_close` + 残余チェック）ctx に載せる;
      `align_rt_http_accept` は `http_wait_parked_or_listener`（新しい `poll(2)` extern）+
      `http_accept_conn` を中心に再構成; `http_serialize_head(rb, persistent)` は keep-alive 経路で
      `Connection` 行を省く。言語側: `ExprKind::HttpServe`/`Rvalue::HttpServe` が `shared: bool` を得た
      （variant ではなく**フィールド** — 全解析パスは引き続き `http.serve` として扱う）、
      `http.serve_shared` は同じ `check_http_serve` を通って dispatch する。テスト: ランタイムの
-     keep-alive unit 6 本（1 コネクション 2 リクエスト、3 つの不適格規則、HEAD との合成、eviction、
-     parked EOF の回復、fd 衛生）+ `serve_shared` の二重 bind unit; driver の `m11_http_server.rs`
-     （`serve_shared` E2E + ゲート）、`apps_web_root.rs`（keep-alive × pkg.web のループ）、
-     `apps_web_prefork.rs`（同時 client、他が応答する間に 1 ワーカーを占有する held-open stream、
-     `workers < 1` の abort）。
+     keep-alive unit 10 本（1 コネクション 2 リクエスト、3 つの不適格規則、HEAD との合成、eviction、
+     parked EOF の回復、fd 衛生、ボディなしレスポンスのフレーミング、ボディを持てないステータスが
+     セット済みボディを抑制すること、interim レスポンスが park しないこと、4 クライアント同時 park）
+     + `serve_shared` の二重 bind unit; driver の `m11_http_server.rs`（`serve_shared` E2E + ゲート）、
+     `apps_web_root.rs`（keep-alive × pkg.web のループ。2 番目の client が 1 番目からコネクションを
+     奪わないことを含む）、`apps_web_prefork.rs`（同時 client、`/proc/net/tcp` から読み出した
+     ワーカー毎に 1 つのリスナー、他が応答する間に 1 ワーカーを占有する held-open stream、範囲外の
+     `workers` の abort）。
    - **呼び出し側/テスト向けの挙動注記:** 適格な HTTP/1.1 リクエストはコネクションを**開いたまま**に
-     するので、EOF まで読む client はサーバが終了するか新規トラフィックが parked コネクションを evict
+     するので、EOF まで読む client はサーバが終了するか容量の逼迫が parked コネクションを evict
      するまでブロックする。コネクション毎 1 リクエストの client は `Connection: close` を送る（driver
      テスト共有の `one_shot` ヘルパ）か、`Content-Length` で読みをフレーム化しなければならない。
 

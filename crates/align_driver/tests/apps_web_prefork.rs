@@ -178,6 +178,11 @@ fn a_held_open_stream_occupies_one_worker_while_the_others_serve() {
     assert!(head.contains("Content-Type: text/event-stream\r\n"), "SSE head: {head:?}");
 
     // While that stream is still open, ordinary requests keep being answered — on other workers.
+    // Deliberately NOT timed: `SO_REUSEPORT` picks a listener by 4-tuple hash, so a given connection
+    // MAY land on the busy worker's accept queue and wait for the stream to end (prefork's honest
+    // semantics, shared with nginx/fasthttp under a blocking handler). Asserting a latency bound
+    // here would be asserting the kernel's hash. What must hold — and does — is that the server as a
+    // whole keeps answering while a stream is mid-generation, which the sequential loop could not.
     for i in 0..4 {
         let resp = exchange(port, b"GET /ping HTTP/1.1\r\nHost: h\r\n\r\n");
         assert!(resp.ends_with("pong"), "request {i} during the open stream: {resp:?}");
@@ -188,10 +193,51 @@ fn a_held_open_stream_occupies_one_worker_while_the_others_serve() {
     drop(stream_sock);
 }
 
-/// `workers < 1` is a programmer-config error, aborted at startup like a malformed route table —
-/// before anything binds.
+/// How many sockets are listening on `port` right now — one per prefork worker, since each binds
+/// its own `SO_REUSEPORT` listener. Read from `/proc/net/tcp{,6}` (Linux only; the caller skips
+/// elsewhere): a LISTEN row (state `0A`) whose local port matches.
+#[cfg(target_os = "linux")]
+fn listening_sockets(port: u16) -> usize {
+    let want = format!(":{port:04X}");
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|s| s.lines().map(str::to_string).collect::<Vec<_>>())
+        .filter(|line| {
+            let mut f = line.split_whitespace();
+            let (_, local, _, state) = (f.next(), f.next(), f.next(), f.next());
+            local.is_some_and(|l| l.to_ascii_uppercase().ends_with(&want)) && state == Some("0A")
+        })
+        .count()
+}
+
+/// The worker count is REAL: `serve(..., W)` binds exactly `W` listeners on the port. Without this,
+/// every other test in this file would pass on a single-worker server — `task_group` dispatches onto
+/// a bounded pool, so "spawned `W` tasks" does not by itself mean "`W` request loops are running".
 #[test]
-fn a_worker_count_below_one_aborts_at_startup() {
+#[cfg(target_os = "linux")]
+fn each_worker_binds_its_own_listener() {
+    if !backend_available() {
+        return;
+    }
+    for workers in [1u32, 2, 4] {
+        let srv = start(&format!("web-prefork-count-{workers}"), workers);
+        // The server is up (start() already waited); confirm it answers, then count the listeners.
+        assert!(exchange(srv.port, b"GET /ping HTTP/1.1\r\nHost: h\r\n\r\n").ends_with("pong"));
+        assert_eq!(
+            listening_sockets(srv.port),
+            workers as usize,
+            "serve(..., {workers}) must bind {workers} listeners"
+        );
+    }
+}
+
+/// `workers < 1` is a programmer-config error, aborted at startup like a malformed route table —
+/// before anything binds. So is a count above the available parallelism: those workers would never
+/// start (the pool is sized by `process.cpu_count()`), and silently serving with fewer request loops
+/// than the call site says would break the promise the parameter makes.
+#[test]
+fn a_worker_count_outside_the_runnable_range_aborts_at_startup() {
     if !backend_available() {
         return;
     }
@@ -213,4 +259,17 @@ fn a_worker_count_below_one_aborts_at_startup() {
     assert!(!out.status.success(), "a zero worker count must abort: {out:?}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("workers must be at least 1"), "diagnosis names the problem: {err:?}");
+
+    // Above the available parallelism: `std::thread::available_parallelism` is what both
+    // `process.cpu_count()` and the task pool read, and no machine reports 100k cores.
+    let over = std::process::Command::new(&built.exe)
+        .args(["--port", &free_loopback_port().to_string(), "--workers", "100000"])
+        .output()
+        .expect("run");
+    assert!(!over.status.success(), "more workers than cores must abort: {over:?}");
+    let over_err = String::from_utf8_lossy(&over.stderr);
+    assert!(
+        over_err.contains("exceeds the available parallelism"),
+        "diagnosis names the cap: {over_err:?}"
+    );
 }

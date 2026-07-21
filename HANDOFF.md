@@ -21,11 +21,19 @@ needed**, exactly as probed: the worker's bind is an ordinary value-carrying
 `if shared { http.serve_shared(…)? } else { http.serve(…)? }`. **Behavioral consequence for every
 caller/test:** an eligible 1.1 request now leaves the connection OPEN, so a read-to-EOF client must
 send `Connection: close` (driver tests share `common::one_shot`) or frame by `Content-Length`.
-**One settled amendment fell out of the implementation:** `respond` used to emit `Content-Length`
-only when a body was SET, so a bodiless `200` was framed "until close" — un-keep-alive-able and
-indistinguishable from a truncated stream. Every response whose status may carry a body is now
-framed either way (the set length, or `0`); `1xx`/`204`/`304` still get no framing header. Keep-alive
-therefore depends only on the REQUEST, and `web.status(201)` stays on the connection.
+**Four corrections fell out of implementation + the adversarial review, all in this PR:**
+① `respond` used to emit `Content-Length` only when a body was SET, so a bodiless `200` was framed
+"until close" — un-keep-alive-able and indistinguishable from a truncated stream. Every response
+whose status may carry a body is now framed either way (the set length, or `0`); `1xx`/`204`/`304`
+get neither the header NOR any body bytes the builder holds (those would be read as the next
+response). ② The park slot became a bounded SET (256, LRU eviction): with one slot every new
+connection evicted the previous one, so a client just told "persistent" lost its next request —
+keep-alive was useless past one client, which would also have made the W5 bench meaningless.
+③ `serve` now aborts when `workers > process.cpu_count()`: `task_group` dispatches onto a pool sized
+by the available parallelism, so never-returning workers past that count SILENTLY never start (the
+`serve(..., 4)` = "four loops" promise was false above cores+1). That required the std addition
+**`process.cpu_count()`** — which also makes the documented `workers = cores` sizing writable at
+all. ④ `poll` now watches `POLLNVAL` (an invalid fd would otherwise spin the accept loop at 100%).
 Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver `m11_http_server.rs`
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE

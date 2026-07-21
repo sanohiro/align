@@ -4214,7 +4214,7 @@ impl EffectScan<'_> {
                 self.expr(name);
                 self.expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 self.impure_direct = true;
                 self.expr(ns);
@@ -5767,6 +5767,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
+            | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -6045,6 +6046,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
+            | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -6750,7 +6752,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -7379,7 +7381,7 @@ impl UnnecessaryHeapScan {
                 self.visit(name);
                 self.visit(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::ProcessExit { code } => self.visit(code),
             ExprKind::ProcessAbort => {}
@@ -8846,7 +8848,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(name, moved, false, false);
                 self.expr(value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => self.expr(code, moved, false, false),
@@ -12414,6 +12416,18 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "process" && matches!(method, "exit" | "abort") {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
+            }
+            // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
+            // process (affinity/quota aware, always >= 1). The number a `task_group` worker count is
+            // sized against, since the runtime's task pool is sized from the same source.
+            if module == "process" && method == "cpu_count" {
+                self.require_import("std.process", "process.cpu_count", span);
+                if !args.is_empty() {
+                    self.diags
+                        .error(format!("'process.cpu_count' takes no arguments, got {}", args.len()), span);
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                return Expr { kind: ExprKind::ProcessCpuCount, ty: Ty::Int(IntTy { bits: 64, signed: true }), span };
             }
             // `std.process` — `process.spawn(cmd, args)` -> Result<child, Error> (fork+execvp).
             if module == "process" && method == "spawn" {
@@ -20342,7 +20356,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}

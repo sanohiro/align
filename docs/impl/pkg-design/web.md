@@ -464,6 +464,10 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
 //   workers >= 2  -> task_group { spawn W workers }; each worker: its OWN http.serve_shared
 //                    listener + the unchanged accept/dispatch/respond loop
 //   workers <  1  -> startup abort (the validate class: a programmer-config error)
+//   workers >  process.cpu_count() -> the SAME abort (found while implementing): a worker never
+//                    returns, and task_group runs its tasks on a pool sized by the available
+//                    parallelism, so tasks past that count never start at all. Aborting keeps the
+//                    promise the parameter makes instead of silently serving with fewer loops.
 ```
 
 - **Nothing hidden, by parameter:** thread creation is visible at every call site — `serve(...,
@@ -490,7 +494,9 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
   serving. Production streaming's gate becomes "run with enough workers", a visible capacity
   decision in the app's source — record `workers >= expected concurrent streams + 1` as the
   sizing rule of thumb in the fn doc.
-- **Sizing:** the bench gate runs `workers = cores`; the fn doc recommends it as the default.
+- **Sizing:** the bench gate runs `workers = process.cpu_count()`; the fn doc recommends it as the
+  default, and it is also the cap (above). That accessor is a std addition this arc required — the
+  recommended sizing was previously unwritable in Align (`std-design/process.md`).
 
 ### Keep-alive rides entirely in std.http
 
@@ -515,7 +521,11 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    outright. The worker body is the factored-out `worker(host, port, routes, shared)`, whose bind
    line is `srv := if shared { http.serve_shared(…)? } else { http.serve(…)? }` — an ordinary
    value-carrying `if`, so no new nameable `http_server` type was needed. Needed NO compiler
-   enabler, as probed.
+   enabler, as probed — but it DID need one std addition, `process.cpu_count()`, because
+   `task_group` dispatches onto a pool sized by the available parallelism: more never-returning
+   workers than that would never start, so `serve` aborts above the cap and the recommended
+   `workers = cores` sizing is now writable. `apps_web_prefork.rs` counts the listeners actually
+   bound (`/proc/net/tcp`), so "spawned W tasks" can never again be mistaken for "W loops run".
 4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
    only now is the Fiber comparison honest. THE REMAINING SLICE.
 

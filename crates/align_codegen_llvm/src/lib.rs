@@ -2378,6 +2378,11 @@ fn build_module<'c>(
         module.add_function("align_rt_time_instant", i64t2.fn_type(&[], false), None),
     );
     funcs.insert(
+        // process.cpu_count () -> i64 (available parallelism, >= 1).
+        "process_cpu_count".to_string(),
+        module.add_function("align_rt_process_cpu_count", i64t2.fn_type(&[], false), None),
+    );
+    funcs.insert(
         // time.sleep (ns: i64) -> void.
         "time_sleep".to_string(),
         module.add_function("align_rt_time_sleep", ctx.void_type().fn_type(&[i64t2.into()], false), None),
@@ -7731,6 +7736,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_call(self.funcs["time_instant"], &[], "instant")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("time_instant returns i64"),
+            Rvalue::ProcessCpuCount => self
+                .builder
+                .build_call(self.funcs["process_cpu_count"], &[], "cpucount")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("process_cpu_count returns i64"),
             Rvalue::TimeSleep { ns } => {
                 let n = self.operand(ns).into();
                 self.builder
