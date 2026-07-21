@@ -161,6 +161,18 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   Whole workspace green (2605 passed), clippy clean; **zero false positives** — the only pre-existing
   test the whole arc broke was the pinned known hole.
 
+**DONE 2026-07-22 — a test-harness exe race that turned `main` red (#600), diagnosed not guessed.**
+`response_builder_payload.rs`'s `run_server` took a `name` and threw it away (`let _ = name;`),
+building every server as `srv-rb`. `build_exe` derives the executable path from that name plus the
+pid, and libtest runs the two server tests concurrently in one binary — so both built, spawned, and
+deleted the SAME file: `ETXTBSY` when one spawned while the other was still linking it, `NotFound`
+when the other's `TempArtifacts` drop had already removed it. Both appeared in one run.
+**Measured A/B** (four concurrent runs of the test binary x six rounds): **2/24 failed with the
+shared name, 0/24 with a per-test one**; serially it is 0/15 either way, which is why it reads as a
+one-off flake — the reproduction needs concurrent load. Swept the suite for the same hazard: no other
+file uses a duplicate literal `build_exe` name, and the other computed-name callers already thread
+theirs through.
+
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
 (`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->
 http_headers`, a Copy, region-bound, non-owning view **whose representation is the ctx pointer**, so
