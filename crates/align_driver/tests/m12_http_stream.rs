@@ -133,6 +133,51 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(frames[1], b"/events", "ctx.path() stays valid after respond_stream (borrowed ctx)");
 }
 
+/// `s.send_event(data)` — WHATWG SSE event framing as a stream method (the pkg.web streaming
+/// design's floor item; it lives HERE because a pkg-level free fn cannot borrow a Move handle).
+/// Each call arrives as exactly one chunk frame `data: {data}\n\n`; an EMPTY event is a real frame
+/// (`data: \n\n`) — unlike `send("")`, which frames nothing.
+#[test]
+fn send_event_writes_whatwg_frames_end_to_end() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  rb.header(\"Content-Type\", \"text/event-stream\")
+  s := ctx.respond_stream(rb)?
+  s.send_event(\"one\")?
+  s.send_event(\"\")?
+  s.finish()?
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let server = build_exe("m12-stream-sse-event", prog);
+    let mut child = std::process::Command::new(&server.exe)
+        .args(["--port", &port.to_string()])
+        .spawn()
+        .expect("spawn server");
+    let resp = client_read_all(port, b"GET /sse HTTP/1.1\r\nHost: h\r\n\r\n");
+    let status = child.wait().expect("server exits");
+    assert!(status.success(), "server exited with {status:?}");
+    let (head, body) = split_head_body(&resp);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {head:?}");
+    assert!(resp.ends_with(b"0\r\n\r\n"), "clean finish after events");
+    let frames = decode_chunks(&body);
+    assert_eq!(frames.len(), 2, "one frame per send_event, INCLUDING the empty event");
+    assert_eq!(frames[0], b"data: one\n\n");
+    assert_eq!(frames[1], b"data: \n\n", "an empty event is a legal frame, not a no-op");
+}
+
 /// A 1.0 request cannot be chunked: the stream is close-delimited **raw** — no `Transfer-Encoding`
 /// header, the payload bytes are written unframed, and close is the terminator (`read_to_end` returns).
 #[test]

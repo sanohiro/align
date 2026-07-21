@@ -1015,11 +1015,12 @@ pub enum Rvalue {
     /// caller, spent — its views remain valid; http.md item 8 ①). Returns an `i32` status (0 = ok;
     /// else `AL_INVALID` → `Error`); the caller branches `Ok(http_stream)` / `Err`. Impure.
     HttpRespondStream { ctx: Operand, rb: Operand, out: Slot },
-    /// `s.send(chunk)` — write one streamed chunk to the stream `s` (opaque pointer, **borrowed** —
-    /// mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`. Returns an `i32` status
-    /// (0 = ok, incl. an empty-chunk no-op; else errno → `Error`); the caller branches `Ok(())` / `Err`.
-    /// Impure.
-    HttpStreamSend { stream: Operand, chunk: Operand },
+    /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk to the stream `s` (opaque
+    /// pointer, **borrowed** — mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`.
+    /// With `event` set the runtime wraps the payload as one WHATWG SSE frame (`data: {data}\n\n`)
+    /// in the same single write. Returns an `i32` status (0 = ok, incl. the plain-send empty-chunk
+    /// no-op; else errno → `Error`); the caller branches `Ok(())` / `Err`. Impure.
+    HttpStreamSend { stream: Operand, chunk: Operand, event: bool },
     /// `s.finish()` — write the terminator (framed mode) + close the fd. `s` is an opaque pointer
     /// **moved in** (the runtime frees it, so the MIR nulls its source slot). Returns an `i32` status
     /// (0 = ok; else `AL_INVALID` → `Error`); the caller branches `Ok(())` / `Err`. Impure.
@@ -9100,13 +9101,13 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             null_moved_source(b, rb);
             lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty)
         }
-        // `s.send(chunk)` → `Result<(), Error>`. `s` is **borrowed** (mutated in place — not consumed);
-        // `chunk` is a byte view.
-        hir::ExprKind::HttpStreamSend { stream, chunk } => {
+        // `s.send(chunk)` / `s.send_event(data)` → `Result<(), Error>`. `s` is **borrowed** (mutated
+        // in place — not consumed); the payload is a byte view.
+        hir::ExprKind::HttpStreamSend { stream, chunk, event } => {
             let s = lower_expr(b, stream);
             let ch = lower_expr(b, chunk);
             let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::HttpStreamSend { stream: s, chunk: ch }));
+            b.push(Stmt::Let(code, Rvalue::HttpStreamSend { stream: s, chunk: ch, event: *event }));
             lower_status_result(b, code, e.ty)
         }
         // `s.finish()` → `Result<(), Error>`. `s` is **consumed** (the runtime frees it): null its source

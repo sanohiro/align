@@ -301,7 +301,7 @@ framework's ability to answer differently (404/405/500) has ended anyway. Nothin
 // The second (and last) handler signature, scoped to stream routes. Borrows the request through
 // `c` (valid for the whole call — serve still holds the handle) and OWNS the response stream.
 fn events(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {
-  web.send_event(s, "tick")?
+  s.send_event("tick")?
   s.finish()
 }
 
@@ -316,9 +316,20 @@ routes := [
 web.sse(pattern, pump)                       -> route   // method GET (EventSource always GETs),
                                                         //   Content-Type text/event-stream
 web.stream(method, pattern, content_type, pump) -> route // the general form
-web.send_event(s, data)  -> Result<(), Error>           // one `data: {data}\n\n` frame, one send;
-                                                        //   single-line data (multi-line = caller)
+s.send_event(data)       -> Result<(), Error>           // one `data: {data}\n\n` frame, one send;
+                                                        //   single-line data (multi-line = caller);
+                                                        //   send_event("") = a legal empty event
 ```
+
+**`send_event` is a `http_stream` METHOD, not a `web.*` free fn** (revised while shipping enabler
+5 — the surface was first sketched as `web.send_event(s, data)`). Two reasons, one decisive: a
+pkg-level free fn takes a Move handle BY VALUE — Align has no user-fn borrow params (borrowing is
+the std bound-receiver mechanism, the recorded `io.copy` restriction) — so
+`web.send_event(s, …)?; s.finish()` cannot compile: the wrapper would consume the very stream the
+pump still has to finish. And SSE event framing was already committed as a std.http floor item
+("SSE event framing (WHATWG) when the first streaming consumer lands", Prerequisites above), so
+the framing lives with the other stream writes — `send` / `send_event` / `finish` / `reject`, one
+method family on one handle. pkg.web ships NO wrapper (the `web.header` no-duplication rule).
 
 ### Types
 
@@ -345,8 +356,10 @@ match r.handler {
     rb := http.response(200)
     rb.header("Content-Type", r.stream_type)
     rb.header("Cache-Control", "no-cache")            // a cached stream is nonsense; always set
-    s := ctx.respond_stream(rb) else { <skip pump> }  // client already gone -> next request
-    pump(c, s) else {}                                // Err after the head: nothing to answer
+    match ctx.respond_stream(rb) {
+      Ok(s) => pump(c, s) else {}                     // Err after the head: nothing to answer
+      Err(e) => {}                                    // client already gone -> next request
+    }
   }
 }
 ```
@@ -405,6 +418,19 @@ with concurrency.
    in `docs/impl/std-design/http.md` item 8; the M12 tests were updated outright
    (`m12_http_stream.rs`, 13 — including a mid-pump `ctx.path()` read, the exact stream-handler
    borrow shape enabler 5 needs).
+5. **pkg.web wiring — DONE (2026-07-21).** `Handler` (`Respond`/`Stream`) + `Route.stream_type` in
+   `types.align`; `web.stream` / `web.sse` constructors; `serve`'s stream arm exactly as the
+   pseudocode above; and `s.send_event(data)` as the std.http method (WHATWG `data: {data}\n\n`,
+   ONE write sharing the lazy head's buffer — head + framing + event in a single `send`; an empty
+   event is a real frame, unlike `send("")`'s no-op; runtime `align_rt_http_stream_send_event` over
+   the shared `http_stream_send_parts`). En route, fixed a **MoveCheck false positive**: a
+   match-arm binding consumed inside a `loop` body poisoned the back-edge fixpoint (arm bindings
+   never cleared their moved bit on (re)initialization, unlike `Let` — exactly serve's
+   `Ok(s) => pump(c, s)`). E2E: `crates/align_driver/tests/apps_web_stream.rs` (3 — SSE frames +
+   mid-pump `param`/`has_query`/`body` reads, the reject 4xx window with the loop surviving, and
+   one-table coexistence: stream-route 405 `Allow` + 404), `m12_http_stream.rs` (+1 `send_event`),
+   runtime unit framing test, and a sema regression pin for the MoveCheck fix. **Still test-only**:
+   production streaming remains gated on concurrent serve (the hard ordering note above).
 
 ### Backlog (recorded, not v1)
 
@@ -425,8 +451,9 @@ timeouts/backpressure — each waits for a consumer.
   `*` tails, method sets); malformed-request matrix; keepalive reuse.
 - **W5 — the router/e2e bench gate.** `bench/web_router` + `bench/web_e2e` vs raw std.http
   (≈ zero overhead required) — the performance contract becomes a pinned regression.
-- **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21); implementation
-  gated on the streaming enablers and (for streams in production) concurrent serve.
+- **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
+  **WIRED and pinned E2E** (enabler 5 above, 2026-07-21) but production-gated on concurrent serve;
+  middleware-lite remains designed-only.
 - **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
   numbers and the gap analysis in this doc.
 

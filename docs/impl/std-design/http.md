@@ -472,6 +472,23 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      (lazy-head/reject/spent-ctx contracts) + `m12_http_stream.rs` (13: borrow-then-stream
      `ctx.path()` mid-pump, spent-ctx `respond` → `Err` E2E, reject → normal-400 E2E, late reject →
      `Err` + truncation, move-gates for reject).
+   - **④ `s.send_event(data) -> Result<(), Error>` — SHIPPED 2026-07-21** (with pkg.web streaming
+     enabler 5, its first consumer — the committed "SSE event framing (WHATWG) when the first
+     streaming consumer lands" floor item). Wraps `data` as ONE event frame `data: {data}\n\n`
+     assembled INSIDE the same buffer as the chunk framing and the (possibly still pending) lazy
+     head — head + chunk framing + event in one `http_send_all` write; raw (1.0) mode writes the
+     event bytes unframed. **`send_event("")` is a legal EMPTY event** (`data: \n\n`, 8 payload
+     bytes — never the chunked terminator), so unlike `send("")` it is a real write and commits
+     the head. Multi-line `data` is the caller's problem in v1 (a bare `\n` changes the event's
+     field structure — splitting is recorded pkg.web backlog). Borrows `s` exactly like `send`
+     (poison latch shared). It is a METHOD, not a `pkg.web` free fn, because a pkg-level free fn
+     takes a Move handle by value (no user-fn borrow params — the `io.copy` bound-receiver
+     restriction class), which would consume the stream the pump still has to finish. Runtime:
+     `align_rt_http_stream_send_event` over the shared `http_stream_send_parts` helper. Language:
+     `HttpStreamSend`/`Rvalue::HttpStreamSend` gained an `event: bool` (same variant, so every
+     analysis pass treats it as `send` — no new-variant soundness sweep needed). Tests: runtime
+     framing unit (framed empty/non-empty + raw), `m12_http_stream.rs` `send_event` E2E, and the
+     pkg.web `apps_web_stream.rs` suite.
 
 ## Known v1 limitations (Slice 2/3/5)
 

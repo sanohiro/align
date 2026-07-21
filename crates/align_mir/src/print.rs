@@ -629,7 +629,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpRbBody { rb, data } => format!("http_rb_body({}, {})", operand_str(rb), operand_str(data)),
         Rvalue::HttpRespond { ctx, rb } => format!("http_respond({}, {})", operand_str(ctx), operand_str(rb)),
         Rvalue::HttpRespondStream { ctx, rb, out } => format!("http_respond_stream({}, {}, -> _{out})", operand_str(ctx), operand_str(rb)),
-        Rvalue::HttpStreamSend { stream, chunk } => format!("http_stream_send({}, {})", operand_str(stream), operand_str(chunk)),
+        Rvalue::HttpStreamSend { stream, chunk, event } => {
+            let f = if *event { "http_stream_send_event" } else { "http_stream_send" };
+            format!("{f}({}, {})", operand_str(stream), operand_str(chunk))
+        }
         Rvalue::HttpStreamFinish { stream } => format!("http_stream_finish({})", operand_str(stream)),
         Rvalue::HttpStreamReject { stream, rb } => format!("http_stream_reject({}, {})", operand_str(stream), operand_str(rb)),
     }

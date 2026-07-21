@@ -4382,7 +4382,7 @@ impl EffectScan<'_> {
                 self.expr(ctx);
                 self.expr(rb);
             }
-            ExprKind::HttpStreamSend { stream, chunk } => {
+            ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.impure_direct = true;
                 self.expr(stream);
                 self.expr(chunk);
@@ -6885,7 +6885,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(ctx, depth);
                 self.walk(rb, depth);
             }
-            ExprKind::HttpStreamSend { stream, chunk } => {
+            ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.walk(stream, depth);
                 self.walk(chunk, depth);
             }
@@ -7493,7 +7493,7 @@ impl UnnecessaryHeapScan {
                 self.visit(ctx);
                 self.visit(rb);
             }
-            ExprKind::HttpStreamSend { stream, chunk } => {
+            ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.visit(stream);
                 self.visit(chunk);
             }
@@ -8668,6 +8668,10 @@ impl<'a> MoveCheck<'a> {
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
                 let scrutinee_roots = self.borrow_sources(scrutinee);
+                let scrutinee_local = match &scrutinee.kind {
+                    ExprKind::Local(id) => Some(*id),
+                    _ => None,
+                };
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
@@ -8680,6 +8684,26 @@ impl<'a> MoveCheck<'a> {
                             BorrowRoots::new()
                         };
                         self.borrows.assign(*binding, roots);
+                        // An arm binding is INITIALIZED here from the scrutinee's payload, exactly
+                        // like a `Let` — clear any stale moved bit. Without this, an arm that
+                        // consumes its own binding inside a `loop` body poisons the back-edge
+                        // fixpoint, and the next iteration's freshly bound value is rejected as
+                        // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
+                        clear_moved(&mut m, *binding);
+                        // And extracting a MOVE payload moves it OUT of the scrutinee: MIR nulls
+                        // the scrutinee's payload slot at arm entry (the binding owns the buffer
+                        // now), so a Local scrutinee becomes whole-moved in this arm's state —
+                        // using or re-matching it would read the nulled payload as a silent wrong
+                        // result. Tag-only / Copy-payload arms extract nothing owned and leave it
+                        // live; the arm join then makes the post-match state "moved iff some
+                        // taken arm extracted", the standard may-analysis. (Found by the #593
+                        // adversarial review: the arm-entry `clear_moved` above had unshielded
+                        // this pre-existing hole's loop form.)
+                        if let Some(sl) = scrutinee_local
+                            && self.is_move(*binding)
+                        {
+                            m.insert(MovedKey::Whole(sl));
+                        }
                     }
                     self.expr(&a.body, &mut m, consuming, direct);
                     if hir_expr_diverges(&a.body) {
@@ -8966,7 +8990,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(ctx, moved, false, false);
                 self.expr(rb, moved, true, true);
             }
-            ExprKind::HttpStreamSend { stream, chunk } => {
+            ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.expr(stream, moved, false, false);
                 self.expr(chunk, moved, false, false);
             }
@@ -12998,10 +13022,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_http_response_builder_method(recv_expr, method, args, span)
             }
             // Streaming-response methods on a `http_stream` (from `ctx.respond_stream(rb)`): `s.send(chunk)`
-            // writes one chunk (borrows `s`), `s.finish()` terminates + closes (consumes `s`),
+            // writes one chunk (borrows `s`), `s.send_event(data)` writes one WHATWG SSE frame
+            // (`data: {data}\n\n`, borrows `s`), `s.finish()` terminates + closes (consumes `s`),
             // `s.reject(rb)` answers with a normal response instead — pre-first-send only (consumes
             // `s` AND `rb`). All yield `Result<(), Error>`. Type-guarded, same as above.
-            "send" | "finish" | "reject" if recv_ty == Ty::HttpStream => {
+            "send" | "send_event" | "finish" | "reject" if recv_ty == Ty::HttpStream => {
                 self.check_http_stream_method(recv_expr, method, args, span)
             }
             _ => {
@@ -18480,13 +18505,17 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `s.send(chunk)` / `s.finish()` / `s.reject(rb)` on a `http_stream` ([`Ty::HttpStream`]), the
-    /// receiver already evaluated. The receiver must be a **bound local** (the v1 Move-temporary
-    /// gate). `send(chunk)` writes one streamed chunk (`chunk` is a byte view — `str` / owned
-    /// `string` auto-borrowed / `slice<u8>` / a `builder`'s bytes), **borrowing** `s` (not consumed);
-    /// `finish()` **consumes** `s` (writes the terminator + closes); `reject(rb)` **consumes** `s`
-    /// AND `rb` (answers with a complete normal response instead of streaming — legal only before
-    /// the first send). All yield `Result<(), Error>` (Impure).
+    /// `s.send(chunk)` / `s.send_event(data)` / `s.finish()` / `s.reject(rb)` on a `http_stream`
+    /// ([`Ty::HttpStream`]), the receiver already evaluated. The receiver must be a **bound local**
+    /// (the v1 Move-temporary gate). `send(chunk)` writes one streamed chunk (`chunk` is a byte
+    /// view — `str` / owned `string` auto-borrowed / `slice<u8>` / a `builder`'s bytes),
+    /// **borrowing** `s` (not consumed); `send_event(data)` writes `data` wrapped as one WHATWG SSE
+    /// frame (`data: {data}\n\n`) in the same single write, borrowing `s` the same way (SSE event
+    /// framing lives HERE, a std.http floor item — a pkg-level free fn cannot borrow a Move
+    /// handle, so `pkg.web` deliberately ships no wrapper); `finish()` **consumes** `s` (writes the
+    /// terminator + closes); `reject(rb)` **consumes** `s` AND `rb` (answers with a complete normal
+    /// response instead of streaming — legal only before the first send). All yield
+    /// `Result<(), Error>` (Impure).
     fn check_http_stream_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -18500,16 +18529,18 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
         match method {
-            "send" => {
+            "send" | "send_event" => {
+                let event = method == "send_event";
                 if args.len() != 1 {
-                    self.diags.error(format!("'.send()' takes 1 argument (the chunk bytes), got {}", args.len()), span);
+                    let what = if event { "the event data" } else { "the chunk bytes" };
+                    self.diags.error(format!("'.{method}()' takes 1 argument ({what}), got {}", args.len()), span);
                     return err;
                 }
-                let chunk = self.check_bytes_init(&args[0], "'.send()'");
+                let chunk = self.check_bytes_init(&args[0], if event { "'.send_event()'" } else { "'.send()'" });
                 if chunk.ty == Ty::Error {
                     return err;
                 }
-                Expr { kind: ExprKind::HttpStreamSend { stream: Box::new(recv_expr), chunk: Box::new(chunk) }, ty: result_ty, span }
+                Expr { kind: ExprKind::HttpStreamSend { stream: Box::new(recv_expr), chunk: Box::new(chunk), event }, ty: result_ty, span }
             }
             "finish" => {
                 if !args.is_empty() {
@@ -18537,7 +18568,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Expr { kind: ExprKind::HttpStreamReject { stream: Box::new(recv_expr), rb: Box::new(rb) }, ty: result_ty, span }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / finish / reject)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / send_event / finish / reject)"), span);
                 err
             }
         }
@@ -20407,7 +20438,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ctx);
                 self.finalize_expr(rb);
             }
-            ExprKind::HttpStreamSend { stream, chunk } => {
+            ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.finalize_expr(stream);
                 self.finalize_expr(chunk);
             }
@@ -22695,6 +22726,46 @@ mod tests {
         assert!(!d.has_errors(), "moving a string into a new binding and using the new one is fine");
         let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return s.len()\n}\n");
         assert!(d2.has_errors(), "using a string after it was moved must be rejected");
+    }
+
+    #[test]
+    fn match_arm_binding_consumed_in_a_loop_is_not_a_use_after_move() {
+        // A match-arm binding is INITIALIZED at arm entry from the scrutinee's payload, so an arm
+        // that consumes its own binding inside a `loop` body is fine on the next iteration — the
+        // binding is fresh. The back-edge fixpoint used to leave the binding's moved bit set,
+        // rejecting exactly pkg.web serve's stream arm (`Ok(s) => pump(c, s)`) as "use of moved
+        // value 's'".
+        let (_p, d) = check(
+            "fn mk(i: i64) -> Result<string, Error> {\n  if i > 3 { return Err(Error.Invalid) }\n  return Ok(\"x\".clone())\n}\nfn eat(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  mut i := 0\n  loop {\n    if i >= 5 { break }\n    match mk(i) {\n      Ok(s) => { n := eat(s); print(n) }\n      Err(e) => {}\n    }\n    i = i + 1\n  }\n  return 0\n}\n",
+        );
+        assert!(!d.has_errors(), "a per-iteration match-arm binding consumed in its arm is fresh each iteration");
+        // A use-after-move WITHIN one arm entry is still caught.
+        let (_q, d2) = check(
+            "fn eat(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  loop {\n    match Ok(\"x\".clone()) {\n      Ok(s) => { n := eat(s); m := eat(s); print(n + m) }\n      Err(e) => {}\n    }\n    break\n  }\n  return 0\n}\n",
+        );
+        assert!(d2.has_errors(), "consuming the same arm binding twice in one entry must still be rejected");
+    }
+
+    #[test]
+    fn extracting_a_move_payload_marks_the_local_scrutinee_moved() {
+        // Extracting a Move payload nulls the scrutinee's payload slot in MIR (the arm binding
+        // owns the buffer), so re-matching the same Local scrutinee would silently read the
+        // nulled payload (wrong result, no crash). The #593 adversarial review showed the
+        // arm-entry clear_moved unshielded this pre-existing hole's loop form; both forms must
+        // now be rejected on the SCRUTINEE.
+        let (_p, d) = check(
+            "fn eat(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  opt := Some(\"x\".clone())\n  mut i := 0\n  loop {\n    if i >= 3 { break }\n    match opt {\n      Some(s) => print(eat(s))\n      None => {}\n    }\n    i = i + 1\n  }\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "re-matching a Move-payload scrutinee across loop iterations must be rejected");
+        let (_q, d2) = check(
+            "fn main() -> i32 {\n  opt := Some(\"x\".clone())\n  match opt {\n    Some(s) => print(s.len())\n    None => {}\n  }\n  match opt {\n    Some(s) => print(s.len())\n    None => {}\n  }\n  return 0\n}\n",
+        );
+        assert!(d2.has_errors(), "re-matching after a Move-payload extraction must be rejected even without a loop");
+        // Copy payloads extract nothing owned — re-matching stays legal.
+        let (_r, d3) = check(
+            "fn main() -> i32 {\n  opt := Some(42)\n  match opt { Some(v) => print(v), None => {} }\n  match opt { Some(v) => print(v + 1), None => {} }\n  return 0\n}\n",
+        );
+        assert!(!d3.has_errors(), "a Copy-payload scrutinee is not moved by extraction");
     }
 
     #[test]

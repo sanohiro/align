@@ -29,12 +29,29 @@ module pkg.web.types
 // `web.body_str(c)` UTF-8-validates it into a `str` view.
 pub Ctx { method: str, path: str, query: str, pattern: str, body: slice<u8> }
 
+// The two handler shapes, one route table (the Align-idiomatic or-kind — a sum type, NOT two fn
+// fields with filler sentinels, and NOT a second route table that would split priority/405 across
+// tables):
+//   - `Respond` — the unary form: BUILD one complete response and hand it back; `serve` writes it
+//     (and answers 500 itself when the handler returns `Err`).
+//   - `Stream` — the streaming form: borrow the request through `c` (valid for the whole call —
+//     `serve` still holds the handle, spent) and OWN the response stream, which exists only once
+//     the head is committed — exactly when the framework's ability to answer differently
+//     (404/405/500) has ended anyway. Pre-stream validation gets its 4xx window via `s.reject(rb)`;
+//     after the first send, an `Err` just ends the stream (drop closes the fd).
+// A fn-only sum type is **Copy** (each payload is a 16-byte `{fn_ptr, env_ptr}` value), so `Route`
+// stays a Copy struct.
+pub Handler {
+  Respond(fn(Ctx) -> Result<response_builder, Error>),
+  Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+}
+
 // One route: the method it answers, the pattern it matches, and the handler to run. A **Copy**
-// struct — `str` views of literal text, plus a fn value — so a route table is an ordinary array
-// value with no ownership story. `method` is the uppercase HTTP method ("GET", "POST", …); an empty
-// method matches ANY method, which is how a catch-all/fallback route is written.
+// struct — `str` views of literal text, plus a Copy `Handler` — so a route table is an ordinary
+// array value with no ownership story. `method` is the uppercase HTTP method ("GET", "POST", …);
+// an empty method matches ANY method, which is how a catch-all/fallback route is written.
+// `stream_type` is the stream head's `Content-Type` — `""` on `Respond` routes (never read).
 //
-// The handler returns the response it built (`response_builder` became a legal `Result` payload for
-// exactly this). Returning `Err` is how a handler declines to answer: `serve` turns it into a 500,
-// which is only possible because the request handle never left `serve`'s frame.
-pub Route { method: str, pattern: str, handler: fn(Ctx) -> Result<response_builder, Error> }
+// Stream routes ride the SAME table: one radix dispatch, one method resolution, and a stream
+// route's method contributes to a 405's `Allow` like any other row.
+pub Route { method: str, pattern: str, stream_type: str, handler: Handler }

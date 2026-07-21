@@ -15214,29 +15214,69 @@ pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *con
     let chunk = unsafe { bytes_view(ptr, len) };
     // A zero-length chunk is the chunked terminator — never frame it; an empty output step is honest
     // "no bytes this step" data, so writing nothing and returning Ok is the correct semantics.
+    // Placed BEFORE the poison check so `send("")` stays an unconditional Ok(0).
     if chunk.is_empty() {
         return 0;
     }
-    // A poisoned stream (an earlier write failed) short-circuits a real send — no point writing to a
-    // broken fd. Placed AFTER the empty-noop check so `send("")` stays an unconditional Ok(0).
+    unsafe { http_stream_send_parts(st, b"", chunk, b"") }
+}
+
+/// `s.send_event(data)` — write `data` as ONE WHATWG SSE event frame, `data: {data}\n\n`, in ONE
+/// write (the prefix/suffix are assembled into the same buffer as the chunk framing and the lazy
+/// head, so head + framing + event go out together). Empty `data` is a **legal empty event**
+/// (`data: \n\n`, 8 payload bytes) — unlike `send`, it is never the chunked terminator, so there is
+/// no empty no-op and the first `send_event` always commits the head (closing the `reject` window).
+/// Multi-line `data` is the CALLER's responsibility in v1 (a bare `\n` inside `data` changes the
+/// event's field structure — the recorded splitting backlog). Poison semantics identical to `send`.
+/// Borrows `s` (mutated in place — the poison latch); never consumed.
+///
+/// # Safety
+/// `s` must be a valid `HttpStream` (or null); `ptr`/`len` a valid byte range (or `{null,<=0}`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_send_event(s: *mut HttpStream, ptr: *const u8, len: i64) -> i32 {
+    if s.is_null() {
+        return AL_INVALID;
+    }
+    let st = unsafe { &mut *s };
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { http_stream_send_parts(st, b"data: ", data, b"\n\n") }
+}
+
+/// The shared writer behind `s.send(chunk)` and `s.send_event(data)`: assemble the lazy head (if
+/// still pending) plus ONE chunk whose payload is `prefix + data + suffix` into a single buffer,
+/// and write it with ONE `http_send_all` call. **Framed** (1.1): one chunk frame (lowercase-hex
+/// length of the COMBINED payload, CRLF, payload, CRLF). **Raw** (1.0): the combined payload bytes
+/// unframed. The combined payload must be non-empty (a zero-length chunk is the protocol
+/// terminator — `send`'s empty no-op short-circuits in its caller; an SSE frame is never empty).
+/// A poisoned stream short-circuits with `AL_INVALID`; the head is taken NOW (committed even if
+/// the write fails — partial bytes may be on the wire, so `reject` can no longer answer with a
+/// normal response); a failed write poisons the stream (`finish` then skips the terminator).
+///
+/// # Safety
+/// `st` must point into a live `HttpStream` whose fd is the stream's (owned) socket.
+unsafe fn http_stream_send_parts(st: &mut HttpStream, prefix: &[u8], data: &[u8], suffix: &[u8]) -> i32 {
     if st.poisoned {
         return AL_INVALID;
     }
-    // The lazy head rides the first real write (taken NOW — committed even if the write fails:
-    // partial bytes may be on the wire, so `reject` can no longer answer with a normal response).
+    let payload_len = prefix.len() + data.len() + suffix.len();
+    debug_assert!(payload_len > 0, "a zero-length chunk is the terminator, never written here");
     let head = st.pending_head.take();
     let head_len = head.as_ref().map_or(0, Vec::len);
-    let mut buf: Vec<u8> = Vec::with_capacity(head_len + chunk.len() + 20);
+    let mut buf: Vec<u8> = Vec::with_capacity(head_len + payload_len + 20);
     if let Some(h) = head {
         buf.extend_from_slice(&h);
     }
     if st.framed {
-        http_push_chunk_size_hex(&mut buf, chunk.len());
+        http_push_chunk_size_hex(&mut buf, payload_len);
         buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(data);
+        buf.extend_from_slice(suffix);
         buf.extend_from_slice(b"\r\n");
     } else {
-        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(data);
+        buf.extend_from_slice(suffix);
     }
     let rc = unsafe { http_send_all(st.fd, &buf) };
     if rc != 0 {
@@ -24868,6 +24908,46 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let mut got2 = Vec::new();
         b2.read_to_end(&mut got2).expect("read");
         assert_eq!(got2, b"HEAD\r\n\r\n0\r\n\r\n");
+    }
+
+    /// `s.send_event(data)` wraps the payload as ONE WHATWG SSE frame (`data: {data}\n\n`) inside
+    /// ONE chunk frame and ONE write (head + framing + event together on the first call), and an
+    /// EMPTY event is a real frame (`data: \n\n`, 8 payload bytes) — never the chunked terminator,
+    /// so unlike `send("")` it commits the lazy head. Raw (1.0) mode writes the SSE frame unframed.
+    #[test]
+    fn http_stream_send_event_frames_sse_data_in_one_chunk() {
+        use std::io::Read;
+        use std::os::unix::io::IntoRawFd;
+        // Framed: head + `data: tick\n\n` (12 payload bytes → chunk size "c") + empty event + terminator.
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.into_raw_fd();
+        let s = Box::into_raw(Box::new(HttpStream {
+            fd,
+            framed: true,
+            poisoned: false,
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
+        }));
+        assert_eq!(unsafe { align_rt_http_stream_send_event(s, b"tick".as_ptr(), 4) }, 0);
+        assert!(unsafe { &*s }.pending_head.is_none(), "the first send_event committed the head");
+        assert_eq!(unsafe { align_rt_http_stream_send_event(s, b"".as_ptr(), 0) }, 0, "an empty event is a real frame, not a no-op");
+        assert_eq!(unsafe { align_rt_http_stream_finish(s) }, 0);
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).expect("read");
+        assert_eq!(got, b"HEAD\r\n\r\nc\r\ndata: tick\n\n\r\n8\r\ndata: \n\n\r\n0\r\n\r\n");
+        // Raw (1.0): the SSE frame goes out unframed; close is the terminator.
+        let (a2, mut b2) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd2 = a2.into_raw_fd();
+        let s2 = Box::into_raw(Box::new(HttpStream {
+            fd: fd2,
+            framed: false,
+            poisoned: false,
+            pending_head: Some(b"HEAD10\r\n\r\n".to_vec()),
+        }));
+        assert_eq!(unsafe { align_rt_http_stream_send_event(s2, b"x".as_ptr(), 1) }, 0);
+        assert_eq!(unsafe { align_rt_http_stream_finish(s2) }, 0);
+        let mut got2 = Vec::new();
+        b2.read_to_end(&mut got2).expect("read");
+        assert_eq!(got2, b"HEAD10\r\n\r\ndata: x\n\n");
     }
 
     /// `s.reject(rb)` (http.md item 8 ③): before anything is sent it discards the stored head and

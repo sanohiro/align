@@ -153,9 +153,9 @@ fn route_table_dispatches_by_method_and_separates_404_from_405() {
 import pkg.web.types\n\
 import pkg.web.internal.router\n\
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"POST\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"POST\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 =\n\
   pkg.web.internal.router.dispatch_routes(routes, method, path)\n\
 pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool =\n\
@@ -212,9 +212,9 @@ fn best_path_route_tree_agrees_with_the_linear_oracle() {
 import pkg.web.types\n\
 import pkg.web.internal.router\n\
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"POST\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"POST\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn best(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
   pkg.web.internal.router.best_path_route(routes, path)\n\
 pub fn best_linear(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
@@ -293,7 +293,7 @@ fn best_path_route_backtracks_from_a_static_dead_end() {
 import pkg.web.types\n\
 import pkg.web.internal.router\n\
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn best(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
   pkg.web.internal.router.best_path_route(routes, path)\n";
     let main = "module main\n\
@@ -342,7 +342,7 @@ fn static_prefix_wildcard_outranks_a_param_chain() {
 import pkg.web.types\n\
 import pkg.web.internal.router\n\
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
-  pkg.web.types.Route { method: \"GET\", pattern: pattern, handler: handler }\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn best(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
   pkg.web.internal.router.best_path_route(routes, path)\n\
 pub fn best_linear(routes: slice<pkg.web.types.Route>, path: str) -> i64 =\n\
