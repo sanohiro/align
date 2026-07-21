@@ -209,6 +209,26 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
     BuiltExe { exe: exe.clone(), _artifacts: TempArtifacts { obj, exe } }
 }
 
+/// Make a raw HTTP request explicitly **one-shot**: insert `Connection: close` right after its
+/// request line.
+///
+/// Since std.http gained server-side keep-alive (`docs/impl/std-design/http.md` item 9 ②), an
+/// eligible HTTP/1.1 request leaves the connection PARKED after the response — so a client that
+/// reads to EOF would block until the server exits or new traffic evicts it. Every E2E test that
+/// drives ONE request per connection now says so in the request, which is also what a real
+/// one-shot client does. A request with no CRLF (a deliberately malformed fixture) is returned
+/// unchanged.
+pub fn one_shot(req: &[u8]) -> Vec<u8> {
+    let Some(eol) = req.windows(2).position(|w| w == b"\r\n") else {
+        return req.to_vec();
+    };
+    let mut out = Vec::with_capacity(req.len() + 19);
+    out.extend_from_slice(&req[..eol + 2]);
+    out.extend_from_slice(b"Connection: close\r\n");
+    out.extend_from_slice(&req[eol + 2..]);
+    out
+}
+
 /// The LLVM IR text for `src` (for asserting on the generated instructions).
 pub fn emit_llvm(src: &str) -> String {
     emit_llvm_with_exports(src, &[])

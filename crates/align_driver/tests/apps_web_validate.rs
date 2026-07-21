@@ -36,7 +36,7 @@ pub fn main() -> Result<(), Error> {{\n\
   routes := [\n\
 {routes_src}\n\
   ]\n\
-  return pkg.web.serve(\"127.0.0.1\", 0, routes)\n\
+  return pkg.web.serve(\"127.0.0.1\", 0, routes, 1)\n\
 }}\n"
     )
 }
@@ -163,7 +163,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.get(\"/x\", getter),\n\
     pkg.web.any(\"/x\", fallback),\n\
   ]\n\
-  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes)\n\
+  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
 }\n";
     let built = build_exe_multi(
         "web-val-ok",
@@ -187,7 +187,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     let resp = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut sock) => {
-                sock.write_all(b"DELETE /x HTTP/1.1\r\nHost: h\r\n\r\n").expect("write");
+                // One request per connection: keep-alive would park the socket and block the read.
+                sock.write_all(&one_shot(b"DELETE /x HTTP/1.1\r\nHost: h\r\n\r\n")).expect("write");
                 let mut out = Vec::new();
                 let _ = sock.read_to_end(&mut out);
                 break String::from_utf8_lossy(&out).into_owned();
@@ -228,7 +229,7 @@ pub fn main() -> Result<(), Error> {\n\
   routes := [\n\
     pkg.web.stream(\"POST\", \"/x\", \"\", pump),\n\
   ]\n\
-  return pkg.web.serve(\"127.0.0.1\", 0, routes)\n\
+  return pkg.web.serve(\"127.0.0.1\", 0, routes, 1)\n\
 }\n";
     let built = build_exe_multi(
         "web-val-streamct",

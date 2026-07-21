@@ -4214,7 +4214,7 @@ impl EffectScan<'_> {
                 self.expr(name);
                 self.expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 self.impure_direct = true;
                 self.expr(ns);
@@ -4363,7 +4363,7 @@ impl EffectScan<'_> {
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
             // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
             // so an effect *inside* the operands is still counted.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.impure_direct = true;
                 self.expr(host);
                 self.expr(port);
@@ -5767,6 +5767,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
+            | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -6045,6 +6046,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
+            | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -6750,7 +6752,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -6872,7 +6874,7 @@ impl<'a> EscapeCheck<'a> {
             // `respond` returns `Result<(), Error>`. The `ctx.*` view getters' escapes are caught by
             // `region_of` / `slice_is_local`, not here. Just recurse to catch an escape *inside* the
             // operands.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.walk(host, depth);
                 self.walk(port, depth);
             }
@@ -7379,7 +7381,7 @@ impl UnnecessaryHeapScan {
                 self.visit(name);
                 self.visit(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::ProcessExit { code } => self.visit(code),
             ExprKind::ProcessAbort => {}
@@ -7480,7 +7482,7 @@ impl UnnecessaryHeapScan {
                 self.visit(max_concurrency);
             }
             // `std.http` (Slice 4) — no heap-narrowing pattern of its own; recurse into the operands.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.visit(host);
                 self.visit(port);
             }
@@ -8846,7 +8848,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(name, moved, false, false);
                 self.expr(value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => self.expr(code, moved, false, false),
@@ -8972,7 +8974,7 @@ impl<'a> MoveCheck<'a> {
             // (borrowed); the ctx getters read `ctx` (borrowed). `respond`, though, **consumes BOTH**
             // `ctx` and `rb` (the runtime frees them — like `request`'s `req`); a use-after-move of
             // either is caught here, and the MIR nulls both slots so the exit `Drop` doesn't double-free.
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.expr(host, moved, false, false);
                 self.expr(port, moved, false, false);
             }
@@ -12415,6 +12417,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
             }
+            // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
+            // process (affinity/quota aware, always >= 1). The number a `task_group` worker count is
+            // sized against, since the runtime's task pool is sized from the same source.
+            if module == "process" && method == "cpu_count" {
+                self.require_import("std.process", "process.cpu_count", span);
+                if !args.is_empty() {
+                    self.diags
+                        .error(format!("'process.cpu_count' takes no arguments, got {}", args.len()), span);
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                return Expr { kind: ExprKind::ProcessCpuCount, ty: Ty::Int(IntTy { bits: 64, signed: true }), span };
+            }
             // `std.process` — `process.spawn(cmd, args)` -> Result<child, Error> (fork+execvp).
             if module == "process" && method == "spawn" {
                 self.require_import("std.process", "process.spawn", span);
@@ -12489,7 +12503,15 @@ impl<'a, 't> Checker<'a, 't> {
             // the receiver type below.
             if module == "http" && method == "serve" {
                 self.require_import("std.http", "http.serve", span);
-                return self.check_http_serve(args, span);
+                return self.check_http_serve(args, false, span);
+            }
+            // `http.serve_shared(host, port)` — the prefork sibling of `http.serve`: same bind, plus
+            // `SO_REUSEPORT` so several live listeners may share ONE port (http.md item 9 ①). Kept a
+            // separate op, not a flag: `http.serve` must keep failing loudly on an accidental second
+            // bind — sharing a port is an explicit decision, visible at the call site.
+            if module == "http" && method == "serve_shared" {
+                self.require_import("std.http", "http.serve_shared", span);
+                return self.check_http_serve(args, true, span);
             }
             if module == "http" && method == "response" {
                 self.require_import("std.http", "http.response", span);
@@ -18311,11 +18333,16 @@ impl<'a, 't> Checker<'a, 't> {
     /// `http.serve(host, port)` — bind a listening socket, yielding `Result<http_server, Error>`
     /// ([`Ty::HttpServer`] Ok payload). `host` is a `str` (empty → wildcard); `port` is an `i64`. A
     /// module function (dispatched like `tcp.listen`). Impure (opens a socket).
-    fn check_http_serve(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+    ///
+    /// `shared` = the sibling op `http.serve_shared(host, port)`: the same bind plus `SO_REUSEPORT`,
+    /// so N prefork workers may each own their own listener on ONE port (http.md item 9 ①). Only the
+    /// runtime call differs — same arity, same types, same effects.
+    fn check_http_serve(&mut self, args: &[ast::Expr], shared: bool, span: Span) -> Expr {
+        let name = if shared { "http.serve_shared" } else { "http.serve" };
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 2 {
             self.diags
-                .error(format!("'http.serve' expects 2 arguments (the host and port), got {}", args.len()), span);
+                .error(format!("'{name}' expects 2 arguments (the host and port), got {}", args.len()), span);
             return err;
         }
         let host = self.check_str_init(&args[0]);
@@ -18325,11 +18352,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if !port.ty.is_int_like() {
             self.diags
-                .error(format!("'http.serve' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
+                .error(format!("'{name}' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
             return err;
         }
         Expr {
-            kind: ExprKind::HttpServe { host: Box::new(host), port: Box::new(port) },
+            kind: ExprKind::HttpServe { host: Box::new(host), port: Box::new(port), shared },
             ty: Ty::Result(Scalar::HttpServer, Scalar::Enum(self.error_enum_id)),
             span,
         }
@@ -20329,7 +20356,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}
@@ -20425,7 +20452,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(urls);
                 self.finalize_expr(max_concurrency);
             }
-            ExprKind::HttpServe { host, port } => {
+            ExprKind::HttpServe { host, port, .. } => {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
             }

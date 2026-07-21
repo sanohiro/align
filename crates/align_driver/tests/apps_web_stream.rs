@@ -39,6 +39,8 @@ fn free_loopback_port() -> u16 {
 /// One request over its own connection, reading until the server closes (a finished stream or a
 /// v1 per-request close), retrying the connect until the server is up.
 fn exchange(port: u16, req: &[u8]) -> Vec<u8> {
+    // One request per connection: keep-alive would leave the socket parked and this read blocked.
+    let req = &one_shot(req)[..];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
@@ -119,7 +121,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.sse(\"/events/:channel\", events),\n\
     pkg.web.stream(\"POST\", \"/ndjson\", \"application/x-ndjson\", echo_stream),\n\
   ]\n\
-  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes)\n\
+  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
 }\n";
 
 /// A server child killed on drop — `serve` never returns, so every test must reap it.

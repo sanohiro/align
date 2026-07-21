@@ -32,6 +32,8 @@ fn free_loopback_port() -> u16 {
 /// Connect (retrying while the server is still binding), send `req`, read the WHOLE response until the
 /// server closes, and return it. The server closes after `finish` / on Drop, so `read_to_end` returns.
 fn client_read_all(port: u16, req: &[u8]) -> Vec<u8> {
+    // One request per connection: keep-alive would leave the socket parked and this read blocked.
+    let req = &one_shot(req)[..];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {

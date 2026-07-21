@@ -33,6 +33,8 @@ fn free_loopback_port() -> u16 {
 /// One request over its own connection (v1 closes after each response), retrying the connect until
 /// the server is up.
 fn exchange(port: u16, req: &[u8]) -> String {
+    // One request per connection: keep-alive would leave the socket parked and this read blocked.
+    let req = &one_shot(req)[..];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
@@ -109,7 +111,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.any(\"/health\", catch_all),\n\
     pkg.web.post(\"/echo\", echo),\n\
   ]\n\
-  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes)\n\
+  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
 }\n";
 
 /// A server child that is killed on drop — `serve` never returns, so every test must reap it.
@@ -151,6 +153,113 @@ fn start(name: &str) -> Server {
         panic!("server exited at startup: {st:?}");
     }
     Server { child, port, _built: built }
+}
+
+/// Read exactly ONE `Content-Length`-framed response off a kept-alive socket, leaving later bytes in
+/// `buf`. A keep-alive client cannot read to EOF — the connection stays open by design.
+fn read_framed(sock: &mut TcpStream, buf: &mut Vec<u8>) -> String {
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(hp) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_end = hp + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let cl = head
+                .lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                .unwrap_or(0);
+            if buf.len() >= head_end + cl {
+                let resp = String::from_utf8_lossy(&buf[..head_end + cl]).to_string();
+                buf.drain(..head_end + cl);
+                return resp;
+            }
+        }
+        let n = sock.read(&mut chunk).expect("read response");
+        assert!(n > 0, "server closed mid-response: {:?}", String::from_utf8_lossy(buf));
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// **Keep-alive × the pkg.web serve loop** (std.http item 9 ②): the framework's loop is byte-identical
+/// before and after keep-alive — `srv.accept()` simply yields the next request off the SAME connection.
+/// Three requests over one socket, each routed and answered on its own, and none of the responses
+/// carries a `Connection` header (absence = persistent, the 1.1 default).
+#[test]
+fn keep_alive_serves_many_requests_over_one_connection() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-keepalive");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut sock = loop {
+        match TcpStream::connect(("127.0.0.1", srv.port)) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("server never came up: {e}"),
+        }
+    };
+    sock.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    let mut buf = Vec::new();
+    let mut resps = Vec::new();
+    for req in [
+        &b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+        &b"GET /v1/models/42 HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+        &b"GET /nope HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+    ] {
+        sock.write_all(req).expect("write request");
+        resps.push(read_framed(&mut sock, &mut buf));
+    }
+    assert!(resps[0].ends_with("{\"models\":[]}"), "request 1 on the connection: {:?}", resps[0]);
+    assert!(resps[1].ends_with("\r\n\r\n42"), "request 2 — its OWN param capture: {:?}", resps[1]);
+    assert!(resps[2].starts_with("HTTP/1.1 404 "), "request 3 — the framework 404: {:?}", resps[2]);
+    for r in &resps {
+        assert!(!r.to_ascii_lowercase().contains("connection:"), "a persistent response emits no Connection header: {r:?}");
+    }
+    // The connection is still open (parked) — a close would have shown up as an EOF read above.
+    sock.set_read_timeout(Some(Duration::from_millis(400))).expect("probe timeout");
+    let mut probe = [0u8; 1];
+    assert!(!matches!(sock.read(&mut probe), Ok(0)), "the connection is parked, not closed");
+
+    // A SECOND client does not cost the first its connection: the server parks a set, not one slot.
+    // (With a single slot this second connect would have closed `sock`, and the request below would
+    // have hit a dead socket — the failure mode a keep-alive client cannot safely retry.)
+    let mut sock2 = TcpStream::connect(("127.0.0.1", srv.port)).expect("second client");
+    sock2.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    let mut buf2 = Vec::new();
+    sock2.write_all(b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n").expect("write");
+    assert!(read_framed(&mut sock2, &mut buf2).ends_with("any"), "the new client is served");
+    sock.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    sock.write_all(b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n")
+        .expect("the first connection must still be alive");
+    assert!(read_framed(&mut sock, &mut buf).ends_with("{\"models\":[]}"), "client 1 survived client 2");
+}
+
+/// **A malformed request must not kill the server.** A bare-LF request line (rejected by the
+/// strict-CRLF smuggling guard) is what any scanner — or a browser speaking TLS to a plaintext port
+/// — produces. `accept` treats it as a per-request fault and keeps waiting, so the serve loop's
+/// `srv.accept()?` never sees it; before that fix one `nc` took the whole server down, and with
+/// prefork it would have taken every worker down in turn.
+#[test]
+fn a_malformed_request_does_not_kill_the_serve_loop() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-malformed");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut bad = loop {
+        match TcpStream::connect(("127.0.0.1", srv.port)) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("server never came up: {e}"),
+        }
+    };
+    bad.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    bad.write_all(b"GET /v1/models HTTP/1.1\nHost: h\r\n\r\n").expect("write the bare-LF request");
+    let mut got = Vec::new();
+    let _ = bad.read_to_end(&mut got);
+    assert!(got.is_empty(), "the malformed request is answered by a close, not a response: {got:?}");
+    // The server is still there.
+    let ok = exchange(srv.port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(ok.ends_with("{\"models\":[]}"), "the loop survived a malformed request: {ok:?}");
 }
 
 #[test]

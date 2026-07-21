@@ -2241,6 +2241,11 @@ fn build_module<'c>(
         module.add_function("align_rt_http_serve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // The `SO_REUSEPORT` prefork sibling (http.md item 9 ①) — identical ABI to `http_serve`.
+        "http_serve_shared".to_string(),
+        module.add_function("align_rt_http_serve_shared", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         "http_server_free".to_string(),
         module.add_function("align_rt_http_server_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
@@ -2371,6 +2376,11 @@ fn build_module<'c>(
         // time.instant () -> i64 (monotonic ns, CLOCK_MONOTONIC).
         "time_instant".to_string(),
         module.add_function("align_rt_time_instant", i64t2.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        // process.cpu_count () -> i64 (available parallelism, >= 1).
+        "process_cpu_count".to_string(),
+        module.add_function("align_rt_process_cpu_count", i64t2.fn_type(&[], false), None),
     );
     funcs.insert(
         // time.sleep (ns: i64) -> void.
@@ -7581,13 +7591,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // i32 status (null `out` first, like the client); `respond` returns i32 (no out); the ctx
             // getters return a `{ptr,len}` view (or write one to `out` for `header`); `response` allocates
             // a builder; `rb_header`/`rb_body` are void; a header/body/status is passed by value.
-            Rvalue::HttpServe { host, port, out } => {
+            Rvalue::HttpServe { host, port, out, shared } => {
                 let (hp, hl) = self.split_str(host)?;
                 let port_v = self.operand(port);
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let callee = if *shared { self.funcs["http_serve_shared"] } else { self.funcs["http_serve"] };
                 self.builder
-                    .build_call(self.funcs["http_serve"], &[hp.into(), hl.into(), port_v.into(), out_ptr.into()], "httpserve")
+                    .build_call(callee, &[hp.into(), hl.into(), port_v.into(), out_ptr.into()], "httpserve")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_serve returns i32 status")
             }
@@ -7725,6 +7736,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_call(self.funcs["time_instant"], &[], "instant")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("time_instant returns i64"),
+            Rvalue::ProcessCpuCount => self
+                .builder
+                .build_call(self.funcs["process_cpu_count"], &[], "cpucount")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("process_cpu_count returns i64"),
             Rvalue::TimeSleep { ns } => {
                 let n = self.operand(ns).into();
                 self.builder

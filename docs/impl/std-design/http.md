@@ -37,7 +37,12 @@ resp.header(name: str) -> Option<str>       // view into resp
 resp.body() -> bytes                         // view into resp (region-bound)
 // Server primitive (not a framework) — surface settled 2026-07-10 (two-lens design review)
 srv := http.serve(host: str, port: i64) -> Result<http_server, Error>
-srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
+                                             // the prefork sibling: same bind + SO_REUSEPORT, so N
+                                             // workers each own a listener on ONE port (item 9 ①)
+srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
+                                             // Yields the next request off a KEPT-ALIVE connection
+                                             // before accepting a new one (item 9 ②) — same surface
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
 ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
@@ -46,9 +51,11 @@ rb := http.response(status: i64)             // response_builder (Move — owns 
                                              // the build-dual of `request`; named apart from the
                                              // parsed read-view `response`)
 rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
-rb.body(data: bytes)                         // optional — a header-only response is legal
+rb.body(data: bytes)                         // optional — a bodiless response is legal and frames
+                                             // as Content-Length: 0 (except 1xx/204/304)
 ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
-                                             // closes the accepted fd (v1: one request per conn);
+                                             // PARKS an eligible 1.1 connection for keep-alive (no
+                                             // Connection header), else closes the accepted fd;
                                              // a HEAD request gets the body SUPPRESSED, its
                                              // Content-Length kept (RFC 9110 §9.3.2; W4)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
@@ -217,7 +224,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    `response_builder` (Move, distinct Ty + display name from the parsed `response`) + `rb.header(name,
    value)` (bound receiver, P6 CR/LF/NUL **abort**) + `rb.body(data)` (optional); `ctx.respond(rb) ->
    Result<(), Error>` (**consumes BOTH** ctx and rb — MIR nulls both slots like `cl.request(req)`;
-   serialize = status line + headers + auto Content-Length iff a body was set; ONE write, R4;
+   serialize = status line + headers + auto Content-Length (0 for a bodiless body-allowed status);
+   ONE write, R4;
    MSG_NOSIGNAL/SO_NOSIGPIPE; closes the fd, v1 one-request-per-conn). **W4 (2026-07-21):
    `respond` to a HEAD request suppresses the body bytes and keeps their `Content-Length` (RFC
    9110 §9.3.2) — enforced at the protocol boundary so any caller answering HEAD through a bodied
@@ -247,7 +255,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      limited for a primitive (no Content-Type).
    - **`respond` consumes both ctx and rb** (precedent: `cl.request(req)` consumes its Move `req`):
      statically forbids respond-twice and use-after-close; one-write serialize (R4).
-   - **Auto-header policy (mirror of client serialize):** auto `Content-Length` iff a body was set;
+   - **Auto-header policy (mirror of client serialize):** auto `Content-Length` on every response
+     whose status may carry a body — the set length, or `0` when no body was set (amended 2026-07-21
+     with keep-alive: an unframed response means "read until close", which forbids a persistent
+     connection and there is no legitimate use for it — close-delimited framing is
+     `respond_stream`'s 1.0 mode). `1xx`/`204`/`304` carry no body and get no framing header;
      caller-supplied Content-Length rejected (smuggling guard); **no auto Date/Server** — editorial
      headers are the caller's (framework = pkg territory).
    - **v1 = one request per accepted connection** (`respond` closes the fd). Server-side keepalive
@@ -496,8 +508,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      framing unit (framed empty/non-empty + raw), `m12_http_stream.rs` `send_event` E2E, and the
      pkg.web `apps_web_stream.rs` suite.
 
-9. **Prefork listener + server-side connection keep-alive — DESIGNED 2026-07-21 (implementation
-   next session; consumer = pkg.web concurrent serve, `pkg-design/web.md` → "Concurrent serve").**
+9. **Prefork listener + server-side connection keep-alive — DESIGNED + SHIPPED 2026-07-21**
+   (consumer = pkg.web concurrent serve, `pkg-design/web.md` → "Concurrent serve").
    Two std changes; keep-alive lands first (independently testable on the v1 sequential loop).
    - **① `http.serve_shared(host, port) -> Result<http server, Error>`** — identical to
      `http.serve` plus `SO_REUSEPORT` on the listener, so N workers each bind their OWN listener
@@ -507,8 +519,13 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      traps). Portability: Linux balances properly; macOS accepts the option for TCP with
      unspecified distribution quality — record, don't gate (the bench box is Linux).
    - **② Connection keep-alive, entirely inside `accept`/`respond` — the loop shape is
-     unchanged for every caller.** One **parked slot per server handle** (the v1
-     one-conn-at-a-time posture, made explicit):
+     unchanged for every caller.** A **bounded parked SET per server handle** (256 connections;
+     at capacity the least-recently-served one is closed to make room). The design opened with a
+     single slot — "the v1 one-conn-at-a-time posture, made explicit" — and that was **corrected
+     during implementation**: with one slot, every new connection evicted the previous one, so a
+     client that had just been told the connection is persistent lost its next request (a failure
+     a client cannot safely retry for a POST). Serving is still strictly one request at a time;
+     the parked connections are idle, not in flight:
      - **Eligibility** (computed at parse time, carried on the ctx): the request is HTTP/1.1,
        has no `Connection: close` header, and left **no residual bytes** past its own body in
        the parse buffer (a pipelining client is answered then closed — residual carry-over is
@@ -517,20 +534,50 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      - **`ctx.respond`**: eligible + write succeeded → the fd is PARKED into the server's slot
        instead of closed, and the auto `Connection: close` header is **omitted** (absence = 
        persistent is the 1.1 default; fasthttp does the same — leanest bytes on the bench path).
-       Ineligible → `Connection: close` + close, exactly today. `respond_stream`, `reject`, and
+       Ineligible → `Connection: close` + close, exactly today.
+     - **The RESPONSE is now always self-delimiting** (settled while implementing; RFC 9112 §6.3).
+       `respond` used to emit `Content-Length` only when a body was SET, so a bodiless `200` was
+       framed "until the connection closes" — un-keep-alive-able, and indistinguishable on the wire
+       from a truncated stream. **Amended outright:** a response whose status may carry a body is
+       framed either way (the set length, or `0` when no body was set); `1xx`/`204`/`304` carry no
+       body and get no framing header; a body SET on one is **rejected** (`Err`, the same treatment
+       a caller-supplied `Content-Length` gets in the same function) rather than silently dropped —
+       such a response is terminated at the first empty line whatever its fields say, so those bytes
+       would be read as the START OF THE NEXT RESPONSE on a kept-alive connection, and silently
+       discarding caller data is the one thing this boundary must not do. `respond_stream` rejects
+       the same statuses (a stream cannot follow a response that has already ended). HEAD stays
+       silent suppression — that one is driven by the REQUEST, which the builder cannot see.
+       Keep-alive therefore depends only on the REQUEST, and bodiless responses (`web.status(201)`)
+       stay on the connection.
+       `respond_stream`, `reject`, and
        every error path keep today's close-always semantics (a stream's terminator is its close;
        the reject window is an error path — recorded, not worth a second framing mode).
-     - **`srv.accept()`**: no parked fd → plain `accept(2)`, as today. Parked fd present →
-       `poll({parked, listener}, infinite)`; parked readable → parse the NEXT request from it
-       (a fresh parse buffer — zero-copy views stay per-request); listener-only readable → take
-       the new connection and CLOSE the parked one (single slot: an idle keep-alive client is
-       evicted by new traffic, so no idle timeout is needed — an idle parked fd with no new
-       traffic just blocks in poll, which IS accept's normal idle state). Both readable →
-       prefer parked (drain the warm client; the fairness caveat is bounded by prefork's other
-       workers and the trusted-network posture — recorded). Parked EOF / parse error → close
-       it, fall through to `accept(2)`. The `accept` surface and `Result` are unchanged.
+     - **`srv.accept()`**: nothing parked → plain `accept(2)`, as today. Otherwise
+       `poll({…parked, listener}, infinite)`; a parked connection readable → claim it out of the
+       set and parse the NEXT request from it (a fresh parse buffer — zero-copy views stay
+       per-request); listener readable → take the new connection, leaving the parked set
+       untouched **unless it is at capacity**, where the coldest parked connection makes room
+       (without that valve idle keep-alive clients pin every slot until they hang up, and
+       `accept` eventually fails `EMFILE`). The readiness scan starts at a **rotating** index
+       rather than always preferring parked: a "parked first" scan lets busy keep-alive clients
+       starve the listener outright — with its own `SO_REUSEPORT` queue no sibling worker can
+       drain it, so new connections would sit until the backlog dropped SYNs. Parked EOF / parse
+       error → close that one, look again. No idle timeout: idle parked fds simply wait in
+       `poll`, which IS accept's normal idle state. `POLLNVAL` is watched alongside
+       `POLLHUP`/`POLLERR` — without it an invalid fd would report a revent no branch matches and
+       the wait would spin. The `accept` surface and `Result` are unchanged.
+     - **A malformed request no longer surfaces from `accept` at all** (corrected here — it was
+       the pre-keep-alive behaviour too, and prefork made it fatal). A smuggling/bare-LF/TLS-to-a-
+       plaintext-port request is a PER-REQUEST fault while the listener is perfectly healthy, so
+       `accept` closes that connection and keeps waiting — exactly what the parked path already
+       did. Returning it handed every caller a `Result` that killed the accept loop
+       (`srv.accept()?`) the first time a scanner connected; with prefork, one such connection
+       per worker took the whole server down. Only a real `accept(2)` failure returns an error,
+       which is what makes `srv.accept()?` correct in a serve loop.
+     - **An interim (`1xx`) response never parks** — it is not a complete response, so a client
+       that got one waits for the final one; the connection closes, as before keep-alive.
      - **Drop-order safety (the one sharp edge):** the ctx must not park into a freed server.
-       The slot is a runtime-internal refcounted cell (`Arc<Mutex<Option<fd>>>`) held by the
+       The set is a runtime-internal refcounted cell (`Arc<Mutex<ParkSlot>>`) held by the
        server handle AND cloned into each ctx at accept — one refcount bump per request, no
        user-visible allocation, uncontended by construction (prefork gives every worker its own
        server handle, so the mutex never crosses threads). Server dropped first → the cell is
@@ -544,6 +591,28 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      keepalive × pkg.web serve E2E (loop unchanged); `serve_shared` double-bind succeeds while
      plain `serve` double-bind still fails; prefork E2E — W workers, concurrent clients, one
      held-open stream while others answer.
+   - **Shipped record.** Runtime: `SO_REUSEPORT` behind a shared `tcp_listen_impl(…, reuseport)` +
+     `align_rt_http_serve_shared`; the parked set as `Arc<Mutex<ParkSlot>>` (`Live(Vec<fd>)`/`Dead`,
+     the latter set by `HttpServer::drop`, which also closes every still-parked fd); eligibility
+     computed in `http_read_request` (`http_request_wants_close` + the residual check) and carried on
+     the ctx; `align_rt_http_accept` restructured around `http_wait_parked_or_listener` (a new
+     `poll(2)` extern) + `http_accept_conn`; `http_serialize_head(rb, persistent)` omitting the
+     `Connection` line on the keep-alive path. Language: `ExprKind::HttpServe`/`Rvalue::HttpServe`
+     gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
+     `http.serve`), and `http.serve_shared` dispatches through the same `check_http_serve`. Tests:
+     11 runtime keep-alive units (two-requests-one-connection, the three ineligibility rules, HEAD
+     composition, new traffic NOT evicting a parked connection, both capacity valves evicting the
+     coldest, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
+     rejecting a set body, an interim response never parking, and four clients parked at once) +
+     the `serve_shared` double-bind unit; driver `m11_http_server.rs` (`serve_shared` E2E + gates),
+     `apps_web_root.rs` (keep-alive × the pkg.web loop, a second client not costing the first its
+     connection, and a malformed request not killing the loop), and `apps_web_prefork.rs`
+     (concurrent clients; one listener per worker read out of `/proc/net/tcp`; a held-open stream
+     occupying one worker while the others serve; the out-of-range `workers` aborts).
+   - **Behavioral note for callers/tests:** an eligible HTTP/1.1 request now leaves the connection
+     OPEN, so a client that reads to EOF blocks until the server exits or capacity pressure evicts
+     the parked connection. One-request-per-connection clients must say `Connection: close` (the
+     driver tests' shared `one_shot` helper) or frame their read by `Content-Length`.
 
 ## Known v1 limitations (Slice 2/3/5)
 

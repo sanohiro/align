@@ -6,7 +6,7 @@
 //! `Result<http_request_ctx, Error>`. `ctx.method()`/`path()`/`header(name)`/`body()` are zero-copy
 //! **views** region-bound to `ctx` (#297). `http.response(status)` builds a Move `response_builder`
 //! (`rb.header`/`rb.body`; a CR/LF/NUL in a header **aborts**, P6); `ctx.respond(rb)` **consumes both**
-//! ctx and rb, serializes (auto Content-Length iff a body was set; a caller Content-Length is rejected;
+//! ctx and rb, serializes (auto Content-Length — a bodiless body-allowed status frames as 0; a caller Content-Length is rejected;
 //! `Connection: close`; no Date/Server), one-writes, and closes the fd (v1: one request per conn). All
 //! server ops are Impure. The wire-level parse/serialize + the five guards + fd-leak are
 //! runtime-unit-tested in `align_runtime`; here we drive a real Align server end-to-end (a Rust client,
@@ -34,6 +34,8 @@ fn free_loopback_port() -> u16 {
 /// queues nothing, so the first *successful* connect is the one the server's single `accept` gets),
 /// send `req`, and return the full response bytes the server wrote (it closes after `respond`).
 fn client_exchange(port: u16, req: &[u8]) -> Vec<u8> {
+    // One request per connection: keep-alive would leave the socket parked and this read blocked.
+    let req = &one_shot(req)[..];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
@@ -210,6 +212,96 @@ pub fn main() -> Result<(), Error> {
 ";
     let out = build_and_run("m11-http-resp-inject", inject);
     assert!(!out.status.success(), "a CR/LF in a response header value must abort (response smuggling)");
+}
+
+// --- http.serve_shared (item 9 ①, the prefork listener) ----------------------------------------
+
+/// `http.serve_shared` is the SIBLING of `http.serve`: same bind, plus `SO_REUSEPORT` so N prefork
+/// workers may each own their own listener on ONE port. Two shared binds on one port succeed (the
+/// plain `serve` cannot — pinned in the runtime unit test), and a shared listener serves an ordinary
+/// request exactly like a strict one.
+#[test]
+fn serve_shared_binds_twice_and_serves() {
+    if !backend_available() {
+        return;
+    }
+    // ① Two live shared listeners on one port. `serve` would fail the second bind with EADDRINUSE;
+    //    the program only reaches `bound2` if the kernel accepted both.
+    let twice = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  a := http.serve_shared(\"127.0.0.1\", p.get_i64(\"port\"))?
+  b := http.serve_shared(\"127.0.0.1\", p.get_i64(\"port\"))?
+  print(\"bound2\")
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let exe = build_exe("m11-http-serve-shared-twice", twice);
+    let out = std::process::Command::new(&exe.exe).args(["--port", &port.to_string()]).output().expect("run");
+    assert!(out.status.success(), "two shared binds on one port succeed: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bound2"), "stdout: {:?}", String::from_utf8_lossy(&out.stdout));
+
+    // ② The same listener serves a normal request — SO_REUSEPORT changes nothing else.
+    let serve = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve_shared(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  rb.header(\"X-Path\", ctx.path())
+  rb.body(\"shared\")
+  ctx.respond(rb)?
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let server = build_exe("m11-http-serve-shared-rt", serve);
+    let mut child = std::process::Command::new(&server.exe).args(["--port", &port.to_string()]).spawn().expect("spawn server");
+    let resp = client_exchange(port, b"GET /hi HTTP/1.1\r\nHost: h\r\n\r\n");
+    let status = child.wait().expect("server exits");
+    assert!(status.success(), "server exited with {status:?}");
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {text:?}");
+    assert!(text.contains("X-Path: /hi\r\n"), "echoed path: {text:?}");
+    assert!(text.ends_with("\r\n\r\nshared"), "body: {text:?}");
+}
+
+/// The sibling shares every compile-time rule with `http.serve`: the import gate and the bound-receiver
+/// gate (it yields the same Move `http_server`).
+#[test]
+fn serve_shared_shares_the_serve_gates() {
+    let noimport = "\
+pub fn main() -> Result<(), Error> {
+  srv := http.serve_shared(\"127.0.0.1\", 8080)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-shared-noimport", noimport), "http.serve_shared without `import std.http` must be rejected");
+    let unbound = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  ctx := http.serve_shared(\"127.0.0.1\", 8080)?.accept()?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-shared-unbound", unbound), "accept on an unbound shared http_server must be rejected");
+    let arity = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  srv := http.serve_shared(\"127.0.0.1\")?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-shared-arity", arity), "http.serve_shared needs both a host and a port");
 }
 
 // --- compile-time Gate-1 rejections ------------------------------------------------------------

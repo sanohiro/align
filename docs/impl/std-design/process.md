@@ -22,7 +22,27 @@ ch.kill(sig: i64) -> Result<(), Error>
 process.exec(cmd: str, args: array<str>) -> Result<(), Error>   // replace current image (execvp; returns only on error)
 process.exit(code: i64)               // run cleanup, then exit — see below
 process.abort()                        // immediate _exit, NO cleanup
+process.cpu_count() -> i64            // parallelism available to THIS process (>= 1); see below
 ```
+
+## `process.cpu_count()` — SHIPPED 2026-07-21
+
+The parallelism available to **this process**: cores as limited by CPU affinity and cgroup quota,
+never the raw machine core count (`std::thread::available_parallelism`). Always `>= 1` — the OS
+failing to answer falls back to `1`, so there is no error path and no `Option`. **Impure** (it
+observes the machine).
+
+It lives here rather than in `std.env` because it is a property of the running process, not of the
+environment block. Its reason to exist is that **it is the number a `task_group` worker count must
+be sized against**: the runtime's task pool is sized from exactly this source and runs the group's
+tasks on that pool PLUS the calling thread, so a group of never-returning tasks larger than
+`cpu_count() + 1` would leave the extra tasks unstarted. `pkg.web.serve`'s `workers` parameter
+aborts above that bound, and the recommended sizing (`workers = process.cpu_count()`) is only
+writable because this exists.
+
+**Deployment note.** It is quota-aware, which is the point — and it makes any bound derived from it
+machine-dependent: a source line naming a fixed worker count can run on a 16-core box and abort in a
+4-CPU container. Deriving the count from `cpu_count()` is the portable spelling.
 
 ## Type & ownership classification
 

@@ -8,7 +8,55 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-21, **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
+_Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE — the
+hard streaming ordering constraint is LIFTED.** The three designed slices all landed in one arc:
+① std.http `http.serve_shared` (`SO_REUSEPORT` sibling op; `ExprKind`/`Rvalue::HttpServe` gained a
+`shared: bool` FIELD, not a variant, so no analysis pass changed), ② std.http keep-alive entirely
+inside `accept`/`respond` (one `Arc<Mutex<ParkSlot>>` per server handle; eligibility = 1.1 + no
+`Connection: close` + no residual; `poll({parked, listener})` preferring parked; no `Connection`
+header on a persistent response; `HttpServer::drop` marks the cell `Dead`), and ③ pkg.web prefork —
+`serve(host, port, routes, workers)` with `workers == 1` inline (strict bind, zero threads) and
+`>= 2` spawning `task_group` workers that each bind their own listener. **No compiler enabler was
+needed**, exactly as probed: the worker's bind is an ordinary value-carrying
+`if shared { http.serve_shared(…)? } else { http.serve(…)? }`. **Behavioral consequence for every
+caller/test:** an eligible 1.1 request now leaves the connection OPEN, so a read-to-EOF client must
+send `Connection: close` (driver tests share `common::one_shot`) or frame by `Content-Length`.
+**Four corrections fell out of implementation + the adversarial review, all in this PR:**
+① `respond` used to emit `Content-Length` only when a body was SET, so a bodiless `200` was framed
+"until close" — un-keep-alive-able and indistinguishable from a truncated stream. Every response
+whose status may carry a body is now framed either way (the set length, or `0`); `1xx`/`204`/`304`
+get neither the header NOR any body bytes the builder holds (those would be read as the next
+response). ② The park slot became a bounded SET (256, LRU eviction): with one slot every new
+connection evicted the previous one, so a client just told "persistent" lost its next request —
+keep-alive was useless past one client, which would also have made the W5 bench meaningless.
+③ `serve` now aborts when `workers > process.cpu_count()`: `task_group` dispatches onto a pool sized
+by the available parallelism, so never-returning workers past that count SILENTLY never start (the
+`serve(..., 4)` = "four loops" promise was false above cores+1). That required the std addition
+**`process.cpu_count()`** — which also makes the documented `workers = cores` sizing writable at
+all. ④ `poll` now watches `POLLNVAL` (an invalid fd would otherwise spin the accept loop at 100%).
+**A SECOND adversarial round then found seven more, all fixed here:** ⑤ **a malformed request killed
+the server** — `accept` surfaced a per-request parse fault (bare-LF, a scanner, TLS to the plaintext
+port) as an `Err`, so `srv.accept()?` returned and, with prefork, every worker died in turn; it now
+closes that connection and keeps waiting, exactly as the parked path already did, and only a real
+`accept(2)` failure returns. (Pre-existing since M11 — prefork is what made it systemic.) ⑥ the
+readiness scan rotates, because "parked first" let busy keep-alive clients starve the listener
+outright (its `SO_REUSEPORT` queue has no sibling to drain it). ⑦ a capacity valve on the listener
+path, so idle keep-alive clients cannot pin every slot until `EMFILE`. ⑧ the worker cap is
+`cpu_count() + 1` (the pool PLUS the caller) — and the prefork tests, which hardcoded 4 workers,
+would have aborted on any CI runner with fewer cores. ⑨ `respond_stream` rejects the bodiless
+statuses too. ⑩ a body set on a bodiless status is now `Err`, not silently dropped (the same
+treatment a caller-set `Content-Length` gets). ⑪ `accept`'s poll array is reused instead of two
+allocations per request. Plus the doc rot and a vacuous eviction test the round-1 change left behind,
+and the prefork tests are serialized (`SO_REUSEPORT` makes a port collision SILENT).
+Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver `m11_http_server.rs`
+(serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
+`apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
+worker while the others answer — the property the sequential loop could not have; `workers < 1`
+abort). **NEXT: W5 — the bench gate** (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
+`workers = cores`), then W7 Fiber. Remaining W4 test matrices (route-tree edges / malformed
+requests) fold into it. Earlier context follows._
+
+_Previously: **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
 ENABLERS 1–5 ALL COMPLETE (#593); W4 HARDENING SLICE 1 COMPLETE (#594).** #593 = the pkg.web
 streaming wiring (`Handler` Respond/Stream sum type in the ONE route table, `web.sse`/`web.stream`,
 serve's stream arm, std.http `s.send_event` — surface revised from the sketched

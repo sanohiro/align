@@ -527,6 +527,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::EnvGet { name, out } => format!("env_get({}, -> _{out})", operand_str(name)),
         Rvalue::EnvSet { name, value } => format!("env_set({}, {})", operand_str(name), operand_str(value)),
         Rvalue::TimeNow => "time_now()".to_string(),
+        Rvalue::ProcessCpuCount => "process_cpu_count()".to_string(),
         Rvalue::TimeInstant => "time_instant()".to_string(),
         Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),
         Rvalue::EncodingEncode { kind, data } => format!("encode_{kind:?}({})", operand_str(data)),
@@ -618,7 +619,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(urls),
             operand_str(max_concurrency)
         ),
-        Rvalue::HttpServe { host, port, out } => format!("http_serve({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::HttpServe { host, port, out, shared } => format!(
+            "{}({}, {}, -> _{out})",
+            if *shared { "http_serve_shared" } else { "http_serve" },
+            operand_str(host),
+            operand_str(port)
+        ),
         Rvalue::HttpAccept { server, out } => format!("http_accept({}, -> _{out})", operand_str(server)),
         Rvalue::HttpCtxMethod { ctx } => format!("http_ctx_method({})", operand_str(ctx)),
         Rvalue::HttpCtxPath { ctx } => format!("http_ctx_path({})", operand_str(ctx)),

@@ -2272,7 +2272,12 @@ path.normalize(p: str) -> string
 spawn
 exec
 exit
+process.cpu_count() -> i64   // parallelism available to THIS process (affinity/quota aware, >= 1)
 ```
+
+`cpu_count` is the number a `task_group` worker count is sized against — the runtime schedules a
+group's tasks on a pool sized from exactly this source, so a set of never-returning tasks larger
+than it would leave the extra ones unstarted.
 
 ### std.env
 

@@ -989,6 +989,11 @@ pub enum ExprKind {
     /// `time.instant()` — a monotonic-clock reading in nanoseconds (`CLOCK_MONOTONIC`), an `i64`.
     /// Impure.
     TimeInstant,
+    /// `process.cpu_count()` — the parallelism available to this process (affinity- and
+    /// quota-aware), an `i64` that is always `>= 1`. Impure (observes the machine), and the number a
+    /// `task_group` worker count must be sized against — the runtime's own pool is sized from the
+    /// same source, so more long-lived tasks than this would never all start.
+    ProcessCpuCount,
     /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
     /// Impure.
@@ -1177,7 +1182,12 @@ pub enum ExprKind {
     /// `ty`). The `http_server` ([`crate::Ty::HttpServer`]) is an owned **Move** handle owning the
     /// listening fd (`Drop`-closed). `host` is a borrowed `str` (empty → wildcard); `port` is an `i64`.
     /// **Impure** (opens a socket). Wraps the net rail's `tcp.listen` (SO_REUSEADDR, backlog 128).
-    HttpServe { host: Box<Expr>, port: Box<Expr> },
+    ///
+    /// `shared` distinguishes the SIBLING op `http.serve_shared(host, port)` (http.md item 9 ①): the
+    /// same bind plus `SO_REUSEPORT`, so N prefork workers each own a listener on ONE port. It is a
+    /// field on this variant rather than a new variant precisely so every analysis pass keeps
+    /// treating it as `http.serve` (nothing about types, regions, moves, or effects differs).
+    HttpServe { host: Box<Expr>, port: Box<Expr>, shared: bool },
     /// `srv.accept()` — block for one inbound connection, read + parse its request, and yield
     /// `Result<http_request_ctx, Error>` (the `ty`). The `http_request_ctx`
     /// ([`crate::Ty::HttpRequestCtx`]) is an owned **Move** handle owning the accepted fd + the parsed
@@ -1215,7 +1225,8 @@ pub enum ExprKind {
     /// is [`crate::Ty::Unit`]. `rb` is a bound local. Pure. The build-dual of [`HttpBody`].
     HttpRbBody { rb: Box<Expr>, data: Box<Expr> },
     /// `ctx.respond(rb)` — serialize `rb` and write the response to `ctx`'s connection in one write,
-    /// then close the fd (v1: one request per conn), yielding `Result<(), Error>` (the `ty`). **Consumes
+    /// then park the connection for keep-alive or close the fd (a runtime decision, http.md item 9 ②),
+    /// yielding `Result<(), Error>` (the `ty`). **Consumes
     /// BOTH** `ctx` ([`crate::Ty::HttpRequestCtx`]) and `rb` ([`crate::Ty::ResponseBuilder`]) — the
     /// runtime frees both (like [`HttpClientRequest`]'s `req`). A caller-supplied Content-Length / a bad
     /// status is `Error.Invalid`. **Impure** (network I/O).

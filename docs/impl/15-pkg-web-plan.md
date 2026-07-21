@@ -140,8 +140,11 @@ normal; designing to one consumer is not.
 
 - **Capturing escaping closures** — unchanged deferral; middleware-lite (non-capturing,
   Move-threaded) covers auth/logging/CORS; stateful middleware waits for the feature + consumer.
-- **Concurrent accept / task_group serving** — sequential v1 per the recorded direction; the
-  concurrency step is measured AFTER the single-core hot path is proven (W5), not assumed.
+- **Concurrent accept / task_group serving** — no longer deferred: SHIPPED 2026-07-21 as prefork
+  (`web.serve(host, port, routes, workers)`, `SO_REUSEPORT` per worker) together with std.http
+  server keep-alive, because the sequential loop made BOTH streaming unusable (one stream starved
+  every client) and the W5 bench meaningless (a close-per-request server measures TCP handshakes).
+  The design is `pkg-design/web.md` → "Concurrent serve (prefork)"; W5 now measures the real shape.
 - **DB drivers (`pkg.db.*`)** — api-server-db.md §2 activates with their first consumer.
 - **Fetch tool / registry / compiled distribution** — pkg-foundation D11/D12, consumer-gated.
 - **A separate repo** — pre-release monorepo per D-A.

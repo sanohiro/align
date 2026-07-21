@@ -164,9 +164,15 @@ fn auto_response(code: i64, body: str) -> response_builder {
   rb
 }
 
-// Own the accept loop and the request handle: bind `host:port`, then for each accepted request
-// dispatch it against `routes`, call the winning handler, and WRITE what it returns. Sequential
-// (one request at a time) in v1 — concurrent serving is the recorded, measured follow-up.
+// ONE worker: bind a listener of its own, then own the accept loop and every request handle it
+// yields — dispatch each request against `routes`, call the winning handler, and WRITE what it
+// returns. `shared` picks the listener: `http.serve_shared` (SO_REUSEPORT — every prefork worker
+// binds the SAME port and the kernel balances connections) vs. the strict `http.serve` for the
+// single-worker path, where an accidental second server must still fail loudly.
+//
+// Sequential WITHIN a worker: one request at a time, and a kept-alive client's next request comes
+// straight back out of `accept` (std.http item 9 ② — the loop is byte-identical before and after
+// keep-alive). Concurrency is `serve`'s worker count, below.
 //
 // Automatic responses, all of which write the request handle exactly once:
 //   - no pattern matched              -> 404 with an empty body
@@ -182,18 +188,8 @@ fn auto_response(code: i64, body: str) -> response_builder {
 // one, and spinning on a broken listener would be worse than surfacing it. Classifying transient
 // accept errors (`ECONNABORTED`, `EMFILE`) as retryable needs errno reaching Align's `Error`, and
 // is recorded as a follow-up.
-pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result<(), Error> {
-  // A malformed route table is a PROGRAMMER error, aborted before the port is even bound (the
-  // design's error policy: startup abort, not Err — nothing should start serving a table that
-  // cannot behave as written). The message names the offending route.
-  bad := pkg.web.internal.router.validate(routes)
-  if bad.len() > 0 {
-    e := io.stderr
-    e.write(bad) else {}
-    e.write("\n") else {}
-    process.abort()
-  }
-  srv := http.serve(host, port)?
+fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool) -> Result<(), Error> {
+  srv := if shared { http.serve_shared(host, port)? } else { http.serve(host, port)? }
   loop {
     ctx := srv.accept()?
     // `ctx.path()` is the raw request-TARGET, query string included. Routing matches the path
@@ -270,4 +266,73 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>) -> Result
       }
     }
   }
+}
+
+// Serve `routes` on `host:port` with `workers` request loops.
+//
+// Thread creation is visible at the call site, by parameter — `serve(..., 4)` says four threads in
+// the source. There is no shared mutable state to make it work: each worker binds its OWN
+// SO_REUSEPORT listener (so no Move handle is shared), keeps its OWN keep-alive slot, and runs the
+// unchanged request loop; the kernel balances inbound connections across the listeners. The route
+// table is the only shared input, captured by value as a 16-byte slice view.
+//
+//   workers == 1  -> exactly the sequential loop, on the calling thread — no task_group, no threads,
+//                    and the STRICT `http.serve` bind (a second server on the port still fails).
+//   workers >= 2  -> `workers` prefork workers, each with its own SO_REUSEPORT listener.
+//   workers <  1  -> a startup abort (the validate class: a programmer-config error).
+//   workers >  process.cpu_count() -> the SAME startup abort. A worker here never returns, and
+//                    `task_group` runs its tasks on a pool sized by the available parallelism, so
+//                    tasks past that count would never start at all. Aborting keeps the promise this
+//                    parameter makes — `serve(..., 4)` really is four request loops — instead of
+//                    silently serving with fewer than the source says.
+//
+// Sizing: `workers = process.cpu_count()` is the default to reach for. An open stream occupies its
+// worker for the whole generation, so a streaming app wants `workers >= expected concurrent streams
+// + 1` — and, given the cap, a machine with cores to match.
+//
+// Error semantics (partial degradation): a worker that hits a listener-level fault returns its `Err`
+// and dies while the others keep serving; `wait()?` joins ALL of them, so `serve` returns — with the
+// first error — only once EVERY worker has died. Per-request faults never kill a worker.
+pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>, workers: i64) -> Result<(), Error> {
+  // A malformed route table is a PROGRAMMER error, aborted before the port is even bound (the
+  // design's error policy: startup abort, not Err — nothing should start serving a table that
+  // cannot behave as written). The message names the offending route. A worker count below one is
+  // the same class of error: a server that can never accept anything.
+  bad := pkg.web.internal.router.validate(routes)
+  if bad.len() > 0 {
+    e := io.stderr
+    e.write(bad) else {}
+    e.write("\n") else {}
+    process.abort()
+  }
+  if workers < 1 {
+    e := io.stderr
+    e.write("pkg.web.serve: workers must be at least 1\n") else {}
+    process.abort()
+  }
+  // A worker loop never returns, and `task_group` runs a group's tasks on a pool sized by the
+  // available parallelism PLUS the calling thread — so `cpu_count() + 1` is exactly how many
+  // never-returning workers can run, and any past that would simply never start. Refuse rather than
+  // silently running fewer request loops than the call site says.
+  runnable := process.cpu_count() + 1
+  if workers > runnable {
+    e := io.stderr
+    e.write("pkg.web.serve: workers exceeds what this machine can run (process.cpu_count() + 1); a worker past that never starts\n") else {}
+    process.abort()
+  }
+  if workers == 1 {
+    return worker(host, port, routes, false)
+  }
+  task_group {
+    mut i := 0
+    loop {
+      if i >= workers {
+        break
+      }
+      spawn(fn { worker(host, port, routes, true) })
+      i = i + 1
+    }
+    wait()?
+  }
+  return Ok(())
 }

@@ -37,7 +37,12 @@ resp.header(name: str) -> Option<str>       // view into resp
 resp.body() -> bytes                         // view into resp (region-bound)
 // Server primitive (not a framework) — surface settled 2026-07-10 (two-lens design review)
 srv := http.serve(host: str, port: i64) -> Result<http_server, Error>
-srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
+                                             // the prefork sibling: same bind + SO_REUSEPORT, so N
+                                             // workers each own a listener on ONE port (item 9 ①)
+srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
+                                             // Yields the next request off a KEPT-ALIVE connection
+                                             // before accepting a new one (item 9 ②) — same surface
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
 ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
@@ -46,9 +51,11 @@ rb := http.response(status: i64)             // response_builder (Move — owns 
                                              // the build-dual of `request`; named apart from the
                                              // parsed read-view `response`)
 rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
-rb.body(data: bytes)                         // optional — a header-only response is legal
+rb.body(data: bytes)                         // optional — a bodiless response is legal and frames
+                                             // as Content-Length: 0 (except 1xx/204/304)
 ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
-                                             // closes the accepted fd (v1: one request per conn);
+                                             // PARKS an eligible 1.1 connection for keep-alive (no
+                                             // Connection header), else closes the accepted fd;
                                              // a HEAD request gets the body SUPPRESSED, its
                                              // Content-Length kept (RFC 9110 §9.3.2; W4)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
@@ -219,9 +226,9 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `http.response(status)` -> `response_builder`(Move。パース済みの `response` とは別の Ty + 表示名)+
    `rb.header(name, value)`(バインド済みレシーバ、P6 の CR/LF/NUL は **abort**)+ `rb.body(data)`(任意)。
    `ctx.respond(rb) -> Result<(), Error>`(ctx と rb の **両方を消費する** — `cl.request(req)` と同様に
-   MIR が両スロットを null にする。シリアライズ = ステータス行 + ヘッダー + ボディがセットされた場合にのみ
-   自動 Content-Length。1 回の write、R4。MSG_NOSIGNAL/SO_NOSIGPIPE。fd を閉じる、v1 は 1 コネクション
-   1 リクエスト)。**W4 (2026-07-21): HEAD リクエストに対する `respond` はボディバイトを抑制し、その
+   MIR が両スロットを null にする。シリアライズ = ステータス行 + ヘッダー + 自動 Content-Length
+   (ボディを持ちうるステータスならボディ未設定でも `0`)。1 回の write、R4。MSG_NOSIGNAL/SO_NOSIGPIPE。
+   fd を閉じる、v1 は 1 コネクション 1 リクエスト)。**W4 (2026-07-21): HEAD リクエストに対する `respond` はボディバイトを抑制し、その
    `Content-Length` は保持する(RFC 9110 §9.3.2)** — プロトコル境界で強制されるため、bodied ビルダーで
    HEAD に応答する呼び出し側(pkg.web の HEAD→GET ルーティングを含む)はすべて構築上 RFC 準拠になる。
    `respond_stream` / `reject` は不変(stream に HEAD 形は無い)。`METHOD SP target SP HTTP/1.1`
@@ -249,8 +256,12 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      プリミティブとしては制限が強すぎる(Content-Type を付けられない)。
    - **`respond` は ctx と rb の両方を消費する**(前例: `cl.request(req)` は Move の `req` を消費する):
      二重 respond と close 後の使用を静的に禁じる。1 回の write でシリアライズする(R4)。
-   - **自動ヘッダーの方針(クライアントのシリアライズの鏡像):** ボディがセットされた場合にのみ
-     `Content-Length` を自動付与する。呼び出し側が指定した Content-Length は拒否する(スマグリング対策)。
+   - **自動ヘッダーの方針(クライアントのシリアライズの鏡像):** ボディを持ちうるステータスのレスポンス
+     には常に `Content-Length` を自動付与する — セットされた長さ、ボディ未設定なら `0`(2026-07-21 に
+     keep-alive と同時に修正: フレーミングヘッダの無いレスポンスは「close まで読む」を意味し、persistent
+     なコネクションを禁じてしまう。そしてその用途に正当性はない — close 区切りのフレーミングは
+     `respond_stream` の 1.0 モードの仕事である)。`1xx`/`204`/`304` はボディを持たないので、フレーミング
+     ヘッダは付けない。呼び出し側が指定した Content-Length は拒否する(スマグリング対策)。
      **Date/Server は自動付与しない** — 編集的なヘッダーは呼び出し側のもの(フレームワーク = pkg の領分)。
    - **v1 は accept したコネクション 1 本につき 1 リクエスト**(`respond` が fd を閉じる)。サーバ側の
      keepalive は後日、この表面の裏に見えない形で入る: `respond` の close はクライアントのスライス 3 の
@@ -391,103 +402,202 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      **リクエストごとのレイテンシを注入**(localhost の RTT ≈ 0 だとオーバーラップの利得が見えなくなる)、
      同 degree の固定スレッドプールを使う Rust ベースラインと比較する。正確な報告: 計測されたオーバーラップ
      係数 + マシンのコア数 + 同 degree での Rust との同等性 — ハードウェア非依存の 12.8× という主張ではない。
-
-**`respond_stream` の作り直し（pkg.web stream ルート向け）— 2026-07-21 設計、同日出荷。**
-pkg.web のストリーミング設計（`docs/impl/pkg-design/web.md` → 「ストリーミング」）が消費者である。
-stream ハンドラの実行中も framework がリクエストコンテキストを所有し続けること、および head 確定前の
-4xx 窓を必要とする。変更は 3 点、いずれも pre-release の完全置換（M12 テストを完全更新、compat パス無し）:
-
-- **① 非消費レシーバ。** `ctx.respond_stream(rb) -> Result<http_stream, Error>` は `rb` **のみ**を
-  消費する。fd は従来どおり stream に持ち上げる; `ctx` は呼び出し側に残り **spent** となる: 以後の
-  `respond`/`respond_stream` は `Err`（abort ではない — bodied-rb の契約バグと違い、通常の制御フローで
-  到達し得る）; その Drop はパースバッファのみ解放し fd close はスキップ（持ち上げ済み）。これが
-  `Ctx` の view（path/query/**body** — LLM の pump はストリーミング中にプロンプトを読む）を pump
-  呼び出しの間ずっと有効に保つ。前例: `rb.header` は既に変異する非消費 bound receiver である。
-- **② 遅延 head。** `respond_stream` は rb を即時に検証する（header-only 契約、P6 ガード、
-  TE/Connection ポリシー — 不変、bodied rb は依然 abort）が、head の書き込みは行わず stream ハンドルに
-  直列化して保存し、最初の `send`（または `finish`）が書く。観測可能な変更: client は最初のイベントまで
-  何も見ない — fn doc に明記、③の対価である。
-- **③ `s.reject(rb) -> Result<(), Error>`。** 最初の send より前でのみ合法（以後は `Err`、poison には
-  触れない）: 保存済み head を破棄し、`rb` を完結した**通常**レスポンスとして書き（respond の
-  serializer、CL+body）、close する。stream を消費する。これが stream ルート唯一の stream 前
-  4xx/5xx 経路である — 検証は pump 内で行い、`reject` がそれに応える。
-- `send`/`finish`/Drop/poison の意味論は他は不変; `framed`（1.0/1.1）は従来どおり `respond_stream`
-  時点で選ばれ、保存 head に焼き込まれる。
-- **出荷記録。** ランタイム: `HttpStream.pending_head`（最初の `send`/`finish` の書き込み試行が取得 —
-  その書き込みが失敗しても確定扱い; head+初回チャンク / head+終端は 1 回の write で出る）、
-  `align_rt_http_stream_reject`、および `respond`/`respond_stream` 双方の spent-fd（`fd < 0`）`Err`
-  チェック; `respond_stream` の検証 `Err` は ctx を**未 spent** のまま残す（呼び出し側はまだ通常の
-  `respond` でエラー応答できる）。言語側: `s.reject(rb)` を
-  `ExprKind::HttpStreamReject`/`Rvalue::HttpStreamReject` で（両方消費、MIR が両スロットを null）;
-  `HttpRespondStream` は `rb` のみ null。テスト: `align_runtime` unit（lazy-head/reject/spent-ctx
-  契約）+ `m12_http_stream.rs`（13 本: pump 中の `ctx.path()` 借用ストリーム、spent-ctx `respond` →
-  `Err` E2E、reject → 通常 400 E2E、遅延 reject → `Err` + 切断、reject の move ゲート）。
-- **④ `s.send_event(data) -> Result<(), Error>` — 2026-07-21 出荷**（pkg.web ストリーミングの
-  enabler 5、その最初の消費者と共に — 確約済みの「最初のストリーミング消費者が着地したときの SSE
-  イベントフレーミング（WHATWG）」床項目）。`data` を 1 つのイベントフレーム `data: {data}\n\n` として
-  包み、チャンクフレーミングと（まだ保留かもしれない）遅延 head と**同じバッファ内**で組み立てる —
-  head + チャンクフレーミング + イベントを 1 回の `http_send_all` write で; raw（1.0）モードはイベン
-  トバイトを非フレームで書く。**`send_event("")` は合法な空イベント**（`data: \n\n`、8 ペイロード
-  バイト — チャンク終端とは決して被らない）なので、`send("")` と違い実際の write であり head を確定
-  する。複数行 `data` は v1 では caller の責務（裸の `\n` はイベントのフィールド構造を変える — 分割は
-  記録済みの pkg.web バックログ）。`s` の借用は `send` と全く同じ（poison ラッチ共有）。これは
-  **メソッド**であって `pkg.web` 自由関数ではない。なぜなら pkg レベルの自由関数は Move ハンドルを値
-  渡しで取り（ユーザ関数に借用パラメータは無い — `io.copy` の bound-receiver 制限クラス）、pump が
-  これから finish すべき stream を消費してしまうからである。ランタイム: 共有 `http_stream_send_parts`
-  ヘルパの上の `align_rt_http_stream_send_event`。言語側: `HttpStreamSend`/`Rvalue::HttpStreamSend`
-  が `event: bool` を得た（同一 variant なので全解析パスが `send` として扱う — 新 variant のソウンド
-  ネス掃きは不要）。テスト: ランタイムのフレーミング unit（フレーム付き 空/非空 + raw）、
-  `m12_http_stream.rs` の `send_event` E2E、および pkg.web の `apps_web_stream.rs` スイート。
-
-**prefork リスナー + サーバ側コネクション keep-alive — 2026-07-21 設計（実装は次セッション;
-消費者 = pkg.web の並行 serve、`pkg-design/web.md` → 「並行 serve」）。** std の変更は 2 点;
-keep-alive が先に着地する（v1 の逐次ループ上で独立にテスト可能）。
-
-- **① `http.serve_shared(host, port) -> Result<http server, Error>`** — リスナー上の
-  `SO_REUSEPORT` を除いて `http.serve` と同一であり、N ワーカーが 1 つのポート上でそれぞれ**自分
-  専用の**リスナーを bind し、カーネルがコネクションを振り分ける。フラグではなく**兄弟**演算:
-  `http.serve` は strict-bind セマンティクスを保つ（誤った 2 つ目のサーバは依然として大声で失敗
-  すべき; ポート共有は明示的な選択 — `respond`/`respond_stream` の兄弟の前例、bool トラップなし）。
-  ポータビリティ: Linux は適切に振り分ける; macOS は TCP に対しこのオプションを受け付けるが分配品質
-  は未規定 — 記録するだけでゲートしない（ベンチ機は Linux）。
-- **② コネクション keep-alive は完全に `accept`/`respond` の内側で — ループ形状はどの呼び出し側に
-  とっても不変。** サーバハンドル毎に 1 つの **parked スロット**（v1 の一度に 1 コネクションの姿勢
-  を明示化したもの）:
-  - **適格性**（パース時に計算され ctx に載る）: リクエストが HTTP/1.1 であり、`Connection: close`
-    ヘッダを持たず、パースバッファ内に自分のボディを越える**残余バイトを残さない**こと（パイプ
-    ライン化する client には応答してから close する — 残余の持ち越しは意図的に**作らない**; 本物の
-    keep-alive client はレスポンスを待つので、残余 ≈ 皆無）。1.0 の keep-alive（レガシーの
-    `Connection: keep-alive`）は非対応 — 従来どおり close。
-  - **`ctx.respond`**: 適格 + 書き込み成功 → fd は close せずサーバのスロットへ **PARK** され、自動の
-    `Connection: close` ヘッダは**省略される**（不在 = 持続が 1.1 のデフォルト; fasthttp も同様に
-    する — ベンチ経路で最も軽いバイト数）。不適格 → `Connection: close` + close、従来どおり。
-    `respond_stream`、`reject`、および全エラーパスは従来の常時 close セマンティクスを保つ（stream の
-    終端子はその close であり、reject 窓はエラーパス — 2 つ目のフレーミングモードに値しない、記録
-    のみ）。
-  - **`srv.accept()`**: parked fd なし → 従来どおり素の `accept(2)`。parked fd あり →
-    `poll({parked, listener}, infinite)`; parked が readable → そこから**次の**リクエストをパース
-    （新しいパースバッファ — zero-copy view はリクエスト毎に保たれる）; listener のみ readable →
-    新規コネクションを取り、parked を close する（単一スロット: idle な keep-alive client は新規
-    トラフィックで evict されるので idle タイムアウトは不要 — 新規トラフィックのない idle な
-    parked fd は poll でブロックするだけで、それが accept の通常の idle 状態そのもの）。両方
-    readable → parked を優先（暖まった client を drain する; 公平性の caveat は prefork の他ワーカー
-    と信頼済みネットワークの姿勢で境界づけられる — 記録）。parked EOF / パースエラー → それを
-    close し、`accept(2)` へフォールスルー。`accept` の表面と `Result` は不変。
-  - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。スロットは
-    ランタイム内部の refcount セル（`Arc<Mutex<Option<fd>>>`）であり、サーバハンドルが保持し**かつ**
-    accept 時に各 ctx へ clone される — リクエスト毎に refcount を 1 つ bump するだけで、ユーザに
-    見える割り当てはなく、構築上 uncontended（prefork が全ワーカーに自分のサーバハンドルを与える
-    ので、mutex はスレッドを決して跨がない）。サーバが先に drop → セルは dead としてマークされ
-    `respond` は単に close する; ctx が先に drop → refcount が解放される。ランタイムの寿命の細部の
-    ために sema/region の表面は追加しない（却下: ctx の region を srv に縛る — より重く、item 4 で
-    出荷した free-standing ハンドルモデルには誤り）。
-- **テストマトリクス（仕様）:** 1 コネクション上で 2 リクエスト E2E（同一ソケット、両方 200、
-  リクエスト毎に view が正しい）; `Connection: close` リクエストの尊重; 1.0 は close; パイプライン化
-  （残余）リクエストは応答してから close; parked fd が新規コネクションで evict される; parked EOF の
-  回復; stream/reject のコネクションは常に close; HEAD（ボディ抑制）+ keep-alive の合成;
-  keepalive × pkg.web serve E2E（ループ不変）; `serve_shared` の二重 bind は成功する一方で素の
-  `serve` の二重 bind は依然として失敗する; prefork E2E — W ワーカー、同時 client、他が応答する間に
-  1 つの held-open stream。
+7. **SSE/chunked ストリーミングレスポンス（`respond_stream`、runway A5 の残り）— 2026-07-11 設計確定、
+   出荷済み。** ランタイム: `HttpStream { fd, framed, poisoned }` + `align_rt_http_respond_stream` /
+   `_stream_send` / `_stream_finish` / `_stream_free`; head のシリアライザは `http_serialize_head` に
+   単一化されている（respond は CL+body を、respond_stream は TE を追加する）; リクエストの HTTP
+   バージョンはパース → `HttpRequestHead.http11` → `HttpRequestCtx.http11` → stream の `framed` と
+   貫かれる。コンパイラ: `Ty::HttpStream`/`Scalar::HttpStream`（`Result` の Ok ペイロードに乗る Move
+   ハンドル。accept の前例）、HIR の `HttpRespondStream`/`HttpStreamSend`/`HttpStreamFinish`、いずれも
+   `lower_http` を通す。テストはランタイムの unit（フレームエンコーダ、バージョン、共有 head の一致、
+   poison、空 send の no-op）+ `crates/align_driver/tests/m12_http_stream.rs`（1.1 chunked / 1.0 raw /
+   切断 / poison / align 自身の client が chunked を拒否する非対称性 / 二重消費 + bodied abort の
+   ゲート）。（2 レンズのレビュー、Fable が統合。）gateway のトークンストリーミング層は: 呼び出し側が
+   SSE の `data: …\n\n` 行をボディ内容として書き、std.http は**転送フレーミングのみ**を提供する
+   （フレームワーク境界を保つ）。
+   - `ctx.respond_stream(rb) -> Result<http_stream, Error>` — ctx と rb の**両方**を消費する
+     （`respond` の前例）。rb は **header-only** でなければならない: 既にボディが設定されていれば
+     プログラマの契約バグ → **abort**（bodied なら `respond` の経路である; `rand.range` と同じ abort
+     クラス — client のデータではなくコード構造に起因する）。head のシリアライズ = ステータス +
+     ヘッダ + 自動の `Transfer-Encoding: chunked` + 自動の `Connection: close`（自動 CL の鏡）;
+     **head のシリアライザは `respond` と単一化されている**（呼び出し側の CL/TE/Connection 拒否ループと
+     P6 ガードを含む共有 head 関数 1 つ。respond は CL+body を、respond_stream は TE を追加する）。
+   - **HTTP/1.0 の client（必須。レビューで発見 — バージョンは当時パースした後に破棄されていた）:**
+     リクエストの HTTP バージョンを parse→head→ctx→stream と貫く。1.0 リクエストに対して chunked は
+     不正なので、stream は **close 区切りの raw モード**で構築する（stream 上の `framed: bool`）:
+     TE ヘッダなし、`send` はペイロードバイトを非フレームで書き、`finish`/Drop は close するだけ
+     （read-to-close は 1.0 の正当なフレーミングである）。
+   - **`http_stream`**（Move。ctx から持ち上げた fd を所有する。free-standing — ctx から何も借用せず
+     region 束縛もない。Move ハンドルの標準的な除外規則に従う）。`s.send(chunk: bytes) ->
+     Result<(), Error>` — 1 つのチャンクフレーム（小文字 hex の長さ、`0x` なし、CRLF ペイロード CRLF）を
+     1 つのバッファで組み立て、`http_send_all` で **1 回の write**（MSG_NOSIGNAL/EINTR/部分書き込みの
+     規律。EPIPE → Error）。**`send("")` は Ok を返す no-op である** — 空チャンクはプロトコルの
+     **終端子**であり、かつ空の出力ステップは予見できる gateway のデータ（トークンをまたいで分割された
+     マルチバイト UTF-8 コードポイントは 0 バイトにデトークナイズされる）であってプログラマのバグでは
+     ない。何も書かないのが正直な意味論である。TCP_NODELAY は accept 時点で設定済み — 1 回の send =
+     即座に見える 1 イベント（トークンストリーミングのレイテンシ要件）。
+   - **`s.finish() -> Result<(), Error>` が唯一のクリーンな終端子である** — stream を消費し
+     （`null_moved_source` の新しい腕。見落としやすい方）、`0\r\n\r\n` を書き（framed モード。
+     トレーラは省略 — RFC 9112 §7.1 に適合）、close し、エラーを表に出す。**Drop は close のみで、
+     終端の write を行わない** — これは先にコミットした項目をあえて**修正する**: v1 には write の
+     デッドラインがないので、停止した peer への Drop 時の終端 write は単一の accept ループを無限に
+     ブロックし得る。加えて、終端チャンクの欠落こそ chunked の送信側が切断を通知する方法そのもので
+     あり、唐突な close の方が安全であり切断に対して正直でもある（明示的な操作はエラーを表に出し、
+     Drop は黙る、という file/conn の前例の分担）。失敗した `send` が立てる **`poisoned` フラグ**に
+     より、`finish` は終端の write をスキップして close し、Err を返す（stream はクリーンに終端
+     しなかった）。
+   - ストリーミングは slow-loris の caveat を再確認させる: stream は設計上、生成の全期間にわたって
+     単一のブロッキング accept スレッドを保持する — 信頼済みネットワークの前提は攻撃時の caveat と
+     いうだけでなく、設計上の荷重を負っている。
+   - client 側のパースは CL のみのまま（chunked → align 自身の client では `Error.Invalid` — 記録済みの
+     非対称性。gateway の client は外部のものである）。
+8. **`respond_stream` の作り直し（pkg.web stream ルート向け）— 2026-07-21 設計、同日出荷。**
+   pkg.web のストリーミング設計（`docs/impl/pkg-design/web.md` → 「ストリーミング」）が消費者である。
+   stream ハンドラの実行中も framework がリクエストコンテキストを所有し続けること、および head 確定前の
+   4xx 窓を必要とする。変更は 3 点、いずれも pre-release の完全置換（M12 テストを完全更新、compat パス無し）:
+   - **① 非消費レシーバ。** `ctx.respond_stream(rb) -> Result<http_stream, Error>` は `rb` **のみ**を
+     消費する。fd は従来どおり stream に持ち上げる; `ctx` は呼び出し側に残り **spent** となる: 以後の
+     `respond`/`respond_stream` は `Err`（abort ではない — bodied-rb の契約バグと違い、通常の制御フローで
+     到達し得る）; その Drop はパースバッファのみ解放し fd close はスキップ（持ち上げ済み）。これが
+     `Ctx` の view（path/query/**body** — LLM の pump はストリーミング中にプロンプトを読む）を pump
+     呼び出しの間ずっと有効に保つ。前例: `rb.header` は既に変異する非消費 bound receiver である。
+   - **② 遅延 head。** `respond_stream` は rb を即時に検証する（header-only 契約、P6 ガード、
+     TE/Connection ポリシー — 不変、bodied rb は依然 abort）が、head の書き込みは行わず stream ハンドルに
+     直列化して保存し、最初の `send`（または `finish`）が書く。観測可能な変更: client は最初のイベントまで
+     何も見ない — fn doc に明記、③の対価である。
+   - **③ `s.reject(rb) -> Result<(), Error>`。** 最初の send より前でのみ合法（以後は `Err`、poison には
+     触れない）: 保存済み head を破棄し、`rb` を完結した**通常**レスポンスとして書き（respond の
+     serializer、CL+body）、close する。stream を消費する。これが stream ルート唯一の stream 前
+     4xx/5xx 経路である — 検証は pump 内で行い、`reject` がそれに応える。
+   - `send`/`finish`/Drop/poison の意味論は他は不変; `framed`（1.0/1.1）は従来どおり `respond_stream`
+     時点で選ばれ、保存 head に焼き込まれる。
+   - **出荷記録。** ランタイム: `HttpStream.pending_head`（最初の `send`/`finish` の書き込み試行が取得 —
+     その書き込みが失敗しても確定扱い; head+初回チャンク / head+終端は 1 回の write で出る）、
+     `align_rt_http_stream_reject`、および `respond`/`respond_stream` 双方の spent-fd（`fd < 0`）`Err`
+     チェック; `respond_stream` の検証 `Err` は ctx を**未 spent** のまま残す（呼び出し側はまだ通常の
+     `respond` でエラー応答できる）。言語側: `s.reject(rb)` を
+     `ExprKind::HttpStreamReject`/`Rvalue::HttpStreamReject` で（両方消費、MIR が両スロットを null）;
+     `HttpRespondStream` は `rb` のみ null。テスト: `align_runtime` unit（lazy-head/reject/spent-ctx
+     契約）+ `m12_http_stream.rs`（13 本: pump 中の `ctx.path()` 借用ストリーム、spent-ctx `respond` →
+     `Err` E2E、reject → 通常 400 E2E、遅延 reject → `Err` + 切断、reject の move ゲート）。
+   - **④ `s.send_event(data) -> Result<(), Error>` — 2026-07-21 出荷**（pkg.web ストリーミングの
+     enabler 5、その最初の消費者と共に — 確約済みの「最初のストリーミング消費者が着地したときの SSE
+     イベントフレーミング（WHATWG）」床項目）。`data` を 1 つのイベントフレーム `data: {data}\n\n` として
+     包み、チャンクフレーミングと（まだ保留かもしれない）遅延 head と**同じバッファ内**で組み立てる —
+     head + チャンクフレーミング + イベントを 1 回の `http_send_all` write で; raw（1.0）モードはイベン
+     トバイトを非フレームで書く。**`send_event("")` は合法な空イベント**（`data: \n\n`、8 ペイロード
+     バイト — チャンク終端とは決して被らない）なので、`send("")` と違い実際の write であり head を確定
+     する。複数行 `data` は v1 では caller の責務（裸の `\n` はイベントのフィールド構造を変える — 分割は
+     記録済みの pkg.web バックログ）。`s` の借用は `send` と全く同じ（poison ラッチ共有）。これは
+     **メソッド**であって `pkg.web` 自由関数ではない。なぜなら pkg レベルの自由関数は Move ハンドルを値
+     渡しで取り（ユーザ関数に借用パラメータは無い — `io.copy` の bound-receiver 制限クラス）、pump が
+     これから finish すべき stream を消費してしまうからである。ランタイム: 共有 `http_stream_send_parts`
+     ヘルパの上の `align_rt_http_stream_send_event`。言語側: `HttpStreamSend`/`Rvalue::HttpStreamSend`
+     が `event: bool` を得た（同一 variant なので全解析パスが `send` として扱う — 新 variant のソウンド
+     ネス掃きは不要）。テスト: ランタイムのフレーミング unit（フレーム付き 空/非空 + raw）、
+     `m12_http_stream.rs` の `send_event` E2E、および pkg.web の `apps_web_stream.rs` スイート。
+9. **prefork リスナー + サーバ側コネクション keep-alive — 2026-07-21 設計 + 出荷**
+   （消費者 = pkg.web の並行 serve、`pkg-design/web.md` → 「並行 serve」）。std の変更は 2 点;
+   keep-alive が先に着地する（v1 の逐次ループ上で独立にテスト可能）。
+   - **① `http.serve_shared(host, port) -> Result<http server, Error>`** — リスナー上の
+     `SO_REUSEPORT` を除いて `http.serve` と同一であり、N ワーカーが 1 つのポート上でそれぞれ**自分
+     専用の**リスナーを bind し、カーネルがコネクションを振り分ける。フラグではなく**兄弟**演算:
+     `http.serve` は strict-bind セマンティクスを保つ（誤った 2 つ目のサーバは依然として大声で失敗
+     すべき; ポート共有は明示的な選択 — `respond`/`respond_stream` の兄弟の前例、bool トラップなし）。
+     ポータビリティ: Linux は適切に振り分ける; macOS は TCP に対しこのオプションを受け付けるが分配品質
+     は未規定 — 記録するだけでゲートしない（ベンチ機は Linux）。
+   - **② コネクション keep-alive は完全に `accept`/`respond` の内側で — ループ形状はどの呼び出し側に
+     とっても不変。** サーバハンドル毎に **上限つきの parked 集合**（256 コネクション。満杯時は最も
+     長く使われていないものを close して空きを作る）。設計当初は単一スロット — 「v1 の一度に 1
+     コネクションの姿勢を明示化したもの」— だったが、これは**実装中に是正した**: 1 スロットでは新規
+     コネクションが毎回それまでのものを evict するので、「このコネクションは持続する」と告げられた
+     ばかりの client が次のリクエストを失う（POST では client 側で安全に再試行できない失敗である）。
+     処理は依然として厳密に一度 1 リクエストずつであり、park されたコネクションは idle であって
+     in-flight ではない:
+     - **適格性**（パース時に計算され ctx に載る）: リクエストが HTTP/1.1 であり、`Connection: close`
+       ヘッダを持たず、パースバッファ内に自分のボディを越える**残余バイトを残さない**こと（パイプ
+       ライン化する client には応答してから close する — 残余の持ち越しは意図的に**作らない**; 本物の
+       keep-alive client はレスポンスを待つので、残余 ≈ 皆無）。1.0 の keep-alive（レガシーの
+       `Connection: keep-alive`）は非対応 — 従来どおり close。
+     - **`ctx.respond`**: 適格 + 書き込み成功 → fd は close せずサーバのスロットへ **PARK** され、自動の
+       `Connection: close` ヘッダは**省略される**（不在 = 持続が 1.1 のデフォルト; fasthttp も同様に
+       する — ベンチ経路で最も軽いバイト数）。不適格 → `Connection: close` + close、従来どおり。
+     - **レスポンスは常に自己完結的にフレーミングされるようになった**（実装中に確定; RFC 9112 §6.3）。
+       `respond` は以前、ボディが SET されたときにのみ `Content-Length` を出していたので、ボディなしの
+       `200` は「コネクションが閉じるまで」という枠付けになっていた — keep-alive できず、しかもワイヤ上で
+       切り詰められた stream と区別がつかない。**完全に改めた:** ボディを持ちうるステータスのレスポンスは
+       どちらの場合もフレーミングされる（セットされた長さ、またはボディ未設定なら `0`）; `1xx`/`204`/`304`
+       はボディを持たないのでフレーミングヘッダを付けない; そこにボディが SET されていた場合は黙って
+       落とさず**拒否する**（`Err`。同じ関数で呼び出し側指定の `Content-Length` が受けるのと同じ扱い）—
+       この種のレスポンスはフィールドが何を言っていようと最初の空行で終端するので、そのバイトは
+       keep-alive されたコネクション上で**次のレスポンスの先頭**として読まれてしまうし、呼び出し側の
+       データを黙って捨てることはこの境界が絶対にやってはならないことだからである。`respond_stream` も
+       同じステータスを拒否する（既に終わったレスポンスの後に stream を続けることはできない）。HEAD は
+       従来どおり黙って抑制する — こちらはビルダからは見えない**リクエスト**が理由だからである。
+       したがって keep-alive の可否は**リクエストだけ**で決まり、ボディなしのレスポンス
+       （`web.status(201)`）もコネクションに留まる。
+       `respond_stream`、`reject`、および全エラーパスは
+       従来の常時 close セマンティクスを保つ（stream の終端子はその close であり、reject 窓はエラー
+       パス — 2 つ目のフレーミングモードに値しない、記録のみ）。
+     - **`srv.accept()`**: park が空 → 従来どおり素の `accept(2)`。そうでなければ
+       `poll({…parked, listener}, infinite)`; park されたコネクションが readable → それを集合から
+       **取り出し**、そこから**次の**リクエストをパースする（新しいパースバッファ — zero-copy view は
+       リクエスト毎に保たれる）; listener が readable → 新規コネクションを取り、**park 集合には手を
+       触れない** — **ただし満杯のときは最も冷たい parked コネクションが場所を空ける**（この弁が無いと
+       idle な keep-alive client が切断するまで全スロットを占有し、やがて `accept` が `EMFILE` で失敗
+       する）。準備完了の走査は常に parked を優先するのではなく、**ローテートする開始位置**から始める:
+       「parked 優先」固定の走査では、忙しい keep-alive client が listener を完全に飢餓させてしまう —
+       `SO_REUSEPORT` では自分専用のキューを持つので兄弟ワーカーが肩代わりして drain することはできず、
+       新規コネクションは backlog が SYN を落とすまで滞留する。parked の EOF / パースエラー → その 1 本を
+       close して見直す。idle タイムアウトは無い: idle な parked fd は `poll` で待つだけであり、それが
+       accept の通常の idle 状態そのものである。`POLLNVAL` は `POLLHUP`/`POLLERR` と並べて監視する —
+       これが無いと無効な fd がどの分岐にも当たらない revent を返し、待機ループが spin してしまう。
+       `accept` の表面と `Result` は不変。
+     - **不正なリクエストはもはや `accept` から一切表に出ない**（ここで是正した — keep-alive 以前から
+       の挙動でもあり、prefork がそれを致命的にした）。smuggling / bare-LF / 平文ポートへの TLS と
+       いったリクエストは、listener が全く健全なままの**リクエスト単位の障害**なので、`accept` はその
+       コネクションを close して待機を続ける — parked 経路が既にやっていたのと全く同じである。これを
+       返していたために、スキャナが 1 本繋いだだけで呼び出し側の accept ループ（`srv.accept()?`）が
+       死んでいた; prefork では worker ごとに 1 本ずつでサーバ全体が落ちた。エラーを返すのは実際の
+       `accept(2)` の失敗だけであり、それこそが serve ループにおける `srv.accept()?` を正しくする。
+     - **interim（`1xx`）レスポンスは決して park しない** — 完全なレスポンスではないので、それを受け
+       取った client は最終レスポンスを待つ。コネクションは keep-alive 以前と同様に close する。
+     - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。集合は
+       ランタイム内部の refcount セル（`Arc<Mutex<ParkSlot>>`）であり、サーバハンドルが保持し**かつ**
+       accept 時に各 ctx へ clone される — リクエスト毎に refcount を 1 つ bump するだけで、ユーザに
+       見える割り当てはなく、構築上 uncontended（prefork が全ワーカーに自分のサーバハンドルを与える
+       ので、mutex はスレッドを決して跨がない）。サーバが先に drop → セルは dead としてマークされ
+       `respond` は単に close する; ctx が先に drop → refcount が解放される。ランタイムの寿命の細部の
+       ために sema/region の表面は追加しない（却下: ctx の region を srv に縛る — より重く、item 4 で
+       出荷した free-standing ハンドルモデルには誤り）。
+   - **テストマトリクス（仕様）:** 1 コネクション上で 2 リクエスト E2E（同一ソケット、両方 200、
+     リクエスト毎に view が正しい）; `Connection: close` リクエストの尊重; 1.0 は close; パイプライン化
+     （残余）リクエストは応答してから close; parked fd が新規コネクションで evict される; parked EOF の
+     回復; stream/reject のコネクションは常に close; HEAD（ボディ抑制）+ keep-alive の合成;
+     keepalive × pkg.web serve E2E（ループ不変）; `serve_shared` の二重 bind は成功する一方で素の
+     `serve` の二重 bind は依然として失敗する; prefork E2E — W ワーカー、同時 client、他が応答する間に
+     1 つの held-open stream。
+   - **出荷記録。** ランタイム: 共有 `tcp_listen_impl(…, reuseport)` の背後に置いた `SO_REUSEPORT` +
+     `align_rt_http_serve_shared`; parked 集合は `Arc<Mutex<ParkSlot>>`（`Live(Vec<fd>)`/`Dead`。
+     後者は `HttpServer::drop` が設定し、park 中の fd を**すべて**閉じる）; 適格性は
+     `http_read_request` で計算し（`http_request_wants_close` + 残余チェック）ctx に載せる;
+     `align_rt_http_accept` は `http_wait_parked_or_listener`（新しい `poll(2)` extern）+
+     `http_accept_conn` を中心に再構成; `http_serialize_head(rb, persistent)` は keep-alive 経路で
+     `Connection` 行を省く。言語側: `ExprKind::HttpServe`/`Rvalue::HttpServe` が `shared: bool` を得た
+     （variant ではなく**フィールド** — 全解析パスは引き続き `http.serve` として扱う）、
+     `http.serve_shared` は同じ `check_http_serve` を通って dispatch する。テスト: ランタイムの
+     keep-alive unit 10 本（1 コネクション 2 リクエスト、3 つの不適格規則、HEAD との合成、eviction、
+     parked EOF の回復、fd 衛生、ボディなしレスポンスのフレーミング、ボディを持てないステータスが
+     セット済みボディを抑制すること、interim レスポンスが park しないこと、4 クライアント同時 park）
+     + `serve_shared` の二重 bind unit; driver の `m11_http_server.rs`（`serve_shared` E2E + ゲート）、
+     `apps_web_root.rs`（keep-alive × pkg.web のループ。2 番目の client が 1 番目からコネクションを
+     奪わないことを含む）、`apps_web_prefork.rs`（同時 client、`/proc/net/tcp` から読み出した
+     ワーカー毎に 1 つのリスナー、他が応答する間に 1 ワーカーを占有する held-open stream、範囲外の
+     `workers` の abort）。
+   - **呼び出し側/テスト向けの挙動注記:** 適格な HTTP/1.1 リクエストはコネクションを**開いたまま**に
+     するので、EOF まで読む client はサーバが終了するか容量の逼迫が parked コネクションを evict
+     するまでブロックする。コネクション毎 1 リクエストの client は `Connection: close` を送る（driver
+     テスト共有の `one_shot` ヘルパ）か、`Content-Length` で読みをフレーム化しなければならない。
 
 ## Known v1 limitations (Slice 2/3/5)
 
