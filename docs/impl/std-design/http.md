@@ -574,6 +574,17 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        (`srv.accept()?`) the first time a scanner connected; with prefork, one such connection
        per worker took the whole server down. Only a real `accept(2)` failure returns an error,
        which is what makes `srv.accept()?` correct in a serve loop.
+     - **Nor does a transient `accept(2)` errno** — the same argument, applied to the syscall
+       itself, and the last path where a worker could still die. One classification decides all of
+       it: `EINTR` and **`ECONNABORTED`** (the client vanished between its SYN and the `accept`, so
+       the connection that would have been returned no longer exists — pure noise, and otherwise a
+       client could kill a worker by connecting and immediately resetting) retry immediately;
+       **`EMFILE`/`ENFILE`** are recoverable descriptor exhaustion, so `accept` **gives a
+       descriptor back — the coldest parked keep-alive connection**, precisely an idle fd, the same
+       choice the capacity valve makes — and retries; with nothing parked to reclaim it backs off
+       10 ms rather than spinning on a table it does not own. Everything else is a genuine
+       listener-level fault and is returned. The result is a degradation (one warm connection is
+       spent to serve the waiting one) where the server previously died.
      - **An interim (`1xx`) response never parks** — it is not a complete response, so a client
        that got one waits for the final one; the connection closes, as before keep-alive.
      - **Drop-order safety (the one sharp edge):** the ctx must not park into a freed server.
@@ -596,7 +607,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      the latter set by `HttpServer::drop`, which also closes every still-parked fd); eligibility
      computed in `http_read_request` (`http_request_wants_close` + the residual check) and carried on
      the ctx; `align_rt_http_accept` restructured around `http_wait_parked_or_listener` (a new
-     `poll(2)` extern) + `http_accept_conn`; `http_serialize_head(rb, persistent)` omitting the
+     `poll(2)` extern) + `http_accept_conn`, whose failures go through `classify_accept_error`
+     (`AcceptFail::NoFds` vs `Fatal`) and, on exhaustion, `http_relieve_fd_pressure`;
+     `http_serialize_head(rb, persistent)` omitting the
      `Connection` line on the keep-alive path. Language: `ExprKind::HttpServe`/`Rvalue::HttpServe`
      gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
      `http.serve`), and `http.serve_shared` dispatches through the same `check_http_serve`. Tests:
@@ -604,7 +617,10 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      composition, new traffic NOT evicting a parked connection, both capacity valves evicting the
      coldest, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
      rejecting a set body, an interim response never parking, and four clients parked at once) +
-     the `serve_shared` double-bind unit; driver `m11_http_server.rs` (`serve_shared` E2E + gates),
+     the `serve_shared` double-bind unit + the two `accept`-errno units (the classification table,
+     and an out-of-process descriptor-exhaustion E2E under a lowered `RLIMIT_NOFILE`: with the table
+     full the parked connection is reclaimed and the pending request still answered);
+     driver `m11_http_server.rs` (`serve_shared` E2E + gates),
      `apps_web_root.rs` (keep-alive × the pkg.web loop, a second client not costing the first its
      connection, and a malformed request not killing the loop), and `apps_web_prefork.rs`
      (concurrent clients; one listener per worker read out of `/proc/net/tcp`; a held-open stream

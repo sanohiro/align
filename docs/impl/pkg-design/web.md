@@ -491,8 +491,11 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
 - **Error semantics (partial degradation).** A worker that hits a listener-level fault returns
   its `Err` and dies; the other workers keep serving. `wait()?` joins ALL tasks, so `serve`
   returns — with the first error — only when EVERY worker has died. Per-request faults never
-  kill a worker (unchanged). The transient-`ECONNABORTED`/`EMFILE` classification follow-up is
-  unchanged and becomes more valuable here.
+  kill a worker (unchanged). **Transient `accept(2)` errnos never surface either** (shipped in
+  std.http, http.md item 9): `EINTR`/`ECONNABORTED` retry, and `EMFILE`/`ENFILE` reclaim the
+  coldest parked keep-alive connection and retry. So "a listener-level fault" now means exactly
+  that — a worker no longer dies because a client reset its SYN or the fd table filled up. No
+  errno reaches Align's `Error` for it; the classification lives entirely under `accept`.
 - **Streaming unblocked.** An open stream occupies exactly its own worker; `W - 1` keep
   serving. Production streaming's gate becomes "run with enough workers", a visible capacity
   decision in the app's source — record `workers >= expected concurrent streams + 1` as the

@@ -14955,22 +14955,81 @@ unsafe fn http_wait_parked_or_listener(fds: &mut Vec<PollFd>, listener: i32, cur
     }
 }
 
-/// Accept one new connection on `lfd` (cloexec, `EINTR`-retried) and set the per-connection socket
-/// options. Returns the connected fd or a mapped status.
+// The two descriptor-exhaustion errnos. Both come from the original BSD numbering and are identical
+// on Linux and macOS/BSD; `std::io::ErrorKind` has no stable variant for either, so they are matched
+// on the raw errno (`ECONNABORTED` does have one — `ConnectionAborted` — and is matched by kind).
+/// The SYSTEM-wide descriptor table is full.
+const ENFILE: i32 = 23;
+/// This PROCESS has reached its descriptor limit (`RLIMIT_NOFILE`).
+const EMFILE: i32 = 24;
+
+/// Why an `accept(2)` did not yield a connection. `EINTR` and `ECONNABORTED` never reach the caller:
+/// both are retried inside [`http_accept_conn`], being pure noise rather than failures.
+enum AcceptFail {
+    /// `EMFILE`/`ENFILE` — out of descriptors. The listener is healthy and the condition is
+    /// transient by nature (connections close), so the caller gives a descriptor back — evicting a
+    /// parked keep-alive connection, which is exactly the idle fd to reclaim — and retries instead
+    /// of dying. Blind retrying would spin at 100% CPU; returning would kill the accept loop.
+    NoFds,
+    /// A real listener-level failure (a closed/invalid listener, `EBADF`, …), already mapped to a
+    /// status. This is the only kind of `accept` failure a serve loop should ever see.
+    Fatal(i32),
+}
+
+/// How long to wait before retrying an `accept` that hit `EMFILE`/`ENFILE` with NOTHING parked to
+/// reclaim — the descriptors are held by something this server does not own, so only time helps.
+/// Short enough to recover promptly, long enough that a permanently exhausted table costs ~100
+/// wakeups/s instead of a spinning core.
+const HTTP_ACCEPT_NO_FDS_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Give one descriptor back after an `accept` hit `EMFILE`/`ENFILE`: close the COLDEST parked
+/// keep-alive connection (the one served longest ago — the same choice the capacity valve makes).
+/// Returns whether one was reclaimed; `false` means the caller must back off instead.
+fn http_relieve_fd_pressure(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>) -> bool {
+    let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
+    match &mut *slot {
+        ParkSlot::Live(fds) if !fds.is_empty() => {
+            unsafe { close(fds.remove(0)) };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The whole `accept(2)` failure policy, as one decision: `None` = noise, retry the call; `Some` =
+/// the classified failure.
+///
+/// - `EINTR` — a signal landed before a connection did.
+/// - `ECONNABORTED` — the client vanished between its SYN and the `accept`, so the connection that
+///   would have been returned no longer exists. Nothing failed; the next one is already waiting.
+///   (Surfacing it would let any client kill a worker by connecting and immediately resetting.)
+fn classify_accept_error(e: &std::io::Error) -> Option<AcceptFail> {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::Interrupted | ErrorKind::ConnectionAborted => None,
+        _ => Some(match e.raw_os_error() {
+            Some(EMFILE) | Some(ENFILE) => AcceptFail::NoFds,
+            _ => AcceptFail::Fatal(io_error_to_status(e)),
+        }),
+    }
+}
+
+/// Accept one new connection on `lfd` (cloexec; the retryable errnos of [`classify_accept_error`]
+/// are retried) and set the per-connection socket options. Returns the connected fd or a classified
+/// failure.
 ///
 /// # Safety
 /// `lfd` must be a valid listening socket.
-unsafe fn http_accept_conn(lfd: i32) -> Result<i32, i32> {
+unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
     let fd = loop {
         let f = unsafe { cloexec_accept(lfd) };
         if f >= 0 {
             break f;
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue;
+        match classify_accept_error(&std::io::Error::last_os_error()) {
+            None => continue,
+            Some(fail) => return Err(fail),
         }
-        return Err(io_error_to_status(&e));
     };
     // Disable Nagle so the response tail is sent immediately (http.md R4); best-effort.
     let on: i32 = 1;
@@ -15002,6 +15061,11 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, i32> {
 /// **A malformed request never surfaces.** It is a per-request fault — the listener is healthy — so
 /// this closes that connection and waits for the next one. Only a real `accept(2)` failure returns
 /// an error, which is what makes `srv.accept()?` in a serve loop correct.
+///
+/// **Nor does a transient `accept(2)` errno** ([`AcceptFail`]): `EINTR` and `ECONNABORTED` retry
+/// immediately, and `EMFILE`/`ENFILE` reclaim a parked keep-alive connection (or, with nothing
+/// parked, back off briefly) and retry. Each of those would otherwise end the caller's loop — and
+/// under prefork, every worker in turn — over a condition the listener will outlive.
 ///
 /// # Safety
 /// `srv` must be a valid `HttpServer` (or null); `out` must point to a writable `*mut HttpRequestCtx`
@@ -15035,7 +15099,16 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
         let fd = if parked_n == 0 {
             match unsafe { http_accept_conn(lfd) } {
                 Ok(fd) => fd,
-                Err(status) => return status,
+                Err(AcceptFail::Fatal(status)) => return status,
+                Err(AcceptFail::NoFds) => {
+                    // The set looked empty when this iteration built its poll array, but a ctx on
+                    // another thread may have parked since — so try to reclaim either way, and only
+                    // wait when there is genuinely nothing of ours to give back.
+                    if !http_relieve_fd_pressure(&park) {
+                        std::thread::sleep(HTTP_ACCEPT_NO_FDS_BACKOFF);
+                    }
+                    continue;
+                }
             }
         } else {
             let start = unsafe { &mut (*srv).poll_cursor };
@@ -15082,7 +15155,15 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                     }
                     match unsafe { http_accept_conn(lfd) } {
                         Ok(fd) => fd,
-                        Err(status) => return status,
+                        Err(AcceptFail::Fatal(status)) => return status,
+                        Err(AcceptFail::NoFds) => {
+                            // Out of descriptors with connections parked: the coldest one IS the
+                            // descriptor to spend, so close it and try again immediately.
+                            if !http_relieve_fd_pressure(&park) {
+                                std::thread::sleep(HTTP_ACCEPT_NO_FDS_BACKOFF);
+                            }
+                            continue;
+                        }
                     }
                 }
             }
@@ -25945,6 +26026,144 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let text = String::from_utf8(next.join().unwrap()).unwrap();
         assert!(text.contains("X-Path: /next\r\n"), "the fresh connection is served: {text:?}");
         unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// `accept(2)`'s errno policy, in one place: which failures are noise to retry, which are
+    /// recoverable descriptor exhaustion, and which are real listener faults the serve loop must be
+    /// handed. Misclassifying any of the first two kills a worker — and under prefork, every worker
+    /// in turn — over a condition the listener outlives.
+    #[test]
+    fn http_accept_classifies_transient_errnos() {
+        const EINTR: i32 = 4;
+        const EBADF: i32 = 9;
+        #[cfg(target_os = "linux")]
+        const ECONNABORTED: i32 = 103;
+        #[cfg(not(target_os = "linux"))]
+        const ECONNABORTED: i32 = 53; // macOS/BSD
+        for errno in [EINTR, ECONNABORTED] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(classify_accept_error(&e).is_none(), "errno {errno} is retried, never surfaced");
+        }
+        for errno in [EMFILE, ENFILE] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(matches!(classify_accept_error(&e), Some(AcceptFail::NoFds)), "errno {errno} is recoverable exhaustion");
+        }
+        // A genuine listener fault still reaches the caller, mapped exactly as before.
+        let bad = std::io::Error::from_raw_os_error(EBADF);
+        let status = io_error_to_status(&bad);
+        assert!(matches!(classify_accept_error(&bad), Some(AcceptFail::Fatal(s)) if s == status), "EBADF is fatal");
+    }
+
+    /// Lower this PROCESS's descriptor limit so "the table is full" is reachable in a handful of
+    /// opens. Only ever called in the out-of-process child below; only the SOFT limit moves, and
+    /// only downward, so nothing needs privilege.
+    #[cfg(target_os = "linux")]
+    fn set_nofile_limit(soft: u64) {
+        #[repr(C)]
+        struct RLimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
+        const RLIMIT_NOFILE: i32 = 7; // Linux (`rlim_t` = `unsigned long`)
+        unsafe extern "C" {
+            fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+            fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        }
+        let mut lim = RLimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { getrlimit(RLIMIT_NOFILE, &mut lim) }, 0, "getrlimit(NOFILE)");
+        lim.rlim_cur = soft.min(lim.rlim_cur).min(lim.rlim_max);
+        assert_eq!(unsafe { setrlimit(RLIMIT_NOFILE, &lim) }, 0, "setrlimit(NOFILE)");
+    }
+
+    /// The scenario, run inside the child: one parked connection, a pending one, and a full
+    /// descriptor table.
+    #[cfg(target_os = "linux")]
+    fn run_fd_exhausted_accept() {
+        use std::io::{Read, Write};
+        set_nofile_limit(96);
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+
+        // A is served once and then goes quiet — parked, holding one server-side descriptor.
+        let mut a = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect A");
+        a.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        a.write_all(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n").expect("write A");
+        let mut abuf = Vec::new();
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "a") }, 0);
+        assert!(read_framed_response(&mut a, &mut abuf, false).ends_with("a"), "A is parked");
+
+        // B connects and sends BEFORE the table fills (a client needs a descriptor too); its
+        // connection then waits in the listener's backlog.
+        let mut b = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect B");
+        b.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        b.write_all(b"GET /b HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n").expect("write B");
+
+        // Fill the descriptor table: from here `accept(2)` can only fail with EMFILE.
+        let mut hogs = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => hogs.push(f),
+                Err(e) => {
+                    assert!(matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)), "the table filled for the expected reason: {e}");
+                    break;
+                }
+            }
+        }
+
+        // The serve loop survives: the coldest parked connection is spent to make room, and the
+        // pending request is answered.
+        assert_eq!(unsafe { serve_one_echo(srv, 200, "b") }, 0, "EMFILE must not end the accept loop");
+        let mut btext = Vec::new();
+        b.read_to_end(&mut btext).expect("read B");
+        let btext = String::from_utf8_lossy(&btext).into_owned();
+        assert!(btext.contains("X-Path: /b\r\n"), "B was served: {btext:?}");
+        // A paid for it — reclaiming an idle keep-alive connection is exactly the intended
+        // degradation.
+        let mut probe = [0u8; 1];
+        assert!(matches!(a.read(&mut probe), Ok(0)), "the coldest parked connection was closed to make room");
+        drop(hogs);
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// **Descriptor exhaustion is a degradation, not a death.** With the table full, `accept` gives
+    /// a descriptor back — the coldest parked keep-alive connection, precisely an idle fd — and
+    /// retries, so the waiting client is still served. Before the classification, `EMFILE` surfaced
+    /// as an `Err`, `srv.accept()?` returned, and under prefork every worker died in turn.
+    ///
+    /// Runs OUT OF PROCESS with a lowered `RLIMIT_NOFILE`: the limit is per-process, so exhausting
+    /// the test binary's own table would break every test running beside it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn http_accept_survives_fd_exhaustion() {
+        const CHILD: &str = "ALIGN_HTTP_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            run_fd_exhausted_accept();
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::http_accept_survives_fd_exhaustion", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // A regressed classification blocks the child in `accept` forever rather than failing, so
+        // the wait is bounded (the nested-par_map watchdog shape).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "fd-exhaustion child failed with {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("accept did not recover from descriptor exhaustion before the watchdog deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Keep-alive must not leak fds: many requests over one parked connection, plus the eviction and

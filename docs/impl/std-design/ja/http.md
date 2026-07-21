@@ -560,6 +560,16 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
        返していたために、スキャナが 1 本繋いだだけで呼び出し側の accept ループ（`srv.accept()?`）が
        死んでいた; prefork では worker ごとに 1 本ずつでサーバ全体が落ちた。エラーを返すのは実際の
        `accept(2)` の失敗だけであり、それこそが serve ループにおける `srv.accept()?` を正しくする。
+     - **一時的な `accept(2)` の errno も表に出ない** — 同じ論法をシステムコール自体に適用したもので
+       あり、worker がまだ死にうる最後の経路だった。分類ひとつで全てが決まる: `EINTR` と
+       **`ECONNABORTED`**（client が SYN と `accept` の間に消えており、返るはずだったコネクションは
+       もう存在しない — 純然たるノイズであり、さもなければ client は繋いで即座に reset するだけで
+       worker を殺せてしまう）は即座にリトライする; **`EMFILE`/`ENFILE`** は回復可能な fd の枯渇な
+       ので、`accept` は **fd を 1 つ空ける — 最も冷たい parked keep-alive コネクションを閉じる**（まさに
+       idle な fd であり、容量の弁と同じ選択である）— そしてリトライする。回収できる parked が無い
+       ときは、自分の所有物ではない fd テーブルの上で spin するのではなく 10 ms バックオフする。
+       それ以外は listener 水準の真の障害であり、そのまま返す。結果として、従来はサーバが死んでいた
+       ところが劣化（待っている 1 本を捌くために暖まったコネクション 1 本を費やす）で済む。
      - **interim（`1xx`）レスポンスは決して park しない** — 完全なレスポンスではないので、それを受け
        取った client は最終レスポンスを待つ。コネクションは keep-alive 以前と同様に close する。
      - **drop 順序の安全性（唯一の鋭い縁）:** ctx は解放済みのサーバへ park してはならない。集合は
@@ -582,14 +592,19 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      後者は `HttpServer::drop` が設定し、park 中の fd を**すべて**閉じる）; 適格性は
      `http_read_request` で計算し（`http_request_wants_close` + 残余チェック）ctx に載せる;
      `align_rt_http_accept` は `http_wait_parked_or_listener`（新しい `poll(2)` extern）+
-     `http_accept_conn` を中心に再構成; `http_serialize_head(rb, persistent)` は keep-alive 経路で
+     `http_accept_conn` を中心に再構成。その失敗は `classify_accept_error`（`AcceptFail::NoFds` か
+     `Fatal` か）を通し、枯渇時は `http_relieve_fd_pressure` へ回す;
+     `http_serialize_head(rb, persistent)` は keep-alive 経路で
      `Connection` 行を省く。言語側: `ExprKind::HttpServe`/`Rvalue::HttpServe` が `shared: bool` を得た
      （variant ではなく**フィールド** — 全解析パスは引き続き `http.serve` として扱う）、
      `http.serve_shared` は同じ `check_http_serve` を通って dispatch する。テスト: ランタイムの
      keep-alive unit 10 本（1 コネクション 2 リクエスト、3 つの不適格規則、HEAD との合成、eviction、
      parked EOF の回復、fd 衛生、ボディなしレスポンスのフレーミング、ボディを持てないステータスが
      セット済みボディを抑制すること、interim レスポンスが park しないこと、4 クライアント同時 park）
-     + `serve_shared` の二重 bind unit; driver の `m11_http_server.rs`（`serve_shared` E2E + ゲート）、
+     + `serve_shared` の二重 bind unit + `accept` の errno unit 2 本（分類テーブル、および
+     `RLIMIT_NOFILE` を下げた別プロセスでの fd 枯渇 E2E: fd テーブルが満杯の状態でも parked
+     コネクションが回収され、待っているリクエストは変わらず応答される）;
+     driver の `m11_http_server.rs`（`serve_shared` E2E + ゲート）、
      `apps_web_root.rs`（keep-alive × pkg.web のループ。2 番目の client が 1 番目からコネクションを
      奪わないことを含む）、`apps_web_prefork.rs`（同時 client、`/proc/net/tcp` から読み出した
      ワーカー毎に 1 つのリスナー、他が応答する間に 1 ワーカーを占有する held-open stream、範囲外の
