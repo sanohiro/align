@@ -233,6 +233,35 @@ fn keep_alive_serves_many_requests_over_one_connection() {
     assert!(read_framed(&mut sock, &mut buf).ends_with("{\"models\":[]}"), "client 1 survived client 2");
 }
 
+/// **A malformed request must not kill the server.** A bare-LF request line (rejected by the
+/// strict-CRLF smuggling guard) is what any scanner — or a browser speaking TLS to a plaintext port
+/// — produces. `accept` treats it as a per-request fault and keeps waiting, so the serve loop's
+/// `srv.accept()?` never sees it; before that fix one `nc` took the whole server down, and with
+/// prefork it would have taken every worker down in turn.
+#[test]
+fn a_malformed_request_does_not_kill_the_serve_loop() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-malformed");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut bad = loop {
+        match TcpStream::connect(("127.0.0.1", srv.port)) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("server never came up: {e}"),
+        }
+    };
+    bad.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    bad.write_all(b"GET /v1/models HTTP/1.1\nHost: h\r\n\r\n").expect("write the bare-LF request");
+    let mut got = Vec::new();
+    let _ = bad.read_to_end(&mut got);
+    assert!(got.is_empty(), "the malformed request is answered by a close, not a response: {got:?}");
+    // The server is still there.
+    let ok = exchange(srv.port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(ok.ends_with("{\"models\":[]}"), "the loop survived a malformed request: {ok:?}");
+}
+
 #[test]
 fn the_serve_loop_answers_request_after_request() {
     if !backend_available() {

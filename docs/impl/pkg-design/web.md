@@ -464,10 +464,13 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
 //   workers >= 2  -> task_group { spawn W workers }; each worker: its OWN http.serve_shared
 //                    listener + the unchanged accept/dispatch/respond loop
 //   workers <  1  -> startup abort (the validate class: a programmer-config error)
-//   workers >  process.cpu_count() -> the SAME abort (found while implementing): a worker never
+//   workers >  process.cpu_count() + 1 -> the SAME abort (found while implementing): a worker never
 //                    returns, and task_group runs its tasks on a pool sized by the available
-//                    parallelism, so tasks past that count never start at all. Aborting keeps the
-//                    promise the parameter makes instead of silently serving with fewer loops.
+//                    parallelism plus the calling thread, so tasks past that count never start at
+//                    all. Aborting keeps the promise the parameter makes instead of silently
+//                    serving with fewer loops. NOTE this makes the cap machine-dependent: a source
+//                    line that names a fixed count aborts on a smaller box (or under a cgroup CPU
+//                    quota, which `cpu_count()` respects) — write `workers = process.cpu_count()`.
 ```
 
 - **Nothing hidden, by parameter:** thread creation is visible at every call site — `serve(...,

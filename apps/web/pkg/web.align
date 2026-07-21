@@ -310,13 +310,14 @@ pub fn serve(host: str, port: i64, routes: slice<pkg.web.types.Route>, workers: 
     e.write("pkg.web.serve: workers must be at least 1\n") else {}
     process.abort()
   }
-  // A worker loop never returns, and `task_group` schedules its tasks on a pool sized by the
-  // available parallelism — so more workers than that would simply never start. Refuse rather than
-  // silently run fewer request loops than the call site says.
-  cores := process.cpu_count()
-  if workers > cores {
+  // A worker loop never returns, and `task_group` runs a group's tasks on a pool sized by the
+  // available parallelism PLUS the calling thread — so `cpu_count() + 1` is exactly how many
+  // never-returning workers can run, and any past that would simply never start. Refuse rather than
+  // silently running fewer request loops than the call site says.
+  runnable := process.cpu_count() + 1
+  if workers > runnable {
     e := io.stderr
-    e.write("pkg.web.serve: workers exceeds the available parallelism (process.cpu_count()); a worker past that never starts\n") else {}
+    e.write("pkg.web.serve: workers exceeds what this machine can run (process.cpu_count() + 1); a worker past that never starts\n") else {}
     process.abort()
   }
   if workers == 1 {

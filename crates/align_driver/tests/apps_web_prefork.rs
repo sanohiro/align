@@ -29,6 +29,22 @@ fn free_loopback_port() -> u16 {
     port
 }
 
+/// Serializes every test in this file. Two are needed:
+/// - `SO_REUSEPORT` makes a port collision SILENT. `free_loopback_port` can hand the same port to
+///   two concurrent tests; before `serve_shared` the loser failed loudly with `EADDRINUSE`, but now
+///   both bind it, the kernel splits connections between two unrelated servers, and the listener
+///   count sees both.
+/// - `listening_sockets` scans the machine-wide `/proc/net/tcp`, so a sibling test's listeners on a
+///   colliding port would inflate it.
+static PREFORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How many workers this machine can actually run: `task_group` dispatches onto a pool sized by the
+/// available parallelism plus the calling thread, and `web.serve` aborts above that — so a test that
+/// asks for more than the runner has would (correctly) fail to start.
+fn max_workers() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32) + 1
+}
+
 /// The application: a trivial unary route and an SSE route whose pump holds its worker for a long
 /// time (an event, then a slow tick loop) — the "one long stream" the other workers must survive.
 const APP: &str = "module main\n\
@@ -133,7 +149,9 @@ fn prefork_workers_answer_concurrent_clients() {
     if !backend_available() {
         return;
     }
-    let srv = start("web-prefork", 4);
+    let _serial = PREFORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let workers = 4.min(max_workers());
+    let srv = start("web-prefork", workers);
     let port = srv.port;
     let clients: Vec<_> = (0..16)
         .map(|_| std::thread::spawn(move || exchange(port, b"GET /ping HTTP/1.1\r\nHost: h\r\n\r\n")))
@@ -153,7 +171,13 @@ fn a_held_open_stream_occupies_one_worker_while_the_others_serve() {
     if !backend_available() {
         return;
     }
-    let srv = start("web-prefork-stream", 3);
+    let _serial = PREFORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Needs at least two workers for the property to mean anything: one holds the stream, another
+    // answers. A single-core runner cannot demonstrate it — skip rather than assert nothing.
+    if max_workers() < 2 {
+        return;
+    }
+    let srv = start("web-prefork-stream", 3.min(max_workers()));
     let port = srv.port;
     // Open the stream and read its first event — after this the pump is inside its tick loop,
     // holding one worker for ~10s.
@@ -220,7 +244,8 @@ fn each_worker_binds_its_own_listener() {
     if !backend_available() {
         return;
     }
-    for workers in [1u32, 2, 4] {
+    let _serial = PREFORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for workers in [1u32, 2, 4].into_iter().filter(|w| *w <= max_workers()) {
         let srv = start(&format!("web-prefork-count-{workers}"), workers);
         // The server is up (start() already waited); confirm it answers, then count the listeners.
         assert!(exchange(srv.port, b"GET /ping HTTP/1.1\r\nHost: h\r\n\r\n").ends_with("pong"));
@@ -241,6 +266,7 @@ fn a_worker_count_outside_the_runnable_range_aborts_at_startup() {
     if !backend_available() {
         return;
     }
+    let _serial = PREFORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let built = build_exe_multi(
         "web-prefork-zero",
         &[
@@ -269,7 +295,7 @@ fn a_worker_count_outside_the_runnable_range_aborts_at_startup() {
     assert!(!over.status.success(), "more workers than cores must abort: {over:?}");
     let over_err = String::from_utf8_lossy(&over.stderr);
     assert!(
-        over_err.contains("exceeds the available parallelism"),
+        over_err.contains("exceeds what this machine can run"),
         "diagnosis names the cap: {over_err:?}"
     );
 }

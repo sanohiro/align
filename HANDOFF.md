@@ -34,6 +34,20 @@ by the available parallelism, so never-returning workers past that count SILENTL
 `serve(..., 4)` = "four loops" promise was false above cores+1). That required the std addition
 **`process.cpu_count()`** — which also makes the documented `workers = cores` sizing writable at
 all. ④ `poll` now watches `POLLNVAL` (an invalid fd would otherwise spin the accept loop at 100%).
+**A SECOND adversarial round then found seven more, all fixed here:** ⑤ **a malformed request killed
+the server** — `accept` surfaced a per-request parse fault (bare-LF, a scanner, TLS to the plaintext
+port) as an `Err`, so `srv.accept()?` returned and, with prefork, every worker died in turn; it now
+closes that connection and keeps waiting, exactly as the parked path already did, and only a real
+`accept(2)` failure returns. (Pre-existing since M11 — prefork is what made it systemic.) ⑥ the
+readiness scan rotates, because "parked first" let busy keep-alive clients starve the listener
+outright (its `SO_REUSEPORT` queue has no sibling to drain it). ⑦ a capacity valve on the listener
+path, so idle keep-alive clients cannot pin every slot until `EMFILE`. ⑧ the worker cap is
+`cpu_count() + 1` (the pool PLUS the caller) — and the prefork tests, which hardcoded 4 workers,
+would have aborted on any CI runner with fewer cores. ⑨ `respond_stream` rejects the bodiless
+statuses too. ⑩ a body set on a bodiless status is now `Err`, not silently dropped (the same
+treatment a caller-set `Content-Length` gets). ⑪ `accept`'s poll array is reused instead of two
+allocations per request. Plus the doc rot and a vacuous eviction test the round-1 change left behind,
+and the prefork tests are serialized (`SO_REUSEPORT` makes a port collision SILENT).
 Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver `m11_http_server.rs`
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE

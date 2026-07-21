@@ -540,25 +540,40 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        framed "until the connection closes" — un-keep-alive-able, and indistinguishable on the wire
        from a truncated stream. **Amended outright:** a response whose status may carry a body is
        framed either way (the set length, or `0` when no body was set); `1xx`/`204`/`304` carry no
-       body and get **neither the framing header nor any body bytes the builder holds** — such a
-       response is terminated at the first empty line whatever its fields say, so a body set on one
-       would be read as the START OF THE NEXT RESPONSE on a kept-alive connection. That suppression
-       is the same protocol-boundary treatment HEAD already gets. Keep-alive therefore depends only
-       on the REQUEST, and bodiless responses (`web.status(201)`) stay on the connection.
+       body and get no framing header; a body SET on one is **rejected** (`Err`, the same treatment
+       a caller-supplied `Content-Length` gets in the same function) rather than silently dropped —
+       such a response is terminated at the first empty line whatever its fields say, so those bytes
+       would be read as the START OF THE NEXT RESPONSE on a kept-alive connection, and silently
+       discarding caller data is the one thing this boundary must not do. `respond_stream` rejects
+       the same statuses (a stream cannot follow a response that has already ended). HEAD stays
+       silent suppression — that one is driven by the REQUEST, which the builder cannot see.
+       Keep-alive therefore depends only on the REQUEST, and bodiless responses (`web.status(201)`)
+       stay on the connection.
        `respond_stream`, `reject`, and
        every error path keep today's close-always semantics (a stream's terminator is its close;
        the reject window is an error path — recorded, not worth a second framing mode).
      - **`srv.accept()`**: nothing parked → plain `accept(2)`, as today. Otherwise
        `poll({…parked, listener}, infinite)`; a parked connection readable → claim it out of the
        set and parse the NEXT request from it (a fresh parse buffer — zero-copy views stay
-       per-request); listener-only readable → take the new connection, leaving the parked set
-       untouched. Both readable → prefer a warm connection (the fairness caveat is bounded by
-       prefork's other workers and the trusted-network posture — recorded). Parked EOF / parse
+       per-request); listener readable → take the new connection, leaving the parked set
+       untouched **unless it is at capacity**, where the coldest parked connection makes room
+       (without that valve idle keep-alive clients pin every slot until they hang up, and
+       `accept` eventually fails `EMFILE`). The readiness scan starts at a **rotating** index
+       rather than always preferring parked: a "parked first" scan lets busy keep-alive clients
+       starve the listener outright — with its own `SO_REUSEPORT` queue no sibling worker can
+       drain it, so new connections would sit until the backlog dropped SYNs. Parked EOF / parse
        error → close that one, look again. No idle timeout: idle parked fds simply wait in
-       `poll`, which IS accept's normal idle state, and capacity pressure evicts the coldest.
-       `POLLNVAL` is watched alongside `POLLHUP`/`POLLERR` — without it an invalid fd would
-       report a revent no branch matches and the wait would spin. The `accept` surface and
-       `Result` are unchanged.
+       `poll`, which IS accept's normal idle state. `POLLNVAL` is watched alongside
+       `POLLHUP`/`POLLERR` — without it an invalid fd would report a revent no branch matches and
+       the wait would spin. The `accept` surface and `Result` are unchanged.
+     - **A malformed request no longer surfaces from `accept` at all** (corrected here — it was
+       the pre-keep-alive behaviour too, and prefork made it fatal). A smuggling/bare-LF/TLS-to-a-
+       plaintext-port request is a PER-REQUEST fault while the listener is perfectly healthy, so
+       `accept` closes that connection and keeps waiting — exactly what the parked path already
+       did. Returning it handed every caller a `Result` that killed the accept loop
+       (`srv.accept()?`) the first time a scanner connected; with prefork, one such connection
+       per worker took the whole server down. Only a real `accept(2)` failure returns an error,
+       which is what makes `srv.accept()?` correct in a serve loop.
      - **An interim (`1xx`) response never parks** — it is not a complete response, so a client
        that got one waits for the final one; the connection closes, as before keep-alive.
      - **Drop-order safety (the one sharp edge):** the ctx must not park into a freed server.
@@ -585,14 +600,15 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      `Connection` line on the keep-alive path. Language: `ExprKind::HttpServe`/`Rvalue::HttpServe`
      gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
      `http.serve`), and `http.serve_shared` dispatches through the same `check_http_serve`. Tests:
-     10 runtime keep-alive units (two-requests-one-connection, the three ineligibility rules, HEAD
-     composition, eviction, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless
-     STATUS suppressing a set body, an interim response never parking, and four clients parked at
-     once) + the `serve_shared` double-bind unit; driver `m11_http_server.rs` (`serve_shared` E2E +
-     gates), `apps_web_root.rs` (keep-alive × the pkg.web loop, including a second client not
-     costing the first its connection), and `apps_web_prefork.rs` (concurrent clients; one listener
-     per worker read out of `/proc/net/tcp`; a held-open stream occupying one worker while the
-     others serve; the out-of-range `workers` aborts).
+     11 runtime keep-alive units (two-requests-one-connection, the three ineligibility rules, HEAD
+     composition, new traffic NOT evicting a parked connection, both capacity valves evicting the
+     coldest, parked-EOF recovery, fd hygiene, bodiless-response framing, a bodiless STATUS
+     rejecting a set body, an interim response never parking, and four clients parked at once) +
+     the `serve_shared` double-bind unit; driver `m11_http_server.rs` (`serve_shared` E2E + gates),
+     `apps_web_root.rs` (keep-alive × the pkg.web loop, a second client not costing the first its
+     connection, and a malformed request not killing the loop), and `apps_web_prefork.rs`
+     (concurrent clients; one listener per worker read out of `/proc/net/tcp`; a held-open stream
+     occupying one worker while the others serve; the out-of-range `workers` aborts).
    - **Behavioral note for callers/tests:** an eligible HTTP/1.1 request now leaves the connection
      OPEN, so a client that reads to EOF blocks until the server exits or capacity pressure evicts
      the parked connection. One-request-per-connection clients must say `Connection: close` (the

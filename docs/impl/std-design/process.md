@@ -34,10 +34,15 @@ observes the machine).
 
 It lives here rather than in `std.env` because it is a property of the running process, not of the
 environment block. Its reason to exist is that **it is the number a `task_group` worker count must
-be sized against**: the runtime's task pool is sized from exactly this source, so a group of
-never-returning tasks larger than this would leave the extra tasks unstarted. `pkg.web.serve`'s
-`workers` parameter aborts above it, and the recommended sizing (`workers = process.cpu_count()`)
-is only writable because this exists.
+be sized against**: the runtime's task pool is sized from exactly this source and runs the group's
+tasks on that pool PLUS the calling thread, so a group of never-returning tasks larger than
+`cpu_count() + 1` would leave the extra tasks unstarted. `pkg.web.serve`'s `workers` parameter
+aborts above that bound, and the recommended sizing (`workers = process.cpu_count()`) is only
+writable because this exists.
+
+**Deployment note.** It is quota-aware, which is the point — and it makes any bound derived from it
+machine-dependent: a source line naming a fixed worker count can run on a 16-core box and abort in a
+4-CPU container. Deriving the count from `cpu_count()` is the portable spelling.
 
 ## Type & ownership classification
 
