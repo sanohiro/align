@@ -631,6 +631,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpRespondStream { ctx, rb, out } => format!("http_respond_stream({}, {}, -> _{out})", operand_str(ctx), operand_str(rb)),
         Rvalue::HttpStreamSend { stream, chunk } => format!("http_stream_send({}, {})", operand_str(stream), operand_str(chunk)),
         Rvalue::HttpStreamFinish { stream } => format!("http_stream_finish({})", operand_str(stream)),
+        Rvalue::HttpStreamReject { stream, rb } => format!("http_stream_reject({}, {})", operand_str(stream), operand_str(rb)),
     }
 }
 

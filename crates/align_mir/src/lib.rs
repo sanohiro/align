@@ -1008,11 +1008,12 @@ pub enum Rvalue {
     /// both source slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the
     /// caller branches `Ok(())` / `Err`. Impure.
     HttpRespond { ctx: Operand, rb: Operand },
-    /// `ctx.respond_stream(rb)` — serialize `rb`'s head + the transfer framing, write it, lift the fd
-    /// out of `ctx`, and write an owned `http_stream` handle (opaque pointer) to `out`. **Both** `ctx`
-    /// and `rb` are opaque pointers **moved in** (the runtime frees both, so the MIR nulls both source
-    /// slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the caller branches
-    /// `Ok(http_stream)` / `Err`. Impure.
+    /// `ctx.respond_stream(rb)` — validate + serialize `rb`'s head + the transfer framing (stored in
+    /// the stream, written lazily by the first send), lift the fd out of `ctx`, and write an owned
+    /// `http_stream` handle (opaque pointer) to `out`. `rb` is an opaque pointer **moved in** (the
+    /// runtime frees it, so the MIR nulls its source slot); `ctx` is **borrowed** (stays with the
+    /// caller, spent — its views remain valid; http.md item 8 ①). Returns an `i32` status (0 = ok;
+    /// else `AL_INVALID` → `Error`); the caller branches `Ok(http_stream)` / `Err`. Impure.
     HttpRespondStream { ctx: Operand, rb: Operand, out: Slot },
     /// `s.send(chunk)` — write one streamed chunk to the stream `s` (opaque pointer, **borrowed** —
     /// mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`. Returns an `i32` status
@@ -1023,6 +1024,12 @@ pub enum Rvalue {
     /// **moved in** (the runtime frees it, so the MIR nulls its source slot). Returns an `i32` status
     /// (0 = ok; else `AL_INVALID` → `Error`); the caller branches `Ok(())` / `Err`. Impure.
     HttpStreamFinish { stream: Operand },
+    /// `s.reject(rb)` — discard the lazy head and answer with a complete NORMAL response instead of
+    /// streaming (legal only before the first send). **Both** `s` and `rb` are opaque pointers
+    /// **moved in** (the runtime frees both, so the MIR nulls both source slots). Returns an `i32`
+    /// status (0 = ok; else `AL_INVALID` / errno → `Error`); the caller branches `Ok(())` / `Err`.
+    /// Impure.
+    HttpStreamReject { stream: Operand, rb: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -3312,6 +3319,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpRbBody { .. }
         | hir::ExprKind::HttpRespond { .. }
         | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamReject { .. }
         | hir::ExprKind::HttpStreamSend { .. }
         | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
@@ -9080,15 +9088,15 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(code, Rvalue::HttpRespond { ctx: cx, rb: r }));
             lower_status_result(b, code, e.ty)
         }
-        // `ctx.respond_stream(rb)` → `Result<http_stream, Error>`. BOTH `ctx` and `rb` are **consumed**
-        // (the runtime frees both, and lifts the fd into the returned stream): null both source slots so
-        // the exit `Drop` doesn't double-free. The result rides the shared out-slot + i32-status
-        // lowering (`ok_ty = HttpStream`), like `srv.accept()`.
+        // `ctx.respond_stream(rb)` → `Result<http_stream, Error>`. `rb` is **consumed** (the runtime
+        // frees it): null its source slot so the exit `Drop` doesn't double-free. `ctx` is
+        // **borrowed** (http.md item 8 ① — the caller keeps the handle, spent; the runtime lifts
+        // just the fd into the returned stream), so its slot stays live. The result rides the shared
+        // out-slot + i32-status lowering (`ok_ty = HttpStream`), like `srv.accept()`.
         hir::ExprKind::HttpRespondStream { ctx, rb } => {
             let out = b.new_slot(Ty::HttpStream);
             let cx = lower_expr(b, ctx);
             let r = lower_expr(b, rb);
-            null_moved_source(b, ctx);
             null_moved_source(b, rb);
             lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty)
         }
@@ -9108,6 +9116,17 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             null_moved_source(b, stream);
             let code = b.fresh_value(status_ty());
             b.push(Stmt::Let(code, Rvalue::HttpStreamFinish { stream: s }));
+            lower_status_result(b, code, e.ty)
+        }
+        // `s.reject(rb)` → `Result<(), Error>`. BOTH `s` and `rb` are **consumed** (the runtime frees
+        // both): null both source slots so the exit `Drop` doesn't double-free.
+        hir::ExprKind::HttpStreamReject { stream, rb } => {
+            let s = lower_expr(b, stream);
+            let r = lower_expr(b, rb);
+            null_moved_source(b, stream);
+            null_moved_source(b, rb);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpStreamReject { stream: s, rb: r }));
             lower_status_result(b, code, e.ty)
         }
         _ => unreachable!("lower_http on a non-http expr"),

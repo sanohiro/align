@@ -8,12 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-21 (session close), **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE;
-streaming COMPILER ENABLERS 1–3 COMPLETE (#589 — `http_stream` nameable, fn value as enum variant
-payload via new `Scalar::Fn`, indirect-call Move-param soundness; + a capturing-closure frame-escape
-UAF fixed at `region_of(Closure)`, which also closed the pre-existing struct fn-field vector).
-Streaming enablers 4–5 (std.http `respond_stream` rework, pkg.web `Handler` wiring) NOT YET — and
-production streaming is gated on concurrent serve.**
+_Last updated: 2026-07-21, **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
+ENABLERS 1–4 COMPLETE — #589 (`http_stream` nameable, fn value as enum variant payload via new
+`Scalar::Fn`, indirect-call Move-param soundness; + a capturing-closure frame-escape UAF fixed at
+`region_of(Closure)`) and the std.http `respond_stream` rework (http.md item 8 ①–③: ctx borrowed +
+spent, lazy head, `s.reject(rb)`; M12 tests replaced outright). Enabler 5 (pkg.web `Handler`
+wiring) NOT YET — and production streaming is gated on concurrent serve.**
 
 ## Where pkg.web stands
 
@@ -123,8 +123,17 @@ Still open from that cluster, both unchanged by this decision:
      `array<i64>` (http_stream stand-in) passed by value through a match-extracted fn payload nulls in
      the caller frame (#573), no double-free over a 200k loop; move-after-use rejected. Real
      `http_stream` receiver awaits enabler 4.
-  4. the std.http `respond_stream` rework (M12 tests updated outright) — NOT YET.
-  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`) — NOT YET.
+  4. the std.http `respond_stream` rework — **DONE (2026-07-21):** `respond_stream` consumes `rb`
+     ONLY; the ctx stays with the caller SPENT (fd lifted; later `respond`/`respond_stream` → `Err`;
+     a validation `Err` leaves it UNSPENT so the caller can still respond an error; views stay valid
+     mid-pump — pinned by a `ctx.path()` send inside the stream). The head is LAZY
+     (`HttpStream.pending_head`; the first `send`/`finish` write attempt takes it — head+chunk /
+     head+terminator go out in one write). New `s.reject(rb)` (consumes both; pre-first-send only)
+     answers with a complete normal response — the pre-stream 4xx window. New
+     `ExprKind`/`Rvalue::HttpStreamReject` wired through every pass; `m12_http_stream.rs` replaced
+     outright (13 tests incl. spent-ctx-Err, reject-400, late-reject-Err E2E) + runtime unit tests.
+  5. pkg.web wiring (`Handler`, constructors, serve match, `send_event`) — NOT YET, **now unblocked**
+     (the real `fn(Ctx, http_stream)` receiver shape is verifiable against the shipped enabler 4).
   **Hard ordering note: production streaming needs concurrent serve first** (an open stream starves
   the sequential v1 loop); the design is independent of it, the shipping is not. The middleware
   section was also rewritten for the settled ownership model (`Option<response_builder>` verdict —

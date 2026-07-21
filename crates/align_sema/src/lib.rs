@@ -506,8 +506,10 @@ pub enum Ty {
     /// the `Ok` payload of its `Result<http_stream, Error>`. An owned **Move** handle owning the
     /// accepted socket fd (lifted out of the `http_request_ctx`; it borrows nothing else — free-standing,
     /// no region binding), `Drop`-closed (close-only — no terminal chunk). `s.send(chunk)` writes one
-    /// chunk frame (borrows `s`); `s.finish()` **consumes** `s` (writes `0\r\n\r\n` + closes). Standard
-    /// Move-handle exclusions (never an array/slice/box element; bound to a local). **Impure** (network).
+    /// chunk frame (borrows `s`); `s.finish()` **consumes** `s` (writes `0\r\n\r\n` + closes);
+    /// `s.reject(rb)` **consumes** `s` and `rb` (answers with a normal response — pre-first-send
+    /// only). Standard Move-handle exclusions (never an array/slice/box element; bound to a local).
+    /// **Impure** (network).
     /// Opaque pointer.
     HttpStream,
     /// A `json.doc` (`core.json`, J4) — the schema-unknown lazy document view. A **Copy**
@@ -4389,6 +4391,11 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
                 self.expr(stream);
             }
+            ExprKind::HttpStreamReject { stream, rb } => {
+                self.impure_direct = true;
+                self.expr(stream);
+                self.expr(rb);
+            }
             ExprKind::HttpResponseBuilder { status } => self.expr(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.expr(rb);
@@ -5804,6 +5811,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpRespondStream { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
+            | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
             | ExprKind::CryptoHash { .. }
@@ -6086,6 +6094,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpRespondStream { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
+            | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
             | ExprKind::CryptoHash { .. }
@@ -6881,6 +6890,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(chunk, depth);
             }
             ExprKind::HttpStreamFinish { stream } => self.walk(stream, depth),
+            ExprKind::HttpStreamReject { stream, rb } => {
+                self.walk(stream, depth);
+                self.walk(rb, depth);
+            }
             ExprKind::HttpResponseBuilder { status } => self.walk(status, depth),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.walk(rb, depth);
@@ -7485,6 +7498,10 @@ impl UnnecessaryHeapScan {
                 self.visit(chunk);
             }
             ExprKind::HttpStreamFinish { stream } => self.visit(stream),
+            ExprKind::HttpStreamReject { stream, rb } => {
+                self.visit(stream);
+                self.visit(rb);
+            }
             ExprKind::HttpResponseBuilder { status } => self.visit(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.visit(rb);
@@ -8940,11 +8957,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(ctx, moved, true, true);
                 self.expr(rb, moved, true, true);
             }
-            // `respond_stream` consumes BOTH `ctx` and `rb` (like `respond`); `send` borrows the
-            // stream (mutated in place — not consumed) and reads the chunk; `finish` consumes the
-            // stream.
+            // `respond_stream` consumes `rb` ONLY — the ctx is **borrowed** (http.md item 8 ①: the
+            // framework keeps the request handle for the whole request; the runtime lifts just the
+            // fd and marks the ctx spent). `send` borrows the stream (mutated in place — not
+            // consumed) and reads the chunk; `finish` consumes the stream; `reject` consumes BOTH
+            // the stream and its answering builder.
             ExprKind::HttpRespondStream { ctx, rb } => {
-                self.expr(ctx, moved, true, true);
+                self.expr(ctx, moved, false, false);
                 self.expr(rb, moved, true, true);
             }
             ExprKind::HttpStreamSend { stream, chunk } => {
@@ -8952,6 +8971,10 @@ impl<'a> MoveCheck<'a> {
                 self.expr(chunk, moved, false, false);
             }
             ExprKind::HttpStreamFinish { stream } => self.expr(stream, moved, true, true),
+            ExprKind::HttpStreamReject { stream, rb } => {
+                self.expr(stream, moved, true, true);
+                self.expr(rb, moved, true, true);
+            }
             ExprKind::HttpResponseBuilder { status } => self.expr(status, moved, false, false),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.expr(rb, moved, false, false);
@@ -12975,9 +12998,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_http_response_builder_method(recv_expr, method, args, span)
             }
             // Streaming-response methods on a `http_stream` (from `ctx.respond_stream(rb)`): `s.send(chunk)`
-            // writes one chunk (borrows `s`), `s.finish()` terminates + closes (consumes `s`). Both yield
-            // `Result<(), Error>`. Type-guarded, same as above.
-            "send" | "finish" if recv_ty == Ty::HttpStream => {
+            // writes one chunk (borrows `s`), `s.finish()` terminates + closes (consumes `s`),
+            // `s.reject(rb)` answers with a normal response instead — pre-first-send only (consumes
+            // `s` AND `rb`). All yield `Result<(), Error>`. Type-guarded, same as above.
+            "send" | "finish" | "reject" if recv_ty == Ty::HttpStream => {
                 self.check_http_stream_method(recv_expr, method, args, span)
             }
             _ => {
@@ -18456,11 +18480,13 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `s.send(chunk)` / `s.finish()` on a `http_stream` ([`Ty::HttpStream`]), the receiver already
-    /// evaluated. The receiver must be a **bound local** (the v1 Move-temporary gate). `send(chunk)`
-    /// writes one streamed chunk (`chunk` is a byte view — `str` / owned `string` auto-borrowed /
-    /// `slice<u8>` / a `builder`'s bytes), **borrowing** `s` (not consumed); `finish()` **consumes** `s`
-    /// (writes the terminator + closes). Both yield `Result<(), Error>` (Impure).
+    /// `s.send(chunk)` / `s.finish()` / `s.reject(rb)` on a `http_stream` ([`Ty::HttpStream`]), the
+    /// receiver already evaluated. The receiver must be a **bound local** (the v1 Move-temporary
+    /// gate). `send(chunk)` writes one streamed chunk (`chunk` is a byte view — `str` / owned
+    /// `string` auto-borrowed / `slice<u8>` / a `builder`'s bytes), **borrowing** `s` (not consumed);
+    /// `finish()` **consumes** `s` (writes the terminator + closes); `reject(rb)` **consumes** `s`
+    /// AND `rb` (answers with a complete normal response instead of streaming — legal only before
+    /// the first send). All yield `Result<(), Error>` (Impure).
     fn check_http_stream_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -18492,8 +18518,26 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::HttpStreamFinish { stream: Box::new(recv_expr) }, ty: result_ty, span }
             }
+            "reject" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.reject()' takes 1 argument (a response_builder), got {}", args.len()), span);
+                    return err;
+                }
+                let rb = self.check_expr(&args[0], None);
+                if rb.ty == Ty::Error {
+                    return err;
+                }
+                if self.resolve(rb.ty) != Ty::ResponseBuilder {
+                    self.diags.error(
+                        format!("'.reject()' expects a response_builder (from `http.response(...)`), got {}", ty_name(rb.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpStreamReject { stream: Box::new(recv_expr), rb: Box::new(rb) }, ty: result_ty, span }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / finish)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / finish / reject)"), span);
                 err
             }
         }
@@ -20368,6 +20412,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(chunk);
             }
             ExprKind::HttpStreamFinish { stream } => self.finalize_expr(stream),
+            ExprKind::HttpStreamReject { stream, rb } => {
+                self.finalize_expr(stream);
+                self.finalize_expr(rb);
+            }
             ExprKind::HttpResponseBuilder { status } => self.finalize_expr(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.finalize_expr(rb);
