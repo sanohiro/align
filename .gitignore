@@ -46,3 +46,6 @@ ll_out/
 
 # stray alignc build outputs run from the repo root
 /main
+# W7 control: the Go binary is built by hand from bench/web_e2e/go
+bench/web_e2e/go/goserver
+bench/web_e2e/go/go.sum

@@ -52,17 +52,23 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 (serve_shared E2E + gates), `apps_web_root.rs` (keep-alive × the pkg.web loop), and the new
 `apps_web_prefork.rs` (16 concurrent clients over 4 workers; a held-open SSE stream occupying ONE
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
-abort). **NEXT: W7 / the load generator — because W5's e2e gate is MET and it reprioritised the rest.**
-`bench/web_e2e` (built 2026-07-21) drives pkg.web and a hand-written `std.http` accept loop over
-keep-alive'd loopback connections: **1.032× at one worker, 0.971× at eight** — framework overhead is
-inside the noise. Crucially it also priced the router work: a request is ~30 µs, dispatch is 35 ns,
-so **the router is 0.1% of a request** and `bench/web_router`'s remaining levers (sibling index, the
-per-edge `Route` struct copy) are worth ~0.1% — do NOT prioritise them over the protocol path. What
-is still owed is an honest ABSOLUTE throughput number: the e2e harness's ~33k req/s is client-bound
-(4 threads driving connections round-robin), so it must not be quoted as capacity; a real load
-generator (`wrk`/`oha`) is the next thing to build, and it is the same tool W7's Fiber comparison
-needs. Two protocol-path candidates that harness would price: the `poll` syscall keep-alive adds per
-request, and sharing one buffer between the parse and the response write.
+abort). **NEXT: close W7 with Fiber, then the 4.1 µs protocol path.** W5's e2e gate is **MET** and W7 is
+**PARTIAL** — both measured 2026-07-21 with a load generator built for the job (one thread per
+connection; the first version drove connections round-robin and measured itself at ~33k req/s,
+quoted nowhere now).
+
+- **W5:** pkg.web costs **0.8 µs/request** over the same responses written directly on `std.http`
+  (CONNS=1 ping-pong; 0.98–1.00× at 32 connections). **Align's whole protocol path is 4.1 µs/req**
+  above a minimal-Rust floor — so dispatch (35 ns) is **0.9% of Align's own path**, and
+  `bench/web_router`'s remaining levers are worth ~0.1%. **Do not spend on the router.** The 4.1 µs
+  is the budget; the two candidates inside it are the `poll` syscall keep-alive adds per request and
+  sharing one buffer between the parse and the response write. (No `strace`/`perf` on this box —
+  the floor server in `bench/web_e2e` is how the path gets priced without them.)
+- **W7:** **pkg.web 491,505 req/s (32 workers) vs Go `net/http` 82,910 (32 cores) — 5.9×**, and
+  1.47× on single-connection latency. **Not closed:** the reference is Fiber, which needs Go ≥ 1.16
+  (`io/fs`) and does not build here (1.15.8), so the control is stdlib `net/http`. Install a newer
+  Go, rebuild `bench/web_e2e/go` against Fiber, re-run `EXTERNAL=`. Also worth re-running under an
+  independent generator (`wrk`/`oha`, neither installed) before quoting these anywhere external.
 (#596 merged: the hoist, the dispatch chains and `bench/web_router`.) (`bench/web_router` + `bench/web_e2e`, keep-alive'd,
 `workers = process.cpu_count()`), then W7 Fiber. **W5 IS ALREADY PAYING OFF — a first measurement
 taken 2026-07-21 says the dispatch path violates performance-contract item 3 and must be fixed

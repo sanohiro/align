@@ -36,3 +36,9 @@ cp align/framework.align align/raw.align "$BUILD/"
 
 echo "target: $mode"
 ALIGN_FRAMEWORK_EXE="$BUILD/framework" ALIGN_RAW_EXE="$BUILD/raw" cargo run -q --release
+
+# The W7 external control is built separately (Go toolchain, no Align involvement):
+#   ( cd go && GO111MODULE=on go build -o goserver . ) && ./go/goserver --port 8080 &
+#   EXTERNAL=127.0.0.1:8080 cargo run -q --release
+# Fiber — the reference pkg.web was designed against — needs Go >= 1.16 (`io/fs`); this box has
+# 1.15.8, so `go/main.go` is stdlib `net/http`. See README.

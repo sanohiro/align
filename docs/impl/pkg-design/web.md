@@ -582,20 +582,26 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   SHIPPED (std.http item 9 ②; `apps_web_root.rs` keep-alive E2E). Remaining W4: route-tree
   edge matrix (deep paths, long segments, empty table), malformed-request matrix, and the
   handler-`Err` logging story (W5+).
-- **W5 — the router/e2e bench gate.** Both benches exist. **`bench/web_e2e` MEETS its gate:**
-  pkg.web vs the same responses written directly on `std.http` is 1.03× at one worker and 0.97× at
-  eight — inside the harness's noise, i.e. the framework costs nothing measurable. **That result
-  also reprioritises `bench/web_router`:** a request costs ~30 µs and dispatch costs 35 ns, so the
-  router is **0.1% of a request** and its remaining levers (sibling index, the per-edge struct copy)
-  are worth ~0.1% at this table size. What W5 still owes is an honest ABSOLUTE number — the e2e
-  harness's ~33k req/s is client-bound, not a server capacity — which is the same load generator W7
-  needs.
+- **W5 — the router/e2e bench gate. MET.** `bench/web_e2e` prices the framework at **0.8 µs per
+  request** over the same responses written directly on `std.http` (CONNS=1 ping-pong; 0.98–1.00×
+  at 32 connections). It also prices everything else, which is why it was built before optimising
+  the router further: **Align's whole protocol path is 4.1 µs/req** above a minimal-Rust floor,
+  dispatch is 35 ns, so the router is **0.9% of Align's own path** and its remaining levers are
+  worth ~0.1%. The real budget is the 4.1 µs — candidates inside it: the `poll` syscall keep-alive
+  adds per request, and sharing one buffer between the parse and the response write.
+  `bench/web_router` remains a report (its scaling row conflates depth and chain position); making
+  it a gate is recorded there.
 - **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
   **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
   prefork section above), so a stream costs one worker instead of the whole server.
   Middleware-lite remains designed-only.
-- **W7 — the external comparison.** Same-box Fiber (Go) plaintext + JSON-echo benches; record the
-  numbers and the gap analysis in this doc.
+- **W7 — the external comparison. PARTIAL.** Same box, same generator, same request:
+  **pkg.web 491,505 req/s (32 workers) vs Go `net/http` 82,910 (32 cores) — 5.9×**; and 1.47× on
+  single-connection latency (70.2 vs 102.5 µs). Align's protocol path costs 4.1 µs above the floor
+  where Go's costs 37.7 µs. **Not closed:** the reference is Fiber, which needs Go ≥ 1.16 and does
+  not build on this box (1.15.8) — `net/http` is the stand-in. The generator is ours (`wrk`/`oha`
+  are not installed) though held identically against both sides, and WSL2 loopback inflates the
+  floor for everyone. Numbers and caveats: `bench/web_e2e/README.md`.
 
 ## Pitfalls
 
