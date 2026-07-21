@@ -314,6 +314,10 @@ fn main() -> Result<(), Error> {\n\
     mism = mism + check(routes, paths[i], i)\n\
     i = i + 1\n\
   }\n\
+  // The EMPTY table walks the cap=2 boundary (root-only columns): both sides must say -1.\n\
+  empty := routes[0..0]\n\
+  mism = mism + check(empty, \"/\", 100)\n\
+  mism = mism + check(empty, \"/x/y\", 101)\n\
   print(mism)\n\
   return Ok(())\n\
 }\n";
