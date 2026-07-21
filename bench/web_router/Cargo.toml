@@ -1,0 +1,15 @@
+[package]
+name = "web-router-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the parent Align workspace (the kernel object is linked in by build.rs).
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

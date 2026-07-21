@@ -530,12 +530,29 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    `workers = cores` sizing is now writable. `apps_web_prefork.rs` counts the listeners actually
    bound (`/proc/net/tcp`), so "spawned W tasks" can never again be mistaken for "W loops run".
 4. **W5 bench gate** (`bench/web_router`, `bench/web_e2e` keep-alive'd, `workers = cores`) —
-   only now is the Fiber comparison honest. THE REMAINING SLICE. **A first measurement (2026-07-21)
-   already found the blocker: dispatch costs 1319 ns/op on a 6-route table and 708 ns/op on a
-   2-route one — it scales with TABLE SIZE, because `best_path_route` rebuilds the radix structure
-   per call.** That contradicts contract item 3 ("a startup-built radix structure … no per-request
-   pattern parsing"), so the recorded hoist (build once in `serve`, match per request over borrowed
-   slices) is a W5 prerequisite, not a follow-up.
+   only now is the Fiber comparison honest. THE REMAINING SLICE. **Its first measurement
+   (2026-07-21) found and fixed the blocker before any bench file existed:** dispatch cost
+   1319 ns/op on a 6-route table and 708 ns/op on a 2-route one — scaling with TABLE SIZE, because
+   `best_path_route` rebuilt the radix structure per call, contradicting contract item 3 ("a
+   startup-built radix structure … no per-request pattern parsing"). The tree is now built ONCE by
+   `router.build_tree(routes)` in `worker`, before the accept loop, as a single flat `array<i64>`
+   (offset header + ten contiguous columns), and matched per request by `tree_best_path` —
+   **1319 → 57 ns/op**, a 23× drop. The two O(table) scans inside dispatch went with it (per-node
+   edge chains + a same-pattern route chain, both built once). `dispatch_routes` /
+   `method_not_allowed` / `allow_methods` take the built tree; `best_path_route` remains as the
+   build-and-match convenience for the differential tests. **Item 3 is still not met.** `bench/web_router` measures it (6-route vs 128-route
+   table) and reports a slope, not 1.00×. Three things about that number, all found by an
+   adversarial review of the bench itself: the remaining cost is the **per-node sibling scan** (a
+   node's static edges are a linked chain with a string compare each — a miss on a flat 128-route
+   namespace still costs ~0.4 µs and the per-route slope is unchanged by the chains, because the
+   chain IS the node's children); the published row **conflates path depth and chain position with
+   table size** (depth-matched and head-positioned, the 128-route table is flat — 49.9 ns vs
+   57.0 ns), so it is a report rather than a gate until it measures the same path against both
+   tables; and one ordering bug was caught there — appending edges at the chain HEAD made
+   first-registered routes the last candidate (`/r0` 23.7 → 394.5 ns/op), now fixed by appending at
+   the tail. The remaining levers are a sibling index (first-byte bucket / sorted edge run) and the
+   per-edge `Route` struct copy forced by `routes[i].pattern` being rejected through a
+   `slice<struct>`.
 
 ## Slices (F3 of the plan)
 

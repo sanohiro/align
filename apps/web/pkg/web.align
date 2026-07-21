@@ -189,6 +189,10 @@ fn auto_response(code: i64, body: str) -> response_builder {
 // accept errors (`ECONNABORTED`, `EMFILE`) as retryable needs errno reaching Align's `Error`, and
 // is recorded as a follow-up.
 fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool) -> Result<(), Error> {
+  // The radix tree is built ONCE, here, and matched against per request (performance-contract item
+  // 3). Building it per dispatch — what shipped through W4 — made dispatch scale with the number of
+  // routes instead of the path's segment count.
+  tree := pkg.web.internal.router.build_tree(routes)
   srv := if shared { http.serve_shared(host, port)? } else { http.serve(host, port)? }
   loop {
     ctx := srv.accept()?
@@ -198,13 +202,13 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
     target := ctx.path()
     path := pkg.web.internal.query.target_path(target)
     method := ctx.method()
-    mut idx := pkg.web.internal.router.dispatch_routes(routes, method, path)
+    mut idx := pkg.web.internal.router.dispatch_routes(routes, tree[..], method, path)
     // RFC 9110 §9.3.2: HEAD is GET without the response body. An explicit HEAD route won above;
     // otherwise the path's GET handler answers, and std.http's `respond` suppresses the body for
     // a HEAD request (its Content-Length still sent). Stream rows are excluded — a stream head
     // has no meaningful HEAD form, so a stream-only GET keeps HEAD at 405.
     if idx < 0 && method == "HEAD" {
-      gidx := pkg.web.internal.router.dispatch_routes(routes, "GET", path)
+      gidx := pkg.web.internal.router.dispatch_routes(routes, tree[..], "GET", path)
       if gidx >= 0 {
         rg := routes[gidx]
         if rg.stream_type == "" {
@@ -254,9 +258,9 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
       // A 404 is the flood case (scanners, stale links), so the `Allow` join is built only once
       // the path is known to match some pattern. Bodies are the error policy's fixed minimal
       // JSON; a HEAD request gets them suppressed by std.http's respond (CL kept).
-      matched := pkg.web.internal.router.best_path_route(routes, path)
+      matched := pkg.web.internal.router.tree_best_path(routes, tree[..], path)
       if matched >= 0 {
-        allow := pkg.web.internal.router.allow_methods(routes, path)
+        allow := pkg.web.internal.router.allow_methods(routes, tree[..], path)
         rb := auto_response(405, "{\"error\":\"method not allowed\"}")
         rb.header("Allow", allow)
         ctx.respond(rb) else {}

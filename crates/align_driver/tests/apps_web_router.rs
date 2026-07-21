@@ -156,10 +156,14 @@ pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_build
   pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
 pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
   pkg.web.types.Route { method: \"POST\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
-pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 =\n\
-  pkg.web.internal.router.dispatch_routes(routes, method, path)\n\
-pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool =\n\
-  pkg.web.internal.router.method_not_allowed(routes, method, path)\n";
+pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {\n\
+  t := pkg.web.internal.router.build_tree(routes)\n\
+  return pkg.web.internal.router.dispatch_routes(routes, t[..], method, path)\n\
+}\n\
+pub fn method_not_allowed(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool {\n\
+  t := pkg.web.internal.router.build_tree(routes)\n\
+  return pkg.web.internal.router.method_not_allowed(routes, t[..], method, path)\n\
+}\n";
     let main = "module main\n\
 import std.http\n\
 import pkg.web\n\
