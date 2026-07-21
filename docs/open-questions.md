@@ -2006,39 +2006,57 @@ mutation, diagnostics, and safe materialization cases in `tests/borrow_liveness.
 escape-flow structural refactor subsequently completed at the checked-HIR boundary through
 #461–#464; this fix supplied the neighboring borrow-state dataflow rather than that migration.
 
-**Borrow liveness ends at MOVE, not at scope-end DROP — OPEN (found 2026-07-21, adversarially, while
-implementing `ctx.headers()`).** #460's shared borrow state above invalidates a view when its owning
-source is **moved or reassigned** (`invalidate_storage` / `invalidate_owner`). It does **not** notice
-the other way a source's storage ends: a Move handle bound inside an inner scope — a loop body, most
-of all — being **dropped when that scope closes**. `Region::Frame` cannot help, because it does not
-distinguish "this frame" from "this iteration". So a view assigned out to a longer-lived local
-survives into the next pass and reads freed memory:
+**Borrow liveness ends at MOVE, not at scope-end DROP — FIXED (found 2026-07-21 adversarially while
+implementing `ctx.headers()`; fixed 2026-07-22).** #460's shared borrow state invalidated a view when
+its owning source was **moved or reassigned** (`invalidate_storage` / `invalidate_owner`). It did
+**not** notice the other way a source's storage ends: an owned local bound inside a `loop` body being
+**dropped when the iteration closes**. `Region::Frame` cannot help, because it does not distinguish
+"this frame" from "this iteration". So a view assigned out to a longer-lived local survived into the
+next pass and read freed memory — no `unsafe`, no std handle required:
 
 ```align
-mut keep := fallback
+mut keep: str := "start"
 loop {
-  print(keep.len())          // reads the PREVIOUS iteration's freed request buffer
-  ctx := srv.accept()?       // dropped at end of iteration — never moved
-  keep = ctx.path()
+  print(keep)              // read the PREVIOUS iteration's freed buffer (printed heap garbage)
+  owned := mk("hello")     // dropped at end of iteration — never moved
+  keep = owned
 }
 ```
 
-It is **general to every view over a Move handle**, not to any one type, and **the inner scope need
-not be a loop** — an `arena {}` block whose handle is dropped at its end does the same. Reproduced on
-a plain `str` from `ctx.path()` (reads a freed buffer, prints stale lengths) and on the
-`http_headers` view from `ctx.headers()`, where the dangling value IS the freed `http_request_ctx`
-pointer that the runtime dereferences to walk the offset table: in the loop shape that aborts, in the
-`arena {}` shape it prints a plausible answer and exits 0. Shape- and allocator-dependent UB either
-way — not a type that fails loudly. The variant where the loop DOES consume the handle
-(`ctx.respond(rb)?` — the pkg.web shape, so every shipped serve loop is safe) is correctly rejected
-by the existing move path.
+**The fix mirrors MIR's actual drop points, and there is exactly one class of them inside a
+function.** `emit_drop_if_live` is emitted at: function exit (nothing follows), an `Assign`'s
+drop-of-old (already covered by the move path), a hidden owner after a **scalar-only** consumer (a
+view-returning consumer keeps the owner alive by construction), and the `loop` per-iteration set
+`loop_iter_drops` = `drop_locals ∩ body_locals`, at the **back-edge** and at **every `break`**.
+`MoveCheck::loop_moves` therefore ends the borrow generation of exactly that set — computed by
+`iteration_drops` from the shared `needs_drop_flag` boundary predicate that builds `Fn::drop_locals`,
+so sema cannot drift from MIR — on the state that reaches the loop head (probe pass + every fixpoint
+round) and on each `break` snapshot. The `break` invalidation applies to the snapshot only, since the
+statements this pass still walks after a `break` belong to the iteration that has not dropped yet.
+`BorrowState::invalid` now records *how* each generation ended (`BorrowEnd::Consumed` / `Dropped`) so
+the diagnostic says which; the join merges per owner by `Ord` (`Consumed` < `Dropped`), keeping it
+commutative for the fixpoint.
 
-Pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view` in
-`crates/align_driver/tests/http_headers_view.rs`, which asserts the current unsound acceptance for
-both the `http_headers` and the `str` case; when the gap is fixed, both assertions flip. The fix
-belongs with #460's dataflow — end a borrow generation at the owner's scope-end drop, not only at its
-move — and is deliberately **not** folded into the `ctx.headers()` slice, which neither introduced
-nor widened it.
+**Two claims in the original write-up were wrong, and the corrections matter more than the bug.**
+① "The inner scope need not be a loop — an `arena {}` block does it too" is **false**, in both
+directions: a heap-owned local bound inside `arena {}` is *not* freed at the block's end (MIR drops
+it at function exit — `emit-mir` shows `drop _3` after `arena_end`, and the shape prints the correct
+string, i.e. nothing was freed), while storage that genuinely *is* arena-allocated is already
+rejected by the region rule's `decl_depth` check ("this value is bound to an arena block and cannot
+escape it"). The `arena` shape "printing a plausible answer" was not allocator luck — it was a
+program with no use-after-free in it. ② The `http_headers` case was described as louder than the
+`str` case; both are the same shape- and allocator-dependent UB, and the `str` case reproduces on a
+plain `string` with no std handle anywhere.
+
+The variant where the loop **consumes** the handle (`ctx.respond(rb)?` — the pkg.web shape, so every
+shipped serve loop was always safe) was already rejected by the move path. Coverage: the flipped
+`a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
+`known_hole_scope_end_drop_…`) in `tests/http_headers_view.rs`, plus six tests in
+`tests/borrow_liveness.rs` — back-edge, `break` edge, and the controls that keep the rule from
+over-rejecting: same-iteration use, a source declared outside the loop, an inner `break` that must
+drop only the inner body's locals, and an owned local *moved out* by `break` (its flag is cleared, so
+it is not a freed source). Mutation-checked: neutering `invalidate_iteration_drops` fails exactly the
+four positive tests and no control.
 
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`

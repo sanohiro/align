@@ -386,3 +386,161 @@ fn main() -> i32 {
 ";
     assert!(check_errs("borrow-pipeline-capture", src));
 }
+
+// --- Scope-end drop: a borrow generation also ends where the source's storage is FREED, not only
+// where it is moved or reassigned. The one early drop MIR emits inside a function is a `loop`'s
+// per-iteration drop set (`loop_iter_drops` — the owned locals declared in the body), emitted at the
+// back-edge and at every `break`. `MoveCheck::loop_moves` mirrors exactly that set.
+
+#[test]
+fn a_view_of_a_loop_body_local_is_dead_after_the_back_edge() {
+    // The general shape of the hole this closed: no `unsafe`, no std handle — the owned `string` is
+    // freed at the back-edge, so the next iteration's read of `keep` printed freed heap bytes.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    n = n + keep.len() as i32
+    owned := mk(\"hello\")
+    keep = owned
+    if n > 100 { break }
+  }
+  return n
+}
+";
+    let diags = check_diagnostics("borrow-loop-back-edge-drop", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("was dropped at the end of the loop iteration"),
+        "a view of a loop-body local read on the next pass must be rejected with the \
+         drop-specific wording: {diags}"
+    );
+}
+
+#[test]
+fn a_view_of_a_loop_body_local_is_dead_after_the_break() {
+    // The same drop set is emitted on the `break` edge, so the read *after* the loop is rejected
+    // too — even though the loop body itself never re-reads the view.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut n := 0
+  loop {
+    owned := mk(\"hello\")
+    keep = owned
+    n = n + 1
+    if n > 2 { break }
+  }
+  return keep.len() as i32
+}
+";
+    assert!(check_errs("borrow-loop-break-drop", src));
+}
+
+#[test]
+fn a_view_used_inside_the_iteration_that_created_it_stays_legal() {
+    // The control that keeps the rule from being vacuous: the view is re-established by its own
+    // `let` on every pass, so the back-edge invalidation of the previous generation is irrelevant.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut n := 0
+  loop {
+    owned := mk(\"hello\")
+    view: str := owned
+    n = n + view.len() as i32
+    if n > 100 { break }
+  }
+  return n
+}
+";
+    assert!(!check_errs("borrow-loop-same-iteration", src));
+}
+
+#[test]
+fn a_view_of_a_source_declared_outside_the_loop_survives_iterations() {
+    // `owned` outlives every iteration — it is not in the loop's drop set — so carrying its view
+    // across the back-edge and out through the `break` is legal.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  owned := mk(\"hello\")
+  mut keep: str := \"\"
+  mut n := 0
+  loop {
+    n = n + keep.len() as i32
+    keep = owned
+    if n > 100 { break }
+  }
+  return keep.len() as i32
+}
+";
+    assert!(!check_errs("borrow-loop-outer-source", src));
+}
+
+#[test]
+fn an_inner_loops_break_drops_only_the_inner_bodys_locals() {
+    // A `break` leaves the innermost loop only, so it must not invalidate views of the *enclosing*
+    // loop body's locals — `outer` is still live after the inner loop ends.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut n := 0
+  loop {
+    outer := mk(\"hello\")
+    mut keep: str := \"\"
+    loop {
+      keep = outer
+      n = n + 1
+      if n > 3 { break }
+    }
+    n = n + keep.len() as i32
+    if n > 100 { break }
+  }
+  return n
+}
+";
+    assert!(!check_errs("borrow-nested-loop-outer-source", src));
+
+    // ...and the inner body's own locals *are* dropped on that edge.
+    let bad = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut n := 0
+  loop {
+    mut keep: str := \"\"
+    loop {
+      inner := mk(\"hello\")
+      keep = inner
+      break
+    }
+    n = n + keep.len() as i32
+    if n > 100 { break }
+  }
+  return n
+}
+";
+    assert!(check_errs("borrow-nested-loop-inner-source", bad));
+}
+
+#[test]
+fn an_owned_loop_body_local_broken_out_of_the_loop_is_not_a_borrow() {
+    // The drop set is emitted at `break`, but a value *moved out* by that same `break` has had its
+    // drop flag cleared — it is owned by the loop's result, not freed. Nothing here borrows.
+    let src = "\
+fn mk(a: str) -> string = a.clone()
+fn main() -> i32 {
+  mut n := 0
+  s := loop {
+    owned := mk(\"hello\")
+    n = n + 1
+    if n > 2 { break owned }
+  }
+  return s.len() as i32
+}
+";
+    assert!(!check_errs("borrow-loop-break-moves-owned", src));
+}

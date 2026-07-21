@@ -3549,6 +3549,7 @@ pub fn check_program_with_effects(
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
+            loop_iter_drops: Vec::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -7764,6 +7765,10 @@ struct MoveCheck<'a> {
     borrows: BorrowState,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
+    /// Per-iteration owned locals of each enclosing `loop` (innermost last) — the locals MIR drops
+    /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
+    /// generation exactly as the back-edge does.
+    loop_iter_drops: Vec<Vec<LocalId>>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -7779,14 +7784,30 @@ type MovedSet = std::collections::HashSet<MovedKey>;
 
 type BorrowRoots = std::collections::BTreeSet<LocalId>;
 
+/// How a borrow source's storage generation ended. Only the diagnostic wording depends on this —
+/// both endings kill every view rooted in that source.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BorrowEnd {
+    /// The source was moved away, reassigned, or reallocated in place.
+    Consumed,
+    /// The source's storage was **freed** where its binding scope ended — the per-iteration drop a
+    /// `loop` emits at its back-edge and at every `break` for owned locals declared in its body.
+    Dropped,
+}
+
+/// Which ended source generations a borrower depends on, and how each ended. `Ord` on
+/// [`BorrowEnd`] makes the join's per-owner merge commutative (`Consumed` < `Dropped`, so a source
+/// that was consumed on one path and dropped on another reports the consumption).
+type EndedRoots = std::collections::BTreeMap<LocalId, BorrowEnd>;
+
 /// Flow-sensitive provenance for locals that borrow storage owned by other locals. `sources`
 /// stores the flattened owner roots of each live borrower. `invalid` records which source
-/// generation was moved, replaced, or potentially reallocated on at least one path reaching the
-/// current point.
+/// generation ended — moved, replaced, potentially reallocated, or dropped at its scope's end — on
+/// at least one path reaching the current point.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
-    invalid: std::collections::HashMap<LocalId, BorrowRoots>,
+    invalid: std::collections::HashMap<LocalId, EndedRoots>,
 }
 
 impl BorrowState {
@@ -7799,10 +7820,11 @@ impl BorrowState {
         }
     }
 
-    fn invalidate_owner(&mut self, owner: LocalId) {
+    fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
         for (&borrower, roots) in &self.sources {
             if roots.contains(&owner) {
-                self.invalid.entry(borrower).or_default().insert(owner);
+                let entry = self.invalid.entry(borrower).or_default().entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
             }
         }
     }
@@ -7813,7 +7835,11 @@ impl BorrowState {
             out.sources.entry(local).or_default().extend(roots);
         }
         for (&local, roots) in &b.invalid {
-            out.invalid.entry(local).or_default().extend(roots);
+            let into = out.invalid.entry(local).or_default();
+            for (&owner, &how) in roots {
+                let entry = into.entry(owner).or_insert(how);
+                *entry = (*entry).min(how);
+            }
         }
         out
     }
@@ -8109,7 +8135,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn invalidate_owner(&mut self, owner: LocalId) {
-        self.borrows.invalidate_owner(owner);
+        self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
     }
 
     fn invalidate_storage(&mut self, storage: &Expr) {
@@ -8118,9 +8144,36 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Whether MIR emits a drop for this local — the same boundary predicate that builds
+    /// `Fn::drop_locals`, so sema's scope-end invalidation covers exactly the locals whose storage
+    /// is actually freed. A local outside this set is never dropped early, so views into it stay
+    /// live.
+    fn is_dropped_local(&self, id: LocalId) -> bool {
+        self.f
+            .locals
+            .get(id as usize)
+            .is_some_and(|l| needs_drop_flag(l.ty, self.structs, self.tuples, self.enums))
+    }
+
+    /// End the borrow generation of every owned local declared in a `loop` body. MIR drops those
+    /// locals (`loop_iter_drops`) at the back-edge and at every `break`, so a view of one that was
+    /// assigned out to a longer-lived binding points at freed storage past that edge. `drops` comes
+    /// from [`Self::iteration_drops`]; declaration order within it is irrelevant, because a local
+    /// not yet bound on this path has no live borrower to invalidate.
+    fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId]) {
+        for &id in drops {
+            state.invalidate_owner(id, BorrowEnd::Dropped);
+        }
+    }
+
+    /// The owned locals a `loop` body drops per iteration, in `body_locals` order.
+    fn iteration_drops(&self, body_locals: &std::ops::Range<LocalId>) -> Vec<LocalId> {
+        body_locals.clone().filter(|&id| self.is_dropped_local(id)).collect()
+    }
+
     fn check_borrow_use(&mut self, local: LocalId, span: Span) {
         let Some(owners) = self.borrows.invalid.get(&local) else { return };
-        let Some(owner) = owners.iter().next().copied() else { return };
+        let Some((owner, how)) = owners.iter().next().map(|(&o, &h)| (o, h)) else { return };
         let borrower = self
             .f
             .locals
@@ -8131,10 +8184,16 @@ impl<'a> MoveCheck<'a> {
             .locals
             .get(owner as usize)
             .map_or("<source>", |l| l.name.as_str());
+        let why = match how {
+            BorrowEnd::Consumed => {
+                "was moved or reassigned (or its storage was reallocated); create a new view from the current source"
+            }
+            BorrowEnd::Dropped => {
+                "was dropped at the end of the loop iteration that declared it; a view cannot outlive the value it borrows"
+            }
+        };
         self.diags.error(
-            format!(
-                "use of invalidated borrow '{borrower}': its source '{source}' was moved or reassigned (or its storage was reallocated); create a new view from the current source"
-            ),
+            format!("use of invalidated borrow '{borrower}': its source '{source}' {why}"),
             span,
         );
     }
@@ -8143,9 +8202,20 @@ impl<'a> MoveCheck<'a> {
     /// full rationale. Kept `#[inline(never)]` so its large locals do not enlarge the recursive
     /// `expr` stack frame.
     #[inline(never)]
-    fn loop_moves(&mut self, body: &Block, moved: &mut MovedSet) {
+    fn loop_moves(
+        &mut self,
+        body: &Block,
+        body_locals: &std::ops::Range<LocalId>,
+        moved: &mut MovedSet,
+    ) {
         let entry = moved.clone();
         let entry_borrows = self.borrows.clone();
+        // The owned locals this body declares. They are freed on every edge that leaves an
+        // iteration — the back-edge below and each `break` (see the `Stmt::Break` arm) — so the
+        // state that reaches the loop head, and the state after the loop, must treat every view
+        // rooted in one of them as dead.
+        let drops = self.iteration_drops(body_locals);
+        self.loop_iter_drops.push(drops.clone());
         // Probe pass: discover which locals a fall-through iteration moves, with diagnostics
         // suppressed by swapping in a throwaway sink (restored after).
         let mut probe = entry.clone();
@@ -8157,7 +8227,8 @@ impl<'a> MoveCheck<'a> {
         self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
         self.loop_borrow_breaks.pop();
-        let probe_borrows = self.borrows.clone();
+        let mut probe_borrows = self.borrows.clone();
+        Self::invalidate_iteration_drops(&mut probe_borrows, &drops);
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
         // `return`s). Conditional `break`/`return` moves are already excluded from `probe` by the
         // `if`/`match` diverging-branch join; but if the body *always* diverges (an unconditional
@@ -8186,10 +8257,9 @@ impl<'a> MoveCheck<'a> {
                 self.block(body, &mut probe_state, false, false);
                 self.loop_breaks.pop();
                 self.loop_borrow_breaks.pop();
-                let next = BorrowState::join(
-                    &head,
-                    &BorrowState::join(&entry_borrows, &self.borrows),
-                );
+                let mut end = self.borrows.clone();
+                Self::invalidate_iteration_drops(&mut end, &drops);
+                let next = BorrowState::join(&head, &BorrowState::join(&entry_borrows, &end));
                 if next == head {
                     break head;
                 }
@@ -8208,6 +8278,7 @@ impl<'a> MoveCheck<'a> {
             .loop_borrow_breaks
             .pop()
             .expect("loop borrow-break frame balanced");
+        self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
         // leave `moved` unchanged.
@@ -8310,8 +8381,17 @@ impl<'a> MoveCheck<'a> {
                     if let Some(frame) = self.loop_breaks.last_mut() {
                         frame.push(moved.clone());
                     }
+                    // This edge leaves the innermost loop, which drops its per-iteration owned
+                    // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them is
+                    // dead in the code that follows the loop. The invalidation applies to the
+                    // snapshot only: statements after a `break` are dead code, but this pass still
+                    // walks them, and they belong to the iteration that has not dropped yet.
+                    let mut at_break = self.borrows.clone();
+                    if let Some(drops) = self.loop_iter_drops.last() {
+                        Self::invalidate_iteration_drops(&mut at_break, drops);
+                    }
                     if let Some(frame) = self.loop_borrow_breaks.last_mut() {
-                        frame.push(self.borrows.clone());
+                        frame.push(at_break);
                     }
                 }
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
@@ -8700,7 +8780,7 @@ impl<'a> MoveCheck<'a> {
             // Extracted into an `#[inline(never)]` helper so its large locals — a `Diagnostics` sink
             // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
             // chain would otherwise overflow the stack; see `expr_depth` test).
-            ExprKind::Loop { body, .. } => self.loop_moves(body, moved),
+            ExprKind::Loop { body, body_locals, .. } => self.loop_moves(body, body_locals, moved),
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.

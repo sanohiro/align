@@ -8,7 +8,9 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-21, **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
+_Last updated: 2026-07-22, **the scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
+the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
+accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
 (#595) — the hard streaming ordering constraint is LIFTED** — plus **#597, `accept`'s
 transient-errno classification: a worker no longer dies over a dropped connection, a pending network
 error, or a full fd table (see "DONE 2026-07-21" under NEXT).** The three designed slices all landed in one arc:
@@ -61,26 +63,44 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **Borrow liveness must end at scope-end DROP, not only at MOVE — a real use-after-free, no
-   `unsafe` required.** Found adversarially while implementing `ctx.headers()` (#598) and recorded
-   in `open-questions.md` next to #460, whose dataflow should own the fix. `MoveCheck` invalidates a
-   view when its owning source is moved or reassigned; it does not notice a Move handle bound in an
-   INNER SCOPE — a loop body, an `arena {}` block — being dropped when that scope closes, and
-   `Region::Frame` cannot tell "this frame" from "this iteration". A view assigned out to a
-   longer-lived local then reads freed memory. **General to every view over a Move handle**
-   (reproduced on a plain `str` from `ctx.path()`, on main, long before #598), and the shipped
-   `serve` loops are safe only because `respond` MOVES the handle each pass. This outranks the perf
-   items below: it is the one open item where the language accepts a program it must reject.
-   `known_hole_scope_end_drop_does_not_invalidate_a_view` pins today's unsound acceptance for both
-   the `http_headers` and the `str` case — when the fix lands, both assertions flip and the
-   `known_hole_` prefix goes. Design first (it is a dataflow/semantics change touching every view),
-   then implement.
-2. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
+1. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
    is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
    `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
    buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
-3. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
+2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
+
+**DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
+item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
+when its source was moved or reassigned; it never noticed the source being **freed**, so a view
+assigned out of a loop body to a longer-lived local read the previous iteration's freed buffer. No
+`unsafe`, no std handle: `mut keep: str := "start"` + `loop { print(keep); owned := mk("hello"); keep
+= owned }` printed heap garbage on `main`.
+- **The fix is a mirror of MIR, not a new policy.** MIR emits exactly one class of early drop inside
+  a function: a `loop`'s per-iteration set (`loop_iter_drops` = `drop_locals ∩ body_locals`) at the
+  **back-edge** and at **every `break`**. (The other `emit_drop_if_live` sites are function exit —
+  nothing follows; an `Assign`'s drop-of-old — already the move path's; and a hidden owner after a
+  *scalar-only* consumer — a view-returning consumer keeps its owner alive by construction.)
+  `loop_moves` now ends that set's borrow generation on the state reaching the loop head (probe +
+  every fixpoint round) and on each `break` snapshot. The drop set comes from `needs_drop_flag`, the
+  same shared predicate that builds `Fn::drop_locals`, so sema cannot drift from MIR.
+- `BorrowState::invalid` records **how** each generation ended (`Consumed` / `Dropped`) so the
+  diagnostic names the right cause; the join merges per owner by `Ord`, keeping it commutative for
+  the fixpoint.
+- **Two claims in the original write-up were wrong, and that is the reusable lesson** (same shape as
+  the #597 test-hang guess): ① the `arena {}` variant is **not an instance of this bug** — a
+  heap-owned local bound inside `arena {}` is dropped at *function* exit (`emit-mir` shows the drop
+  after `arena_end`, and the shape prints the correct string, i.e. nothing was freed), while storage
+  that genuinely is arena-allocated is already rejected by the region rule's `decl_depth` check.
+  ② `http_headers` is not reliably louder than `str`; both are shape- and allocator-dependent UB.
+  Verify a UB claim by running it, not by reasoning from the type.
+- Tests: the flipped `a_view_of_a_handle_dropped_at_the_end_of_an_iteration_is_rejected` (was
+  `known_hole_scope_end_drop_…`), plus six in `tests/borrow_liveness.rs` — back-edge, `break` edge,
+  and the controls that keep the rule from over-rejecting: same-iteration use, a source declared
+  outside the loop, an inner `break` dropping only the inner body's locals, and an owned local
+  **moved out** by `break`. Mutation-checked (neutering the invalidation fails exactly the four
+  positive tests, no control). Whole workspace green, clippy clean; **zero false positives** — the
+  only test the fix broke was the pinned known hole.
 
 **DONE 2026-07-21 — `web.header(c, name)`, on the std.http enabler `ctx.headers()`
 (`std-design/http.md` item 10, now SHIPPED).** The detached view won: `ctx.headers() ->
@@ -109,19 +129,15 @@ forwards. pkg.web ships no lookup of its own.
 - Tests: `crates/align_driver/tests/http_headers_view.rs` (the full item-10 matrix) +
   `apps_web_root.rs::web_header_reads_the_request_header_table` (case-insensitive hit / folded hit /
   absent-is-`None` / present-but-empty-is-`Some("")`).
-- **A PRE-EXISTING soundness hole surfaced by the adversarial pass, recorded Open, deliberately not
-  fixed here:** `MoveCheck` ends a borrow generation when the owner is **moved or reassigned**, never
-  when it is **dropped at an inner scope's end** — so a view assigned out of an inner scope whose
-  Move handle merely drops (rather than being consumed) survives it and reads freed memory. The
-  scope need not be a loop: an `arena {}` block does it too. General to every view over a Move
-  handle: reproduced identically on a plain `str` from `ctx.path()`. Every shipped `serve` loop is
-  safe because `ctx.respond(rb)` MOVES the handle each pass, which the existing move path rejects.
-  Item 10 changes only the blast radius, and not reliably — the dangling value here IS the freed
-  `http_request_ctx` pointer and the runtime dereferences it, so the loop shape aborts while the
-  `arena {}` shape prints a plausible answer and exits 0. Pinned as
-  `known_hole_scope_end_drop_does_not_invalidate_a_view` (asserts the current unsound acceptance for
-  BOTH the header view and the `str` case; flip both when fixed) and written up in
-  `open-questions.md` next to #460, whose dataflow should own the fix.
+- **A PRE-EXISTING soundness hole surfaced by the adversarial pass, deliberately not fixed here —
+  FIXED the next day, see "DONE 2026-07-22" above:** `MoveCheck` ended a borrow generation when the
+  owner was **moved or reassigned**, never when it was **dropped at the end of a loop iteration**, so
+  a view assigned out of a loop body whose Move handle merely drops survived it and read freed
+  memory. General to every view over a Move handle: reproduced identically on a plain `str` from
+  `ctx.path()` and on a plain `string`. Every shipped `serve` loop was safe because `ctx.respond(rb)`
+  MOVES the handle each pass, which the existing move path rejects. Two claims made here were wrong
+  and are corrected in the 2026-07-22 entry: the `arena {}` block does **not** do it too, and this
+  type is not reliably louder than a `str`.
 
 **DONE 2026-07-21 — `accept`'s transient-errno classification (#597).** `http_accept_conn` used to
 return ANY `accept(2)` failure and `pkg.web`'s `srv.accept()?` ended the worker on it. One decision
