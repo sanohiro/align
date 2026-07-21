@@ -381,9 +381,13 @@ with concurrency.
    `array<i64>` (the `http_stream` stand-in) by value through a match-extracted fn payload and
    asserts no double-free (completion, not a signal exit) plus a move-after-use reject. The real
    `http_stream` receiver awaits enabler 4.
-4. **std.http `respond_stream` rework** (changes ①–③ above) — recorded in
-   `docs/impl/std-design/http.md`; update the M12 tests to the new receiver form (pre-release:
-   change outright, no compat path). **Not yet done.**
+4. **std.http `respond_stream` rework — DONE** (changes ①–③, shipped 2026-07-21). The ctx is
+   borrowed and left SPENT on success (a later `respond`/`respond_stream` is `Err`; a validation
+   `Err` leaves it unspent), the head is lazy (stored in the stream; first `send`/`finish` writes
+   it), and `s.reject(rb)` answers pre-stream with a complete normal response. Full shipped record
+   in `docs/impl/std-design/http.md` item 8; the M12 tests were updated outright
+   (`m12_http_stream.rs`, 13 — including a mid-pump `ctx.path()` read, the exact stream-handler
+   borrow shape enabler 5 needs).
 
 ### Backlog (recorded, not v1)
 

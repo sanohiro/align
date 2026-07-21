@@ -1220,13 +1220,16 @@ pub enum ExprKind {
     /// runtime frees both (like [`HttpClientRequest`]'s `req`). A caller-supplied Content-Length / a bad
     /// status is `Error.Invalid`. **Impure** (network I/O).
     HttpRespond { ctx: Box<Expr>, rb: Box<Expr> },
-    /// `ctx.respond_stream(rb)` — begin a chunked/streaming response: serialize `rb`'s head (header-only)
-    /// plus the transfer framing, write it, and yield `Result<http_stream, Error>` (the `ty`). **Consumes
-    /// BOTH** `ctx` ([`crate::Ty::HttpRequestCtx`]) and `rb` ([`crate::Ty::ResponseBuilder`]) — the
-    /// runtime frees both (like [`HttpRespond`]) and lifts the accepted fd into the returned
-    /// [`crate::Ty::HttpStream`]. A `rb` with a body set **aborts** (a header-only builder is required —
-    /// the streamed body is written with `s.send`); a bad status is `Error.Invalid`. A 1.0 request gets
-    /// close-delimited raw framing (no chunked). **Impure** (network I/O).
+    /// `ctx.respond_stream(rb)` — begin a chunked/streaming response: validate + serialize `rb`'s head
+    /// (header-only) plus the transfer framing into the returned stream (**lazy** — the first
+    /// `send`/`finish` writes it), and yield `Result<http_stream, Error>` (the `ty`). **Consumes `rb`
+    /// ONLY** ([`crate::Ty::ResponseBuilder`] — the runtime frees it); `ctx`
+    /// ([`crate::Ty::HttpRequestCtx`]) is **borrowed** (http.md item 8 ①): the runtime lifts just the
+    /// fd into the returned [`crate::Ty::HttpStream`] and leaves the ctx with the caller SPENT (its
+    /// views stay valid; a later `respond`/`respond_stream` on it is `Err`). A `rb` with a body set
+    /// **aborts** (a header-only builder is required — the streamed body is written with `s.send`); a
+    /// bad status is `Error.Invalid` and leaves the ctx unspent. A 1.0 request gets close-delimited
+    /// raw framing (no chunked). **Impure** (network I/O).
     HttpRespondStream { ctx: Box<Expr>, rb: Box<Expr> },
     /// `s.send(chunk)` — write one streamed chunk (one chunk frame in framed/1.1 mode, or raw payload
     /// bytes in 1.0 mode) to the stream `s` ([`crate::Ty::HttpStream`]), yielding `Result<(), Error>`
@@ -1239,6 +1242,10 @@ pub enum ExprKind {
     /// it. A poisoned stream (a prior failed `send`) skips the terminal write and returns `Err`.
     /// **Impure** (network I/O).
     HttpStreamFinish { stream: Box<Expr> },
+    /// `s.reject(rb)` — answer the connection with a complete NORMAL response instead of streaming
+    /// (the stream route's pre-stream 4xx window; legal only before the first send). Consumes BOTH
+    /// the stream and the builder. → `Result<(), Error>`. Impure.
+    HttpStreamReject { stream: Box<Expr>, rb: Box<Expr> },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
     /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return

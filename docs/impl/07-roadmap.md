@@ -1978,6 +1978,9 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   bound-receiver methods, and the runtime `http_respond_stream`/`http_stream_send`/`_finish`/`_free`
   FFI. `cargo test` green (runtime frame-encoder/version/poison units + an end-to-end 1.1-chunked /
   1.0-raw / truncation / poison driver suite in `m12_http_stream.rs`).
+  *(Historical shape: reworked 2026-07-21 for pkg.web stream routes — `respond_stream` now borrows
+  the ctx (spent), the head is lazy, and `s.reject(rb)` is the pre-stream 4xx window; current
+  contract = http.md item 8.)*
 
 
 ## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (COMPLETE 2026-07-11)

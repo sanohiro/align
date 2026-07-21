@@ -1,14 +1,18 @@
-//! M12 std.http — the SSE/chunked **streaming response** (`respond_stream`, the runway A5 remainder).
-//! `ctx.respond_stream(rb)` consumes BOTH ctx and rb (rb must be header-only — a bodied builder
-//! aborts), writes the response head + the transfer framing (`Transfer-Encoding: chunked` for a 1.1
-//! client, or close-delimited raw for a 1.0 client), lifts the accepted fd into an owned `http_stream`,
-//! and yields `Result<http_stream, Error>`. `s.send(chunk)` writes ONE chunk frame in ONE write
-//! (`send("")` is a no-op — an empty chunk is the terminator); `s.finish()` is the sole clean terminator
-//! (`0\r\n\r\n` + close), consuming `s`. Drop is **close-only** (no terminal write — abrupt close is
-//! chunked's own truncation signal). The wire framing / poison / version threading are runtime-unit-
-//! tested in `align_runtime`; here we drive a real Align streaming server end-to-end (a Rust client that
-//! DECODES the chunked framing) and check the Gate-1 rejections + the recorded 1.1/1.0 + truncation +
-//! poison paths. (`docs/impl/std-design/http.md` slice-plan item 7.)
+//! M12 std.http — the SSE/chunked **streaming response** (`respond_stream`, the runway A5 remainder;
+//! reworked per `docs/impl/std-design/http.md` item 8 for pkg.web stream routes).
+//! `ctx.respond_stream(rb)` consumes `rb` ONLY (header-only — a bodied builder aborts) and **borrows**
+//! `ctx`: it validates + serializes the head + the transfer framing (`Transfer-Encoding: chunked` for
+//! a 1.1 client, or close-delimited raw for a 1.0 client) into the owned `http_stream` — **lazy**, the
+//! first `send`/`finish` writes it — lifts the accepted fd, and leaves the ctx with the caller SPENT
+//! (views stay valid; a later `respond`/`respond_stream` on it is `Err`). `s.send(chunk)` writes ONE
+//! chunk frame in ONE write (`send("")` is a no-op — an empty chunk is the terminator); `s.finish()`
+//! is the sole clean terminator (`0\r\n\r\n` + close), consuming `s`; `s.reject(rb)` — legal only
+//! before the first send — discards the stored head and answers with a complete NORMAL response
+//! (consuming BOTH). Drop is **close-only** (no terminal write — abrupt close is chunked's own
+//! truncation signal). The wire framing / lazy-head / reject / poison / version threading are
+//! runtime-unit-tested in `align_runtime`; here we drive a real Align streaming server end-to-end (a
+//! Rust client that DECODES the chunked framing) and check the Gate-1 rejections + the recorded
+//! 1.1/1.0 + truncation + poison + spent-ctx + reject paths.
 
 mod common;
 use common::*;
@@ -77,7 +81,9 @@ fn decode_chunks(body: &[u8]) -> Vec<Vec<u8>> {
 
 /// 1.1 end-to-end: `respond_stream` + N `send`s (one with an empty chunk) + `finish` against a Rust
 /// client that decodes the chunked framing. Each non-empty send must arrive as exactly one frame, the
-/// empty send must produce NO frame, and the body must end with the `0\r\n\r\n` terminator.
+/// empty send must produce NO frame, and the body must end with the `0\r\n\r\n` terminator. The ctx is
+/// **borrowed** (item 8 ①): its `path()` view is read AFTER `respond_stream` and streamed as a chunk —
+/// the LLM-pump shape (read the request while streaming the response).
 #[test]
 fn stream_http11_chunked_frames_end_to_end() {
     if !backend_available() {
@@ -97,7 +103,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   s := ctx.respond_stream(rb)?
   s.send(\"data: one\\n\\n\")?
   s.send(\"\")?
-  s.send(\"data: two\\n\\n\")?
+  s.send(ctx.path())?
   s.finish()?
   return Ok(())
 }
@@ -119,11 +125,12 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert!(!head.to_ascii_lowercase().contains("content-length"), "a streamed response has no Content-Length: {head:?}");
     // The terminator must be present (a clean finish).
     assert!(resp.ends_with(b"0\r\n\r\n"), "clean finish writes the 0-chunk terminator");
-    // Exactly two frames (the empty send produced NO frame), each a whole SSE event.
+    // Exactly two frames (the empty send produced NO frame); the second is the ctx's `path()` view,
+    // read AFTER `respond_stream` — the ctx borrow keeps the request views valid while streaming.
     let frames = decode_chunks(&body);
     assert_eq!(frames.len(), 2, "one frame per non-empty send; send(\"\") frames nothing");
     assert_eq!(frames[0], b"data: one\n\n");
-    assert_eq!(frames[1], b"data: two\n\n");
+    assert_eq!(frames[1], b"/events", "ctx.path() stays valid after respond_stream (borrowed ctx)");
 }
 
 /// A 1.0 request cannot be chunked: the stream is close-delimited **raw** — no `Transfer-Encoding`
@@ -380,11 +387,144 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert!(!status.success(), "a bodied respond_stream must abort");
 }
 
+/// The SPENT ctx (item 8 ①): after `respond_stream` the ctx stays with the caller — its views are
+/// legal — but a later `respond` on it is a runtime `Err` (the stream owns the connection), pinned
+/// end-to-end: the handler observes the Err (marker) and the client still gets a clean stream.
+#[test]
+fn respond_on_spent_ctx_is_err_end_to_end() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  s := ctx.respond_stream(rb)?
+  rb2 := http.response(500)
+  match ctx.respond(rb2) {
+    Ok(_) => print(0)
+    Err(_) => print(1)
+  }
+  s.send(\"ok\")?
+  s.finish()?
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let server = build_exe("m12-stream-spent-ctx", prog);
+    let child = std::process::Command::new(&server.exe)
+        .args(["--port", &port.to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let resp = client_read_all(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    let out = child.wait_with_output().expect("server exits");
+    assert!(out.status.success(), "server exited cleanly: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "respond on a spent ctx returns Err");
+    let (head, body) = split_head_body(&resp);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "the STREAM head went out, not the 500: {head:?}");
+    assert_eq!(decode_chunks(&body), vec![b"ok".to_vec()], "the stream itself is unaffected");
+}
+
+/// `s.reject(rb)` (item 8 ③) end-to-end: the pre-stream 4xx window. The pump rejects before any
+/// send — the client receives a complete NORMAL response (CL + body, no Transfer-Encoding, nothing
+/// of the discarded stream head).
+#[test]
+fn stream_reject_answers_with_a_normal_response() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  rb.header(\"X-Stream-Head\", \"discarded\")
+  s := ctx.respond_stream(rb)?
+  rb2 := http.response(400)
+  rb2.body(\"bad request\")
+  s.reject(rb2)?
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let server = build_exe("m12-stream-reject", prog);
+    let mut child = std::process::Command::new(&server.exe)
+        .args(["--port", &port.to_string()])
+        .spawn()
+        .expect("spawn server");
+    let resp = client_read_all(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    let status = child.wait().expect("server exits");
+    assert!(status.success(), "server exited with {status:?}");
+    let (head, body) = split_head_body(&resp);
+    assert!(head.starts_with("HTTP/1.1 400 Bad Request\r\n"), "the reject response, not the stream head: {head:?}");
+    assert!(head.contains("Content-Length: 11\r\n"), "a NORMAL (CL-framed) response: {head:?}");
+    assert!(!head.to_ascii_lowercase().contains("transfer-encoding"), "no stream framing: {head:?}");
+    assert!(!head.contains("X-Stream-Head"), "the stored stream head was discarded: {head:?}");
+    assert_eq!(body, b"bad request");
+}
+
+/// `reject` after the first send is a runtime `Err` (the head is committed — a normal response can
+/// no longer be written); the connection just closes (truncation), and the handler observes the Err.
+#[test]
+fn stream_reject_after_send_is_err() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  s := ctx.respond_stream(rb)?
+  s.send(\"first\")?
+  rb2 := http.response(400)
+  match s.reject(rb2) {
+    Ok(_) => print(0)
+    Err(_) => print(1)
+  }
+  return Ok(())
+}
+";
+    let port = free_loopback_port();
+    let server = build_exe("m12-stream-reject-late", prog);
+    let child = std::process::Command::new(&server.exe)
+        .args(["--port", &port.to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let resp = client_read_all(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    let out = child.wait_with_output().expect("server exits");
+    assert!(out.status.success(), "server exited cleanly: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "reject after a send returns Err");
+    let (head, _body) = split_head_body(&resp);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "the committed stream head stands: {head:?}");
+    assert!(!resp.ends_with(b"0\r\n\r\n"), "no terminator — the late reject closed the stream abruptly");
+}
+
 // --- compile-time Gate-1 rejections ------------------------------------------------------------
 
-/// `respond_stream` consumes BOTH `ctx` and `rb`: using either after the call is a moved-value error.
+/// `respond_stream` consumes `rb` ONLY: using `rb` after the call is a moved-value error, while the
+/// ctx is borrowed — reading its views after the call compiles clean (pinned at check level here;
+/// exercised end-to-end above).
 #[test]
-fn respond_stream_consumes_ctx_and_rb() {
+fn respond_stream_consumes_rb_but_borrows_ctx() {
     let use_ctx = "\
 import std.http
 import std.cli
@@ -397,10 +537,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   rb := http.response(200)
   s := ctx.respond_stream(rb)?
   print(ctx.path())
+  s.finish()?
   return Ok(())
 }
 ";
-    assert!(check_errs("m12-stream-uses-ctx", use_ctx), "using ctx after respond_stream must be rejected (consumed)");
+    assert!(!check_errs("m12-stream-uses-ctx", use_ctx), "using ctx views after respond_stream is legal (borrowed)");
     let use_rb = "\
 import std.http
 import std.cli
@@ -417,6 +558,48 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ";
     assert!(check_errs("m12-stream-uses-rb", use_rb), "using rb after respond_stream must be rejected (consumed)");
+}
+
+/// `reject` consumes BOTH the stream and its builder: a `send` after `reject`, and a use of the
+/// answering `rb` after `reject`, are moved-value errors.
+#[test]
+fn stream_reject_consumes_stream_and_rb() {
+    let send_after = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  s := ctx.respond_stream(rb)?
+  rb2 := http.response(400)
+  s.reject(rb2)?
+  s.send(\"x\")?
+  return Ok(())
+}
+";
+    assert!(check_errs("m12-stream-send-after-reject", send_after), "send after reject must be rejected (stream consumed)");
+    let rb_after = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  ctx := srv.accept()?
+  rb := http.response(200)
+  s := ctx.respond_stream(rb)?
+  rb2 := http.response(400)
+  s.reject(rb2)?
+  rb2.body(\"x\")
+  return Ok(())
+}
+";
+    assert!(check_errs("m12-stream-rb-after-reject", rb_after), "using rb after reject must be rejected (consumed)");
 }
 
 /// `finish` consumes the stream: a `send` after `finish` is a moved-value error.

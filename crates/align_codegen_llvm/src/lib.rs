@@ -2304,6 +2304,10 @@ fn build_module<'c>(
         module.add_function("align_rt_http_stream_finish", ctx.i32_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        "http_stream_reject".to_string(),
+        module.add_function("align_rt_http_stream_reject", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         "http_stream_free".to_string(),
         module.add_function("align_rt_http_stream_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
@@ -7679,6 +7683,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["http_stream_finish"], &[s.into()], "httpstreamfinish")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_finish returns i32 status")
+            }
+            Rvalue::HttpStreamReject { stream, rb } => {
+                let s = self.operand(stream).into_pointer_value();
+                let r = self.operand(rb).into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["http_stream_reject"], &[s.into(), r.into()], "httpstreamreject")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_stream_reject returns i32 status")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {

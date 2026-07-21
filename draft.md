@@ -2455,15 +2455,21 @@ server primitive
 ```
 
 The server primitive streams a response via `http_stream` (SSE / chunked). `respond_stream` consumes
-both the request context and a **header-only** response builder (a bodied builder aborts — the body is
-streamed, not preset); a 1.1 client gets `Transfer-Encoding: chunked`, a 1.0 client close-delimited
-raw. `finish` is the sole clean terminator (Drop closes without a terminal chunk — abrupt close is
-chunked's own truncation signal).
+a **header-only** response builder (a bodied builder aborts — the body is streamed, not preset) and
+**borrows** the request context: the connection is lifted into the stream and the context stays with
+the caller, *spent* (its request views remain valid while streaming; a later `respond` on it is
+`Err`). The head is **lazy** — validated immediately, written by the first `send` (or `finish`); until
+then `reject` may answer with a complete normal response instead (the pre-stream 4xx window). A 1.1
+client gets `Transfer-Encoding: chunked`, a 1.0 client close-delimited raw. `finish` is the sole
+clean terminator (Drop closes without a terminal chunk — abrupt close is chunked's own truncation
+signal).
 
 ```text
-ctx.respond_stream(rb: response_builder) -> Result<http_stream, Error>  // consumes ctx + rb
+ctx.respond_stream(rb: response_builder) -> Result<http_stream, Error>  // consumes rb; borrows ctx (spent)
 s.send(chunk: bytes) -> Result<(), Error>       // one chunk frame, one write; send("") = no-op
 s.finish() -> Result<(), Error>                 // consumes s; writes 0\r\n\r\n (framed) + closes
+s.reject(rb: response_builder) -> Result<(), Error> // consumes s + rb; pre-first-send only:
+                                                    //   discard the head, answer normally, close
 ```
 
 ---

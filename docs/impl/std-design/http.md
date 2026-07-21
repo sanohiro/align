@@ -439,11 +439,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - Client parse stays CL-only (chunked → `Error.Invalid` on align's own client — the
      recorded asymmetry; the gateway's clients are external).
 
-8. **`respond_stream` rework for pkg.web stream routes — DESIGNED 2026-07-21, NOT SHIPPED.**
+8. **`respond_stream` rework for pkg.web stream routes — DESIGNED + SHIPPED 2026-07-21.**
    pkg.web's streaming design (`docs/impl/pkg-design/web.md` → "Streaming") is the consumer; it
    requires the framework to keep owning the request context while a stream handler runs, and a
-   4xx window before the head is committed. Three changes, all pre-release-outright (update the
-   M12 tests, no compat path):
+   4xx window before the head is committed. Three changes, all pre-release-outright (the M12 tests
+   were updated outright, no compat path):
    - **① Non-consuming receiver.** `ctx.respond_stream(rb) -> Result<http_stream, Error>` consumes
      `rb` ONLY. The fd is lifted into the stream as today; `ctx` stays with the caller, **spent**:
      a later `respond`/`respond_stream` on it is `Err` (not abort — reachable via ordinary control
@@ -462,6 +462,16 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      pre-stream 4xx/5xx path — validation happens inside the pump, `reject` answers it.
    - `send`/`finish`/Drop/poison semantics above are otherwise unchanged; `framed` (1.0/1.1) is
      chosen at `respond_stream` time as today and baked into the stored head.
+   - **Shipped record.** Runtime: `HttpStream.pending_head` (taken by the first `send`/`finish`
+     write attempt — committed even if that write fails; head + first chunk / head + terminator go
+     out in ONE write), `align_rt_http_stream_reject`, and spent-fd (`fd < 0`) `Err` checks in both
+     `respond` and `respond_stream`; a validation `Err` from `respond_stream` leaves the ctx
+     UNSPENT (the caller can still `respond` an error). Language: `s.reject(rb)` via
+     `ExprKind::HttpStreamReject`/`Rvalue::HttpStreamReject` (both consumed, MIR nulls both slots);
+     `HttpRespondStream` now nulls only `rb`. Tests: `align_runtime` unit
+     (lazy-head/reject/spent-ctx contracts) + `m12_http_stream.rs` (13: borrow-then-stream
+     `ctx.path()` mid-pump, spent-ctx `respond` → `Err` E2E, reject → normal-400 E2E, late reject →
+     `Err` + truncation, move-gates for reject).
 
 ## Known v1 limitations (Slice 2/3/5)
 

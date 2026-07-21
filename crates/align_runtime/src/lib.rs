@@ -15045,6 +15045,11 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     let (Some(c), Some(r)) = (ctx_owned, rb_owned) else {
         return AL_INVALID; // a null handle — both `Drop` here (fd closed, buffers freed)
     };
+    // A SPENT ctx — `respond_stream` already lifted the fd into a stream. Plain `Err` (the stream
+    // owns the connection now; http.md item 8 ①).
+    if c.fd < 0 {
+        return AL_INVALID;
+    }
     let bytes = match http_serialize_response(&r) {
         Ok(b) => b,
         Err(s) => return s, // `c` drops → the accepted fd is closed
@@ -15055,27 +15060,37 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
 }
 
 // ---------------------------------------------------------------------------------------------
-// std.http — SSE / chunked streaming response (http.md item 7). `ctx.respond_stream(rb)` writes the
-// response head (with `Transfer-Encoding: chunked` for a 1.1 client, or close-delimited raw framing
-// for a 1.0 client), lifts the accepted fd out of the ctx, and hands back an owned `http_stream`. The
-// caller then `s.send(chunk)`s each token (one chunk frame, one write) and `s.finish()`es (the sole
-// clean terminator: `0\r\n\r\n` in framed mode, then close). Drop is **close-only** — no terminal
-// write ever (abrupt close is chunked's own truncation signal, and with no write deadline a terminal
-// write to a stalled peer would block the single accept loop). **All ops Impure** (network syscalls).
+// std.http — SSE / chunked streaming response (http.md items 7 + 8). `ctx.respond_stream(rb)`
+// validates + serializes the response head (with `Transfer-Encoding: chunked` for a 1.1 client, or
+// close-delimited raw framing for a 1.0 client), lifts the accepted fd out of the ctx — the ctx
+// itself stays with the caller, SPENT — and hands back an owned `http_stream` holding the head
+// UNWRITTEN (lazy head, item 8 ②). The first `s.send(chunk)` (or `finish`) writes the head, then
+// each `send` is one chunk frame, one write; `s.finish()` is the sole clean terminator (`0\r\n\r\n`
+// in framed mode, then close). Before anything is sent, `s.reject(rb)` (item 8 ③) discards the head
+// and answers with a complete NORMAL response instead — the stream route's pre-stream 4xx window.
+// Drop is **close-only** — no terminal write ever (abrupt close is chunked's own truncation signal,
+// and with no write deadline a terminal write to a stalled peer would block the single accept
+// loop). **All ops Impure** (network syscalls).
 // ---------------------------------------------------------------------------------------------
 
 /// A `http_stream` (`std.http`) — the streaming-response handle from `ctx.respond_stream(rb)`. An
 /// owned **Move** handle owning the accepted socket fd (lifted out of the `http_request_ctx`; it
 /// borrows nothing else from the ctx — free-standing). `framed` selects one chunk frame per `send`
 /// (HTTP/1.1, `Transfer-Encoding: chunked`) vs. raw payload bytes (HTTP/1.0, close-delimited);
-/// `poisoned` is latched by any failed `send` so `finish` skips the terminal write. `Drop` closes the
-/// fd with **no** terminal write (http.md item 7's settled amendment).
+/// `pending_head` holds the serialized-but-unwritten response head (lazy head — taken by the first
+/// `send`/`finish` write attempt, or discarded by `reject`); `poisoned` is latched by any failed
+/// `send` so `finish` skips the terminal write. `Drop` closes the fd with **no** terminal write
+/// (http.md item 7's settled amendment).
 pub struct HttpStream {
     fd: i32,
     /// `true` → chunked framing (1.1); `false` → raw close-delimited bytes (1.0).
     framed: bool,
     /// Latched by any failed `send`; makes `finish` skip the `0\r\n\r\n` terminator and return `Err`.
     poisoned: bool,
+    /// The serialized head, not yet on the wire. `Some` until the first `send`/`finish` write
+    /// attempt takes it (committed even if that write then fails — bytes may be on the wire);
+    /// `reject` is legal exactly while this is `Some`.
+    pending_head: Option<Vec<u8>>,
 }
 
 impl Drop for HttpStream {
@@ -15108,18 +15123,23 @@ fn http_push_chunk_size_hex(buf: &mut Vec<u8>, mut n: usize) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
-/// `ctx.respond_stream(rb)` — begin a streaming response: serialize `rb`'s head (shared with
-/// `respond` via [`http_serialize_head`]) plus the transfer-framing header, write it in one write,
-/// lift the accepted fd out of `ctx`, and write the owned `http_stream` handle to `*out` (returning
-/// `0`); else a mapped status leaving `*out` null. **Consumes BOTH** `ctx` and `rb` (the language
-/// moved them in, nulling both caller slots — the runtime frees them). `rb` must be **header-only**: a
-/// body already set is a programmer contract bug → **abort** (`respond` is the bodied path). A 1.1
-/// request gets `Transfer-Encoding: chunked`; a 1.0 request cannot be chunked, so the stream is
-/// close-delimited raw (no TE header). Errors: `AL_INVALID` for a bad status / caller framing header,
-/// or the head-write `send` errno; the fd is closed on **every** failure path (via the ctx `Drop`).
+/// `ctx.respond_stream(rb)` — begin a streaming response: validate + serialize `rb`'s head (shared
+/// with `respond` via [`http_serialize_head`]) plus the transfer-framing header, lift the accepted
+/// fd out of `ctx`, and write the owned `http_stream` handle — holding the head **unwritten** — to
+/// `*out` (returning `0`); else a mapped status leaving `*out` null. **Consumes `rb` ONLY** (the
+/// language moved it in, nulling its caller slot — the runtime frees it); `ctx` is **borrowed**
+/// (http.md item 8 ①): on success it stays with the caller **spent** (fd lifted → a later
+/// `respond`/`respond_stream` on it returns `AL_INVALID`; its `Drop` frees the parse buffer and
+/// skips the fd close), so its `method`/`path`/`header`/`body` views stay valid for the whole pump.
+/// The head is **lazy** (item 8 ②): nothing reaches the client until the first `send`/`finish` —
+/// the price of the `reject` window. `rb` must be **header-only**: a body already set is a
+/// programmer contract bug → **abort** (`respond` is the bodied path). A 1.1 request gets
+/// `Transfer-Encoding: chunked`; a 1.0 request cannot be chunked, so the stream is close-delimited
+/// raw (no TE header). Errors (`AL_INVALID`: a spent ctx, a bad status / caller framing header)
+/// leave the ctx **unspent** — the caller may still `respond` a normal error response.
 ///
 /// # Safety
-/// `ctx` a pointer from [`align_rt_http_accept`] (moved in — freed here), or null; `rb` a pointer from
+/// `ctx` a pointer from [`align_rt_http_accept`] (borrowed — NOT freed), or null; `rb` a pointer from
 /// [`align_rt_http_response_new`] (moved in — freed here), or null; `out` must point to a writable
 /// `*mut HttpStream` slot (or be null).
 #[unsafe(no_mangle)]
@@ -15128,17 +15148,25 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
     rb: *mut ResponseBuilder,
     out: *mut *mut HttpStream,
 ) -> i32 {
-    // Take ownership of BOTH moved-in handles FIRST, so every early return frees them (mirror
-    // `respond`): the ctx's `Drop` closes its fd; the builder's `Drop` frees its buffers.
-    let ctx_owned = if ctx.is_null() { None } else { Some(unsafe { Box::from_raw(ctx) }) };
+    // Own the ONLY moved-in handle FIRST, so every early return frees it (the builder's `Drop`
+    // frees its buffers). The ctx is borrowed — never freed here.
     let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
     if out.is_null() {
-        return AL_INVALID; // both `Drop` here (fd closed, buffers freed)
+        return AL_INVALID; // `rb` `Drop`s here (buffers freed)
     }
     unsafe { *out = core::ptr::null_mut() };
-    let (Some(mut c), Some(r)) = (ctx_owned, rb_owned) else {
-        return AL_INVALID; // a null handle — both `Drop` here
+    let Some(r) = rb_owned else {
+        return AL_INVALID;
     };
+    if ctx.is_null() {
+        return AL_INVALID; // `rb` `Drop`s here
+    }
+    let c = unsafe { &mut *ctx };
+    // A SPENT ctx — an earlier `respond`/`respond_stream` already took the connection. Plain `Err`
+    // (not abort): reachable via ordinary control flow, unlike the bodied-rb contract bug below.
+    if c.fd < 0 {
+        return AL_INVALID;
+    }
     // `rb` must be header-only. A set body is `respond`'s job, not a streamed response — a
     // code-structure bug (the `respond`/`rand.range` abort class, not client data). Abort.
     if r.body.is_some() {
@@ -15148,34 +15176,32 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
     // header + the terminating blank line. A 1.1 request → chunked; a 1.0 request → raw (no TE).
     let mut head = match http_serialize_head(&r) {
         Ok(b) => b,
-        Err(s) => return s, // `c` drops → the accepted fd is closed
+        Err(s) => return s, // ctx unspent — the caller can still `respond` an error
     };
     let framed = c.http11;
     if framed {
         head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
     head.extend_from_slice(b"\r\n");
-    // One SIGPIPE-safe write of the head.
-    let rc = unsafe { http_send_all(c.fd, &head) };
-    if rc != 0 {
-        return rc; // `c` drops → the accepted fd is closed
-    }
-    // Lift the fd out of the ctx (so the ctx's `Drop` does NOT close it — the stream owns it now),
-    // then drop the ctx (freeing its request buffer).
+    // Lift the fd out of the ctx (its `Drop` then skips the close — the stream owns the fd now; the
+    // ctx keeps its parse buffer alive for the caller's views). The head is stored, not written.
     let fd = c.fd;
     c.fd = -1;
-    drop(c);
-    unsafe { *out = Box::into_raw(Box::new(HttpStream { fd, framed, poisoned: false })) };
+    unsafe { *out = Box::into_raw(Box::new(HttpStream { fd, framed, poisoned: false, pending_head: Some(head) })) };
     0
 }
 
-/// `s.send(chunk)` — write one streamed chunk. **Framed** (1.1): one chunk frame (lowercase-hex
-/// length, CRLF, payload, CRLF) assembled in ONE buffer and sent in ONE `http_send_all` write.
-/// **Raw** (1.0): the payload bytes unframed, one write. **`send("")` (an empty chunk) is a no-op
-/// returning `0`** — a zero-length chunk is the protocol TERMINATOR, and an empty output step is
-/// foreseeable gateway data (a multi-byte codepoint split across tokens detokenizes to zero bytes),
-/// not a bug. On a write error the stream is **poisoned** (so `finish` skips the terminator) and the
-/// errno returned. Borrows `s` (mutated in place — the poison latch); never consumed.
+/// `s.send(chunk)` — write one streamed chunk, **flushing the lazy head first** if this is the
+/// stream's first write (head + first chunk assembled in the SAME buffer — still one write; the
+/// head is committed by the attempt even if the write fails, closing the `reject` window).
+/// **Framed** (1.1): one chunk frame (lowercase-hex length, CRLF, payload, CRLF) assembled in ONE
+/// buffer and sent in ONE `http_send_all` write. **Raw** (1.0): the payload bytes unframed, one
+/// write. **`send("")` (an empty chunk) is a no-op returning `0`** — a zero-length chunk is the
+/// protocol TERMINATOR, and an empty output step is foreseeable gateway data (a multi-byte
+/// codepoint split across tokens detokenizes to zero bytes), not a bug; it does NOT flush the head
+/// (nothing to write), so the `reject` window stays open. On a write error the stream is
+/// **poisoned** (so `finish` skips the terminator) and the errno returned. Borrows `s` (mutated in
+/// place — the poison latch); never consumed.
 ///
 /// # Safety
 /// `s` must be a valid `HttpStream` (or null); `ptr`/`len` a valid byte range (or `{null,<=0}`).
@@ -15196,7 +15222,14 @@ pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *con
     if st.poisoned {
         return AL_INVALID;
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(chunk.len() + 20);
+    // The lazy head rides the first real write (taken NOW — committed even if the write fails:
+    // partial bytes may be on the wire, so `reject` can no longer answer with a normal response).
+    let head = st.pending_head.take();
+    let head_len = head.as_ref().map_or(0, Vec::len);
+    let mut buf: Vec<u8> = Vec::with_capacity(head_len + chunk.len() + 20);
+    if let Some(h) = head {
+        buf.extend_from_slice(&h);
+    }
     if st.framed {
         http_push_chunk_size_hex(&mut buf, chunk.len());
         buf.extend_from_slice(b"\r\n");
@@ -15213,10 +15246,12 @@ pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *con
 }
 
 /// `s.finish()` — the SOLE clean terminator. **Consumes** `s` (the language moved it in, nulling the
-/// caller slot — the runtime frees it). **Framed + not poisoned:** write `0\r\n\r\n` (trailers omitted,
-/// conformant per RFC 9112 §7.1), close the fd (via `Drop`), surface any write errno. **Raw + not
-/// poisoned:** just close (close IS the 1.0 terminator), return `0`. **Poisoned:** skip the terminal
-/// write, close, return `AL_INVALID` (the stream did not terminate cleanly). A null handle → `AL_INVALID`.
+/// caller slot — the runtime frees it). Flushes the lazy head first if nothing was ever sent (an
+/// empty response body is a legal stream — head + terminator go out in ONE write). **Framed + not
+/// poisoned:** write `0\r\n\r\n` (trailers omitted, conformant per RFC 9112 §7.1), close the fd (via
+/// `Drop`), surface any write errno. **Raw + not poisoned:** write the head if still pending, then
+/// close (close IS the 1.0 terminator). **Poisoned:** skip the terminal write, close, return
+/// `AL_INVALID` (the stream did not terminate cleanly). A null handle → `AL_INVALID`.
 ///
 /// # Safety
 /// `s` a pointer from [`align_rt_http_respond_stream`] (moved in — freed here), or null.
@@ -15225,16 +15260,54 @@ pub unsafe extern "C" fn align_rt_http_stream_finish(s: *mut HttpStream) -> i32 
     if s.is_null() {
         return AL_INVALID;
     }
-    let st = unsafe { Box::from_raw(s) }; // consumed — `Drop` closes the fd at scope end
+    let mut st = unsafe { Box::from_raw(s) }; // consumed — `Drop` closes the fd at scope end
     if st.poisoned {
         return AL_INVALID; // a failed `send` already broke the stream — skip the terminator, close, Err
     }
+    // The lazy head (nothing was ever sent) + the terminator share one buffer, one write.
+    let mut buf = st.pending_head.take().unwrap_or_default();
     if st.framed {
         // The terminal zero-length chunk. `Drop` closes the fd right after (RAII), so surface the errno.
-        unsafe { http_send_all(st.fd, b"0\r\n\r\n") }
-    } else {
-        0 // raw mode: close (via `Drop`) IS the terminator
+        buf.extend_from_slice(b"0\r\n\r\n");
     }
+    if buf.is_empty() {
+        0 // raw mode, head already written: close (via `Drop`) IS the terminator
+    } else {
+        unsafe { http_send_all(st.fd, &buf) }
+    }
+}
+
+/// `s.reject(rb)` — answer the connection with a complete NORMAL response instead of streaming: the
+/// stream route's only pre-stream 4xx/5xx window (http.md item 8 ③). **Consumes BOTH** `s` and `rb`
+/// (the language moved them in, nulling both caller slots — the runtime frees them). Legal only
+/// while the lazy head is still pending (nothing sent): discards the stored head, serializes `rb`
+/// via `respond`'s serializer ([`http_serialize_response`] — `Content-Length` + body), writes it in
+/// one write, and closes (via `Drop`). After the first send — or on a poisoned stream — returns
+/// `AL_INVALID` and just closes (abrupt close; the committed head cannot be unsaid). A serialize
+/// error (bad status / caller framing header) closes with nothing written.
+///
+/// # Safety
+/// `s` a pointer from [`align_rt_http_respond_stream`] (moved in — freed here), or null; `rb` a
+/// pointer from [`align_rt_http_response_new`] (moved in — freed here), or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_reject(s: *mut HttpStream, rb: *mut ResponseBuilder) -> i32 {
+    // Own BOTH moved-in handles FIRST, so every early return frees them (the stream's `Drop` closes
+    // the fd; the builder's `Drop` frees its buffers).
+    let s_owned = if s.is_null() { None } else { Some(unsafe { Box::from_raw(s) }) };
+    let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
+    let (Some(mut st), Some(r)) = (s_owned, rb_owned) else {
+        return AL_INVALID; // a null handle — the non-null one `Drop`s here
+    };
+    // The head is already committed (a first `send` took it — even a failed one may have put bytes
+    // on the wire): a normal response can no longer be written. Close only, `Err`.
+    if st.pending_head.take().is_none() {
+        return AL_INVALID;
+    }
+    let bytes = match http_serialize_response(&r) {
+        Ok(b) => b,
+        Err(code) => return code, // `st` drops → the fd closes, nothing was written
+    };
+    unsafe { http_send_all(st.fd, &bytes) } // `st` drops → close right after the one write
 }
 
 /// Free a `http_stream`, closing its socket fd (via `Drop`, close-only — NO terminal write). Null-safe.
@@ -24722,7 +24795,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // A stream whose `poisoned` flag is set returns Err from finish and does not write `0\r\n\r\n`.
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let fd = a.into_raw_fd();
-        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: true }));
+        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: true, pending_head: None }));
         assert_eq!(unsafe { align_rt_http_stream_finish(s) }, AL_INVALID, "poisoned finish returns Err");
         // `fd` was closed by finish's Drop; a second close must fail (already closed → no leak).
         assert_eq!(unsafe { close(fd) }, -1, "the stream's fd was closed by finish");
@@ -24738,9 +24811,15 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(b); // peer gone → a write on `a` eventually errors (EPIPE / ECONNRESET)
         let fd = a.into_raw_fd();
-        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: false }));
+        let s = Box::into_raw(Box::new(HttpStream {
+            fd,
+            framed: true,
+            poisoned: false,
+            pending_head: Some(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
+        }));
         assert_eq!(unsafe { align_rt_http_stream_send(s, b"".as_ptr(), 0) }, 0, "empty send is Ok");
         assert!(!unsafe { &*s }.poisoned, "empty send never wrote, so never poisoned");
+        assert!(unsafe { &*s }.pending_head.is_some(), "empty send does not flush the lazy head (reject window stays open)");
         // A real non-empty send now DOES write; against a dropped peer it errors and poisons. (A single
         // buffered write may succeed before the peer-gone error surfaces, so drive until it errors.)
         let mut errored = false;
@@ -24753,6 +24832,133 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert!(errored, "a send to a dead peer eventually errors");
         assert!(unsafe { &*s }.poisoned, "a failed send poisons the stream");
         unsafe { align_rt_http_stream_free(s) };
+    }
+
+    /// The lazy head (http.md item 8 ②) rides the first real `send` in ONE write (head + first
+    /// chunk), and a stream `finish`ed without any send still writes head + terminator.
+    #[test]
+    fn http_stream_lazy_head_flushes_on_first_send_and_on_finish() {
+        use std::io::Read;
+        use std::os::unix::io::IntoRawFd;
+        // First send flushes head + chunk together.
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.into_raw_fd();
+        let s = Box::into_raw(Box::new(HttpStream {
+            fd,
+            framed: true,
+            poisoned: false,
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
+        }));
+        assert_eq!(unsafe { align_rt_http_stream_send(s, b"hi".as_ptr(), 2) }, 0);
+        assert!(unsafe { &*s }.pending_head.is_none(), "first send committed the head");
+        assert_eq!(unsafe { align_rt_http_stream_finish(s) }, 0);
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).expect("read");
+        assert_eq!(got, b"HEAD\r\n\r\n2\r\nhi\r\n0\r\n\r\n");
+        // A send-less finish writes head + terminator (an empty streamed body is legal).
+        let (a2, mut b2) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd2 = a2.into_raw_fd();
+        let s2 = Box::into_raw(Box::new(HttpStream {
+            fd: fd2,
+            framed: true,
+            poisoned: false,
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
+        }));
+        assert_eq!(unsafe { align_rt_http_stream_finish(s2) }, 0);
+        let mut got2 = Vec::new();
+        b2.read_to_end(&mut got2).expect("read");
+        assert_eq!(got2, b"HEAD\r\n\r\n0\r\n\r\n");
+    }
+
+    /// `s.reject(rb)` (http.md item 8 ③): before anything is sent it discards the stored head and
+    /// writes `rb` as a complete NORMAL response; after the head is committed it returns `Err` and
+    /// just closes. Both paths free both handles (fd closed, no leak).
+    #[test]
+    fn http_stream_reject_writes_normal_response_only_before_commit() {
+        use std::io::Read;
+        use std::os::unix::io::IntoRawFd;
+        // Pre-commit: reject writes the normal 400 response (CL + body), never the stored head.
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.into_raw_fd();
+        let s = Box::into_raw(Box::new(HttpStream {
+            fd,
+            framed: true,
+            poisoned: false,
+            pending_head: Some(b"STREAMHEAD\r\n\r\n".to_vec()),
+        }));
+        let rb = Box::into_raw(Box::new(ResponseBuilder {
+            status: 400,
+            headers: Vec::new(),
+            body: Some(b"bad".to_vec()),
+        }));
+        assert_eq!(unsafe { align_rt_http_stream_reject(s, rb) }, 0);
+        assert_eq!(unsafe { close(fd) }, -1, "reject consumed the stream (fd closed)");
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).expect("read");
+        let text = String::from_utf8(got).unwrap();
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"), "normal response head: {text}");
+        assert!(text.contains("Content-Length: 3\r\n") && text.ends_with("\r\n\r\nbad"), "CL + body: {text}");
+        assert!(!text.contains("STREAMHEAD"), "the stored stream head was discarded");
+        // Post-commit (head taken by a send): reject is Err, closes, writes nothing more.
+        let (a2, mut b2) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd2 = a2.into_raw_fd();
+        let s2 = Box::into_raw(Box::new(HttpStream { fd: fd2, framed: false, poisoned: false, pending_head: None }));
+        let rb2 = Box::into_raw(Box::new(ResponseBuilder { status: 400, headers: Vec::new(), body: None }));
+        assert_eq!(unsafe { align_rt_http_stream_reject(s2, rb2) }, AL_INVALID);
+        assert_eq!(unsafe { close(fd2) }, -1, "reject consumed the stream even on Err");
+        let mut got2 = Vec::new();
+        b2.read_to_end(&mut got2).expect("read");
+        assert!(got2.is_empty(), "post-commit reject writes nothing");
+    }
+
+    /// `respond_stream` borrows the ctx (http.md item 8 ①): on success the ctx stays with the
+    /// caller SPENT (fd lifted, parse buffer alive), and a later `respond`/`respond_stream` on it is
+    /// a plain `Err`. On a validation error the ctx is left UNSPENT (the caller can still respond).
+    #[test]
+    fn http_respond_stream_borrows_and_spends_the_ctx() {
+        use std::os::unix::io::IntoRawFd;
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.into_raw_fd();
+        let mut ctx = HttpRequestCtx {
+            fd,
+            buf: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            method_start: 0,
+            method_len: 3,
+            target_start: 4,
+            target_len: 1,
+            headers: Vec::new(),
+            body_start: 18,
+            body_len: 0,
+            http11: true,
+        };
+        // A bad rb (caller framing header) fails WITHOUT spending the ctx.
+        let bad = Box::into_raw(Box::new(ResponseBuilder {
+            status: 200,
+            headers: vec![("Content-Length".to_string(), "5".to_string())],
+            body: None,
+        }));
+        let mut out: *mut HttpStream = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_respond_stream(&mut ctx, bad, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        assert_eq!(ctx.fd, fd, "a validation error leaves the ctx unspent");
+        // Success lifts the fd (ctx spent) and stores the head unwritten.
+        let rb = Box::into_raw(Box::new(ResponseBuilder { status: 200, headers: Vec::new(), body: None }));
+        assert_eq!(unsafe { align_rt_http_respond_stream(&mut ctx, rb, &mut out) }, 0);
+        assert!(!out.is_null());
+        assert_eq!(ctx.fd, -1, "success spends the ctx (fd lifted into the stream)");
+        assert!(unsafe { &*out }.pending_head.is_some(), "the head is lazy — nothing written yet");
+        // A later respond_stream on the spent ctx is a plain Err (rb still freed).
+        let rb2 = Box::into_raw(Box::new(ResponseBuilder { status: 200, headers: Vec::new(), body: None }));
+        let mut out2: *mut HttpStream = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_respond_stream(&mut ctx, rb2, &mut out2) }, AL_INVALID);
+        assert!(out2.is_null());
+        // A later respond on the spent ctx is a plain Err too (respond consumes the ctx — box it
+        // like the language would; its Drop must skip the lifted fd).
+        let boxed = Box::into_raw(Box::new(ctx));
+        let rb3 = Box::into_raw(Box::new(ResponseBuilder { status: 200, headers: Vec::new(), body: None }));
+        assert_eq!(unsafe { align_rt_http_respond(boxed, rb3) }, AL_INVALID);
+        unsafe { align_rt_http_stream_free(out) };
+        drop(b);
     }
 
     /// The five inbound smuggling guards each reject with `Invalid`.

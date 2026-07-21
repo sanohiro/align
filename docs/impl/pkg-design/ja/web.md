@@ -362,8 +362,12 @@ v1 の `serve` は逐次 — **開いた stream は他の全 client を飢えさ
    `array<i64>`（`http_stream` の代役）を値渡しで match 抽出した fn payload に通し、二重 free が
    ないこと（signal 終了ではなく完走）と move-after-use 拒否を検証。実 `http_stream` receiver は
    enabler 4 待ち。
-4. **std.http `respond_stream` の作り直し**（上記変更①–③）— `docs/impl/std-design/http.md` に
-   記録; M12 テストを新 receiver 形に更新（pre-release: 完全置換、compat パスなし）。**未完了。**
+4. **std.http `respond_stream` の作り直し — 完了**（変更①–③、2026-07-21 出荷）。ctx は借用され
+   成功時に SPENT で残る（以後の `respond`/`respond_stream` は `Err`; 検証 `Err` は未 spent のまま）、
+   head は遅延（stream に保存し最初の `send`/`finish` が書く）、`s.reject(rb)` が stream 前に完結した
+   通常レスポンスで応える。出荷記録の全文は `docs/impl/std-design/http.md` item 8; M12 テストは完全
+   置換（`m12_http_stream.rs`、13 本 — pump 中の `ctx.path()` 読みを含む。これは enabler 5 が必要と
+   する stream ハンドラの借用形そのものである）。
 
 ### バックログ（記録のみ、v1 外）
 
