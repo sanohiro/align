@@ -27,7 +27,15 @@ module pkg.web.types
 // `body` is the request body as a zero-copy `slice<u8>` view into the request buffer (empty for a
 // bodyless request), read once by `serve` when it builds the Ctx — `web.body(c)` returns it and
 // `web.body_str(c)` UTF-8-validates it into a `str` view.
-pub Ctx { method: str, path: str, query: str, pattern: str, body: slice<u8> }
+//
+// `headers` is std.http's detached header-table view (`ctx.headers()`, std-design/http.md item 10) —
+// a Copy, non-owning value whose representation IS the request-context pointer, so carrying it costs
+// one pointer and no allocation. It is the one accessor that cannot ride a stored span: the header
+// NAME is not known until the handler asks, so the value being borrowed is the whole parsed table.
+// `web.header(c, name)` forwards to `c.headers.get(name)`; pkg.web ships NO lookup of its own (a
+// second RFC 9110 implementation here would be against One way). `http_headers` is a global surface
+// type name, so this module stays the dependency-free leaf it is designed to be.
+pub Ctx { method: str, path: str, query: str, pattern: str, body: slice<u8>, headers: http_headers }
 
 // The two handler shapes, one route table (the Align-idiomatic or-kind — a sum type, NOT two fn
 // fields with filler sentinels, and NOT a second route table that would split priority/405 across

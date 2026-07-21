@@ -45,7 +45,14 @@ srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes 
                                              // before accepting a new one (item 9 ②) — same surface
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
-ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
+ctx.headers() -> http_headers                // the parsed header table as a Copy, non-owning VIEW
+                                             // (region-bound to ctx, like ctx.body(); item 10).
+                                             // A struct field type, so a Copy per-request context
+                                             // can carry it — `http_headers` is a GLOBAL type name
+hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive lookup; the returned
+                                             // str views the request buffer and INHERITS `hs`'s
+                                             // region (so a wrapper taking the view through a
+                                             // parameter compiles — item 10 ④)
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -219,8 +226,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    mirror of `HttpResponse` R1 — streaming 32 KiB reads to the head's end + Content-Length body
    framing, reusing the Incomplete/Invalid split and the 256 KiB-head / 128-header / 1 GiB-body caps;
    a malformed request closes that conn and returns `Error.Invalid`, the listener stays alive);
-   `ctx.method()/path()` (`str` views), `ctx.header(name)` (case-insensitive `Option<str>` view),
-   `ctx.body()` (`slice<u8>` view) — all region-bound to `ctx` (#297); `http.response(status)` ->
+   `ctx.method()/path()` (`str` views), `ctx.headers()` (a Copy `http_headers` view of the parsed
+   header table; `hs.get(name)` is the case-insensitive `Option<str>` lookup — item 10, which
+   REPLACED `ctx.header(name)`), `ctx.body()` (`slice<u8>` view) — all region-bound to `ctx` (#297); `http.response(status)` ->
    `response_builder` (Move, distinct Ty + display name from the parsed `response`) + `rb.header(name,
    value)` (bound receiver, P6 CR/LF/NUL **abort**) + `rb.body(data)` (optional); `ctx.respond(rb) ->
    Result<(), Error>` (**consumes BOTH** ctx and rb — MIR nulls both slots like `cl.request(req)`;
@@ -673,8 +681,10 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      the parked connection. One-request-per-connection clients must say `Connection: close` (the
      driver tests' shared `one_shot` helper) or frame their read by `Content-Length`.
 
-10. **`ctx.headers()` — the detached header-table view — DESIGNED 2026-07-21, not yet built**
-    (consumer = `pkg.web`'s `web.header(c, name)`, `pkg-design/web.md` → ctx accessors).
+10. **`ctx.headers()` — the detached header-table view — SHIPPED 2026-07-21** (branch
+    `http-headers-view`; consumer = `pkg.web`'s `web.header(c, name)`, `pkg-design/web.md` → ctx
+    accessors). The design below is the record; ①–⑨ shipped as written, and **What actually shipped**
+    at the end records the four places implementation taught something the design did not say.
 
     **The problem, precisely.** A framework's per-request context is a **Copy struct of views that
     owns nothing** — pkg.web's `Ctx` exists in that shape for load-bearing reasons (an owning `Ctx`
@@ -790,6 +800,53 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
       breakdown), its ja mirror, `docs/open-questions.md`, and the compiler sites — the method
       dispatch arm, `check_http_ctx_method`'s `"header"` case, and the "try method / path / header /
       …" suggestion string. `rb.header` / `r.header` / `resp.header` are different receivers and stay.
+    - **What actually shipped (2026-07-21) — including where the design was incomplete.** ①–⑧ are as
+      designed: `Ty::HttpHeaders` (Copy, `tracks_region`, `ty_may_borrow`, no `Scalar`, its own
+      `(8, 8)` arm), `ExprKind::HttpCtxHeaders` lowering to `Rvalue::Use`, the existing
+      `HttpCtxHeader` node re-pointed at the view, the region split (`Frame` cap on `headers()`,
+      inherit on `get`), the `hs.get` dispatch arm above `check_box_get`, Pure, and **zero** new
+      runtime code. `Ty::HttpRequestCtx`'s 16-vs-8 over-report is fixed with it, and
+      `sema_and_codegen_struct_layout_agree` gained rows for a Move-handle field, a `http_headers`
+      field, a `Ty::Fn` field, a `slice<T>` field and the pkg.web `Ctx` shape itself. Four
+      corrections to the design's own account:
+      - **⑤ under-counts the compiler-forced passes for the new `ExprKind`.** `region_of` and
+        `slice_is_local` are both exhaustive over `ExprKind`, so the *region* rule — the one the
+        whole design turns on — is **fail-closed**, not fail-open. The fail-open surface is only
+        what ⑤ names at the `Ty` level (`ty_may_borrow`, `scalar_type`) plus the one `ExprKind` tail
+        it correctly identifies (`borrow_sources_inner`). Each was mutation-checked: dropping
+        `ty_may_borrow` or the `borrow_sources_inner` arm is caught by the bare-local
+        use-after-`respond` test **and** the cross-iteration test; dropping the `scalar_type` arm
+        breaks every pkg.web E2E; dropping `tracks_region`, `region_of` or `slice_is_local` fails
+        the build.
+      - **⑤'s "tailored diagnostic" needed TWO sites, not one.** There are two `payload_scalar`s —
+        a free one (with a `what` label) and a `Checker` method — and the method one hardcoded
+        `"Option payload"` for every caller, so an *array element* rejection reported itself as an
+        Option payload. The method now takes the position it is checking, which fixes that
+        pre-existing mislabel for every type, not just this one.
+      - **The test matrix's "cannot survive its ctx across a `serve` iteration" is only half true, and
+        the other half is a pre-existing hole.** `MoveCheck` ends a borrow generation when the owner
+        is **moved or reassigned**, not when it is **dropped at an inner scope's end**, and
+        `Region::Frame` cannot tell "this frame" from "this iteration". The pkg.web shape is safe
+        because `ctx.respond(rb)` MOVES the handle every pass — that case is rejected. But an inner
+        scope that merely lets the ctx drop (a loop body, or an `arena {}` block) leaks the view into
+        what follows, and this is general to every view over a Move handle (reproduced identically on
+        a plain `str` from `ctx.path()`). Item 10 changes only the blast radius, and not reliably:
+        here the dangling value IS the freed `http_request_ctx` pointer, which
+        `align_rt_http_ctx_header` dereferences to walk the offset table, so the loop shape aborts —
+        while the `arena {}` shape prints a plausible answer and exits 0. Shape-dependent UB, not a
+        loud failure mode to lean on. Pinned as
+        `known_hole_scope_end_drop_does_not_invalidate_a_view` and recorded as **Open** in
+        `docs/open-questions.md` (next to #460, whose dataflow should own the fix). Deliberately not
+        fixed here: it is neither introduced nor widened by this slice, and ending a borrow generation
+        at scope-end drop is its own design.
+      - **⑨'s suggestion string is unreachable for the removed name — so the removed name got its
+        own arm.** The ctx-method dispatch arm is name-guarded (`"method" | "path" | "headers" | …`),
+        so `ctx.header(x)` never reaches `check_http_ctx_method`, and the "try …" list it would have
+        landed in is not where a caller of the old spelling arrives; the generic *"unknown method"*
+        was. Review round 1 asked for the hint to be real, so a `"header" if recv_ty ==
+        Ty::HttpRequestCtx` arm now **errors** with the replacement spelled out — it resolves
+        nothing, so it is a diagnostic, not a compat path. (The suggestion string was updated too; it
+        still serves an unknown method that IS in the guard list.)
 
 ## Known v1 limitations (Slice 2/3/5)
 
@@ -878,3 +935,12 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 - Move-rejection + unbound-receiver rejected
 - import-required
 - `bench/http_client` numbers recorded vs a Rust baseline (R6 — completion is benchmark-gated)
+- item 10 — `ctx.headers()`: the wrapper-through-a-parameter compiles AND reads the table E2E; a
+  view from a LOCAL handle rejected on return / `break` / wrapped in a struct / held across a serve
+  iteration **that consumes the ctx** (the pkg.web shape — the drop-only variant is the pre-existing
+  `MoveCheck` hole pinned as `known_hole_scope_end_drop_does_not_invalidate_a_view`); `hs.get()` after `ctx.respond(rb)` rejected **on a bare local** (a `str` field in an
+  enclosing struct masks the hole); `hs.get()` after `ctx.respond_stream(rb)` compiles and works;
+  case-insensitive hit + miss E2E through `pkg.web`; the view rejected as an `Option`/`Result`
+  payload and as an array element; a struct carrying it stays Copy (no drop emitted) with a
+  `sema_and_codegen_struct_layout_agree` row. (`crates/align_driver/tests/http_headers_view.rs` +
+  `apps_web_root.rs::web_header_reads_the_request_header_table`.)

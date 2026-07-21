@@ -3,8 +3,9 @@
 //! rail's `tcp.listen` — SO_REUSEADDR, backlog 128). `srv.accept()` blocks for one connection, reads +
 //! parses the request (a NEW request-head parser with five inbound smuggling guards: strict CRLF, no
 //! space before colon, no Transfer-Encoding, origin-form target only, method-token/CR-LF-NUL guards) ->
-//! `Result<http_request_ctx, Error>`. `ctx.method()`/`path()`/`header(name)`/`body()` are zero-copy
-//! **views** region-bound to `ctx` (#297). `http.response(status)` builds a Move `response_builder`
+//! `Result<http_request_ctx, Error>`. `ctx.method()`/`path()`/`headers()`/`body()` are zero-copy
+//! **views** region-bound to `ctx` (#297) — `ctx.headers()` yields the detached header-table view
+//! whose `hs.get(name)` is the case-insensitive lookup (item 10; it REPLACED `ctx.header(name)`). `http.response(status)` builds a Move `response_builder`
 //! (`rb.header`/`rb.body`; a CR/LF/NUL in a header **aborts**, P6); `ctx.respond(rb)` **consumes both**
 //! ctx and rb, serializes (auto Content-Length — a bodiless body-allowed status frames as 0; a caller Content-Length is rejected;
 //! `Connection: close`; no Date/Server), one-writes, and closes the fd (v1: one request per conn). All

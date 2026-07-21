@@ -149,20 +149,21 @@ web.param(c, name)   -> str              // named :param capture (fixed slot arr
                                          //   a name not in the pattern is a startup-checkable
                                          //   bug → abort at tree build if statically absent)
 web.query(c, name)   -> Option<str>      // std.http query floor (percent-decoded per RFC 3986)
-web.header(c, name)  -> Option<str>      // NOT SHIPPED YET — enabler DESIGNED, see the note below
+web.header(c, name)  -> Option<str>      // SHIPPED 2026-07-21: RFC 9110 §5.1 case-insensitive
 web.body(c)          -> slice<u8>        // SHIPPED 2026-07-21: `Ctx.body` carries the zero-copy
 web.body_str(c)      -> Result<str, Error>    //   view; body_str = `.as_str()` (validated view)
 //   JSON in: req: ChatReq := json.decode(web.body_str(c)?)?   — core.json, view-decoding
-//   `web.header` blocker (recorded 2026-07-21): the Copy `Ctx` owns nothing, and an
-//   arbitrary-name header lookup cannot ride a single stored view the way `body` does — it needs
-//   either a raw-head `str`/`slice<u8>` view field + a pkg.web-side RFC 9110 lookup (duplicating
-//   std.http's, against One way), or a std.http enabler exposing the parsed header table to a
-//   detached view (the ideal shape — e.g. `ctx.headers()` as a view value the Ctx can carry).
-//   **ENABLER DESIGNED 2026-07-21 — `std-design/http.md` item 10.** The detached view won:
+//   `web.header` rode the std.http enabler `std-design/http.md` item 10, SHIPPED with it. The
+//   problem it solved: the Copy `Ctx` owns nothing, and an arbitrary-name header lookup cannot ride
+//   a single stored view the way `body` does — the header NAME is not known until the handler asks,
+//   so the value being borrowed is the whole parsed table. The two candidates were a raw-head
+//   `str`/`slice<u8>` view field + a pkg.web-side RFC 9110 lookup (duplicating std.http's, against
+//   One way, and an allocation per request to materialize the table), or a std.http enabler
+//   exposing the parsed table as a detached view. The detached view won:
 //   `ctx.headers() -> http_headers` (a Copy, region-bound, non-owning view whose representation IS
 //   the ctx pointer, so `hs.get(name)` reuses the existing runtime lookup and adds no runtime code
 //   at all), `Ctx` carries it as one more field, and `web.header(c, name) = c.headers.get(name)`
-//   forwards. pkg.web ships NO lookup of its own. `ctx.header(name)` is REPLACED by
+//   forwards. pkg.web ships NO lookup of its own. `ctx.header(name)` was REPLACED by
 //   `ctx.headers().get(name)` in std.http so the lookup keeps one spelling.
 
 // responders (Pure; they BUILD a response — they do not touch the request handle, so a handler may
@@ -179,9 +180,9 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 
 ```text
 // types
-web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, and the
-             matched pattern). It owns NOTHING — the request handle stays with `serve`, and the
-             views are valid for the handler call.
+web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
+             pattern, the body view, and the detached header-table view). It owns NOTHING — the
+             request handle stays with `serve`, and the views are valid for the handler call.
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```

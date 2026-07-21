@@ -87,6 +87,11 @@ pub fn query(c: pkg.web.types.Ctx, name: str) -> str =
 pub fn has_query(c: pkg.web.types.Ctx, name: str) -> bool =
   pkg.web.internal.query.has(c.query, name)
 
+// A request header's value, case-insensitively (RFC 9110 §5.1), or `None` when absent. Zero-copy:
+// the returned `str` views the request buffer. The lookup itself is std.http's — `c.headers` is the
+// detached header-table view `serve` minted from the request context, and this forwards to it.
+pub fn header(c: pkg.web.types.Ctx, name: str) -> Option<str> = c.headers.get(name)
+
 // The request body as a zero-copy byte view into the request buffer — empty for a bodyless
 // request. The raw form: a JSON handler goes through `body_str` instead.
 pub fn body(c: pkg.web.types.Ctx) -> slice<u8> = c.body
@@ -224,6 +229,7 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
         query: pkg.web.internal.query.target_query(target),
         pattern: r.pattern,
         body: ctx.body(),
+        headers: ctx.headers(),
       }
       match r.handler {
         Respond(h) => {

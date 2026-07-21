@@ -86,6 +86,13 @@ fn boom(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   return Err(Error.Invalid)\n\
 }\n\
 \n\
+fn show_header(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  match pkg.web.header(c, pkg.web.query(c, \"name\")) {\n\
+    Some(v) => pkg.web.text(v)\n\
+    None => pkg.web.status_text(404, \"absent\")\n\
+  }\n\
+}\n\
+\n\
 fn echo(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   b := pkg.web.body(c)\n\
   if b.len() == 0 {\n\
@@ -110,6 +117,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.get(\"/boom\", boom),\n\
     pkg.web.any(\"/health\", catch_all),\n\
     pkg.web.post(\"/echo\", echo),\n\
+    pkg.web.get(\"/hdr\", show_header),\n\
   ]\n\
   return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
 }\n";
@@ -438,6 +446,44 @@ fn body_and_body_str_read_the_request_body() {
     // The server survived all three (the loop is still up) — a GET after them still answers.
     let alive = exchange(port, b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(alive.starts_with("HTTP/1.1 200 OK\r\n"), "server alive after body requests: {alive:?}");
+}
+
+/// `web.header(c, name)` — the accessor the detached header-table view (std-design/http.md item 10)
+/// enabled. The Copy `Ctx` carries `ctx.headers()` as one more field, and `web.header` forwards to
+/// `c.headers.get(name)`: pkg.web ships NO lookup of its own, so what is asserted here is std.http's
+/// RFC 9110 §5.1 case-insensitive lookup reaching a handler through a by-value context struct.
+///
+/// This is also the end-to-end proof of the region split: the wrapper takes `Ctx` **by parameter**,
+/// which is precisely the shape the old `ctx.header(name)` could not be wrapped in.
+#[test]
+fn web_header_reads_the_request_header_table() {
+    if !backend_available() {
+        return;
+    }
+    let srv = start("web-root-header");
+    let port = srv.port;
+
+    // Exact case.
+    let exact = exchange(port, b"GET /hdr?name=X-Trace HTTP/1.1\r\nHost: h\r\nX-Trace: abc123\r\n\r\n");
+    assert!(exact.starts_with("HTTP/1.1 200 OK\r\n"), "exact-case header: {exact:?}");
+    assert!(exact.ends_with("\r\n\r\nabc123"), "exact-case value: {exact:?}");
+
+    // Differently cased on BOTH sides of the comparison — the lookup is case-insensitive.
+    let folded = exchange(port, b"GET /hdr?name=x-TRACE HTTP/1.1\r\nHost: h\r\nX-tRaCe: abc123\r\n\r\n");
+    assert!(folded.ends_with("\r\n\r\nabc123"), "case-insensitive value: {folded:?}");
+
+    // A header the request does not carry is `None` — distinct from present-but-empty.
+    let miss = exchange(port, b"GET /hdr?name=X-Nope HTTP/1.1\r\nHost: h\r\nX-Trace: abc123\r\n\r\n");
+    assert!(miss.starts_with("HTTP/1.1 404 "), "an absent header is None: {miss:?}");
+    assert!(miss.ends_with("\r\n\r\nabsent"), "the handler's absent answer: {miss:?}");
+
+    // Present but EMPTY is `Some("")`, not `None` — the 200 (not 404) is the assertion.
+    let empty = exchange(port, b"GET /hdr?name=X-Trace HTTP/1.1\r\nHost: h\r\nX-Trace:\r\n\r\n");
+    assert!(empty.starts_with("HTTP/1.1 200 OK\r\n"), "present-but-empty is Some(\"\"): {empty:?}");
+
+    // The framework's own request handle is unaffected — the loop keeps serving.
+    let alive = exchange(port, b"GET /health HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(alive.starts_with("HTTP/1.1 200 OK\r\n"), "server alive after header requests: {alive:?}");
 }
 
 /// W4: HEAD is GET without the response body (RFC 9110 §9.3.2) — an explicit HEAD route wins,
