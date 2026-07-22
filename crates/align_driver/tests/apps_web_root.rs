@@ -162,6 +162,10 @@ impl Server {
 }
 
 fn start(name: &str) -> Server {
+    start_app(name, APP)
+}
+
+fn start_app(name: &str, app: &str) -> Server {
     let port = free_loopback_port();
     let built = build_exe_multi(
         name,
@@ -170,7 +174,7 @@ fn start(name: &str) -> Server {
             ("pkg/web/internal/query.align", QUERY),
             ("pkg/web/types.align", TYPES),
             ("pkg/web.align", WEB_ROOT),
-            ("main.align", APP),
+            ("main.align", app),
         ],
         "main.align",
     );
@@ -188,6 +192,65 @@ fn start(name: &str) -> Server {
         panic!("server exited at startup: {st:?}; stderr: {stderr}");
     }
     Server { child, port, _built: built }
+}
+
+const MIDDLEWARE_APP: &str = "module main\n\
+import std.cli\n\
+import pkg.web\n\
+import pkg.web.types\n\
+\n\
+fn auth(c: pkg.web.types.Ctx) -> pkg.web.types.Middleware {\n\
+  if pkg.web.query(c, \"token\") != \"ok\" {\n\
+    match pkg.web.status_text(401, \"unauthorized\") {\n\
+      Ok(rb) => { return pkg.web.types.Middleware.Respond(rb) }\n\
+      Err(e) => { return pkg.web.types.Middleware.Failed(e) }\n\
+    }\n\
+  }\n\
+  return pkg.web.types.Middleware.Proceed\n\
+}\n\
+\n\
+fn guard(c: pkg.web.types.Ctx) -> pkg.web.types.Middleware {\n\
+  if pkg.web.has_query(c, \"fail\") { return pkg.web.types.Middleware.Failed(Error.Denied) }\n\
+  return pkg.web.types.Middleware.Proceed\n\
+}\n\
+\n\
+fn item(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  return pkg.web.text(pkg.web.param(c, \"id\"))\n\
+}\n\
+\n\
+pub fn main(args: array<str>) -> Result<(), Error> {\n\
+  cmd := cli.command(\"srv\")\n\
+  cmd.flag_i64(\"port\", 0)\n\
+  p := cmd.parse(args)?\n\
+  routes := pkg.web.group_with(\"/api\", [auth, guard], [pkg.web.get(\"/items/:id\", item)])\n\
+  plain := pkg.web.group(\"/unused\", [pkg.web.get(\"/item\", item)])\n\
+  return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
+}\n";
+
+#[test]
+fn grouped_middleware_prefix_short_circuit_error_and_survival() {
+    if !backend_available() {
+        return;
+    }
+    let mut srv = start_app("web-root-middleware", MIDDLEWARE_APP);
+
+    let denied = exchange(srv.port, b"GET /api/items/42 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(denied.starts_with("HTTP/1.1 401 "), "first middleware short-circuits: {denied:?}");
+    assert!(denied.ends_with("unauthorized"), "short-circuit body: {denied:?}");
+
+    let ok = exchange(srv.port, b"GET /api/items/42?token=ok HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(ok.ends_with("\r\n\r\n42"), "prefix routing keeps param capture aligned: {ok:?}");
+
+    let wrong_method = exchange(srv.port, b"POST /api/items/42 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(wrong_method.starts_with("HTTP/1.1 405 "), "grouped path keeps method dispatch: {wrong_method:?}");
+    assert!(wrong_method.contains("Allow: GET\r\n"), "grouped path keeps Allow: {wrong_method:?}");
+
+    let failed = exchange(srv.port, b"GET /api/items/7?token=ok&fail=1 HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(failed.starts_with("HTTP/1.1 500 "), "middleware failure becomes 500: {failed:?}");
+    let alive = exchange(srv.port, b"GET /api/items/8?token=ok HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(alive.ends_with("\r\n\r\n8"), "serve loop survives middleware failure: {alive:?}");
+
+    assert_eq!(srv.stop_and_stderr(), "pkg.web: middleware Failed (GET /api/items/7): Denied\n");
 }
 
 #[test]

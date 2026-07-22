@@ -26,6 +26,72 @@ pub fn seg_end(s: str, start: i64) -> i64 {
   }
 }
 
+fn seg_count(s: str) -> i64 {
+  mut n := 0
+  mut cur := 0
+  loop {
+    if cur >= s.len() { break n }
+    cur = seg_end(s, cur + 1)
+    n = n + 1
+  }
+}
+
+fn route_seg_count(r: pkg.web.types.Route) -> i64 = seg_count(r.prefix) + seg_count(r.pattern)
+
+// Segment `k` of the logical `prefix + pattern` path. Group prefixes and route patterns stay as
+// separate zero-copy views; startup tree construction is the only caller that asks for arbitrary
+// segment numbers.
+fn route_seg(r: pkg.web.types.Route, k: i64) -> str {
+  pn := seg_count(r.prefix)
+  s := if k < pn { r.prefix } else { r.pattern }
+  mut want := if k < pn { k } else { k - pn }
+  mut cur := 0
+  loop {
+    e := seg_end(s, cur + 1)
+    if want == 0 { break s[cur + 1 .. e] }
+    want = want - 1
+    cur = e
+  }
+}
+
+fn route_seg_part(r: pkg.web.types.Route, k: i64) -> i64 = if k < seg_count(r.prefix) { 0 } else { 1 }
+
+fn route_seg_start(r: pkg.web.types.Route, k: i64) -> i64 {
+  pn := seg_count(r.prefix)
+  s := if k < pn { r.prefix } else { r.pattern }
+  mut want := if k < pn { k } else { k - pn }
+  mut cur := 0
+  loop {
+    if want == 0 { break cur + 1 }
+    cur = seg_end(s, cur + 1)
+    want = want - 1
+  }
+}
+
+fn route_label(r: pkg.web.types.Route, part: i64, start: i64, end: i64) -> str {
+  s := if part == 0 { r.prefix } else { r.pattern }
+  s[start..end]
+}
+
+fn same_route_claim(a: pkg.web.types.Route, b: pkg.web.types.Route) -> bool {
+  an := route_seg_count(a)
+  bn := route_seg_count(b)
+  mut k := 0
+  loop {
+    if k >= an && k >= bn { break true }
+    if k >= an || k >= bn { break false }
+    aseg := route_seg(a, k)
+    bseg := route_seg(b, k)
+    if aseg.starts_with(":") {
+      if !bseg.starts_with(":") { break false }
+    } else {
+      if aseg.starts_with("*") { break bseg.starts_with("*") }
+      if bseg.starts_with(":") || bseg.starts_with("*") || aseg != bseg { break false }
+    }
+    k = k + 1
+  }
+}
+
 // A specificity score >= 0 if `path` matches `pattern`, or -1 if it does not. A higher score is a
 // more specific match. The score is **fixed-width base-3, left-aligned to the PATH's segment count
 // D**: position i (left to right) carries weight w_i * 3^(D-1-i) with w = 2 (static), 1 (`:param`),
@@ -102,6 +168,46 @@ pub fn match_score(pattern: str, path: str) -> i64 {
   }
 }
 
+fn route_match_score(r: pkg.web.types.Route, path: str) -> i64 {
+  mut d := 0
+  mut t := 0
+  loop {
+    if t >= path.len() { break }
+    t = seg_end(path, t + 1)
+    d = d + 1
+  }
+  pn := route_seg_count(r)
+  mut k := 0
+  mut xp := 0
+  mut score := 0
+  loop {
+    if k >= pn && xp >= path.len() { break score }
+    if k >= pn || xp >= path.len() { break -1 }
+    pseg := route_seg(r, k)
+    xe := seg_end(path, xp + 1)
+    xseg := path[xp + 1 .. xe]
+    if pseg.starts_with("*") {
+      mut sh := score
+      mut rem := d - k
+      loop {
+        if rem <= 0 { break }
+        sh = sh * 3
+        rem = rem - 1
+      }
+      break sh
+    }
+    if pseg.starts_with(":") {
+      if xe == xp + 1 { break -1 }
+      score = score * 3 + 1
+    } else {
+      if pseg != xseg { break -1 }
+      score = score * 3 + 2
+    }
+    k = k + 1
+    xp = xe
+  }
+}
+
 // Linear-scan dispatch (the reference oracle): return the index of the most specific route in
 // `patterns` that matches `path`, or -1 if none match. Distinct matching patterns have distinct
 // scores, so the highest-scoring match is unique; ambiguous (equal-priority) route sets are a build
@@ -172,11 +278,11 @@ pub fn filled(m: i64, v: i64) -> array<i64> {
 //                            kept as the build's own record of how many edges exist)
 //   [2 + k*cap .. +cap]      column k, in this order:
 //                            0 n_param  1 n_wild   2 n_leaf  3 n_efirst
-//                            4 e_child  5 e_pat    6 e_start 7 e_end
-//                            8 e_next   9 r_next  10 n_elast
+//                            4 e_child  5 e_pat    6 e_part  7 e_start 8 e_end
+//                            9 e_next  10 r_next  11 n_elast
 //
 // Node columns are indexed by node id; edge columns by edge id. An edge LABEL is the zero-copy
-// triple `(e_pat, e_start, e_end)` — a route index plus a byte range into that route's pattern —
+// tuple `(e_pat, e_part, e_start, e_end)` — a route index, prefix/pattern selector, and byte range —
 // so the tree stores no strings at all.
 //
 // **Why this is a separate build step.** Through W4 the columns were rebuilt inside every dispatch:
@@ -200,11 +306,12 @@ fn c_leaf(cap: i64) -> i64 = 2 + 2 * cap
 fn c_efirst(cap: i64) -> i64 = 2 + 3 * cap
 fn c_echild(cap: i64) -> i64 = 2 + 4 * cap
 fn c_epat(cap: i64) -> i64 = 2 + 5 * cap
-fn c_estart(cap: i64) -> i64 = 2 + 6 * cap
-fn c_eend(cap: i64) -> i64 = 2 + 7 * cap
-fn c_enext(cap: i64) -> i64 = 2 + 8 * cap
-fn c_rnext(cap: i64) -> i64 = 2 + 9 * cap
-fn c_elast(cap: i64) -> i64 = 2 + 10 * cap
+fn c_epart(cap: i64) -> i64 = 2 + 6 * cap
+fn c_estart(cap: i64) -> i64 = 2 + 7 * cap
+fn c_eend(cap: i64) -> i64 = 2 + 8 * cap
+fn c_enext(cap: i64) -> i64 = 2 + 9 * cap
+fn c_rnext(cap: i64) -> i64 = 2 + 10 * cap
+fn c_elast(cap: i64) -> i64 = 2 + 11 * cap
 
 // Build the radix tree over the route table: insert each route's pattern segment-by-segment, read
 // straight out of `routes[r].pattern` (a table cannot be projected to a `slice<str>` —
@@ -219,7 +326,7 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
   // it, but `build_tree` is reachable without `validate`, e.g. from the differential tests) has
   // `count_route_segs == 0` and any number of routes.
   cap := count_route_segs(routes) + routes.len() + 2
-  mut t := filled(2 + 11 * cap, -1)
+  mut t := filled(2 + 12 * cap, -1)
   t[0] = cap
   npar := c_param(cap)
   nwil := c_wild(cap)
@@ -227,6 +334,7 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
   efir := c_efirst(cap)
   echi := c_echild(cap)
   epat := c_epat(cap)
+  epart := c_epart(cap)
   esta := c_estart(cap)
   eend := c_eend(cap)
   enex := c_enext(cap)
@@ -239,17 +347,15 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
   loop {
     if r >= np { break }
     rr := routes[r]
-    pat := rr.pattern
     mut node := 0
-    mut cur := 0
+    mut k := 0
+    nseg := route_seg_count(rr)
     loop {
-      if cur >= pat.len() {
+      if k >= nseg {
         if t[nlea + node] == -1 { t[nlea + node] = r }
         break
       }
-      ss := cur + 1
-      se := seg_end(pat, ss)
-      seg := pat[ss..se]
+      seg := route_seg(rr, k)
       if seg.starts_with("*") {
         if t[nwil + node] == -1 { t[nwil + node] = r }
         break
@@ -260,15 +366,13 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
           nc = nc + 1
         }
         node = t[npar + node]
-        cur = se
       } else {
         mut child := -1
         mut j := t[efir + node]
         loop {
           if j < 0 { break }
           rl := routes[t[epat + j]]
-          lp := rl.pattern
-          lab := lp[t[esta + j]..t[eend + j]]
+          lab := route_label(rl, t[epart + j], t[esta + j], t[eend + j])
           if lab == seg {
             child = t[echi + j]
             break
@@ -280,8 +384,11 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
           nc = nc + 1
           t[echi + ec] = child
           t[epat + ec] = r
+          t[epart + ec] = route_seg_part(rr, k)
+          ss := route_seg_start(rr, k)
+          part_text := if t[epart + ec] == 0 { rr.prefix } else { rr.pattern }
           t[esta + ec] = ss
-          t[eend + ec] = se
+          t[eend + ec] = seg_end(part_text, ss)
           // Append at the TAIL of this node's chain, keeping REGISTRATION order. Order cannot
           // change which edge matches (labels at a node are unique — the loop above deduped them),
           // but it decides how many labels a request compares before its own: prepending made a
@@ -298,8 +405,8 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
           ec = ec + 1
         }
         node = child
-        cur = se
       }
+      k = k + 1
     }
     r = r + 1
   }
@@ -319,7 +426,7 @@ pub fn build_tree(routes: slice<pkg.web.types.Route>) -> array<i64> {
       // second one unreachable — `[get("/u/:id"), post("/u/:uid")]` answered `POST /u/7` with a
       // 405 whose `Allow` said `GET`, and an `any` fallback spelled with a different parameter
       // name was silently dead. Both tables pass `validate`.
-      if same_claim(rb.pattern, ra.pattern) {
+      if same_route_claim(rb, ra) {
         t[rnex + a] = b
         break
       }
@@ -359,6 +466,7 @@ fn tree_walk(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str, node:
   se := seg_end(path, ss)
   seg := path[ss..se]
   epat := c_epat(cap)
+  epart := c_epart(cap)
   esta := c_estart(cap)
   eend := c_eend(cap)
   enex := c_enext(cap)
@@ -373,8 +481,7 @@ fn tree_walk(routes: slice<pkg.web.types.Route>, t: slice<i64>, path: str, node:
     // Field projection through a `slice<struct>` index is recorded compiler backlog; it is worth
     // real ns here (see `bench/web_router/README.md`).
     rl := routes[t[epat + j]]
-    lp := rl.pattern
-    lab := lp[t[esta + j]..t[eend + j]]
+    lab := route_label(rl, t[epart + j], t[esta + j], t[eend + j])
     if lab == seg {
       child = t[c_echild(cap) + j]
       break
@@ -483,8 +590,9 @@ fn same_claim(a: str, b: str) -> bool {
 }
 
 // The first problem in `routes`, or "" when the table is well-formed. Checked per route: a known
-// method; a pattern that starts with "/"; `:`/`*` segments with non-empty names, `*` only in the
-// tail segment, and no name used twice in one pattern. Checked per pair: no two routes making the
+// method; a literal group prefix in canonical shape; a pattern that starts with "/"; `:`/`*`
+// segments with non-empty names, `*` only in the tail segment, and no name used twice in one
+// pattern. Checked per pair: no two routes making the
 // same path claim where the second can never win — the same method twice (a duplicate; also the
 // source of a duplicated 405 `Allow` join), or anything after an `any` route on that claim (an
 // empty method answers every method first, so the later row is unreachable).
@@ -495,6 +603,7 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
     if i >= n { break "".clone() }
     ri := routes[i]
     m := ri.method
+    prefix := ri.prefix
     pat := ri.pattern
     if !method_known(m) {
       mut b := builder()
@@ -512,6 +621,24 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
       b.write(" pattern \"")
       b.write(pat)
       b.write("\" must start with \"/\"")
+      break b.to_string()
+    }
+    if prefix.len() > 0 && (!prefix.starts_with("/") || prefix == "/" || prefix.ends_with("/")) {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" group prefix \"")
+      b.write(prefix)
+      b.write("\" must start with \"/\", contain a segment, and not end with \"/\"")
+      break b.to_string()
+    }
+    if prefix.contains(":") || prefix.contains("*") {
+      mut b := builder()
+      b.write("pkg.web: route ")
+      b.write_int(i)
+      b.write(" group prefix \"")
+      b.write(prefix)
+      b.write("\" must contain only literal segments")
       break b.to_string()
     }
     // A stream route's head is built by `serve` from `stream_type`; an empty one would emit a
@@ -588,7 +715,7 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
     loop {
       if j >= n { break }
       rj := routes[j]
-      if same_claim(pat, rj.pattern) {
+      if same_route_claim(ri, rj) {
         if m == rj.method {
           pair_err = "duplicate route"
           pair_at = j
@@ -637,13 +764,7 @@ pub fn count_route_segs(routes: slice<pkg.web.types.Route>) -> i64 {
   loop {
     if r >= n { break total }
     rr := routes[r]
-    p := rr.pattern
-    mut c := 0
-    loop {
-      if c >= p.len() { break }
-      c = seg_end(p, c + 1)
-      total = total + 1
-    }
+    total = total + route_seg_count(rr)
     r = r + 1
   }
 }
@@ -680,7 +801,7 @@ pub fn best_path_route_linear(routes: slice<pkg.web.types.Route>, path: str) -> 
   loop {
     if i >= n { break }
     ri := routes[i]
-    s := match_score(ri.pattern, path)
+    s := route_match_score(ri, path)
     if s > best_score {
       best_score = s
       best = i

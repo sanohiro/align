@@ -909,9 +909,8 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], vi
 ///
 /// Keyed on `Scalar::is_move()` alone — the SAME predicate `drop_enum` uses to pick which payload
 /// fields to free — so the classifier and the drop stay in lockstep. Pass 0c admits only owned
-/// `array<T>` (a flat-freeable `{ptr,len}`) as a Move payload; a Move *struct* payload is rejected
-/// there (it would need a recursive `drop_struct_fields`, which `drop_enum` does not do), so this
-/// never sees one.
+/// `array<T>` (a flat-freeable `{ptr,len}`) and the opaque `response_builder` handle as Move
+/// payloads; a Move *struct* payload is rejected there (it would need recursive field drops).
 pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
     enums.get(id as usize).is_some_and(|e| e.variants.iter().flat_map(|v| v.payload.iter()).any(|s| s.is_move()))
 }
@@ -2997,9 +2996,15 @@ pub fn check_program_with_effects(
                     // smaller than a Move-handle payload. (Generic sum types with a fn payload are still
                     // rejected upstream at the template payload resolver — deferred, no consumer.)
                     Ty::Fn(fid) => payload.push(Scalar::Fn(fid)),
+                    // pkg.web middleware's short-circuit verdict. A response builder is an owned
+                    // opaque handle; the enum's tag-switched drop calls its null-safe free routine.
+                    Ty::ResponseBuilder => payload.push(Scalar::ResponseBuilder),
+                    // The builtin Error is a closed, scalar-only enum and may be carried by a
+                    // framework verdict without opening general enum-in-enum recursion/cycles.
+                    Ty::Enum(id) if id == error_enum_id => payload.push(Scalar::Enum(id)),
                     Ty::Error => {}
                     other => diags.error(
-                        format!("variant payloads must be a primitive scalar, plain struct, owned `array<T>`, or fn value for now, got {}", ty_name(other)),
+                        format!("variant payloads must be a primitive scalar, plain struct, owned `array<T>`, fn value, or supported framework handle for now, got {}", ty_name(other)),
                         t.span(),
                     ),
                 }
@@ -5460,8 +5465,12 @@ impl<'a> EscapeCheck<'a> {
             // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
             // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
             // also borrows its source/input, so it needs the shorter of the two regions.)
-            ExprKind::ArrayToArray { .. }
-            | ExprKind::ArrayPartition { .. }
+            ExprKind::ArrayToArray { source, stages, .. } => {
+                let from_source = Region::arena(depth).shorter(self.region_of(source, depth));
+                stage_capture_exprs(stages)
+                    .fold(from_source, |acc, capture| acc.shorter(self.region_of(capture, depth)))
+            }
+            ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayScan { .. }
             | ExprKind::ArraySort { .. }
@@ -5968,6 +5977,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ResultMapErr { result, .. } => self.slice_is_local(result),
             ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
             ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
+            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.slice_is_local(recv),
             ExprKind::StructLit { fields, .. } => fields.iter().any(|f| self.slice_is_local(f)),
             ExprKind::Field { root, .. } => self.state.local_backed_slice.contains(root),
             ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
@@ -6061,8 +6071,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayChunks { .. }
             | ExprKind::Len(..)
-            | ExprKind::Index { .. }
-            | ExprKind::ElemField { .. }
             | ExprKind::Template(..)
             | ExprKind::JsonDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
@@ -12307,8 +12315,16 @@ impl<'a, 't> Checker<'a, 't> {
             let span = e.span;
             return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
         }
+        let dyn_struct_match = matches!((e.ty, ps),
+            (Ty::DynStructArray(aid, Layout::Aos), Scalar::Struct(pid)) if aid == pid);
+        let dyn_scalar_match = matches!(e.ty, Ty::DynArray(es)
+            if self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)));
+        if dyn_struct_match || dyn_scalar_match {
+            let span = e.span;
+            return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+        }
         if let Ty::Array(es, _) = e.ty
-            && es == ps {
+            && self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)) {
                 // The borrow lowers via the same slot-materialization as a pipeline source,
                 // so the same restriction applies: only a literal or a named local.
                 if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -12322,7 +12338,9 @@ impl<'a, 't> Checker<'a, 't> {
                 return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
             }
         // Already a slice, or a mismatch: let unification report any error.
-        if e.ty != Ty::Slice(ps) {
+        let slice_match = matches!(e.ty, Ty::Slice(es)
+            if self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)));
+        if !slice_match {
             self.constrain(e.ty, Some(Ty::Slice(ps)), e.span);
         }
         e
@@ -13753,7 +13771,9 @@ impl<'a, 't> Checker<'a, 't> {
         // transparently through `Result`/`Option`/tuple/struct wrappers so an `array<Option<slice>>`
         // / `array<Result<slice, Error>>` can't smuggle an arena view past the direct-slice guard
         // (both are also blocked by the composite-payload rule below — this is defense in depth).
-        if ty_mentions_slice(self.resolve(elem_ty), self.structs, self.tuples) {
+        if ty_mentions_slice(self.resolve(elem_ty), self.structs, self.tuples)
+            && !matches!(self.resolve(elem_ty), Ty::Struct(_))
+        {
             self.diags.error(
                 format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
                 span,
@@ -13797,7 +13817,10 @@ impl<'a, 't> Checker<'a, 't> {
                 ));
             }
         }
-        let scalar = self.payload_scalar(elem_ty, "array element", span);
+        let scalar = match self.resolve(elem_ty) {
+            Ty::Fn(fid) => Scalar::Fn(fid),
+            other => self.payload_scalar(other, "array element", span),
+        };
         Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar), pooled: false }, ty: Ty::Array(scalar, n), span }
     }
 
@@ -14820,7 +14843,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `src.….to_array()` — materialize the surviving (scalar) elements into an *owned*
+    /// `src.….to_array()` — materialize the surviving Copy elements into an *owned*
     /// `array<T>`. MMv2 slice 3: the result is arena-bump-allocated (bulk-freed), so it is
     /// only allowed inside an `arena {}`; free-standing (heap + drop) arrives in slice 4.
     fn check_array_to_array(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
@@ -14833,20 +14856,29 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
             return err;
         };
-        let Some(scalar) = ty_to_scalar(elem) else {
-            self.diags.error(
-                format!("'to_array' needs a scalar element, got {} (project a field first)", ty_name(elem)),
-                span,
-            );
-            return err;
+        let out_ty = match elem {
+            Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums) => Ty::DynStructArray(id, Layout::Aos),
+            Ty::Struct(id) => {
+                self.diags.error(
+                    format!("'to_array' cannot collect Move struct '{}' (its fields need per-element drop)", self.structs[id as usize].name),
+                    span,
+                );
+                return err;
+            }
+            _ => {
+                let Some(scalar) = ty_to_scalar(elem) else {
+                    self.diags.error(
+                        format!("'to_array' needs a scalar or Copy struct element, got {}", ty_name(elem)),
+                        span,
+                    );
+                    return err;
+                };
+                Ty::DynArray(scalar)
+            }
         };
-        if matches!(elem, Ty::Struct(_)) {
-            self.diags.error("'to_array' over struct elements is not supported yet (project a field first)".to_string(), span);
-            return err;
-        }
         Expr {
             kind: ExprKind::ArrayToArray { source: Box::new(source), stages, elem },
-            ty: Ty::DynArray(scalar),
+            ty: out_ty,
             span,
         }
     }
@@ -21559,6 +21591,17 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     }
 }
 
+/// A Copy element admitted specifically by arrays/slices. Function values are closure pairs
+/// (`{fn_ptr, env_ptr}`), already represented by `Scalar::Fn`; keeping them out of `ty_to_scalar`
+/// preserves the narrower Option/Result/box payload surface while allowing homogeneous callback
+/// lists such as pkg.web middleware.
+fn collection_scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+    match ty {
+        Ty::Fn(fid) => Some(Scalar::Fn(fid)),
+        _ => scalar_arg(ty, what, false, span, diags),
+    }
+}
+
 /// An `Option`/`Result` payload may not be a **Move struct** (one that owns a `string`/owned field):
 /// the aggregate's drop is scalar-shaped (`payload_is_move` / `move_payload_fields` free a flat
 /// `{ptr,len}`) and does not recurse into a struct's owned fields, so an owned-struct payload would
@@ -21997,7 +22040,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "slice element", false, span, diags) {
+            match collection_scalar_arg(inner, "slice element", span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
@@ -22059,7 +22102,7 @@ fn resolve_type(
                     Ty::Error
                 }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-                _ => match scalar_arg(inner, "array element", false, span, diags) {
+                _ => match collection_scalar_arg(inner, "array element", span, diags) {
                     Some(s) => Ty::DynArray(s),
                     None => Ty::Error,
                 },

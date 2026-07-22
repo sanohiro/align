@@ -35,7 +35,7 @@ module pkg.web.types
 // `web.header(c, name)` forwards to `c.headers.get(name)`; pkg.web ships NO lookup of its own (a
 // second RFC 9110 implementation here would be against One way). `http_headers` is a global surface
 // type name, so this module stays the dependency-free leaf it is designed to be.
-pub Ctx { method: str, path: str, query: str, pattern: str, body: slice<u8>, headers: http_headers }
+pub Ctx { method: str, path: str, query: str, prefix: str, pattern: str, body: slice<u8>, headers: http_headers }
 
 // The two handler shapes, one route table (the Align-idiomatic or-kind — a sum type, NOT two fn
 // fields with filler sentinels, and NOT a second route table that would split priority/405 across
@@ -54,12 +54,34 @@ pub Handler {
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
 }
 
+// A pre-handler verdict. `Result<Option<response_builder>, Error>` cannot be represented by the
+// current non-recursive payload model (the Option alone can), so this or-kind spells the exact same
+// three outcomes without nesting aggregate payloads: `Proceed`, `Respond(rb)`, or `Failed(e)`.
+pub Middleware {
+  Proceed,
+  Respond(response_builder),
+  Failed(Error),
+}
+
+// A middleware chain is wrapped so `Route` can distinguish no middleware without manufacturing a
+// dangling empty slice.
+pub MiddlewareList {
+  handlers: slice<fn(Ctx) -> Middleware>,
+}
+
 // One route: the method it answers, the pattern it matches, and the handler to run. A **Copy**
-// struct — `str` views of literal text, plus a Copy `Handler` — so a route table is an ordinary
-// array value with no ownership story. `method` is the uppercase HTTP method ("GET", "POST", …);
+// struct — `str`/slice views plus a Copy `Handler` — so a route table is ordinary Copy data (the
+// views remain region-tied to their sources). `method` is the uppercase HTTP method ("GET", "POST", …);
 // an empty method matches ANY method, which is how a catch-all/fallback route is written.
 // `stream_type` is the stream head's `Content-Type` — `""` on `Respond` routes (never read).
 //
 // Stream routes ride the SAME table: one radix dispatch, one method resolution, and a stream
 // route's method contributes to a 405's `Allow` like any other row.
-pub Route { method: str, pattern: str, stream_type: str, handler: Handler }
+pub Route {
+  method: str,
+  prefix: str,
+  pattern: str,
+  middleware: Option<MiddlewareList>,
+  stream_type: str,
+  handler: Handler,
+}
