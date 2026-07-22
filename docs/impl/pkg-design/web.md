@@ -554,8 +554,8 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    build-and-match convenience for the differential tests. **Item 3's ideal 1.00× is still not
    met, but its regression gate is now real.** `bench/web_router` compares identical runtime paths
    at identical depths over 6- and 128-route tables, reporting static/param at both sibling-chain
-   ends plus miss. Adjacent AB/BA pairs feed a median paired ratio. Head stays 1.05–1.07×; the
-   remaining **per-node sibling scan** is isolated at 1.87–2.11× on the tail (a node's static edges
+   ends plus miss. Adjacent AB/BA pairs feed a median paired ratio. Local 200k runs put head at
+   1.05–1.07×; the remaining **per-node sibling scan** is isolated at 1.87–2.11× on the tail (a node's static edges
    are a linked chain with a string compare each). Linux x86_64 baseline CI pins head <= 1.35× and
    every shape <= 2.75×; the bounds reject the old depth-mismatched row, O(table) route scans, and
    reversed registration order. One ordering bug was caught before this gate — appending edges at

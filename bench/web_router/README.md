@@ -85,7 +85,8 @@ the remaining sibling-chain slope instead of mixing it with depth and chain posi
   at or below **1.35x**, and every shape at or below **2.75x**. Those bounds leave 28–31% headroom
   over six native/baseline 200k runs while rejecting the old depth-mismatched row (~1.5x), a return
   to O(table) route scans (~20x), and reversed sibling order. A mutation restoring the old two-vs-
-  three-segment mismatch reaches 1.59x and fails the head ceiling.
+  three-segment mismatch reaches 1.59x and fails the head ceiling. The first hosted CI run measured
+  1.14x at the head and 2.23x worst, within those ceilings.
 - **The per-edge `Route` struct copy.** Resolving a label needs one field, but `routes[i].pattern`
   is rejected through a `slice<struct>` (`'arr[i].pattern' needs a struct array or soa`), so the
   walk binds the whole `Route` (four 16-byte views) per sibling. This multiplies the sibling scan;
