@@ -13,12 +13,12 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 
 ```
-6 interleaved blocks x 6666 requests per arm (after 2000 warm-up)
+6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        33048           950
-  align               14.00         703.0           56.0        37459          1164
+  floor                0.00           0.0            0.0        32817           386
+  align                7.00         489.0            0.0        36245           748
 
-  http.get's CPU work above the floor:  4412 ns/req, 14.00 allocations
+  http.get's CPU work above the floor:  3429 ns/req, 7.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -75,9 +75,24 @@ the pool lookup.
 
 ## What it found
 
-**14 allocations and ~4.4 µs of CPU per `http.get`** — a bigger budget than the server path's
-(~2.5 µs after #602–#604). The remaining allocations are the request `String`s (`method`, `url`), the
-response buffer, the parsed head's span `Vec`, and the owned response.
+The original instrument found **14 allocations and ~4.4 µs of CPU per `http.get`** — a bigger budget
+than the server path's (~2.5 µs after #602–#604). The first allocation slice cut that to **7
+allocations and ~3.4 µs**:
+
+- `get` / `post` use static method strings and borrow the ABI URL/body through a request view instead
+  of first building owned `String` / `Vec` fields. A full request builder exposes the same view, so
+  serialization and exchange still have one path.
+- The request serializer computes the exact wire size and reserves once; decimal `Content-Length`
+  rendering no longer allocates a temporary `String`. Growth went from 56 to **0 B/request**.
+- The socket exchange retains the already-parsed head, then moves its header spans and receive
+  buffer directly into the response. It no longer parses the same head twice or copies the complete
+  response bytes into a second `Vec`.
+
+Three consecutive 100k-request runs measured **3362 / 3429 / 3489 ns** above the floor, versus the
+instrument's original **4404 / 4412 / 4509 ns**: about **−1.0 µs (−22%)**, with the allocation count
+exactly 7 in every block. The harness pins 7 as a ceiling; allocation regressions fail instead of
+quietly becoming a new printed baseline. Further cuts now require representation or reuse work
+(header spans, response handle and pool bookkeeping), not another obvious redundant ownership hop.
 
 ### Negative result: read-into-the-response-buffer does NOT transfer from the server
 
