@@ -8,7 +8,9 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
+_Last updated: 2026-07-22, **the protocol-path perf work has an instrument (`bench/http_path`, #601)
+and its first win (#602: the 32 KiB per-request memset is gone, ~−640 ns); before that, the
+scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
 the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
 accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
 (#595) — the hard streaming ordering constraint is LIFTED** — plus **#597, `accept`'s
@@ -63,10 +65,21 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **The 4.1 µs protocol path — attack ALLOCATION, not the syscall.** The speculative-read attempt
-   is a recorded negative result (below). Four-plus allocations per request on a 4.1 µs budget:
-   `http_read_request`'s fresh `Vec`, the header-span `Vec`, the builder's `String`s, the serialize
-   buffer. Price each with `bench/web_e2e` at **`CONNS=1`** (~1% stable; throughput moves 18%).
+1. **Keep going down the protocol path with `bench/http_path` (#601), not `web_e2e`.** The budget is
+   **~3.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
+   CPU). Measured targets, in order of what is known about them:
+   - **The response serialize buffer's 4 `realloc`s** — `http_serialize_head` starts from
+     `Vec::new()` and doubles 8→16→32→64→128. Pre-reserving takes allocations 14 → 10 and measured
+     **−971 / −690 / −1089 / −541 ns across four adjacent A/B pairs** in a scratch experiment. This
+     is the single biggest remaining item and it is nearly free to do.
+   - **`http_socket_exchange`, the CLIENT path**, still has the identical `[0u8; 32 * 1024]` +
+     `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool).
+     `bench/http_client` exists to price it.
+   - **`http_parse_request_head` rescans from offset 0 on every read** — a 206 KB head delivered in
+     100-byte pieces costs 65–103 ms of server CPU, on `main` and after #602 alike. That, not
+     allocation, is the real slowloris lever here. Resume the scan from `buf.len() - 3`.
+   - The remaining allocations: the header-span `Vec`, the builder's two `String`s per header, the
+     `Box`es. Pooling them is a bigger design question than the three above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
@@ -160,6 +173,43 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   arm, and *restoring* the attribution to `borrow_sources`), each failing exactly its own tests.
   Whole workspace green (2605 passed), clippy clean; **zero false positives** — the only pre-existing
   test the whole arc broke was the pinned known hole.
+
+**DONE 2026-07-22 — `bench/http_path` (#601), and the correction that the roadmap's measurement plan
+did not work.** The plan said to price the 4.1 µs path's allocations with `bench/web_e2e` at
+`CONNS=1`. It cannot: that figure is the *difference of two ~70 µs measurements*, so it carries both
+their noises — three adjacent baseline runs gave **3.3 / 3.9 / 4.8 µs**, a spread larger than the
+whole allocation budget. `bench/http_path` prices the same path in-process on an exact allocation
+count (**14.00 per request**, zero noise) plus the server thread's `CLOCK_THREAD_CPUTIME_ID`.
+- **Two floors, because Align does one syscall more.** The keep-alive `poll` costs **~0.9 µs** — 21%
+  of the naive difference, and not CPU work. Reporting only against a plain read/write floor charged
+  it to Align. The honest CPU budget is **~3.5 µs**.
+- **Three of the first version's headline claims were wrong** and the adversarial rounds killed each:
+  the floor was missing that `poll`; "±1.3%" was a 3-sample fluke (11 samples gave σ 3.5%, and the
+  residual is *between-run drift*, which iterations cannot fix); and the bench built the runtime with
+  LTO while the compiler links a default-release archive across a C ABI (2.8% bias). Then a second
+  round found the **slot position itself is biased** — three *identical* floors read slot 2 ~115 ns
+  above slot 1 — so the arm order is now counterbalanced, which moved the reported `poll` cost from
+  1022 to 858 ns against an independent 913 ns.
+- Lessons promoted to `bench/README.md`: a floor must do the same syscalls or its difference is not
+  the thing you named; iterations do not cure drift (alternate, counterbalance, take the median); and
+  min is the wrong statistic for a *difference of two* arms (median σ 88/173/99 vs min 146/214/127).
+
+**DONE 2026-07-22 — the 32 KiB memset on every request (#602), the first real win on that budget.**
+`http_read_request` read into a `let mut chunk = [0u8; 32 * 1024]` and then `extend_from_slice`d it
+into the buffer that keeps the request. The array is zero-initialised and LLVM does not elide it, so
+the shipped object carried a **32 KiB `memset` plus an eight-page stack probe per request** — larger
+than all fourteen heap allocations together — plus a per-byte copy. Reading straight into the
+buffer's uninitialised spare capacity removes all three. **Median −640 ns** (reviewer, 8/8 negative),
+−404 ns on the final commit here; **−16% on a 200 KiB body**, because the memset is per-request but
+the copy is per-byte.
+- **The first cut introduced an attacker-controlled 2× peak buffer** and the review caught it:
+  reserving a flat chunk before the final short read let `Vec`'s amortized growth double, and
+  `truncate` never gives capacity back — 2 GiB per connection at `HTTP_MAX_BODY`. Reads are now
+  clamped to the framed remainder, with doubling bounded by the framed total: capacity/total is
+  **1.00× where main is 2.00×**, at 1/8/64 MiB, with reallocs still O(log n).
+- Behaviour change, benign and now documented: a client pipelining behind a *bodied* request is no
+  longer closed on — reads can no longer overshoot the framing, so the next request is simply re-read
+  on the next `accept`. No byte can be lost (`truncate` discards only when `residual` is already set).
 
 **DONE 2026-07-22 — a test-harness exe race that turned `main` red (#600), diagnosed not guessed.**
 `response_builder_payload.rs`'s `run_server` took a `name` and threw it away (`let _ = name;`),
