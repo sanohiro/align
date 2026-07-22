@@ -9,8 +9,10 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-22, **the protocol-path perf work has an instrument (`bench/http_path`, #601)
-and two wins (#602: the 32 KiB per-request memset is gone, ~−640 ns; #603: the response is
-serialized in ONE right-sized allocation — 14 → 9 allocations/request, ~−468 ns); before that, the
+and three wins (#602: the 32 KiB per-request memset is gone, ~−640 ns; #603: the response is
+serialized in ONE right-sized allocation — 14 → 9 allocations/request, ~−468 ns; #604: the inbound
+head parse resumes across reads — a 206 KiB head in 100-byte pieces goes 56 ms → 0.24 ms, closing a
+slowloris lever); before that, the
 scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
 the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
 accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
@@ -71,12 +73,12 @@ READMEs):**
    CPU). Measured targets, in order of what is known about them:
    - **`http_socket_exchange`, the CLIENT path**, still has the identical `[0u8; 32 * 1024]` +
      `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool).
-     `bench/http_client` exists to price it.
-   - **`http_parse_request_head` rescans from offset 0 on every read** — a 206 KB head delivered in
-     100-byte pieces costs 65–103 ms of server CPU, on `main` and after #602 alike. That, not
-     allocation, is the real slowloris lever here. Resume the scan from `buf.len() - 3`.
+     **It needs an instrument first**, and `bench/http_client` is not it: that harness reports
+     ~65 µs/req end-to-end over loopback, so the ~0.6 µs this is worth sits under its noise. The
+     honest move is an in-process client-side twin of `bench/http_path` (thread CPU time + a
+     counting allocator), then the change. Do not "measure" it with the throughput harness.
    - The remaining allocations: the header-span `Vec`, the builder's two `String`s per header, the
-     `Box`es. Pooling them is a bigger design question than the three above.
+     `Box`es. Pooling them is a bigger design question than the two above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
@@ -191,6 +193,35 @@ count (**14.00 per request** then, 9.00 after #603; zero noise) plus the server 
 - Lessons promoted to `bench/README.md`: a floor must do the same syscalls or its difference is not
   the thing you named; iterations do not cure drift (alternate, counterbalance, take the median); and
   min is the wrong statistic for a *difference of two* arms (median σ 88/173/99 vs min 146/214/127).
+
+**DONE 2026-07-22 — the inbound head parse RESUMES across reads (#604): 56 ms → 0.24 ms, the
+slowloris lever closed.** `http_read_request` re-parsed the whole buffer after every read, so the
+cost of one request was quadratic in **how finely the client chose to split its head** — nothing to
+do with volume. Measured on a 206 KiB head (120 headers, under the 128 cap): **56.4 ms** of one
+worker's CPU at 100-byte pieces, 5.2 ms at 1 KiB, 0.67 ms at 8 KiB — the shape of an O(n²). Prefork
+makes it systemic: a handful of such connections pins every worker. Now **0.243 / 0.153 / 0.062 ms**
+for the same three splits (**232× at 100 bytes**), and the bytes the `\n` search touches are
+**exactly the head's size at every split** — 1.00×, invariant.
+- **The fix is the parser, not a cache in front of it.** `HttpRequestHeadScan` holds `pos` (the next
+  unparsed line), `scanned` (how far into the current line the `\n` search already got), the
+  validated request line, the header spans, and the `Content-Length` — all offsets into a buffer
+  that only ever grows, so a span accepted in an earlier call stays valid in a later one. `advance`
+  continues; it never starts over. `scanned` is what bounds a **single** pathological header line
+  (up to the 256 KiB block cap) to O(its length) rather than O(length × reads) — without it the
+  quadratic survives inside one line.
+- **The one-shot `http_parse_request_head` is now `#[cfg(test)]`** — the same scan advanced once. Two
+  new tests tie the forms together: a **differential oracle** re-feeding a 22-case corpus (well-formed
+  shapes, valid-so-far prefixes, and every smuggling guard) at 1/2/3/7/64/4096-byte pieces and
+  asserting the incremental verdict and every span match the one-shot; and a linearity test asserting
+  the *measured* search work stays under 2× the head.
+- **The instrument was wrong before the mutations fixed it.** The first linearity assertion read the
+  cursor's own bookkeeping, so removing the resume entirely (`from = pos`) left it green — it
+  measured what the code intended, not what it did. It now counts what `memchr` actually looked at
+  (a `#[cfg(test)]` counter, charging `rel + 1` on a hit — charging the slice length instead read
+  3.34× and looked like a failure). Four mutations now fail the right test: no-resume and
+  scanned-never-advances fail linearity, scanned-not-reset fails both, and a weakened bare-LF guard
+  fails the existing smuggling suite (a differential test cannot catch that one — it mutates both
+  sides equally, which is worth remembering).
 
 **DONE 2026-07-22 — one right-sized allocation per response (#603), the second win on that budget.**
 `http_serialize_head` started from `Vec::new()` and doubled 8→16→32→64→128 on the way to a plaintext
