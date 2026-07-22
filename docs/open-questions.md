@@ -2178,6 +2178,26 @@ of a loop. `emit-mir` over all 213 repo `.align` files is byte-identical, and th
 same-iteration use, literal-only holes, `t := template "{h}"` then `h = …` (a template COPIES its
 holes), builder writes, nested loops, arena scoping — are pinned as tests, each mutation-checked.
 
+The adversarial review added three hardening items worth recording as *rules*, not incidents.
+**(a) An exhaustive variant list still leaves its justification fail-open.** The ~130 arms justified
+by "this result type never borrows" are right today — verified by replacing that arm's body with
+`assert!(false)`: the whole suite stays green and no corpus file panics, so they are reached zero
+times — but nothing would go red if `ArrayBuilderBuild`'s element rule, `RandShuffle`,
+`EncodingDecode`, or an `HttpResponseBuilder` type later became borrow-capable. They now end in a
+`debug_assert!(!ty_may_borrow(…))`, which turns exactly that future change into a test failure.
+**(b) `MoveCheck::arena_depth` counts `arena` ONLY**, deliberately unlike the two identically-named
+region counters in the same file, which also count `task_group`: MIR keeps task groups on a stack
+separate from `Builder::arenas`, so a `template` inside one still gets its hidden owner and still
+dies on the enclosing loop's edge. Harmonizing the three counters would silently re-open the
+use-after-free with only the region rule left to catch it — pinned by a `task_group` row.
+**(c) `borrow_sources` recurses through an `Arena` node without entering that depth** — the single
+place the sema/MIR mirror is not lexical. It errs strict (a root can only reject) and the escape
+check rejects those programs anyway, so it is left as-is with a comment, because the "obvious fix"
+is the unsound direction. The temporary-root diagnostic also gained the two escapes it was missing:
+it used to say only "bind the owned value to a local declared outside the loop", which a `template`
+user cannot do (its owner is hidden), and now names `.clone()` and an enclosing `arena` as well —
+still one message per fact.
+
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`
 previously passed `check`: a frame-local array's slice escaped inside a `Result`/`Option` wrapper,

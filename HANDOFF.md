@@ -285,7 +285,7 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   edges; outside a loop the hidden owner lives to function exit, so nothing is recorded.
 - `BorrowState::invalid` records **how** each generation ended (`Consumed` / `Dropped`) so the
   diagnostic names the right cause, and names the source when it *has* a name (a temporary's message
-  instead says to bind the owned value to a local outside the loop); the join merges per root by
+  instead names the three ways to give the storage a longer life — see #621); the join merges per root by
   `Ord`, keeping it commutative for the fixpoint.
 - **Where the temp root is ATTRIBUTED matters as much as the condition.** MIR mints the hidden owner
   only where a fresh Move value is *borrowed* (`lower_borrowed_owned`); a value **moved** into a
@@ -843,11 +843,44 @@ Nothing there stands in for a missing compiler feature.
    over-rejection. Tests live with the other borrow-liveness rows in
    `crates/align_driver/tests/borrow_liveness.rs` (45 there now).
 
+   **Blast radius, wider than the repro suggests.** Because the provenance is on the *node*, every
+   way of laundering that `str` onward inherits it — a tuple, `Some`/`Ok`, an `if`/`match` value, a
+   match-payload binding, a struct literal or a later field / tuple-index read of one,
+   destructuring, `else`-unwrap, a nested template, `.trim()`, slicing, `.bytes()`. All of those
+   checked ok on `main` and genuinely read freed heap (confirmed under `MALLOC_PERTURB_`). The
+   struct-field spelling is pinned as the representative row.
+
+   **The independent adversarial review found no soundness defect and no over-rejection** — it
+   independently reproduced the mutation matrix, the 213-file `emit-mir` byte-identity (200 of the
+   213 actually `check` ok, so it is real coverage), and the suite/clippy state. Four hardening items
+   came out of it and are in the PR: ① the ~130 "type never borrows" arms are justified by a *type*
+   fact that, unlike the variant list, is **not** compiler-forced — so they now end in a
+   `debug_assert!(!ty_may_borrow(…))`, converting "this result became borrow-capable" from silence
+   into a test failure. Verified free: replacing that arm's body with `assert!(false)` leaves the
+   whole workspace suite green (2660) and all 213 corpus files panic-free, i.e. those arms are
+   reached **zero** times today. ② `MoveCheck::arena_depth` counts `arena` **only**, deliberately
+   unlike the two identically-named region counters in the same file, which also count `task_group`
+   — MIR keeps task groups on a stack separate from `Builder::arenas`, so a template inside one
+   still dies on the enclosing loop's edge. A future "harmonization" would silently re-open the UAF
+   with only the region rule left to catch it, so the field documents the difference and a
+   `task_group` row pins the borrow half (mutation-checked: harmonizing the counters fails exactly
+   that row). ③ `borrow_sources` recurses through an `Arena` node without entering `arena_depth` —
+   the one place the sema/MIR mirror is not lexical; it errs strict and the escape check covers
+   those programs, and the arm now says so, so the next reader does not "fix" it in the unsound
+   direction. ④ the blast-radius row above.
+
+   **The diagnostic wording changed, once, for everyone.** The reused temporary message said only
+   "bind the owned value to a local declared outside the loop" — advice a template user cannot
+   follow, since its owner is hidden and there is no owned value to bind. It now names all three
+   generic escapes (bind outside the loop / `.clone()` into a local / allocate in an enclosing
+   `arena`); still one message per fact, still not template-specific.
+
    **The reusable lesson**, and it is the same one twice: a `_` arm in a *classification* is a
    soundness hole even when every arm above it is right, because the rules that consume it can only
    act on what it reports. #620 removed one from MIR's display classification; this removes the one
    in sema's borrow classification — and removing it is what surfaced `EnumValue` and `RandSample`,
-   neither of which anyone had reported.
+   neither of which anyone had reported. The review's item ① is the same lesson a level up: an
+   exhaustive *variant* list still leaves the *justification* fail-open unless something asserts it.
 
    0b. **Codegen panic hardening is asymmetric.** `gen_print`'s `into_int_value()`
    (`crates/align_codegen_llvm/src/lib.rs`, ~:8443) still aborts on `print(array)` / `print(struct)`

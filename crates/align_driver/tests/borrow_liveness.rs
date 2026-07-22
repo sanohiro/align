@@ -1323,3 +1323,93 @@ fn main() -> i32 {
 ";
     assert!(!check_errs("borrow-rand-sample-outer-source", legal));
 }
+
+/// **The `task_group` half of the arena mirror, pinned rather than left to the region rule.**
+/// `MoveCheck::arena_depth` counts `arena` ONLY, unlike the two identically-named region counters in
+/// `align_sema` which also count `task_group` — because MIR keeps task groups on a stack separate
+/// from `Builder::arenas`, so a `template` inside one still gets its hidden owned `string` and still
+/// dies on the enclosing loop's edge. On `main` this shape reported only the region errors; the
+/// borrow error is the one that would vanish if someone "harmonized" the three counters, so it is
+/// asserted specifically.
+#[test]
+fn a_template_returned_out_of_a_task_group_in_a_loop_is_rejected() {
+    // The assignment is INSIDE the `task_group`, which is what makes this row sensitive to the
+    // counter: the walk is what maintains `arena_depth`, so counting `task_group` there would
+    // suppress the root here. (The tail-value spelling below goes through the `borrow_sources`
+    // query instead, which reads the outer depth — see the non-lexical note on that arm.)
+    let inside = "\
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut c := 0
+  loop {
+    task_group {
+      keep = template \"v={c}\"
+    }
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-template-task-group", inside);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "a `task_group` is NOT an arena for this rule — the template's hidden owner still dies on \
+         the loop edge, and the borrow diagnostic must say so rather than leaving the shape to the \
+         region rule: {diags}"
+    );
+
+    let as_the_value = "\
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut c := 0
+  loop {
+    keep = task_group { template \"v={c}\" }
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-template-task-group-value", as_the_value);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "the tail-value spelling must be rejected too: {diags}"
+    );
+}
+
+/// **The blast radius, documented with one row.** The `Template` arm is provenance on the *node*,
+/// so every way of laundering that `str` onward inherits it: a tuple, `Some`/`Ok`, an `if`/`match`
+/// value, a match-payload binding, a struct literal or a later field/tuple-index read of one,
+/// destructuring, `else`-unwrap, a nested template, `.trim()`, slicing, `.bytes()`. All of those
+/// checked ok on `main` and read freed heap. This pins the struct-literal spelling — the shape that
+/// most looks like it should be safe, because the `str` is stored into a *field* rather than
+/// assigned — as the representative.
+#[test]
+fn a_template_laundered_through_a_struct_field_is_rejected() {
+    let src = "\
+S { a: str }
+fn main() -> i32 {
+  mut keep: S := S { a: \"start\" }
+  mut c := 0
+  loop {
+    keep = S { a: template \"v={c}\" }
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep.a)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-template-struct-field", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "storing the template's `str` into a struct field must carry its provenance, not launder \
+         it: {diags}"
+    );
+}

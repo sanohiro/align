@@ -7847,6 +7847,17 @@ struct MoveCheck<'a> {
     /// `Builder::arenas` depth. Inside one, a `template`'s bytes are bump-allocated instead of
     /// getting a hidden owned `string` freed on each loop edge ([`owns_hidden_string`]), so no
     /// per-iteration root is recorded and an arena-scoped accumulator stays legal.
+    ///
+    /// **This counts `arena` ONLY — deliberately unlike the two identically-named region counters
+    /// in this file** (`Checker::arena_depth` and the escape walk's `depth`), which also count
+    /// `task_group { … }`. They are right for their own job: a `task_group`'s values live in a
+    /// region, so the escape check must see one. This one must mirror MIR's `Builder::arenas`
+    /// exactly, and MIR keeps task groups on a *separate* stack — `b.arenas` is untouched by
+    /// `task_group`, so a `template` inside one still gets its hidden owner and still dies on the
+    /// enclosing loop's edge. Counting `task_group` here would make this pass believe otherwise and
+    /// silently re-open the use-after-free (only the region rule would still catch that shape, and
+    /// only because a `task_group` value cannot escape its block at all). Pinned by
+    /// `borrow_liveness.rs::a_template_returned_out_of_a_task_group_in_a_loop_is_rejected`.
     arena_depth: u32,
 }
 
@@ -8291,6 +8302,15 @@ impl<'a> MoveCheck<'a> {
                 roots
             }
             ExprKind::TupleIndex { recv, .. } => self.borrow_sources(recv),
+            // NOTE — the single place the sema/MIR arena mirror is **not lexical, on purpose.** This
+            // is a query, not the walk: it recurses into an `Arena` block's tail value WITHOUT
+            // entering [`Self::arena_depth`], so a `template` that is an arena block's value is
+            // judged at the *outer* depth and may get a root MIR did not mint. That errs STRICT
+            // (a root can only reject), the escape check rejects those programs anyway
+            // (`region_of(Arena-tail)` is arena-bound), and the walk itself — which is what
+            // `template_owner_root` normally reads — does enter the arena. Do not "fix" this by
+            // making the query maintain the depth unless it also handles being entered from inside
+            // an arena: that direction is the unsound one.
             ExprKind::Block(b)
             | ExprKind::Arena(b)
             | ExprKind::TaskGroup(b)
@@ -8331,15 +8351,23 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone | ExprKind::Loop { .. }
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::FsReadFileView { .. }
-            | ExprKind::FsReadBytesView { .. }
+            | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
             // (2) Results whose type never borrows (scalars, `Unit`, freshly owned `string` /
             //   `buffer` / `array<string>` / Move handles), so the `ty_may_borrow` gate at the top of
-            //   `borrow_sources` has already returned an empty set before reaching this match. Two
-            //   are worth naming because a widening of their element rules would move them into the
-            //   borrowing set: `ArrayBuilderBuild` (sema restricts `array_builder<T>` elements to
-            //   Copy scalars and owned `string`) and `RandShuffle` (in place, `Unit` — its sibling
-            //   `RandSample`, which does return views, is handled above).
-            | ExprKind::Unit | ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Char(..) | ExprKind::Bool(..)
+            //   `borrow_sources` — this function's ONLY caller — has already returned an empty set
+            //   and these arms are unreachable in practice.
+            //
+            //   That justification is a *type* fact, and unlike the variant list it is not
+            //   compiler-forced: widening one of these results to a borrow-capable type would make
+            //   the arm silently answer "borrows nothing" — the same fail-open shape this match
+            //   exists to remove, one level up. The `debug_assert` below is the gate, so such a
+            //   change fails the test suite instead of passing it. It is silent today: the whole
+            //   driver suite and all 213 repo `.align` files reach none of these arms. Candidates
+            //   worth watching: `ArrayBuilderBuild` (sema restricts `array_builder<T>` elements to
+            //   Copy scalars and owned `string`), `RandShuffle` (in place, `Unit` — its sibling
+            //   `RandSample`, which does return views, is handled above), `EncodingDecode`, and the
+            //   `HttpResponseBuilder` family.
+            ExprKind::Unit | ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Char(..) | ExprKind::Bool(..)
             | ExprKind::Unary { .. } | ExprKind::Cast(..) | ExprKind::Binary { .. } | ExprKind::IntArith { .. }
             | ExprKind::MathOp { .. } | ExprKind::Wait | ExprKind::RawAlloc(..) | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. } | ExprKind::RawStore { .. } | ExprKind::RawOffset { .. }
@@ -8380,8 +8408,16 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
-            | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
-            => BorrowRoots::new(),
+            | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. } => {
+                debug_assert!(
+                    !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
+                    "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
+                     now may borrow — give it a real provenance arm instead of letting it report \
+                     'borrows nothing'",
+                    std::mem::discriminant(&e.kind)
+                );
+                BorrowRoots::new()
+            }
         }
     }
 
@@ -8468,7 +8504,12 @@ impl<'a> MoveCheck<'a> {
                 format!("use of invalidated borrow '{borrower}': its source '{source}' {why}")
             }
             (BorrowRoot::IterTemp(_), _) => format!(
-                "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; bind the owned value to a local declared outside the loop and borrow that instead"
+                // The three ways to give the storage a longer life are named because only one of
+                // them exists for every producer: a `template` has no owned value to bind (its
+                // owner is hidden), so "bind it outside the loop" alone was advice the user could
+                // not follow — `.clone()` into a `string`, or an enclosing `arena`, are its
+                // escapes. All three are generic; none is template-specific.
+                "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; give the storage a longer life — bind the owned value to a local declared outside the loop, `.clone()` it into one, or allocate it in an `arena` that encloses the loop — and borrow that instead"
             ),
         };
         self.diags.error(msg, span);
