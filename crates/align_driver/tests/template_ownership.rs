@@ -124,10 +124,17 @@ fn main() -> i32 {
     }
 }
 
-/// An owned `string` hole **borrows**: the MIR must read the local's `{ptr,len}` for the piece and
-/// leave the local's ownership alone, so exactly one `drop` frees it — at scope end, after the
-/// template and after every later use. (Before the fix this never reached MIR's ownership question
-/// at all: the hole became an `IntHole` and codegen panicked.)
+/// A **bound** owned `string` in a hole: the piece reads the local's `{ptr,len}`, the local's
+/// ownership is untouched, and exactly one `drop` frees it — at scope end, after the template and
+/// after every later use. Before the fix this never reached MIR's ownership question at all (the
+/// hole became an `IntHole` and codegen aborted), so this row discriminates against the pre-fix
+/// compiler as a whole.
+///
+/// It does **not** isolate sema's `StrBorrow` half: for a bound place the lowering is byte-identical
+/// with or without the borrow, because `lower_borrowed_owned` early-returns on
+/// `may_need_synthetic_owner(Local) == false`. The borrow only changes the lowering of an *unbound*
+/// hole — that is [`an_owned_string_hole_temporary_is_freed_each_iteration`], which is the row that
+/// fails when the borrow alone is reverted.
 #[test]
 fn an_owned_string_hole_borrows_and_is_dropped_once() {
     let src = r#"
@@ -161,7 +168,10 @@ fn main() -> Result<(), Error> {
 }
 
 /// A fresh owned `string` interpolated inside a `loop` gets MIR's hidden owner, freed on **every**
-/// loop edge — the temporary neither leaks per iteration nor outlives the pass that made it.
+/// loop edge — the temporary neither leaks per iteration nor outlives the pass that made it. This
+/// is the row that pins sema's `string` → `str` borrow specifically: revert only that borrow and
+/// the hole still renders (MIR classifies `Ty::String` as a byte view), but no hidden owner is
+/// minted and the per-iteration allocation leaks.
 #[test]
 fn an_owned_string_hole_temporary_is_freed_each_iteration() {
     let src = r#"

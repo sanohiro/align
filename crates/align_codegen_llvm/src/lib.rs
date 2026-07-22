@@ -9539,13 +9539,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             self.builder.build_call(self.funcs[callee], &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
                         }
                         // Integers and `char` (a `u32` code point) render through the int writer.
-                        // Anything else is NOT an integer at the LLVM level: `Scalar::String` /
-                        // `DynArray` / … are `{ptr,len}` aggregates, and blindly calling
-                        // `into_int_value()` on one aborts the compiler. Those payloads are
-                        // rejected at the struct-field boundary today ("an `Option` struct field
-                        // must have a non-owned payload"), so the fallback arm below is
-                        // unreachable — but it fails as a compiler error rather than a panic if
-                        // that ever changes.
+                        // Anything else is NOT an integer at the LLVM level, and blindly calling
+                        // `into_int_value()` on it aborts the compiler. The Move payloads
+                        // (`Scalar::String` / `DynArray` / …) are rejected at the struct-field
+                        // boundary ("an `Option` struct field must have a non-owned payload"), but
+                        // that gate only tests Move-ness, so the fallback arm below is **live**: a
+                        // non-Move `enum` payload (`C { R, G, B }` in `S { a: Option<C> }`) reaches
+                        // it and lowers to `%C = type { i32 }`, a StructValue. It used to panic
+                        // there; it now fails as a compiler error. That is still a codegen error
+                        // with no sema diagnostic behind it — the Gate-3 shape this file's template
+                        // holes just shed — so `json.encode`'s `Option` payload domain wants the
+                        // same sema-side gate. Recorded as a follow-up in `HANDOFF.md`.
                         ity @ (Ty::Int(_) | Ty::IntVar(_) | Ty::Char) => {
                             let BasicValueEnum::IntValue(v) = payload else {
                                 return Err(self.err(format!("json.encode Option field '{name}' payload is not an integer")));

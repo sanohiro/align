@@ -739,9 +739,47 @@ Nothing there stands in for a missing compiler feature.
    `let s := template …`, `builder.write(template …)`, inside a `loop`, inside a `match` arm, and
    inside functions that afterwards move / return the interpolated value) and `template_ownership.rs`
    (borrow-and-drop-once MIR evidence, per-iteration temporary free, the 16-case
-   diagnostic-not-panic matrix). Mutation-checked: reverting the fix fails all four owned-`string`
-   rows with the original panic; reverting only the sema borrow leaves the panic fixed but LEAKS the
-   interpolated temporary, which the per-iteration row catches.
+   diagnostic-not-panic matrix). **Mutation-checked, with the adversarial review's corrections:**
+   reverting sema + MIR together fails all four owned-`string` rows (with the codegen hardening
+   still in, as `CodegenError: an int template hole expects an integer operand, got StructValue(…)`;
+   revert that hunk too and it is the original `expected the IntValue variant` panic). Reverting
+   **only** the sema borrow fails exactly one row workspace-wide —
+   `an_owned_string_hole_temporary_is_freed_each_iteration` — because MIR then classifies the raw
+   `Ty::String` as a byte view (no panic) but no hidden owner is minted and the interpolated
+   temporary leaks. Reverting **only** the MIR half is NOT test-visible: sema hands MIR a `Ty::Str`,
+   so the old `_ => IntHole` catch-all never sees a `string` again. Its value is a **compile-time**
+   guarantee, not a runtime-pinned one: adding a `PrintKind` variant breaks the MIR match, which is
+   exactly the fail-open this defect came from. The independent adversarial review measured the
+   borrow non-consuming across temporaries, moves, loops, struct fields, array elements, `match`
+   arms, arenas, `?` paths, drop-flag branches, `par_map` and `spawn` (LD_PRELOAD malloc counter at
+   two iteration counts), and confirmed `emit-mir` over all 213 repo `.align` files is byte-identical
+   to `main`.
+
+   **Two follow-ups this PR does NOT fix (separate work, both confirmed by that review):**
+
+   0a. **SOUNDNESS, pre-existing on `main`, HIGH — a `str` bound from a `template` escapes the
+   hidden owner's loop-edge free, and sema accepts it.** Repro: `mut acc: str := "start"` then
+   `loop { acc = template "{acc}-{c}"; c = c + 1; if c >= 5 { break } }` then `print(acc)` →
+   `alignc check` reports ok, and the binary reads freed memory (the debug runtime trips
+   `ptr::copy_nonoverlapping` unaligned/overlap precondition; a release build prints garbage).
+   Cause: `borrow_sources_inner` (`crates/align_sema/src/lib.rs`, ~:8245) has **no
+   `ExprKind::Template` arm** and a fail-open `_ => BorrowRoots::new()` tail — the same fail-open
+   class this PR removed from MIR. `region_of(Template) = Frame` blocks a `return` but is not borrow
+   provenance, so the loop-edge invalidation never fires. The sibling shape (`keep = h` for a
+   loop-local owned `string` `h`) IS correctly rejected, so only the Template provenance edge is
+   missing. The owned-`string`-hole spelling of the same loop is reachable through this PR's new
+   capability and misbehaves identically.
+
+   0b. **Codegen panic hardening is asymmetric.** `gen_print`'s `into_int_value()`
+   (`crates/align_codegen_llvm/src/lib.rs`, ~:8443) still aborts on `print(array)` / `print(struct)`
+   when the sema gate is bypassed, and `Operand::Value(id) => self.values[id]` (~:10007) is a direct
+   map index that aborts for a `()` operand — so `template "{u()}"` and `print(u())` abort *before*
+   reaching the new `display_*` accessors: one unprintable shape escapes the hardening even on the
+   template path. Neither is reachable through today's sema gate; both are the Gate-3 belt-and-braces
+   this PR applied to the template pieces only. Same bucket: `json.encode`'s `Option` payload domain
+   needs a sema-side gate — its codegen fallback arm is **live** (a non-Move `enum` payload such as
+   `C { R, G, B }` in `S { a: Option<C> }` reaches it; it panicked on `main` and now returns a
+   `CodegenError` with no sema diagnostic behind it).
 
 1. **`pkg.web` root + `serve()` — DONE, then rebuilt on the settled ownership model.** `apps/web/pkg/web.align` is real: per-method constructors
    (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the
