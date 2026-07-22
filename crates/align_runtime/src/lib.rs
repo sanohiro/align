@@ -15551,7 +15551,13 @@ fn http_reason_phrase(status: i64) -> &'static str {
 /// status (`100..=599`), returning `Err(AL_INVALID)` on either. The returned buffer ends exactly at
 /// `Connection: close\r\n` (no trailing `\r\n`) — or at the last caller header when `persistent`
 /// (the keep-alive path: no `Connection` header at all, since absence IS persistent in HTTP/1.1).
-fn http_serialize_head(rb: &ResponseBuilder, persistent: bool) -> Result<Vec<u8>, i32> {
+///
+/// `extra` is what the CALLER will append after the head — its framing header, the blank line and
+/// any body. The head's own size is computed exactly ([`http_head_len`]), so the whole message
+/// lands in **one** allocation with no `realloc`: a natural `Vec::new()` doubles 8→16→32→64→128 on
+/// the way to a plaintext response, and each of those four growth events measured ≈206 ns on
+/// `bench/http_path`.
+fn http_serialize_head(rb: &ResponseBuilder, persistent: bool, extra: usize) -> Result<Vec<u8>, i32> {
     // A valid HTTP status code is `100..=599`.
     if !(100..=599).contains(&rb.status) {
         return Err(AL_INVALID);
@@ -15565,8 +15571,8 @@ fn http_serialize_head(rb: &ResponseBuilder, persistent: bool) -> Result<Vec<u8>
             return Err(AL_INVALID);
         }
     }
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"HTTP/1.1 ");
+    let mut buf: Vec<u8> = Vec::with_capacity(http_head_len(rb, persistent).saturating_add(extra));
+    buf.extend_from_slice(HTTP_STATUS_LINE_PREFIX);
     // Status is exactly three digits (guarded `100..=599` above), so render it into a 3-byte stack
     // array instead of heap-allocating a `String` on this hot serialize path.
     let s = rb.status as u32;
@@ -15585,9 +15591,64 @@ fn http_serialize_head(rb: &ResponseBuilder, persistent: bool) -> Result<Vec<u8>
     // `Connection` header at all: absence IS persistent in HTTP/1.1, and the leanest bytes on the
     // bench path (fasthttp does the same).
     if !persistent {
-        buf.extend_from_slice(b"Connection: close\r\n");
+        buf.extend_from_slice(HTTP_CONNECTION_CLOSE);
     }
     Ok(buf)
+}
+
+/// The status line's fixed prefix. A const, not a literal at the write site, so the size
+/// computations cannot drift from the bytes actually written (same for the three consts below).
+const HTTP_STATUS_LINE_PREFIX: &[u8] = b"HTTP/1.1 ";
+/// The explicit close signal (RFC 9112 §9.6) — written on every non-`persistent` response.
+const HTTP_CONNECTION_CLOSE: &[u8] = b"Connection: close\r\n";
+/// The framing header's name; the length's digits and the CRLF follow it.
+const HTTP_CONTENT_LENGTH_PREFIX: &[u8] = b"Content-Length: ";
+/// The streaming path's framing header (a 1.1 client only — a 1.0 stream is close-delimited).
+const HTTP_TE_CHUNKED: &[u8] = b"Transfer-Encoding: chunked\r\n";
+
+/// The exact serialized length of the head [`http_serialize_head`] writes — the capacity
+/// that makes the response one allocation. Mirrors that function line for line (status line,
+/// `name: value\r\n` per header, the optional close line); the shared consts keep the two in step.
+/// Saturating, so a nonsense-sized header list yields a capacity hint, never a wrapped one — the
+/// value is only ever a hint (`extend_from_slice` still grows if it is short).
+fn http_head_len(rb: &ResponseBuilder, persistent: bool) -> usize {
+    // status line: prefix + 3 digits + SP + reason + CRLF
+    let mut n = HTTP_STATUS_LINE_PREFIX.len() + 3 + 1 + http_reason_phrase(rb.status).len() + 2;
+    for (name, value) in &rb.headers {
+        // `name` + ": " + `value` + CRLF
+        n = n.saturating_add(name.len()).saturating_add(2).saturating_add(value.len()).saturating_add(2);
+    }
+    if !persistent {
+        n = n.saturating_add(HTTP_CONNECTION_CLOSE.len());
+    }
+    n
+}
+
+/// Append a decimal integer — the `Content-Length` value. Sibling of
+/// [`http_push_chunk_size_hex`]: a stack render + one `extend_from_slice`, so the framing header
+/// costs no `String` allocation on the serialize path. [`http_decimal_len`] is its length.
+fn http_push_decimal(buf: &mut Vec<u8>, mut n: usize) {
+    let mut tmp = [0u8; 20]; // the widest `usize` decimal (`u64::MAX` = 20 digits)
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// How many bytes [`http_push_decimal`] writes for `n`.
+fn http_decimal_len(mut n: usize) -> usize {
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
 }
 
 /// May a response with this status carry a body at all? `1xx` / `204` / `304` never do (RFC 9110
@@ -15629,10 +15690,23 @@ fn http_serialize_response_inner(rb: &ResponseBuilder, suppress_body: bool, pers
     if bodiless_status && rb.body.is_some() {
         return Err(AL_INVALID);
     }
-    let mut buf = http_serialize_head(rb, persistent)?;
+    let body_len = rb.body.as_ref().map_or(0, |b| b.len());
+    // Everything this function appends after the head, so the head serializer sizes the buffer for
+    // the whole response and nothing here can `realloc`: the framing header (when the status may
+    // carry a body), the terminating blank line, and the body bytes actually sent.
+    let framing = match bodiless_status {
+        true => 0,
+        false => HTTP_CONTENT_LENGTH_PREFIX.len() + http_decimal_len(body_len) + 2,
+    };
+    let sent_body = match suppress_body {
+        true => 0, // HEAD: the length is written, the bytes are not
+        false => body_len,
+    };
+    let extra = framing.saturating_add(2).saturating_add(sent_body);
+    let mut buf = http_serialize_head(rb, persistent, extra)?;
     if !bodiless_status {
-        buf.extend_from_slice(b"Content-Length: ");
-        buf.extend_from_slice(rb.body.as_ref().map_or(0, |b| b.len()).to_string().as_bytes());
+        buf.extend_from_slice(HTTP_CONTENT_LENGTH_PREFIX);
+        http_push_decimal(&mut buf, body_len);
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
@@ -15839,13 +15913,15 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
     }
     // Shared head serialize (status line + caller headers + `Connection: close`), then the framing
     // header + the terminating blank line. A 1.1 request → chunked; a 1.0 request → raw (no TE).
-    let mut head = match http_serialize_head(&r, false) {
+    // Both are reserved up front, so the stored head is one allocation like `respond`'s response.
+    let framed = c.http11;
+    let extra = (if framed { HTTP_TE_CHUNKED.len() } else { 0 }) + 2; // + the terminating blank line
+    let mut head = match http_serialize_head(&r, false, extra) {
         Ok(b) => b,
         Err(s) => return s, // ctx unspent — the caller can still `respond` an error
     };
-    let framed = c.http11;
     if framed {
-        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        head.extend_from_slice(HTTP_TE_CHUNKED);
     }
     head.extend_from_slice(b"\r\n");
     // Lift the fd out of the ctx (its `Drop` then skips the close — the stream owns the fd now; the
@@ -25468,6 +25544,78 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert_eq!(out2, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
     }
 
+    /// **One allocation per response, and no `realloc`.** `http_head_len` + the caller's `extra`
+    /// must equal the bytes actually written, so the serialized buffer comes back exactly full —
+    /// `Vec::with_capacity(n)` reserves exactly `n`, so `len() == capacity()` is a byte-exact
+    /// assertion that the size computation still mirrors the writer. Any drift (a header line's
+    /// separator, a framing prefix, the blank line) leaves the buffer short (a `realloc` — the cost
+    /// this exists to remove, ≈206 ns each) or long, and either way fails here.
+    #[test]
+    fn http_serialize_reserves_exactly_what_it_writes() {
+        let hdr = |n: &str, v: &str| (n.to_string(), v.to_string());
+        let cases: Vec<(ResponseBuilder, bool, bool)> = vec![
+            // (builder, suppress_body, persistent)
+            (ResponseBuilder { status: 200, headers: vec![], body: None }, false, false),
+            (ResponseBuilder { status: 200, headers: vec![], body: None }, false, true),
+            (ResponseBuilder { status: 200, headers: vec![hdr("Content-Type", "text/plain")], body: Some(b"Hello, World!".to_vec()) }, false, true),
+            (ResponseBuilder { status: 200, headers: vec![hdr("A", "1"), hdr("B", "2"), hdr("C", "3")], body: Some(vec![b'x'; 1000]) }, false, false),
+            // HEAD: the length is written for a body whose bytes are not.
+            (ResponseBuilder { status: 200, headers: vec![], body: Some(vec![b'y'; 12345]) }, true, false),
+            // A set-but-empty body still frames as `0`.
+            (ResponseBuilder { status: 201, headers: vec![], body: Some(vec![]) }, false, false),
+            // Bodiless statuses: no framing header at all.
+            (ResponseBuilder { status: 204, headers: vec![], body: None }, false, true),
+            (ResponseBuilder { status: 304, headers: vec![], body: None }, false, false),
+            (ResponseBuilder { status: 100, headers: vec![], body: None }, false, false),
+            // An unknown status has an empty reason phrase.
+            (ResponseBuilder { status: 599, headers: vec![hdr("X", "")], body: Some(b"z".to_vec()) }, false, false),
+        ];
+        for (rb, suppress, persistent) in &cases {
+            let out = http_serialize_response_inner(rb, *suppress, *persistent).unwrap();
+            assert_eq!(
+                out.len(),
+                out.capacity(),
+                "status {} suppress={suppress} persistent={persistent}: reserved {} for {} bytes",
+                rb.status,
+                out.capacity(),
+                out.len()
+            );
+        }
+        // The streaming head sizes both framings the same way (mirrors `align_rt_http_respond_stream`).
+        for framed in [false, true] {
+            let rb = ResponseBuilder { status: 200, headers: vec![hdr("X-Tag", "v")], body: None };
+            let extra = (if framed { HTTP_TE_CHUNKED.len() } else { 0 }) + 2; // + the terminating blank line
+            let mut head = http_serialize_head(&rb, false, extra).unwrap();
+            if framed {
+                head.extend_from_slice(HTTP_TE_CHUNKED);
+            }
+            head.extend_from_slice(b"\r\n");
+            assert_eq!(head.len(), head.capacity(), "streaming head, framed={framed}");
+        }
+    }
+
+    /// The `Content-Length` renderer replaces a `to_string()` allocation, so it must agree with it
+    /// digit for digit — and its length function with the renderer — across the interesting widths.
+    #[test]
+    fn http_decimal_render_matches_to_string() {
+        let mut n: usize = 1;
+        let mut cases = vec![0usize, 7, 9, 10, 99, 100, 1000, 12345, usize::MAX];
+        loop {
+            cases.push(n - 1);
+            cases.push(n);
+            match n.checked_mul(10) {
+                Some(next) => n = next,
+                None => break,
+            }
+        }
+        for v in cases {
+            let mut buf = Vec::new();
+            http_push_decimal(&mut buf, v);
+            assert_eq!(String::from_utf8(buf.clone()).unwrap(), v.to_string(), "render of {v}");
+            assert_eq!(http_decimal_len(v), buf.len(), "length of {v}");
+        }
+    }
+
     /// The streaming head is the shared head plus the framing header: a 1.1 stream gets
     /// `Transfer-Encoding: chunked`; a bodied builder aborts; a bad status / caller framing header is
     /// rejected by the shared serializer. (The head-write + fd lift are exercised end-to-end by the
@@ -25476,7 +25624,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     fn http_stream_head_serialize_contract() {
         // A 1.1 streaming head appends `Transfer-Encoding: chunked` after `Connection: close`.
         let rb = ResponseBuilder { status: 200, headers: Vec::new(), body: None };
-        let mut head = http_serialize_head(&rb, false).unwrap();
+        let mut head = http_serialize_head(&rb, false, 0).unwrap();
         head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
         assert_eq!(
             String::from_utf8(head).unwrap(),
@@ -25485,10 +25633,10 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // A caller framing header is rejected by the shared serializer (same as `respond`).
         let mut bad = ResponseBuilder { status: 200, headers: Vec::new(), body: None };
         bad.headers.push(("Content-Length".to_string(), "5".to_string()));
-        assert_eq!(http_serialize_head(&bad, false), Err(AL_INVALID));
+        assert_eq!(http_serialize_head(&bad, false, 0), Err(AL_INVALID));
         // A bad status is rejected too.
         let badstatus = ResponseBuilder { status: 999, headers: Vec::new(), body: None };
-        assert_eq!(http_serialize_head(&badstatus, false), Err(AL_INVALID));
+        assert_eq!(http_serialize_head(&badstatus, false, 0), Err(AL_INVALID));
     }
 
     /// A poisoned stream's `finish` skips the terminal write and returns `Err`, and closes the fd (no
