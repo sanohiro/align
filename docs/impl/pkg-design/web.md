@@ -649,14 +649,37 @@ fn upload(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {
   epilogue after the close one are ignored, as the RFC requires.
 - **Strict where HTTP is settled.** `name` is REQUIRED (RFC 7578 §4.2), the disposition must be
   `form-data`, `obs-fold` continuations are rejected rather than interpreted (RFC 9110 §5.2 removed
-  them, and guessing at a folded header's intent is how smuggling bugs start), and field names /
-  parameter attributes fold ASCII case only. Unknown headers are skipped by a byte-level compare, so
-  they need not even be valid UTF-8; a RECOGNIZED header that is not UTF-8 is `Invalid`, because
-  `Part`'s fields are `str`.
+  them, and guessing at a folded header's intent is how smuggling bugs start), a BARE parameter value
+  must be an RFC 9110 §5.6.6 `token` (`boundary=A,B` and `boundary=abc def` are refused — Go's `mime`
+  rejects both, so accepting them would let a proxy and this parser disagree about where the parts
+  are), and field names / parameter attributes fold ASCII case only. Unknown headers are skipped by a
+  byte-level compare, so they need not even be valid UTF-8; a RECOGNIZED header that is not UTF-8 is
+  `Invalid`, because `Part`'s fields are `str`.
+- **A duplicate is refused, never resolved.** Two `Content-Disposition` (or two `Content-Type`) field
+  lines in one part, or one parameter attribute twice in one list, is `Invalid`. First-wins (Go) and
+  last-wins are both guesses, they disagree with each other, and the parser in front of us may have
+  made the other one — that difference is the smuggling primitive. One rule, both levels.
+- **`filename` is advisory and is NOT sanitized** (RFC 7578 §4.2) — the one attack surface this
+  module hands the application. It comes back exactly as it arrived: `../`, an absolute path,
+  backslashes, control-free UTF-8 of the client's choosing. It must never be used as a path, or part
+  of one, without the application validating it. Refusing to guess is deliberate — a silent rewrite
+  would be as wrong as a traversal, and a zero-copy view cannot rewrite anything anyway. Note too
+  that `filename=""` (what a browser sends for an untouched file input) is indistinguishable from an
+  absent `filename`: both read `""`, so testing `p.filename.len() > 0` separates "named a file" from
+  "did not", NOT "is a file part" from "is a field".
 - **`boundary()` has one failure answer.** `""` means "not a walkable multipart form" for every
-  reason — wrong media type, no parameter, empty, over 70 bytes (§5.1.1), a control byte, a `"`, an
-  unterminated quote, an escape — so an application checks once. `next` refuses an empty boundary
-  for the caller who forgot: `--` alone would split the body at nonsense positions.
+  reason — wrong media type, no `boundary` parameter, a repeated one, empty, over 70 bytes (§5.1.1),
+  a control byte, a bare value that is not a `token`, a value ending in SP/HTAB (§5.1.1's
+  `bcharsnospace` — transport padding follows a delimiter, so a trailing space makes "boundary or
+  padding?" ambiguous), an unterminated quote, or an escape — so an application checks once. `next`
+  refuses an empty boundary for the caller who forgot: `--` alone would split the body at nonsense
+  positions.
+- **Stricter than Go at the RFC's grammatical minimum, on purpose.** A part's data must end with the
+  CRLF that belongs to the next delimiter, so the minimal empty part
+  `--SEP\r\nContent-Disposition: form-data; name="a"\r\n\r\n--SEP--` (no CRLF at all between the
+  header section and the close-delimiter) is `Invalid` here, where Go's `mime/multipart` accepts it.
+  Requiring the byte the grammar puts there keeps ONE reading of where a part ends; the lenient
+  reading needs a second.
 
 **Not in v1, deliberately:** no field map or "collect into an array" convenience (that allocates, and
 which fields matter is the application's business), no streaming/chunked multipart (the body is one
@@ -665,12 +688,15 @@ buffer today — `next` is a pure function of it, so a future streaming form is 
 `filename*` decoding (percent-decoding allocates; `std.encoding` is the visible step if a consumer
 needs it).
 
-**Tests:** `crates/align_driver/tests/apps_web_multipart.rs` — 12 cases over the shipped source
+**Tests:** `crates/align_driver/tests/apps_web_multipart.rs` — 16 cases over the shipped source
 (`include_str!`): the two-part text+file body, zero-length parts, preamble/epilogue/transport
 padding, case-insensitive names, quoted vs bare parameters, a `;` inside a quoted filename, missing
-`name` / wrong disposition / obs-fold / no-colon lines, truncation as `Invalid` rather than `Done`,
-the boundary appearing inside a part's data, a verbatim binary data view (NUL / 0xFF / bare CRLF),
-the `boundary()` accept/reject rows, and the empty-boundary and out-of-range `from` guards.
+`name` / wrong disposition / no-colon lines, an obs-fold continuation (its own discriminating body),
+every duplicate form, the bare-`token` and trailing-space boundary rules, truncation as `Invalid`
+rather than `Done`, the boundary appearing inside a part's data, a verbatim binary data view (NUL /
+0xFF / bare CRLF), the `boundary()` accept/reject rows, and the empty-boundary and out-of-range
+`from` guards. The `upload` handler above is EXTRACTED from this file and compiled against the real
+`apps/web/pkg/**`, so a documented example that stops compiling fails the suite.
 
 ## Slices (F3 of the plan)
 

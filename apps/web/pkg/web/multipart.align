@@ -29,6 +29,20 @@ module pkg.web.multipart
 //     }
 //   }
 //
+// **A duplicate is refused, never resolved.** Two `Content-Disposition` (or two `Content-Type`)
+// field lines in one part, or one parameter attribute twice in one list, is `Invalid`. Picking the
+// first or the last would be a guess, the two guesses disagree, and whatever parser stands in front
+// of us may have made the other one — which is precisely how a request-smuggling differential is
+// built. The same reasoning applies to a bare parameter value that is not an RFC 9110 `token`.
+//
+// **`filename` is advisory and is NOT sanitized** (RFC 7578 §4.2): it is handed back exactly as it
+// arrived, which includes `../`, an absolute path, backslashes, or any other UTF-8-valid bytes the
+// client chose. It must never be used as a path, or as part of one, without the application
+// validating it — this module refuses to guess what a safe name would be, because a silent rewrite
+// is as wrong as a traversal. Note also that `filename=""` (what a browser sends for an untouched
+// file input) is indistinguishable from an absent `filename`: both read as "", so a `filename` test
+// separates "named a file" from "did not", not "is a file part" from "is a field".
+//
 // **Zero allocation, zero copy.** Every `str`/`slice<u8>` handed back is a view into the caller's
 // body (or into the `content-type` header for `boundary`). Nothing here allocates, so a 200 MB
 // upload costs no more than the buffer it already arrived in. Iteration state is one `i64` the
@@ -61,7 +75,9 @@ MAX_BOUNDARY := 70
 //
 // The range test is written `i > b.len() - n` rather than `i + n > b.len()` on purpose: integer
 // overflow is DEFINED to wrap in Align, so the sum form lets a near-`i64::MAX` index wrap negative,
-// pass the guard, and index out of bounds — an abort, from one bad number.
+// pass the guard, and index out of bounds — an abort, from one bad number. `next`'s own `from`
+// range check means no caller can reach that today, so no test can pin this form; it is checked
+// here rather than assumed, because the invariant belongs to the helper, not to its one caller.
 fn bytes_at(b: slice<u8>, i: i64, s: str) -> bool {
   sb := s.bytes()
   n := sb.len()
@@ -153,6 +169,37 @@ Param {
   Invalid,
 }
 
+// Whether `c` is an RFC 9110 §5.6.2 `tchar` — the bytes a bare (unquoted) parameter value may use.
+fn is_tchar(c: i64) -> bool {
+  if c >= 48 && c <= 57 { return true }    // '0'..'9'
+  if c >= 65 && c <= 90 { return true }    // 'A'..'Z'
+  if c >= 97 && c <= 122 { return true }   // 'a'..'z'
+  // The punctuation half of tchar: ! # $ % & ' * + - . ^ _ ` | ~
+  c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43
+    || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+
+// Whether `v` is a non-empty RFC 9110 §5.6.6 `token`, i.e. a legal BARE parameter value.
+//
+// This is not pedantry: "everything up to the next ';'" would accept `boundary=A,B` and
+// `boundary=abc def`, which a stricter parser in front of us (Go's `mime` rejects both) reads as a
+// different boundary — or as no valid header at all. A proxy that sees boundary `A` and an origin
+// that sees `A,B` disagree about where the parts are, which is exactly the differential a request
+// smuggler is looking for. A value that is not a token is refused rather than interpreted.
+fn is_token(v: str) -> bool {
+  vb := v.bytes()
+  n := v.len()
+  if n < 1 {
+    return false
+  }
+  mut i := 0
+  loop {
+    if i >= n { break true }
+    if !is_tchar(vb[i] as i64) { break false }
+    i = i + 1
+  }
+}
+
 // The value of parameter `attr` in a header value's parameter list `params` (what `tail_params`
 // returns), unquoted-or-quoted, attribute name compared case-insensitively (RFC 9110 §5.6.6).
 //
@@ -161,13 +208,20 @@ Param {
 //   - a quoted value carrying a `\` quoted-pair — the value the sender meant is NOT the bytes on
 //     the wire, so it cannot be handed back zero-copy, and returning the still-escaped bytes would
 //     silently give the caller a wrong filename. Refusing beats lying;
+//   - a bare value that is not a `token` (see `is_token`);
+//   - `attr` appearing TWICE — a duplicate is refused, never resolved (the module's one rule for
+//     ambiguity: picking the first or the last is a guess, and the two guesses disagree with each
+//     other and with whatever parser stands in front of us);
 //   - the attribute we were asked for present with no value at all.
 // A `\` inside some OTHER parameter's value is not fatal: it is scanned over correctly (a
-// quoted-pair never terminates the string) and skipped.
+// quoted-pair never terminates the string) and skipped. Because a duplicate has to be SEEN to be
+// refused, the whole list is walked even after a match.
 fn param(params: str, attr: str) -> Param {
   pb := params.bytes()
   n := params.len()
   mut i := 0
+  mut found := false
+  mut value := ""
   loop {
     // Skip the ';' separators and any OWS around them.
     loop {
@@ -177,7 +231,7 @@ fn param(params: str, attr: str) -> Param {
       i = i + 1
     }
     if i >= n {
-      break Param.Absent
+      break if found { Param.Value(value) } else { Param.Absent }
     }
     // The attribute name runs to '=' (it has a value) or ';' (it does not).
     mut e := i
@@ -227,11 +281,15 @@ fn param(params: str, attr: str) -> Param {
           break Param.Invalid
         }
         if ci_eq(name, attr) {
-          break if escaped { Param.Invalid } else { Param.Value(params[v + 1..q]) }
+          if found || escaped {
+            break Param.Invalid
+          }
+          found = true
+          value = params[v + 1..q]
         }
         i = q + 1
       } else {
-        // A bare token value: it runs to the next ';'.
+        // A bare value: it runs to the next ';', and must be a `token`.
         mut te := v
         loop {
           if te >= n { break }
@@ -239,7 +297,12 @@ fn param(params: str, attr: str) -> Param {
           te = te + 1
         }
         if ci_eq(name, attr) {
-          break Param.Value(trim(params[v..te]))
+          bare := trim(params[v..te])
+          if found || !is_token(bare) {
+            break Param.Invalid
+          }
+          found = true
+          value = bare
         }
         i = te
       }
@@ -249,14 +312,24 @@ fn param(params: str, attr: str) -> Param {
 
 // ── Boundary ──────────────────────────────────────────────────────────────────────────────────
 
-// Whether a boundary value can be used as-is: 1..=70 bytes (RFC 2046 §5.1.1), no control byte and
-// no '"'. The length bound and the control bytes are the RFC's; the '"' is ours — a boundary
-// carrying one could only have reached us through a quoted-string, so accepting it would mean the
-// delimiter we scan for is not the one the sender wrote.
+// Whether a boundary value can be used as-is: 1..=70 bytes, no control byte, and not ending in
+// SP/HTAB. All three are RFC 2046 §5.1.1's own grammar — `1*70<bchars>` whose LAST character is a
+// `bcharsnospace`. The trailing-space rule is load-bearing rather than pedantic: a delimiter line
+// may carry transport padding after the boundary, so a boundary that itself ends in a space makes
+// "where the boundary ends and the padding begins" ambiguous — two parsers can split one body
+// differently.
+//
+// The '"' test cannot fire, and is kept as a checked invariant rather than an assumed one: a raw
+// '"' inside a quoted-string would have CLOSED that string, `\"` is refused by `param`'s
+// quoted-pair rule, and a bare value must be a `token`, which excludes '"'.
 fn usable_boundary(v: str) -> bool {
   vb := v.bytes()
   n := v.len()
   if n < 1 || n > MAX_BOUNDARY {
+    return false
+  }
+  last := vb[n - 1] as i64
+  if last == SP || last == HTAB {
     return false
   }
   mut i := 0
@@ -389,8 +462,8 @@ fn delim_at(b: slice<u8>, bd: str, from: i64) -> i64 {
   if c < 0 { -1 } else { c + 2 }
 }
 
-// The index just past the CRLF that ends the field line starting at `i`, or -1 when the line is not
-// terminated.
+// The index OF the CR that ends the field line starting at `i` (so `b[i..line_end(b, i)]` is the
+// line without its terminator), or -1 when the line is not terminated.
 fn line_end(b: slice<u8>, i: i64) -> i64 {
   n := b.len()
   mut k := i
@@ -408,8 +481,17 @@ fn line_end(b: slice<u8>, i: i64) -> i64 {
 // `Invalid` is a body that does not parse — no delimiter at all, a header line with no ':' or an
 // obsolete `obs-fold` continuation (RFC 9110 §5.2 removed it, and guessing at its intent is how
 // smuggling bugs start), a Content-Disposition that is not `form-data`, a missing `name` parameter,
-// a header line that is not valid UTF-8 (`Part`'s fields are `str`), or a body that ends before its
-// closing delimiter. The application answers 400; there is nothing partial worth handing back.
+// a duplicated Content-Disposition / Content-Type / parameter attribute, a non-`token` bare
+// parameter value, a quoted-pair escape in a value we would have to return, a header line that is
+// not valid UTF-8 (`Part`'s fields are `str`), or a body that ends before its closing delimiter.
+// The application answers 400; there is nothing partial worth handing back.
+//
+// One deliberate strictness beyond the grammar's minimum: the part's data must end with a CRLF
+// before the delimiter, because that CRLF belongs to the delimiter. A body written
+// `--SEP\r\nContent-Disposition: form-data; name="a"\r\n\r\n--SEP--` — an empty part with no CRLF
+// at all between the headers and the close — is therefore `Invalid` here, where Go's
+// `mime/multipart` accepts it. Requiring the byte the RFC's grammar puts there keeps one reading of
+// where a part ends.
 pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
   // An empty boundary would make `--` alone a delimiter and split the body at nonsense positions.
   // It is what `boundary()` returns for a request that is not a walkable multipart form, so this
@@ -439,6 +521,7 @@ pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
   mut part_filename := ""
   mut part_type := ""
   mut have_name := false
+  mut have_type := false
   mut data_start := -1
   loop {
     if hp >= body.len() {
@@ -454,6 +537,9 @@ pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
     }
     le := line_end(body, hp)
     if le < 0 {
+      // An unterminated field line. The no-colon guard below would refuse it too (its scan bound
+      // `le` is already behind `ci`), so this changes no outcome — it names the truncation at the
+      // point it is detectable instead of letting a -1 flow into an index computation.
       return Step.Invalid
     }
     // Split the field line at its first ':'.
@@ -467,6 +553,12 @@ pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
       return Step.Invalid            // a field line with no ':'
     }
     if ci_eq_bytes(body, hp, ci, "content-disposition") {
+      // A second Content-Disposition — refused, never resolved. `have_name` is exactly "a
+      // Content-Disposition was already accepted here": the only way past the parameter match
+      // below sets it, every other way out of this branch returns.
+      if have_name {
+        return Step.Invalid
+      }
       value := match body[ci + 1..le].as_str() {
         Ok(v) => v
         Err(_) => { return Step.Invalid }
@@ -491,10 +583,14 @@ pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
       }
     }
     if ci_eq_bytes(body, hp, ci, "content-type") {
+      if have_type {
+        return Step.Invalid            // a second Content-Type — refused, never resolved
+      }
       part_type = match body[ci + 1..le].as_str() {
         Ok(v) => trim(v)
         Err(_) => { return Step.Invalid }
       }
+      have_type = true
     }
     // Any other field is skipped: it need not even be valid UTF-8 to be ignored.
     hp = le + 2

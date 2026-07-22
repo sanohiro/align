@@ -218,9 +218,19 @@ READMEs):**
    iteration; a `\` quoted-pair in a quoted `filename`/`boundary` is REFUSED rather than returned
    still-escaped (un-escaping would allocate, and the escaped bytes are the wrong filename); and a
    delimiter is checked as a whole LINE (RFC 2046 §5.1.1), so a data line that merely starts with
-   the boundary (`--SEPARATE` for boundary `SEP`) stays inside the part. No compiler enabler was
-   needed. `crates/align_driver/tests/apps_web_multipart.rs` drives the shipped source
-   (`include_str!`) through 12 cases. **§2b of the plan now has no `TODO` rows left.**
+   the boundary (`--SEPARATE` for boundary `SEP`) stays inside the part. **Review round two added
+   the ambiguity rules:** a duplicate is refused, never resolved (two `Content-Disposition` /
+   `Content-Type` lines in one part, or one parameter attribute twice — first-wins and last-wins are
+   both guesses that disagree, and the parser in front of us may have made the other one), a BARE
+   parameter value must be an RFC 9110 `token` (`boundary=A,B` / `boundary=abc def` are refused, as
+   Go's `mime` refuses them), and a boundary may not end in SP/HTAB (§5.1.1 `bcharsnospace` —
+   transport padding follows a delimiter). It also pinned the security note the docs were missing:
+   **`filename` is advisory and unsanitized** — `../` and absolute paths come back verbatim, and an
+   application must validate before using it as a path. No compiler enabler was needed.
+   `crates/align_driver/tests/apps_web_multipart.rs` drives the shipped source (`include_str!`)
+   through 16 cases, one of which EXTRACTS the documented `upload` handler out of
+   `pkg-design/web.md` and compiles it against the real `apps/web/pkg/**`, so a doc example that
+   stops compiling fails the suite. **§2b of the plan now has no `TODO` rows left.**
 
 **DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
 item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
@@ -674,7 +684,7 @@ apps/jwt/pkg/jwt.align                  encode_hs256 / decode_hs256 / time_claim
 ```
 
 Driver tests: `apps_web_router.rs` (7), `apps_web_serve.rs` (3, real socket), `apps_web_query.rs` (3),
-`apps_web_cookie.rs` (3), `apps_web_cors.rs` (3), `apps_web_multipart.rs` (12), `apps_jwt.rs` (3),
+`apps_web_cookie.rs` (3), `apps_web_cors.rs` (3), `apps_web_multipart.rs` (16), `apps_jwt.rs` (3),
 `pkg_foundation.rs` (6),
 `struct_handle_fields.rs` (9), `struct_slice_fields.rs` (5), `fn_values.rs` (21).
 
@@ -684,6 +694,31 @@ THROUGH the `Route.handler` fn-value field -> a responder consuming the handle o
 Nothing there stands in for a missing compiler feature.
 
 ## NEXT (in order)
+
+0. **OPEN COMPILER DEFECT (found 2026-07-22 while writing `pkg.web.multipart`; NOT fixed there —
+   it needs its own PR): interpolating an OWNED `string` into a `template` panics in codegen
+   instead of diagnosing.** The panic is
+   `Found StructValue { … llvm_type: "{ ptr, i64 }" } but expected the IntValue variant`, i.e. the
+   template lowering assumes a scalar operand and never learns the `string` representation. Minimal
+   repro on `main`:
+
+   ```align
+   module main
+
+   fn main() -> Result<(), Error> {
+     mut b := builder()
+     b.write("hello")
+     s := b.to_string()
+     print(template "value={s}")
+     return Ok(())
+   }
+   ```
+
+   A `str` interpolates fine; only the owned `string` does this. Two things are wrong and both are
+   in Gate 3 of the self-review checklist: the compiler PANICS on a program a user can write, and it
+   panics in codegen rather than being rejected (or accepted) in sema. Fix = teach the template
+   lowering the `string` operand (borrow it to a `str` view — the same thing `print(s)` already
+   does), and add the sema-side rejection for whatever remains unsupported.
 
 1. **`pkg.web` root + `serve()` — DONE, then rebuilt on the settled ownership model.** `apps/web/pkg/web.align` is real: per-method constructors
    (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the

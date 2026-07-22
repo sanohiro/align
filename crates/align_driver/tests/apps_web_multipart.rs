@@ -150,6 +150,83 @@ fn malformed_parts_are_invalid() {
 }
 
 #[test]
+fn an_obs_fold_continuation_is_refused_not_interpreted() {
+    if !backend_available() {
+        return;
+    }
+    // The discriminating body for the obs-fold guard alone: every header here is otherwise
+    // well-formed, and the folded line belongs to a header nothing reads. Without the guard the
+    // continuation parses as its own field line and the part comes back as `a|||1`; RFC 9110 §5.2
+    // removed obs-fold, and reading a folded header as a fresh one is how two parsers end up
+    // disagreeing about a request.
+    let main = program(
+        r#"  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\n X-Fold: 1\r\n\r\nz\r\n--SEP--", "SEP")"#,
+    );
+    let out = run_multipart("multipart-obs-fold", &main);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "INVALID\n");
+}
+
+#[test]
+fn a_duplicate_is_refused_never_resolved() {
+    if !backend_available() {
+        return;
+    }
+    // One rule for ambiguity: a repeat is `Invalid`. Picking the first (Go's choice) or the last
+    // are both guesses, they disagree with each other, and whatever parser stands in front of us
+    // may have made the other one — the shape of a smuggling differential. Covered here: a second
+    // Content-Disposition, a second Content-Type, a repeated `name`, a repeated `filename`, and a
+    // repeated `boundary` parameter (which makes the request unwalkable, so `boundary` answers "").
+    let main = program(
+        r#"  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nz\r\n--SEP--", "SEP")
+  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain\r\nContent-Type: text/html\r\n\r\nz\r\n--SEP--", "SEP")
+  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"; name=\"b\"\r\n\r\nz\r\n--SEP--", "SEP")
+  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"; filename=\"f\"; filename=\"g\"\r\n\r\nz\r\n--SEP--", "SEP")
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=a; boundary=a").len())
+  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain\r\n\r\nz\r\n--SEP--", "SEP")"#,
+    );
+    let out = run_multipart("multipart-duplicates", &main);
+    assert_eq!(out.status.code(), Some(0));
+    // The last row is the same shape without a repeat — the rule rejects duplicates, not headers.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "INVALID\nINVALID\nINVALID\nINVALID\n0\na||text/plain|z\nDONE\n"
+    );
+}
+
+#[test]
+fn a_bare_parameter_value_must_be_a_token() {
+    if !backend_available() {
+        return;
+    }
+    // RFC 9110 §5.6.6: an unquoted parameter value is a `token`. Taking "everything up to the next
+    // ';'" instead would accept `boundary=A,B` and `boundary=abc def` — which Go's `mime` rejects
+    // outright, so a proxy in front of us would see a different boundary (or no valid header) than
+    // we do, and the two of us would disagree about where the parts are. A QUOTED value may hold
+    // those bytes (`"A,B"`, `"a b c"`) — that is what quoting is for. A boundary may not END in
+    // SP/HTAB either (RFC 2046 `bcharsnospace`): transport padding follows a delimiter, so a
+    // trailing space makes "boundary or padding?" ambiguous.
+    let main = program(
+        r#"  print(pkg.web.multipart.boundary("multipart/form-data; boundary=ok-9_x"))
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=\"A,B\""))
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=\"a b c\""))
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=A,B").len())
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=abc def").len())
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=a\"b").len())
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=\"abc \"").len())
+  print(pkg.web.multipart.boundary("multipart/form-data; boundary=\"abc\t\"").len())
+  walk("--SEP\r\nContent-Disposition: form-data; name=a b\r\n\r\nz\r\n--SEP--", "SEP")
+  walk("--SEP\r\nContent-Disposition: form-data; name=a-b_9\r\n\r\nz\r\n--SEP--", "SEP")"#,
+    );
+    let out = run_multipart("multipart-token", &main);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok-9_x\nA,B\na b c\n0\n0\n0\n0\n0\nINVALID\na-b_9|||z\nDONE\n"
+    );
+}
+
+#[test]
 fn a_truncated_body_is_invalid_not_done() {
     if !backend_available() {
         return;
@@ -334,9 +411,12 @@ fn an_unusable_boundary_argument_never_walks() {
     // `boundary()` returns "" for a request that is not a walkable multipart form; an empty
     // boundary would make `--` alone a delimiter, so `next` refuses it rather than splitting the
     // body at nonsense positions. An out-of-range `from` is refused for a harder reason: integer
-    // overflow WRAPS in Align, so `i64::MAX` fed to a `i + n > len` bounds guard used to wrap
-    // negative, pass it, and abort the process on the index — one bad number, no server. Every such
-    // `from` now reads as `Invalid`, and the walk that survives it prints last.
+    // overflow WRAPS in Align, so `i64::MAX` reached a `i + n > len` bounds test inside the scan,
+    // wrapped negative, passed it, and aborted the process on the index — one bad number, no
+    // server. What this row pins is `next`'s own `from` range check, the guard that keeps such a
+    // value out of the scan at all; the wrap-safe form of that inner test is unreachable behind it
+    // and deliberately not claimed to be pinned here. Every out-of-range `from` reads as `Invalid`,
+    // and the walk that survives them prints last.
     let main = program(
         r#"  walk("--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nz\r\n--SEP--", "")
   body := "--SEP\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nz\r\n--SEP--".bytes()
@@ -359,4 +439,47 @@ fn an_unusable_boundary_argument_never_walks() {
         String::from_utf8_lossy(&out.stdout),
         "INVALID\nINVALID\nINVALID\nINVALID\nINVALID\nINVALID\na|||z\nDONE\n"
     );
+}
+
+const WEB_ROOT: &str = include_str!("../../../apps/web/pkg/web.align");
+const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
+const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
+const QUERY: &str = include_str!("../../../apps/web/pkg/web/internal/query.align");
+const DESIGN_DOC: &str = include_str!("../../../docs/impl/pkg-design/web.md");
+
+/// The first ```` ```align ```` block after `marker` in the design doc — the documented example
+/// itself, not a copy of it that can drift away from what readers are told to write.
+fn doc_example(marker: &str) -> String {
+    let after = DESIGN_DOC.split_once(marker).expect("design-doc section").1;
+    let body = after.split_once("```align\n").expect("align fence").1;
+    body.split_once("```").expect("fence close").0.to_string()
+}
+
+#[test]
+fn the_documented_handler_example_compiles_against_the_real_pkg_web() {
+    if !backend_available() {
+        return;
+    }
+    // The doc's `upload` handler is EXTRACTED from `pkg-design/web.md` and built against the real
+    // `apps/web/pkg/**` sources. A documented example that does not compile is worse than none —
+    // and the first draft of this one did not: it called `pkg.web.status(c, 400)` (the responder
+    // takes no `Ctx`) and used `pkg.web.header(...)` as a `str` when it returns `Option<str>`.
+    let main = format!(
+        "module main\nimport pkg.web\nimport pkg.web.types\nimport pkg.web.multipart\n\n{}\nfn main() -> Result<(), Error> {{\n  routes := [pkg.web.post(\"/upload\", upload)]\n  print(routes.len())\n  return Ok(())\n}}\n",
+        doc_example("## multipart/form-data")
+    );
+    let out = build_and_run_multi(
+        "multipart-doc-example",
+        &[
+            ("pkg/web.align", WEB_ROOT),
+            ("pkg/web/types.align", TYPES),
+            ("pkg/web/internal/router.align", ROUTER),
+            ("pkg/web/internal/query.align", QUERY),
+            ("pkg/web/multipart.align", MULTIPART),
+            ("main.align", &main),
+        ],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
 }
