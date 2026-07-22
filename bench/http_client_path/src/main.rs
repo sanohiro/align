@@ -103,6 +103,20 @@ use align_runtime::{
 const RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
 
+/// The response both arms move. `BODY=n` swaps the 13-byte default for an `n`-byte body — the shape
+/// a gateway actually reads back, and the one where per-byte copying (rather than per-request
+/// overhead) dominates. A change can win at one size and lose at the other, so both are measured.
+fn response_bytes() -> Vec<u8> {
+    match std::env::var("BODY").ok().and_then(|v| v.parse::<usize>().ok()) {
+        None => RESPONSE.to_vec(),
+        Some(n) => {
+            let mut r = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {n}\r\n\r\n").into_bytes();
+            r.extend(std::iter::repeat(b'x').take(n));
+            r
+        }
+    }
+}
+
 /// Exactly what `align_rt_http_client_get` puts on the wire for `http://127.0.0.1:{port}/plaintext`
 /// — asserted by the peer on the first request of every arm, so the floor cannot quietly measure a
 /// cheaper exchange. A mismatch means the runtime's request serializer changed and this must follow
@@ -154,7 +168,7 @@ fn start_watchdog() {
 /// **It allocates nothing per request** — a fixed read buffer and a `const` response — because the
 /// counting allocator is global and this thread shares the process with the measured one. The floor
 /// arm's `0.00 allocs/req` is the assertion that keeps this honest.
-fn spawn_peer(listener: TcpListener, arm: &'static str, expected: Vec<u8>) -> std::thread::JoinHandle<()> {
+fn spawn_peer(listener: TcpListener, arm: &'static str, expected: Vec<u8>, response: Vec<u8>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let (mut conn, _) = listener.accept().expect("peer accept");
         conn.set_nodelay(true).ok();
@@ -178,7 +192,7 @@ fn spawn_peer(listener: TcpListener, arm: &'static str, expected: Vec<u8>) -> st
                 );
                 first = false;
             }
-            if conn.write_all(RESPONSE).is_err() {
+            if conn.write_all(&response).is_err() {
                 return;
             }
         }
@@ -248,24 +262,32 @@ fn main() {
     // `connect`, not this).
     let (align_listener, align_port) = bind_loopback();
     let request = align_request_bytes(align_port);
-    let align_peer = spawn_peer(align_listener, "align", request.clone());
+    let response = response_bytes();
+    let align_peer = spawn_peer(align_listener, "align", request.clone(), response.clone());
 
     // --- arm 0: the floor — write the request, read the response, keep the connection. Exactly the
     // syscalls Align's exchange makes, and nothing else.
     let (floor_listener, floor_port) = bind_loopback();
-    let floor_peer = spawn_peer(floor_listener, "floor", request.clone());
+    let floor_peer = spawn_peer(floor_listener, "floor", request.clone(), response.clone());
     let mut floor_conn = TcpStream::connect(("127.0.0.1", floor_port)).expect("floor connect");
     floor_conn.set_nodelay(true).ok();
     let client: *mut HttpClient = align_rt_http_client_new();
     let url = format!("http://127.0.0.1:{align_port}/plaintext");
 
-    let mut resp_buf = [0u8; 512];
+    let mut resp_buf = vec![0u8; response.len() + 64];
     // One dispatcher rather than two closures, so the arm ORDER can be varied per block below.
-    let mut exchange = |arm: usize, buf: &mut [u8; 512]| match arm {
+    let mut exchange = |arm: usize, buf: &mut Vec<u8>| match arm {
         0 => {
             floor_conn.write_all(&request).expect("floor write");
-            let n = floor_conn.read(buf).expect("floor read");
-            assert_eq!(&buf[..n], RESPONSE, "floor: peer sent a different response");
+            // Read to the framed length, exactly as Align's exchange does — a single `read` would
+            // stop at the first segment and make the floor cheaper than the arm it is the zero for.
+            let mut got = 0;
+            while got < response.len() {
+                let n = floor_conn.read(&mut buf[got..]).expect("floor read");
+                assert!(n > 0, "floor: peer closed early");
+                got += n;
+            }
+            assert_eq!(&buf[..got], &response[..], "floor: peer sent a different response");
         }
         _ => {
             let mut resp = std::ptr::null_mut();

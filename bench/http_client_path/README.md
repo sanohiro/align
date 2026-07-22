@@ -76,18 +76,50 @@ the pool lookup.
 ## What it found
 
 **14 allocations and ~4.4 µs of CPU per `http.get`** — a bigger budget than the server path's
-(~2.5 µs after #602–#604). Known items in it, in the order they are understood:
+(~2.5 µs after #602–#604). The remaining allocations are the request `String`s (`method`, `url`), the
+response buffer, the parsed head's span `Vec`, and the owned response.
 
-- **`http_socket_exchange` reads into a `let mut chunk = [0u8; 32 * 1024]`** and then
-  `extend_from_slice`s into the buffer that keeps the response — the identical shape #602 removed
-  from the server, where it measured ~−640 ns and was *larger than all fourteen heap allocations
-  together*. Its fix is also the same, including the trap #602's review caught: reserving a flat
-  chunk before the final short read doubles the buffer, so the reserve must be bounded by what the
-  framing still wants.
-- **`Vec::new()` for the response buffer** — 56 bytes of `realloc` growth per request says it grows
-  at least once even for a 96-byte response.
-- The remaining allocations: the request `String`s (`method`, `url`), the parsed head's span `Vec`,
-  the owned response.
+### Negative result: read-into-the-response-buffer does NOT transfer from the server
+
+The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
+into a `let mut chunk = [0u8; 32 * 1024]` and then `extend_from_slice`s into the buffer that keeps
+the response, the identical *source shape* #602 removed, where it was worth ~−640 ns and was larger
+than all fourteen heap allocations together. **It was implemented, measured, and discarded.** Two
+independent reasons, both worth keeping:
+
+**1. The memset it targets is not there.** `objdump` of the shipped `libalign_runtime.a`:
+`http_socket_exchange` is inlined into `http_client_perform`, which contains **zero `memset` calls**
+(one stack probe remains, for the 32 KiB frame). LLVM elides the zero-init here — the array's only
+use before being read is the transport call that fills it — where on the server, in a different
+inlining context, #602 measured the `memset` present in the object. *The premise was a source-level
+resemblance that the compiler had already dissolved.* Check the object, not the source.
+
+**2. Reading into the buffer forces a size decision before the framing is known**, and on the client
+that decision has no good answer. Adjacent A/B, `align_runtime` stashed and rebuilt between arms:
+
+| response body | before | after | |
+|---|---|---|---|
+| 13 B | 4646 | 4194 | −452 ns |
+| **8 KiB** | 4699 / 4816 / 4887 | 5931 / 6809 / 5815 | **+1200 ns, 3/3** |
+| 200 KiB | 11689 | 6738 | −4951 ns (−42%) |
+
+The 8 KiB regression is the whole story. A 2 KiB starting buffer (what the server uses, sized for a
+request head) caps the *first* read at 2 KiB, so every response past 2 KiB costs an extra `read`
+syscall that the 32 KiB stack chunk absorbed in one. Starting bigger is not available: **this buffer
+IS the returned response body** — `truncate` never gives capacity back — so a 16 KiB start would
+retain 16 KiB for a 96-byte response. The server does not face this: request heads are small, and
+bodied requests are the rare case.
+
+The 200 KiB win is real (per-byte copy elimination, matching #602's −16% server-side on the same
+size) and is the gateway's actual shape, so this is worth revisiting **as a body-size-aware read
+strategy**, not as a transplant of the server's.
+
+**3. And it broke the pooling safety property**, which is recorded as its own test
+(`http_client_does_not_pool_leftover_arriving_after_the_framing`): a response carrying bytes past its
+`Content-Length` is a dirty conn, detected by having *read* the overshoot. A read sized to the framed
+remainder cannot overshoot, so `buf.len() == t` becomes trivially true and the dirty conn is pooled —
+misframing the next response on it. The test asserts on the **idle pool**, not the accept count,
+because the pooled-then-failed path retries on a fresh connect and accepts twice either way.
 
 ## Caveats
 
