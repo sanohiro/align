@@ -53,6 +53,15 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   than its own σ. The fix is structural: **alternate the arms in blocks inside one process and take
   the median**, so drift hits every arm alike. (Three samples suggested ±1.3%; eleven showed 3.5%.
   Quote a spread with its sample size, or don't quote it.)
+- **Alternating is not enough — counterbalance the order.** Even interleaved, the *position* in the
+  cycle carries a bias: three **identical** floors in `http_path`'s three slots read slot 2 ~115 ns
+  above slot 1 and slot 3 ~109 ns below it, systematically, and it does not shrink with more blocks.
+  That was 11% of one reported line. Reverse the order on alternate blocks (`A,B,C` then `C,B,A`) so
+  every arm sees every slot equally often — this is what "balanced order" above actually requires.
+- **Min is the right statistic for one kernel's time, the wrong one for a difference of two.** Taking
+  each arm's min picks two uncorrelated low outliers and *adds* their noise, and discards exactly the
+  correlated drift interleaving exists to cancel. Measured on the same data: median σ 88/173/99 ns vs
+  min σ 146/214/127.
 - **When the result disappoints, autopsy — don't guess.** If a mechanism that *should* win comes back
   flat or slower, do not reason about the cause from intuition: build an **absolute-ms breakdown** that
   starts from the fast variant and adds one realistic cost at a time (stage-1 alone → + materialize →

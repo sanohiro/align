@@ -4,20 +4,20 @@ What one request costs **inside** the server: allocations and the server thread'
 two in-process floors.
 
 ```sh
-bench/http_path/run.sh              # 100000 requests per arm in 5 interleaved blocks
-bench/http_path/run.sh 200000 10    # requests-per-arm, blocks
+bench/http_path/run.sh              # 100000 requests per arm in 6 interleaved blocks
+bench/http_path/run.sh 200000 10    # requests-per-arm, blocks (blocks must be even)
 ```
 
 ```
-5 interleaved blocks x 20000 requests per arm (after 2000 warm-up)
+6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor (plain)        0.00           0.0            0.0        30959           444
-  floor (+poll)        0.00           0.0            0.0        32053           523
-  align               14.00         585.0          135.0        35675           662
+  floor (plain)        0.00           0.0            0.0        31253           418
+  floor (+poll)        0.00           0.0            0.0        32016           274
+  align               14.00         585.0          135.0        35488           247
 
-  the keep-alive `poll` costs:                    1094 ns/req
-  Align above the plain floor (web_e2e's figure):  4716 ns/req
-  Align's CPU work above the poll floor:          3621 ns/req, 14.00 allocations
+  the keep-alive `poll` costs:                    763 ns/req
+  Align above the plain floor (web_e2e's figure):  4234 ns/req
+  Align's CPU work above the poll floor:          3471 ns/req, 14.00 allocations
 ```
 
 ## Why this exists — `web_e2e` cannot price an allocation
@@ -82,28 +82,47 @@ first response **in every arm** — which is what keeps the arms comparable rath
 - **No channel between the client and server halves.** The socket already sequences them, and a
   channel would allocate on the client thread — which the counting allocator would then charge to the
   request path. Removing it is what makes allocations/request exactly integral.
-- **A watchdog.** If a client dies, its server arm blocks in `poll`/`accept` forever and the client's
-  own assertions are never observed. 20 s without progress aborts the process instead of hanging.
+- **A watchdog, and deliberately no client read timeout.** If a client dies, its server arm blocks in
+  `poll`/`accept` forever and the client's own assertions are never observed — so 20 s without
+  progress aborts the process. The clients themselves must NOT have a read timeout: while one arm
+  runs a block the other two clients sit in `read` for that whole block, which at large block sizes
+  exceeds any timeout worth setting (a 20 s one aborted `run.sh 500000 4`). `SERVED` advances during
+  *any* arm's block, so the watchdog fires only on a true global stall — the right condition.
 
 ## Precision — what to trust
 
-**Interleaved blocks and a median, not one long pass.** Within a run the harness is tight (an A/A
-floor-vs-floor check reads ±25 ns), but the box drifts *between* runs by more than the harness's own
-σ — an unchanged binary read mean 4201 in one batch and 4682 ten minutes later. **More iterations do
-not fix that**; alternating the arms inside one process does, because the drift then hits all of them
-alike. This is `bench/README.md`'s balanced-order rule applied.
+**Interleaved blocks and a median, not one long pass.** The box drifts *between* runs by more than
+the harness's own σ — an unchanged binary read mean 4201 ns in one batch and 4682 ten minutes later.
+**More iterations do not fix that**; alternating the arms inside one process does, because the drift
+then hits all of them alike.
 
-Observed across five consecutive runs of the current harness:
+**And the arm ORDER is counterbalanced, because the slot itself is biased.** Running three
+*identical* plain floors in the three slots showed slot 2 reading ~115 ns above slot 1 and slot 3
+~109 ns below slot 2 — systematically, not shrinking with more blocks. That is twice the headline's
+own σ and half the size of the effects this harness exists to price; uncorrected it inflated the
+`poll` line by 11% and deflated the headline by 3%. The order is therefore reversed on odd blocks
+(hence `blocks` must be even), and the `poll` figure moved from ~1022 to ~858 ns — agreeing with an
+independent two-arm measurement of 913 ns that never had the bias.
+
+Observed across six consecutive runs of the current harness:
 
 | metric | values (ns/req) | σ |
 |---|---|---|
-| Align above the **poll** floor | 3621 3630 3712 3565 3499 | ~78 ns (2.2%) |
-| Align above the plain floor | 4716 4416 4475 4737 4561 | ~130 ns (2.9%) |
-| the `poll` itself | 1094 786 763 1172 1063 | ~170 ns (large — a syscall's cost is the noisiest thing here) |
+| Align above the **poll** floor | 3542 3664 3583 3533 3482 3639 | **68 ns (1.9%)** |
+| Align above the plain floor | 4626 4335 4371 4378 4315 4568 | 126 ns (2.8%) |
+| the `poll` itself | 1084 671 788 845 832 929 | 130 ns (a syscall's cost is the noisiest thing here) |
 
-So: **quote the poll-floor difference**, expect ~2% run to run, and take any A/B **adjacently**. A
-single earlier 3-sample reading suggested ±1.3%; with 11 samples the true figure was 3.5%, which is
-why the claim now comes with its sample size.
+So: **quote the poll-floor difference**, expect ~2% run to run, and take any A/B **adjacently**. An
+early 3-sample reading suggested ±1.3%; with 11 samples the true figure was 3.5%, which is why every
+spread here comes with its sample size.
+
+**Median, not min — deliberately differing from `bench/README.md`'s primary harness.** That rule
+("keep the per-kernel minimum") is for a single kernel's own time, where interference is one-sided
+noise on one quantity. Here the reported number is a *difference of two independently minimized
+arms*, so taking each arm's min picks two uncorrelated low outliers and adds their noise — and throws
+away exactly the correlated block-to-block drift the interleaving exists to cancel. Measured over the
+same per-block data: median gives σ 88 / 173 / 99 ns on the three lines where min gives 146 / 214 /
+127.
 
 The allocation count carries none of this: it is 14.00 in every run, every variant, invariant to
 request shape and profile.

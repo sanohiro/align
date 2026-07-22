@@ -203,7 +203,11 @@ fn spawn_client(port: u16, total: u64) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_nodelay(true).ok();
-        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).ok();
+        // **No read timeout on purpose.** While one arm runs a block, the other arms' clients sit in
+        // `read` for the whole block — at 200k requests per block that is well over any timeout worth
+        // setting, and a timeout here aborted ordinary large-block invocations. The watchdog is the
+        // right guard: `SERVED` advances during *any* arm's block, so it fires only on a true global
+        // stall, which is exactly the condition worth failing on.
         let mut resp = vec![0u8; 512];
         for i in 0..total {
             s.write_all(REQUEST).expect("send request");
@@ -261,8 +265,8 @@ fn main() {
         }
     };
     let reqs_per_arm = parse(args.next(), 100_000, "requests-per-arm");
-    let blocks = parse(args.next(), 5, "blocks");
-    assert!(blocks >= 3, "need at least 3 blocks for a median");
+    let blocks = parse(args.next(), 6, "blocks");
+    assert!(blocks >= 4 && blocks % 2 == 0, "blocks must be even and >= 4 (counterbalanced order)");
     let per_block = reqs_per_arm / blocks;
     assert!(per_block >= 1_000, "at least 1000 requests per block (got {per_block})");
     let warm = per_block.min(2_000);
@@ -296,41 +300,49 @@ fn main() {
     let align_client = spawn_client(align_port, total);
 
     let mut req_buf = [0u8; 2048];
-    let mut plain = |buf: &mut [u8; 2048]| {
-        let n = plain_conn.read(buf).expect("plain read");
-        assert!(n > 0, "plain floor: client closed");
-        plain_conn.write_all(RESPONSE).expect("plain write");
-    };
-    let mut pollf = |buf: &mut [u8; 2048]| {
-        let mut fds = [
-            PollFd { fd: poll_conn.as_raw_fd(), events: POLLIN, revents: 0 },
-            PollFd { fd: poll_listener.as_raw_fd(), events: POLLIN, revents: 0 },
-        ];
-        let r = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
-        assert!(r > 0, "poll floor: poll failed");
-        let n = poll_conn.read(buf).expect("poll floor read");
-        assert!(n > 0, "poll floor: client closed");
-        poll_conn.write_all(RESPONSE).expect("poll floor write");
-    };
-    let mut align = || {
-        assert!(unsafe { serve_one(srv) }, "align request failed");
+    // One dispatcher rather than three closures, so the arm ORDER can be varied per block below.
+    let mut serve = |arm: usize, buf: &mut [u8; 2048]| match arm {
+        0 => {
+            let n = plain_conn.read(buf).expect("plain read");
+            assert!(n > 0, "plain floor: client closed");
+            plain_conn.write_all(RESPONSE).expect("plain write");
+        }
+        1 => {
+            let mut fds = [
+                PollFd { fd: poll_conn.as_raw_fd(), events: POLLIN, revents: 0 },
+                PollFd { fd: poll_listener.as_raw_fd(), events: POLLIN, revents: 0 },
+            ];
+            let r = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
+            assert!(r > 0, "poll floor: poll failed");
+            let n = poll_conn.read(buf).expect("poll floor read");
+            assert!(n > 0, "poll floor: client closed");
+            poll_conn.write_all(RESPONSE).expect("poll floor write");
+        }
+        _ => assert!(unsafe { serve_one(srv) }, "align request failed"),
     };
 
     // Warm-up per arm: the first requests pay one-time costs (the parked set's first insert,
     // allocator arena growth) that are not per-request costs.
     for _ in 0..warm {
-        plain(&mut req_buf);
-        pollf(&mut req_buf);
-        align();
+        for arm in 0..3 {
+            serve(arm, &mut req_buf);
+        }
     }
 
-    // Interleaved blocks: A,B,C,A,B,C,… so between-block drift hits every arm alike.
-    let (mut sp, mut sq, mut sa) = (Vec::new(), Vec::new(), Vec::new());
-    for _ in 0..blocks {
-        sp.push(measure_block(per_block, || plain(&mut req_buf)));
-        sq.push(measure_block(per_block, || pollf(&mut req_buf)));
-        sa.push(measure_block(per_block, &mut align));
+    // **Counterbalanced interleaving.** Alternating A,B,C every block is not enough: the SLOT itself
+    // carries a systematic bias on this box — with three identical floors in the three slots, slot 2
+    // reads ~115 ns above slot 1 and slot 3 ~109 ns below slot 2. That is twice the headline's own σ
+    // and half the size of the effects this harness exists to price, and it does not shrink with more
+    // blocks. Reversing the order on odd blocks cancels it, which is what `bench/README.md`'s
+    // "balanced order" actually asks for; `blocks` is even so every arm gets each slot equally often.
+    let mut samples: [Vec<Sample>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for b in 0..blocks {
+        for slot in 0..3usize {
+            let arm = if b % 2 == 0 { slot } else { 2 - slot };
+            samples[arm].push(measure_block(per_block, || serve(arm, &mut req_buf)));
+        }
     }
+    let [sp, sq, sa] = samples;
 
     drop(plain_conn);
     drop(poll_conn);

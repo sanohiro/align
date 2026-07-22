@@ -112,8 +112,10 @@ Two things to carry forward rather than re-derive:
 2. **The remaining 4.1 µs is not one syscall.** With the poll unremovable this way, what is left to
    attack is allocation and copying: `http_read_request` starts a fresh `Vec` per request, the
    header spans are a fresh `Vec`, the builder holds `String`s, and the response is serialized into
-   another fresh buffer. **Measured since: 14 allocations and 770 bytes per request**, on a path
-   whose whole budget is 4.1 µs.
+   another fresh buffer. **Measured since (`bench/http_path`): exactly 14 allocations per request** —
+   585 bytes of fresh allocation plus 135 bytes of `realloc` growth — on a path whose whole budget is
+   4.1 µs. (Two figures, not one summed: pre-reserving a buffer moves bytes between them, so a single
+   total shows an improvement as a regression.)
 
 **Correction (2026-07-22): the last sentence of that point used to say `bench/web_e2e` at `CONNS=1`
 can price each one. It cannot.** The "above the floor" figure is a *difference of two ~70 µs

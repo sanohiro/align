@@ -7,9 +7,9 @@
 # Three arms — a plain read/write floor, the same plus the `poll` Align's keep-alive wait does, and
 # Align — run in INTERLEAVED blocks so the box's between-run drift hits all of them alike.
 #
-#   bench/http_path/run.sh [requests-per-arm] [blocks]     (default: 100000 5)
+#   bench/http_path/run.sh [requests-per-arm] [blocks]     (default: 100000 6)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 cargo build -q --release
-./target/release/http-path-bench "${1:-100000}" "${2:-5}"
+./target/release/http-path-bench "${1:-100000}" "${2:-6}"
