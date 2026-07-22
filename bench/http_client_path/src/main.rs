@@ -263,6 +263,7 @@ fn main() {
     let (align_listener, align_port) = bind_loopback();
     let request = align_request_bytes(align_port);
     let response = response_bytes();
+    let default_response = response == RESPONSE;
     let align_peer = spawn_peer(align_listener, "align", request.clone(), response.clone());
 
     // --- arm 0: the floor — write the request, read the response, keep the connection. Exactly the
@@ -333,12 +334,17 @@ fn main() {
     // The zero that proves neither peer thread is polluting the Align count: the floor arm runs the
     // identical peer and must allocate nothing at all.
     assert_eq!(fa, 0.0, "the floor allocated — the counter is seeing the peer thread");
-    for sample in &sa {
-        assert!(
-            sample.allocs <= 7.0,
-            "http.get allocation regression: {:.2}/request exceeds the pinned 7-allocation ceiling",
-            sample.allocs
-        );
+    // Seven is the common 13-byte response's ceiling. Larger BODY= probes intentionally exercise
+    // buffer growth, so their allocation count is data for the size comparison rather than this
+    // small-response regression gate.
+    if default_response {
+        for sample in &sa {
+            assert!(
+                sample.allocs <= 7.0,
+                "http.get allocation regression: {:.2}/request exceeds the pinned 7-allocation ceiling",
+                sample.allocs
+            );
+        }
     }
 
     let spread = |xs: &[Sample]| {

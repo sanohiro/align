@@ -94,7 +94,7 @@ exactly 7 in every block. The harness pins 7 as a ceiling; allocation regression
 quietly becoming a new printed baseline. Further cuts now require representation or reuse work
 (header spans, response handle and pool bookkeeping), not another obvious redundant ownership hop.
 
-### Negative result: read-into-the-response-buffer does NOT transfer from the server
+### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
 The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
 into a `let mut chunk = [0u8; 32 * 1024]` and then `extend_from_slice`s into the buffer that keeps
@@ -135,6 +135,31 @@ strategy**, not as a transplant of the server's.
 remainder cannot overshoot, so `buf.len() == t` becomes trivially true and the dirty conn is pooled —
 misframing the next response on it. The test asserts on the **idle pool**, not the accept count,
 because the pooled-then-failed path retries on a fresh connect and accepts twice either way.
+
+### Positive follow-up: direct-read only the large body's middle
+
+The body-size-aware version keeps the 32 KiB first read, so framing is known without adding a
+syscall to 8 KiB responses. Once Content-Length is known, only a large body's **middle** reads
+directly into the response `Vec`; capacity grows geometrically as bytes arrive, rather than trusting
+an advertised 1 GiB length up front. It deliberately leaves the last 32767 bytes for the original
+unclamped 32 KiB read. That final one-byte margin is what still observes an immediately available
+overshoot and makes the connection unpoolable.
+
+Runtime-only stash/rebuild A/B, with the benchmark change retained in both arms:
+
+| response body | before | body-aware | result |
+|---|---:|---:|---:|
+| 13 B | 3562 | 3525 | −37 ns (unchanged) |
+| 8 KiB | 3677 | 3509 | −168 ns (unchanged) |
+| 200 KiB, pair 1 | 6694 | 3976 | −2718 ns |
+| 200 KiB, pair 2 | 6330 | 3693 | −2637 ns |
+| 200 KiB, pair 3 | 5227 | 3390 | −1837 ns |
+
+The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. Allocation events stay 10,
+but geometric growth capped at the framed total reduces retained growth from **229376 → 172116
+bytes/request**. The benchmark's 7-allocation regression ceiling now applies only to its default
+13-byte response; `BODY=...` is intentionally a buffer-growth probe and must print those counts
+rather than aborting before it can report them.
 
 ## Caveats
 
