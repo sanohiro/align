@@ -13792,8 +13792,10 @@ unsafe impl Sync for HttpClient {}
 impl HttpClient {
     /// Take a live idle conn for `key`, freeing any idle past [`HTTP_POOL_IDLE_TIMEOUT`] (assumed
     /// dead) as it scans. Returns the reusable conn's `(fd, ssl)` (`ssl` null for a plaintext bucket).
-    /// `None` if the bucket is empty or holds only stale conns; an emptied bucket's key is removed so
-    /// connecting to many distinct hosts/schemes can't leak empty `Vec`s.
+    /// `None` if the bucket is empty or holds only stale conns. An emptied bucket stays in the map
+    /// while the checked-out request is in flight, preserving its `Vec` allocation for the common
+    /// take/put cycle. Every terminal path that does not put calls [`Self::remove_empty`], so distinct
+    /// hosts/schemes still cannot accumulate empty buckets.
     ///
     /// (A stale conn's teardown — up to `SSL_shutdown`+`SSL_free`+`close`, which can WRITE a
     /// close_notify record and block on a full/dead socket — runs OUTSIDE the lock: reaped conns are
@@ -13814,9 +13816,6 @@ impl HttpClient {
                         }
                         stale.push((c.fd, c.ssl)); // stale — reap (TLS-aware) OUTSIDE the lock
                     }
-                    if bucket.is_empty() {
-                        map.remove(key); // don't accumulate empty buckets across many hosts/schemes
-                    }
                     found
                 }
             }
@@ -13825,6 +13824,17 @@ impl HttpClient {
             unsafe { close_tls(ssl, fd) };
         }
         found
+    }
+
+    /// Remove `key` only if its idle bucket is still empty. Called when an exchange terminates
+    /// without returning a conn: if a concurrent request refilled the bucket meanwhile, its conn and
+    /// key remain untouched. This bounds empty-key retention to an in-flight request while letting
+    /// the single-threaded/common take/put cycle reuse the bucket's allocation.
+    fn remove_empty(&self, key: &(HttpScheme, String, i64)) {
+        let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(key).is_some_and(Vec::is_empty) {
+            map.remove(key);
+        }
     }
 
     /// Return a reusable conn `(fd, ssl)` to `key`'s idle bucket. Expired idle conns are reaped
@@ -14257,7 +14267,12 @@ unsafe fn http_client_perform(
                     Ok(c) => (c, false),
                     // A fresh-connect / handshake failure surfaces directly (handshake failures happen
                     // ONLY on the fresh path, so they are never wrongly retried).
-                    Err(s) => return s,
+                    Err(s) => {
+                        if let Some(c) = client_ref {
+                            c.remove_empty(&key);
+                        }
+                        return s;
+                    }
                 }
             }
         };
@@ -14268,10 +14283,14 @@ unsafe fn http_client_perform(
                 // receive buffer into `response`. Decide the conn's fate only after that successful
                 // parse: a protocol failure returns `Failed` above and is never pooled.
                 let (fd, ssl) = conn.into_parts();
-                match (reusable, client_ref) {
-                    (true, Some(c)) => c.put_idle(key, fd, ssl),
+                if reusable && let Some(c) = client_ref {
+                    c.put_idle(key, fd, ssl);
+                } else {
                     // Not reusable (or no client): free the conn (TLS-aware — ssl null → close fd).
-                    _ => unsafe { close_tls(ssl, fd) },
+                    unsafe { close_tls(ssl, fd) };
+                    if let Some(c) = client_ref {
+                        c.remove_empty(&key);
+                    }
                 }
                 unsafe { *out = Box::into_raw(Box::new(response)) };
                 #[cfg(test)]
@@ -14285,6 +14304,9 @@ unsafe fn http_client_perform(
                 if reused && !received_any && attempt == 0 {
                     attempt += 1;
                     continue;
+                }
+                if let Some(c) = client_ref {
+                    c.remove_empty(&key);
                 }
                 return status;
             }
@@ -25029,10 +25051,11 @@ mod tests {
         assert_eq!(server.join().unwrap(), 1, "exactly one real connection was made (the fresh retry)");
     }
 
-    /// An emptied idle bucket's key is removed from the pool map, so connecting to many distinct hosts
-    /// does not leak empty `Vec`s (gemini finding 3).
+    /// An emptied idle bucket stays available for the request's eventual put, then explicit cleanup
+    /// removes it if the request terminates without returning a conn. Cleanup must not remove a bucket
+    /// another request has refilled meanwhile.
     #[test]
-    fn http_pool_removes_emptied_bucket() {
+    fn http_pool_retains_emptied_bucket_until_safe_cleanup() {
         let client = align_rt_http_client_new();
         let cref = unsafe { &*client };
         let key = (HttpScheme::Http, "example.com".to_string(), 80i64);
@@ -25040,8 +25063,43 @@ mod tests {
         cref.put_idle(key.clone(), fd, std::ptr::null_mut());
         assert!(cref.idle.lock().unwrap().contains_key(&key), "put creates the bucket");
         assert_eq!(cref.take_idle(&key), Some((fd, std::ptr::null_mut())), "take returns the pooled fd");
-        assert!(!cref.idle.lock().unwrap().contains_key(&key), "an emptied bucket's key is removed");
+        assert!(cref.idle.lock().unwrap().contains_key(&key), "take retains the empty bucket for put reuse");
+        cref.remove_empty(&key);
+        assert!(!cref.idle.lock().unwrap().contains_key(&key), "terminal cleanup removes the empty bucket");
+
+        let refilled = dead_fd();
+        cref.put_idle(key.clone(), refilled, std::ptr::null_mut());
+        cref.remove_empty(&key);
+        assert_eq!(
+            cref.take_idle(&key),
+            Some((refilled, std::ptr::null_mut())),
+            "cleanup leaves a concurrently refilled bucket untouched"
+        );
         unsafe { close(fd) }; // we took it out of the pool — close it ourselves
+        unsafe { close(refilled) };
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// A checked-out stale conn can fail, then its mandatory fresh retry can fail too. That terminal
+    /// path must remove the retained empty bucket rather than leaking one key per failed authority.
+    #[test]
+    fn http_client_failed_stale_retry_removes_retained_empty_bucket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind refused target");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // no listener remains, so the fresh retry gets connection-refused
+
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let key = (HttpScheme::Http, "127.0.0.1".to_string(), port as i64);
+        cref.put_idle(key.clone(), dead_fd(), std::ptr::null_mut());
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_ne!(rc, 0, "the stale conn's fresh retry has no listening peer");
+        assert!(out.is_null());
+        assert!(cref.idle.lock().unwrap().is_empty(), "terminal failure removes the retained empty bucket");
+
         unsafe { align_rt_http_client_free(client) };
     }
 
