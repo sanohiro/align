@@ -1,39 +1,54 @@
-//! `http_path` — what one request costs INSIDE the server, in allocations and in CPU nanoseconds.
+//! `http_path` — pricing the server's own request path in allocations and CPU nanoseconds.
 //!
-//! **Why this exists.** `bench/web_e2e` prices the whole request over loopback and reports "Align's
-//! protocol path above the floor". That number is a *difference of two ~70 µs measurements*, so it
-//! carries the noise of both: three adjacent baseline runs on this box gave **3.3 / 3.9 / 4.8
-//! µs/req** — a 1.5 µs spread on a 4.0 µs signal. The allocation work the roadmap points at is worth
-//! less than that spread, so `web_e2e` cannot price it, whatever the per-run req/s stability
-//! suggests. (Its `CONNS=1` lesson still holds for what it was about: throughput moves 18% run to
-//! run, req/s at one connection ~1%. It is the *derived difference* that is unusable here.)
+//! **Why this exists.** `bench/web_e2e` reports "Align's protocol path above the floor" as the
+//! difference of two ~70 µs end-to-end measurements, so it carries both their noises: three adjacent
+//! baseline runs gave 3.3 / 3.9 / 4.8 µs/req — a 1.5 µs spread on a 4.0 µs signal, larger than the
+//! whole allocation budget that difference is supposed to price. (Its `CONNS=1` lesson still holds
+//! for what it measured: throughput moves 18% run to run, req/s at one connection ~1%. It is the
+//! *derived difference* that is unusable.)
 //!
-//! So this harness measures the server side directly, in one process, on two clocks that do not
-//! have that problem:
+//! This harness measures the same path in one process, on metrics that survive:
 //!
-//! - **allocations and bytes per request**, counted exactly by a `#[global_allocator]` — no
-//!   statistics at all. `align_runtime` is linked as a Rust lib rather than through its C ABI
-//!   precisely so its own `Vec`/`String` traffic is visible here.
+//! - **allocations per request — exact, integral, zero noise**, from a counting
+//!   `#[global_allocator]`. `align_runtime` is a dependency as a Rust lib rather than through its C
+//!   ABI so its own `Vec`/`String` traffic is visible. **Scope:** that is the runtime's *Rust*
+//!   allocations only. Align-language allocation (`align_rt_alloc`) calls libc `malloc` directly and
+//!   is invisible here — fine while the measured handler is this file's pure-Rust `serve_one`, and a
+//!   trap for anyone who extends this to a real Align handler or to `pkg.web`.
 //! - **server CPU ns per request**, from `CLOCK_THREAD_CPUTIME_ID`. Wall time is the wrong clock:
-//!   `accept` blocks in `poll` until the client's next request, so a wall-clock loop measures the
-//!   ~65 µs loopback round-trip and buries the server's own few µs inside it. Thread CPU time
-//!   accrues only while the thread is on-CPU, so blocking simply does not count.
+//!   `accept` blocks in `poll` until the client's next request, so a wall-clock loop reads the ~65 µs
+//!   loopback round-trip around ~4 µs of work.
 //!
-//! The syscalls (`poll`, `read`, `write`) are inside the measured region and identical across arms,
-//! so a difference between arms is the CPU-side change.
+//! **Two floors, because Align does one syscall more.** Align's path is `poll({parked, listener})` →
+//! `read` → `send`; a plain read/write floor does one fewer syscall, and that `poll` costs ~0.9 µs
+//! on this box — 21% of the naive difference. Reporting only against a plain floor would charge that
+//! syscall to Align's CPU work and overstate what allocation removal can reach. So both floors run:
+//! the plain one keeps the number comparable with `web_e2e`, and the poll floor is the honest budget
+//! for CPU-side work.
 //!
-//! Run: `bench/http_path/run.sh` (or `cargo run --release -- [iters]`). Linux-specific.
+//! **Interleaved blocks, median, not one long pass.** Within a run the harness is tight, but the box
+//! drifts *between* runs by more than its own σ (~480 ns observed on an unchanged binary), so more
+//! iterations do not converge past that. The arms therefore alternate in blocks inside one process
+//! and each reports the median of its blocks — `bench/README.md`'s balanced-order rule, applied.
+//!
+//! Run: `bench/http_path/run.sh` (or `cargo run --release -- [requests-per-arm] [blocks]`).
+//! Linux-specific.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // --- the counting allocator ---------------------------------------------------------------------
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static BYTES: AtomicU64 = AtomicU64::new(0);
-/// Counting is off until the measured loop starts, so setup traffic is not attributed to requests.
+/// Bytes requested by *fresh* allocations. Kept apart from growth (below) on purpose: pre-reserving
+/// a buffer moves bytes between these two, and a single summed figure would read as a regression.
+static FRESH_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes added by `realloc` growth (`new - old`).
+static GROWTH_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Counting is off until a measured block starts, so setup traffic is never attributed to requests.
 static COUNTING: AtomicBool = AtomicBool::new(false);
 
 struct Counting;
@@ -42,7 +57,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            FRESH_BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
         }
         unsafe { System.alloc(l) }
     }
@@ -54,7 +69,7 @@ unsafe impl GlobalAlloc for Counting {
         // buffer removes, and hiding it would make a growing buffer look free.
         if COUNTING.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(new.saturating_sub(l.size()) as u64, Ordering::Relaxed);
+            GROWTH_BYTES.fetch_add(new.saturating_sub(l.size()) as u64, Ordering::Relaxed);
         }
         unsafe { System.realloc(p, l, new) }
     }
@@ -63,7 +78,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-// --- the server thread's own CPU time ------------------------------------------------------------
+// --- clocks and syscalls -------------------------------------------------------------------------
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -72,10 +87,20 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+const POLLIN: i16 = 0x001;
 
 unsafe extern "C" {
     fn clock_gettime(clk: i32, tp: *mut Timespec) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
 }
 
 /// This thread's consumed CPU time, in nanoseconds.
@@ -86,21 +111,28 @@ fn thread_cpu_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-// --- the request path ----------------------------------------------------------------------------
+// --- the request path -----------------------------------------------------------------------------
 
 use align_runtime::{
     align_rt_http_accept, align_rt_http_rb_body, align_rt_http_rb_header, align_rt_http_respond,
     align_rt_http_response_new, align_rt_http_serve, align_rt_http_server_free, HttpServer,
 };
 
-const REQUEST: &[u8] =
-    b"GET /plaintext HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: */*\r\nUser-Agent: http-path-bench\r\n\r\n";
+/// **`bench/web_e2e`'s exact request bytes.** Keeping them identical is what lets the two harnesses'
+/// numbers be compared at all; a heavier request measurably changes the parse cost (a 3-header
+/// variant read ~340 ns higher here, with the allocation count unchanged at 14).
+const REQUEST: &[u8] = b"GET /plaintext HTTP/1.1\r\nHost: h\r\n\r\n";
 const BODY: &[u8] = b"Hello, World!";
 const CT_NAME: &[u8] = b"Content-Type";
 const CT_VALUE: &[u8] = b"text/plain; charset=utf-8";
 
-/// One server-side request: accept (poll + read + parse), build the response `bench/web_e2e`'s
-/// `/plaintext` route builds, respond (serialize + one write). False if any step failed.
+/// The response both floors write — byte-for-byte what the Align path produces for this request, so
+/// every arm moves the same bytes through the same `write`. The client asserts this on its first
+/// response in **every** arm, which is what keeps the arms comparable rather than merely similar.
+const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
+
+/// One server-side request through Align: accept (poll + read + parse), build the response
+/// `bench/web_e2e`'s `/plaintext` route builds, respond (serialize + one write).
 unsafe fn serve_one(srv: *mut HttpServer) -> bool {
     let mut ctx = std::ptr::null_mut();
     if unsafe { align_rt_http_accept(srv, &mut ctx) } != 0 {
@@ -120,14 +152,14 @@ unsafe fn serve_one(srv: *mut HttpServer) -> bool {
     }
 }
 
-/// The canned response the floor arm writes — byte-for-byte what the Align path produces for
-/// `/plaintext`, so the two arms move the same bytes through the same syscalls.
-const FLOOR_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
+// --- the harness ------------------------------------------------------------------------------------
 
-/// What one arm measured.
-struct Arm {
+/// One block's measurement for one arm.
+#[derive(Clone, Copy)]
+struct Sample {
     allocs: f64,
-    bytes: f64,
+    fresh_bytes: f64,
+    growth_bytes: f64,
     cpu_ns: f64,
 }
 
@@ -139,101 +171,211 @@ fn free_loopback_port() -> u16 {
     p
 }
 
-/// Drive `iters` ping-pong requests against a server loop, on this thread, with one keep-alive
-/// client on another. `serve` runs ONE request and must not return until it has answered.
+/// Progress counter, read by the watchdog. A server arm blocks in `poll`/`accept` forever if its
+/// client dies, and the client's own `expect`s are then never observed — so without this the harness
+/// hangs silently instead of failing.
+static SERVED: AtomicU64 = AtomicU64::new(0);
+
+fn start_watchdog() {
+    std::thread::spawn(|| {
+        let mut last = 0;
+        let mut stalled = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let now = SERVED.load(Ordering::Relaxed);
+            stalled = if now == last { stalled + 1 } else { 0 };
+            last = now;
+            if stalled >= 20 {
+                eprintln!("http_path: no progress for 20s after {now} requests — aborting");
+                std::process::abort();
+            }
+        }
+    });
+}
+
+/// The client half: one keep-alive connection, strictly ping-pong, driving `total` requests.
 ///
-/// **No channel between the halves, on purpose:** the socket already sequences them (the server's
-/// next read blocks until the client sends again), and a channel would allocate on the client
-/// thread — which this process's counting allocator would then charge to the request path.
-fn run_arm(port: u16, iters: u64, mut serve: impl FnMut()) -> Arm {
-    let client = std::thread::spawn(move || {
+/// **No channel back to the server half, on purpose:** the socket already sequences them (the
+/// server's next accept blocks until the client sends again), and a channel would allocate on this
+/// thread — which the counting allocator would then charge to the request path. Removing it is what
+/// makes allocations/request exactly integral.
+fn spawn_client(port: u16, total: u64) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_nodelay(true).ok();
-        let mut resp = [0u8; 512];
-        for _ in 0..iters {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).ok();
+        let mut resp = vec![0u8; 512];
+        for i in 0..total {
             s.write_all(REQUEST).expect("send request");
             let n = s.read(&mut resp).expect("read response");
             assert!(n > 0, "server closed the connection early");
+            if i == 0 {
+                assert_eq!(
+                    &resp[..n],
+                    RESPONSE,
+                    "this arm does not emit the shared response byte-for-byte — the arms are not comparable"
+                );
+            }
         }
-    });
+    })
+}
 
-    // Warm-up: the first requests pay one-time costs (the parked set's first insert, allocator
-    // arena growth, the client's connect) that are not per-request costs.
-    let warm = (iters / 10).clamp(1, 2_000);
-    for _ in 0..warm {
-        serve();
-    }
-
-    let measured = iters - warm;
+/// Run one measured block of `reqs` requests, with counting armed only for its duration.
+fn measure_block(reqs: u64, mut serve: impl FnMut()) -> Sample {
     ALLOCS.store(0, Ordering::SeqCst);
-    BYTES.store(0, Ordering::SeqCst);
+    FRESH_BYTES.store(0, Ordering::SeqCst);
+    GROWTH_BYTES.store(0, Ordering::SeqCst);
     COUNTING.store(true, Ordering::SeqCst);
     let cpu0 = thread_cpu_ns();
-    for _ in 0..measured {
+    for _ in 0..reqs {
         serve();
+        SERVED.fetch_add(1, Ordering::Relaxed);
     }
     let cpu_ns = thread_cpu_ns() - cpu0;
     COUNTING.store(false, Ordering::SeqCst);
-    client.join().expect("client thread");
+    let n = reqs as f64;
+    Sample {
+        allocs: ALLOCS.load(Ordering::SeqCst) as f64 / n,
+        fresh_bytes: FRESH_BYTES.load(Ordering::SeqCst) as f64 / n,
+        growth_bytes: GROWTH_BYTES.load(Ordering::SeqCst) as f64 / n,
+        cpu_ns: cpu_ns as f64 / n,
+    }
+}
 
-    Arm {
-        allocs: ALLOCS.load(Ordering::SeqCst) as f64 / measured as f64,
-        bytes: BYTES.load(Ordering::SeqCst) as f64 / measured as f64,
-        cpu_ns: cpu_ns as f64 / measured as f64,
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = xs.len();
+    if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
     }
 }
 
 fn main() {
-    let iters: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-
-    // --- the floor: read the request, write a canned response, keep the connection. Same socket
-    // setup, same client, same clock — so the CPU cost of the syscalls and of WSL2's accounting is
-    // in BOTH arms and cancels in the difference. Without this control the absolute CPU number is
-    // uninterpretable (it reads ~36 µs/req, which is virtualization overhead, not server work).
-    let floor_port = free_loopback_port();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", floor_port)).expect("bind floor");
-    let floor = {
-        let mut conn: Option<std::net::TcpStream> = None;
-        let mut req = [0u8; 2048];
-        run_arm(floor_port, iters, || {
-            let c = conn.get_or_insert_with(|| {
-                let (s, _) = listener.accept().expect("floor accept");
-                s.set_nodelay(true).ok();
-                s
-            });
-            let n = c.read(&mut req).expect("floor read");
-            assert!(n > 0, "floor: client closed");
-            c.write_all(FLOOR_RESPONSE).expect("floor write");
-        })
+    let mut args = std::env::args().skip(1);
+    let parse = |s: Option<String>, dflt: u64, what: &str| -> u64 {
+        match s {
+            None => dflt,
+            Some(v) => v.parse().unwrap_or_else(|_| panic!("{what}: not a number: {v:?}")),
+        }
     };
-    drop(listener);
+    let reqs_per_arm = parse(args.next(), 100_000, "requests-per-arm");
+    let blocks = parse(args.next(), 5, "blocks");
+    assert!(blocks >= 3, "need at least 3 blocks for a median");
+    let per_block = reqs_per_arm / blocks;
+    assert!(per_block >= 1_000, "at least 1000 requests per block (got {per_block})");
+    let warm = per_block.min(2_000);
+    let total = warm + per_block * blocks;
 
-    // --- Align's own path.
-    let port = free_loopback_port();
+    start_watchdog();
+
+    // --- arm 1: the plain floor — read, write, keep the connection. One syscall FEWER than Align.
+    let plain_port = free_loopback_port();
+    let plain_listener = std::net::TcpListener::bind(("127.0.0.1", plain_port)).expect("bind plain");
+    let plain_client = spawn_client(plain_port, total);
+    let (mut plain_conn, _) = plain_listener.accept().expect("plain accept");
+    plain_conn.set_nodelay(true).ok();
+
+    // --- arm 2: the poll floor — the same, plus the `poll({conn, listener})` Align does before its
+    // read. This is the honest zero for CPU-side work; the difference between the two floors IS the
+    // syscall Align's keep-alive wait costs.
+    let poll_port = free_loopback_port();
+    let poll_listener = std::net::TcpListener::bind(("127.0.0.1", poll_port)).expect("bind poll");
+    let poll_client = spawn_client(poll_port, total);
+    let (mut poll_conn, _) = poll_listener.accept().expect("poll accept");
+    poll_conn.set_nodelay(true).ok();
+
+    // --- arm 3: Align.
+    let align_port = free_loopback_port();
     let mut srv: *mut HttpServer = std::ptr::null_mut();
     let host = b"127.0.0.1";
-    let rc = unsafe { align_rt_http_serve(host.as_ptr(), host.len() as i64, port as i64, &mut srv) };
+    let rc =
+        unsafe { align_rt_http_serve(host.as_ptr(), host.len() as i64, align_port as i64, &mut srv) };
     assert_eq!(rc, 0, "http.serve failed: {rc}");
-    let align = run_arm(port, iters, || {
-        assert!(unsafe { serve_one(srv) }, "request failed");
-    });
-    unsafe { align_rt_http_server_free(srv) };
+    let align_client = spawn_client(align_port, total);
 
-    let measured = iters - (iters / 10).clamp(1, 2_000);
-    println!("requests measured per arm: {measured}");
-    println!("  arm            allocs/req   bytes/req   CPU ns/req");
+    let mut req_buf = [0u8; 2048];
+    let mut plain = |buf: &mut [u8; 2048]| {
+        let n = plain_conn.read(buf).expect("plain read");
+        assert!(n > 0, "plain floor: client closed");
+        plain_conn.write_all(RESPONSE).expect("plain write");
+    };
+    let mut pollf = |buf: &mut [u8; 2048]| {
+        let mut fds = [
+            PollFd { fd: poll_conn.as_raw_fd(), events: POLLIN, revents: 0 },
+            PollFd { fd: poll_listener.as_raw_fd(), events: POLLIN, revents: 0 },
+        ];
+        let r = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
+        assert!(r > 0, "poll floor: poll failed");
+        let n = poll_conn.read(buf).expect("poll floor read");
+        assert!(n > 0, "poll floor: client closed");
+        poll_conn.write_all(RESPONSE).expect("poll floor write");
+    };
+    let mut align = || {
+        assert!(unsafe { serve_one(srv) }, "align request failed");
+    };
+
+    // Warm-up per arm: the first requests pay one-time costs (the parked set's first insert,
+    // allocator arena growth) that are not per-request costs.
+    for _ in 0..warm {
+        plain(&mut req_buf);
+        pollf(&mut req_buf);
+        align();
+    }
+
+    // Interleaved blocks: A,B,C,A,B,C,… so between-block drift hits every arm alike.
+    let (mut sp, mut sq, mut sa) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..blocks {
+        sp.push(measure_block(per_block, || plain(&mut req_buf)));
+        sq.push(measure_block(per_block, || pollf(&mut req_buf)));
+        sa.push(measure_block(per_block, &mut align));
+    }
+
+    drop(plain_conn);
+    drop(poll_conn);
+    unsafe { align_rt_http_server_free(srv) };
+    for c in [plain_client, poll_client, align_client] {
+        c.join().expect("client thread");
+    }
+
+    let med = |xs: &[Sample], f: fn(&Sample) -> f64| median(xs.iter().map(f).collect());
+    let (pa, qa, aa) = (med(&sp, |s| s.allocs), med(&sq, |s| s.allocs), med(&sa, |s| s.allocs));
+    let (pc, qc, ac) = (med(&sp, |s| s.cpu_ns), med(&sq, |s| s.cpu_ns), med(&sa, |s| s.cpu_ns));
+    // The zero that proves the client thread is not polluting the Align count: a floor arm runs the
+    // identical client and must allocate nothing at all.
+    assert_eq!(pa, 0.0, "the plain floor allocated — the counter is seeing the client thread");
+    assert_eq!(qa, 0.0, "the poll floor allocated — the counter is seeing the client thread");
+
+    let spread = |xs: &[Sample]| {
+        let v: Vec<f64> = xs.iter().map(|s| s.cpu_ns).collect();
+        let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        hi - lo
+    };
+    println!("{blocks} interleaved blocks x {per_block} requests per arm (after {warm} warm-up)");
+    println!("  arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread");
+    for (name, s, a, c) in [
+        ("floor (plain)", &sp, pa, pc),
+        ("floor (+poll)", &sq, qa, qc),
+        ("align", &sa, aa, ac),
+    ] {
+        println!(
+            "  {name:<14} {a:>10.2}  {:>12.1}  {:>13.1}  {c:>11.0}  {:>12.0}",
+            med(s, |x| x.fresh_bytes),
+            med(s, |x| x.growth_bytes),
+            spread(s)
+        );
+    }
     println!(
-        "  floor          {:>10.2}  {:>10.1}  {:>11.0}",
-        floor.allocs, floor.bytes, floor.cpu_ns
+        "\n  the keep-alive `poll` costs:                    {:.0} ns/req",
+        qc - pc
     );
     println!(
-        "  align          {:>10.2}  {:>10.1}  {:>11.0}",
-        align.allocs, align.bytes, align.cpu_ns
+        "  Align above the plain floor (web_e2e's figure):  {:.0} ns/req",
+        ac - pc
     );
     println!(
-        "\n  Align's server-side cost above the floor: {:.0} ns/req, {:.2} allocations, {:.0} bytes",
-        align.cpu_ns - floor.cpu_ns,
-        align.allocs - floor.allocs,
-        align.bytes - floor.bytes
+        "  Align's CPU work above the poll floor:          {:.0} ns/req, {aa:.2} allocations",
+        ac - qc
     );
 }

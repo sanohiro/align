@@ -4,11 +4,12 @@
 # else. Unlike `bench/web_e2e` this links `align_runtime` as a Rust lib, so a counting global
 # allocator sees the runtime's own `Vec`/`String` traffic.
 #
-#   bench/http_path/run.sh [iters]        (default: 200000 — see README on why not fewer)
+# Three arms — a plain read/write floor, the same plus the `poll` Align's keep-alive wait does, and
+# Align — run in INTERLEAVED blocks so the box's between-run drift hits all of them alike.
+#
+#   bench/http_path/run.sh [requests-per-arm] [blocks]     (default: 100000 5)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-iters="${1:-200000}"
-
 cargo build -q --release
-./target/release/http-path-bench "$iters"
+./target/release/http-path-bench "${1:-100000}" "${2:-5}"

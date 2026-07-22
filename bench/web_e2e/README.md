@@ -121,5 +121,10 @@ measurements*, so it carries both their noises: three adjacent baseline runs giv
 µs/req**, a 1.5 µs spread on a 4.0 µs signal — larger than the whole allocation budget. Per-run req/s
 at one connection really is stable to ~1%; the derived difference is not, and that distinction is the
 lesson. **`bench/http_path` is the instrument for this work**: it prices the same path in-process on
-an exact allocation count (zero noise) plus the server thread's own CPU time (±1.3% at 200k
-iterations), and its 4.3 µs above its own floor agrees with the 4.0–4.1 µs here.
+an exact allocation count (zero noise) plus the server thread's own CPU time (~2% run to run, from
+interleaved blocks rather than one long pass).
+
+It also splits a number this README conflates. **Align does one syscall more than the floor here —
+the keep-alive `poll` — and that costs ~0.9 µs**, so of the 4.0–4.1 µs quoted above, only ~3.6 µs is
+CPU-side work that allocation removal can reach. `http_path` runs both a plain floor (comparable with
+this one) and a `poll` floor (the honest budget), and reports both.

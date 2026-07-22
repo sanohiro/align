@@ -41,8 +41,18 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   so the 4 µs difference is stable to ~35% (measured: 3.3 / 3.9 / 4.8 on adjacent runs). Anything
   smaller than that spread cannot be priced there however many times you run it. When the quantity
   you care about is a small difference, **measure it directly**: `bench/http_path` prices the same
-  path in-process on an exact allocation count and the server thread's own CPU time, gets ±1.3%, and
-  agrees with `web_e2e`'s absolute number — which is what makes both trustworthy.
+  path in-process on an exact allocation count plus the server thread's own CPU time (~2% run to
+  run).
+- **A floor must do the same syscalls, or its difference is not the thing you named.** `http_path`'s
+  first version compared Align (`poll` → `read` → `write`) against a floor that only read and wrote,
+  and called the difference Align's CPU cost. **The missing `poll` was ~0.9 µs of the 4.3 µs** — 21%
+  of the headline, attributed to work that does not exist. It now runs both floors and reports both
+  differences.
+- **Iterations do not cure drift.** More iterations shrink *within-run* noise only. On this box an
+  unchanged binary read 4201 ns in one batch and 4682 ten minutes later — a between-run shift larger
+  than its own σ. The fix is structural: **alternate the arms in blocks inside one process and take
+  the median**, so drift hits every arm alike. (Three samples suggested ±1.3%; eleven showed 3.5%.
+  Quote a spread with its sample size, or don't quote it.)
 - **When the result disappoints, autopsy — don't guess.** If a mechanism that *should* win comes back
   flat or slower, do not reason about the cause from intuition: build an **absolute-ms breakdown** that
   starts from the fast variant and adds one realistic cost at a time (stage-1 alone → + materialize →
