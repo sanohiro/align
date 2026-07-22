@@ -14269,7 +14269,7 @@ unsafe fn http_client_perform(
                 // parse: a protocol failure returns `Failed` above and is never pooled.
                 let (fd, ssl) = conn.into_parts();
                 match (reusable, client_ref) {
-                    (true, Some(c)) => c.put_idle(key.clone(), fd, ssl),
+                    (true, Some(c)) => c.put_idle(key, fd, ssl),
                     // Not reusable (or no client): free the conn (TLS-aware — ssl null → close fd).
                     _ => unsafe { close_tls(ssl, fd) },
                 }
