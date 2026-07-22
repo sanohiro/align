@@ -106,17 +106,19 @@ DONE   Cookie parse / Set-Cookie build          pkg.web.cookie   (2026-07-20)
 DONE   HTML escaping                            std.encoding     (2026-07-20)
 DONE   CORS decisions (allowlist, wildcard+cred  pkg.web.cors     (2026-07-20)
        rejection, Vary, preflight methods)      — header emission wires in at serve
-TODO   multipart/form-data (uploads)            pkg.web or pkg
-NEXT   fn VALUE with a `Result` return          compiler (FnTy.ret is a Scalar today)
-NEXT   fn VALUE called with a STRUCT argument   compiler (closure ABI aggregate-arg path)
+DONE   multipart/form-data (uploads)            pkg.web.multipart (2026-07-22)
+       — zero-copy Part views + Found/Done/Invalid walk; a PUBLIC sibling module,
+       unwired from the core surface (a body codec, not a routing concern)
+DONE   fn VALUE with a `Result` return          compiler         (#575)
+DONE   fn VALUE called with a STRUCT argument   compiler         (indirect aggregate-arg path)
 LATER  JWT HS384/512, RS256/ES256               needs std.crypto hmac_sha384/512, RSA/ECDSA
 ```
 
-**The two `NEXT` compiler items gate the designed handler contract.** `Route.handler` is
-`fn(Ctx) -> Result<(), Error>`; a fn *value* cannot carry a `Result` return, and calling one with a
-struct argument aborts (F1① only exercised scalar parameters). Until both land, a matched handler is
-called directly rather than through the route table's field — the shapes otherwise compose and are
-proven over a real socket (`apps_web_serve.rs`).
+**The two compiler items that once gated the designed handler contract have landed.** A fn *value*
+may return `Result<T, E>` (#575) and may be called with a struct argument, so `serve` dispatches
+through the route table's `Handler` field itself — `match r.handler { Respond(h) => … }` calling
+`h(c)` with the Copy `Ctx` — rather than calling a matched handler directly. The shape is proven over
+a real socket (`apps_web_serve.rs`, `apps_web_root.rs`).
 
 **OAuth 2.0 / OIDC** (owner asked 2026-07-20) is a package (`pkg.oauth`) over these parts, not a
 separate subsystem:
