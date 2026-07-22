@@ -656,7 +656,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      through `classify_accept_error` (`Again`/`NoFds`/`Fatal`, its noise half the
      `accept_errno_is_noise` predicate shared with the net rail) and, on exhaustion,
      `http_yield_for_fds` → `http_relieve_fd_pressure`;
-     `http_serialize_head(rb, persistent)` omitting the
+     `http_serialize_head(rb, persistent, extra)` omitting the
      `Connection` line on the keep-alive path. Language: `ExprKind::HttpServe`/`Rvalue::HttpServe`
      gained a `shared: bool` (a FIELD, not a variant — every analysis pass keeps treating it as
      `http.serve`), and `http.serve_shared` dispatches through the same `check_http_serve`. Tests:

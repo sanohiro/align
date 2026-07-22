@@ -11,13 +11,13 @@ bench/http_path/run.sh 200000 10    # requests-per-arm, blocks (blocks must be e
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor (plain)        0.00           0.0            0.0        31253           418
-  floor (+poll)        0.00           0.0            0.0        32016           274
-  align               14.00         585.0          135.0        35488           247
+  floor (plain)        0.00           0.0            0.0        30767           372
+  floor (+poll)        0.00           0.0            0.0        31616           550
+  align                9.00        2679.0            0.0        34105           182
 
-  the keep-alive `poll` costs:                    763 ns/req
-  Align above the plain floor (web_e2e's figure):  4234 ns/req
-  Align's CPU work above the poll floor:          3471 ns/req, 14.00 allocations
+  the keep-alive `poll` costs:                    849 ns/req
+  Align above the plain floor (web_e2e's figure):  3338 ns/req
+  Align's CPU work above the poll floor:          2489 ns/req, 9.00 allocations
 ```
 
 ## Why this exists — `web_e2e` cannot price an allocation
@@ -45,7 +45,7 @@ floors run:
 - **plain floor** — read, write, keep the connection. Its difference is the number comparable with
   `web_e2e`'s.
 - **poll floor** — the same, plus the identical `poll({conn, listener})` before the read. Its
-  difference is the honest budget for CPU-side work: **~3.6 µs, of which 14 allocations.**
+  difference is the honest budget for CPU-side work: **~2.5 µs, of which 9 allocations.**
 
 Both floors write the response Align produces, byte-for-byte, and the client asserts that on its
 first response **in every arm** — which is what keeps the arms comparable rather than merely similar.
@@ -124,15 +124,20 @@ away exactly the correlated block-to-block drift the interleaving exists to canc
 same per-block data: median gives σ 88 / 173 / 99 ns on the three lines where min gives 146 / 214 /
 127.
 
-The allocation count carries none of this: it is 14.00 in every run, every variant, invariant to
+The allocation count carries none of this: it is integral in every run — 9.00 today, invariant to
 request shape and profile.
 
 ## Does it converge?
 
-Yes, and this was checked before the harness was used for anything. Pre-reserving the response
-serialize buffer (`Vec::new()` → `with_capacity`) removes exactly the 4 `realloc` events the counter
-attributes to it: the count reads 14 → 10 and the time **−971 / −690 / −1089 / −541 ns across four
-adjacent A/B pairs, 4/4 the same sign** — ≈206 ns per realloc event.
+Yes, and this was checked before the harness was used for anything: pre-reserving the response
+serialize buffer (`Vec::new()` → `with_capacity`) removed exactly the 4 `realloc` events the counter
+attributed to it — the count read 14 → 10 in a scratch experiment, and the time **−971 / −690 /
+−1089 / −541 ns across four adjacent A/B pairs, 4/4 the same sign** (≈206 ns per realloc event).
+
+**That is now shipped** (#603, with the `Content-Length` `to_string()` removed in the same pass):
+14 → **9** allocations, and **−537 / −478 / −421 / −434 ns across four adjacent A/B pairs, 4/4 the
+same sign**. Note what the byte columns did — `fresh` +82, `growth` 135 → 0 — which is exactly why
+they are reported separately.
 
 ## Caveats
 

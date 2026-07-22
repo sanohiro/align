@@ -641,7 +641,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      `http_accept_conn`（1 回の呼び出しにつき `accept` はちょうど 1 回）を中心に再構成。その失敗は
      `classify_accept_error`（`Again`/`NoFds`/`Fatal`。ノイズ側の半分は net 側と共有する述語
      `accept_errno_is_noise`）を通し、枯渇時は `http_yield_for_fds` → `http_relieve_fd_pressure` へ
-     回す; `http_serialize_head(rb, persistent)` は keep-alive 経路で
+     回す; `http_serialize_head(rb, persistent, extra)` は keep-alive 経路で
      `Connection` 行を省く。言語側: `ExprKind::HttpServe`/`Rvalue::HttpServe` が `shared: bool` を得た
      （variant ではなく**フィールド** — 全解析パスは引き続き `http.serve` として扱う）、
      `http.serve_shared` は同じ `check_http_serve` を通って dispatch する。テスト: ランタイムの

@@ -9,7 +9,8 @@ Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-22, **the protocol-path perf work has an instrument (`bench/http_path`, #601)
-and its first win (#602: the 32 KiB per-request memset is gone, ~−640 ns); before that, the
+and two wins (#602: the 32 KiB per-request memset is gone, ~−640 ns; #603: the response is
+serialized in ONE right-sized allocation — 14 → 9 allocations/request, ~−468 ns); before that, the
 scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
 the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
 accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
@@ -66,12 +67,8 @@ abort).
 READMEs):**
 
 1. **Keep going down the protocol path with `bench/http_path` (#601), not `web_e2e`.** The budget is
-   **~3.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
+   **~2.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
    CPU). Measured targets, in order of what is known about them:
-   - **The response serialize buffer's 4 `realloc`s** — `http_serialize_head` starts from
-     `Vec::new()` and doubles 8→16→32→64→128. Pre-reserving takes allocations 14 → 10 and measured
-     **−971 / −690 / −1089 / −541 ns across four adjacent A/B pairs** in a scratch experiment. This
-     is the single biggest remaining item and it is nearly free to do.
    - **`http_socket_exchange`, the CLIENT path**, still has the identical `[0u8; 32 * 1024]` +
      `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool).
      `bench/http_client` exists to price it.
@@ -179,7 +176,8 @@ did not work.** The plan said to price the 4.1 µs path's allocations with `benc
 `CONNS=1`. It cannot: that figure is the *difference of two ~70 µs measurements*, so it carries both
 their noises — three adjacent baseline runs gave **3.3 / 3.9 / 4.8 µs**, a spread larger than the
 whole allocation budget. `bench/http_path` prices the same path in-process on an exact allocation
-count (**14.00 per request**, zero noise) plus the server thread's `CLOCK_THREAD_CPUTIME_ID`.
+count (**14.00 per request** then, 9.00 after #603; zero noise) plus the server thread's
+`CLOCK_THREAD_CPUTIME_ID`.
 - **Two floors, because Align does one syscall more.** The keep-alive `poll` costs **~0.9 µs** — 21%
   of the naive difference, and not CPU work. Reporting only against a plain read/write floor charged
   it to Align. The honest CPU budget is **~3.5 µs**.
@@ -193,6 +191,38 @@ count (**14.00 per request**, zero noise) plus the server thread's `CLOCK_THREAD
 - Lessons promoted to `bench/README.md`: a floor must do the same syscalls or its difference is not
   the thing you named; iterations do not cure drift (alternate, counterbalance, take the median); and
   min is the wrong statistic for a *difference of two* arms (median σ 88/173/99 vs min 146/214/127).
+
+**DONE 2026-07-22 — one right-sized allocation per response (#603), the second win on that budget.**
+`http_serialize_head` started from `Vec::new()` and doubled 8→16→32→64→128 on the way to a plaintext
+response, and `http_serialize_response_inner` then rendered the `Content-Length` value through
+`to_string()` — a `String` allocated and dropped per response. Both are gone: the head serializer now
+takes an **`extra`** parameter (what the caller will append — its framing header, the blank line, the
+body) and reserves `http_head_len(rb, persistent) + extra` up front, so the whole message is written
+into ONE exactly-sized buffer; `http_push_decimal` renders the length from the stack, the sibling of
+the chunked path's `http_push_chunk_size_hex`. **14 → 9 allocations/request** and **−537 / −478 /
+−421 / −434 ns across four adjacent A/B pairs, 4/4 the same sign** (`bench/http_path`); the poll-floor
+budget is now ~2.5 µs. `respond_stream` reserves its `Transfer-Encoding` line the same way.
+- **The size function is the risk, and the assertion has to be the right one.** `http_head_len` +
+  `http_response_extra` mirror the writer, so any drift (a separator, a prefix, the blank line)
+  silently costs a `realloc` — the very thing removed. The test asserts **`out.len()` == what the
+  size functions say**, which depends on no allocator behaviour, over a matrix (no headers / many
+  headers / bodied / set-but-empty body / HEAD-suppressed / persistent / the three bodiless statuses
+  / an unknown status's empty reason phrase). `len() == capacity()` follows as a *corollary* — on
+  its own it is weaker than it looks, since `RawVec` grows to `max(cap*2, required)` and a
+  half-sized reservation would satisfy it after a real growth. The five written literals are
+  `const`s shared by writer and sizer, so they cannot drift at all.
+- **The adversarial review found a realloc this pass ADDED, and a test that pinned nothing.**
+  ① `stream_finish` extends the *stored head* with the 5-byte chunked terminator, so an exactly
+  sized head guaranteed a `realloc` + copy on every zero-event SSE response (on `main` the head's
+  slack absorbed it). `http_stream_head_extra` now reserves those 5 bytes; when a `send` comes first
+  the head is copied out and dropped, so they are merely unused. ② The streaming reservation had
+  **no test at all** — the first version re-typed the formula in the test and asserted on its own
+  copy, so mutating the production line to a 999-byte over-reserve left all 292 tests green (nothing
+  about over/under-reserving changes a wire byte). It now goes through the real
+  `align_rt_http_respond_stream` and asserts the stored head's spare capacity is *exactly* the
+  terminator's room. Both mutations, and a body-forgetting response sizer, now fail.
+- The wrapper was **not** kept: `http_serialize_head` itself gained the parameter (one mechanism, per
+  the repo's no-compat rule), and its three call sites each pass what they append.
 
 **DONE 2026-07-22 — the 32 KiB memset on every request (#602), the first real win on that budget.**
 `http_read_request` read into a `let mut chunk = [0u8; 32 * 1024]` and then `extend_from_slice`d it
