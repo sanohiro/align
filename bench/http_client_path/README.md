@@ -15,10 +15,10 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        31481           295
-  align                3.00         263.0            0.0        34710           906
+  floor                0.00           0.0            0.0        31624           310
+  align                2.00         213.0            0.0        34742           799
 
-  http.get's CPU work above the floor:  3229 ns/req, 3.00 allocations
+  http.get's CPU work above the floor:  3118 ns/req, 2.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -125,6 +125,20 @@ the inner key and keeps TLS/plaintext and distinct ports isolated. The host beco
 new host bucket is first created, outside the warmed per-request path. The common path is now **4 →
 3 allocations** and **272 → 263 fresh B/request**. Three 100k-request runs measured **3054 / 3468 /
 3229 ns** above the floor, CPU-neutral at this noise level. The harness pins 3; 200 KiB is 7 → 6.
+
+The request's 50-byte wire buffer was the next reusable allocation. Each client now lends a scratch
+`Vec` to an in-flight serializer and takes it back through an RAII lease on every terminal path,
+including validation, connect, TLS, socket, and retry failures. Concurrent `get_many` workers lease
+distinct buffers; retention is bounded to eight buffers of at most 64 KiB, while larger requests are
+still sent normally and simply drop their storage afterward. The common path is now **3 → 2
+allocations** and **263 → 213 fresh B/request**. Three 100k-request runs measured **2995 / 3482 /
+3118 ns** above the floor (median 3118 ns, CPU-neutral); the harness pins 2, and a disabled-reuse
+mutation restores 3 and trips the gate. The 200 KiB response probe is 6 → 5 allocations.
+
+The remaining two common-path allocations are the returned response itself: its 120-byte opaque
+handle (including two inline header spans) and its 93-byte response buffer in this sample. Combining
+them needs a custom single-allocation representation and a correspondingly careful ownership/free
+boundary, rather than another local reuse cut.
 
 ### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
