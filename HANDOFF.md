@@ -8,7 +8,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP idle-bucket reuse cut is DONE (#610):
+_Last updated: 2026-07-22, **the HTTP response header-span inline cut is DONE (#611): the common
+`Content-Type` + `Content-Length` pair now lives inside the opaque response
+handle, while a third header spills losslessly to the existing heap representation. The common path
+falls 5 → 4 allocations/request and 352 → 272 fresh bytes with CPU flat at ~3.1 µs above the syscall
+floor.** Before that, **the HTTP idle-bucket reuse cut landed (#610):
 the pool retains an emptied bucket only while its checked-out request is in flight, then either
 reuses it on put or removes it on every terminal no-put path. The common path falls 6 → 5
 allocations/request (480 → 352 fresh bytes) with CPU flat at ~3.3 µs above the syscall floor; a
@@ -109,6 +113,11 @@ READMEs):**
      or terminates; no-put paths remove it only if another request has not refilled it. This makes the
      common path **6 → 5 allocations** and fresh bytes **480 → 352 B/request**; CPU stays flat (three
      100k runs 3267/3181/3451 ns above the floor). The benchmark pins 5, and 200 KiB is 9 → 8.
+   - **DONE (#611) — inline two response header spans:** the dominant response carries
+     exactly `Content-Type` + `Content-Length`, so those spans now live in the opaque response handle;
+     a third header spills to a `Vec` with order, lookup, and the 128-header cap preserved. This makes
+     the common path **5 → 4 allocations** and fresh bytes **352 → 272 B/request**; CPU stays flat
+     (three 100k runs 3113/3363/3146 ns above the floor). The benchmark pins 4; 200 KiB is 8 → 7.
    - **DONE (#608) — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
      direct-read only a large framed body's middle into the response buffer, then leave the last
      32767 bytes to the original unclamped read. This keeps 13 B / 8 KiB flat, makes 200 KiB
@@ -127,10 +136,10 @@ READMEs):**
      `Incomplete`; an oversized head whose cap-crossing read also carried the final blank line
      returned `Ok` and bypassed it. The successful-head path now checks `body_start <= 256 KiB`,
      with a mutation-checked socket regression.
-   - The remaining five common-path allocations need representation/reuse work: the parsed host
-     `String` (9 B here), request bytes (~50 B), response `Box` (72 B), response bytes (93 B here),
-     and header-span `Vec` (128 B). Builder calls also retain two `String`s per caller header. This is
-     a bigger design question than the redundant ownership hops removed above.
+   - The remaining four common-path allocations need representation/reuse work: the parsed host
+     `String` (9 B here), request bytes (~50 B), enlarged response `Box` (120 B, including two inline
+     spans), and response bytes (93 B here). Builder calls also retain two `String`s per caller header.
+     This is a bigger design question than the redundant ownership hops removed above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
