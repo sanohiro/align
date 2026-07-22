@@ -8,7 +8,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-23, **the `template` borrow-provenance hole is FIXED (NEXT item 0a, PR #621),
+_Last updated: 2026-07-23, **the Gate-3 codegen hardening #620 started is FINISHED (NEXT item 0b).**
+`gen_print` now dispatches on the SAME `align_sema::print_kind` classification the template holes
+use and reads its operand through the same `display_int` / `display_float` / `display_view`
+accessors, so its catch-all integer tail is gone; `Operand::Value(id)` / `Operand::Arg(i)` are
+fallible lookups instead of a direct map index and an `expect`, which closes the one unprintable
+shape (`()`) that escaped even the template path. The sweep found the class was **live, not
+theoretical**: `json.encode` of an `Option<enum>` / `Option<char>` field, an `array<char>` field, or
+an `array<enum>` field reached codegen with **no sema diagnostic at all**, and the last two killed
+the compiler outright. `json.encode` now names its own encodable domain in sema
+(`json_encodable_scalar`, one predicate for both an `Option` payload and an `array` element; an
+`array<Struct>` element is validated like a decode target), and the descriptor builders behind that
+gate (`json_payload_tag_sub` / `emit_json_subtable` / `emit_json_union` / `emit_desc_table`) return
+`CodegenError` instead of aborting. Verdicts over all 116 repo `.align` files are identical to
+`main` and the emitted LLVM IR is instruction-identical (5 files differ only in SSA temp NAMES at
+the `print(str)` site, now `%p`/`%l` from the shared accessor). One defect found and deliberately
+NOT fixed here because it is `align_mir`, not codegen: `structArray.to_array()` with no pipeline
+stage panics MIR (`to_array/scan needs a scalar element`) on plain user input — recorded as item 0c.
+Before that, **the `template` borrow-provenance hole was FIXED (NEXT item 0a, PR #621),
 and with it the fail-open tail that hid it.** A `str` bound from a `template` inside a `loop` used to
 escape the hidden owner's per-iteration free with `alignc check` reporting ok — `template` is the one
 expression whose value (`str`) views storage the expression itself allocates (a hidden owned
@@ -882,16 +899,86 @@ Nothing there stands in for a missing compiler feature.
    neither of which anyone had reported. The review's item ① is the same lesson a level up: an
    exhaustive *variant* list still leaves the *justification* fail-open unless something asserts it.
 
-   0b. **Codegen panic hardening is asymmetric.** `gen_print`'s `into_int_value()`
-   (`crates/align_codegen_llvm/src/lib.rs`, ~:8443) still aborts on `print(array)` / `print(struct)`
-   when the sema gate is bypassed, and `Operand::Value(id) => self.values[id]` (~:10007) is a direct
-   map index that aborts for a `()` operand — so `template "{u()}"` and `print(u())` abort *before*
-   reaching the new `display_*` accessors: one unprintable shape escapes the hardening even on the
-   template path. Neither is reachable through today's sema gate; both are the Gate-3 belt-and-braces
-   this PR applied to the template pieces only. Same bucket: `json.encode`'s `Option` payload domain
-   needs a sema-side gate — its codegen fallback arm is **live** (a non-Move `enum` payload such as
-   `C { R, G, B }` in `S { a: Option<C> }` reaches it; it panicked on `main` and now returns a
-   `CodegenError` with no sema diagnostic behind it).
+   0b. **DONE (2026-07-23) — the asymmetric codegen panic hardening, finished; and the sweep found
+   the class was LIVE.** #620 hardened the template display pieces only. Three named gaps plus a
+   sweep of `align_codegen_llvm` for the same class:
+
+   ① **`gen_print` shared nothing with the template path.** It dispatched on `ty` with a **catch-all
+   integer tail**, so `print(array)` / `print(struct)` / `print(u())` fell through to
+   `self.operand(arg).into_int_value()` and aborted the compiler with inkwell's `Found ArrayValue {
+   … } but expected the IntValue variant` if the sema gate were ever bypassed. It now matches on
+   `align_sema::print_kind(ty)` — the SAME classification sema's `print`/hole check and MIR's
+   `TemplatePiece` selection use — with `None` a `CodegenError`, and reads the operand through the
+   same `display_int` / `display_float` / `display_view` accessors a hole does. **One mechanism for
+   both display sites**, and because the `match kind` is exhaustive, adding a `PrintKind` variant now
+   breaks codegen too, not just sema and MIR.
+
+   ② **`Operand::Value(id) => self.values[id]` was a direct map index.** A `()`-returning call
+   defines a `ValueId` whose LLVM call yields **void**, so nothing is recorded for it, and reading it
+   aborted — *before* reaching any `display_*` accessor, which is why `template "{u()}"` escaped
+   #620's hardening even on the template path. `operand` is now fallible; its sibling
+   `Operand::Arg(i)`'s `expect("param index in range")` went with it. That made **299 call sites**
+   take `?`; three closures were rewritten to loops / `collect::<Result<_,_>>()`. No behavior change
+   (see the IR evidence below).
+
+   ③ **`json.encode`'s unrenderable field domain had no sema gate at all — and it was reachable.**
+   The struct-field declaration gate only rejects an **owned** (Move) `Option` payload / `array`
+   element, so every non-Move-but-unrenderable shape walked straight into codegen. Measured on
+   `main`: `S { a: Option<C> }` with `C { R, G, B }` produced a bare `CodegenError` with nothing
+   behind it; **`S { xs: array<char> }` and `S { xs: array<C> }` aborted the compiler** —
+   `json_payload_tag_sub`'s `unreachable!("json.decode payload is …")` and `emit_json_union`'s
+   `expect("union variant carries exactly one payload")` respectively. Neither had ever been
+   reported. Sema now names the encodable domain itself: one predicate `json_encodable_scalar`
+   (int / float / bool / `str`) serves **both** an `Option<T>` payload and an `array<T>` element, an
+   `Option<Struct>` / `array<Struct>` element is validated like a decode target
+   (`decode_struct_fields_ok` — the encode subtable is built from exactly that schema), and the two
+   new diagnostics name what an encodable field may be. Deliberately an allow-list, not an exhaustive
+   match: this classification fails **closed** (an unlisted scalar is a diagnostic, never a wrong
+   rendering), the opposite of the `_ => IntHole` tail that caused #620 — the doc comment says so.
+   `Option<char>` is rejected too, matching the required-`char` field rule; it used to encode as a
+   **number**.
+
+   **The sweep, and what was deliberately left.** The three descriptor emitters behind the new gate
+   (`json_payload_tag_sub`, `emit_json_subtable`, `emit_desc_table`, `emit_json_union`,
+   `decode_field_table`) now return `CodegenError` — defense in depth on the two sites that were
+   aborting minutes earlier. Left as compiler-internal single-pass invariants, and they are: the
+   ~300 remaining `into_*_value()` reads, whose LLVM shape is fixed by the MIR opcode being lowered
+   (`gen_float_bin`'s operands are floats because the `Rvalue` is a float binop), not by a
+   type-classification that a sema gate could get wrong; the `get_nth_param(k).unwrap()`s, which read
+   a thunk/trampoline codegen itself just created with a known signature; `self.funcs[…]` /
+   `self.slots[…]` / `self.struct_types[…]`, keyed by names and ids the declare pass populated from
+   the same MIR. The distinguishing test used throughout: **does the shape come from a
+   classification, or from the opcode?** Only the former can be wrong on user input.
+
+   **Evidence.** Regression rows in the two existing homes: `align_codegen_llvm`'s `mod tests` drives
+   hand-built MIR past the sema gate (the technique the allocation-shape probes already use) —
+   `print_of_an_unprintable_value_is_an_error_not_a_panic` (array / struct / slice),
+   `a_unit_valued_operand_is_an_error_not_a_panic`,
+   `an_out_of_range_argument_operand_is_an_error_not_a_panic`,
+   `an_unrenderable_json_descriptor_payload_is_an_error_not_a_panic` (`array<char>` and a
+   payload-less union); `template_ownership.rs` pins the sema half —
+   `an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic` (4 rows) plus the over-rejection
+   control `every_encodable_json_field_shape_still_encodes`, which asserts the real runtime JSON for
+   every shape that DOES encode. **Every row mutation-checked** (reverted alone, rebuilt, run):
+   restoring the `print` catch-all + raw `into_int_value` reproduces the original inkwell panic
+   verbatim; restoring `self.values[id]` / the `Arg` `expect` / the `unreachable!` / the union
+   `expect` each fails exactly its row; deleting either sema gate fails exactly its rows; and
+   **tightening** the gate (dropping `Scalar::Str`) fails the control, which is what pins it against
+   over-rejection. Workspace 2666 passed / 0 failed, clippy clean. `alignc check` over all 116 repo
+   `.align` files is verdict-identical to `main`, and `emit-llvm` over the 108 that check ok is
+   byte-identical for 103 — the 5 that differ differ **only in SSA temp names** at the `print(str)`
+   site (`%sptr`/`%slen` → `%p`/`%l`, from the now-shared `display_view`), instruction for
+   instruction.
+
+   0c. **NOT this PR's crate, but found by its sweep: `align_mir` panics on `structArray.to_array()`.**
+   `E { c: i64 }` then `[E { c: 1 }].to_array()` → `to_array/scan needs a scalar element`
+   (`crates/align_mir/src/lib.rs`, the `cur.expect(...)` at the append point). Sema accepts it —
+   `check_array_to_array` explicitly supports a Copy-struct element (`Ty::DynStructArray`) — so this
+   is an unimplemented lowering, not a rejected program: the identity collect is the ONLY broken
+   shape, because `map` / `where` load a whole struct element by index and this path never does.
+   `[E{..}].map(f).to_array()` works. The fix is to load the element the same way at the append
+   point (the `lower_struct_elem` call the two stages already make), which is an *implementation*,
+   not hardening — left out of a Gate-3 PR on purpose.
 
 1. **`pkg.web` root + `serve()` — DONE, then rebuilt on the settled ownership model.** `apps/web/pkg/web.align` is real: per-method constructors
    (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the

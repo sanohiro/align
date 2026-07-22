@@ -323,3 +323,71 @@ fn main() -> Result<(), Error> {
         assert_eq!(build_and_run("owned-template-question", src).status.code(), Some(2));
     }
 }
+
+/// `json.encode` desugars to a `template`, so it inherits the Gate-3 rule the holes above follow:
+/// a field shape the encoder cannot render is a **sema** diagnostic, never a codegen abort.
+///
+/// Each row below reached codegen with **no diagnostic at all**, because the struct-field
+/// declaration gate only rejects an *owned* (Move) `Option` payload / `array` element. `array<char>`
+/// and `array<enum>` then aborted the compiler outright (`json_payload_tag_sub`'s `unreachable!`
+/// and `emit_json_union`'s one-payload `expect`); `Option<enum>` produced a bare codegen error with
+/// nothing behind it. `json.encode` now names its own encodable domain.
+#[test]
+fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "option-enum",
+            "import core.json\nC { R, G, B }\nS { a: Option<C> }\nfn main() -> i32 {\n  s := S { a: Some(C.G) }\n  print(json.encode(s))\n  return 0\n}\n",
+            "an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+        ),
+        (
+            "option-char",
+            "import core.json\nS { a: Option<char> }\nfn main() -> i32 {\n  s := S { a: Some('x') }\n  print(json.encode(s))\n  return 0\n}\n",
+            "an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+        ),
+        (
+            "array-char",
+            "import core.json\nS { xs: array<char> }\nfn main() -> i32 {\n  s := S { xs: ['a', 'b'].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "an `array` field's element must be an int, float, bool, str, or a struct",
+        ),
+        (
+            "array-enum",
+            "import core.json\nC { R, G }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.R, C.G].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "an `array` field's element must be an int, float, bool, str, or a struct",
+        ),
+    ];
+    for (name, src, want) in cases {
+        let diagnostics = check_diagnostics(&format!("json-field-{name}"), src);
+        assert!(
+            diagnostics.contains("'json.encode' field"),
+            "a `{name}` field must be rejected in sema:\n{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(want),
+            "the `{name}` diagnostic must name the encodable domain:\n{diagnostics}"
+        );
+    }
+}
+
+/// The control for the row above: every field shape the encoder DOES render still encodes, and
+/// still encodes correctly. Without this the gate could be tightened into rejecting real programs
+/// and nothing would notice.
+#[test]
+fn every_encodable_json_field_shape_still_encodes() {
+    let src = "import core.json\n\
+               N { z: i64 }\n\
+               S { a: Option<i64>, b: Option<str>, c: Option<bool>, d: Option<f64>, e: Option<N>, xs: array<i64>, ys: array<str>, zs: array<bool> }\n\
+               fn main() -> i32 {\n\
+                 s := S { a: Some(1), b: Some(\"x\"), c: Some(true), d: Some(1.5), e: Some(N { z: 2 }), xs: [7, 8].to_array(), ys: [\"p\"].to_array(), zs: [false].to_array() }\n\
+                 print(json.encode(s))\n\
+                 return 0\n\
+               }\n";
+    let diagnostics = check_diagnostics("json-field-encodable", src);
+    assert!(!diagnostics.contains("error"), "no encodable shape may be rejected:\n{diagnostics}");
+    assert!(backend_available(), "this row's value is the runtime output; a missing backend must fail, not skip");
+    let out = build_and_run("json-field-encodable", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "{\"a\":1,\"b\":\"x\",\"c\":true,\"d\":1.5,\"e\":{\"z\":2},\"xs\":[7,8],\"ys\":[\"p\"],\"zs\":[false]}"
+    );
+}

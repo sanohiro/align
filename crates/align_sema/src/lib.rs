@@ -701,6 +701,28 @@ fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
 }
 
+/// The scalars `json.encode` can render as a JSON **leaf** value — the single definition of that
+/// domain, consumed by the `json.encode` field walk (`json_object_parts`) for both an `Option<T>`
+/// payload and an `array<T>` element.
+///
+/// These are exactly the shapes the flat value writers know: an integer, a float, a bool, and a
+/// `str`. Anything else (an `enum`, a `char`, a `slice<T>` / `soa` / `json.doc` view, `()`) has no
+/// JSON rendering here, and the **struct-field declaration** gate does not catch it because that
+/// gate only rejects **owned** (Move) payloads. Composite payloads that do have a rendering — a
+/// nested struct (`Option<Struct>` / `array<Struct>`) — take the descriptor-driven path instead and
+/// are validated there, by `decode_struct_fields_ok`. Kept as one predicate so adding a renderable
+/// leaf is one edit, not one per field shape.
+///
+/// **Deliberately an allow-list, not an exhaustive match.** The `_`-arm lesson from the display
+/// classification (`print_kind`) was about failing *open* — a shape nobody handled became "an
+/// integer" and blew up codegen. This fails **closed**: a [`Scalar`] variant nobody listed is
+/// rejected with a diagnostic, never handed to a writer that cannot render it. The cost of
+/// forgetting to add a new renderable scalar here is a spurious rejection, which a test catches
+/// (`every_encodable_json_field_shape_still_encodes`), not a compiler abort.
+fn json_encodable_scalar(s: Scalar) -> bool {
+    matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)
+}
+
 /// Whether an `Option`/`Result` type carries an owned (Move) payload that the aggregate owns
 /// — so the aggregate is itself a Move type and its drop must free that payload (MMv2 slice 8a).
 pub fn payload_is_move(ty: Ty) -> bool {
@@ -16880,6 +16902,24 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                     continue;
                 }
+                // Every other payload is rendered by the flat `OptionField` writer, which knows the
+                // same value shapes a *required* field does — int, float, bool, str. The struct-field
+                // declaration gate above only rejects an **owned** payload (`sc.is_move()`), so a
+                // non-Move but unrenderable one (`Option<enum>`, `Option<slice<T>>`, `Option<()>`,
+                // `Option<char>`, a `soa`/`json.doc` view) used to reach codegen with no diagnostic
+                // at all and abort there. `json.encode` names its own encodable domain instead.
+                if !json_encodable_scalar(s) {
+                    self.diags.error(
+                        format!(
+                            "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+                            f.name,
+                            ty_name(f.ty)
+                        ),
+                        span,
+                    );
+                    *ok = false;
+                    continue;
+                }
                 parts.push(TemplatePart::OptionField { access: access(f.ty), name: f.name.clone() });
                 continue;
             }
@@ -16897,11 +16937,33 @@ impl<'a, 't> Checker<'a, 't> {
                 self.json_object_parts(base, nid, elem, &full, visiting, parts, span, ok);
             } else if let Ty::DynStructArray(eid, _) = f.ty {
                 // An `array<Struct>` field emits `[{...},...]` via the runtime descriptor-driven
-                // encoder (dynamic length → a runtime loop, not a static unroll).
-                parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
+                // encoder (dynamic length → a runtime loop, not a static unroll). The ELEMENT struct's
+                // schema drives that descriptor table, so validate it like a decode target — exactly
+                // as the `Option<struct>` field above does — instead of letting an unrenderable
+                // element field surface as a codegen panic.
+                if !self.decode_struct_fields_ok(eid, span) {
+                    *ok = false;
+                } else {
+                    parts.push(TemplatePart::StructArrayField { access: access(f.ty), struct_id: eid });
+                }
             } else if let Ty::DynArray(s) = f.ty {
                 // An `array<scalar>` field (T1b) emits `[e0,e1,…]` via a runtime loop (dynamic length).
-                parts.push(TemplatePart::ScalarArrayField { access: access(f.ty), elem: s });
+                // The element rides the same flat leaf writer as an `Option` payload, so it obeys the
+                // same domain: `array<char>` and `array<enum>` have no JSON leaf rendering and used to
+                // reach codegen's descriptor builder, which aborted the compiler on them.
+                if !json_encodable_scalar(s) {
+                    self.diags.error(
+                        format!(
+                            "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
+                            f.name,
+                            ty_name(f.ty)
+                        ),
+                        span,
+                    );
+                    *ok = false;
+                } else {
+                    parts.push(TemplatePart::ScalarArrayField { access: access(f.ty), elem: s });
+                }
             } else if let Ty::Enum(eid) = f.ty {
                 // A shape-directed union (`enum`) field (J1b-2b): emit the live variant's payload bare
                 // after the `"name":` prefix already pushed above — the value-side dual of the union
