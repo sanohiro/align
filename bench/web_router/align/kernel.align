@@ -97,16 +97,33 @@ pub fn hw(shape: i64, n: i64) -> i64 {
 
 // ── The scaling gate ──────────────────────────────────────────────────────────────────────────
 //
-// The same dispatch over a 128-route table (8 groups x 8 resources x {static, :param}). Contract
-// item 3 says dispatch is O(path segments) and FLAT in table size, so `fw_big` must land on
-// `fw`'s numbers — not on `fw`'s numbers plus a per-route slope. An adversarial review measured
-// the pre-chain implementation at ~0.85 ns per route (44 ns at 8 routes, 453 ns at 512), which a
-// six-route bench could not resolve at all; this shape is what makes the property a gate rather
-// than a claim in prose.
+// Two tables containing the SAME head/middle/tail paths at the SAME three-/four-segment depths.
+// The small table has 6 routes; the large one has 128 (8 groups x 8 resources x {static, :param}).
+// Comparing the same runtime-selected path removes the old row's depth and path-position confounds.
 //
-// `shape`: 0 = a static hit on the FIRST route, 1 = a `:param` hit on the LAST group, 2 = a miss.
-// The first two are the interesting ends — a linear scan finds route 0 immediately and the last
-// one only after the whole table.
+// `shape`: 0 static/head, 1 param/head, 2 static/tail, 3 miss, 4 param/tail. Keeping miss at slot 3
+// preserves `path_of`'s defensive fallback. The harness reports both path kinds at both chain ends.
+pub fn fw_scale_small(shape: i64, n: i64) -> i64 {
+  routes := [
+    pkg.web.get("/api/g0/res0", h),
+    pkg.web.get("/api/g0/res0/:id", h),
+    pkg.web.get("/api/g3/res3", h),
+    pkg.web.get("/api/g3/res3/:id", h),
+    pkg.web.get("/api/g7/res7", h),
+    pkg.web.get("/api/g7/res7/:id", h),
+  ]
+  paths := ["/api/g0/res0", "/api/g0/res0/42", "/api/g7/res7", "/api/zz/nope", "/api/g7/res7/42"]
+  path := path_of(paths, shape)
+  tree := pkg.web.bench.build(routes)
+  mut acc := 0
+  mut i := 0
+  loop {
+    if i >= n { break acc }
+    acc = acc + pkg.web.bench.dispatch(routes, tree[..], "GET", path)
+    i = i + 1
+  }
+}
+
 pub fn fw_big(shape: i64, n: i64) -> i64 {
   routes := [
     pkg.web.get("/api/g0/res0", h),
@@ -238,7 +255,7 @@ pub fn fw_big(shape: i64, n: i64) -> i64 {
     pkg.web.get("/api/g7/res7", h),
     pkg.web.get("/api/g7/res7/:id", h),
   ]
-  paths := ["/api/g0/res0", "/api/g7/res7/42", "/api/zz/nope/42", "/api/zz/nope/42"]
+  paths := ["/api/g0/res0", "/api/g0/res0/42", "/api/g7/res7", "/api/zz/nope", "/api/g7/res7/42"]
   path := path_of(paths, shape)
   tree := pkg.web.bench.build(routes)
   mut acc := 0

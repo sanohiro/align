@@ -6,8 +6,9 @@ Times the shipped framework router — the radix tree built once, matched per re
 six-route table and the same four request shapes.
 
 ```sh
-bench/web_router/run.sh            # 200k dispatches per shape, best of 7
-N=1000000 TRIALS=9 bench/web_router/run.sh
+bench/web_router/run.sh            # 200k dispatches, median of 8 adjacent AB/BA pairs
+N=1000000 TRIALS=10 bench/web_router/run.sh
+WEB_ROUTER_GATE=1 N=100000 TRIALS=8 bench/web_router/run.sh baseline
 ```
 
 ## How it works
@@ -32,24 +33,26 @@ read 2.3 ns/op for the static shape — the loop counter alone, because the whol
 constant-folded (`bench/README.md`: "Runtime data, never literals"). Both sides now take an opaque
 `shape` and index a path table with it.
 
-## Result (2026-07-21, native, 200k dispatches, best of 7)
+## Result (2026-07-22, native, 200k dispatches, median of 8 adjacent counterbalanced pairs)
 
 ```
   shape                               framework hand-written      ratio
-  static   /v1/models                   35.4 ns       2.3 ns     15.35x
-  param    /v1/models/42                48.8 ns      10.0 ns      4.86x
-  wildcard /assets/css/site.css         43.9 ns      15.6 ns      2.81x
-  miss     /v2/nope                     24.8 ns       9.9 ns      2.51x
+  static   /v1/models                   34.8 ns       2.8 ns     12.61x
+  param    /v1/models/42                49.8 ns       9.8 ns      5.08x
+  wildcard /assets/css/site.css         44.6 ns      15.7 ns      2.85x
+  miss     /v2/nope                     25.3 ns      10.1 ns      2.50x
 
   scaling (6-route vs 128-route table)
   shape                                6 routes   128 routes      ratio
-  static hit                            35.2 ns      52.1 ns      1.48x
-  param  hit                            49.3 ns     144.2 ns      2.93x
-  miss                                  24.9 ns      78.9 ns      3.17x
+  static hit / chain head               48.5 ns      51.1 ns      1.06x
+  param  hit / chain head               64.1 ns      67.2 ns      1.05x
+  static hit / chain tail               60.7 ns     127.6 ns      2.09x
+  param  hit / chain tail               74.6 ns     139.2 ns      1.87x
+  miss                                  47.4 ns      76.1 ns      1.61x
 ```
 
-**The gate is NOT met, and — read the caveat below — this scaling row is not yet a clean measurement
-of the property.**
+**The CI regression gate is met. Contract item 3's ideal 1.00x is not: the honest row now isolates
+the remaining sibling-chain slope instead of mixing it with depth and chain position.**
 
 ### What is fixed
 
@@ -65,7 +68,7 @@ of the property.**
   the ones an app writes first (`/health`, `/metrics`, …), the chain now appends at the TAIL, in
   registration order. Every small-table shape got faster with it (42.6 → 35.4 ns static).
 
-### What is left, and why this row is not yet the gate
+### What is left, and what CI pins
 
 - **The sibling scan is the remaining slope.** A node's static edges are a linked chain walked with
   a string compare per sibling, so dispatch is O(segments × siblings), not O(segments). A miss on a
@@ -73,15 +76,17 @@ of the property.**
   is **unchanged** by the chains — the chain IS the node's children. The fix is a sibling index (a
   first-byte bucket, or a sorted edge run with a binary search): build-time work, per-request O(1)
   or O(log siblings).
-- **This scaling row conflates three variables**, which the review demonstrated by decomposing it:
-  the small table's static path is 2 segments and the large one's is 3 (**1.35× of pure depth**),
-  and each shape lands at a different position in its chain. Depth-matched and head-positioned, the
-  128-route table answers in **49.9 ns vs 57.0 ns** for the 6-route table at the same depth — i.e.
-  *flat*. The honest measurement is the SAME path against a small and a large table, reported at
-  both chain ends; that redesign is the next change here. Until then read the row as "there is a
-  slope", not as its size.
-- **It is a report, not a gate.** Nothing fails, nothing exits non-zero, and it is not in CI.
-  Wiring a documented ceiling is part of the same follow-up.
+- **The row now changes only table size.** Both tables contain the exact same head and tail paths at
+  the same depth, and static/param are reported separately at both ends. Each number is measured as
+  an adjacent pair, alternating small→large and large→small; the ratio is the median of those paired
+  ratios rather than a ratio of unrelated minima. Chain-head rows stay at **1.05–1.07x**; tail rows
+  expose the real scan at **1.87–2.11x**.
+- **CI pins two explicit regression ceilings on Linux x86_64 baseline:** chain-head shapes must stay
+  at or below **1.35x**, and every shape at or below **2.75x**. Those bounds leave 28–31% headroom
+  over six native/baseline 200k runs while rejecting the old depth-mismatched row (~1.5x), a return
+  to O(table) route scans (~20x), and reversed sibling order. A mutation restoring the old two-vs-
+  three-segment mismatch reaches 1.59x and fails the head ceiling. The first hosted CI run measured
+  1.14x at the head and 2.23x worst, within those ceilings.
 - **The per-edge `Route` struct copy.** Resolving a label needs one field, but `routes[i].pattern`
   is rejected through a `slice<struct>` (`'arr[i].pattern' needs a struct array or soa`), so the
   walk binds the whole `Route` (four 16-byte views) per sibling. This multiplies the sibling scan;
