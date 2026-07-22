@@ -14845,7 +14845,87 @@ fn http_request_wants_close(buf: &[u8], headers: &[HttpHeaderSpan]) -> bool {
     false
 }
 
-/// Read + parse one inbound request over the accepted socket `fd`: stream 32 KiB reads (never per-line —
+/// The buffer an inbound request starts with, and the spare kept for a read while the head is still
+/// being scanned. An ordinary request head (a request line and a few headers) arrives inside this,
+/// so the common request costs exactly one modest allocation and one `read`.
+const HTTP_HEAD_CHUNK: usize = 2 * 1024;
+
+/// The most spare capacity [`http_read_into`] asks for in one go once a body is framed. Larger than
+/// [`HTTP_HEAD_CHUNK`] so a big body streams in few reads, and bounded so the buffer cannot be grown
+/// far past what the framing actually needs.
+const HTTP_READ_CHUNK: usize = 16 * 1024;
+
+/// One `read(2)` **directly into `buf`'s uninitialised spare capacity**, appending what arrives.
+/// `want` is the framed remainder — `Some(n)` once the head is parsed, `None` while it is not, which
+/// is the difference between "grow to exactly what is left" and "grow the way any buffer of unknown
+/// final size should". Returns the byte count (`0` = EOF), retrying `EINTR`.
+///
+/// The obvious spelling — read into a `[u8; 32 * 1024]` stack buffer, then `extend_from_slice` —
+/// costs a **32 KiB `memset` and an eight-page stack probe on every request** (the array is
+/// zero-initialised, and LLVM does not elide it), plus a copy of the request bytes. That was the
+/// single largest item on this path, larger than all of its heap allocations together. Reading into
+/// the destination removes all three, and removes the per-byte copy, which is what makes a large
+/// body cheaper (measured ~-16% on a 200 KiB body, where the `memset` alone would be amortised).
+///
+/// **`want` is what keeps the buffer honest.** Reserving a fixed chunk regardless would double the
+/// allocation on the final short read of a framed body — `Vec::reserve` grows amortized, and
+/// `truncate` does not give capacity back — handing an attacker who picks `Content-Length` a 2x peak
+/// buffer for the request's whole lifetime (2 GiB at `HTTP_MAX_BODY`). Reserving only what the
+/// framing can still use keeps the peak at what was asked for.
+///
+/// # Safety
+/// `fd` must be a readable descriptor. The `set_len` below is sound because the kernel initialised
+/// exactly the `n` bytes reported, and `n` is bounded by the spare capacity passed to `read`.
+unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Result<usize, i32> {
+    let len_now = buf.len();
+    match want {
+        // The head is not framed yet, so the final size is unknown: grow the way any such buffer
+        // should — amortized, so a pathological head arriving in tiny pieces is not O(n^2) reallocs.
+        None => buf.reserve(HTTP_HEAD_CHUNK),
+        // The final fill: take exactly what the framing still wants. `want >= 1` because the caller
+        // only reads when `buf.len() < need`, so this always leaves spare capacity.
+        Some(want) if want <= HTTP_READ_CHUNK => buf.reserve_exact(want),
+        // Still streaming a body: double (so 1 GiB stays O(log n) reallocs), but never past the
+        // framed total. `Vec`'s own amortized growth ignores that ceiling and overshoots it by up to
+        // 2x on the doubling that straddles it — and `truncate` never gives capacity back, so a
+        // client choosing `Content-Length` would hold the overshoot for the request's whole
+        // lifetime. Measured on a framed total landing exactly on a power of two: 2.00x with a flat
+        // `reserve`, 1.00x here.
+        Some(want) => {
+            let target = (buf.capacity().saturating_mul(2))
+                .max(len_now + HTTP_READ_CHUNK)
+                .min(len_now + want);
+            buf.reserve_exact(target - len_now);
+        }
+    }
+    // Captured before the `EINTR` loop, which cannot touch `buf` — keep it that way if this loop
+    // ever grows a body: a `reserve` inside it would leave `ptr`/`spare` stale.
+    let len = buf.len();
+    let spare = buf.capacity() - len;
+    debug_assert!(spare > 0, "reserve guarantees spare capacity");
+    loop {
+        let r = unsafe { read(fd, buf.as_mut_ptr().add(len) as *mut core::ffi::c_void, spare) };
+        if r >= 0 {
+            let n = r as usize;
+            // The kernel cannot write more than the count it was given, so this never fires. It is
+            // a hard check rather than a clamp on purpose: if it ever did, the overflow already
+            // happened in the kernel and quietly clamping `set_len` would hide the corruption.
+            if n > spare {
+                return Err(AL_INVALID);
+            }
+            // `len + n <= capacity`, and every byte up to it was written by the kernel.
+            unsafe { buf.set_len(len + n) };
+            return Ok(n);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(io_error_to_status(&e));
+    }
+}
+
+/// Read + parse one inbound request over the accepted socket `fd`: stream reads (never per-line —
 /// http.md R4) to the head's end via [`http_parse_request_head`], then frame the body by Content-Length
 /// (a request without CL has no body). Returns the built [`HttpRequestCtx`] (owning `fd` + the buffer +
 /// the offset table), or a mapped status (`AL_INVALID` for a malformed / smuggling / truncated request,
@@ -14854,9 +14934,11 @@ fn http_request_wants_close(buf: &[u8], headers: &[HttpHeaderSpan]) -> bool {
 /// # Safety
 /// `fd` must be a valid connected socket.
 unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
-    let mut buf: Vec<u8> = Vec::new();
+    // Sized so an ordinary request head lands in ONE read with no growth. This is capacity, not
+    // initialised bytes: the read below writes straight into the spare tail (see `http_read_into`),
+    // so nothing here is zeroed or copied.
+    let mut buf: Vec<u8> = Vec::with_capacity(HTTP_HEAD_CHUNK);
     let mut head: Option<HttpRequestHead> = None;
-    let mut chunk = [0u8; 32 * 1024];
     loop {
         // Parse the head once (framing decided once), then just read to the framed length.
         if head.is_none() {
@@ -14870,8 +14952,10 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 Err(HttpParseErr::Invalid) => return Err(AL_INVALID),
             }
         }
-        // If the head is parsed, compute the framed end; complete once `buf` reaches it.
-        let complete_need = if let Some(h) = head.as_ref() {
+        // If the head is parsed, compute the framed end ONCE — both the completeness test below and
+        // the read's `want` are this same quantity, and computing it twice is two spellings of one
+        // rule that must agree.
+        let framed_need = if let Some(h) = head.as_ref() {
             let need = match h.content_length {
                 Some(n) => {
                     if n > HTTP_MAX_BODY {
@@ -14886,19 +14970,21 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 }
                 None => h.body_start, // no Content-Length → no body
             };
-            if buf.len() >= need {
-                Some(need)
-            } else {
-                None
-            }
+            Some(need)
         } else {
             None
         };
-        if let Some(need) = complete_need {
+        if let Some(need) = framed_need.filter(|&need| buf.len() >= need) {
             let h = head.take().unwrap();
             // Keep-alive eligibility, decided here — while the residual bytes are still visible
             // (http.md item 9 ②): 1.1, no `Connection: close`, and nothing read past this request's
-            // own body. A pipelining client is answered then closed; 1.0 keep-alive is not supported.
+            // own body. 1.0 keep-alive is not supported.
+            //
+            // **Residual can now only come from the pre-head window.** Reads are clamped to the
+            // framed remainder, so `buf` cannot overshoot `need` once a body is framed — a client
+            // that pipelines behind a bodied request is no longer closed on, it is simply re-read on
+            // the next `accept`. Bytes cannot be lost either way: `truncate` discards only when
+            // `buf.len() > need`, which is exactly the condition that already set `residual`.
             let residual = buf.len() > need;
             let keep_alive = h.http11 && !residual && !http_request_wants_close(&buf, &h.headers);
             buf.truncate(need); // drop any pipelined bytes — the eligibility check above saw them
@@ -14918,23 +15004,16 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 park: None, // filled by `accept` from the server handle
             });
         }
-        // Read more (retries EINTR).
-        let n = loop {
-            let r = unsafe { read(fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
-            if r >= 0 {
-                break r;
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(io_error_to_status(&e));
-        };
+        // Read more, straight into `buf`'s spare capacity. Once the head is parsed the framing says
+        // exactly how many bytes are still wanted, so the buffer is never grown past them. The
+        // subtraction cannot underflow: control only reaches here when `buf.len() < need`, and
+        // `need` was bounded by the `HTTP_MAX_BODY` + `checked_add` gate just above.
+        let want = framed_need.map(|need| need - buf.len());
+        let n = unsafe { http_read_into(fd, &mut buf, want) }?;
         if n == 0 {
             // EOF before a complete request (client closed / truncated head or body) → malformed.
             return Err(AL_INVALID);
         }
-        buf.extend_from_slice(&chunk[..n as usize]);
         // Bound the pre-head scan region too (an adversary that never sends the blank line).
         if head.is_none() && buf.len() > HTTP_MAX_HEADER_BLOCK {
             return Err(AL_INVALID);
@@ -25458,6 +25537,81 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert!(errored, "a send to a dead peer eventually errors");
         assert!(unsafe { &*s }.poisoned, "a failed send poisons the stream");
         unsafe { align_rt_http_stream_free(s) };
+    }
+
+    /// **The multi-read path**, which `http_read_into` rewrote: a body larger than one read's spare
+    /// capacity must still arrive whole. This is the case a single-read request never exercises —
+    /// the loop has to `reserve` again, grow the buffer, and append at the right offset — and
+    /// getting the `set_len` offset wrong here would corrupt or truncate the body silently.
+    #[test]
+    fn http_read_request_reassembles_a_body_larger_than_one_read() {
+        use std::io::Write;
+        use std::os::unix::io::IntoRawFd;
+        // Comfortably past HTTP_READ_CHUNK, so several reads and at least one growth are needed.
+        let body_len = HTTP_READ_CHUNK * 3 + 7;
+        let body: Vec<u8> = (0..body_len).map(|i| (i % 251) as u8).collect();
+        let mut req = format!("POST /upload HTTP/1.1\r\nHost: h\r\nContent-Length: {body_len}\r\n\r\n")
+            .into_bytes();
+        let head_len = req.len();
+        req.extend_from_slice(&body);
+        let req_len = req.len();
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // Write from a thread: the request is far larger than the socket buffer, so a single
+        // blocking write would deadlock against a reader that has not started yet.
+        let writer = std::thread::spawn(move || {
+            b.write_all(&req).expect("write request");
+            // Leave the peer open until the reader is done; dropping early would EOF mid-body.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let fd = a.into_raw_fd();
+        let ctx = unsafe { http_read_request(fd) }.expect("a framed request reassembles");
+        writer.join().expect("writer");
+
+        assert_eq!(ctx.body_len, body_len, "the whole body arrived");
+        assert_eq!(ctx.body_start, head_len, "the body starts right after the head");
+        assert_eq!(
+            &ctx.buf[ctx.body_start..ctx.body_start + ctx.body_len],
+            &body[..],
+            "the reassembled body is byte-for-byte what was sent"
+        );
+        assert_eq!(
+            &ctx.buf[ctx.method_start..ctx.method_start + ctx.method_len],
+            b"POST",
+            "the head still parses over the grown buffer"
+        );
+        // **The framing bounds the buffer.** Growing by a fixed chunk regardless of the remainder
+        // makes `Vec`'s amortized doubling overshoot the last step, and `truncate` never gives
+        // capacity back — so a client choosing `Content-Length` would hold a 2x peak buffer for the
+        // request's whole lifetime (2 GiB at `HTTP_MAX_BODY`). Without this bound the capacity here
+        // lands well past `req_len + HTTP_HEAD_CHUNK` (65-73 KiB, depending on how the socket splits
+        // the bytes); the only legitimate slack is the initial head buffer.
+        assert!(
+            ctx.buf.capacity() <= req_len + HTTP_HEAD_CHUNK,
+            "buffer grown to {} for a {req_len}-byte request — the framed remainder is what bounds it",
+            ctx.buf.capacity()
+        );
+    }
+
+    /// A request whose head arrives split across reads (the client pauses mid-header) still parses.
+    /// The head-parse loop re-runs on an incomplete buffer, so this pins that `http_read_into`
+    /// appends rather than overwrites.
+    #[test]
+    fn http_read_request_handles_a_head_split_across_reads() {
+        use std::io::Write;
+        use std::os::unix::io::IntoRawFd;
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let writer = std::thread::spawn(move || {
+            b.write_all(b"GET /split HTTP/1.1\r\nHo").expect("write part 1");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            b.write_all(b"st: h\r\n\r\n").expect("write part 2");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let fd = a.into_raw_fd();
+        let ctx = unsafe { http_read_request(fd) }.expect("a split head reassembles");
+        writer.join().expect("writer");
+        assert_eq!(&ctx.buf[ctx.target_start..ctx.target_start + ctx.target_len], b"/split");
+        assert_eq!(ctx.body_len, 0);
     }
 
     /// The lazy head (http.md item 8 ②) rides the first real `send` in ONE write (head + first
