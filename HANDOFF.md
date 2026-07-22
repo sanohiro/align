@@ -8,7 +8,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP client allocation slice is implemented on the current branch:
+_Last updated: 2026-07-22, **the HTTP client allocation slice is DONE (#607):
 `http.get` is 14 → 7 allocations/request and ~4.4 → ~3.4 µs above its syscall floor. Convenience
 GET/POST borrow their ABI inputs, request serialization reserves its exact wire size, and the socket
 exchange moves its first parsed head + receive buffer straight into the response instead of parsing
@@ -91,7 +91,7 @@ READMEs):**
      it, so a read sized to the framed remainder pools a dirty conn
      (`http_client_does_not_pool_leftover_arriving_after_the_framing` pins it, asserting on the idle
      pool rather than the accept count — the retry path makes an accept count blind to it).
-   - **DONE on the current branch — the obvious client ownership/allocation batch:** convenience
+   - **DONE (#607) — the obvious client ownership/allocation batch:** convenience
      GET/POST now borrow their ABI inputs; request serialization reserves once at its exact size;
      the first parsed response head and socket receive buffer move into the response rather than
      being rebuilt/copied. `bench/http_client_path`: **14 → 7 allocations**, growth **56 → 0
