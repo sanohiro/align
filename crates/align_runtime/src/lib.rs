@@ -13455,9 +13455,19 @@ impl Conn {
     /// # Safety
     /// The conn must be live.
     unsafe fn read(&mut self, buf: &mut [u8]) -> ConnRead {
+        unsafe { self.read_raw(buf.as_mut_ptr(), buf.len()) }
+    }
+
+    /// Read up to `len` bytes into raw writable storage. Unlike [`Conn::read`], the destination may
+    /// be a `Vec`'s uninitialised spare capacity; the transport initialises exactly the bytes named
+    /// by `ConnRead::Data`.
+    ///
+    /// # Safety
+    /// The conn must be live, and `dst..dst+len` must be valid writable storage.
+    unsafe fn read_raw(&mut self, dst: *mut u8, len: usize) -> ConnRead {
         match *self {
-            Conn::Plain { fd } => unsafe { plain_read(fd, buf) },
-            Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, buf) },
+            Conn::Plain { fd } => unsafe { plain_read(fd, dst, len) },
+            Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, dst, len) },
         }
     }
 
@@ -13495,10 +13505,10 @@ unsafe fn close_tls(ssl: *mut c_void, fd: i32) {
 /// behind the same [`ConnRead`] shape). Retries `EINTR`; `0` bytes = EOF.
 ///
 /// # Safety
-/// `fd` must be a valid connected socket.
-unsafe fn plain_read(fd: i32, buf: &mut [u8]) -> ConnRead {
+/// `fd` must be a valid connected socket, and `dst..dst+len` must be writable.
+unsafe fn plain_read(fd: i32, dst: *mut u8, len: usize) -> ConnRead {
     loop {
-        let r = unsafe { read(fd, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+        let r = unsafe { read(fd, dst as *mut core::ffi::c_void, len) };
         if r > 0 {
             return ConnRead::Data(r as usize);
         }
@@ -13562,11 +13572,11 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8]) -> i32 {
 /// `WANT_*` retry; a syscall/library error maps through [`ssl_error_status`].
 ///
 /// # Safety
-/// `ssl` must be a live handshaken `SSL*`.
-unsafe fn tls_read(ssl: *mut c_void, buf: &mut [u8]) -> ConnRead {
+/// `ssl` must be a live handshaken `SSL*`, and `dst..dst+len` must be writable.
+unsafe fn tls_read(ssl: *mut c_void, dst: *mut u8, len: usize) -> ConnRead {
     loop {
-        let want = buf.len().min(c_int::MAX as usize) as c_int;
-        let n = unsafe { SSL_read(ssl, buf.as_mut_ptr() as *mut c_void, want) };
+        let want = len.min(c_int::MAX as usize) as c_int;
+        let n = unsafe { SSL_read(ssl, dst as *mut c_void, want) };
         if n > 0 {
             return ConnRead::Data(n as usize);
         }
@@ -13991,6 +14001,44 @@ enum HttpExchange {
     Failed { status: i32, received_any: bool },
 }
 
+const HTTP_CLIENT_READ_CHUNK: usize = 32 * 1024;
+
+/// Read one framed body step directly into `buf`'s uninitialised spare capacity. Capacity grows at
+/// most geometrically toward `framed_total`: an untrusted huge Content-Length cannot force its full
+/// allocation before the peer has sent a comparable amount of data. `read_limit` may be smaller
+/// than that spare capacity so the caller can preserve room for an overshoot-detecting final read.
+///
+/// # Safety
+/// `conn` must be live; `framed_total > buf.len()`, and `read_limit` must fit in that remainder.
+unsafe fn http_conn_read_into(
+    conn: &mut Conn,
+    buf: &mut Vec<u8>,
+    framed_total: usize,
+    read_limit: usize,
+) -> ConnRead {
+    let len = buf.len();
+    debug_assert!(framed_total > len);
+    debug_assert!((1..=framed_total - len).contains(&read_limit));
+    let desired = buf
+        .capacity()
+        .saturating_mul(2)
+        .max(len + HTTP_CLIENT_READ_CHUNK)
+        .min(framed_total);
+    buf.reserve_exact(desired - len);
+    let writable = (buf.capacity() - len).min(read_limit);
+    debug_assert!(writable > 0);
+    let result = unsafe { conn.read_raw(buf.as_mut_ptr().add(len), writable) };
+    match result {
+        ConnRead::Data(n) if n <= writable => {
+            // The transport initialised exactly these `n` bytes, and `n <= writable <= spare`.
+            unsafe { buf.set_len(len + n) };
+            ConnRead::Data(n)
+        }
+        ConnRead::Data(_) => ConnRead::Err(AL_INVALID),
+        other => other,
+    }
+}
+
 /// Send `request` (the serialized bytes, one write — http.md R4) over `conn` (plaintext or TLS —
 /// the [`Conn`] abstraction keeps this loop single-sourced), then stream the response into one
 /// growing buffer, stopping at the Content-Length-framed end (or at EOF for a read-to-close
@@ -14016,7 +14064,7 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
     // into the returned response instead of scanning and allocating for the same head twice.
     let mut parsed_head: Option<HttpHead> = None;
     let mut target: Option<(usize, bool)> = None;
-    let mut chunk = [0u8; 32 * 1024];
+    let mut chunk = [0u8; HTTP_CLIENT_READ_CHUNK];
     loop {
         // Decide the framing once, then just read to the target length (no per-chunk head re-scan —
         // http.md R1/R4). `keep_alive` is computed here while the head spans still index `buf`.
@@ -14064,8 +14112,20 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
                 Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
             };
         }
-        // One read step over the conn (plaintext `read(2)` / TLS `SSL_read`, both behind `Conn::read`).
-        let n = match unsafe { conn.read(&mut chunk) } {
+        // For a large framed body, stream its middle directly into the response buffer. Always leave
+        // the last <32 KiB for the ordinary *unclamped* chunk read: that read can observe bytes past
+        // Content-Length and mark the conn dirty. Small responses keep the original one-read path,
+        // and an untrusted huge length grows the destination only geometrically as bytes arrive.
+        let direct = target.and_then(|(t, _)| {
+            let remaining = t - buf.len();
+            (remaining >= HTTP_CLIENT_READ_CHUNK)
+                .then(|| (t, remaining - (HTTP_CLIENT_READ_CHUNK - 1)))
+        });
+        let (read_result, appended_directly) = match direct {
+            Some((t, limit)) => (unsafe { http_conn_read_into(conn, &mut buf, t, limit) }, true),
+            None => (unsafe { conn.read(&mut chunk) }, false),
+        };
+        let n = match read_result {
             ConnRead::Data(n) => n,
             ConnRead::Err(status) => return HttpExchange::Failed { status, received_any: !buf.is_empty() },
             ConnRead::Eof => {
@@ -14086,7 +14146,9 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
                 return HttpExchange::Failed { status: AL_INVALID, received_any: true };
             }
         };
-        buf.extend_from_slice(&chunk[..n]);
+        if !appended_directly {
+            buf.extend_from_slice(&chunk[..n]);
+        }
         // Defensive memory bound for read-to-close (no declared Content-Length).
         if parsed_head.as_ref().is_some_and(|head| head.content_length.is_none())
             && buf.len() > HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK)
@@ -24495,6 +24557,26 @@ mod tests {
         assert!(req.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "auto Host header missing: {req:?}");
     }
 
+    /// A framed body well past two client read chunks takes the direct-to-response middle path and
+    /// still returns every byte exactly once.
+    #[test]
+    fn http_client_get_reassembles_a_large_body() {
+        let expected: Vec<u8> = (0..HTTP_CLIENT_READ_CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
+        let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", expected.len()).into_bytes();
+        resp.extend_from_slice(&expected);
+        let (port, server) = http_serve_once(resp);
+        let url = format!("http://127.0.0.1:{port}/large");
+        let client = align_rt_http_client_new();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, expected);
+        unsafe { align_rt_http_resp_free(out) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().expect("large-body server");
+    }
+
     /// P2: a 4xx status is a valid `Ok(response)` with that status, NOT a transport error.
     #[test]
     fn http_client_get_404_is_ok_not_err() {
@@ -24861,6 +24943,51 @@ mod tests {
         assert_eq!(pooled, 0, "a conn whose leftover arrived after the framing must not be pooled");
         unsafe { align_rt_http_client_free(client) };
         server.join().unwrap();
+    }
+
+    /// The large-body direct-read path must preserve the same dirty-connection rule. Its final read
+    /// is deliberately left one byte wider than the framed remainder, so an immediately available
+    /// overshoot is observed rather than hidden behind a read clamped to Content-Length.
+    #[test]
+    fn http_client_large_body_direct_read_still_detects_leftover() {
+        use std::io::{Read, Write};
+        let body_len = HTTP_CLIENT_READ_CHUNK * 3 + 17;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept large-body client");
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut tmp = [0u8; 512];
+            assert_ne!(sock.read(&mut tmp).unwrap_or(0), 0, "client request");
+            write!(sock, "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Feed exactly the direct-read prefix first. Once the client drains it, its next read is
+            // the deliberately unclamped final chunk.
+            sock.write_all(&vec![b'x'; body_len - HTTP_CLIENT_READ_CHUNK]).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut tail_and_extra = vec![b'x'; HTTP_CLIENT_READ_CHUNK];
+            tail_and_extra.extend_from_slice(b"LEFTOVER");
+            sock.write_all(&tail_and_extra).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        let url = format!("http://127.0.0.1:{port}/large");
+        let client = align_rt_http_client_new();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, vec![b'x'; body_len]);
+        unsafe { align_rt_http_resp_free(out) };
+        let pooled: usize = {
+            let map = unsafe { &*client }.idle.lock().unwrap();
+            map.values().map(Vec::len).sum()
+        };
+        assert_eq!(pooled, 0, "the large-body overshoot must make the conn unpoolable");
+        unsafe { align_rt_http_client_free(client) };
+        server.join().expect("large-body dirty server");
     }
 
     /// A raw fd whose peer has already closed — writing to it fails (EPIPE) and reading returns EOF.

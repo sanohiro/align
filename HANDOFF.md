@@ -8,7 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP client allocation slice is DONE (#607):
+_Last updated: 2026-07-22, **the body-size-aware HTTP client read is DONE (#608): a 200 KiB response
+falls from 6330 → 3693 ns/request above the syscall floor (median,
+−42%), while 13 B and 8 KiB stay flat. Only the large body's middle reads directly into the returned
+buffer; the 32 KiB first read remains, growth is geometric rather than trusting Content-Length up
+front, and the last read stays unclamped to preserve dirty-connection detection.** Before that,
+**the HTTP client allocation slice landed (#607):
 `http.get` is 14 → 7 allocations/request and ~4.4 → ~3.4 µs above its syscall floor. Convenience
 GET/POST borrow their ABI inputs, request serialization reserves its exact wire size, and the socket
 exchange moves its first parsed head + receive buffer straight into the response instead of parsing
@@ -84,13 +89,14 @@ READMEs):**
      known: a 2 KiB start costs an extra `read` syscall for every response past 2 KiB (**+1200 ns at
      8 KiB, 3/3**) and starting bigger is not available because that buffer IS the returned response
      body. Full numbers + the two lessons in `bench/http_client_path/README.md`.
-   - **Worth revisiting as a BODY-SIZE-AWARE read strategy, which is a different design.** The
-     discarded experiment won **−42% at a 200 KiB body** (per-byte copy elimination, matching #602's
-     −16% server-side) — and that is the align-LLM gateway's actual shape. Any such attempt must keep
-     the dirty-conn property: the overshoot that marks a conn unpoolable is detected by having READ
-     it, so a read sized to the framed remainder pools a dirty conn
-     (`http_client_does_not_pool_leftover_arriving_after_the_framing` pins it, asserting on the idle
-     pool rather than the accept count — the retry path makes an accept count blind to it).
+   - **DONE (#608) — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
+     direct-read only a large framed body's middle into the response buffer, then leave the last
+     32767 bytes to the original unclamped read. This keeps 13 B / 8 KiB flat, makes 200 KiB
+     **6330 → 3693 ns/request above the floor (median, −42%)**, and reduces retained growth
+     **229376 → 172116 B/request**. Capacity grows geometrically as bytes arrive, so a lying huge
+     Content-Length does not allocate its whole claim up front. The one-byte final margin preserves
+     the dirty-conn property; a new large-body socket regression pins the returned bytes and idle
+     pool, alongside `http_client_does_not_pool_leftover_arriving_after_the_framing`.
    - **DONE (#607) — the obvious client ownership/allocation batch:** convenience
      GET/POST now borrow their ABI inputs; request serialization reserves once at its exact size;
      the first parsed response head and socket receive buffer move into the response rather than
