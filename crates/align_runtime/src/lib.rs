@@ -14708,6 +14708,15 @@ struct HttpRequestHeadScan {
     /// accumulate here, exactly as they would in a one-shot parse of the finished buffer.
     headers: Vec<HttpHeaderSpan>,
     content_length: Option<usize>,
+    /// Set when `advance` yielded its head. **A scan is one request's parse.** Re-advancing a spent
+    /// one is a caller bug, and the honest answer is `Invalid` — close the connection. It used to
+    /// return a header-less `Ok`: the `Ok` path moves only the header list out, leaving `pos` AT the
+    /// blank line (the terminating `break` deliberately skips `commit_line`), so a second `advance`
+    /// re-found that line and returned immediately. The framing survived — `content_length` intact,
+    /// so a body would still be consumed — while every header silently vanished, which would make
+    /// `http_request_wants_close` see an empty list and read a `Connection: close` request as
+    /// keep-alive. `Incomplete` would be no better: it would spin the read loop.
+    spent: bool,
     /// Test-only: the total bytes the `\n` search has actually looked at. The linearity property is
     /// about the WORK, and the cursor's own bookkeeping cannot report it — an implementation that
     /// tracked `scanned` perfectly but still searched from `pos` would look identical from outside.
@@ -14733,6 +14742,7 @@ impl HttpRequestHeadScan {
             line: None,
             headers: Vec::new(),
             content_length: None,
+            spent: false,
             #[cfg(test)]
             searched: 0,
         }
@@ -14806,6 +14816,9 @@ impl HttpRequestHeadScan {
 /// `Err(Incomplete)` leaves the scan resumable; `Err(Invalid)` is terminal (the caller closes the
 /// connection); `Ok` yields the head and spends the scan (its header list is moved out).
 fn advance(&mut self, src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
+    if self.spent {
+        return Err(HttpParseErr::Invalid); // see `spent` — fail closed, never a header-less `Ok`
+    }
     // --- request line: `METHOD SP target SP HTTP/1.x` (strict CRLF, guard 1) ---
     if self.line.is_none() {
         let (rl_start, rl_len, next) = self.next_line(src)?;
@@ -14849,11 +14862,11 @@ fn advance(&mut self, src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
         });
         self.commit_line(next);
     }
-    // Set by the block above on this call, or by an earlier one — the `else` is dead by
-    // construction. It answers `Incomplete` rather than panicking: a misuse (advancing a scan that
-    // already yielded its head) must never take a server down (Gate 3).
+    // Set by the block above on this call, or by an earlier one, so the `else` is unreachable. It
+    // fails closed rather than panicking — an impossible state must never take a server down
+    // (Gate 3), and `Invalid` (close) is the safe verdict where `Incomplete` would spin the loop.
     let Some(line) = self.line else {
-        return Err(HttpParseErr::Incomplete);
+        return Err(HttpParseErr::Invalid);
     };
 
     // --- headers: strict-CRLF lines up to the first empty line ---
@@ -14920,7 +14933,9 @@ fn advance(&mut self, src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
         self.headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
         self.commit_line(next);
     }
-    // The blank line was reached: the scan is spent — its header list moves into the head.
+    // The blank line was reached: the scan is spent — its header list moves into the head, and any
+    // further `advance` is rejected (see `spent`).
+    self.spent = true;
     Ok(HttpRequestHead {
         method_start: line.method_start,
         method_len: line.method_len,
@@ -26155,7 +26170,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     #[test]
     fn http_head_scan_matches_one_shot_parse() {
         let big_value = format!("X-Long: {}\r\n", "v".repeat(5000));
-        let flood = (0..200).map(|i| format!("X-{i}: v\r\n")).collect::<String>();
+        let flood = |n: usize| (0..n).map(|i| format!("X-{i}: v\r\n")).collect::<String>();
         let corpus: Vec<Vec<u8>> = [
             // Well-formed, in the shapes the server actually sees.
             &b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"[..],
@@ -26185,7 +26200,11 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         .map(|s| s.to_vec())
         .chain([
             format!("GET / HTTP/1.1\r\n{big_value}\r\n").into_bytes(), // one line far bigger than a chunk
-            format!("GET / HTTP/1.1\r\n{flood}\r\n").into_bytes(),     // past HTTP_MAX_HEADERS
+            // The `HTTP_MAX_HEADERS` cliff itself, from both sides — the flood check accumulates
+            // across `advance` calls, so the boundary is where an incremental count could differ.
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS - 2)).into_bytes(),
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS)).into_bytes(),
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS + 1)).into_bytes(),
         ])
         .collect();
 
@@ -26235,6 +26254,25 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         }
     }
 
+    /// **A spent scan is spent.** `advance` moves only the header list out of itself, so before the
+    /// `spent` latch a second call re-found the same blank line and returned a header-less `Ok`
+    /// **with the framing intact** — `content_length` still set, so a body would still be consumed,
+    /// while every header vanished. `http_request_wants_close` would then see an empty list and read
+    /// a `Connection: close` request as keep-alive. No caller does this today (`http_read_request`
+    /// builds a fresh scan per request and stops advancing once the head is `Some`), which is
+    /// exactly why it needs pinning: it is a trap laid for the next caller, not a live bug.
+    #[test]
+    fn http_head_scan_rejects_being_advanced_after_it_yielded() {
+        let raw = b"GET / HTTP/1.1\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc";
+        let mut scan = HttpRequestHeadScan::new();
+        let head = scan.advance(raw).expect("the head parses");
+        assert_eq!(head.headers.len(), 2);
+        assert!(
+            matches!(scan.advance(raw), Err(HttpParseErr::Invalid)),
+            "a spent scan fails closed — never a header-less Ok, and never Incomplete (which would spin the read loop)"
+        );
+    }
+
     /// The scan is **O(head)**, not O(head × reads). Before it, `http_read_request` re-parsed the
     /// whole buffer after every read, so a 206 KiB head delivered in 100-byte pieces cost ~56 ms of
     /// one server worker's CPU — a slowloris lever needing no volume at all, and one that prefork
@@ -26274,7 +26312,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             // Measured: exactly 1.00x the head at every piece size — the search never looks at a
             // byte twice. 2x is the ceiling asserted, leaving room for an implementation that
             // re-touches a line boundary. Re-parsing from zero is ~n²/piece: 2100x the head at 100
-            // bytes, which is the 56 ms this replaced (now 0.24 ms).
+            // bytes, which is the 56 ms this replaced (now 0.24 ms). **`piece=100` is the row that
+            // carries this assertion** — a regression to searching from `pos` costs only ~1.2x at
+            // 8192 and would slip under the bar there.
             assert!(
                 scanned_bytes < 2 * head.len() as u64,
                 "piece={piece}: scanned {scanned_bytes} bytes for a {}-byte head",

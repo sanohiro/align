@@ -214,6 +214,21 @@ for the same three splits (**232× at 100 bytes**), and the bytes the `\n` searc
   shapes, valid-so-far prefixes, and every smuggling guard) at 1/2/3/7/64/4096-byte pieces and
   asserting the incremental verdict and every span match the one-shot; and a linearity test asserting
   the *measured* search work stays under 2× the head.
+- **A spent scan used to return a header-less `Ok`** — the adversarial review's one finding, and the
+  comment that claimed to guard it was factually wrong. `advance` moves only the header list out, and
+  the terminating `break` deliberately skips `commit_line`, so `pos` still points AT the blank line: a
+  second call re-found it and returned `Ok` **with the framing intact** (`content_length` still set,
+  so a body would still be consumed) and **every header gone** — which would make
+  `http_request_wants_close` see an empty list and read a `Connection: close` request as keep-alive.
+  Not reachable (`http_read_request` builds a fresh scan per request and stops advancing once the head
+  is `Some`), so it was a trap for the next caller rather than a live bug. A `spent` latch now fails
+  closed with `Invalid` — `Incomplete` would have spun the read loop — and a test pins it.
+  The review's 400k-input × 7-chunking differential fuzz found **no** parse disagreement, no panic
+  (debug build, including buffers truncated below `pos`), and no residual quadratic (1.00× at every
+  split, including a single 200 KiB header line); its two coverage notes are also applied — the
+  `HTTP_MAX_HEADERS` cliff itself (126/128/129) is now in the differential corpus, and the linearity
+  test records that `piece=100` is the row carrying its assertion (a regression costs only ~1.2× at
+  8192 and would slip under the 2× bar there).
 - **The instrument was wrong before the mutations fixed it.** The first linearity assertion read the
   cursor's own bookkeeping, so removing the resume entirely (`from = pos`) left it green — it
   measured what the code intended, not what it did. It now counts what `memchr` actually looked at
