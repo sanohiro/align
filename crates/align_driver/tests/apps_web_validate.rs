@@ -99,6 +99,17 @@ fn malformed_tables_abort_at_startup_with_a_diagnosis() {
     );
     // A pattern without the leading slash never matches a request path.
     assert_aborts("web-val-slash", "    pkg.web.get(\"x\", h),", "must start with \"/\"");
+    // Group prefixes are stored separately from patterns, but must still form a literal path.
+    assert_aborts(
+        "web-val-prefix-shape",
+        "    pkg.web.types.Route { method: \"GET\", prefix: \"api\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h) },",
+        "group prefix",
+    );
+    assert_aborts(
+        "web-val-prefix-dynamic",
+        "    pkg.web.types.Route { method: \"GET\", prefix: \"/:tenant\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h) },",
+        "only literal segments",
+    );
     // A nameless parameter segment cannot be read back by `web.param`.
     assert_aborts("web-val-name", "    pkg.web.get(\"/a/:\", h),", "needs a name");
     // The walker treats a wildcard as tail-absorbing; an interior one is a contradiction.

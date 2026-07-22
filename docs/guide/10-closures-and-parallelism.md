@@ -40,7 +40,7 @@ fn main() -> i32 {
 }
 ```
 
-Current limits (implementation in progress): a lambda bound to a value needs typed parameters, and **returning** a function value — or storing one in a struct or array — is deferred until region-backed closure environments land. Passing functions *down* covers pipelines and both parallel constructs, which is the load-bearing case.
+Current limits (implementation in progress): a lambda bound to a value needs typed parameters, and returning a bare function value is still deferred. Function values can be stored in structs and homogeneous arrays/slices; named and non-capturing values are freely reusable, while escape analysis rejects a frame-capturing value that would outlive its environment.
 
 ## Purity is inferred — and parallelism requires it
 

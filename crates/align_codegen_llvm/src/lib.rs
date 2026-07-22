@@ -709,25 +709,24 @@ fn build_module<'c>(
     // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
     let struct_types: Vec<StructType<'c>> =
         program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
-    // Sum-type layouts → a non-union tagged struct `{ i32 tag, <every variant's payload flattened> }`,
-    // indexed by enum id. Built **before** the struct bodies (J1b) because a struct field may now be a
-    // sum type, so `set_struct_body` needs the enum types to exist. Enum payloads are scalars or
-    // (opaque, not-yet-bodied) structs — a literal LLVM struct may reference an opaque type by value;
-    // it becomes sized once the struct bodies below are set. (Enum payloads are never another enum —
-    // `enum_payload_ok` — so this construction needs no enum type in turn.)
+    // Sum-type layouts → named tagged structs `{ i32 tag, <every variant's payload flattened> }`.
+    // Create every enum opaque first, then set the bodies, mirroring structs. This lets the closed
+    // builtin `Error` enum be a payload of pkg.web's middleware verdict without admitting general
+    // recursive enum graphs in sema.
     let enum_types: Vec<StructType<'c>> = program
         .enums
         .iter()
-        .map(|e| {
-            let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
-            for v in &e.variants {
-                for &s in &v.payload {
-                    fields.push(scalar_type(ctx, scalar_to_ty(s), &struct_types, &[]));
-                }
-            }
-            ctx.struct_type(&fields, false)
-        })
+        .map(|e| ctx.opaque_struct_type(&e.name))
         .collect();
+    for (e, et) in program.enums.iter().zip(&enum_types) {
+        let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
+        for v in &e.variants {
+            for &s in &v.payload {
+                fields.push(scalar_type(ctx, scalar_to_ty(s), &struct_types, &enum_types));
+            }
+        }
+        et.set_body(&fields, false);
+    }
     // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
     // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
     // keep declaration order) to eliminate padding. Source access is by name, so this is invisible.
@@ -3360,7 +3359,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
         Scalar::Child => unreachable!("a child handle is not a box/array payload"),
-        Scalar::Fn(_) => unreachable!("a fn value is not a box/array payload"),
+        Scalar::Fn(_) => 16,
     }
 }
 
@@ -6044,14 +6043,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::ArenaAlloc { handle, count, elem } => {
-                // bytes = count * sizeof(elem); align = sizeof(elem). Bump-allocate in the arena.
-                let scalar = align_sema::ty_to_scalar(*elem).expect("ArenaAlloc elem must be a scalar");
+                // bytes = count * sizeof(elem); use the element ABI alignment (a struct's size is
+                // not necessarily a power of two, so it cannot double as an allocator alignment).
                 let i64t = self.ctx.i64_type();
-                let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
+                let elem_ty = self.llvm_type(*elem);
+                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&elem_ty), false);
+                let elem_align = i64t.const_int(self.target_data.get_abi_alignment(&elem_ty) as u64, false);
                 let count_v = self.operand(count).into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
-                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), bytes.into(), elem_bytes.into()], "buf")
+                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), bytes.into(), elem_align.into()], "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -6059,9 +6060,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::HeapAllocBuf { count, elem } => {
                 // bytes = count * sizeof(elem); heap-allocate (freed by a later Drop).
-                let scalar = align_sema::ty_to_scalar(*elem).expect("HeapAllocBuf elem must be a scalar");
                 let i64t = self.ctx.i64_type();
-                let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
+                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&self.llvm_type(*elem)), false);
                 let count_v = self.operand(count).into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
@@ -8299,29 +8299,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Tag-switched drop of a **Move** sum type (J2): load the i32 tag, switch on it, and for each
-    /// variant carrying an owned payload free that payload's buffer. A variant whose payload is a
-    /// scalar / `str` / plain-struct owns nothing and falls through (the `else` continue block). Every
-    /// owned enum payload today is an owned `array<T>` — a `{ptr,len}` freed by its field-0 pointer,
-    /// one flat free (the element is non-owned, pass 0c). Null-safe: an unconstructed / moved-out enum
+    /// variant carrying an owned payload free that payload's buffer or opaque handle. A variant
+    /// whose payload is a scalar / `str` / plain-struct owns nothing and falls through (the `else`
+    /// continue block). Every
+    /// owned array is a `{ptr,len}` freed by its field-0 pointer; an owned handle uses its matching
+    /// runtime free function. Null-safe: an unconstructed / moved-out enum
     /// was zeroed by `DropFlagInit`, so the tag reads 0 and a variant-0 owned payload frees `null`.
     /// `base` is the pointer to the in-memory enum aggregate (`{ i32 tag, payloads… }`).
     fn drop_enum(&self, base: inkwell::values::PointerValue<'c>, enum_id: u32) -> Result<(), CodegenError> {
         let ety = self.enum_types[enum_id as usize];
-        // (variant tag, LLVM field indices of its owned payloads) for every variant that owns a buffer.
+        // (variant tag, LLVM field indices + scalar kinds of its owned payloads) for every variant
+        // that owns storage. Arrays are `{ptr,len}` buffers; Move handles are opaque pointers with
+        // their own null-safe free routine.
         // A variant's payload `k` lives at flat field index `field_base + k` (`field_base` includes the
         // tag slot — see `MakeEnum`). Snapshot into owned `Vec`s so no borrow of `self.enums` is held
         // across the builder calls below.
-        let owned: Vec<(u64, Vec<u32>)> = self.enums[enum_id as usize]
+        let owned: Vec<(u64, Vec<(u32, Scalar)>)> = self.enums[enum_id as usize]
             .variants
             .iter()
             .enumerate()
             .filter_map(|(vi, v)| {
-                let fields: Vec<u32> = v
+                let fields: Vec<(u32, Scalar)> = v
                     .payload
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.is_move())
-                    .map(|(k, _)| v.field_base + k as u32)
+                    .map(|(k, s)| (v.field_base + k as u32, *s))
                     .collect();
                 (!fields.is_empty()).then_some((vi as u64, fields))
             })
@@ -8343,15 +8346,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
         for ((_, fields), (_, bb)) in owned.iter().zip(cases.iter()) {
             self.builder.position_at_end(*bb);
-            for &fi in fields {
+            for &(fi, scalar) in fields {
                 let fp = self.builder.build_struct_gep(ety, base, fi, "dropev").map_err(|e| self.err(e))?;
-                let agg = self
-                    .builder
-                    .build_load(slice_struct_type(self.ctx), fp, "dropevv")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let ptr = self.builder.build_extract_value(agg, 0, "dropevptr").map_err(|e| self.err(e))?;
-                self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                if let Some(free_fn) = handle_free_fn(scalar_to_ty(scalar)) {
+                    let ptr = self
+                        .builder
+                        .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "dropevh")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs[free_fn], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                } else {
+                    let agg = self
+                        .builder
+                        .build_load(slice_struct_type(self.ctx), fp, "dropevv")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "dropevptr").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                }
             }
             self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
         }

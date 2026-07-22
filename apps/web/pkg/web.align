@@ -22,7 +22,7 @@ import pkg.web.internal.query
 // The general unary form. Every per-method constructor below is this with the method spelled out;
 // an EMPTY method matches any method, which is how a catch-all is written.
 pub fn route(method: str, pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
-  pkg.web.types.Route { method: method, pattern: pattern, stream_type: "", handler: pkg.web.types.Handler.Respond(handler) }
+  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: "", handler: pkg.web.types.Handler.Respond(handler) }
 
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("GET", pattern, handler)
@@ -55,7 +55,7 @@ pub fn any(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_build
 // `Content-Type`. Stream routes live in the same table as unary routes: same radix dispatch, same
 // method resolution, same 405 `Allow` contribution.
 pub fn stream(method: str, pattern: str, content_type: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), Error>) -> pkg.web.types.Route =
-  pkg.web.types.Route { method: method, pattern: pattern, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump) }
+  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump) }
 
 // A Server-Sent Events route: method GET (EventSource always GETs), `Content-Type:
 // text/event-stream`. The pump writes WHATWG event frames with `s.send_event(data)` — SSE event
@@ -64,6 +64,37 @@ pub fn stream(method: str, pattern: str, content_type: str, pump: fn(pkg.web.typ
 // has to finish.
 pub fn sse(pattern: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), Error>) -> pkg.web.types.Route =
   stream("GET", pattern, "text/event-stream", pump)
+
+// Prefix a route table. The route pattern stays a zero-copy view; the router matches the logical
+// concatenation `prefix + pattern` without allocating a joined string.
+pub fn group(prefix: str, routes: slice<pkg.web.types.Route>) -> array<pkg.web.types.Route> =
+  routes.map(fn r {
+    pkg.web.types.Route {
+      method: r.method,
+      prefix: prefix,
+      pattern: r.pattern,
+      middleware: r.middleware,
+      stream_type: r.stream_type,
+      handler: r.handler,
+    }
+  }).to_array()
+
+// Prefix a route table and run `middleware` in declaration order before its handlers.
+pub fn group_with(
+  prefix: str,
+  middleware: slice<fn(pkg.web.types.Ctx) -> pkg.web.types.Middleware>,
+  routes: slice<pkg.web.types.Route>,
+) -> array<pkg.web.types.Route> =
+  routes.map(fn r {
+    pkg.web.types.Route {
+      method: r.method,
+      prefix: prefix,
+      pattern: r.pattern,
+      middleware: Some(pkg.web.types.MiddlewareList { handlers: middleware }),
+      stream_type: r.stream_type,
+      handler: r.handler,
+    }
+  }).to_array()
 
 // ── Accessors ─────────────────────────────────────────────────────────────────────────────────
 //
@@ -74,8 +105,10 @@ pub fn sse(pattern: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), 
 // The `:name` / `*name` capture for the matched route, as a view into the request path (`""` when
 // the matched pattern has no such parameter). Zero-allocation: it re-walks the matched pattern
 // rather than materializing a slot array.
-pub fn param(c: pkg.web.types.Ctx, name: str) -> str =
-  pkg.web.internal.router.param_value(c.pattern, c.path, name)
+pub fn param(c: pkg.web.types.Ctx, name: str) -> str {
+  routed_path := c.path[c.prefix.len() .. c.path.len()]
+  pkg.web.internal.router.param_value(c.pattern, routed_path, name)
+}
 
 // The raw (still percent-encoded) value of query parameter `name`, or `""` when absent. Zero-copy
 // and zero-allocation — an ESCAPED key is matched by decoding as the comparison walks.
@@ -161,12 +194,41 @@ fn answer(h: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>, c: pkg.we
   }
 }
 
+fn before(r: pkg.web.types.Route, c: pkg.web.types.Ctx) -> pkg.web.types.Middleware {
+  match r.middleware {
+    None => pkg.web.types.Middleware.Proceed
+    Some(chain) => {
+      hs := chain.handlers
+      mut i := 0
+      loop {
+        if i >= hs.len() { break pkg.web.types.Middleware.Proceed }
+        pre := hs[i]
+        match pre(c) {
+          Proceed => { i = i + 1 }
+          Respond(short_response) => { break pkg.web.types.Middleware.Respond(short_response) }
+          Failed(pre_error) => { break pkg.web.types.Middleware.Failed(pre_error) }
+        }
+      }
+    }
+  }
+}
+
 // One stable diagnostic for every application handler failure. The client sees only the fixed 500
 // body above; stderr keeps the route context and the complete builtin Error value for operators.
 // Logging is best-effort: a closed stderr must not turn one request fault into a dead serve loop.
 fn log_handler_error(c: pkg.web.types.Ctx, err: Error) -> () {
+  log_request_error("handler Err", c, err)
+}
+
+fn log_middleware_error(c: pkg.web.types.Ctx, err: Error) -> () {
+  log_request_error("middleware Failed", c, err)
+}
+
+fn log_request_error(kind: str, c: pkg.web.types.Ctx, err: Error) -> () {
   mut line := builder()
-  line.write("pkg.web: handler Err (")
+  line.write("pkg.web: ")
+  line.write(kind)
+  line.write(" (")
   line.write(c.method)
   line.write(" ")
   line.write(c.path)
@@ -254,39 +316,39 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
         method: method,
         path: path,
         query: pkg.web.internal.query.target_query(target),
+        prefix: r.prefix,
         pattern: r.pattern,
         body: ctx.body(),
         headers: ctx.headers(),
       }
-      match r.handler {
-        Respond(h) => {
-          // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`,
-          // so handing both to one call would move the handle while a borrow of it is still live.
-          rb := answer(h, c)
-          ctx.respond(rb) else {}
+      match before(r, c) {
+        Failed(pre_error) => {
+          log_middleware_error(c, pre_error)
+          middleware_error_response := auto_response(500, "{\"error\":\"internal error\"}")
+          ctx.respond(middleware_error_response) else {}
         }
-        Stream(pump) => {
-          // The framework builds the stream head; the pump never sees a builder. The head is LAZY
-          // (std.http item 8 ②): nothing is written until the pump's first send, so the pump can
-          // still `s.reject(rb)` with a complete normal response — its pre-stream 4xx window.
-          rb := http.response(200)
-          rb.header("Content-Type", r.stream_type)
-          // A cached stream is nonsense; always set.
-          rb.header("Cache-Control", "no-cache")
-          match ctx.respond_stream(rb) {
-            Ok(s) => {
-              // The pump OWNS the stream (finish/reject consume it; a dropped stream just closes).
-              // `c`'s views stay valid for the whole call: `ctx` stays here, borrowed and spent.
-              // An `Err` after the head is committed has nothing left to answer through — log it,
-              // let the owned stream close, and move on to the next request.
-              match pump(c, s) {
-                Ok(_) => {}
-                Err(e) => log_handler_error(c, e)
+        Respond(short_response) => ctx.respond(short_response) else {}
+        Proceed => {
+          match r.handler {
+            Respond(h) => {
+              // The builder is produced BEFORE `respond` consumes `ctx`: `c` holds views into `ctx`.
+              handler_response := answer(h, c)
+              ctx.respond(handler_response) else {}
+            }
+            Stream(pump) => {
+              stream_head := http.response(200)
+              stream_head.header("Content-Type", r.stream_type)
+              stream_head.header("Cache-Control", "no-cache")
+              match ctx.respond_stream(stream_head) {
+                Ok(s) => {
+                  match pump(c, s) {
+                    Ok(_) => {}
+                    Err(e) => log_handler_error(c, e)
+                  }
+                }
+                Err(e) => {}
               }
             }
-            // `respond_stream` failing means the builder was invalid or the client is already
-            // gone — either way there is no stream; serve the next request.
-            Err(e) => {}
           }
         }
       }

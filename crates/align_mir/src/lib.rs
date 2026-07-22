@@ -3795,6 +3795,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ArrayToSlice(inner) => {
+            if matches!(inner.ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                let owned_view = lower_borrowed_owned(b, inner);
+                let v = b.fresh_value(e.ty);
+                inherit_borrow_owners(b, v, [&owned_view]);
+                b.push(Stmt::Let(v, Rvalue::Use(owned_view)));
+                return Operand::Value(v);
+            }
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
@@ -6023,7 +6030,11 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.cur = exit;
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::Load(acc)));
-    let arr = b.fresh_value(Ty::DynArray(scalar_of(elem)));
+    let array_ty = match elem {
+        Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+        _ => Ty::DynArray(scalar_of(elem)),
+    };
+    let arr = b.fresh_value(array_ty);
     b.push(Stmt::Let(arr, Rvalue::MakeDynArray { ptr: Operand::Value(out_ptr), len: Operand::Value(len) }));
     // Free the source temporary now its elements have been copied into the new buffer — UNLESS its
     // storage was donated to `arr` above, in which case the result array now owns that buffer and is

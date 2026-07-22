@@ -133,6 +133,7 @@ web.patch(pattern, handler)   -> route
 
 // grouping (pure data: prefix + routes → prefixed routes; no closures involved)
 web.group(prefix, routes)     -> array<route>
+web.group_with(prefix, middleware, routes) -> array<route>
 
 // serving — Impure; `workers` request loops (prefork, SO_REUSEPORT — see "Concurrent serve")
 web.serve(host, port, routes, workers) -> Result<(), Error>
@@ -279,22 +280,29 @@ pump `Err` emits one best-effort stderr line with the request method/path and th
 error value (`NotFound`, `Invalid`, `Denied`, or `Code(n)`); a logging failure never kills the loop.
 Nothing request-derived can panic; everything is `Result` or a view.
 
-## Middleware (redesigned 2026-07-21 for the settled ownership model — lands W6)
+## Middleware (shipped 2026-07-22)
 
 Fiber's `c.Next()` chain needs capturing closures (deferred). The framework-owns-the-handle model
 makes the v1 shape simpler than the original Move-threading design: `Ctx` is Copy, so a
-pre-handler neither consumes nor returns it —
+pre-handler neither consumes nor returns it. The verdict is an or-kind rather than the originally
+sketched nested `Result<Option<response_builder>, Error>`: the current payload model deliberately
+does not nest aggregates, and a single tagged value gives the same three outcomes with one clear
+drop boundary —
 
 ```text
-fn(c: Ctx) -> Result<Option<response_builder>, Error>
-//   None      -> proceed to the next pre-handler / the handler
-//   Some(rb)  -> short-circuit: serve writes rb, the handler never runs (auth reject, redirect)
-//   Err       -> 500, same as a handler Err
+Middleware { Proceed, Respond(response_builder), Failed(Error) }
+fn(c: Ctx) -> Middleware
+//   Proceed     -> run the next pre-handler / the handler
+//   Respond(rb) -> short-circuit: serve writes rb, the handler never runs (auth reject, redirect)
+//   Failed(e)   -> log request context + 500, same policy as a handler Err
 ```
 
-`Option<response_builder>` is a legal payload since #583. Groups carry the list:
-`web.group_with(prefix, [auth, log], routes)`. Covers auth/logging/CORS headers without closures;
-stateful middleware waits for the capturing-closure feature and a real consumer.
+Groups carry a homogeneous named-function list:
+`web.group_with("/api", [auth, log], routes)`. `group` and `group_with` return an owned route array;
+the radix tree matches `prefix + pattern` as two zero-copy views (no joined string per route or
+request). Prefixes are literal, non-root paths with no trailing slash. Covers auth, request logging,
+redirects, preflight responses, and other pre-handler policies; stateful middleware still waits for
+an escaping closure-environment design.
 
 
 ## Streaming (SSE + generic) — designed 2026-07-21, lands W6
@@ -611,10 +619,9 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   adds per request, and sharing one buffer between the parse and the response write.
   `bench/web_router`'s honest same-path scaling row and CI ceilings now pin the current sibling-scan
   bound; the ideal 1.00× still wants a sibling index.
-- **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
-  **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
-  prefork section above), so a stream costs one worker instead of the whole server.
-  Middleware-lite remains designed-only.
+- **W6 — middleware-lite + streaming. DONE.** Streaming is wired and pinned E2E. Middleware-lite
+  shipped 2026-07-22: `group` / `group_with`, zero-copy prefix-aware radix dispatch, ordered
+  pre-handlers, short-circuit responses, logged 500s, and serve-loop survival are E2E-pinned.
 - **W7 — the external comparison. DONE.** Same box, same generator, same request, both sides in
   their prefork configuration (Fiber's own throughput recommendation, and the analogue of
   `serve(..., workers)`): **pkg.web 491,505 req/s vs Fiber-prefork 374,393 — 1.31×**, plus 1.19× on
