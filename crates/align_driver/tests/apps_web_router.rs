@@ -284,6 +284,113 @@ fn main() -> Result<(), Error> {\n\
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
 }
 
+/// W4 route-tree edge matrix: production dispatch must stay total beyond the linear oracle's
+/// base-3 score width, compare unusually long static segments byte-exactly, preserve equally long
+/// parameter views, and give all table-query helpers sensible answers for an empty table.
+#[test]
+fn route_tree_handles_deep_long_and_empty_tables() {
+    if !backend_available() {
+        return;
+    }
+
+    // `match_score` deliberately documents an i64 scoring limit around 39 segments. Sixty-four
+    // segments therefore exercise the production tree on ground the differential oracle cannot
+    // certify. A 4 KiB segment is well beyond ordinary routing labels without making this compiler
+    // integration test needlessly large.
+    let deep_prefix = (0..63).map(|i| format!("/d{i}")).collect::<String>();
+    let deep_static = format!("{deep_prefix}/leaf");
+    let deep_param_pattern = format!("{deep_prefix}/:id");
+    let deep_param_alias = format!("{deep_prefix}/:item");
+    let deep_param_path = format!("{deep_prefix}/42");
+    let long = "a".repeat(4096);
+    let long_static = format!("/long/{long}");
+    let long_miss = format!("/long/{}b", &long[..long.len() - 1]);
+    let long_param_path = format!("/capture/{long}");
+
+    let web_root = "module pkg.web\n\
+import pkg.web.types\n\
+import pkg.web.internal.router\n\
+pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"GET\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
+pub fn post(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =\n\
+  pkg.web.types.Route { method: \"POST\", pattern: pattern, stream_type: \"\", handler: pkg.web.types.Handler.Respond(handler) }\n\
+pub fn dispatch(routes: slice<pkg.web.types.Route>, method: str, path: str) -> i64 {\n\
+  t := pkg.web.internal.router.build_tree(routes)\n\
+  return pkg.web.internal.router.dispatch_routes(routes, t[..], method, path)\n\
+}\n\
+pub fn denied(routes: slice<pkg.web.types.Route>, method: str, path: str) -> bool {\n\
+  t := pkg.web.internal.router.build_tree(routes)\n\
+  return pkg.web.internal.router.method_not_allowed(routes, t[..], method, path)\n\
+}\n\
+pub fn allowed(routes: slice<pkg.web.types.Route>, path: str) -> string {\n\
+  t := pkg.web.internal.router.build_tree(routes)\n\
+  return pkg.web.internal.router.allow_methods(routes, t[..], path)\n\
+}\n\
+pub fn validate(routes: slice<pkg.web.types.Route>) -> string = pkg.web.internal.router.validate(routes)\n\
+pub fn param(pattern: str, path: str, name: str) -> str = pkg.web.internal.router.param_value(pattern, path, name)\n";
+    let main_template = r#"module main
+import std.http
+import pkg.web
+import pkg.web.types
+
+fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error> = Ok(http.response(200))
+
+fn main() -> Result<(), Error> {
+  routes := [
+    pkg.web.get("__LONG_STATIC__", h),
+    pkg.web.get("/capture/:value", h),
+    pkg.web.get("__DEEP_STATIC__", h),
+    pkg.web.get("__DEEP_PARAM__", h),
+    pkg.web.post("__DEEP_ALIAS__", h),
+  ]
+  print(pkg.web.dispatch(routes, "GET", "__LONG_STATIC__"))
+  print(pkg.web.dispatch(routes, "GET", "__LONG_MISS__"))
+  print(pkg.web.dispatch(routes, "GET", "__LONG_PARAM_PATH__"))
+  print(pkg.web.param("/capture/:value", "__LONG_PARAM_PATH__", "value").len())
+  print(pkg.web.dispatch(routes, "GET", "__DEEP_STATIC__"))
+  print(pkg.web.dispatch(routes, "GET", "__DEEP_PARAM_PATH__"))
+  print(pkg.web.dispatch(routes, "POST", "__DEEP_PARAM_PATH__"))
+  print(pkg.web.dispatch(routes, "DELETE", "__DEEP_PARAM_PATH__"))
+  print(pkg.web.denied(routes, "DELETE", "__DEEP_PARAM_PATH__"))
+  allow := pkg.web.allowed(routes, "__DEEP_PARAM_PATH__")
+  print(allow)
+  diagnosis := pkg.web.validate(routes)
+  print(diagnosis.len())
+
+  empty := routes[0..0]
+  print(pkg.web.dispatch(empty, "GET", "/"))
+  print(pkg.web.dispatch(empty, "DELETE", "/nope"))
+  print(pkg.web.denied(empty, "GET", "/"))
+  empty_allow := pkg.web.allowed(empty, "/")
+  print(empty_allow.len())
+  empty_diagnosis := pkg.web.validate(empty)
+  print(empty_diagnosis.len())
+  return Ok(())
+}
+"#;
+    let main = main_template
+        .replace("__LONG_STATIC__", &long_static)
+        .replace("__LONG_MISS__", &long_miss)
+        .replace("__LONG_PARAM_PATH__", &long_param_path)
+        .replace("__DEEP_STATIC__", &deep_static)
+        .replace("__DEEP_PARAM_PATH__", &deep_param_path)
+        .replace("__DEEP_PARAM__", &deep_param_pattern)
+        .replace("__DEEP_ALIAS__", &deep_param_alias);
+    let files: Vec<(&str, String)> = vec![
+        ("pkg/web/internal/router.align", ROUTER.to_string()),
+        ("pkg/web/types.align", TYPES.to_string()),
+        ("pkg/web.align", web_root.to_string()),
+        ("main.align", main),
+    ];
+    let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    let out = build_and_run_multi("web-table-edges", &refs, "main.align");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\n-1\n1\n4096\n2\n3\n4\n-1\ntrue\nGET, POST\n0\n-1\n-1\nfalse\n0\n0\n"
+    );
+}
+
 /// Backtracking dispatches ABSOLUTELY (not just oracle-agreement): a static branch that dead-ends
 /// must unwind to the sibling `:param` (and, in the wildcard shape, to the `*wildcard`) — the exact
 /// regression the adversarial review of #591 caught (the no-backtracking walk 404'd these while the
