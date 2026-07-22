@@ -8,7 +8,10 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the W4 route-tree edge matrix is DONE (#615): production dispatch is
+_Last updated: 2026-07-22, **the W4 malformed-request matrix is DONE (#616): pkg.web now drives
+request-line, target-form, header-syntax, Transfer-Encoding, and conflicting-Content-Length faults
+through real sockets, proving after every class that only the bad connection closes and the serve
+loop remains alive.** Before that, **the W4 route-tree edge matrix landed (#615): production dispatch is
 now pinned at 64 path segments (past the linear oracle's safe score width), with 4 KiB static and
 captured parameter segments, and across every empty-table query helper.** Before that, **the
 web-router scaling row + CI gate landed (#614): identical runtime
@@ -182,8 +185,11 @@ READMEs):**
    64-segment static and param path (the base-3 linear oracle can wrap beyond ~39), byte-exact 4 KiB
    static hit/miss, a 4 KiB zero-copy param capture, same-claim GET/POST dispatch + 405 `Allow`, and
    empty-table dispatch / 405 / `Allow` / validation. No implementation bug surfaced.
-4. Then: W4's malformed-request matrix and handler-`Err` logging story, middleware-lite (W6,
-   designed only), multipart.
+4. **DONE (#616) — W4 malformed-request matrix:** five real-socket rejection classes cover the
+   request line, target form, header syntax, and framing; a valid routed request after every case
+   proves the worker loop survives. The runtime parser's exhaustive guard + incremental/one-shot
+   differential suites remain the lower-layer coverage.
+5. Then: W4's handler-`Err` logging story, middleware-lite (W6, designed only), multipart.
 
 **DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
 item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
@@ -572,8 +578,8 @@ BEFORE the bench is meaningful:**
 reviewed THREE times (the pre-PR checklist, then two independent adversarial passes) and each pass
 found real defects in the previous one's output — round 2 found seven, including a pre-existing
 `accept` contract bug that let one malformed request kill a pkg.web server. Review the FIXES, not
-just the feature. The route-tree edge matrix shipped in #615; malformed requests remain. Earlier
-context follows._
+just the feature. The route-tree edge matrix shipped in #615 and malformed-request matrix in #616;
+only handler-`Err` logging remains in W4. Earlier context follows._
 
 _Previously: **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
 ENABLERS 1–5 ALL COMPLETE (#593); W4 HARDENING SLICE 1 COMPLETE (#594).** #593 = the pkg.web
@@ -598,7 +604,7 @@ bodies, loop-spawned workers capturing the `slice<Route>` view + fn-field indire
 threads all run correctly today. **Implementation order: ① `http.serve_shared` (sibling op) →
 ② std.http keep-alive (testable on the sequential loop) → ③ pkg.web prefork (serve signature,
 all call sites outright) → ④ W5 bench gate (keep-alive'd, `workers = cores`) → Fiber (W7).**
-The route-tree edge matrix shipped in #615; the malformed-request matrix remains in W4 hardening.
+The route-tree edge matrix shipped in #615 and malformed-request matrix in #616.
 (Housekeeping, found while mirroring: `ja/http.md` has pre-existing drift — item 7's SSE
 streaming body was never mirrored and the recent items use an unnumbered-bold style; items 8–9
 followed the local style. A ja/http.md re-sync pass is owed, separate from any feature work.) Earlier context: #589 (`http_stream`
