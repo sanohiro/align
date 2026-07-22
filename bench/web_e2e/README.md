@@ -112,5 +112,21 @@ Two things to carry forward rather than re-derive:
 2. **The remaining 4.1 µs is not one syscall.** With the poll unremovable this way, what is left to
    attack is allocation and copying: `http_read_request` starts a fresh `Vec` per request, the
    header spans are a fresh `Vec`, the builder holds `String`s, and the response is serialized into
-   another fresh buffer. That is four-plus allocations on a path whose whole budget is 4.1 µs, and
-   `bench/web_e2e` at `CONNS=1` can price each one.
+   another fresh buffer. **Measured since (`bench/http_path`): exactly 14 allocations per request** —
+   585 bytes of fresh allocation plus 135 bytes of `realloc` growth — on a path whose whole budget is
+   4.1 µs. (Two figures, not one summed: pre-reserving a buffer moves bytes between them, so a single
+   total shows an improvement as a regression.)
+
+**Correction (2026-07-22): the last sentence of that point used to say `bench/web_e2e` at `CONNS=1`
+can price each one. It cannot.** The "above the floor" figure is a *difference of two ~70 µs
+measurements*, so it carries both their noises: three adjacent baseline runs give **3.3 / 3.9 / 4.8
+µs/req**, a 1.5 µs spread on a 4.0 µs signal — larger than the whole allocation budget. Per-run req/s
+at one connection really is stable to ~1%; the derived difference is not, and that distinction is the
+lesson. **`bench/http_path` is the instrument for this work**: it prices the same path in-process on
+an exact allocation count (zero noise) plus the server thread's own CPU time (~2% run to run, from
+interleaved blocks rather than one long pass).
+
+It also splits a number this README conflates. **Align does one syscall more than the floor here —
+the keep-alive `poll` — and that costs ~0.9 µs**, so of the 4.0–4.1 µs quoted above, only ~3.6 µs is
+CPU-side work that allocation removal can reach. `http_path` runs both a plain floor (comparable with
+this one) and a `poll` floor (the honest budget), and reports both.

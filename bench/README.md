@@ -36,6 +36,32 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   then *all* of B over a >cache working set produces wildly wrong ratios
   (the second kernel benefits from a warm-ish cache / settled clocks). This trap once made an
   identical-machine-code kernel look "20× slower" — it was a measurement artifact.
+- **A difference of two large measurements carries both their noises.** `web_e2e` reports "Align's
+  protocol path above the floor" by subtracting two ~70 µs end-to-end numbers, each stable to ~1% —
+  so the 4 µs difference is stable to ~35% (measured: 3.3 / 3.9 / 4.8 on adjacent runs). Anything
+  smaller than that spread cannot be priced there however many times you run it. When the quantity
+  you care about is a small difference, **measure it directly**: `bench/http_path` prices the same
+  path in-process on an exact allocation count plus the server thread's own CPU time (~2% run to
+  run).
+- **A floor must do the same syscalls, or its difference is not the thing you named.** `http_path`'s
+  first version compared Align (`poll` → `read` → `write`) against a floor that only read and wrote,
+  and called the difference Align's CPU cost. **The missing `poll` was ~0.9 µs of the 4.3 µs** — 21%
+  of the headline, attributed to work that does not exist. It now runs both floors and reports both
+  differences.
+- **Iterations do not cure drift.** More iterations shrink *within-run* noise only. On this box an
+  unchanged binary read 4201 ns in one batch and 4682 ten minutes later — a between-run shift larger
+  than its own σ. The fix is structural: **alternate the arms in blocks inside one process and take
+  the median**, so drift hits every arm alike. (Three samples suggested ±1.3%; eleven showed 3.5%.
+  Quote a spread with its sample size, or don't quote it.)
+- **Alternating is not enough — counterbalance the order.** Even interleaved, the *position* in the
+  cycle carries a bias: three **identical** floors in `http_path`'s three slots read slot 2 ~115 ns
+  above slot 1 and slot 3 ~109 ns below it, systematically, and it does not shrink with more blocks.
+  That was 11% of one reported line. Reverse the order on alternate blocks (`A,B,C` then `C,B,A`) so
+  every arm sees every slot equally often — this is what "balanced order" above actually requires.
+- **Min is the right statistic for one kernel's time, the wrong one for a difference of two.** Taking
+  each arm's min picks two uncorrelated low outliers and *adds* their noise, and discards exactly the
+  correlated drift interleaving exists to cancel. Measured on the same data: median σ 88/173/99 ns vs
+  min σ 146/214/127.
 - **When the result disappoints, autopsy — don't guess.** If a mechanism that *should* win comes back
   flat or slower, do not reason about the cause from intuition: build an **absolute-ms breakdown** that
   starts from the fast variant and adds one realistic cost at a time (stage-1 alone → + materialize →
