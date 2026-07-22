@@ -8,7 +8,17 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the REST-completeness backlog's last `TODO` is closed (#619):
+_Last updated: 2026-07-22, **the owned-`string` template defect is FIXED (NEXT item 0, PR #620):
+interpolating an owned `string` (`template "{h}"`) no longer panics codegen — it borrows the buffer
+to a `str` view (sema's existing `StrBorrow`, the same borrow `b.write(s)` / a `str` argument
+applies), so there is ONE string display and the `string` is neither moved nor freed by the
+interpolation. `print`'s argument now takes the identical borrow (its lowered MIR is byte-identical,
+verified), and the fail-open MIR catch-all that caused the bug (`_ => IntHole`) is replaced by
+sema's single `print_kind` classification, which both stages now share. Every remaining unprintable
+hole — array / slice / buffer / builder / array_builder / reader / struct / tuple / Option / enum /
+`()` / fn-value — is a sema DIAGNOSTIC, swept by a 16-case matrix, and the codegen display paths
+return a compiler error instead of an inkwell panic if a shape ever mismatches.** Before that,
+**the REST-completeness backlog's last `TODO` was closed (#619):
 `pkg.web.multipart` walks an RFC 7578 upload body with zero allocation and zero copy — `boundary()`
 reads the delimiter out of the Content-Type, and `next(body, bd, from)` hands back
 `Found(Part)` / `Done` / `Invalid` where every name, filename, content-type and data run is a view
@@ -695,30 +705,81 @@ Nothing there stands in for a missing compiler feature.
 
 ## NEXT (in order)
 
-0. **OPEN COMPILER DEFECT (found 2026-07-22 while writing `pkg.web.multipart`; NOT fixed there —
-   it needs its own PR): interpolating an OWNED `string` into a `template` panics in codegen
-   instead of diagnosing.** The panic is
-   `Found StructValue { … llvm_type: "{ ptr, i64 }" } but expected the IntValue variant`, i.e. the
-   template lowering assumes a scalar operand and never learns the `string` representation. Minimal
-   repro on `main`:
+0. **DONE (2026-07-22, PR #620) — the owned-`string` template defect** (found while writing
+   `pkg.web.multipart`; it needed its own PR). `template "{h}"` on an owned `string` panicked
+   codegen with `Found StructValue { … llvm_type: "{ ptr, i64 }" } but expected the IntValue
+   variant`; a `str` interpolated fine.
 
-   ```align
-   module main
+   **Root cause:** MIR's template-hole lowering classified the hole with its own catch-all —
+   `Ty::Str => StrHole, Ty::Bool => …, _ => IntHole` — while sema's `is_printable` accepted
+   `Ty::String`. The one printable type the match forgot therefore became "an integer", and codegen
+   asked a `{ptr,i64}` aggregate for its `IntValue`. Two independent classifications of the same
+   fact, and the wildcard failed OPEN. (The lowering never even reached an ownership question.)
 
-   fn main() -> Result<(), Error> {
-     mut b := builder()
-     b.write("hello")
-     s := b.to_string()
-     print(template "value={s}")
-     return Ok(())
-   }
-   ```
+   **Fix — the ideal form, one string display, not two:** an owned `string` is *borrowed* to a `str`
+   view in sema (`check_print_operand` → the existing `ExprKind::StrBorrow`, the same borrow
+   `b.write(s)` / a `str` argument / `s == t` already apply), so `template "{h}"` neither moves nor
+   frees `h` — `h` stays usable and is dropped exactly once, at scope end; an interpolated *temporary*
+   gets MIR's hidden owner and is freed on every loop edge. `print`'s argument takes the identical
+   borrow, so the two display sites share one mechanism (its lowered MIR is byte-identical — verified
+   by diffing `emit-mir` before/after). The fail-open catch-all is gone: sema now exposes a single
+   `print_kind(ty) -> Option<PrintKind>` classification, `is_printable` is defined from it, and MIR
+   picks the `TemplatePiece` from it — adding a printable type forces every consumer to handle it.
+   Codegen's display accessors (`display_int` / `display_float` / `display_view`, plus the
+   `json.encode` `OptionField` payload arms) now return a `CodegenError` instead of an inkwell panic
+   on a shape mismatch.
 
-   A `str` interpolates fine; only the owned `string` does this. Two things are wrong and both are
-   in Gate 3 of the self-review checklist: the compiler PANICS on a program a user can write, and it
-   panics in codegen rather than being rejected (or accepted) in sema. Fix = teach the template
-   lowering the `string` operand (borrow it to a `str` view — the same thing `print(s)` already
-   does), and add the sema-side rejection for whatever remains unsupported.
+   **Sibling sweep:** every other Move/aggregate kind that can reach a hole — `array<T>`, `slice<T>`,
+   `buffer`, `builder`, `array_builder<T>`, `reader`, struct, tuple, `Option<T>`, `enum`, `()`,
+   fn-value — is a real sema diagnostic ("a template hole must be an int, float, str, bool, or
+   char, got X"), never a codegen panic, and `print`'s path is gated by the same classification.
+   `json.encode` of a `string` field / an `Option<Move>` field was already rejected at the
+   struct-field boundary. Tests: `m5.rs` (`template_hole_takes_an_owned_string`,
+   `owned_string_interpolates_in_every_position` — direct `print(template …)`, a bound
+   `let s := template …`, `builder.write(template …)`, inside a `loop`, inside a `match` arm, and
+   inside functions that afterwards move / return the interpolated value) and `template_ownership.rs`
+   (borrow-and-drop-once MIR evidence, per-iteration temporary free, the 16-case
+   diagnostic-not-panic matrix). **Mutation-checked, with the adversarial review's corrections:**
+   reverting sema + MIR together fails all four owned-`string` rows (with the codegen hardening
+   still in, as `CodegenError: an int template hole expects an integer operand, got StructValue(…)`;
+   revert that hunk too and it is the original `expected the IntValue variant` panic). Reverting
+   **only** the sema borrow fails exactly one row workspace-wide —
+   `an_owned_string_hole_temporary_is_freed_each_iteration` — because MIR then classifies the raw
+   `Ty::String` as a byte view (no panic) but no hidden owner is minted and the interpolated
+   temporary leaks. Reverting **only** the MIR half is NOT test-visible: sema hands MIR a `Ty::Str`,
+   so the old `_ => IntHole` catch-all never sees a `string` again. Its value is a **compile-time**
+   guarantee, not a runtime-pinned one: adding a `PrintKind` variant breaks the MIR match, which is
+   exactly the fail-open this defect came from. The independent adversarial review measured the
+   borrow non-consuming across temporaries, moves, loops, struct fields, array elements, `match`
+   arms, arenas, `?` paths, drop-flag branches, `par_map` and `spawn` (LD_PRELOAD malloc counter at
+   two iteration counts), and confirmed `emit-mir` over all 213 repo `.align` files is byte-identical
+   to `main`.
+
+   **Two follow-ups this PR does NOT fix (separate work, both confirmed by that review):**
+
+   0a. **SOUNDNESS, pre-existing on `main`, HIGH — a `str` bound from a `template` escapes the
+   hidden owner's loop-edge free, and sema accepts it.** Repro: `mut acc: str := "start"` then
+   `loop { acc = template "{acc}-{c}"; c = c + 1; if c >= 5 { break } }` then `print(acc)` →
+   `alignc check` reports ok, and the binary reads freed memory (the debug runtime trips
+   `ptr::copy_nonoverlapping` unaligned/overlap precondition; a release build prints garbage).
+   Cause: `borrow_sources_inner` (`crates/align_sema/src/lib.rs`, ~:8245) has **no
+   `ExprKind::Template` arm** and a fail-open `_ => BorrowRoots::new()` tail — the same fail-open
+   class this PR removed from MIR. `region_of(Template) = Frame` blocks a `return` but is not borrow
+   provenance, so the loop-edge invalidation never fires. The sibling shape (`keep = h` for a
+   loop-local owned `string` `h`) IS correctly rejected, so only the Template provenance edge is
+   missing. The owned-`string`-hole spelling of the same loop is reachable through this PR's new
+   capability and misbehaves identically.
+
+   0b. **Codegen panic hardening is asymmetric.** `gen_print`'s `into_int_value()`
+   (`crates/align_codegen_llvm/src/lib.rs`, ~:8443) still aborts on `print(array)` / `print(struct)`
+   when the sema gate is bypassed, and `Operand::Value(id) => self.values[id]` (~:10007) is a direct
+   map index that aborts for a `()` operand — so `template "{u()}"` and `print(u())` abort *before*
+   reaching the new `display_*` accessors: one unprintable shape escapes the hardening even on the
+   template path. Neither is reachable through today's sema gate; both are the Gate-3 belt-and-braces
+   this PR applied to the template pieces only. Same bucket: `json.encode`'s `Option` payload domain
+   needs a sema-side gate — its codegen fallback arm is **live** (a non-Move `enum` payload such as
+   `C { R, G, B }` in `S { a: Option<C> }` reaches it; it panicked on `main` and now returns a
+   `CodegenError` with no sema diagnostic behind it).
 
 1. **`pkg.web` root + `serve()` — DONE, then rebuilt on the settled ownership model.** `apps/web/pkg/web.align` is real: per-method constructors
    (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`any` over a shared `route()`), the

@@ -9358,6 +9358,41 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
     }
 
+    /// Read a display operand as an integer, reporting a compiler error instead of panicking when
+    /// the LLVM shape is not an integer. Which piece a `template` hole becomes is decided once, by
+    /// sema's [`align_sema::print_kind`], so a mismatch here can only be a compiler bug — and a
+    /// compiler bug must surface as an error, never an inkwell panic on a user program. That panic
+    /// is exactly what an owned `string` hole used to produce ("expected the IntValue variant").
+    fn display_int(&self, op: &Operand, what: &str) -> Result<IntValue<'c>, CodegenError> {
+        let v = self.operand(op);
+        match v {
+            BasicValueEnum::IntValue(i) => Ok(i),
+            other => Err(self.err(format!("{what} expects an integer operand, got {other:?}"))),
+        }
+    }
+
+    /// Read a display operand as a float. Same contract as [`Self::display_int`].
+    fn display_float(&self, op: &Operand, what: &str) -> Result<inkwell::values::FloatValue<'c>, CodegenError> {
+        let v = self.operand(op);
+        match v {
+            BasicValueEnum::FloatValue(f) => Ok(f),
+            other => Err(self.err(format!("{what} expects a float operand, got {other:?}"))),
+        }
+    }
+
+    /// Read a display operand as a `{ptr, len}` byte view (`str`, or an owned `string` already
+    /// borrowed to one by sema). Same contract as [`Self::display_int`]: a shape mismatch is a
+    /// compiler error, not a panic.
+    fn display_view(&self, op: &Operand, what: &str) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
+        let v = self.operand(op);
+        let BasicValueEnum::StructValue(agg) = v else {
+            return Err(self.err(format!("{what} expects a {{ptr, len}} view operand, got {v:?}")));
+        };
+        let ptr = self.builder.build_extract_value(agg, 0, "p").map_err(|e| self.err(e))?;
+        let len = self.builder.build_extract_value(agg, 1, "l").map_err(|e| self.err(e))?;
+        Ok((ptr, len))
+    }
+
     fn gen_template(
         &mut self,
         result_id: ValueId,
@@ -9394,17 +9429,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
+                // A `str` hole — an owned `string` reaches here already borrowed to one (sema's
+                // `StrBorrow`), so both share this single byte-view path.
                 align_mir::TemplatePiece::StrHole(op) => {
-                    let agg = self.operand(op).into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "p").map_err(|e| self.err(e))?;
-                    let len = self.builder.build_extract_value(agg, 1, "l").map_err(|e| self.err(e))?;
+                    let (ptr, len) = self.display_view(op, "a str template hole")?;
                     self.builder
                         .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::IntHole(op) => {
                     let ty = self.f.operand_ty(op);
-                    let v = self.operand(op).into_int_value();
+                    let v = self.display_int(op, "an int template hole")?;
                     // Use the actual LLVM width (robust even if `ty` is the error type).
                     let wide = if v.get_type().get_bit_width() < 64 {
                         if is_signed(ty) {
@@ -9420,30 +9455,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::BoolHole(op) => {
-                    let v = self.operand(op).into_int_value();
+                    let v = self.display_int(op, "a bool template hole")?;
                     let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                     self.builder
                         .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::CharHole(op) => {
-                    let v = self.operand(op).into_int_value();
+                    let v = self.display_int(op, "a char template hole")?;
                     self.builder
                         .build_call(self.funcs["builder_write_char"], &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::FloatHole(op) => {
                     let ty = self.f.operand_ty(op);
-                    let v = self.operand(op).into_float_value();
+                    let v = self.display_float(op, "a float template hole")?;
                     let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
                     self.builder
                         .build_call(self.funcs[callee], &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::JsonStrHole(op) => {
-                    let agg = self.operand(op).into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "jp").map_err(|e| self.err(e))?;
-                    let len = self.builder.build_extract_value(agg, 1, "jl").map_err(|e| self.err(e))?;
+                    let (ptr, len) = self.display_view(op, "a json.encode str field")?;
                     self.builder
                         .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
@@ -9480,7 +9513,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // Render the payload by its scalar kind (mirrors the holes above).
                     match scalar_to_ty(s) {
                         Ty::Str => {
-                            let pa = payload.into_struct_value();
+                            let BasicValueEnum::StructValue(pa) = payload else {
+                                return Err(self.err(format!("json.encode Option field '{name}' payload is not a {{ptr, len}} view")));
+                            };
                             let sptr = self.builder.build_extract_value(pa, 0, "osp").map_err(|e| self.err(e))?;
                             let slen = self.builder.build_extract_value(pa, 1, "osl").map_err(|e| self.err(e))?;
                             self.builder
@@ -9488,19 +9523,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .map_err(|e| self.err(e))?;
                         }
                         Ty::Bool => {
-                            let v = payload.into_int_value();
+                            let BasicValueEnum::IntValue(v) = payload else {
+                                return Err(self.err(format!("json.encode Option field '{name}' payload is not a bool")));
+                            };
                             let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                             self.builder
                                 .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                         fty @ Ty::Float(_) => {
-                            let v = payload.into_float_value();
+                            let BasicValueEnum::FloatValue(v) = payload else {
+                                return Err(self.err(format!("json.encode Option field '{name}' payload is not a float")));
+                            };
                             let callee = if fty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
                             self.builder.build_call(self.funcs[callee], &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
                         }
-                        ity => {
-                            let v = payload.into_int_value();
+                        // Integers and `char` (a `u32` code point) render through the int writer.
+                        // Anything else is NOT an integer at the LLVM level, and blindly calling
+                        // `into_int_value()` on it aborts the compiler. The Move payloads
+                        // (`Scalar::String` / `DynArray` / …) are rejected at the struct-field
+                        // boundary ("an `Option` struct field must have a non-owned payload"), but
+                        // that gate only tests Move-ness, so the fallback arm below is **live**: a
+                        // non-Move `enum` payload (`C { R, G, B }` in `S { a: Option<C> }`) reaches
+                        // it and lowers to `%C = type { i32 }`, a StructValue. It used to panic
+                        // there; it now fails as a compiler error. That is still a codegen error
+                        // with no sema diagnostic behind it — the Gate-3 shape this file's template
+                        // holes just shed — so `json.encode`'s `Option` payload domain wants the
+                        // same sema-side gate. Recorded as a follow-up in `HANDOFF.md`.
+                        ity @ (Ty::Int(_) | Ty::IntVar(_) | Ty::Char) => {
+                            let BasicValueEnum::IntValue(v) = payload else {
+                                return Err(self.err(format!("json.encode Option field '{name}' payload is not an integer")));
+                            };
                             let wide = if v.get_type().get_bit_width() < 64 {
                                 if is_signed(ity) {
                                     self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
@@ -9513,6 +9566,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             self.builder
                                 .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
                                 .map_err(|e| self.err(e))?;
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "json.encode Option field '{name}' has an unrenderable payload type {other:?}"
+                            )));
                         }
                     }
                     // Trailing comma (stripped by `PopComma` if this is the last present field).

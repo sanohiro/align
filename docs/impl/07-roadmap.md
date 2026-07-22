@@ -607,7 +607,10 @@ later slices (struct arrays, M5 strings/JSON).
   the runtime's shortest round-trip decimal (Rust `Display`), with a `.0` appended when the
   rendering would otherwise look like an integer (runtime `align_rt_print_{bool,char,f32,f64}`
   + matching `builder_write_*`; MIR `BoolHole`/`CharHole`/`FloatHole`). `is_printable`
-  (numeric | `str` | `bool` | `char`) gates both `print` and template holes.
+  (numeric | `str` | owned `string` | `bool` | `char`) gates both `print` and template holes,
+  over the single `print_kind` classification MIR reuses to pick the hole's `TemplatePiece`.
+  An owned `string` displays exactly like a `str`: sema borrows it (`StrBorrow`) in both
+  positions, so displaying it neither moves nor frees it.
 - [done] `str` struct fields. A struct may hold `str` fields (codegen lays them out as the
   `{ ptr, len }` view via `abi_type`). To avoid reopening the arena-escape gap without
   per-struct region tracking, a `str` field may only hold a **region-0** str (a literal /

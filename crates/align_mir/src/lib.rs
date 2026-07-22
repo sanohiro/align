@@ -2777,12 +2777,21 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     hir::TemplatePart::Hole(h) => {
                         let ty = h.ty;
                         let op = lower_expr(b, h);
-                        pieces.push(match ty {
-                            Ty::Str => TemplatePiece::StrHole(op),
-                            Ty::Bool => TemplatePiece::BoolHole(op),
-                            Ty::Char => TemplatePiece::CharHole(op),
-                            Ty::Float(_) => TemplatePiece::FloatHole(op),
-                            _ => TemplatePiece::IntHole(op),
+                        // The piece is picked by sema's SINGLE display classification
+                        // (`print_kind`), never by a local catch-all: a printable type sema accepts
+                        // but this match forgot used to fall into `IntHole` and hand codegen a
+                        // `{ptr,len}` aggregate where it demanded an integer. An owned `string` is
+                        // already a borrowed `str` here (sema's `StrBorrow`), so it renders through
+                        // the one string path.
+                        pieces.push(match align_sema::print_kind(ty) {
+                            Some(align_sema::PrintKind::Str) => TemplatePiece::StrHole(op),
+                            Some(align_sema::PrintKind::Bool) => TemplatePiece::BoolHole(op),
+                            Some(align_sema::PrintKind::Char) => TemplatePiece::CharHole(op),
+                            Some(align_sema::PrintKind::Float) => TemplatePiece::FloatHole(op),
+                            // `Int`, plus the poisoned `Ty::Error` hole — unprintable holes are a
+                            // sema error, and an erroring program never reaches MIR, so the only
+                            // `None` here is the error sentinel, which codegen renders as an int.
+                            Some(align_sema::PrintKind::Int) | None => TemplatePiece::IntHole(op),
                         });
                     }
                     hir::TemplatePart::JsonStr(h) => {

@@ -12290,6 +12290,20 @@ impl<'a, 't> Checker<'a, 't> {
         e
     }
 
+    /// Check a **display operand** (`print`'s argument, a `template` hole), applying the same
+    /// `string` → `str` borrow [`Self::check_str_init`] applies to a `str` position. Unlike that
+    /// one it constrains nothing else: every other type is left for the caller's printability
+    /// check to accept or report. Displaying an owned `string` is a read — the borrow keeps it
+    /// usable afterwards and leaves it to be dropped exactly once, at scope end.
+    fn check_print_operand(&mut self, a: &ast::Expr) -> Expr {
+        let e = self.check_expr(a, None);
+        if e.ty == Ty::String {
+            let span = e.span;
+            return Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span };
+        }
+        e
+    }
+
     /// Check an expression expected to be a `slice<T>`, applying the array → slice borrow
     /// (`ArrayToSlice`) when the source is a matching array. Shared by call arguments and
     /// slice-annotated `let` bindings so both produce a real slice value (not a bare array).
@@ -12356,7 +12370,9 @@ impl<'a, 't> Checker<'a, 't> {
         let checked = args
             .iter()
             .map(|a| {
-                let e = self.check_expr(a, None);
+                // An owned `string` is borrowed to a `str` view, exactly like a `template` hole:
+                // one string display, and `print(s)` leaves `s` usable.
+                let e = self.check_print_operand(a);
                 if !is_printable(e.ty) {
                     self.diags
                         .error("'print' expects an int, float, str, bool, or char".to_string(), e.span);
@@ -13414,7 +13430,12 @@ impl<'a, 't> Checker<'a, 't> {
             match p {
                 ast::TemplatePart::Text(s) => hparts.push(TemplatePart::Text(s.clone())),
                 ast::TemplatePart::Hole(expr) => {
-                    let e = self.check_expr(expr, None);
+                    // An owned `string` interpolates exactly like a `str` — there is ONE string
+                    // display — so borrow its bytes here (`StrBorrow`: zero-cost, same `{ptr,len}`
+                    // layout, non-consuming). `template "{s}"` therefore neither moves nor frees
+                    // `s`; the `string` stays owned by its slot and is dropped once, at scope end.
+                    // This is the same borrow `b.write(s)` / a `str` argument / `s == t` apply.
+                    let e = self.check_print_operand(expr);
                     if !is_printable(e.ty) {
                         self.diags.error(
                             format!("a template hole must be an int, float, str, bool, or char, got {}", ty_name(e.ty)),
@@ -21259,10 +21280,45 @@ fn path_str(p: &ast::Path) -> String {
     p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".")
 }
 
-/// Types `print` and a `template` hole can render: integers, floats, `str`, `bool`, `char`
-/// (and the error sentinel, to avoid cascading diagnostics).
+/// Types `print` and a `template` hole can render: integers, floats, `str` — an owned `string`
+/// included, borrowed to a `str` view by [`Checker::check_print_operand`] — `bool`, and `char`
+/// (plus the error sentinel, to avoid cascading diagnostics). One list, one classifier: see
+/// [`print_kind`].
 fn is_printable(ty: Ty) -> bool {
-    ty.is_numeric() || matches!(ty, Ty::Str | Ty::String | Ty::Bool | Ty::Char | Ty::Error)
+    matches!(ty, Ty::Error) || print_kind(ty).is_some()
+}
+
+/// How a printable value is rendered — the **single** classification shared by the display
+/// consumers: sema's `print` / `template`-hole checks and MIR's [`hir::TemplatePart::Hole`] →
+/// `TemplatePiece` selection. There is ONE string display in Align, so an owned `string` classifies
+/// exactly like a `str` here (both are `{ptr,len}` byte views; the owned side is borrowed
+/// non-consumingly by [`hir::ExprKind::StrBorrow`] before it reaches MIR).
+///
+/// Single-sourced deliberately: the owned-`string`-in-a-`template` codegen panic existed because
+/// MIR classified template holes with its own `_ => IntHole` catch-all, so a printable type sema
+/// accepted silently became "an integer" and blew up on a `{ ptr, i64 }` operand. Adding a
+/// printable type here now forces every consumer to handle it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrintKind {
+    Int,
+    Float,
+    Bool,
+    Char,
+    /// A `{ptr,len}` byte view — `str`, or an owned `string` borrowed as one.
+    Str,
+}
+
+/// The [`PrintKind`] of `ty`, or `None` when it is not printable (`print` / a `template` hole then
+/// reports a sema error; nothing unprintable reaches MIR).
+pub fn print_kind(ty: Ty) -> Option<PrintKind> {
+    Some(match ty {
+        Ty::Int(_) | Ty::IntVar(_) => PrintKind::Int,
+        Ty::Float(_) | Ty::FloatVar(_) => PrintKind::Float,
+        Ty::Bool => PrintKind::Bool,
+        Ty::Char => PrintKind::Char,
+        Ty::Str | Ty::String => PrintKind::Str,
+        _ => return None,
+    })
 }
 
 /// Map a method name to the builder writer it denotes (MMv2 slice 7c/7d), if any.
