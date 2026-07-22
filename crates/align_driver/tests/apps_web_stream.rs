@@ -112,6 +112,10 @@ fn echo_stream(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {\n\
   s.finish()\n\
 }\n\
 \n\
+fn fail_stream(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {\n\
+  return Err(Error.Denied)\n\
+}\n\
+\n\
 pub fn main(args: array<str>) -> Result<(), Error> {\n\
   cmd := cli.command(\"srv\")\n\
   cmd.flag_i64(\"port\", 0)\n\
@@ -120,6 +124,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.get(\"/plain\", plain),\n\
     pkg.web.sse(\"/events/:channel\", events),\n\
     pkg.web.stream(\"POST\", \"/ndjson\", \"application/x-ndjson\", echo_stream),\n\
+    pkg.web.stream(\"GET\", \"/fail-stream\", \"text/plain\", fail_stream),\n\
   ]\n\
   return pkg.web.serve(\"127.0.0.1\", p.get_i64(\"port\"), routes, 1)\n\
 }\n";
@@ -138,6 +143,21 @@ impl Drop for Server {
     }
 }
 
+impl Server {
+    fn stop_and_stderr(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut stderr = String::new();
+        self.child
+            .stderr
+            .take()
+            .expect("stderr piped")
+            .read_to_string(&mut stderr)
+            .expect("read stderr");
+        stderr
+    }
+}
+
 fn start(name: &str) -> Server {
     let port = free_loopback_port();
     let built = build_exe_multi(
@@ -153,13 +173,34 @@ fn start(name: &str) -> Server {
     );
     let mut child = std::process::Command::new(&built.exe)
         .args(["--port", &port.to_string()])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn server");
     std::thread::sleep(Duration::from_millis(300));
     if let Ok(Some(st)) = child.try_wait() {
-        panic!("server exited at startup: {st:?}");
+        let mut stderr = String::new();
+        child.stderr.take().expect("stderr piped").read_to_string(&mut stderr).expect("read stderr");
+        panic!("server exited at startup: {st:?}; stderr: {stderr}");
     }
     Server { child, port, _built: built }
+}
+
+#[test]
+fn a_stream_handler_error_is_logged_and_the_loop_survives() {
+    if !backend_available() {
+        return;
+    }
+    let mut srv = start("web-stream-handler-log");
+
+    // The lazy stream head has not committed, but a pump Err is not a normal response builder: the
+    // connection closes, the failure is logged, and the next request still runs.
+    let failed = exchange(srv.port, b"GET /fail-stream HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(failed.is_empty(), "a pre-send pump Err writes no partial stream: {failed:?}");
+    let plain = exchange(srv.port, b"GET /plain HTTP/1.1\r\nHost: h\r\n\r\n");
+    let (head, body) = split_head_body(&plain);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "loop survived: {head:?}");
+    assert_eq!(body, b"plain");
+    assert_eq!(srv.stop_and_stderr(), "pkg.web: handler Err (GET /fail-stream): Denied\n");
 }
 
 #[test]

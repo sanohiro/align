@@ -8,7 +8,10 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the W4 malformed-request matrix is DONE (#616): pkg.web now drives
+_Last updated: 2026-07-22, **W4 is COMPLETE (#617): handler failures no longer vanish — unary
+handlers and stream pumps log one best-effort stderr line with the real request method/path and the
+complete builtin `Error`, while preserving the fixed 500/stream-close behavior and keeping the serve
+loop alive.** Before that, **the W4 malformed-request matrix was DONE (#616): pkg.web now drives
 request-line, target-form, header-syntax, Transfer-Encoding, and conflicting-Content-Length faults
 through real sockets, proving after every class that only the bad connection closes and the serve
 loop remains alive.** Before that, **the W4 route-tree edge matrix landed (#615): production dispatch is
@@ -189,7 +192,10 @@ READMEs):**
    request line, target form, header syntax, and framing; a valid routed request after every case
    proves the worker loop survives. The runtime parser's exhaustive guard + incremental/one-shot
    differential suites remain the lower-layer coverage.
-5. Then: W4's handler-`Err` logging story, middleware-lite (W6, designed only), multipart.
+5. **DONE (#617) — W4 handler-`Err` logging:** unary handlers and stream pumps emit one stable
+   stderr line with method, path, and the full builtin `Error`; E2E pins every Error variant, unary
+   500 + survival, and stream close + survival. **W4 is complete.** Next: middleware-lite (W6,
+   designed only), then multipart.
 
 **DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
 item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
@@ -579,7 +585,7 @@ reviewed THREE times (the pre-PR checklist, then two independent adversarial pas
 found real defects in the previous one's output — round 2 found seven, including a pre-existing
 `accept` contract bug that let one malformed request kill a pkg.web server. Review the FIXES, not
 just the feature. The route-tree edge matrix shipped in #615 and malformed-request matrix in #616;
-only handler-`Err` logging remains in W4. Earlier context follows._
+handler-`Err` logging then closed W4 in #617. Earlier context follows._
 
 _Previously: **pkg.web: F1 + F0 + W1 COMPLETE, W2 ROUTING COMPLETE; streaming
 ENABLERS 1–5 ALL COMPLETE (#593); W4 HARDENING SLICE 1 COMPLETE (#594).** #593 = the pkg.web
@@ -810,8 +816,8 @@ request; `apps_web_root.rs` pins it, including that a `:param` capture reads the
   same-method pair on one claim unrepresentable.
 - **404/405 empty bodies — DONE.** The automatic 404/405/500 now carry the design's fixed minimal
   JSON bodies (`{"error":"not found"}` / `"method not allowed"` / `"internal error"`).
-- **A handler's `Err` still vanishes without a trace** — `serve` swallows it to keep the loop
-  alive, with no log line. Needs the logging story W5+ owes (unchanged).
+- **A handler's `Err` logging — DONE in the W4-closing PR.** Unary handlers and stream pumps log
+  method/path/full builtin `Error` to stderr without changing their response or loop semantics.
 
 Also shipped-with-a-caveat: `serve` returns an `accept` error rather than retrying — but that now
 means only a genuine listener-level fault, since #597 classifies the transient errnos inside

@@ -274,8 +274,10 @@ pkg layer needs nothing user code doesn't have.
 `serve` returns `Err` only for setup (bind/listen/tree-build abort is a startup abort, not Err —
 programmer error). Per-request: framework maps malformed requests to 400, unmatched to 404/405,
 handler `Err` to 500 — fixed minimal JSON bodies, loop continues. Application error vocabularies
-(e.g. the OpenAI error object) are app policy via `web.status_json`. Nothing request-derived can
-panic; everything is `Result` or a view.
+(e.g. the OpenAI error object) are app policy via `web.status_json`. Every unary-handler and stream-
+pump `Err` emits one best-effort stderr line with the request method/path and the complete builtin
+error value (`NotFound`, `Invalid`, `Denied`, or `Code(n)`); a logging failure never kills the loop.
+Nothing request-derived can panic; everything is `Result` or a view.
 
 ## Middleware (redesigned 2026-07-21 for the settled ownership model — lands W6)
 
@@ -384,8 +386,8 @@ match r.handler {
   pump, `return s.reject(...)` on bad input, stream on good input — one fn, no separate validate
   phase (rejected: a per-route validate fn doubles the parse work and bloats Route).
 - After the first send there is NO error window, by HTTP's own rules: a pump `Err` mid-stream just
-  ends the stream (drop closes the fd; the client sees termination). Same silent-`Err` posture as a
-  handler Err — the W4 logging story covers both.
+  ends the stream (drop closes the fd; the client sees termination). It emits the same method/path/
+  error stderr diagnostic as a unary handler `Err`.
 - The loop never dies per request, unchanged.
 
 ### Ordering constraint (hard) — LIFTED 2026-07-21
@@ -596,8 +598,10 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   capture, same-claim GET/POST + 405 `Allow`, and every empty-table query helper. **The
   malformed-request matrix is SHIPPED too:** real sockets cover malformed request-line, target
   form, header syntax, Transfer-Encoding, and conflicting Content-Length; a valid routed request
-  after every class proves only the bad connection closes. Remaining W4: the handler-`Err` logging
-  story (W5+).
+  after every class proves only the bad connection closes. **Handler-`Err` logging is SHIPPED:**
+  unary handlers and stream pumps emit one stderr line carrying the real method, path, and complete
+  builtin `Error`; the 500/stream-close behavior and serve-loop survival are E2E-pinned. W4 is
+  complete.
 - **W5 — the router/e2e bench gate. MET.** `bench/web_e2e` prices the framework at **0.8 µs per
   request** over the same responses written directly on `std.http` (CONNS=1 ping-pong; 0.98–1.00×
   at 32 connections). It also prices everything else, which is why it was built before optimising
