@@ -14683,24 +14683,115 @@ struct HttpRequestHead {
     http11: bool,
 }
 
-/// Parse one **strict-CRLF**-terminated line starting at `pos` in `src`, returning
-/// `Ok(Some((line_start, line_len, next_pos)))` where the line content excludes the terminating CRLF.
-/// A bare LF (an `\n` not immediately preceded by `\r`) is **rejected** with `Err(())` — the server-side
-/// strict-line-ending smuggling guard (http.md Slice 4, guard 1). `Ok(None)` if there is no `\n` at or
-/// after `pos` yet (a valid-so-far prefix — read more). Scans with `memchr` (http.md R2).
-fn http_next_line_strict(src: &[u8], pos: usize) -> Result<Option<(usize, usize, usize)>, ()> {
-    match memchr::memchr(b'\n', &src[pos..]) {
-        None => Ok(None), // no line terminator yet — incomplete
-        Some(rel) => {
-            let nl = rel + pos;
-            // Strict CRLF: the byte before `\n` must be `\r` (and there must be one — an `\n` at `pos`
-            // is a bare LF). A lone `\n` is a request-smuggling vector some proxies accept and others
-            // don't; a strict server rejects it.
-            if nl == pos || src[nl - 1] != b'\r' {
-                return Err(()); // bare LF
-            }
-            Ok(Some((pos, nl - 1 - pos, nl + 1)))
+/// The **resumable** state of one inbound head parse — the parser itself, not a cache in front of
+/// it. A head arrives over as many `read`s as the client chooses to split it into, and re-parsing
+/// the whole buffer after each one is quadratic: a 206 KiB head delivered in 100-byte pieces
+/// measured **56 ms of server CPU** for one request (5.2 ms at 1 KiB, 0.67 ms at 8 KiB — the shape
+/// of an O(n²)). One connection could therefore burn a prefork worker for a twentieth of a second,
+/// which is the real slowloris lever on this path. Resuming makes it O(head).
+///
+/// Every offset it keeps is an index into the caller's buffer, which only ever **grows** (bytes are
+/// appended, never shifted — see [`http_read_into`]), so a span accepted in an earlier call stays
+/// valid in a later one. The one-shot [`http_parse_request_head`] is a fresh scan advanced once,
+/// so both forms are the same code and every existing guard test covers both.
+struct HttpRequestHeadScan {
+    /// Where the next unparsed line begins. `0` until the request line is accepted.
+    pos: usize,
+    /// How many bytes from `pos` have already been searched for `\n` and did not contain one.
+    /// Resuming the search here — rather than at `pos` — is what bounds a single pathological
+    /// header line (up to `HTTP_MAX_HEADER_BLOCK` of it) to O(its length) instead of O(length ×
+    /// reads).
+    scanned: usize,
+    /// `Some` once the request line has been parsed and validated; it is never re-examined.
+    line: Option<HttpRequestLineParts>,
+    /// Header spans accepted so far. The flood cap and the conflicting-`Content-Length` check both
+    /// accumulate here, exactly as they would in a one-shot parse of the finished buffer.
+    headers: Vec<HttpHeaderSpan>,
+    content_length: Option<usize>,
+    /// Set when `advance` yielded its head. **A scan is one request's parse.** Re-advancing a spent
+    /// one is a caller bug, and the honest answer is `Invalid` — close the connection. It used to
+    /// return a header-less `Ok`: the `Ok` path moves only the header list out, leaving `pos` AT the
+    /// blank line (the terminating `break` deliberately skips `commit_line`), so a second `advance`
+    /// re-found that line and returned immediately. The framing survived — `content_length` intact,
+    /// so a body would still be consumed — while every header silently vanished, which would make
+    /// `http_request_wants_close` see an empty list and read a `Connection: close` request as
+    /// keep-alive. `Incomplete` would be no better: it would spin the read loop.
+    spent: bool,
+    /// Test-only: the total bytes the `\n` search has actually looked at. The linearity property is
+    /// about the WORK, and the cursor's own bookkeeping cannot report it — an implementation that
+    /// tracked `scanned` perfectly but still searched from `pos` would look identical from outside.
+    #[cfg(test)]
+    searched: u64,
+}
+
+/// The validated request line — the part of [`HttpRequestHead`] that is settled before the headers.
+#[derive(Clone, Copy)]
+struct HttpRequestLineParts {
+    method_start: usize,
+    method_len: usize,
+    target_start: usize,
+    target_len: usize,
+    http11: bool,
+}
+
+impl HttpRequestHeadScan {
+    fn new() -> HttpRequestHeadScan {
+        HttpRequestHeadScan {
+            pos: 0,
+            scanned: 0,
+            line: None,
+            headers: Vec::new(),
+            content_length: None,
+            spent: false,
+            #[cfg(test)]
+            searched: 0,
         }
+    }
+
+    /// One **strict-CRLF**-terminated line at `self.pos`, returning `(line_start, line_len,
+    /// next_pos)` with the terminating CRLF excluded. The `\n` search resumes at `pos + scanned`,
+    /// and on `Incomplete` records how far it got so the next call does not re-scan those bytes.
+    /// A bare LF (an `\n` not immediately preceded by `\r`) is **rejected** — the server-side
+    /// strict-line-ending smuggling guard (http.md Slice 4, guard 1). Scans with `memchr`
+    /// (http.md R2).
+    fn next_line(&mut self, src: &[u8]) -> Result<(usize, usize, usize), HttpParseErr> {
+        // The buffer only ever grows in the read loop, so this never fires. Answering `Incomplete`
+        // rather than indexing is what makes the two subtractions below — `src.len() - self.pos`
+        // and `src[nl - 1]` — locally, obviously safe: from here on `self.pos <= from <= nl`, and
+        // `nl == self.pos` is rejected before `nl - 1` is formed (Gate 3: diagnose, never panic).
+        if src.len() < self.pos {
+            return Err(HttpParseErr::Incomplete);
+        }
+        let from = self.pos.saturating_add(self.scanned).min(src.len());
+        let hit = memchr::memchr(b'\n', &src[from..]);
+        #[cfg(test)]
+        {
+            // What `memchr` actually looked at: it stops at the first match.
+            self.searched += hit.map_or(src.len() - from, |rel| rel + 1) as u64;
+        }
+        match hit {
+            None => {
+                // Every byte of the line so far is `\n`-free; the next call starts past them.
+                self.scanned = src.len() - self.pos;
+                Err(HttpParseErr::Incomplete)
+            }
+            Some(rel) => {
+                let nl = from + rel;
+                // Strict CRLF: the byte before `\n` must be `\r` (and there must be one — an `\n` at
+                // `pos` is a bare LF). A lone `\n` is a request-smuggling vector some proxies accept
+                // and others don't; a strict server rejects it.
+                if nl == self.pos || src[nl - 1] != b'\r' {
+                    return Err(HttpParseErr::Invalid); // bare LF
+                }
+                Ok((self.pos, nl - 1 - self.pos, nl + 1))
+            }
+        }
+    }
+
+    /// Consume the line at `self.pos` and start the next one.
+    fn commit_line(&mut self, next: usize) {
+        self.pos = next;
+        self.scanned = 0;
     }
 }
 
@@ -14710,65 +14801,83 @@ fn http_next_line_strict(src: &[u8], pos: usize) -> Result<Option<(usize, usize,
 /// banner). Framing is Content-Length only (any `Transfer-Encoding` → `Invalid`). `Incomplete` while
 /// the request line / header block is not yet terminated; `Invalid` on any malformed line or guard
 /// violation. Scanning rides `memchr` (http.md R2).
+///
+/// This is [`HttpRequestHeadScan`] advanced once over a whole buffer — the spelling the guard suites
+/// use, since a guard is a property of the bytes and not of how they were split. **The server reads
+/// through the scan itself** (`http_read_request` keeps one across reads), so this one-shot form has
+/// no production caller; `http_head_scan_matches_one_shot_parse` is what ties the two together.
+#[cfg(test)]
 fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
+    HttpRequestHeadScan::new().advance(src)
+}
+
+impl HttpRequestHeadScan {
+/// Continue the parse over `src` — the same buffer as the previous call with more bytes appended.
+/// `Err(Incomplete)` leaves the scan resumable; `Err(Invalid)` is terminal (the caller closes the
+/// connection); `Ok` yields the head and spends the scan (its header list is moved out).
+fn advance(&mut self, src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
+    if self.spent {
+        return Err(HttpParseErr::Invalid); // see `spent` — fail closed, never a header-less `Ok`
+    }
     // --- request line: `METHOD SP target SP HTTP/1.x` (strict CRLF, guard 1) ---
-    let (rl_start, rl_len, mut pos) = match http_next_line_strict(src, 0) {
-        Ok(Some(x)) => x,
-        Ok(None) => return Err(HttpParseErr::Incomplete),
-        Err(()) => return Err(HttpParseErr::Invalid), // bare LF
+    if self.line.is_none() {
+        let (rl_start, rl_len, next) = self.next_line(src)?;
+        let line = &src[rl_start..rl_start + rl_len];
+        // Exactly three SP-separated tokens: METHOD, target, version. (The target is origin-form and
+        // percent-encodes spaces, so it never itself contains a raw SP — guard 5 re-checks that.)
+        let Some(sp1) = memchr::memchr(b' ', line) else {
+            return Err(HttpParseErr::Invalid);
+        };
+        let method = &line[..sp1];
+        let rest = &line[sp1 + 1..];
+        let Some(sp2) = memchr::memchr(b' ', rest) else {
+            return Err(HttpParseErr::Invalid);
+        };
+        let target = &rest[..sp2];
+        let version = &rest[sp2 + 1..];
+        // Guard 5: the method must be a bare RFC 7230 token; the target must carry no
+        // start-line-breaking byte (CR/LF/NUL/SP — the serialize-side inbound mirror).
+        if !http_is_token(method) {
+            return Err(HttpParseErr::Invalid);
+        }
+        if target.is_empty() || !http_request_line_field_clean(target) {
+            return Err(HttpParseErr::Invalid);
+        }
+        // Guard 4: origin-form targets only — a leading `/`. Absolute-form (`http://...`),
+        // authority-form (`host:port`, CONNECT), and asterisk-form (`*`, OPTIONS) are rejected in v1.
+        if target[0] != b'/' {
+            return Err(HttpParseErr::Invalid);
+        }
+        // Version: HTTP/1.1 or HTTP/1.0 only (v1 always closes the conn, so 1.0 vs 1.1 persistence is
+        // moot; any other/garbage version is malformed).
+        if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
+            return Err(HttpParseErr::Invalid);
+        }
+        self.line = Some(HttpRequestLineParts {
+            method_start: rl_start,
+            method_len: method.len(),
+            target_start: rl_start + sp1 + 1,
+            target_len: target.len(),
+            http11: version == b"HTTP/1.1",
+        });
+        self.commit_line(next);
+    }
+    // Set by the block above on this call, or by an earlier one, so the `else` is unreachable. It
+    // fails closed rather than panicking — an impossible state must never take a server down
+    // (Gate 3), and `Invalid` (close) is the safe verdict where `Incomplete` would spin the loop.
+    let Some(line) = self.line else {
+        return Err(HttpParseErr::Invalid);
     };
-    let line = &src[rl_start..rl_start + rl_len];
-    // Exactly three SP-separated tokens: METHOD, target, version. (The target is origin-form and
-    // percent-encodes spaces, so it never itself contains a raw SP — guard 5 re-checks that.)
-    let Some(sp1) = memchr::memchr(b' ', line) else {
-        return Err(HttpParseErr::Invalid);
-    };
-    let method = &line[..sp1];
-    let rest = &line[sp1 + 1..];
-    let Some(sp2) = memchr::memchr(b' ', rest) else {
-        return Err(HttpParseErr::Invalid);
-    };
-    let target = &rest[..sp2];
-    let version = &rest[sp2 + 1..];
-    // Guard 5: the method must be a bare RFC 7230 token; the target must carry no start-line-breaking
-    // byte (CR/LF/NUL/SP — the serialize-side inbound mirror).
-    if !http_is_token(method) {
-        return Err(HttpParseErr::Invalid);
-    }
-    if target.is_empty() || !http_request_line_field_clean(target) {
-        return Err(HttpParseErr::Invalid);
-    }
-    // Guard 4: origin-form targets only — a leading `/`. Absolute-form (`http://...`), authority-form
-    // (`host:port`, CONNECT), and asterisk-form (`*`, OPTIONS) are rejected in v1.
-    if target[0] != b'/' {
-        return Err(HttpParseErr::Invalid);
-    }
-    // Version: HTTP/1.1 or HTTP/1.0 only (v1 always closes the conn, so 1.0 vs 1.1 persistence is moot;
-    // any other/garbage version is malformed).
-    if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
-        return Err(HttpParseErr::Invalid);
-    }
-    let http11 = version == b"HTTP/1.1";
-    let method_start = rl_start;
-    let method_len = method.len();
-    let target_start = rl_start + sp1 + 1;
-    let target_len = target.len();
 
     // --- headers: strict-CRLF lines up to the first empty line ---
-    let mut headers: Vec<HttpHeaderSpan> = Vec::new();
-    let mut content_length: Option<usize> = None;
     let body_start;
     loop {
-        let (ls, ll, next) = match http_next_line_strict(src, pos) {
-            Ok(Some(x)) => x,
-            Ok(None) => return Err(HttpParseErr::Incomplete), // header block truncated — read more
-            Err(()) => return Err(HttpParseErr::Invalid),     // bare LF (guard 1)
-        };
+        let (ls, ll, next) = self.next_line(src)?;
         if ll == 0 {
             body_start = next; // the blank line terminates the header block
             break;
         }
-        if headers.len() >= HTTP_MAX_HEADERS {
+        if self.headers.len() >= HTTP_MAX_HEADERS {
             return Err(HttpParseErr::Invalid); // header flood
         }
         let hline = &src[ls..ls + ll];
@@ -14790,7 +14899,7 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
         let name = &src[name_start..name_start + name_len];
         let value = &src[value_start..value_start + value_len];
         // Guard 6: a header value must not carry a request-smuggling byte — NUL or a stray CR (a bare
-        // LF is already impossible: `http_next_line_strict` ends the line at the CRLF and rejects any
+        // LF is already impossible: `next_line` ends the line at the CRLF and rejects any
         // bare LF outright). `http_field_is_clean` rejects exactly CR/LF/NUL and permits SP/HTAB, so a
         // legitimate space-bearing value like `User-Agent: foo bar` is untouched.
         if !http_field_is_clean(value) {
@@ -14809,21 +14918,35 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
                 return Err(HttpParseErr::Invalid);
             };
             // A second Content-Length whose value conflicts with the first is a smuggling vector →
-            // reject; an identical repeat is harmless.
-            if content_length.is_some_and(|prev| prev != n) {
+            // reject; an identical repeat is harmless. (Accumulated across `advance` calls, so a
+            // conflicting pair split over two reads is caught exactly as a one-shot parse catches it.)
+            if self.content_length.is_some_and(|prev| prev != n) {
                 return Err(HttpParseErr::Invalid);
             }
-            content_length = Some(n);
+            self.content_length = Some(n);
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             // Guard 3: any inbound Transfer-Encoding → Invalid. This covers both TE-alone (v1 frames by
             // Content-Length only — no chunked de-framing) and the CL+TE smuggling pair (TE is rejected
             // whether or not a CL is also present).
             return Err(HttpParseErr::Invalid);
         }
-        headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
-        pos = next;
+        self.headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
+        self.commit_line(next);
     }
-    Ok(HttpRequestHead { method_start, method_len, target_start, target_len, headers, body_start, content_length, http11 })
+    // The blank line was reached: the scan is spent — its header list moves into the head, and any
+    // further `advance` is rejected (see `spent`).
+    self.spent = true;
+    Ok(HttpRequestHead {
+        method_start: line.method_start,
+        method_len: line.method_len,
+        target_start: line.target_start,
+        target_len: line.target_len,
+        headers: core::mem::take(&mut self.headers),
+        body_start,
+        content_length: self.content_length,
+        http11: line.http11,
+    })
+}
 }
 
 /// Does this request's header block ask for the connection to be closed? A `Connection` field whose
@@ -14939,10 +15062,15 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
     // so nothing here is zeroed or copied.
     let mut buf: Vec<u8> = Vec::with_capacity(HTTP_HEAD_CHUNK);
     let mut head: Option<HttpRequestHead> = None;
+    // The head parse RESUMES across reads instead of starting over. Re-parsing the whole buffer
+    // after every read is quadratic in how finely the client chooses to split its head — a 206 KiB
+    // head in 100-byte pieces measured 56 ms of this worker's CPU for one request. See
+    // [`HttpRequestHeadScan`].
+    let mut scan = HttpRequestHeadScan::new();
     loop {
         // Parse the head once (framing decided once), then just read to the framed length.
         if head.is_none() {
-            match http_parse_request_head(&buf) {
+            match scan.advance(&buf) {
                 Ok(h) => head = Some(h),
                 Err(HttpParseErr::Incomplete) => {
                     if buf.len() > HTTP_MAX_HEADER_BLOCK {
@@ -26031,6 +26159,168 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     fn http_parse_request_head_incomplete_prefix() {
         assert!(matches!(http_parse_request_head(b"GET / HTTP/1.1\r\nHost: x"), Err(HttpParseErr::Incomplete)));
         assert!(matches!(http_parse_request_head(b"GET /"), Err(HttpParseErr::Incomplete)));
+    }
+
+    /// **The resumable scan and the one-shot parse must agree on every byte and every guard.** The
+    /// server parses a head over as many `advance` calls as the client split it into; the guard
+    /// suites parse the same bytes in one. A differential oracle over both — the corpus fed whole,
+    /// then re-fed one byte at a time and at several chunk sizes — is what makes the guard suites'
+    /// coverage apply to the incremental path too, and it is the only thing standing between a
+    /// resumed cursor and a smuggling differential.
+    #[test]
+    fn http_head_scan_matches_one_shot_parse() {
+        let big_value = format!("X-Long: {}\r\n", "v".repeat(5000));
+        let flood = |n: usize| (0..n).map(|i| format!("X-{i}: v\r\n")).collect::<String>();
+        let corpus: Vec<Vec<u8>> = [
+            // Well-formed, in the shapes the server actually sees.
+            &b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"[..],
+            &b"GET / HTTP/1.0\r\n\r\n"[..],
+            &b"POST /submit HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"[..],
+            &b"GET /x HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nConnection: close\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello", // identical repeat: legal
+            b"GET / HTTP/1.1\r\nUser-Agent: foo bar\r\n\r\n", // SP-bearing value stays legal
+            // Valid-so-far prefixes — every one must stay `Incomplete`.
+            b"GET /",
+            b"GET / HTTP/1.1\r\n",
+            b"GET / HTTP/1.1\r\nHost: x",
+            b"GET / HTTP/1.1\r\nHost: x\r\n",
+            // Each smuggling guard, so the differential covers the rejections too.
+            b"GET / HTTP/1.1\nHost: h\r\n\r\n",                                   // bare LF (guard 1)
+            b"GET / HTTP/1.1\r\nHost: h\r\nFo@o: v\r\n\r\n",                       // non-token name (guard 2)
+            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",               // TE (guard 3)
+            b"GET http://x/ HTTP/1.1\r\n\r\n",                                     // absolute-form (guard 4)
+            b"GET / HTTP/1.1\r\nContent-Length: +3\r\n\r\n",                       // non-digit CL
+            b"GET / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n",   // conflicting CL
+            b"GET / HTTP/2.0\r\n\r\n",                                             // bad version
+            b"GET / HTTP/1.1\r\nHost\r\n\r\n",                                     // no colon
+            b"BAD\r\n\r\n",                                                        // no SP tokens
+            b"",
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .chain([
+            format!("GET / HTTP/1.1\r\n{big_value}\r\n").into_bytes(), // one line far bigger than a chunk
+            // The `HTTP_MAX_HEADERS` cliff itself, from both sides — the flood check accumulates
+            // across `advance` calls, so the boundary is where an incremental count could differ.
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS - 2)).into_bytes(),
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS)).into_bytes(),
+            format!("GET / HTTP/1.1\r\n{}\r\n", flood(HTTP_MAX_HEADERS + 1)).into_bytes(),
+        ])
+        .collect();
+
+        for raw in &corpus {
+            let one_shot = http_parse_request_head(raw);
+            // Feed it the way the read loop does: append a piece, advance, stop at the first verdict.
+            for piece in [1usize, 2, 3, 7, 64, 4096] {
+                let mut scan = HttpRequestHeadScan::new();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut got = Err(HttpParseErr::Incomplete);
+                for c in raw.chunks(piece.max(1)) {
+                    buf.extend_from_slice(c);
+                    got = scan.advance(&buf);
+                    if !matches!(got, Err(HttpParseErr::Incomplete)) {
+                        break;
+                    }
+                }
+                let what = format!("{:?} in {piece}-byte pieces", String::from_utf8_lossy(raw));
+                match (&one_shot, &got) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!((a.method_start, a.method_len), (b.method_start, b.method_len), "{what}: method");
+                        assert_eq!((a.target_start, a.target_len), (b.target_start, b.target_len), "{what}: target");
+                        assert_eq!(a.body_start, b.body_start, "{what}: body_start");
+                        assert_eq!(a.content_length, b.content_length, "{what}: content_length");
+                        assert_eq!(a.http11, b.http11, "{what}: http11");
+                        assert_eq!(a.headers.len(), b.headers.len(), "{what}: header count");
+                        for (x, y) in a.headers.iter().zip(&b.headers) {
+                            assert_eq!(
+                                (x.name_start, x.name_len, x.value_start, x.value_len),
+                                (y.name_start, y.name_len, y.value_start, y.value_len),
+                                "{what}: header span"
+                            );
+                        }
+                    }
+                    (Err(HttpParseErr::Invalid), Err(HttpParseErr::Invalid)) => {}
+                    (Err(HttpParseErr::Incomplete), Err(HttpParseErr::Incomplete)) => {}
+                    (a, b) => {
+                        let name = |r: &Result<HttpRequestHead, HttpParseErr>| match r {
+                            Ok(_) => "Ok",
+                            Err(HttpParseErr::Incomplete) => "Incomplete",
+                            Err(HttpParseErr::Invalid) => "Invalid",
+                        };
+                        panic!("{what}: one-shot {} vs incremental {}", name(a), name(b))
+                    }
+                }
+            }
+        }
+    }
+
+    /// **A spent scan is spent.** `advance` moves only the header list out of itself, so before the
+    /// `spent` latch a second call re-found the same blank line and returned a header-less `Ok`
+    /// **with the framing intact** — `content_length` still set, so a body would still be consumed,
+    /// while every header vanished. `http_request_wants_close` would then see an empty list and read
+    /// a `Connection: close` request as keep-alive. No caller does this today (`http_read_request`
+    /// builds a fresh scan per request and stops advancing once the head is `Some`), which is
+    /// exactly why it needs pinning: it is a trap laid for the next caller, not a live bug.
+    #[test]
+    fn http_head_scan_rejects_being_advanced_after_it_yielded() {
+        let raw = b"GET / HTTP/1.1\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc";
+        let mut scan = HttpRequestHeadScan::new();
+        let head = scan.advance(raw).expect("the head parses");
+        assert_eq!(head.headers.len(), 2);
+        assert!(
+            matches!(scan.advance(raw), Err(HttpParseErr::Invalid)),
+            "a spent scan fails closed — never a header-less Ok, and never Incomplete (which would spin the read loop)"
+        );
+    }
+
+    /// The scan is **O(head)**, not O(head × reads). Before it, `http_read_request` re-parsed the
+    /// whole buffer after every read, so a 206 KiB head delivered in 100-byte pieces cost ~56 ms of
+    /// one server worker's CPU — a slowloris lever needing no volume at all, and one that prefork
+    /// makes systemic (a handful of connections pins every worker). The assertion is the *shape*
+    /// rather than a wall-clock bound: the total bytes the `\n` search touches must stay within a
+    /// small constant of the head's own size, no matter how finely it is split.
+    #[test]
+    fn http_head_scan_is_linear_in_the_head_not_the_reads() {
+        let mut head = b"GET / HTTP/1.1\r\n".to_vec();
+        let pad = vec![b'v'; 206 * 1024 / 120];
+        for i in 0..120 {
+            head.extend_from_slice(format!("X-Pad-{i}: ").as_bytes());
+            head.extend_from_slice(&pad);
+            head.extend_from_slice(b"\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+
+        for piece in [100usize, 1024, 8192] {
+            let mut scan = HttpRequestHeadScan::new();
+            let mut buf: Vec<u8> = Vec::new();
+            let parsed = loop {
+                let Some(c) = head.get(buf.len()..(buf.len() + piece).min(head.len())) else {
+                    break None;
+                };
+                if c.is_empty() {
+                    break None;
+                }
+                buf.extend_from_slice(c);
+                let r = scan.advance(&buf);
+                if !matches!(r, Err(HttpParseErr::Incomplete)) {
+                    break r.ok();
+                }
+            };
+            let h = parsed.unwrap_or_else(|| panic!("piece={piece}: the head parses"));
+            assert_eq!(h.headers.len(), 120);
+            let scanned_bytes = scan.searched;
+            // Measured: exactly 1.00x the head at every piece size — the search never looks at a
+            // byte twice. 2x is the ceiling asserted, leaving room for an implementation that
+            // re-touches a line boundary. Re-parsing from zero is ~n²/piece: 2100x the head at 100
+            // bytes, which is the 56 ms this replaced (now 0.24 ms). **`piece=100` is the row that
+            // carries this assertion** — a regression to searching from `pos` costs only ~1.2x at
+            // 8192 and would slip under the bar there.
+            assert!(
+                scanned_bytes < 2 * head.len() as u64,
+                "piece={piece}: scanned {scanned_bytes} bytes for a {}-byte head",
+                head.len()
+            );
+        }
     }
 
     /// The PR-review hardening guards: full-token field-names (reject a mid-name non-tchar), clean
