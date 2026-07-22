@@ -8,8 +8,8 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP response header-span inline cut is implemented on the current
-branch: the common `Content-Type` + `Content-Length` pair now lives inside the opaque response
+_Last updated: 2026-07-22, **the HTTP response header-span inline cut is DONE (#611): the common
+`Content-Type` + `Content-Length` pair now lives inside the opaque response
 handle, while a third header spills losslessly to the existing heap representation. The common path
 falls 5 → 4 allocations/request and 352 → 272 fresh bytes with CPU flat at ~3.1 µs above the syscall
 floor.** Before that, **the HTTP idle-bucket reuse cut landed (#610):
@@ -113,7 +113,7 @@ READMEs):**
      or terminates; no-put paths remove it only if another request has not refilled it. This makes the
      common path **6 → 5 allocations** and fresh bytes **480 → 352 B/request**; CPU stays flat (three
      100k runs 3267/3181/3451 ns above the floor). The benchmark pins 5, and 200 KiB is 9 → 8.
-   - **DONE on the current branch — inline two response header spans:** the dominant response carries
+   - **DONE (#611) — inline two response header spans:** the dominant response carries
      exactly `Content-Type` + `Content-Length`, so those spans now live in the opaque response handle;
      a third header spills to a `Vec` with order, lookup, and the 128-header cap preserved. This makes
      the common path **5 → 4 allocations** and fresh bytes **352 → 272 B/request**; CPU stays flat
