@@ -65,6 +65,95 @@ fn template_expression_holes() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "sum=42 dbl=40 hi=world!\n");
 }
 
+/// An **owned `string`** interpolates exactly like a `str` — one string display, not two. This used
+/// to abort codegen ("Found StructValue { … `{ ptr, i64 }` } but expected the IntValue variant"):
+/// the hole was classified by a MIR catch-all that assumed every non-`str` scalar was an integer.
+/// The hole borrows the buffer, so the `string` is neither moved nor freed by the interpolation.
+#[test]
+fn template_hole_takes_an_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+fn main() -> Result<(), Error> {
+  mut b := builder()
+  b.write("hello")
+  s := b.to_string()
+  print(template "value={s}")
+  print(template "again={s} len={s.len()}")
+  print(s)
+  print(s.len())
+  return Ok(())
+}
+"#;
+    let out = build_and_run("template-owned-string", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "value=hello\nagain=hello len=5\nhello\n5\n"
+    );
+}
+
+/// The owned-`string` hole in every position it can occupy: a direct `print(template …)`, a bound
+/// `let s := template …`, `builder.write(template …)`, inside a `loop`, inside a `match` arm, and
+/// inside a function that afterwards moves — or returns — the very value it interpolated. The
+/// closing `print(h)` proves the original survived all of it (and the run proves it is freed once:
+/// a double free aborts).
+#[test]
+fn owned_string_interpolates_in_every_position() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+import std.encoding
+Mode { On, Off }
+fn take(s: string) -> i64 = s.len()
+fn interp_then_move(h: string) -> i64 {
+  t := template "moved={h}"
+  return t.len() + take(h)
+}
+fn interp_then_return(h: string) -> string {
+  print(template "kept={h}")
+  return h
+}
+fn main() -> Result<(), Error> {
+  h := encoding.hex_encode("ab".bytes())
+  print(template "direct={h}")
+  bound := template "let={h}"
+  print(bound)
+  mut b := builder()
+  b.write(template "w={h}")
+  print(b.to_string())
+  mut i := 0
+  mut n := 0
+  loop {
+    t := encoding.hex_encode("cd".bytes())
+    line := template "loop{i}={t}"
+    n = n + line.len()
+    i = i + 1
+    if i >= 3 { break }
+  }
+  print(n)
+  mode := Mode.On
+  m := match mode {
+    On => template "on={h}",
+    Off => template "off={h}",
+  }
+  print(m)
+  print(interp_then_move(encoding.hex_encode("ef".bytes())))
+  print(interp_then_return(encoding.hex_encode("01".bytes())))
+  print(h)
+  return Ok(())
+}
+"#;
+    let out = build_and_run("template-owned-string-positions", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "direct=6162\nlet=6162\nw=6162\n30\non=6162\n14\nkept=3031\n3031\n6162\n"
+    );
+}
+
 #[test]
 fn len_of_str_slice_array() {
     if !backend_available() {
