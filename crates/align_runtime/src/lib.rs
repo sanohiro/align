@@ -12899,6 +12899,16 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
 /// `Content-Length` is emitted iff the body is non-empty. Shared by the codec FFI and the Slice-2
 /// client (`http_client_perform`) — the ONE source of request wire bytes.
 fn http_serialize_core(r: HttpRequestView<'_>) -> Result<Vec<u8>, i32> {
+    let mut buf = Vec::new();
+    http_serialize_into(r, &mut buf)?;
+    Ok(buf)
+}
+
+/// Render `r` into a caller-owned request buffer, clearing any previous bytes first. The client
+/// lends this buffer from its bounded scratch pool; the standalone codec above starts with an empty
+/// `Vec` and therefore retains its one exactly-sized allocation contract.
+fn http_serialize_into(r: HttpRequestView<'_>, buf: &mut Vec<u8>) -> Result<(), i32> {
+    buf.clear();
     let Some((_scheme, authority, path)) = http_split_url(r.url) else {
         return Err(AL_INVALID); // non-http(s) scheme / empty authority / malformed
     };
@@ -12936,7 +12946,9 @@ fn http_serialize_core(r: HttpRequestView<'_>) -> Result<Vec<u8>, i32> {
         }
     }
     wire_len = wire_len.checked_add(2).and_then(|n| n.checked_add(r.body.len())).ok_or(AL_INVALID)?;
-    let mut buf: Vec<u8> = Vec::with_capacity(wire_len);
+    if buf.capacity() < wire_len {
+        buf.reserve_exact(wire_len);
+    }
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
     buf.extend_from_slice(path.as_bytes());
@@ -12952,13 +12964,13 @@ fn http_serialize_core(r: HttpRequestView<'_>) -> Result<Vec<u8>, i32> {
     }
     if !r.body.is_empty() {
         buf.extend_from_slice(HTTP_CONTENT_LENGTH_PREFIX);
-        http_push_decimal(&mut buf, r.body.len());
+        http_push_decimal(buf, r.body.len());
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(r.body);
     debug_assert_eq!(buf.len(), wire_len);
-    Ok(buf)
+    Ok(())
 }
 
 /// Free a `HttpRequest` (its method / url / headers / body). Null-safe.
@@ -13307,6 +13319,15 @@ const HTTP_MAX_HEADER_BLOCK: usize = 256 * 1024;
 /// Max idle keepalive conns retained per host:port (http.md R3/P5). Beyond this, a finished conn is
 /// closed rather than pooled — a bound on fd growth when many requests to one host finish at once.
 const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 8;
+
+/// Maximum number of serialized-request scratch buffers retained by one client. This covers the
+/// common `get_many` fan-out without letting completed bursts retain an unbounded number of buffers.
+const HTTP_CLIENT_REQUEST_BUFFER_POOL_MAX: usize = 8;
+
+/// A request larger than this is still sent normally, but its allocation is dropped afterward
+/// instead of being retained by the client. Together with the count cap above this bounds scratch
+/// retention to 512 KiB per client.
+const HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX: usize = 64 * 1024;
 
 /// A pooled conn idle longer than this is assumed dead (a server keepalive idle timeout is typically
 /// 5–75 s) and closed on *take* rather than reused — avoiding a doomed reuse+retry round-trip. This is
@@ -13827,12 +13848,12 @@ type HttpIdlePool = std::collections::HashMap<String, HttpHostPool>;
 /// `get`/`post`/`request` to the same authority with zero opt-in, and all closed on `Drop` (http.md
 /// P5 — no fd leak across pool churn).
 ///
-/// The map is behind a `Mutex` so a future `get_many` (task_group over shared workers) can share one
-/// client across threads; the v1 bound-receiver norm is single-threaded and never contends. A conn is
-/// only ever *idle* in the map between requests — an in-flight exchange holds it out, so the lock is
-/// held only for the O(1) take/put, never across blocking I/O.
+/// The pool state is behind `Mutex`es so `get_many` can share one client across workers. A conn is
+/// only ever *idle* in the map between requests, and each request scratch is exclusively leased, so
+/// locks are held only for O(1) take/put operations, never across serialization or blocking I/O.
 pub struct HttpClient {
     idle: std::sync::Mutex<HttpIdlePool>,
+    request_buffers: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 // SAFETY: `IdleConn` holds a raw `*mut c_void` (an OpenSSL `SSL*`), which makes it non-`Send`, so the
@@ -13845,6 +13866,18 @@ unsafe impl Send for HttpClient {}
 unsafe impl Sync for HttpClient {}
 
 impl HttpClient {
+    /// Lend one serialized-request scratch buffer. Each concurrent worker owns its buffer until the
+    /// returned lease drops, so no lock is held during serialization or socket I/O.
+    fn request_buffer(&self) -> HttpRequestBuffer<'_> {
+        let bytes = self
+            .request_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+            .unwrap_or_default();
+        HttpRequestBuffer { client: Some(self), bytes }
+    }
+
     /// Take a live idle conn for `(scheme, host, port)`, freeing any idle past
     /// [`HTTP_POOL_IDLE_TIMEOUT`] (assumed dead) as it scans. Returns the reusable conn's `(fd, ssl)`
     /// (`ssl` null for a plaintext bucket).
@@ -13942,10 +13975,51 @@ impl HttpClient {
     }
 }
 
+/// One request serializer's exclusive scratch buffer. Returning it in `Drop` covers every terminal
+/// path in `http_client_perform`, including validation, connect, TLS, socket, and retry failures.
+struct HttpRequestBuffer<'a> {
+    client: Option<&'a HttpClient>,
+    bytes: Vec<u8>,
+}
+
+impl HttpRequestBuffer<'_> {
+    fn unpooled() -> Self {
+        Self { client: None, bytes: Vec::new() }
+    }
+
+    fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for HttpRequestBuffer<'_> {
+    fn drop(&mut self) {
+        let Some(client) = self.client else {
+            return;
+        };
+        let mut bytes = core::mem::take(&mut self.bytes);
+        if bytes.capacity() > HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX {
+            return;
+        }
+        bytes.clear();
+        let mut pool = client.request_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < HTTP_CLIENT_REQUEST_BUFFER_POOL_MAX {
+            pool.push(bytes);
+        }
+    }
+}
+
 /// `http.client()` — allocate a client handle owning an empty keepalive pool.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
-    Box::into_raw(Box::new(HttpClient { idle: std::sync::Mutex::new(std::collections::HashMap::new()) }))
+    Box::into_raw(Box::new(HttpClient {
+        idle: std::sync::Mutex::new(std::collections::HashMap::new()),
+        request_buffers: std::sync::Mutex::new(Vec::new()),
+    }))
 }
 
 /// Free a `client`, closing every pooled idle conn (http.md P5 — no fd leak across pool churn).
@@ -14311,12 +14385,15 @@ unsafe fn http_client_perform(
     let Some((host, port)) = http_split_authority(authority, default_port) else {
         return AL_INVALID;
     };
-    // 3. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
-    let request_bytes = match http_serialize_core(req) {
-        Ok(b) => b,
-        Err(s) => return s,
-    };
     let client_ref: Option<&HttpClient> = unsafe { client.as_ref() };
+    // 3. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
+    // A real client lends bounded scratch storage; a null client keeps the no-pool behavior.
+    let mut request_bytes = client_ref
+        .map(HttpClient::request_buffer)
+        .unwrap_or_else(HttpRequestBuffer::unpooled);
+    if let Err(s) = http_serialize_into(req, request_bytes.bytes_mut()) {
+        return s;
+    }
     // Block SIGPIPE for the whole HTTPS exchange (handshake + I/O + teardown) on THIS thread — the TLS
     // BIO's `write(2)` carries no `MSG_NOSIGNAL` (http.md Slice 5). Plaintext keeps `MSG_NOSIGNAL` and
     // needs no guard; `.then(..)` leaves the guard `None` there (a no-op). Held for the function.
@@ -14352,7 +14429,7 @@ unsafe fn http_client_perform(
             }
         };
         // Exchange over this conn.
-        match unsafe { http_socket_exchange(&mut conn, &request_bytes) } {
+        match unsafe { http_socket_exchange(&mut conn, request_bytes.as_slice()) } {
             HttpExchange::Complete { response, reusable } => {
                 // The exchange has already parsed the head and moved both its spans and the socket
                 // receive buffer into `response`. Decide the conn's fate only after that successful
@@ -24371,6 +24448,72 @@ mod tests {
                 req.url
             );
         }
+    }
+
+    /// A client reuses request serialization storage across calls, returns it after validation
+    /// failures, and bounds both retained capacity and burst concurrency. Large requests remain
+    /// valid; only their completed scratch allocation is discarded.
+    #[test]
+    fn http_client_request_buffer_reuse_is_bounded_and_error_safe() {
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let get = HttpRequestView {
+            method: "GET",
+            url: "http://example.com/path",
+            headers: &[],
+            body: &[],
+        };
+
+        let (first_ptr, first_capacity) = {
+            let mut lease = cref.request_buffer();
+            http_serialize_into(get, lease.bytes_mut()).expect("representative GET serializes");
+            (lease.as_slice().as_ptr(), lease.bytes.capacity())
+        };
+        {
+            let pool = cref.request_buffers.lock().unwrap();
+            assert_eq!(pool.len(), 1, "the completed request returns one scratch buffer");
+            assert!(pool[0].is_empty(), "returned request bytes are cleared");
+            assert_eq!(pool[0].capacity(), first_capacity);
+        }
+        {
+            let mut lease = cref.request_buffer();
+            assert_eq!(lease.as_slice().as_ptr(), first_ptr, "the next request receives the same allocation");
+            let invalid = HttpRequestView { method: "BAD METHOD", ..get };
+            assert_eq!(http_serialize_into(invalid, lease.bytes_mut()), Err(AL_INVALID));
+        }
+        assert_eq!(
+            cref.request_buffers.lock().unwrap().len(),
+            1,
+            "a serializer error returns the scratch buffer through the lease"
+        );
+
+        let large_body = vec![b'x'; HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX];
+        {
+            let mut lease = cref.request_buffer();
+            let post = HttpRequestView {
+                method: "POST",
+                url: "http://example.com/upload",
+                headers: &[],
+                body: &large_body,
+            };
+            http_serialize_into(post, lease.bytes_mut()).expect("large request still serializes");
+            assert!(lease.bytes.capacity() > HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX);
+        }
+        assert!(
+            cref.request_buffers.lock().unwrap().is_empty(),
+            "oversized scratch is dropped instead of retained"
+        );
+
+        let leases: Vec<_> = (0..HTTP_CLIENT_REQUEST_BUFFER_POOL_MAX + 1)
+            .map(|_| cref.request_buffer())
+            .collect();
+        drop(leases);
+        assert_eq!(
+            cref.request_buffers.lock().unwrap().len(),
+            HTTP_CLIENT_REQUEST_BUFFER_POOL_MAX,
+            "a completed burst retains at most the configured number of buffers"
+        );
+        unsafe { align_rt_http_client_free(client) };
     }
 
     /// An unknown scheme, an empty authority, and a caller-supplied Host / Content-Length all fail

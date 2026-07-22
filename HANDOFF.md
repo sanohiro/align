@@ -8,7 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP borrowed-host pool lookup is DONE (#612):
+_Last updated: 2026-07-22, **the HTTP request serialization-buffer reuse is DONE (#613):
+each client lends bounded scratch storage to an in-flight serializer and gets it back by RAII on
+every success/error path; concurrent workers lease distinct buffers, and retention is capped at
+eight buffers of at most 64 KiB. The common path falls 3 → 2 allocations/request and 263 → 213 fresh
+bytes with CPU flat at ~3.1 µs above the syscall floor.** Before that, **the HTTP borrowed-host pool
+lookup landed (#612):
 authority splitting now returns a URL-backed host slice, and the pool is keyed by host first so
 `HashMap<String, ...>` can query it with `&str`; `(scheme, port)` remains the inner endpoint key.
 The common path falls 4 → 3 allocations/request and 272 → 263 fresh bytes with CPU flat at ~3.2 µs
@@ -128,6 +133,13 @@ READMEs):**
      is allocated only when a new host bucket is first created, not per request. This makes the common
      path **4 → 3 allocations** and fresh bytes **272 → 263 B/request**; CPU stays flat (three 100k
      runs 3054/3468/3229 ns above the floor). The benchmark pins 3; 200 KiB is 7 → 6.
+   - **DONE (#613) — reuse request serialization buffers:** each client lends one scratch `Vec` to
+     every in-flight serializer and takes it back through an RAII lease on success, validation,
+     connect, TLS, socket, and retry exits. `get_many` workers lease distinct buffers; retention is
+     bounded to eight buffers of at most 64 KiB, while larger requests still work and discard their
+     allocation afterward. The common path is **3 → 2 allocations** and **263 → 213 fresh
+     B/request**; CPU stays flat (three 100k runs 2995/3482/3118 ns, median 3118). The benchmark pins
+     2, a disabled-reuse mutation restores 3 and trips the gate, and 200 KiB is 6 → 5.
    - **DONE (#608) — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
      direct-read only a large framed body's middle into the response buffer, then leave the last
      32767 bytes to the original unclamped read. This keeps 13 B / 8 KiB flat, makes 200 KiB
@@ -146,10 +158,10 @@ READMEs):**
      `Incomplete`; an oversized head whose cap-crossing read also carried the final blank line
      returned `Ok` and bypassed it. The successful-head path now checks `body_start <= 256 KiB`,
      with a mutation-checked socket regression.
-   - The remaining three common-path allocations need representation/reuse work: request bytes
-     (~50 B), the response `Box` (120 B, including two inline spans), and response bytes (93 B here).
-     Builder calls also retain two `String`s per caller header. This is a bigger design question than
-     the redundant ownership hops removed above.
+   - The remaining two common-path allocations are the response `Box` (120 B, including two inline
+     spans) and response bytes (93 B here). Combining them needs a custom one-allocation response
+     representation and a careful opaque-handle/free boundary. Builder calls also retain two
+     `String`s per caller header.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
