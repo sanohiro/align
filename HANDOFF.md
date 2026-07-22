@@ -8,7 +8,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP idle-bucket reuse cut is implemented on the current branch:
+_Last updated: 2026-07-22, **the HTTP idle-bucket reuse cut is DONE (#610):
 the pool retains an emptied bucket only while its checked-out request is in flight, then either
 reuses it on put or removes it on every terminal no-put path. The common path falls 6 → 5
 allocations/request (480 → 352 fresh bytes) with CPU flat at ~3.3 µs above the syscall floor; a
@@ -103,7 +103,7 @@ READMEs):**
      the idle map instead of cloning its host `String` makes the common path **7 → 6 allocations**
      and fresh bytes **489 → 480 B/request**; CPU remains ~3.4 µs above the floor (three 100k runs
      3219/3418/3575 ns). The benchmark now pins 6; the 200 KiB arm likewise falls 10 → 9 allocations.
-   - **DONE on the current branch — retain the idle bucket across its in-flight request:** taking the
+   - **DONE (#610) — retain the idle bucket across its in-flight request:** taking the
      last conn used to remove and free the bucket's `Vec<IdleConn>`, then every successful put built
      the same 128-byte allocation again. The empty bucket now survives only until that request puts
      or terminates; no-put paths remove it only if another request has not refilled it. This makes the
