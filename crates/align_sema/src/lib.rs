@@ -1282,6 +1282,28 @@ pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
     }
 }
 
+/// Whether MIR backs this expression with a hidden owned `string` that its **own value only
+/// views** — the one shape [`may_need_synthetic_owner`] cannot describe, because there the owner's
+/// type IS the expression's type.
+///
+/// `template "…"` (and `json.encode`, which desugars to it) produces a `str`, but MIR allocates an
+/// owned `string` for the bytes at the node itself (`lower_expr`'s `Template` arm), unconditionally
+/// — not only in a borrowing position. That owner joins the innermost loop's per-iteration drops
+/// like any other hidden owner, so a `str` bound from a template dies on that loop's edges. Because
+/// the owner's type (`string`) differs from the value's (`str`), `needs_drop_flag(e.ty)` is false
+/// and `MoveCheck::temp_owner_root` cannot see it — which is exactly how a template escaped borrow
+/// liveness.
+///
+/// `in_arena` mirrors MIR's `b.arenas.is_empty()`: inside an `arena` the bytes are bump-allocated
+/// and no owner is minted, so the view lives to the arena's end. That lifetime is the escape
+/// check's business (`region_of(Template)` is `Region::arena(depth)` there), not this pass's.
+///
+/// Single-sourced so MIR and `MoveCheck` cannot disagree about which expressions own storage no
+/// name refers to.
+pub fn owns_hidden_string(e: &hir::Expr, in_arena: bool) -> bool {
+    !in_arena && matches!(e.kind, hir::ExprKind::Template(_))
+}
+
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
@@ -3598,6 +3620,7 @@ pub fn check_program_with_effects(
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
             loop_iter_drops: Vec::new(),
+            arena_depth: 0,
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -7820,6 +7843,22 @@ struct MoveCheck<'a> {
     /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
     /// generation exactly as the back-edge does.
     loop_iter_drops: Vec<Vec<LocalId>>,
+    /// How many `arena { … }` blocks enclose the expression being walked — the mirror of MIR's
+    /// `Builder::arenas` depth. Inside one, a `template`'s bytes are bump-allocated instead of
+    /// getting a hidden owned `string` freed on each loop edge ([`owns_hidden_string`]), so no
+    /// per-iteration root is recorded and an arena-scoped accumulator stays legal.
+    ///
+    /// **This counts `arena` ONLY — deliberately unlike the two identically-named region counters
+    /// in this file** (`Checker::arena_depth` and the escape walk's `depth`), which also count
+    /// `task_group { … }`. They are right for their own job: a `task_group`'s values live in a
+    /// region, so the escape check must see one. This one must mirror MIR's `Builder::arenas`
+    /// exactly, and MIR keeps task groups on a *separate* stack — `b.arenas` is untouched by
+    /// `task_group`, so a `template` inside one still gets its hidden owner and still dies on the
+    /// enclosing loop's edge. Counting `task_group` here would make this pass believe otherwise and
+    /// silently re-open the use-after-free (only the region rule would still catch that shape, and
+    /// only because a `task_group` value cannot escape its block at all). Pinned by
+    /// `borrow_liveness.rs::a_template_returned_out_of_a_task_group_in_a_loop_is_rejected`.
+    arena_depth: u32,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -7998,6 +8037,21 @@ impl<'a> MoveCheck<'a> {
         .then_some(BorrowRoot::IterTemp(depth))
     }
 
+    /// The hidden-owner root of a **`template`** — the one expression whose value views storage the
+    /// expression itself allocates, so [`Self::temp_owner_root`] (which keys on `needs_drop_flag`
+    /// of the value's own type, `str`) cannot see it. MIR's condition is single-sourced in
+    /// [`owns_hidden_string`]; the arena half comes from [`Self::arena_depth`], MIR's `arenas`
+    /// stack. Outside a `loop` the hidden owner lives to function exit, so nothing is recorded.
+    ///
+    /// Unlike `temp_owner_root` this root belongs in [`Self::borrow_sources`], not
+    /// [`Self::storage_roots`]: MIR mints the template's owner at the node **unconditionally**, not
+    /// only where the value is borrowed, so plainly assigning the produced `str` to a longer-lived
+    /// local (`acc = template "{acc}-{c}"`) already depends on it.
+    fn template_owner_root(&self, e: &Expr) -> Option<BorrowRoot> {
+        let depth = self.loop_iter_drops.len() as u32;
+        (depth > 0 && owns_hidden_string(e, self.arena_depth > 0)).then_some(BorrowRoot::IterTemp(depth))
+    }
+
     /// Storage roots a **borrower of `e`** depends on. A view local forwards its already-flattened
     /// provenance; a local that owns viewable storage also contributes itself. Caller-owned slice
     /// parameters intentionally produce no intra-frame root — this pass only invalidates storage
@@ -8045,6 +8099,10 @@ impl<'a> MoveCheck<'a> {
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
             ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
+            // Not a fail-open default: this DELEGATES to [`Self::borrow_sources`], whose own
+            // classification is exhaustive, so a new `ExprKind` is still forced to be classified —
+            // there, once, rather than in both places. The arms above exist only because a *place*
+            // contributes its own local's storage on top of that.
             _ => roots.extend(self.borrow_sources(e)),
         }
         roots
@@ -8052,6 +8110,10 @@ impl<'a> MoveCheck<'a> {
 
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
+    /// The classification in [`Self::borrow_sources_inner`] is **exhaustive** — no `_` tail —
+    /// because an expression that silently defaulted to "borrows nothing" is exactly how a
+    /// `template`'s hidden owner, a sum-type payload, and `rand.sample`'s copied views each escaped
+    /// intra-frame borrow liveness.
     /// Note: this returns the roots of views **contained in** `e`, and deliberately does *not* add
     /// `e`'s own hidden-owner temp root — that belongs to a borrow of `e` and is added by
     /// [`Self::storage_roots`]. A borrow-producing arm below therefore routes its borrowed operand
@@ -8094,12 +8156,13 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpCtxMethod { ctx: buffer }
             | ExprKind::HttpCtxPath { ctx: buffer }
             | ExprKind::HttpCtxBody { ctx: buffer }
-            // `ctx.headers()` carries the ctx's storage provenance (http.md item 10 ⑤): this tail is
-            // `_ => BorrowRoots::new()`, so a new node is NOT compiler-forced here even though the
-            // other passes are exhaustive — and without this arm `hs := ctx.headers()` records no
-            // borrow at all, so `ctx.respond(rb)` would not invalidate it and a later `hs.get(…)`
-            // would read a freed buffer. `hs.get(name)` reads its receiver's roots, which chains
-            // through `storage_roots`'s `_ => borrow_sources(e)` fallthrough for a temporary view.
+            // `ctx.headers()` carries the ctx's storage provenance (http.md item 10 ⑤): without this
+            // arm `hs := ctx.headers()` records no borrow at all, so `ctx.respond(rb)` would not
+            // invalidate it and a later `hs.get(…)` would read a freed buffer. `hs.get(name)` reads
+            // its receiver's roots, which chains through `storage_roots`'s `_ => borrow_sources(e)`
+            // fallthrough for a temporary view. (This match's tail is now exhaustive, so a new node
+            // IS compiler-forced here — but only to be *classified*, which is the whole point: the
+            // default it can no longer take silently is "borrows nothing".)
             | ExprKind::HttpCtxHeaders { ctx: buffer }
             | ExprKind::HttpCtxHeader { headers: buffer, .. }
             | ExprKind::ConnReader { conn: buffer }
@@ -8130,6 +8193,17 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 union(vec![source, init])
             }
+            // `r.sample(xs, k)` copies `k` element *values* out of `xs` into a fresh owned array —
+            // the same materializing shape as `.to_array()` above, so the result inherits `xs`'s
+            // already-flattened provenance. With `slice<str>` elements those values are `str`
+            // VIEWS, so the sampled array borrows exactly what `xs` borrows (`rng`/`k` are Copy).
+            ExprKind::RandSample { xs, .. } => self.borrow_sources(xs),
+            // `template "…"` / `json.encode(…)` produce a `str` view of a hidden owned `string` MIR
+            // allocates at the node (see [`Self::template_owner_root`]); inside a loop that owner is
+            // freed on every iteration edge. The *holes* contribute nothing: the template COPIES
+            // their rendered bytes into its own storage, so `t := template "{h}"` survives a later
+            // `h = …` — exactly the property that keeps it a real copy rather than a view of `h`.
+            ExprKind::Template(_) => self.template_owner_root(e).into_iter().collect(),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
@@ -8216,7 +8290,27 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
+            // A sum-type constructor is the exact sibling of `StructLit` / `Tuple` / `OptionSome`
+            // above: `C.Text(view)` stores the payload's `str` view in the enum, so the value
+            // borrows whatever its payload borrows. It was the one aggregate constructor the old
+            // `_` tail swallowed, which let `keep = C.Text(h.trim())` outlive `h`.
+            ExprKind::EnumValue { payload, .. } => {
+                let mut roots = BorrowRoots::new();
+                for p in payload {
+                    roots.extend(self.borrow_sources(p));
+                }
+                roots
+            }
             ExprKind::TupleIndex { recv, .. } => self.borrow_sources(recv),
+            // NOTE — the single place the sema/MIR arena mirror is **not lexical, on purpose.** This
+            // is a query, not the walk: it recurses into an `Arena` block's tail value WITHOUT
+            // entering [`Self::arena_depth`], so a `template` that is an arena block's value is
+            // judged at the *outer* depth and may get a root MIR did not mint. That errs STRICT
+            // (a root can only reject), the escape check rejects those programs anyway
+            // (`region_of(Arena-tail)` is arena-bound), and the walk itself — which is what
+            // `template_owner_root` normally reads — does enter the arena. Do not "fix" this by
+            // making the query maintain the depth unless it also handles being entered from inside
+            // an arena: that direction is the unsound one.
             ExprKind::Block(b)
             | ExprKind::Arena(b)
             | ExprKind::TaskGroup(b)
@@ -8242,7 +8336,88 @@ impl<'a> MoveCheck<'a> {
                 roots
             }
             ExprKind::ElseUnwrap { opt, fallback } => union(vec![opt, fallback]),
-            _ => BorrowRoots::new(),
+            // ── The remaining forms record NO provenance, and the list is EXHAUSTIVE: there is no
+            // `_` tail, so a new `ExprKind` cannot silently inherit "borrows nothing" — which is
+            // precisely how `template` above (and `EnumValue`, and `RandSample`) escaped this pass.
+            //
+            // (1) Borrow-CAPABLE results whose storage this frame neither owns nor can free early:
+            //   `Str`/`ConstArray` view read-only rodata; `FnValue` is a top-level function with no
+            //   environment (a capturing `Closure` is handled above); a `Reader`/`Writer` opened here
+            //   OWNS its fd (`c.reader()`/`.buffered()`, which do borrow, are handled above);
+            //   `fs.read_*_view` returns an mmap view bound to the enclosing arena, whose lifetime
+            //   the escape check enforces via `region_of`; a `loop`'s value is provably `Static`
+            //   (`check_break_escape` rejects breaking a view of local storage out of the loop);
+            //   `OptionNone` carries no payload.
+            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone | ExprKind::Loop { .. }
+            | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
+            | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::FsReadFileView { .. }
+            | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
+            // (2) Results whose type never borrows (scalars, `Unit`, freshly owned `string` /
+            //   `buffer` / `array<string>` / Move handles), so the `ty_may_borrow` gate at the top of
+            //   `borrow_sources` — this function's ONLY caller — has already returned an empty set
+            //   and these arms are unreachable in practice.
+            //
+            //   That justification is a *type* fact, and unlike the variant list it is not
+            //   compiler-forced: widening one of these results to a borrow-capable type would make
+            //   the arm silently answer "borrows nothing" — the same fail-open shape this match
+            //   exists to remove, one level up. The `debug_assert` below is the gate, so such a
+            //   change fails the test suite instead of passing it. It is silent today: the whole
+            //   driver suite and all 213 repo `.align` files reach none of these arms. Candidates
+            //   worth watching: `ArrayBuilderBuild` (sema restricts `array_builder<T>` elements to
+            //   Copy scalars and owned `string`), `RandShuffle` (in place, `Unit` — its sibling
+            //   `RandSample`, which does return views, is handled above), `EncodingDecode`, and the
+            //   `HttpResponseBuilder` family.
+            ExprKind::Unit | ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Char(..) | ExprKind::Bool(..)
+            | ExprKind::Unary { .. } | ExprKind::Cast(..) | ExprKind::Binary { .. } | ExprKind::IntArith { .. }
+            | ExprKind::MathOp { .. } | ExprKind::Wait | ExprKind::RawAlloc(..) | ExprKind::RawFree(..)
+            | ExprKind::RawLoad { .. } | ExprKind::RawStore { .. } | ExprKind::RawOffset { .. }
+            | ExprKind::HeapNew(..) | ExprKind::BoxGet(..) | ExprKind::BoxClone(..) | ExprKind::StrClone(..)
+            | ExprKind::StrPredicate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
+            | ExprKind::BuilderToString(..) | ExprKind::Select { .. } | ExprKind::VecSumWhere { .. }
+            | ExprKind::VecDot { .. } | ExprKind::VecMinMax { .. } | ExprKind::VecSum { .. }
+            | ExprKind::VecLoad { .. } | ExprKind::VecStore { .. } | ExprKind::VecLit { .. }
+            | ExprKind::ArraySum { .. } | ExprKind::ArrayCount { .. } | ExprKind::ArrayAnyAll { .. }
+            | ExprKind::ArrayMinMax { .. } | ExprKind::ArrayDot { .. } | ExprKind::ArrayMapInto { .. }
+            | ExprKind::Len(..) | ExprKind::JsonDecodeScalar { .. } | ExprKind::JsonDocKind { .. }
+            | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
+            | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
+            | ExprKind::WriterFlush { .. } | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
+            | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
+            | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
+            | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
+            | ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(..) | ExprKind::FsWriteFile { .. }
+            | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. } | ExprKind::FsReadDir { .. }
+            | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
+            | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
+            | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
+            | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
+            | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
+            | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
+            | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. } | ExprKind::EncodingEncode { .. }
+            | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
+            | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
+            | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
+            | ExprKind::CliCommand { .. } | ExprKind::CliFlag { .. } | ExprKind::CliParse { .. }
+            | ExprKind::CliGetBool { .. } | ExprKind::CliGetI64 { .. } | ExprKind::CliUsage { .. }
+            | ExprKind::HttpRequest { .. } | ExprKind::HttpHeader { .. } | ExprKind::HttpBody { .. }
+            | ExprKind::HttpParse { .. } | ExprKind::HttpRespStatus { .. } | ExprKind::HttpClient
+            | ExprKind::HttpClientGet { .. } | ExprKind::HttpClientPost { .. } | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
+            | ExprKind::HttpResponseBuilder { .. } | ExprKind::HttpRbHeader { .. } | ExprKind::HttpRbBody { .. }
+            | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
+            | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
+            | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
+            | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. } => {
+                debug_assert!(
+                    !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
+                    "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
+                     now may borrow — give it a real provenance arm instead of letting it report \
+                     'borrows nothing'",
+                    std::mem::discriminant(&e.kind)
+                );
+                BorrowRoots::new()
+            }
         }
     }
 
@@ -8329,7 +8504,12 @@ impl<'a> MoveCheck<'a> {
                 format!("use of invalidated borrow '{borrower}': its source '{source}' {why}")
             }
             (BorrowRoot::IterTemp(_), _) => format!(
-                "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; bind the owned value to a local declared outside the loop and borrow that instead"
+                // The three ways to give the storage a longer life are named because only one of
+                // them exists for every producer: a `template` has no owned value to bind (its
+                // owner is hidden), so "bind it outside the loop" alone was advice the user could
+                // not follow — `.clone()` into a `string`, or an enclosing `arena`, are its
+                // escapes. All three are generic; none is template-specific.
+                "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; give the storage a longer life — bind the owned value to a local declared outside the loop, `.clone()` it into one, or allocate it in an `arena` that encloses the loop — and borrow that instead"
             ),
         };
         self.diags.error(msg, span);
@@ -8904,7 +9084,15 @@ impl<'a> MoveCheck<'a> {
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            // `arena { … }` is transparent the same way, but the walk must know it is inside one:
+            // MIR mints no hidden `string` owner for a `template` there, so no per-iteration borrow
+            // root is recorded (see [`owns_hidden_string`] and `Self::template_owner_root`).
+            ExprKind::Arena(b) => {
+                self.arena_depth += 1;
+                self.block(b, moved, consuming, direct);
+                self.arena_depth -= 1;
+            }
             // A `loop` runs its body repeatedly, so a value moved out of an *enclosing* (pre-loop)
             // local by one iteration is already moved at the start of the next — a use there is a
             // use-after-move on the loop back-edge. Two passes make this sound (moves are monotonic;

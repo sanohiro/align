@@ -8,7 +8,22 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the owned-`string` template defect is FIXED (NEXT item 0, PR #620):
+_Last updated: 2026-07-23, **the `template` borrow-provenance hole is FIXED (NEXT item 0a, PR #621),
+and with it the fail-open tail that hid it.** A `str` bound from a `template` inside a `loop` used to
+escape the hidden owner's per-iteration free with `alignc check` reporting ok — `template` is the one
+expression whose value (`str`) views storage the expression itself allocates (a hidden owned
+`string`), so the existing hidden-owner machinery, which keys on the value's OWN type being
+droppable, was structurally blind to it. That fact is now single-sourced in sema's
+`owns_hidden_string(e, in_arena)`, which MIR's lowering calls too, and `MoveCheck` mirrors MIR's
+arena stack so the idiomatic **arena-scoped** accumulator stays legal. Closing the
+`_ => BorrowRoots::new()` tail that hid it — `borrow_sources_inner` is now exhaustive over all 216
+`ExprKind` variants, no wildcard — surfaced **two more holes of the same class, neither previously
+reported**: `EnumValue` (the one aggregate constructor that did not forward its payload's
+provenance, so `keep = C.Text(view)` outlived the view's source) and `RandSample` (a sampled
+`array<str>` holds views into its source). MIR is byte-identical over all 213 repo `.align` files;
+the whole workspace suite is green with zero pre-existing tests flipped. Details, mutation evidence,
+and the pinned legal-cases battery under NEXT item 0a. Before that, **the owned-`string` template
+defect was FIXED (NEXT item 0, PR #620):
 interpolating an owned `string` (`template "{h}"`) no longer panics codegen — it borrows the buffer
 to a `str` view (sema's existing `StrBorrow`, the same borrow `b.write(s)` / a `str` argument
 applies), so there is ONE string display and the `string` is neither moved nor freed by the
@@ -77,8 +92,11 @@ protocol-path perf work gained an instrument
 ~−468 ns; #604: the inbound head parse resumes across reads — a 206 KiB head in 100-byte pieces goes
 56 ms → 0.24 ms, closing a slowloris lever); before that, the
 scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
-the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
-accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
+the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). **That entry's closing
+claim — "the language no longer accepts a program it must reject" — was FALSE, and item 0a below
+records how: the drop-edge rule was right, but three expressions never handed it any provenance to
+act on. They are fixed now; the honest statement is that the classification those rules read is now
+compiler-forced to be complete, so the next such gap cannot be silent.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
 (#595) — the hard streaming ordering constraint is LIFTED** — plus **#597, `accept`'s
 transient-errno classification: a worker no longer dies over a dropped connection, a pending network
 error, or a full fd table (see "DONE 2026-07-21" under NEXT).** The three designed slices all landed in one arc:
@@ -242,8 +260,11 @@ READMEs):**
    `pkg-design/web.md` and compiles it against the real `apps/web/pkg/**`, so a doc example that
    stops compiling fails the suite. **§2b of the plan now has no `TODO` rows left.**
 
-**DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
-item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
+**DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** (**Correction,
+2026-07-23:** this entry claimed the last program-the-language-must-reject was closed. It was not —
+the *rule* was complete, but `borrow_sources_inner`'s fail-open `_` tail meant three expressions
+handed it no provenance at all, so the rule never fired for them. Fixed in the entry below, item
+0a.) `MoveCheck` invalidated a view
 when its source was moved or reassigned; it never noticed the source being **freed**, so a view
 assigned out of a loop body to a longer-lived local read the previous iteration's freed buffer. No
 `unsafe`, no std handle: `mut keep: str := "start"` + `loop { print(keep); owned := mk("hello"); keep
@@ -264,7 +285,7 @@ assigned out of a loop body to a longer-lived local read the previous iteration'
   edges; outside a loop the hidden owner lives to function exit, so nothing is recorded.
 - `BorrowState::invalid` records **how** each generation ended (`Consumed` / `Dropped`) so the
   diagnostic names the right cause, and names the source when it *has* a name (a temporary's message
-  instead says to bind the owned value to a local outside the loop); the join merges per root by
+  instead names the three ways to give the storage a longer life — see #621); the join merges per root by
   `Ord`, keeping it commutative for the fixpoint.
 - **Where the temp root is ATTRIBUTED matters as much as the condition.** MIR mints the hidden owner
   only where a fresh Move value is *borrowed* (`lower_borrowed_owned`); a value **moved** into a
@@ -757,18 +778,109 @@ Nothing there stands in for a missing compiler feature.
 
    **Two follow-ups this PR does NOT fix (separate work, both confirmed by that review):**
 
-   0a. **SOUNDNESS, pre-existing on `main`, HIGH — a `str` bound from a `template` escapes the
-   hidden owner's loop-edge free, and sema accepts it.** Repro: `mut acc: str := "start"` then
+   0a. **DONE (2026-07-23, PR #621) — SOUNDNESS, pre-existing on `main`, HIGH: a `str` bound from a
+   `template` escaped the hidden owner's loop-edge free, and sema accepted it — and the fail-open
+   tail that let it through hid TWO MORE of the same bug.** Repro: `mut acc: str := "start"` then
    `loop { acc = template "{acc}-{c}"; c = c + 1; if c >= 5 { break } }` then `print(acc)` →
-   `alignc check` reports ok, and the binary reads freed memory (the debug runtime trips
-   `ptr::copy_nonoverlapping` unaligned/overlap precondition; a release build prints garbage).
-   Cause: `borrow_sources_inner` (`crates/align_sema/src/lib.rs`, ~:8245) has **no
-   `ExprKind::Template` arm** and a fail-open `_ => BorrowRoots::new()` tail — the same fail-open
-   class this PR removed from MIR. `region_of(Template) = Frame` blocks a `return` but is not borrow
-   provenance, so the loop-edge invalidation never fires. The sibling shape (`keep = h` for a
-   loop-local owned `string` `h`) IS correctly rejected, so only the Template provenance edge is
-   missing. The owned-`string`-hole spelling of the same loop is reachable through this PR's new
-   capability and misbehaves identically.
+   `alignc check` reported ok, and the binary read freed memory (the debug runtime trips
+   `ptr::copy_nonoverlapping`'s precondition; a release build printed garbage).
+
+   **Confirmed cause, and the part the original write-up got only half right.** The reported half is
+   real: `borrow_sources_inner` had no `ExprKind::Template` arm and a fail-open
+   `_ => BorrowRoots::new()` tail. But adding an arm is not enough to *know* what to put in it, and
+   the deeper reason the machinery could not see a template is that **`template` is the one
+   expression whose value views storage the expression itself allocates**: MIR mints a hidden owned
+   `string` at the node (`b.arenas.is_empty().then(|| b.new_synthetic_owner(Ty::String))`) while the
+   value's own type is `str`. `MoveCheck::temp_owner_root` keys on `needs_drop_flag(e.ty)` — and a
+   `str` is not droppable — so the existing hidden-owner machinery was structurally blind to it. It
+   is also the one hidden owner minted **unconditionally** rather than only in a borrowing position,
+   which is why the root belongs in `borrow_sources` and not in `storage_roots` (where every other
+   temp root lives): plainly assigning the `str` already depends on it.
+
+   **Fix.** A shared `owns_hidden_string(e, in_arena)` in sema is now the single definition of that
+   fact, and MIR's Template lowering calls it — the same single-sourcing pattern as
+   `may_need_synthetic_owner` / `borrow_transparent_value` / `print_kind`. `MoveCheck` grew an
+   `arena_depth` counter mirroring MIR's `arenas` stack, because inside an `arena {}` no owner is
+   minted (the bytes are bump-allocated and outlive the loop) — **without that mirror the idiomatic
+   arena-scoped accumulator, which is the correct way to write the rejected loop, would have been
+   rejected too.** Diagnostics are the existing ones verbatim, no new wording.
+
+   **The sweep found two more holes, both fixed and pinned here.** ① **`ExprKind::EnumValue`** — the
+   exact sibling of `StructLit` / `Tuple` / `OptionSome`, all of which forward their operands'
+   provenance. It was the one aggregate constructor the `_` tail swallowed, so `keep = C.Text(h.trim())`
+   over a loop-local `string` `h` laundered the borrow and printed garbage. ② **`ExprKind::RandSample`**
+   — `r.sample(xs, k)` copies element *values* into a fresh owned array, and with `slice<str>` elements
+   those values are views; it is the `.to_array()` shape, which does forward, and it did not.
+   `json.encode` needed no rule of its own: it desugars to `Template`, so it inherits the fix (pinned).
+
+   **The tail itself is closed, not just its instances.** `borrow_sources_inner` is now **exhaustive
+   over all 216 `ExprKind` variants with no `_` arm** — verified compiler-forced by deleting one
+   variant from the list and getting `E0004 non-exhaustive patterns`. The 145 previously-swallowed
+   variants are classified in two commented groups: borrow-capable results whose storage this frame
+   cannot free early (rodata `Str`/`ConstArray`, an environment-less `FnValue`, a `Reader`/`Writer`
+   that owns its fd, `fs.read_*_view`'s arena-bound mmap, `OptionNone`, and `Loop` — whose value is
+   provably `Static` because `check_break_escape` rejects breaking a view of local storage out of a
+   loop, the reason `Loop` was NOT a fourth hole), and results whose type never borrows at all. Two
+   are called out as one-rule-change away from becoming holes: `ArrayBuilderBuild` (sema restricts
+   `array_builder<T>` to Copy scalars and owned `string`) and `RandShuffle`.
+
+   **Over-rejection risk, and how it was bounded.** The only widening is "a `str` from a template
+   inside a loop dies on that loop's edges", so the exposure is templates, sum-type constructors and
+   `rand.sample`. Bounded three ways: (a) `emit-mir` over all 213 repo `.align` files is
+   **byte-identical** to `main` and `alignc check` over the same corpus is verdict- and
+   message-identical; (b) a legal-cases battery of eight shapes is pinned as a test — same-iteration
+   bind-and-use, outside any loop, literal-only holes, `t := template "{h}"` followed by `h = …` (a
+   template is a real COPY of its holes, so this stays legal), written into a builder, an outer
+   loop's template read by an inner loop, an arena-scoped accumulator, an arena opened inside the
+   loop — plus outer-source controls for the enum and sample rows and a runtime assertion that the
+   arena accumulator really produces `start-0-1-2-3-4`; (c) the whole workspace suite is green
+   (2658 passed, 0 failed) with zero pre-existing tests flipped.
+
+   **Mutation evidence** (each reverted alone, rebuilt, run): dropping the `Template` arm fails
+   exactly the three template/`json.encode` rows; dropping the `EnumValue` arm fails exactly the
+   sum-type row; dropping the `RandSample` arm fails exactly the sample row; **dropping the arena
+   half of `owns_hidden_string` fails the legal-cases row**, which is what pins the guard against
+   over-rejection. Tests live with the other borrow-liveness rows in
+   `crates/align_driver/tests/borrow_liveness.rs` (45 there now).
+
+   **Blast radius, wider than the repro suggests.** Because the provenance is on the *node*, every
+   way of laundering that `str` onward inherits it — a tuple, `Some`/`Ok`, an `if`/`match` value, a
+   match-payload binding, a struct literal or a later field / tuple-index read of one,
+   destructuring, `else`-unwrap, a nested template, `.trim()`, slicing, `.bytes()`. All of those
+   checked ok on `main` and genuinely read freed heap (confirmed under `MALLOC_PERTURB_`). The
+   struct-field spelling is pinned as the representative row.
+
+   **The independent adversarial review found no soundness defect and no over-rejection** — it
+   independently reproduced the mutation matrix, the 213-file `emit-mir` byte-identity (200 of the
+   213 actually `check` ok, so it is real coverage), and the suite/clippy state. Four hardening items
+   came out of it and are in the PR: ① the ~130 "type never borrows" arms are justified by a *type*
+   fact that, unlike the variant list, is **not** compiler-forced — so they now end in a
+   `debug_assert!(!ty_may_borrow(…))`, converting "this result became borrow-capable" from silence
+   into a test failure. Verified free: replacing that arm's body with `assert!(false)` leaves the
+   whole workspace suite green (2660) and all 213 corpus files panic-free, i.e. those arms are
+   reached **zero** times today. ② `MoveCheck::arena_depth` counts `arena` **only**, deliberately
+   unlike the two identically-named region counters in the same file, which also count `task_group`
+   — MIR keeps task groups on a stack separate from `Builder::arenas`, so a template inside one
+   still dies on the enclosing loop's edge. A future "harmonization" would silently re-open the UAF
+   with only the region rule left to catch it, so the field documents the difference and a
+   `task_group` row pins the borrow half (mutation-checked: harmonizing the counters fails exactly
+   that row). ③ `borrow_sources` recurses through an `Arena` node without entering `arena_depth` —
+   the one place the sema/MIR mirror is not lexical; it errs strict and the escape check covers
+   those programs, and the arm now says so, so the next reader does not "fix" it in the unsound
+   direction. ④ the blast-radius row above.
+
+   **The diagnostic wording changed, once, for everyone.** The reused temporary message said only
+   "bind the owned value to a local declared outside the loop" — advice a template user cannot
+   follow, since its owner is hidden and there is no owned value to bind. It now names all three
+   generic escapes (bind outside the loop / `.clone()` into a local / allocate in an enclosing
+   `arena`); still one message per fact, still not template-specific.
+
+   **The reusable lesson**, and it is the same one twice: a `_` arm in a *classification* is a
+   soundness hole even when every arm above it is right, because the rules that consume it can only
+   act on what it reports. #620 removed one from MIR's display classification; this removes the one
+   in sema's borrow classification — and removing it is what surfaced `EnumValue` and `RandSample`,
+   neither of which anyone had reported. The review's item ① is the same lesson a level up: an
+   exhaustive *variant* list still leaves the *justification* fail-open unless something asserts it.
 
    0b. **Codegen panic hardening is asymmetric.** `gen_print`'s `into_int_value()`
    (`crates/align_codegen_llvm/src/lib.rs`, ~:8443) still aborts on `print(array)` / `print(struct)`

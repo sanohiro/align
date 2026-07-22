@@ -2153,6 +2153,51 @@ places — neutering `invalidate_iteration_drops`, `temp_owner_root`, the `IterT
 the `storage_roots` attribution, or the block-transparency arm, and *restoring* the attribution to
 `borrow_sources` — each fails exactly the corresponding tests and nothing else.
 
+**Borrow PROVENANCE was fail-open where borrow LIVENESS was complete — FIXED as #621 (2026-07-23).**
+The rule above was right and still never fired for three expressions, because `borrow_sources_inner`
+ended in `_ => BorrowRoots::new()`: a form it did not name reported "borrows nothing", and a rule can
+only invalidate what provenance reports. ① **`template`** is the one expression whose value views
+storage the expression *itself* allocates — MIR mints a hidden owned `string` at the node while the
+value's type is `str`, so `temp_owner_root`'s `needs_drop_flag(e.ty)` half was structurally blind to
+it, and `region_of(Template) = Frame` blocks a `return` but is not provenance. It is also the one
+hidden owner minted **unconditionally** rather than only in a borrowing position, so its root belongs
+in `borrow_sources`, not in `storage_roots` where every other temp root lives. The condition is now
+single-sourced in sema's `owns_hidden_string(e, in_arena)`, which MIR's lowering calls, and
+`MoveCheck` mirrors MIR's arena stack — inside an `arena {}` no owner is minted, and without that
+mirror the idiomatic arena-scoped accumulator (the correct way to write the rejected loop) would be
+rejected too. ② **`EnumValue`** — the one aggregate constructor that did not forward its payload's
+provenance, unlike `StructLit` / `Tuple` / `OptionSome`. ③ **`RandSample`** — a sampled `array<str>`
+holds views into its source, the `.to_array()` shape, which does forward. `json.encode` needed no
+rule: it desugars to `Template`. Neither ② nor ③ had been reported; **both fell out of closing the
+tail**, which is the argument for closing a fail-open classification rather than its instances.
+`borrow_sources_inner` is now exhaustive over all 216 `ExprKind` variants with no wildcard
+(compiler-forced: deleting one variant yields `E0004`), the 145 previously-swallowed variants
+classified in two documented groups. `Loop` is in the safe group *for a reason worth keeping*: its
+value is provably `Static` because `check_break_escape` rejects breaking a view of local storage out
+of a loop. `emit-mir` over all 213 repo `.align` files is byte-identical, and the legal cases —
+same-iteration use, literal-only holes, `t := template "{h}"` then `h = …` (a template COPIES its
+holes), builder writes, nested loops, arena scoping — are pinned as tests, each mutation-checked.
+
+The adversarial review added three hardening items worth recording as *rules*, not incidents.
+**(a) An exhaustive variant list still leaves its justification fail-open.** The ~130 arms justified
+by "this result type never borrows" are right today — verified by replacing that arm's body with
+`assert!(false)`: the whole suite stays green and no corpus file panics, so they are reached zero
+times — but nothing would go red if `ArrayBuilderBuild`'s element rule, `RandShuffle`,
+`EncodingDecode`, or an `HttpResponseBuilder` type later became borrow-capable. They now end in a
+`debug_assert!(!ty_may_borrow(…))`, which turns exactly that future change into a test failure.
+**(b) `MoveCheck::arena_depth` counts `arena` ONLY**, deliberately unlike the two identically-named
+region counters in the same file, which also count `task_group`: MIR keeps task groups on a stack
+separate from `Builder::arenas`, so a `template` inside one still gets its hidden owner and still
+dies on the enclosing loop's edge. Harmonizing the three counters would silently re-open the
+use-after-free with only the region rule left to catch it — pinned by a `task_group` row.
+**(c) `borrow_sources` recurses through an `Arena` node without entering that depth** — the single
+place the sema/MIR mirror is not lexical. It errs strict (a root can only reject) and the escape
+check rejects those programs anyway, so it is left as-is with a comment, because the "obvious fix"
+is the unsound direction. The temporary-root diagnostic also gained the two escapes it was missing:
+it used to say only "bind the owned value to a local declared outside the loop", which a `template`
+user cannot do (its owner is hidden), and now names `.clone()` and an enclosing `arena` as well —
+still one message per fact.
+
 **Wrapper-hidden local-slice escape through a function return — FIXED as #459, 2026-07-15 (found in the
 #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }`
 previously passed `check`: a frame-local array's slice escaped inside a `Result`/`Option` wrapper,
