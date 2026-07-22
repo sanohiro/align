@@ -1,0 +1,21 @@
+[package]
+name = "http-client-path-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the parent Align workspace, but depends on `align_runtime` as a RUST LIB (not the
+# cdylib): that is the whole point. A `#[global_allocator]` here then intercepts the runtime's own
+# `Vec`/`String` traffic on the client path, which a C-ABI boundary would hide. Same rationale, and
+# the same trap, as `bench/http_path` — see its Cargo.toml.
+[workspace]
+
+[dependencies]
+align_runtime = { path = "../../crates/align_runtime" }
+
+# **Deliberately the DEFAULT release profile**, not an LTO'd one: the compiler links the shipped
+# `libalign_runtime.a`, built with the workspace's default release settings and called across a real
+# C-ABI boundary. Turning LTO on here would let the harness inline runtime internals and read faster
+# than what ships — a systematic bias the size of the harness's own noise.
+[profile.release]
+opt-level = 3
