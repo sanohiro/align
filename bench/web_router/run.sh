@@ -45,7 +45,7 @@ cp align/kernel.align "$BUILD/kernel.align"
 # `emit-obj` writes its objects into the CURRENT directory, one per module — so emit from inside
 # the assembled tree and collect them there.
 ( cd "$BUILD" && "$ALIGNC" emit-obj kernel.align --target-cpu "$align_tgt" \
-    --export fw --export hw --export fw_big >/dev/null )
+    --export fw --export hw --export fw_scale_small --export fw_big >/dev/null )
 
 # One object per module; link them all. Built by globbing, not by parsing `ls`: `:` is the separator
 # build.rs splits on, so a TMPDIR containing one would otherwise produce silently bogus paths.

@@ -108,6 +108,11 @@ jobs:
       - name: Build release compiler
         run: cargo build --locked --release -p align_runtime -p align_driver
 
+      - name: Gate pkg.web router scaling
+        if: matrix.lint
+        shell: bash
+        run: WEB_ROUTER_GATE=1 N=100000 TRIALS=8 bench/web_router/run.sh baseline
+
       - name: Smoke test packaged command
         shell: bash
         run: |

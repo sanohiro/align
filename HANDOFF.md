@@ -8,7 +8,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP request serialization-buffer reuse is DONE (#613):
+_Last updated: 2026-07-22, **the web-router scaling row + CI gate is DONE (#614): identical runtime
+paths at identical depths now cross the 6- and 128-route tables at both sibling-chain ends, using
+median adjacent AB/BA ratios. Head is 1.05–1.13× and the honest remaining tail slope is 1.84–2.17×;
+Linux x86_64 baseline CI pins head <= 1.35× and every shape <= 2.75×.** Before that, **the HTTP
+request serialization-buffer reuse landed (#613):
 each client lends bounded scratch storage to an in-flight serializer and gets it back by RAII on
 every success/error path; concurrent workers lease distinct buffers, and retention is capped at
 eight buffers of at most 64 KiB. The common path falls 3 → 2 allocations/request and 263 → 213 fresh
@@ -162,8 +166,14 @@ READMEs):**
      spans) and response bytes (93 B here). Combining them needs a custom one-allocation response
      representation and a careful opaque-handle/free boundary. Builder calls also retain two
      `String`s per caller header.
-2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
-   middleware-lite (W6, designed only), multipart.
+2. **DONE (#614) — `bench/web_router` scaling row + CI gate:** the old row mixed a two-segment
+   small path with a three-segment large path and sampled unrelated chain positions. Both tables now
+   contain the exact same paths at the exact same depths; static/param are reported at chain head and
+   tail, and ratios are medians of adjacent counterbalanced pairs. Six native/baseline 200k runs put
+   head at 1.04–1.07× and worst at 2.08–2.11×; three CI-sized baseline runs put head at 1.09–1.13×
+   and worst at 2.15–2.17×. Linux x86_64 CI gates head <= 1.35× and every shape <= 2.75×. Restoring
+   the old depth mismatch reaches 1.59× and mutation-fails the head gate.
+3. Then: W4's remaining test matrices, middleware-lite (W6, designed only), multipart.
 
 **DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
 item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
@@ -518,14 +528,14 @@ BEFORE the bench is meaningful:**
   table, 708 ns/op over a 2-route one (release runtime, best of 7 × 200k dispatches) — cost scaling
   with the number of ROUTES, the signature of the per-call radix build. After hoisting the build
   out of the request path: **1319 → 57 ns/op**, a **23× drop**. Then the two O(table) scans inside
-  dispatch went too (per-node edge chains + a same-CLAIM route chain, both built once). **Item 3 is
-  still NOT met**, and `bench/web_router` reports the slope (6-route vs 128-route). **Read its
-  README before touching this** — a fourth adversarial round showed the row conflates three
-  variables: the small table's static path is 2 segments and the large one's is 3 (1.35× of pure
-  depth), and each shape lands at a different chain position; depth-matched and head-positioned the
-  128-route table is FLAT (49.9 vs 57.0 ns). It is a report, not a gate, until it measures the SAME
-  path against both tables and reports both chain ends — that redesign is the next step here. The
-  real remaining lever is the **per-node sibling scan**: a node's static edges are a linked chain
+  dispatch went too (per-node edge chains + a same-CLAIM route chain, both built once). **Item 3's
+  ideal is still NOT met**, but `bench/web_router` now reports and gates the slope honestly (6-route
+  vs 128-route). **Read its README before touching this.** The old row conflated three variables:
+  the small table's static path was 2 segments and the large one's 3, and each shape landed at a
+  different chain position. #614 replaced it with identical runtime paths at identical depths,
+  reporting static/param at both chain ends and using median adjacent AB/BA ratios. Head is
+  1.05–1.13×; the honest remaining lever is the **per-node sibling scan** at 1.84–2.17× on the tail:
+  a node's static edges are a linked chain
   with a string compare each, so a miss on a flat 128-route namespace still costs ~0.4 µs and the
   per-route slope is UNCHANGED by the chains (the chain IS the node's children). Wants a first-byte
   bucket or a sorted edge run. Second lever: the per-edge `Route` struct copy forced by

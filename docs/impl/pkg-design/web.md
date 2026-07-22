@@ -551,15 +551,15 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    **1319 → 57 ns/op**, a 23× drop. The two O(table) scans inside dispatch went with it (per-node
    edge chains + a same-pattern route chain, both built once). `dispatch_routes` /
    `method_not_allowed` / `allow_methods` take the built tree; `best_path_route` remains as the
-   build-and-match convenience for the differential tests. **Item 3 is still not met.** `bench/web_router` measures it (6-route vs 128-route
-   table) and reports a slope, not 1.00×. Three things about that number, all found by an
-   adversarial review of the bench itself: the remaining cost is the **per-node sibling scan** (a
-   node's static edges are a linked chain with a string compare each — a miss on a flat 128-route
-   namespace still costs ~0.4 µs and the per-route slope is unchanged by the chains, because the
-   chain IS the node's children); the published row **conflates path depth and chain position with
-   table size** (depth-matched and head-positioned, the 128-route table is flat — 49.9 ns vs
-   57.0 ns), so it is a report rather than a gate until it measures the same path against both
-   tables; and one ordering bug was caught there — appending edges at the chain HEAD made
+   build-and-match convenience for the differential tests. **Item 3's ideal 1.00× is still not
+   met, but its regression gate is now real.** `bench/web_router` compares identical runtime paths
+   at identical depths over 6- and 128-route tables, reporting static/param at both sibling-chain
+   ends plus miss. Adjacent AB/BA pairs feed a median paired ratio. Head stays 1.05–1.07×; the
+   remaining **per-node sibling scan** is isolated at 1.87–2.11× on the tail (a node's static edges
+   are a linked chain with a string compare each). Linux x86_64 baseline CI pins head <= 1.35× and
+   every shape <= 2.75×; the bounds reject the old depth-mismatched row, O(table) route scans, and
+   reversed registration order. One ordering bug was caught before this gate — appending edges at
+   the chain HEAD made
    first-registered routes the last candidate (`/r0` 23.7 → 394.5 ns/op), now fixed by appending at
    the tail. The remaining levers are a sibling index (first-byte bucket / sorted edge run) and the
    per-edge `Route` struct copy forced by `routes[i].pattern` being rejected through a
@@ -600,8 +600,8 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   dispatch is 35 ns, so the router is **0.9% of Align's own path** and its remaining levers are
   worth ~0.1%. The real budget is the 4.1 µs — candidates inside it: the `poll` syscall keep-alive
   adds per request, and sharing one buffer between the parse and the response write.
-  `bench/web_router` remains a report (its scaling row conflates depth and chain position); making
-  it a gate is recorded there.
+  `bench/web_router`'s honest same-path scaling row and CI ceilings now pin the current sibling-scan
+  bound; the ideal 1.00× still wants a sibling index.
 - **W6 — middleware-lite + streaming** — both DESIGNED (sections above, 2026-07-21). Streaming is
   **WIRED, pinned E2E, and no longer production-gated**: concurrent serve SHIPPED 2026-07-21 (the
   prefork section above), so a stream costs one worker instead of the whole server.
