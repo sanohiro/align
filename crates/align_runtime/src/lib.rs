@@ -12623,6 +12623,9 @@ pub unsafe extern "C" fn align_rt_cli_parsed_free(parsed: *mut CliParsed) {
 /// The response header-count cap: a response with more than this many headers is rejected
 /// (`AL_INVALID`) — a bound against a pathological / adversarial response header flood.
 const HTTP_MAX_HEADERS: usize = 128;
+/// Header spans kept inside the response handle before spilling to a heap Vec. Two covers the
+/// dominant `Content-Type` + `Content-Length` response without bloating the opaque handle further.
+const HTTP_INLINE_RESPONSE_HEADERS: usize = 2;
 /// The response body-size cap (1 GiB): a `Content-Length` above this is rejected (`AL_INVALID`) —
 /// a sanity bound (a real body is not handed to the language as a single 1 GiB+ view in v1).
 const HTTP_MAX_BODY: usize = 1 << 30;
@@ -12655,11 +12658,57 @@ impl HttpRequest {
 
 /// One parsed response header, stored as byte offsets into [`HttpResponse::buf`] — NO owned
 /// `String` (http.md R1). `name`/`value` are already OWS-trimmed at parse time.
+#[derive(Clone, Copy, Default)]
 struct HttpHeaderSpan {
     name_start: usize,
     name_len: usize,
     value_start: usize,
     value_len: usize,
+}
+
+/// The common response carries two headers (`Content-Type` + `Content-Length`). Keep those spans
+/// inside the response handle; only a third header spills to a `Vec`. This removes one allocation
+/// from the common client/parse path without lowering [`HTTP_MAX_HEADERS`] or changing lookup order.
+enum HttpHeaderSpans {
+    Inline { spans: [HttpHeaderSpan; HTTP_INLINE_RESPONSE_HEADERS], len: u8 },
+    Heap(Vec<HttpHeaderSpan>),
+}
+
+impl HttpHeaderSpans {
+    fn new() -> Self {
+        Self::Inline { spans: [HttpHeaderSpan::default(); HTTP_INLINE_RESPONSE_HEADERS], len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len as usize,
+            Self::Heap(spans) => spans.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[HttpHeaderSpan] {
+        match self {
+            Self::Inline { spans, len } => &spans[..*len as usize],
+            Self::Heap(spans) => spans,
+        }
+    }
+
+    fn push(&mut self, span: HttpHeaderSpan) {
+        match self {
+            Self::Inline { spans, len } if (*len as usize) < spans.len() => {
+                spans[*len as usize] = span;
+                *len += 1;
+            }
+            Self::Inline { spans, len } => {
+                debug_assert_eq!(*len as usize, spans.len());
+                let mut heap = Vec::with_capacity(spans.len() * 2);
+                heap.extend_from_slice(spans);
+                heap.push(span);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(spans) => spans.push(span),
+        }
+    }
 }
 
 /// A parsed HTTP/1.1 response — ONE owned raw byte buffer plus an offset table (http.md R1). The
@@ -12669,7 +12718,7 @@ struct HttpHeaderSpan {
 pub struct HttpResponse {
     buf: Vec<u8>,
     status: i64,
-    headers: Vec<HttpHeaderSpan>,
+    headers: HttpHeaderSpans,
     body_start: usize,
     body_len: usize,
 }
@@ -12972,7 +13021,7 @@ enum HttpParseErr {
 /// (streaming completeness, no body copy per iteration).
 struct HttpHead {
     status: i64,
-    headers: Vec<HttpHeaderSpan>,
+    headers: HttpHeaderSpans,
     /// Offset in `src` just past the blank line terminating the header block (the body start).
     body_start: usize,
     /// The declared `Content-Length`, or `None` for read-to-close framing (no CL, not chunked).
@@ -13015,7 +13064,7 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
     };
 
     // --- headers: lines up to the first empty line ---
-    let mut headers: Vec<HttpHeaderSpan> = Vec::new();
+    let mut headers = HttpHeaderSpans::new();
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     let body_start;
@@ -13179,7 +13228,7 @@ pub unsafe extern "C" fn align_rt_http_resp_header(
     }
     let r = unsafe { &*resp };
     let want = unsafe { bytes_view(name_ptr, name_len) };
-    for h in &r.headers {
+    for h in r.headers.as_slice() {
         let name = &r.buf[h.name_start..h.name_start + h.name_len];
         if name.eq_ignore_ascii_case(want) {
             let vptr = unsafe { r.buf.as_ptr().add(h.value_start) };
@@ -13904,7 +13953,7 @@ pub unsafe extern "C" fn align_rt_http_client_free(c: *mut HttpClient) {
 /// comma-separated token list; a `close` token anywhere forces close (wins over a later `keep-alive`).
 fn http_head_keep_alive(head: &HttpHead, buf: &[u8]) -> bool {
     let mut keep = head.http_1_1;
-    for h in &head.headers {
+    for h in head.headers.as_slice() {
         let name = &buf[h.name_start..h.name_start + h.name_len];
         if !name.eq_ignore_ascii_case(b"connection") {
             continue;
@@ -24413,6 +24462,28 @@ mod tests {
         let base = unsafe { &*out }.buf.as_ptr() as usize;
         let end = base + unsafe { &*out }.buf.len();
         assert!((body.ptr as usize) >= base && (body.ptr as usize) < end, "body must view the owned buffer");
+        let response = unsafe { &*out };
+        assert!(matches!(&response.headers, HttpHeaderSpans::Inline { len: 2, .. }), "the common two-header response stays inline");
+        unsafe { align_rt_http_resp_free(out) };
+    }
+
+    /// A third response header spills the inline span table to a heap Vec without changing order or
+    /// lookup. This pins the non-common representation path; the header-flood test below pins its cap.
+    #[test]
+    fn http_parse_third_header_spills_and_preserves_lookup() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-First: one\r\nX-Second: two\r\nContent-Length: 1\r\n\r\nx";
+        let mut out: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_parse(raw.as_ptr(), raw.len() as i64, &mut out) }, 0);
+        let response = unsafe { &*out };
+        assert!(matches!(&response.headers, HttpHeaderSpans::Heap(spans) if spans.len() == 3));
+
+        for (name, expected) in [(b"x-first".as_slice(), b"one".as_slice()), (b"x-second", b"two")] {
+            let mut value = AlignStr { ptr: core::ptr::null(), len: 0 };
+            assert_eq!(unsafe { align_rt_http_resp_header(out, name.as_ptr(), name.len() as i64, &mut value) }, 1);
+            assert_eq!(unsafe { safe_slice(value.ptr, value.len) }, expected);
+        }
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"x");
         unsafe { align_rt_http_resp_free(out) };
     }
 

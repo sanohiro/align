@@ -334,14 +334,14 @@ fn main() {
     // The zero that proves neither peer thread is polluting the Align count: the floor arm runs the
     // identical peer and must allocate nothing at all.
     assert_eq!(fa, 0.0, "the floor allocated — the counter is seeing the peer thread");
-    // Five is the common 13-byte response's ceiling. Larger BODY= probes intentionally exercise
+    // Four is the common 13-byte response's ceiling. Larger BODY= probes intentionally exercise
     // buffer growth, so their allocation count is data for the size comparison rather than this
     // small-response regression gate.
     if default_response {
         for sample in &sa {
             assert!(
-                sample.allocs <= 5.0,
-                "http.get allocation regression: {:.2}/request exceeds the pinned 5-allocation ceiling",
+                sample.allocs <= 4.0,
+                "http.get allocation regression: {:.2}/request exceeds the pinned 4-allocation ceiling",
                 sample.allocs
             );
         }

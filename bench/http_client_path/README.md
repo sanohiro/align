@@ -15,10 +15,10 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        30974           599
-  align                5.00         352.0            0.0        34241           536
+  floor                0.00           0.0            0.0        30828           582
+  align                4.00         272.0            0.0        33942           275
 
-  http.get's CPU work above the floor:  3267 ns/req, 5.00 allocations
+  http.get's CPU work above the floor:  3113 ns/req, 4.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -111,6 +111,13 @@ level. A temporary exact-size histogram made the cut explicit: the prior six all
 and two 128 B blocks (header spans and the idle bucket); this removes the bucket block. The harness
 pins 5; the 200 KiB probe is 9 → 8 allocations.
 
+The remaining 128-byte block was the header-span `Vec`. The dominant response has exactly two
+headers, so those spans now live inside the opaque response handle; a third header spills to a heap
+Vec with insertion order, lookup, and the 128-header cap unchanged. The handle grows 72 → 120 B,
+but replaces the old 72 B handle + 128 B span allocation: the common path is **5 → 4 allocations**
+and **352 → 272 fresh B/request**. Three 100k-request runs measured **3113 / 3363 / 3146 ns** above
+the floor, CPU-neutral at this noise level. The harness pins 4; the 200 KiB probe is 8 → 7.
+
 ### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
 The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
@@ -173,10 +180,10 @@ Runtime-only stash/rebuild A/B, with the benchmark change retained in both arms:
 | 200 KiB, pair 3 | 5227 | 3390 | −1837 ns |
 
 The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. In that runtime-only #608 A/B,
-allocation events stayed 10 because both arms predated the pool-key and idle-bucket cuts; the current
-total is 8.
+allocation events stayed 10 because both arms predated the pool-key, idle-bucket, and inline-header
+cuts; the current total is 7.
 Geometric growth capped at the framed total reduces retained growth from **229376 → 172116
-bytes/request**. The benchmark's 5-allocation regression ceiling now applies only to its default
+bytes/request**. The benchmark's 4-allocation regression ceiling now applies only to its default
 13-byte response; `BODY=...` is intentionally a buffer-growth probe and must print those counts
 rather than aborting before it can report them.
 
