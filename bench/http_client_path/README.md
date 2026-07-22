@@ -15,10 +15,10 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        32817           386
-  align                7.00         489.0            0.0        36245           748
+  floor                0.00           0.0            0.0        30998           340
+  align                6.00         480.0            0.0        34416           388
 
-  http.get's CPU work above the floor:  3429 ns/req, 7.00 allocations
+  http.get's CPU work above the floor:  3418 ns/req, 6.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -94,6 +94,12 @@ exactly 7 in every block. The harness pins 7 as a ceiling; allocation regression
 quietly becoming a new printed baseline. Further cuts now require representation or reuse work
 (header spans, response handle and pool bookkeeping), not another obvious redundant ownership hop.
 
+One pool-bookkeeping ownership hop was still redundant: after a completed exchange the request's
+owned `(scheme, host, port)` key is dead, but returning the conn cloned its host `String` into the
+idle map. Moving that key instead makes the common path **7 → 6 allocations** (fresh bytes 489 →
+480); three 100k-request runs measured **3219 / 3418 / 3575 ns** above the floor, CPU-neutral at this
+noise level. The harness now pins 6. The same cut makes the 200 KiB probe 10 → 9 allocations.
+
 ### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
 The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
@@ -155,9 +161,10 @@ Runtime-only stash/rebuild A/B, with the benchmark change retained in both arms:
 | 200 KiB, pair 2 | 6330 | 3693 | −2637 ns |
 | 200 KiB, pair 3 | 5227 | 3390 | −1837 ns |
 
-The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. Allocation events stay 10,
-but geometric growth capped at the framed total reduces retained growth from **229376 → 172116
-bytes/request**. The benchmark's 7-allocation regression ceiling now applies only to its default
+The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. In that runtime-only #608 A/B,
+allocation events stayed 10 because both arms predated the pool-key move; the current total is 9.
+Geometric growth capped at the framed total reduces retained growth from **229376 → 172116
+bytes/request**. The benchmark's 6-allocation regression ceiling now applies only to its default
 13-byte response; `BODY=...` is intentionally a buffer-growth probe and must print those counts
 rather than aborting before it can report them.
 
