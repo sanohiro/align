@@ -8,7 +8,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP pool-key ownership cut is implemented on the current branch:
+_Last updated: 2026-07-22, **the HTTP pool-key ownership cut is DONE (#609):
 the completed request moves its now-dead `(scheme, host, port)` key back into the idle map instead of
 cloning the host `String`, taking the common path 7 → 6 allocations/request (489 → 480 fresh bytes)
 with CPU flat at ~3.4 µs above the syscall floor.** Before that, **the body-size-aware HTTP client
@@ -93,7 +93,7 @@ READMEs):**
      known: a 2 KiB start costs an extra `read` syscall for every response past 2 KiB (**+1200 ns at
      8 KiB, 3/3**) and starting bigger is not available because that buffer IS the returned response
      body. Full numbers + the two lessons in `bench/http_client_path/README.md`.
-   - **DONE on the current branch — move the completed request's pool key:** the success path always
+   - **DONE (#609) — move the completed request's pool key:** the success path always
      returns, so its owned `(scheme, host, port)` key is dead after returning the conn. Moving it into
      the idle map instead of cloning its host `String` makes the common path **7 → 6 allocations**
      and fresh bytes **489 → 480 B/request**; CPU remains ~3.4 µs above the floor (three 100k runs
