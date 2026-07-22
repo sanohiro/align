@@ -8,7 +8,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP borrowed-host pool lookup is implemented on the current branch:
+_Last updated: 2026-07-22, **the HTTP borrowed-host pool lookup is DONE (#612):
 authority splitting now returns a URL-backed host slice, and the pool is keyed by host first so
 `HashMap<String, ...>` can query it with `&str`; `(scheme, port)` remains the inner endpoint key.
 The common path falls 4 → 3 allocations/request and 272 → 263 fresh bytes with CPU flat at ~3.2 µs
@@ -122,7 +122,7 @@ READMEs):**
      a third header spills to a `Vec` with order, lookup, and the 128-header cap preserved. This makes
      the common path **5 → 4 allocations** and fresh bytes **352 → 272 B/request**; CPU stays flat
      (three 100k runs 3113/3363/3146 ns above the floor). The benchmark pins 4; 200 KiB is 8 → 7.
-   - **DONE on the current branch — borrow host through pool lookup:** `http_split_authority` now
+   - **DONE (#612) — borrow host through pool lookup:** `http_split_authority` now
      returns a host slice into the URL, and the idle pool's outer `String` host key supports borrowed
      lookup; `(scheme, port)` is an inner map so schemes and ports still cannot cross. Host ownership
      is allocated only when a new host bucket is first created, not per request. This makes the common
