@@ -966,3 +966,360 @@ fn main() -> i32 {
 ";
     assert!(!check_errs("borrow-if-over-outer-views", via_views));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The hidden owner a `template` mints for ITSELF, and the two siblings the same fail-open tail
+// swallowed. All three were accepted on `main` and read freed memory at runtime.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// `template "…"` is the one expression whose value (`str`) views storage the expression itself
+/// allocates: MIR mints a hidden owned `string` at the node, unconditionally, and that owner joins
+/// the innermost loop's per-iteration drops. `MoveCheck::temp_owner_root` could not see it — it
+/// keys on `needs_drop_flag` of the value's OWN type, and a `str` is not droppable — and
+/// `borrow_sources_inner` had no `Template` arm, so the fail-open `_` tail gave the result no
+/// provenance at all. `region_of(Template) = Frame` blocks a `return` but is not borrow provenance,
+/// so the loop-edge invalidation never fired and this checked ok while reading freed heap.
+#[test]
+fn a_str_accumulated_by_a_template_across_loop_iterations_is_rejected() {
+    let src = "\
+fn main() -> i32 {
+  mut acc: str := \"start\"
+  mut c := 0
+  loop {
+    acc = template \"{acc}-{c}\"
+    c = c + 1
+    if c >= 5 { break }
+  }
+  print(acc)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-template-accumulator", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'acc'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "a `str` bound from a `template` must die on the loop edge that frees the template's \
+         hidden owner, with the existing temporary wording: {diags}"
+    );
+}
+
+/// The owned-`string`-hole spelling of the same loop — reachable through #620's new capability
+/// (interpolating an owned `string` borrows it to a `str`). The hole is the template's own hidden
+/// owner, not `h`, so the message is the same temporary one.
+#[test]
+fn a_template_over_an_owned_string_hole_escaping_the_loop_is_rejected() {
+    let src = "\
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut c := 0
+  loop {
+    h := \"hello\".clone()
+    keep = template \"v={h}\"
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-template-owned-hole", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "the owned-`string`-hole spelling is the same hidden-owner hole: {diags}"
+    );
+}
+
+/// `json.encode` desugars to `ExprKind::Template`, so it inherits the fix rather than needing its
+/// own rule — the reason the provenance edge belongs on the node and not on the surface syntax.
+#[test]
+fn json_encode_escaping_a_loop_is_rejected_like_its_template_desugaring() {
+    let src = "\
+import core.json
+P { a: i64 }
+fn main() -> i32 {
+  mut keep: str := \"start\"
+  mut c := 0
+  loop {
+    p := P { a: c }
+    keep = json.encode(p)
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep)
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-json-encode-loop", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("it borrows a temporary value created inside the loop"),
+        "`json.encode` is a `template`, so it must be rejected identically: {diags}"
+    );
+}
+
+/// **The controls.** A template's storage dies at the iteration edge, and nowhere else — every one
+/// of these was legal before the fix and must stay legal. In particular the last two: MIR mints NO
+/// hidden owner inside an `arena {}` (the bytes are bump-allocated and live to the arena's end), so
+/// `MoveCheck` mirrors that with its own arena depth. Without that mirror an arena-scoped
+/// accumulator — the idiomatic way to write the rejected loop above — would have been rejected too.
+#[test]
+fn a_template_that_does_not_outlive_its_iteration_stays_legal() {
+    let cases: [(&str, &str); 8] = [
+        (
+            "same-iteration bind and use",
+            "\
+fn main() -> i32 {
+  mut c := 0
+  loop {
+    s := template \"iter {c}\"
+    print(s)
+    c = c + 1
+    if c >= 3 { break }
+  }
+  return 0
+}
+",
+        ),
+        (
+            "outside any loop",
+            "\
+fn main() -> i32 {
+  c := 7
+  s := template \"n={c}\"
+  print(s)
+  return 0
+}
+",
+        ),
+        (
+            "literal-only holes",
+            "\
+fn main() -> i32 {
+  mut c := 0
+  loop {
+    s := template \"no holes at all\"
+    print(s)
+    c = c + 1
+    if c >= 3 { break }
+  }
+  return 0
+}
+",
+        ),
+        (
+            "a template is a COPY of its holes, not a view of them",
+            "\
+fn main() -> i32 {
+  mut h := \"hello\".clone()
+  t := template \"v={h}\"
+  h = \"world\".clone()
+  print(t)
+  print(h)
+  return 0
+}
+",
+        ),
+        (
+            "written straight into a builder",
+            "\
+fn main() -> i32 {
+  mut c := 0
+  loop {
+    mut b := builder()
+    b.write(template \"row {c}\")
+    print(b.to_string())
+    c = c + 1
+    if c >= 3 { break }
+  }
+  return 0
+}
+",
+        ),
+        (
+            "an outer loop's template read by an inner loop",
+            "\
+fn main() -> i32 {
+  mut c := 0
+  loop {
+    s := template \"outer {c}\"
+    mut d := 0
+    loop {
+      print(s)
+      d = d + 1
+      if d >= 2 { break }
+    }
+    c = c + 1
+    if c >= 2 { break }
+  }
+  return 0
+}
+",
+        ),
+        (
+            "an arena-scoped accumulator (the arena outlives the loop)",
+            "\
+fn main() -> i32 {
+  arena {
+    mut acc: str := \"start\"
+    mut c := 0
+    loop {
+      acc = template \"{acc}-{c}\"
+      c = c + 1
+      if c >= 5 { break }
+    }
+    print(acc)
+  }
+  return 0
+}
+",
+        ),
+        (
+            "an arena opened inside the loop",
+            "\
+fn main() -> i32 {
+  mut c := 0
+  loop {
+    arena {
+      s := template \"iter {c}\"
+      print(s)
+    }
+    c = c + 1
+    if c >= 3 { break }
+  }
+  return 0
+}
+",
+        ),
+    ];
+    for (what, src) in cases {
+        let diags = check_diagnostics("borrow-template-legal", src);
+        assert!(diags.is_empty(), "{what} must stay legal, got: {diags}");
+    }
+
+    // And the arena accumulator really does accumulate — the control against "legal but wrong".
+    let out = build_and_run(
+        "borrow-template-arena-accumulator",
+        "\
+fn main() -> i32 {
+  arena {
+    mut acc: str := \"start\"
+    mut c := 0
+    loop {
+      acc = template \"{acc}-{c}\"
+      c = c + 1
+      if c >= 5 { break }
+    }
+    print(acc)
+  }
+  return 0
+}
+",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "start-0-1-2-3-4");
+}
+
+/// **The second hole the exhaustiveness sweep found.** A sum-type constructor is the exact sibling
+/// of `StructLit` / `Tuple` / `OptionSome`, all three of which forward their operands' provenance —
+/// `EnumValue` was the one aggregate constructor the `_` tail swallowed, so `C.Text(view)` laundered
+/// the borrow and outlived the `string` the view pointed into. Accepted on `main`, printed garbage.
+#[test]
+fn a_sum_type_carrying_a_view_of_a_dropped_loop_local_is_rejected() {
+    let src = "\
+C { Text(str), Num(i64) }
+fn main() -> i32 {
+  mut keep: C := C.Num(0)
+  mut c := 0
+  loop {
+    h := \"hello-world\".clone()
+    keep = C.Text(h.trim())
+    c = c + 1
+    if c >= 3 { break }
+  }
+  match keep {
+    Text(s) => print(s),
+    Num(n) => print(n),
+  }
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-enum-payload-loop-local", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("its source 'h'")
+            && diags.contains("was dropped at the end of the loop iteration"),
+        "a sum-type payload borrows what it was constructed from, and must name that source: \
+         {diags}"
+    );
+
+    // The control: the same constructor over a source that outlives the loop stays legal.
+    let legal = "\
+C { Text(str), Num(i64) }
+fn label(c: C) -> i64 = match c { Text(s) => s.len(), Num(n) => n }
+fn main() -> i32 {
+  xs := [\"alpha\", \"beta\"]
+  mut i := 0
+  mut total := 0
+  loop {
+    v := C.Text(xs[i])
+    total = total + label(v)
+    i = i + 1
+    if i >= 2 { break }
+  }
+  print(total)
+  return 0
+}
+";
+    assert!(!check_errs("borrow-enum-payload-outer-source", legal));
+}
+
+/// **The third.** `r.sample(xs, k)` copies element VALUES into a fresh owned array — with
+/// `slice<str>` elements those values are views, so the result borrows exactly what `xs` borrows.
+/// That is the `.to_array()` shape, which does forward provenance; `RandSample` did not.
+#[test]
+fn a_sampled_array_of_views_into_a_dropped_loop_local_is_rejected() {
+    let src = "\
+import std.rand
+fn main() -> i32 {
+  mut r := rand.seed()
+  mut keep: array<str> := r.sample([\"x\", \"y\"][0..2], 1)
+  mut c := 0
+  loop {
+    h := \"hello-world\".clone()
+    xs := [h.trim(), h.trim()]
+    keep = r.sample(xs[0..2], 1)
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep[0])
+  return 0
+}
+";
+    let diags = check_diagnostics("borrow-rand-sample-loop-local", src);
+    assert!(
+        diags.contains("use of invalidated borrow 'keep'")
+            && diags.contains("its source 'h'")
+            && diags.contains("was dropped at the end of the loop iteration"),
+        "a sampled `array<str>` holds views into its source and must inherit its provenance: \
+         {diags}"
+    );
+
+    // The control: sampling views of a source that outlives the loop stays legal.
+    let legal = "\
+import std.rand
+fn main() -> i32 {
+  mut r := rand.seed()
+  names := [\"alpha\", \"beta\", \"gamma\"]
+  mut keep: array<str> := r.sample(names[0..3], 1)
+  mut c := 0
+  loop {
+    keep = r.sample(names[0..3], 1)
+    c = c + 1
+    if c >= 3 { break }
+  }
+  print(keep[0].len())
+  return 0
+}
+";
+    assert!(!check_errs("borrow-rand-sample-outer-source", legal));
+}

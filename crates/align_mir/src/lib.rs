@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -2768,8 +2768,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Template(parts) => {
             // Outside an explicit arena, retain the produced bytes in a hidden owned string. Its
             // view inherits this owner through scalar/view consumers and loop/function cleanup.
-            // Register before holes: a `?` inside one may emit an early cleanup edge.
-            let owner = b.arenas.is_empty().then(|| b.new_synthetic_owner(Ty::String));
+            // Register before holes: a `?` inside one may emit an early cleanup edge. The condition
+            // is sema's (`owns_hidden_string`), shared so `MoveCheck`'s borrow liveness ends a
+            // template view's generation at exactly the loop edge where this owner is freed.
+            let owner = owns_hidden_string(e, !b.arenas.is_empty()).then(|| b.new_synthetic_owner(Ty::String));
             let mut pieces = Vec::new();
             for p in parts {
                 match p {
