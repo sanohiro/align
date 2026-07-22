@@ -12636,6 +12636,23 @@ pub struct HttpRequest {
     body: Vec<u8>,
 }
 
+/// The request fields the serializer and client exchange only borrow. Builder-backed requests use
+/// [`HttpRequest::as_view`]; the convenience `get` / `post` calls can point directly at their FFI
+/// inputs, so a synchronous exchange does not allocate owned method, URL, or body copies first.
+#[derive(Clone, Copy)]
+struct HttpRequestView<'a> {
+    method: &'a str,
+    url: &'a str,
+    headers: &'a [(String, String)],
+    body: &'a [u8],
+}
+
+impl HttpRequest {
+    fn as_view(&self) -> HttpRequestView<'_> {
+        HttpRequestView { method: &self.method, url: &self.url, headers: &self.headers, body: &self.body }
+    }
+}
+
 /// One parsed response header, stored as byte offsets into [`HttpResponse::buf`] — NO owned
 /// `String` (http.md R1). `name`/`value` are already OWS-trimmed at parse time.
 struct HttpHeaderSpan {
@@ -12815,7 +12832,7 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
     if req.is_null() {
         return AL_INVALID;
     }
-    match http_serialize_core(unsafe { &*req }) {
+    match http_serialize_core(unsafe { &*req }.as_view()) {
         Ok(buf) => {
             unsafe { *out = buffer_from_vec(buf) };
             0
@@ -12832,8 +12849,8 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
 /// `METHOD <path> HTTP/1.1\r\nHost: <authority>\r\n<caller headers>\r\n[Content-Length: <n>\r\n]\r\n<body>`.
 /// `Content-Length` is emitted iff the body is non-empty. Shared by the codec FFI and the Slice-2
 /// client (`http_client_perform`) — the ONE source of request wire bytes.
-fn http_serialize_core(r: &HttpRequest) -> Result<Vec<u8>, i32> {
-    let Some((_scheme, authority, path)) = http_split_url(&r.url) else {
+fn http_serialize_core(r: HttpRequestView<'_>) -> Result<Vec<u8>, i32> {
+    let Some((_scheme, authority, path)) = http_split_url(r.url) else {
         return Err(AL_INVALID); // non-http(s) scheme / empty authority / malformed
     };
     // The URL-derived request-line fields must not carry start-line-breaking bytes (CR/LF/NUL/SP) —
@@ -12842,18 +12859,35 @@ fn http_serialize_core(r: &HttpRequest) -> Result<Vec<u8>, i32> {
         return Err(AL_INVALID);
     }
     // Reject a caller-supplied Host / Content-Length: both are auto-generated below.
-    for (name, _) in &r.headers {
+    for (name, _) in r.headers {
         if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("content-length") {
             return Err(AL_INVALID);
         }
     }
-    let method = if r.method.is_empty() { "GET" } else { r.method.as_str() };
+    let method = if r.method.is_empty() { "GET" } else { r.method };
     // The method must be a bare RFC 7230 token — a space / CTL / CRLF would corrupt or extend the
     // start-line (`<method> <target> HTTP/1.1`).
     if !http_is_token(method.as_bytes()) {
         return Err(AL_INVALID);
     }
-    let mut buf: Vec<u8> = Vec::new();
+    // Reserve the exact wire size once. The former incremental growth needed several allocator
+    // events for even the small GET used by `bench/http_client_path`.
+    let mut wire_len = method.len();
+    for n in [1, path.len(), b" HTTP/1.1\r\n".len(), b"Host: ".len(), authority.len(), 2] {
+        wire_len = wire_len.checked_add(n).ok_or(AL_INVALID)?;
+    }
+    for (name, value) in r.headers {
+        for n in [name.len(), 2, value.len(), 2] {
+            wire_len = wire_len.checked_add(n).ok_or(AL_INVALID)?;
+        }
+    }
+    if !r.body.is_empty() {
+        for n in [HTTP_CONTENT_LENGTH_PREFIX.len(), http_decimal_len(r.body.len()), 2] {
+            wire_len = wire_len.checked_add(n).ok_or(AL_INVALID)?;
+        }
+    }
+    wire_len = wire_len.checked_add(2).and_then(|n| n.checked_add(r.body.len())).ok_or(AL_INVALID)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(wire_len);
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
     buf.extend_from_slice(path.as_bytes());
@@ -12861,19 +12895,20 @@ fn http_serialize_core(r: &HttpRequest) -> Result<Vec<u8>, i32> {
     buf.extend_from_slice(b"Host: ");
     buf.extend_from_slice(authority.as_bytes());
     buf.extend_from_slice(b"\r\n");
-    for (name, value) in &r.headers {
+    for (name, value) in r.headers {
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(b": ");
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
     if !r.body.is_empty() {
-        buf.extend_from_slice(b"Content-Length: ");
-        buf.extend_from_slice(r.body.len().to_string().as_bytes());
+        buf.extend_from_slice(HTTP_CONTENT_LENGTH_PREFIX);
+        http_push_decimal(&mut buf, r.body.len());
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
-    buf.extend_from_slice(&r.body);
+    buf.extend_from_slice(r.body);
+    debug_assert_eq!(buf.len(), wire_len);
     Ok(buf)
 }
 
@@ -13044,8 +13079,7 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
 /// buffer). `Incomplete` if the header block is unterminated or a `Content-Length` body runs past
 /// `src` (a truncated read); `Invalid` on any malformed head or over-cap body. Shared by the codec
 /// FFI and the Slice-2 client — the ONE authoritative response decoder.
-fn http_parse_core(src: &[u8]) -> Result<HttpResponse, HttpParseErr> {
-    let head = http_parse_head(src)?;
+fn http_response_from_head(buf: Vec<u8>, head: HttpHead) -> Result<HttpResponse, HttpParseErr> {
     // --- body framing (v1: Content-Length only; chunked already rejected in the head scan) ---
     let body_len = match head.content_length {
         Some(n) => {
@@ -13055,26 +13089,32 @@ fn http_parse_core(src: &[u8]) -> Result<HttpResponse, HttpParseErr> {
             // `checked_add` (Gate-2 discipline): a wrap would otherwise turn an out-of-buffer body
             // into an in-bounds one. A body running past `src` is a truncated read → `Incomplete`.
             match head.body_start.checked_add(n) {
-                Some(end) if end <= src.len() => n,
+                Some(end) if end <= buf.len() => n,
                 Some(_) => return Err(HttpParseErr::Incomplete),
                 None => return Err(HttpParseErr::Invalid),
             }
         }
         // No Content-Length and not chunked: the body is everything remaining (read-to-close), which
         // for a complete buffer is the tail after the header terminator.
-        None => src.len() - head.body_start,
+        None => buf.len() - head.body_start,
     };
     if body_len > HTTP_MAX_BODY {
         return Err(HttpParseErr::Invalid);
     }
-    // R1: own ONE copy of the raw bytes; every span/offset above indexes it identically.
     Ok(HttpResponse {
-        buf: src.to_vec(),
+        buf,
         status: head.status,
         headers: head.headers,
         body_start: head.body_start,
         body_len,
     })
+}
+
+fn http_parse_core(src: &[u8]) -> Result<HttpResponse, HttpParseErr> {
+    let head = http_parse_head(src)?;
+    // The complete-buffer FFI borrows its input, so its response must own one copy. The socket
+    // client already owns its receive buffer and calls `http_response_from_head` directly instead.
+    http_response_from_head(src.to_vec(), head)
 }
 
 /// `http.parse(bytes)` — parse a complete HTTP/1.1 response buffer into an owned [`HttpResponse`]
@@ -13942,10 +13982,10 @@ fn http_split_authority(authority: &str, default_port: i64) -> Option<(String, i
 /// response byte was seen (a reused idle conn that fails with zero bytes is an idle-close race → retry
 /// once on a fresh conn; a fresh conn's failure, or a mid-response failure, is returned as-is).
 enum HttpExchange {
-    /// A complete response was read. `reusable` = keep-alive AND Content-Length-framed AND no bytes
+    /// A complete parsed response. `reusable` = keep-alive AND Content-Length-framed AND no bytes
     /// beyond the framed message (a keepalive server sends exactly one response per request; a
     /// read-to-close response, a `Connection: close`, or leftover bytes make the conn non-reusable).
-    Complete { bytes: Vec<u8>, reusable: bool },
+    Complete { response: HttpResponse, reusable: bool },
     /// The exchange failed. `received_any` distinguishes a pre-response failure (retryable on a reused
     /// conn) from a mid-response one.
     Failed { status: i32, received_any: bool },
@@ -13955,8 +13995,8 @@ enum HttpExchange {
 /// the [`Conn`] abstraction keeps this loop single-sourced), then stream the response into one
 /// growing buffer, stopping at the Content-Length-framed end (or at EOF for a read-to-close
 /// response). Reads go in 32 KiB chunks — never a per-line read (http.md R4). Does NOT close `conn`
-/// (the caller decides pool-return vs close). Returns an [`HttpExchange`] carrying the bytes + reuse
-/// verdict, or a failure + whether any byte was received.
+/// (the caller decides pool-return vs close). Returns an [`HttpExchange`] carrying the parsed
+/// response + reuse verdict, or a failure + whether any byte was received.
 ///
 /// # Safety
 /// `conn` must be live (a valid connected fd / handshaken `SSL*`).
@@ -13971,29 +14011,36 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
         return HttpExchange::Failed { status: ws, received_any: false };
     }
     let mut buf: Vec<u8> = Vec::new();
-    // Framing, decided ONCE the header block is available: `Some((target, keep_alive))` under
-    // Content-Length framing, or read-to-close (`None` here after `read_to_close` is set).
+    // Framing, decided ONCE the header block is available: `target` is the total framed length under
+    // Content-Length, or `None` for read-to-close. Keep the parsed head so its span allocation moves
+    // into the returned response instead of scanning and allocating for the same head twice.
+    let mut parsed_head: Option<HttpHead> = None;
     let mut target: Option<(usize, bool)> = None;
-    let mut read_to_close = false;
     let mut chunk = [0u8; 32 * 1024];
     loop {
         // Decide the framing once, then just read to the target length (no per-chunk head re-scan —
         // http.md R1/R4). `keep_alive` is computed here while the head spans still index `buf`.
-        if target.is_none() && !read_to_close {
+        if parsed_head.is_none() {
             match http_parse_head(&buf) {
                 Ok(head) => {
+                    // The terminator itself must land inside the advertised head cap. Checking the
+                    // cap only on `Incomplete` prefixes lets an oversized head through when its
+                    // final read also carries the blank line.
+                    if head.body_start > HTTP_MAX_HEADER_BLOCK {
+                        return HttpExchange::Failed { status: AL_INVALID, received_any: true };
+                    }
                     let keep_alive = http_head_keep_alive(&head, &buf);
-                    match head.content_length {
-                        Some(cl) => match head.body_start.checked_add(cl) {
+                    if let Some(cl) = head.content_length {
+                        match head.body_start.checked_add(cl) {
                             Some(t) if t <= HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) => {
                                 target = Some((t, keep_alive));
                             }
                             _ => return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() },
-                        },
-                        // No Content-Length → read-to-close framing: the conn is never reusable (its
-                        // end is the connection close).
-                        None => read_to_close = true,
+                        }
                     }
+                    // No Content-Length → read-to-close framing: `target` stays empty and the conn
+                    // is never reusable (its end is the connection close).
+                    parsed_head = Some(head);
                 }
                 Err(HttpParseErr::Incomplete) => {
                     if buf.len() > HTTP_MAX_HEADER_BLOCK {
@@ -14011,7 +14058,11 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
             // would misframe the NEXT response — a data-corruption class bug), so drop the conn.
             let reusable = keep_alive && buf.len() == t;
             buf.truncate(t);
-            return HttpExchange::Complete { bytes: buf, reusable };
+            let head = parsed_head.take().expect("a framed target always has a parsed head");
+            return match http_response_from_head(buf, head) {
+                Ok(response) => HttpExchange::Complete { response, reusable },
+                Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
+            };
         }
         // One read step over the conn (plaintext `read(2)` / TLS `SSL_read`, both behind `Conn::read`).
         let n = match unsafe { conn.read(&mut chunk) } {
@@ -14024,15 +14075,22 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
                 if buf.is_empty() {
                     return HttpExchange::Failed { status: AL_INVALID, received_any: false };
                 }
-                if read_to_close {
-                    return HttpExchange::Complete { bytes: buf, reusable: false };
+                if target.is_none()
+                    && let Some(head) = parsed_head.take()
+                {
+                    return match http_response_from_head(buf, head) {
+                        Ok(response) => HttpExchange::Complete { response, reusable: false },
+                        Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
+                    };
                 }
                 return HttpExchange::Failed { status: AL_INVALID, received_any: true };
             }
         };
         buf.extend_from_slice(&chunk[..n]);
         // Defensive memory bound for read-to-close (no declared Content-Length).
-        if read_to_close && buf.len() > HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) {
+        if parsed_head.as_ref().is_some_and(|head| head.content_length.is_none())
+            && buf.len() > HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK)
+        {
             return HttpExchange::Failed { status: AL_INVALID, received_any: true };
         }
     }
@@ -14086,10 +14144,14 @@ unsafe fn http_connect_fd(host: &str, port: i64) -> Result<i32, i32> {
 ///
 /// # Safety
 /// `out` must point to a writable `*mut HttpResponse` slot.
-unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *mut *mut HttpResponse) -> i32 {
+unsafe fn http_client_perform(
+    client: *mut HttpClient,
+    req: HttpRequestView<'_>,
+    out: *mut *mut HttpResponse,
+) -> i32 {
     // 1. Split the URL into scheme + authority (`https://` now routes to TLS — Slice 5; any other
     //    scheme / empty authority / malformed → Error.Invalid).
-    let Some((scheme, authority, _path)) = http_split_url(&req.url) else {
+    let Some((scheme, authority, _path)) = http_split_url(req.url) else {
         return AL_INVALID;
     };
     // 2. The connect address (`Host:` keeps the full authority; serialize handles that). Default port
@@ -14139,30 +14201,20 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
         };
         // Exchange over this conn.
         match unsafe { http_socket_exchange(&mut conn, &request_bytes) } {
-            HttpExchange::Complete { bytes, reusable } => {
-                // Parse BEFORE deciding the conn's fate: a conn is only safe to pool if its response
-                // fully parsed. A parse failure (a protocol violation the looser streaming pass let
-                // through) means the stream is untrustworthy; pooling it would risk response smuggling.
-                // On failure close the conn (fd + SSL*) and return `AL_INVALID` (no retry — bytes were
-                // received, this is a protocol error, not the stale-conn race).
-                return match http_parse_core(&bytes) {
-                    Ok(resp) => {
-                        let (fd, ssl) = conn.into_parts();
-                        match (reusable, client_ref) {
-                            (true, Some(c)) => c.put_idle(key.clone(), fd, ssl),
-                            // Not reusable (or no client): free the conn (TLS-aware — ssl null → close fd).
-                            _ => unsafe { close_tls(ssl, fd) },
-                        }
-                        unsafe { *out = Box::into_raw(Box::new(resp)) };
-                        #[cfg(test)]
-                        LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        0
-                    }
-                    Err(_) => {
-                        unsafe { conn.close() };
-                        AL_INVALID
-                    }
-                };
+            HttpExchange::Complete { response, reusable } => {
+                // The exchange has already parsed the head and moved both its spans and the socket
+                // receive buffer into `response`. Decide the conn's fate only after that successful
+                // parse: a protocol failure returns `Failed` above and is never pooled.
+                let (fd, ssl) = conn.into_parts();
+                match (reusable, client_ref) {
+                    (true, Some(c)) => c.put_idle(key.clone(), fd, ssl),
+                    // Not reusable (or no client): free the conn (TLS-aware — ssl null → close fd).
+                    _ => unsafe { close_tls(ssl, fd) },
+                }
+                unsafe { *out = Box::into_raw(Box::new(response)) };
+                #[cfg(test)]
+                LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return 0;
             }
             HttpExchange::Failed { status, received_any } => {
                 unsafe { conn.close() }; // frees fd AND SSL* on every failure path
@@ -14201,9 +14253,11 @@ pub unsafe extern "C" fn align_rt_http_client_get(
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let url = String::from_utf8_lossy(unsafe { bytes_view(url_ptr, url_len) }).into_owned();
-    let req = HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new() };
-    unsafe { http_client_perform(client, &req, out) }
+    let Some(url) = (unsafe { abi_str_view(url_ptr, url_len) }) else {
+        return AL_INVALID;
+    };
+    let req = HttpRequestView { method: "GET", url, headers: &[], body: &[] };
+    unsafe { http_client_perform(client, req, out) }
 }
 
 /// `cl.get_many(urls, max_concurrency)` (http.md item 6 / R5) — perform a batch of `GET`s over
@@ -14297,7 +14351,7 @@ pub unsafe extern "C" fn align_rt_http_get_many(
                         break;
                     }
                     let mut resp: *mut HttpResponse = core::ptr::null_mut();
-                    let code = unsafe { http_client_perform(shared.ptr(), &requests[i], &mut resp) };
+                    let code = unsafe { http_client_perform(shared.ptr(), requests[i].as_view(), &mut resp) };
                     if code == 0 {
                         results[i].store(resp, Ordering::Relaxed);
                     } else {
@@ -14389,10 +14443,12 @@ pub unsafe extern "C" fn align_rt_http_client_post(
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    let url = String::from_utf8_lossy(unsafe { bytes_view(url_ptr, url_len) }).into_owned();
-    let body = unsafe { bytes_view(body_ptr, body_len) }.to_vec();
-    let req = HttpRequest { method: "POST".to_string(), url, headers: Vec::new(), body };
-    unsafe { http_client_perform(client, &req, out) }
+    let Some(url) = (unsafe { abi_str_view(url_ptr, url_len) }) else {
+        return AL_INVALID;
+    };
+    let body = unsafe { bytes_view(body_ptr, body_len) };
+    let req = HttpRequestView { method: "POST", url, headers: &[], body };
+    unsafe { http_client_perform(client, req, out) }
 }
 
 /// `cl.request(req)` — perform the fully-built request `req` (its method / url / caller headers /
@@ -14420,7 +14476,7 @@ pub unsafe extern "C" fn align_rt_http_client_request(
     let Some(owned) = owned else {
         return AL_INVALID; // a null request handle
     };
-    unsafe { http_client_perform(client, &owned, out) }
+    unsafe { http_client_perform(client, owned.as_view(), out) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -21420,7 +21476,7 @@ mod tests {
         unsafe { align_rt_io_reader_free(r) };
         unsafe { align_rt_tcp_conn_free(conn) };
         unsafe { align_rt_buffer_free(b) };
-        let _ = server.join();
+        server.join().expect("oversized-head server");
     }
 
     #[test]
@@ -24134,6 +24190,30 @@ mod tests {
         unsafe { align_rt_http_request_free(req) };
     }
 
+    /// The request serializer computes the complete wire length before allocating. This pins the
+    /// allocation invariant directly: every representative request gets one exactly-sized `Vec`
+    /// and no growth. The canonical-byte tests above pin the independent semantic oracle.
+    #[test]
+    fn http_request_serialize_reserves_exactly_what_it_writes() {
+        let headers = vec![("Accept".to_string(), "application/json".to_string())];
+        let body = b"{\"k\":1}";
+        let cases = [
+            HttpRequestView { method: "GET", url: "http://localhost:8080", headers: &[], body: &[] },
+            HttpRequestView { method: "", url: "https://example.com/path?q=1", headers: &[], body: &[] },
+            HttpRequestView { method: "POST", url: "http://example.com/submit", headers: &headers, body },
+        ];
+        for req in cases {
+            let out = http_serialize_core(req).expect("representative request serializes");
+            assert_eq!(
+                out.capacity(),
+                out.len(),
+                "{} {}: the request buffer must allocate its exact wire length once",
+                req.method,
+                req.url
+            );
+        }
+    }
+
     /// An unknown scheme, an empty authority, and a caller-supplied Host / Content-Length all fail
     /// serialization with `AL_INVALID` and leave `*out` null. (Slice 5: `https://` is NO LONGER a
     /// bad URL for the serializer — the wire request line + `Host` are scheme-independent; only the
@@ -24494,6 +24574,24 @@ mod tests {
             assert!(out.is_null(), "a rejected URL leaves the out slot null");
         }
         unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// The response-head cap applies even when the read that crosses it also supplies the final
+    /// blank line. A cap check confined to the parser's `Incomplete` arm accepts this shape.
+    #[test]
+    fn http_client_rejects_a_terminated_head_past_the_cap() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: ".to_vec();
+        response.resize(HTTP_MAX_HEADER_BLOCK, b'x');
+        response.extend_from_slice(b"\r\n\r\n");
+        let (port, server) = http_serve_once(response);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, AL_INVALID, "a terminated response head beyond the cap must be rejected");
+        assert!(out.is_null());
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join();
     }
 
     /// `http.client()` allocates a non-null handle; every free is null-safe, and a null out slot is a

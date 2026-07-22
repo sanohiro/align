@@ -333,6 +333,13 @@ fn main() {
     // The zero that proves neither peer thread is polluting the Align count: the floor arm runs the
     // identical peer and must allocate nothing at all.
     assert_eq!(fa, 0.0, "the floor allocated — the counter is seeing the peer thread");
+    for sample in &sa {
+        assert!(
+            sample.allocs <= 7.0,
+            "http.get allocation regression: {:.2}/request exceeds the pinned 7-allocation ceiling",
+            sample.allocs
+        );
+    }
 
     let spread = |xs: &[Sample]| {
         let v: Vec<f64> = xs.iter().map(|s| s.cpu_ns).collect();

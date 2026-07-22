@@ -8,11 +8,17 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the protocol-path perf work has an instrument (`bench/http_path`, #601)
-and three wins (#602: the 32 KiB per-request memset is gone, ~−640 ns; #603: the response is
-serialized in ONE right-sized allocation — 14 → 9 allocations/request, ~−468 ns; #604: the inbound
-head parse resumes across reads — a 206 KiB head in 100-byte pieces goes 56 ms → 0.24 ms, closing a
-slowloris lever); before that, the
+_Last updated: 2026-07-22, **the HTTP client allocation slice is implemented on the current branch:
+`http.get` is 14 → 7 allocations/request and ~4.4 → ~3.4 µs above its syscall floor. Convenience
+GET/POST borrow their ABI inputs, request serialization reserves its exact wire size, and the socket
+exchange moves its first parsed head + receive buffer straight into the response instead of parsing
+and copying both twice. The Codex review also closed a response-head cap bypass: a head whose final
+read crossed 256 KiB and included the terminator used to be accepted.** Before that, the
+protocol-path perf work gained an instrument
+(`bench/http_path`, #601) and three wins (#602: the 32 KiB per-request memset is gone, ~−640 ns;
+#603: the response is serialized in ONE right-sized allocation — 14 → 9 allocations/request,
+~−468 ns; #604: the inbound head parse resumes across reads — a 206 KiB head in 100-byte pieces goes
+56 ms → 0.24 ms, closing a slowloris lever); before that, the
 scope-end-drop borrow hole is CLOSED — borrow liveness now ends at
 the owner's DROP, not only at its move (see "DONE 2026-07-22" under NEXT). The language no longer
 accepts a program it must reject.** Before that, 2026-07-21: **pkg.web: CONCURRENT SERVE (PREFORK) + SERVER KEEP-ALIVE COMPLETE
@@ -68,9 +74,10 @@ abort).
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
 
-1. **Keep going down the protocol path with `bench/http_path` (#601), not `web_e2e`.** The budget is
-   **~2.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
-   CPU). Measured targets, in order of what is known about them:
+1. **Keep going down the protocol path with the dedicated in-process instruments
+   (`bench/http_path` for the server, `bench/http_client_path` for the client), not `web_e2e`.** The
+   server budget is **~2.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9
+   µs and is not CPU). Measured targets, in order of what is known about them:
    - ~~apply #602's read-into-the-buffer to the CLIENT~~ — **tried, measured, DISCARDED (#606).**
      The memset it targets does not exist there (`objdump`: zero `memset` calls — LLVM elides it in
      that inlining context), and reading into the buffer forces a size decision before the framing is
@@ -84,11 +91,20 @@ READMEs):**
      it, so a read sized to the framed remainder pools a dirty conn
      (`http_client_does_not_pool_leftover_arriving_after_the_framing` pins it, asserting on the idle
      pool rather than the accept count — the retry path makes an accept count blind to it).
-   - The remaining client allocations: the request `String`s (`method`, `url`), the response buffer,
-     the head's span `Vec`, the owned response. The client budget is **14 allocations and ~4.4 µs
-     above its floor** (`bench/http_client_path`, #605) — bigger than the server's ~2.5 µs.
-   - The remaining allocations: the header-span `Vec`, the builder's two `String`s per header, the
-     `Box`es. Pooling them is a bigger design question than the two above.
+   - **DONE on the current branch — the obvious client ownership/allocation batch:** convenience
+     GET/POST now borrow their ABI inputs; request serialization reserves once at its exact size;
+     the first parsed response head and socket receive buffer move into the response rather than
+     being rebuilt/copied. `bench/http_client_path`: **14 → 7 allocations**, growth **56 → 0
+     B/request**, CPU **~4.4 → ~3.4 µs** above the floor (three runs 3362/3429/3489 ns). The bench
+     pins 7 as a regression ceiling.
+   - **Codex review correction:** the response-head cap was checked only while parsing returned
+     `Incomplete`; an oversized head whose cap-crossing read also carried the final blank line
+     returned `Ok` and bypassed it. The successful-head path now checks `body_start <= 256 KiB`,
+     with a mutation-checked socket regression.
+   - The remaining allocations need representation/reuse work: the header-span `Vec`, the owned
+     response `Box`, request/response buffers and pool-key bookkeeping. Builder calls also retain
+     two `String`s per caller header. This is a bigger design question than the redundant ownership
+     hops removed above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 
