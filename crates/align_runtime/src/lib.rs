@@ -14845,38 +14845,76 @@ fn http_request_wants_close(buf: &[u8], headers: &[HttpHeaderSpan]) -> bool {
     false
 }
 
-/// How much spare capacity [`http_read_into`] keeps available for one `read`. Big enough that an
-/// ordinary request (a request line and a few headers) arrives in a single call.
+/// The buffer an inbound request starts with, and the spare kept for a read while the head is still
+/// being scanned. An ordinary request head (a request line and a few headers) arrives inside this,
+/// so the common request costs exactly one modest allocation and one `read`.
+const HTTP_HEAD_CHUNK: usize = 2 * 1024;
+
+/// The most spare capacity [`http_read_into`] asks for in one go once a body is framed. Larger than
+/// [`HTTP_HEAD_CHUNK`] so a big body streams in few reads, and bounded so the buffer cannot be grown
+/// far past what the framing actually needs.
 const HTTP_READ_CHUNK: usize = 16 * 1024;
 
 /// One `read(2)` **directly into `buf`'s uninitialised spare capacity**, appending what arrives.
-/// Returns the byte count (`0` = EOF), retrying `EINTR`.
+/// `want` is how many more bytes this request can still use — the framed remainder once the head is
+/// parsed, or [`HTTP_HEAD_CHUNK`] while it is not. Returns the byte count (`0` = EOF), retrying
+/// `EINTR`.
 ///
 /// The obvious spelling — read into a `[u8; 32 * 1024]` stack buffer, then `extend_from_slice` —
 /// costs a **32 KiB `memset` and an eight-page stack probe on every request** (the array is
 /// zero-initialised, and LLVM does not elide it), plus a copy of the request bytes. That was the
 /// single largest item on this path, larger than all of its heap allocations together. Reading into
-/// the destination removes all three.
+/// the destination removes all three, and removes the per-byte copy, which is what makes a large
+/// body cheaper (measured ~-16% on a 200 KiB body, where the `memset` alone would be amortised).
+///
+/// **`want` is what keeps the buffer honest.** Reserving a fixed chunk regardless would double the
+/// allocation on the final short read of a framed body — `Vec::reserve` grows amortized, and
+/// `truncate` does not give capacity back — handing an attacker who picks `Content-Length` a 2x peak
+/// buffer for the request's whole lifetime (2 GiB at `HTTP_MAX_BODY`). Reserving only what the
+/// framing can still use keeps the peak at what was asked for.
 ///
 /// # Safety
 /// `fd` must be a readable descriptor. The `set_len` below is sound because the kernel initialised
 /// exactly the `n` bytes reported, and `n` is bounded by the spare capacity passed to `read`.
-unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>) -> Result<usize, i32> {
-    // Keep a full chunk of spare capacity available. `reserve` is a no-op once the buffer is big
-    // enough, so a warm connection's second and later reads do not touch the allocator at all.
-    buf.reserve(HTTP_READ_CHUNK);
+unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: usize) -> Result<usize, i32> {
+    // Amortized growth while a body is still streaming (doubling keeps a 1 GiB body from being
+    // O(n^2) reallocs), then ONE exact growth for the final fill. `reserve` alone would double on
+    // that last step — `Vec` grows amortized and `truncate` never gives capacity back — so a client
+    // choosing `Content-Length` would hold a 2x peak buffer for the request's whole lifetime.
+    // Measured on a framed total that lands exactly on a power of two: 2.00x with a flat `reserve`,
+    // 1.00x here.
+    let want = want.max(1);
+    let len_now = buf.len();
+    if want <= HTTP_READ_CHUNK {
+        // The final fill: take exactly what the framing still wants.
+        buf.reserve_exact(want);
+    } else {
+        // Still streaming: double (so a 1 GiB body is O(log n) reallocs, not O(n)), but never past
+        // the framed total — `Vec`'s own amortized growth ignores that ceiling and would overshoot
+        // it by up to 2x on the doubling that straddles it.
+        let target = (buf.capacity().saturating_mul(2))
+            .max(len_now + HTTP_READ_CHUNK)
+            .min(len_now + want);
+        buf.reserve_exact(target - len_now);
+    }
+    // Captured before the `EINTR` loop, which cannot touch `buf` — keep it that way if this loop
+    // ever grows a body: a `reserve` inside it would leave `ptr`/`spare` stale.
     let len = buf.len();
     let spare = buf.capacity() - len;
     debug_assert!(spare > 0, "reserve guarantees spare capacity");
     loop {
         let r = unsafe { read(fd, buf.as_mut_ptr().add(len) as *mut core::ffi::c_void, spare) };
         if r >= 0 {
-            // `r` is at most `spare` (the kernel never writes past the length it was given), so the
-            // new length stays within capacity and covers only kernel-initialised bytes.
             let n = r as usize;
-            debug_assert!(n <= spare, "read wrote past the length it was given");
-            unsafe { buf.set_len(len + n.min(spare)) };
-            return Ok(n.min(spare));
+            // The kernel cannot write more than the count it was given, so this never fires. It is
+            // a hard check rather than a clamp on purpose: if it ever did, the overflow already
+            // happened in the kernel and quietly clamping `set_len` would hide the corruption.
+            if n > spare {
+                return Err(AL_INVALID);
+            }
+            // `len + n <= capacity`, and every byte up to it was written by the kernel.
+            unsafe { buf.set_len(len + n) };
+            return Ok(n);
         }
         let e = std::io::Error::last_os_error();
         if e.kind() == std::io::ErrorKind::Interrupted {
@@ -14895,10 +14933,10 @@ unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>) -> Result<usize, i32> {
 /// # Safety
 /// `fd` must be a valid connected socket.
 unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
-    // Sized so an ordinary request lands in ONE read with no growth, while a large body still costs
-    // a bounded number of doublings. This is capacity, not initialised bytes: the read below writes
-    // straight into the spare tail (see `http_read_into`), so nothing here is zeroed or copied.
-    let mut buf: Vec<u8> = Vec::with_capacity(HTTP_READ_CHUNK);
+    // Sized so an ordinary request head lands in ONE read with no growth. This is capacity, not
+    // initialised bytes: the read below writes straight into the spare tail (see `http_read_into`),
+    // so nothing here is zeroed or copied.
+    let mut buf: Vec<u8> = Vec::with_capacity(HTTP_HEAD_CHUNK);
     let mut head: Option<HttpRequestHead> = None;
     loop {
         // Parse the head once (framing decided once), then just read to the framed length.
@@ -14961,8 +14999,13 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 park: None, // filled by `accept` from the server handle
             });
         }
-        // Read more, straight into `buf`'s spare capacity.
-        let n = unsafe { http_read_into(fd, &mut buf) }?;
+        // Read more, straight into `buf`'s spare capacity. Once the head is parsed the framing says
+        // exactly how many bytes are still wanted, so the buffer is never grown past them.
+        let want = match head.as_ref() {
+            Some(h) => h.body_start.saturating_add(h.content_length.unwrap_or(0)).saturating_sub(buf.len()),
+            None => HTTP_HEAD_CHUNK,
+        };
+        let n = unsafe { http_read_into(fd, &mut buf, want) }?;
         if n == 0 {
             // EOF before a complete request (client closed / truncated head or body) → malformed.
             return Err(AL_INVALID);
@@ -25507,6 +25550,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             .into_bytes();
         let head_len = req.len();
         req.extend_from_slice(&body);
+        let req_len = req.len();
 
         let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         // Write from a thread: the request is far larger than the socket buffer, so a single
@@ -25531,6 +25575,21 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             &ctx.buf[ctx.method_start..ctx.method_start + ctx.method_len],
             b"POST",
             "the head still parses over the grown buffer"
+        );
+        // **The buffer must not be grown past what the framing asked for.** Reserving a fixed chunk
+        // regardless of the remainder makes `Vec`'s amortized growth double on the final short read,
+        // and `truncate` does not give capacity back — so a client choosing `Content-Length` would
+        // get a 2x peak buffer for the request's whole lifetime. One read's worth of slack is the
+        // most that can be legitimately outstanding.
+        // **The framing bounds the buffer.** Growing by a fixed chunk regardless of the remainder
+        // makes `Vec`'s amortized doubling overshoot the last step, and `truncate` never gives
+        // capacity back — so a client choosing `Content-Length` would hold a 2x peak buffer for the
+        // request's whole lifetime (2 GiB at `HTTP_MAX_BODY`). Measured before this bound existed:
+        // 73728 bytes here. The only legitimate slack is the initial head buffer.
+        assert!(
+            ctx.buf.capacity() <= req_len + HTTP_HEAD_CHUNK,
+            "buffer grown to {} for a {req_len}-byte request — the framed remainder is what bounds it",
+            ctx.buf.capacity()
         );
     }
 
