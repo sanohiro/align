@@ -9574,7 +9574,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // …, "an `Option` struct field must have a non-owned payload"), and
                         // `json.encode` itself rejects every non-Move payload it cannot render
                         // (`Option<enum>` / `Option<slice<T>>` / `Option<char>` / `Option<()>`) via
-                        // `json_encodable_option_payload`. The tail below is therefore defense in
+                        // `json_encodable_scalar`. The tail below is therefore defense in
                         // depth — a compiler error, never a panic.
                         ity @ (Ty::Int(_) | Ty::IntVar(_)) => {
                             let BasicValueEnum::IntValue(v) = payload else {
@@ -9680,6 +9680,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ptr = self.builder.build_extract_value(agg, 0, "scap").map_err(|e| self.err(e))?;
                     let len = self.builder.build_extract_value(agg, 1, "scal").map_err(|e| self.err(e))?;
                     let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                    // NOTE the discarded `sub` pointer: this writer takes a bare tag, so an element
+                    // kind that needs a sub-descriptor cannot be rendered here. That is why sema's
+                    // `json_encodable_scalar` admits only int / float / bool / `str` elements — an
+                    // `array<enum>` used to reach this line, hand the runtime kind 6 with a NULL
+                    // sub, and silently print `[null,null]` (a payload-less enum aborted instead, in
+                    // `emit_json_union`). Encoding `array<enum>` properly means passing `sub` and
+                    // teaching `json_encode_scalar_array` about it — a feature, not hardening.
                     let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null)?;
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
@@ -10031,11 +10038,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// - `Operand::Value(id)` is only in [`Self::values`] if the statement that defined `id`
     ///   produced a basic value. A `()`-returning call defines a `ValueId` whose LLVM call yields
     ///   **void**, so nothing is recorded — reading it used to index a `HashMap` and abort the
-    ///   compiler (`print(u())` / `template "{u()}"`, both of which sema now rejects, reached it).
+    ///   compiler.
     /// - `Operand::Arg(i)` indexes the LLVM parameter list, which a MIR/ABI mismatch can outrun.
     ///
-    /// Both are compiler bugs when they fire — and a compiler bug on user input must surface as a
-    /// diagnosable error, never a panic (the Gate-3 rule).
+    /// The `Arg` case is a compiler bug when it fires. The `()` case is **not** hypothetical and is
+    /// **not** fully gated by sema: `print(u())` / `template "{u()}"` are sema-rejected, but
+    /// `x := u()`, `fn v() { return u() }`, `g(u())` with `g(a: ())`, `x := { u() }` and
+    /// `x := arena { u() }` all pass `alignc check` and reach here — a MIR **lowering** hole, not an
+    /// intended rejection (the same programs written with `if` / `match` / `loop { break u() }`
+    /// compile fine). They abort the compiler without this accessor. So this error is currently
+    /// user-reachable and carries no source span; fixing the lowering is a recorded follow-up.
+    /// Either way, a compiler bug on user input must surface as a diagnosable error, never a panic
+    /// (the Gate-3 rule).
     fn operand(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
         Ok(match op {
             Operand::Const(Const::Int(v, ty)) => {
@@ -10300,8 +10314,10 @@ mod tests {
 
     /// A `()`-valued operand. A `()`-returning call defines a `ValueId` whose LLVM call yields
     /// **void**, so no LLVM value is recorded for it — and reading it used to index a `HashMap`
-    /// directly and abort. `print(u())` / `template "{u()}"` are the source spellings that got here
-    /// (both sema-rejected today); the operand read itself must degrade to a `CodegenError`.
+    /// directly and abort. Real source reaches this: `x := u()` / `fn v() { return u() }` /
+    /// `g(u())` / `x := { u() }` / `x := arena { u() }` all check ok and abort the compiler on
+    /// `main` (`print(u())` / `template "{u()}"` are the two spellings sema *does* reject). Until
+    /// the lowering hole is closed the read must at least degrade to a `CodegenError`.
     #[test]
     fn a_unit_valued_operand_is_an_error_not_a_panic() {
         let unit_fn = Function {

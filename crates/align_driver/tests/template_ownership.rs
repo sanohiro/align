@@ -328,10 +328,12 @@ fn main() -> Result<(), Error> {
 /// a field shape the encoder cannot render is a **sema** diagnostic, never a codegen abort.
 ///
 /// Each row below reached codegen with **no diagnostic at all**, because the struct-field
-/// declaration gate only rejects an *owned* (Move) `Option` payload / `array` element. `array<char>`
-/// and `array<enum>` then aborted the compiler outright (`json_payload_tag_sub`'s `unreachable!`
-/// and `emit_json_union`'s one-payload `expect`); `Option<enum>` produced a bare codegen error with
-/// nothing behind it. `json.encode` now names its own encodable domain.
+/// declaration gate only rejects an *owned* (Move) `Option` payload / `array` element. What happened
+/// next on `main` differs per row and is worth stating precisely: `array<char>` aborted the compiler
+/// (`json_payload_tag_sub`'s `unreachable!`); `array<enum>` aborted only for a **payload-less** enum
+/// (`emit_json_union`'s one-payload `expect`) and otherwise **silently printed `[null,null]`**,
+/// because `ScalarArrayField` discards the sub-descriptor; `Option<enum>` produced a bare codegen
+/// error with nothing behind it. `json.encode` now names its own encodable domain.
 #[test]
 fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
     let cases: &[(&str, &str, &str)] = &[
@@ -350,17 +352,34 @@ fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
             "import core.json\nS { xs: array<char> }\nfn main() -> i32 {\n  s := S { xs: ['a', 'b'].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
             "an `array` field's element must be an int, float, bool, str, or a struct",
         ),
+        // Payload-less: aborted in `emit_json_union`. The payload-carrying spelling below is the
+        // silent-wrong-output case — it printed `{"xs":[null,null]}` on `main`.
         (
             "array-enum",
             "import core.json\nC { R, G }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.R, C.G].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
             "an `array` field's element must be an int, float, bool, str, or a struct",
+        ),
+        (
+            "array-enum-with-payload",
+            "import core.json\nC { N(i64), T(str) }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.N(1), C.N(2)].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "an `array` field's element must be an int, float, bool, str, or a struct",
+        ),
+        // An `array<Struct>` field's ELEMENT struct drives the descriptor table the runtime encoder
+        // walks, so its own fields must be renderable too. `char` is not — and the diagnostic must
+        // name `json.encode`, the builtin this program actually called, not the decode direction
+        // that happens to share the walk. (Taken through a parameter: an `array<Struct>` value can
+        // only be produced by `json.decode` today, and the point is to reach the ENCODE gate.)
+        (
+            "array-struct-element",
+            "import core.json\nE { c: char }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = json.encode(b).len()\nfn main() -> i32 = 0\n",
+            "'json.encode' field 'c' has type char",
         ),
     ];
     for (name, src, want) in cases {
         let diagnostics = check_diagnostics(&format!("json-field-{name}"), src);
         assert!(
             diagnostics.contains("'json.encode' field"),
-            "a `{name}` field must be rejected in sema:\n{diagnostics}"
+            "a `{name}` field must be rejected in sema, naming the builtin it called:\n{diagnostics}"
         );
         assert!(
             diagnostics.contains(want),
@@ -371,10 +390,17 @@ fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
 
 /// The control for the row above: every field shape the encoder DOES render still encodes, and
 /// still encodes correctly. Without this the gate could be tightened into rejecting real programs
-/// and nothing would notice.
+/// and nothing would notice — which is a live risk, because the two gates behind these rows are
+/// **direction-sensitive** (`json_struct_fields_ok(.., JsonDir::Encode)`): validating an encode
+/// field with the decode domain silently narrows it.
+///
+/// `assert!(backend_available())` rather than the skip its neighbours use, deliberately: the whole
+/// value of this test is the runtime output, so a missing backend must fail loudly instead of
+/// passing vacuously.
 #[test]
 fn every_encodable_json_field_shape_still_encodes() {
-    let src = "import core.json\n\
+    // Every leaf shape an `Option` payload / `array` element may take, in one object.
+    let leaves = "import core.json\n\
                N { z: i64 }\n\
                S { a: Option<i64>, b: Option<str>, c: Option<bool>, d: Option<f64>, e: Option<N>, xs: array<i64>, ys: array<str>, zs: array<bool> }\n\
                fn main() -> i32 {\n\
@@ -382,12 +408,51 @@ fn every_encodable_json_field_shape_still_encodes() {
                  print(json.encode(s))\n\
                  return 0\n\
                }\n";
-    let diagnostics = check_diagnostics("json-field-encodable", src);
-    assert!(!diagnostics.contains("error"), "no encodable shape may be rejected:\n{diagnostics}");
-    assert!(backend_available(), "this row's value is the runtime output; a missing backend must fail, not skip");
-    let out = build_and_run("json-field-encodable", src);
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "{\"a\":1,\"b\":\"x\",\"c\":true,\"d\":1.5,\"e\":{\"z\":2},\"xs\":[7,8],\"ys\":[\"p\"],\"zs\":[false]}"
+    // An `array<Struct>` field — the descriptor-table path, whose element schema the encode gate
+    // validates. Round-tripped through `json.decode`, the only producer of such a value today.
+    let struct_array = "import core.json\n\
+               E { x: i64, name: str }\n\
+               Bag { items: array<E> }\n\
+               fn main() -> Result<(), Error> {\n\
+                 input := \"{\\\"items\\\":[{\\\"x\\\":1,\\\"name\\\":\\\"a\\\"},{\\\"x\\\":2,\\\"name\\\":\\\"b\\\"}]}\"\n\
+                 b: Bag := json.decode(input)?\n\
+                 print(json.encode(b))\n\
+                 return Ok(())\n\
+               }\n";
+    // The one field shape the encode and decode domains DISAGREE on: an `Option<enum>` inside a
+    // descriptor-path struct. The encoder renders it (kind 6 + a real union sub-descriptor); the
+    // decoder cannot. On `main` this program was REJECTED, by a decode-shaped gate on an encode
+    // path — this row is what pins the direction.
+    let optional_union = "import core.json\n\
+               C { N(i64), T(str) }\n\
+               N { c: Option<C> }\n\
+               S { a: Option<N> }\n\
+               fn main() -> i32 {\n\
+                 s := S { a: Some(N { c: Some(C.N(7)) }) }\n\
+                 print(json.encode(s))\n\
+                 return 0\n\
+               }\n";
+    let cases: &[(&str, &str, &str)] = &[
+        ("leaves", leaves, "{\"a\":1,\"b\":\"x\",\"c\":true,\"d\":1.5,\"e\":{\"z\":2},\"xs\":[7,8],\"ys\":[\"p\"],\"zs\":[false]}"),
+        ("struct-array", struct_array, "{\"items\":[{\"x\":1,\"name\":\"a\"},{\"x\":2,\"name\":\"b\"}]}"),
+        ("optional-union", optional_union, "{\"a\":{\"c\":7}}"),
+    ];
+    assert!(backend_available(), "these rows' value is the runtime output; a missing backend must fail, not skip");
+    for (name, src, want) in cases {
+        let diagnostics = check_diagnostics(&format!("json-encodable-{name}"), src);
+        assert!(!diagnostics.contains("error"), "`{name}` must not be rejected:\n{diagnostics}");
+        let out = build_and_run(&format!("json-encodable-{name}"), src);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), *want, "`{name}` encoded wrong");
+    }
+
+    // An `Option<enum>` in an `array<Struct>` ELEMENT is the same encode-only rule one level down.
+    // No runnable form exists (such a value can only come from `json.decode`, which rejects the
+    // shape), so it is pinned as an acceptance row through a parameter.
+    let element_optional_union =
+        "import core.json\nC { N(i64), T(str) }\nE { x: i64, a: Option<C> }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = json.encode(b).len()\nfn main() -> i32 = 0\n";
+    let diagnostics = check_diagnostics("json-encodable-element-optional-union", element_optional_union);
+    assert!(
+        !diagnostics.contains("error"),
+        "an `Option<enum>` element field encodes; the gate must not borrow the decode domain:\n{diagnostics}"
     );
 }
