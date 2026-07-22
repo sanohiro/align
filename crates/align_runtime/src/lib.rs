@@ -15108,11 +15108,16 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
             // (http.md item 9 ②): 1.1, no `Connection: close`, and nothing read past this request's
             // own body. 1.0 keep-alive is not supported.
             //
-            // **Residual can now only come from the pre-head window.** Reads are clamped to the
-            // framed remainder, so `buf` cannot overshoot `need` once a body is framed — a client
-            // that pipelines behind a bodied request is no longer closed on, it is simply re-read on
-            // the next `accept`. Bytes cannot be lost either way: `truncate` discards only when
-            // `buf.len() > need`, which is exactly the condition that already set `residual`.
+            // **Residual comes from the pre-head window, and from any read whose buffer had slack
+            // past the framing.** #602 recorded this as "reads are clamped to the framed remainder";
+            // that overstates it. `http_read_into` *reserves* by the remainder, but `reserve_exact`
+            // is a no-op when the capacity already suffices and the read then takes the whole spare —
+            // so a 2 KiB buffer holding a small framed request still overshoots into pipelined bytes
+            // (and closes on them), while one grown to exactly the framed total does not. Both
+            // outcomes are correct here: an overshoot sets `residual` and closes, and no overshoot
+            // leaves the pipelined request to be re-read on the next `accept`. Bytes cannot be lost
+            // either way — `truncate` discards only when `buf.len() > need`, which is exactly the
+            // condition that already set `residual`.
             let residual = buf.len() > need;
             let keep_alive = h.http11 && !residual && !http_request_wants_close(&buf, &h.headers);
             buf.truncate(need); // drop any pipelined bytes — the eligibility check above saw them
@@ -24697,6 +24702,67 @@ mod tests {
         }
         unsafe { align_rt_http_client_free(client) };
         assert_eq!(server.join().unwrap(), 2, "a conn with bytes past Content-Length must not be pooled");
+    }
+
+    /// The same dirty-conn rule when the leftover arrives in a **later segment than the one that
+    /// framed the response** — the case the sibling test above cannot reach, because it sends head,
+    /// body and leftover together and the very first (still unframed) read therefore swallows all of
+    /// them. Here the head goes out alone; by the time the leftover is written the client has already
+    /// computed the framing, so the read that collects it is a framed one.
+    ///
+    /// It also pins what the exchange's **unclamped** read buys. The overshoot is detected by having
+    /// READ it, so any rewrite that sizes the read to the framed remainder — the obvious shape when
+    /// reading straight into the response buffer — makes `buf.len() == t` trivially true and pools
+    /// the dirty conn. That was measured, not imagined: the read-into-buffer experiment recorded in
+    /// `bench/http_client_path/README.md` failed exactly here.
+    ///
+    /// **The assertion is the POOL, not the accept count**, and that distinction is the test: with
+    /// the dirty conn pooled, the next `get` takes it, reads `EFTOVER` as a response head, fails, and
+    /// *retries on a fresh connect* — so the server still accepts twice and an accept-count assertion
+    /// passes either way. It did: the sibling test's shape could not tell the two apart. Reading the
+    /// idle map directly states the property with no timing or retry path in the way.
+    #[test]
+    fn http_client_does_not_pool_leftover_arriving_after_the_framing() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut tmp = [0u8; 512];
+            if sock.read(&mut tmp).unwrap_or(0) == 0 {
+                return;
+            }
+            // The head alone — the client parses it and frames the body at 2 bytes.
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
+            let _ = sock.flush();
+            // Then the body AND the stray bytes together, in a later segment.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = sock.write_all(b"hiLEFTOVER");
+            let _ = sock.flush();
+            // Hold the conn open until the client has decided whether to pool it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(
+            unsafe { safe_slice(body.ptr, body.len) },
+            b"hi",
+            "the body is exactly the framed bytes, leftover excluded"
+        );
+        unsafe { align_rt_http_resp_free(out) };
+        let pooled: usize = {
+            let map = unsafe { &*client }.idle.lock().unwrap();
+            map.values().map(Vec::len).sum()
+        };
+        assert_eq!(pooled, 0, "a conn whose leftover arrived after the framing must not be pooled");
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
     }
 
     /// A raw fd whose peer has already closed — writing to it fails (EPIPE) and reading returns EOF.

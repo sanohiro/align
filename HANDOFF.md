@@ -71,14 +71,22 @@ READMEs):**
 1. **Keep going down the protocol path with `bench/http_path` (#601), not `web_e2e`.** The budget is
    **~2.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
    CPU). Measured targets, in order of what is known about them:
-   - **`http_socket_exchange`, the CLIENT path**, still has the identical `[0u8; 32 * 1024]` +
-     `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool) — where
-     it was *larger than all fourteen heap allocations together*. **The instrument now exists**
-     (`bench/http_client_path`, #605): the client budget is **14 allocations and ~4.4 µs above its
-     floor**, bigger than the server's. Also visible there: `Vec::new()` for the response buffer
-     (56 B of `realloc` growth per request), the request `String`s, the head's span `Vec`.
-     Apply #602's shape, INCLUDING the trap its review caught — a flat pre-read reserve doubles the
-     buffer on the final short read, so it must be bounded by what the framing still wants.
+   - ~~apply #602's read-into-the-buffer to the CLIENT~~ — **tried, measured, DISCARDED (#606).**
+     The memset it targets does not exist there (`objdump`: zero `memset` calls — LLVM elides it in
+     that inlining context), and reading into the buffer forces a size decision before the framing is
+     known: a 2 KiB start costs an extra `read` syscall for every response past 2 KiB (**+1200 ns at
+     8 KiB, 3/3**) and starting bigger is not available because that buffer IS the returned response
+     body. Full numbers + the two lessons in `bench/http_client_path/README.md`.
+   - **Worth revisiting as a BODY-SIZE-AWARE read strategy, which is a different design.** The
+     discarded experiment won **−42% at a 200 KiB body** (per-byte copy elimination, matching #602's
+     −16% server-side) — and that is the align-LLM gateway's actual shape. Any such attempt must keep
+     the dirty-conn property: the overshoot that marks a conn unpoolable is detected by having READ
+     it, so a read sized to the framed remainder pools a dirty conn
+     (`http_client_does_not_pool_leftover_arriving_after_the_framing` pins it, asserting on the idle
+     pool rather than the accept count — the retry path makes an accept count blind to it).
+   - The remaining client allocations: the request `String`s (`method`, `url`), the response buffer,
+     the head's span `Vec`, the owned response. The client budget is **14 allocations and ~4.4 µs
+     above its floor** (`bench/http_client_path`, #605) — bigger than the server's ~2.5 µs.
    - The remaining allocations: the header-span `Vec`, the builder's two `String`s per header, the
      `Box`es. Pooling them is a bigger design question than the two above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
