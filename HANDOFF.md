@@ -8,7 +8,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-23, **the Gate-3 codegen hardening #620 started is FINISHED (NEXT item 0b).**
+_Last updated: 2026-07-23, **v0.2.0 RELEASE PREP: the workspace version is bumped to 0.2.0 and
+`RELEASE_NOTES_0.2.0.md` is written (headline: `pkg.web`, the zero-copy REST framework — 1.31x Go
+Fiber-prefork; plus the JSON/`std.http` waves and the three soundness fixes). Tagging `v0.2.0` and
+pushing the tag — which is what triggers the public release build — is the OWNER's step, deliberately
+not automated here.** Before that, **the Gate-3 codegen hardening #620 started is FINISHED (NEXT item 0b).**
 `gen_print` now dispatches on the SAME `align_sema::print_kind` classification the template holes
 use and reads its operand through the same `display_int` / `display_float` / `display_view`
 accessors, so its catch-all integer tail is gone; `Operand::Value(id)` / `Operand::Arg(i)` are
