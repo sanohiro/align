@@ -593,8 +593,11 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
   SHIPPED (std.http item 9 ②; `apps_web_root.rs` keep-alive E2E). **The route-tree edge matrix is
   SHIPPED:** absolute production-tree expectations cover 64 path segments (past the linear
   oracle's safe base-3 score width), byte-exact 4 KiB static hit/miss, a 4 KiB zero-copy param
-  capture, same-claim GET/POST + 405 `Allow`, and every empty-table query helper. Remaining W4:
-  the malformed-request matrix and the handler-`Err` logging story (W5+).
+  capture, same-claim GET/POST + 405 `Allow`, and every empty-table query helper. **The
+  malformed-request matrix is SHIPPED too:** real sockets cover malformed request-line, target
+  form, header syntax, Transfer-Encoding, and conflicting Content-Length; a valid routed request
+  after every class proves only the bad connection closes. Remaining W4: the handler-`Err` logging
+  story (W5+).
 - **W5 — the router/e2e bench gate. MET.** `bench/web_e2e` prices the framework at **0.8 µs per
   request** over the same responses written directly on `std.http` (CONNS=1 ping-pong; 0.98–1.00×
   at 32 connections). It also prices everything else, which is why it was built before optimising

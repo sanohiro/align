@@ -241,33 +241,42 @@ fn keep_alive_serves_many_requests_over_one_connection() {
     assert!(read_framed(&mut sock, &mut buf).ends_with("{\"models\":[]}"), "client 1 survived client 2");
 }
 
-/// **A malformed request must not kill the server.** A bare-LF request line (rejected by the
-/// strict-CRLF smuggling guard) is what any scanner — or a browser speaking TLS to a plaintext port
-/// — produces. `accept` treats it as a per-request fault and keeps waiting, so the serve loop's
-/// `srv.accept()?` never sees it; before that fix one `nc` took the whole server down, and with
-/// prefork it would have taken every worker down in turn.
+/// **Malformed request matrix:** request-line, header-syntax, and framing failures close only that
+/// connection. `accept` keeps waiting, so the serve loop's `srv.accept()?` never sees a per-request
+/// parse fault; before that fix one scanner request took the server down, and with prefork it would
+/// have taken every worker down in turn.
 #[test]
-fn a_malformed_request_does_not_kill_the_serve_loop() {
+fn malformed_requests_do_not_kill_the_serve_loop() {
     if !backend_available() {
         return;
     }
     let srv = start("web-root-malformed");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut bad = loop {
-        match TcpStream::connect(("127.0.0.1", srv.port)) {
-            Ok(s) => break s,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => panic!("server never came up: {e}"),
+    let cases: [(&str, &[u8]); 5] = [
+        ("bare LF", b"GET /v1/models HTTP/1.1\nHost: h\r\n\r\n"),
+        ("absolute-form target", b"GET http://evil/v1/models HTTP/1.1\r\nHost: h\r\n\r\n"),
+        ("space before header colon", b"GET /v1/models HTTP/1.1\r\nHost : h\r\n\r\n"),
+        ("transfer encoding", b"POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        (
+            "conflicting content lengths",
+            b"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc",
+        ),
+    ];
+    for (name, raw) in cases {
+        let mut bad = TcpStream::connect(("127.0.0.1", srv.port)).expect("connect malformed client");
+        bad.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
+        bad.write_all(raw).unwrap_or_else(|e| panic!("write {name}: {e}"));
+        let mut got = Vec::new();
+        match bad.read_to_end(&mut got) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("{name}: malformed connection did not close: {e}"),
         }
-    };
-    bad.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
-    bad.write_all(b"GET /v1/models HTTP/1.1\nHost: h\r\n\r\n").expect("write the bare-LF request");
-    let mut got = Vec::new();
-    let _ = bad.read_to_end(&mut got);
-    assert!(got.is_empty(), "the malformed request is answered by a close, not a response: {got:?}");
-    // The server is still there.
-    let ok = exchange(srv.port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
-    assert!(ok.ends_with("{\"models\":[]}"), "the loop survived a malformed request: {ok:?}");
+        assert!(got.is_empty(), "{name}: malformed input is answered by close, not response: {got:?}");
+
+        // Check after EVERY class: a later case must not hide that an earlier one killed the loop.
+        let ok = exchange(srv.port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert!(ok.ends_with("{\"models\":[]}"), "the loop survived {name}: {ok:?}");
+    }
 }
 
 #[test]
