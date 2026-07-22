@@ -195,7 +195,7 @@ READMEs):**
 5. **DONE (#617) — W4 handler-`Err` logging:** unary handlers and stream pumps emit one stable
    stderr line with method, path, and the full builtin `Error`; E2E pins every Error variant, unary
    500 + survival, and stream close + survival. **W4 is complete.**
-6. **DONE (PR pending) — W6 middleware-lite:** `web.group` / `group_with`, homogeneous named-function
+6. **DONE (#618) — W6 middleware-lite:** `web.group` / `group_with`, homogeneous named-function
    middleware lists, zero-copy prefix-aware radix routing, ordered proceed/short-circuit/failure
    verdicts, logged 500s, and loop survival are E2E-pinned. The implementation also landed the two
    narrow language enablers the design required (function-value slices and Copy-struct
