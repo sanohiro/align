@@ -208,7 +208,7 @@ budget is now ~2.5 µs. `respond_stream` reserves its `Transfer-Encoding` line t
   buffer is a byte-exact assertion that the two still agree; the new test asserts it over a matrix
   (no headers / many headers / bodied / set-but-empty body / HEAD-suppressed / persistent / the three
   bodiless statuses / an unknown status's empty reason phrase) plus both streaming framings. The
-  three written literals are `const`s shared by writer and sizer, so they cannot drift at all.
+  four written literals are `const`s shared by writer and sizer, so they cannot drift at all.
 - The wrapper was **not** kept: `http_serialize_head` itself gained the parameter (one mechanism, per
   the repo's no-compat rule), and its three call sites each pass what they append.
 
