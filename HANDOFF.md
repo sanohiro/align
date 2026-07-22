@@ -72,11 +72,13 @@ READMEs):**
    **~2.5 µs of CPU above the poll floor** (the keep-alive `poll` is a further ~0.9 µs and is not
    CPU). Measured targets, in order of what is known about them:
    - **`http_socket_exchange`, the CLIENT path**, still has the identical `[0u8; 32 * 1024]` +
-     `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool).
-     **It needs an instrument first**, and `bench/http_client` is not it: that harness reports
-     ~65 µs/req end-to-end over loopback, so the ~0.6 µs this is worth sits under its noise. The
-     honest move is an in-process client-side twin of `bench/http_path` (thread CPU time + a
-     counting allocator), then the change. Do not "measure" it with the throughput harness.
+     `extend_from_slice` that #602 removed from the server (`http.get`/`get_many`/the pool) — where
+     it was *larger than all fourteen heap allocations together*. **The instrument now exists**
+     (`bench/http_client_path`, #605): the client budget is **14 allocations and ~4.4 µs above its
+     floor**, bigger than the server's. Also visible there: `Vec::new()` for the response buffer
+     (56 B of `realloc` growth per request), the request `String`s, the head's span `Vec`.
+     Apply #602's shape, INCLUDING the trap its review caught — a flat pre-read reserve doubles the
+     buffer on the final short read, so it must be bounded by what the framing still wants.
    - The remaining allocations: the header-span `Vec`, the builder's two `String`s per header, the
      `Box`es. Pooling them is a bigger design question than the two above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,

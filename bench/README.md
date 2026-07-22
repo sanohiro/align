@@ -42,7 +42,10 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   smaller than that spread cannot be priced there however many times you run it. When the quantity
   you care about is a small difference, **measure it directly**: `bench/http_path` prices the same
   path in-process on an exact allocation count plus the server thread's own CPU time (~2% run to
-  run).
+  run). The same trap was written into the roadmap a second time for the CLIENT path — "`bench/http_client`
+  exists to price it", of a ~0.6 µs item, in a harness reporting ~65 µs/req end to end. It does not;
+  `bench/http_client_path` is its in-process twin (~1.1% run to run). **Check that an instrument can
+  resolve the effect before naming it as the one to use.**
 - **A floor must do the same syscalls, or its difference is not the thing you named.** `http_path`'s
   first version compared Align (`poll` → `read` → `write`) against a floor that only read and wrote,
   and called the difference Align's CPU cost. **The missing `poll` was ~0.9 µs of the 4.3 µs** — 21%
