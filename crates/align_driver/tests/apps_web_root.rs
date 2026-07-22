@@ -51,8 +51,8 @@ fn exchange(port: u16, req: &[u8]) -> String {
 }
 
 /// The application: a route table built with the per-method constructors, one handler per route,
-/// and `web.serve` owning everything else. `boom` returns `Err` AFTER responding — the case the
-/// serve loop must survive.
+/// and `web.serve` owning everything else. `boom` and `fail_as` return `Err` without building a
+/// response — the cases the framework must answer, log, and survive.
 const APP: &str = "module main\n\
 import std.cli\n\
 import pkg.web\n\
@@ -86,6 +86,14 @@ fn boom(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   return Err(Error.Invalid)\n\
 }\n\
 \n\
+fn fail_as(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
+  kind := pkg.web.param(c, \"kind\")\n\
+  if kind == \"not-found\" { return Err(Error.NotFound) }\n\
+  if kind == \"denied\" { return Err(Error.Denied) }\n\
+  if kind == \"code\" { return Err(Error.Code(77)) }\n\
+  return Err(Error.Invalid)\n\
+}\n\
+\n\
 fn show_header(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {\n\
   match pkg.web.header(c, pkg.web.query(c, \"name\")) {\n\
     Some(v) => pkg.web.text(v)\n\
@@ -115,6 +123,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     pkg.web.put(\"/v1/models/:id\", replace_model),\n\
     pkg.web.get(\"/search\", search),\n\
     pkg.web.get(\"/boom\", boom),\n\
+    pkg.web.get(\"/fail/:kind\", fail_as),\n\
     pkg.web.any(\"/health\", catch_all),\n\
     pkg.web.post(\"/echo\", echo),\n\
     pkg.web.get(\"/hdr\", show_header),\n\
@@ -137,6 +146,21 @@ impl Drop for Server {
     }
 }
 
+impl Server {
+    fn stop_and_stderr(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut stderr = String::new();
+        self.child
+            .stderr
+            .take()
+            .expect("stderr piped")
+            .read_to_string(&mut stderr)
+            .expect("read stderr");
+        stderr
+    }
+}
+
 fn start(name: &str) -> Server {
     let port = free_loopback_port();
     let built = build_exe_multi(
@@ -152,15 +176,42 @@ fn start(name: &str) -> Server {
     );
     let mut child = std::process::Command::new(&built.exe)
         .args(["--port", &port.to_string()])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn server");
     // A server that dies at startup (bind failure, arg parse) would otherwise show up only as a
     // 30-second connect timeout, so surface it as itself.
     std::thread::sleep(Duration::from_millis(300));
     if let Ok(Some(st)) = child.try_wait() {
-        panic!("server exited at startup: {st:?}");
+        let mut stderr = String::new();
+        child.stderr.take().expect("stderr piped").read_to_string(&mut stderr).expect("read stderr");
+        panic!("server exited at startup: {st:?}; stderr: {stderr}");
     }
     Server { child, port, _built: built }
+}
+
+#[test]
+fn handler_errors_are_logged_with_request_context_and_the_loop_survives() {
+    if !backend_available() {
+        return;
+    }
+    let mut srv = start("web-root-handler-log");
+    for path in ["not-found", "invalid", "denied", "code"] {
+        let req = format!("GET /fail/{path} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let resp = exchange(srv.port, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 500 "), "{path}: {resp:?}");
+    }
+
+    let alive = exchange(srv.port, b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(alive.ends_with("{\"models\":[]}"), "loop survives logged failures: {alive:?}");
+
+    assert_eq!(
+        srv.stop_and_stderr(),
+        "pkg.web: handler Err (GET /fail/not-found): NotFound\n\
+pkg.web: handler Err (GET /fail/invalid): Invalid\n\
+pkg.web: handler Err (GET /fail/denied): Denied\n\
+pkg.web: handler Err (GET /fail/code): Code(77)\n"
+    );
 }
 
 /// Read exactly ONE `Content-Length`-framed response off a kept-alive socket, leaving later bytes in

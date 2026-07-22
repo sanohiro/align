@@ -154,8 +154,35 @@ pub fn json(body: str) -> Result<response_builder, Error> = status_json(200, bod
 fn answer(h: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>, c: pkg.web.types.Ctx) -> response_builder {
   match h(c) {
     Ok(built) => built
-    Err(e) => auto_response(500, "{\"error\":\"internal error\"}")
+    Err(e) => {
+      log_handler_error(c, e)
+      auto_response(500, "{\"error\":\"internal error\"}")
+    }
   }
+}
+
+// One stable diagnostic for every application handler failure. The client sees only the fixed 500
+// body above; stderr keeps the route context and the complete builtin Error value for operators.
+// Logging is best-effort: a closed stderr must not turn one request fault into a dead serve loop.
+fn log_handler_error(c: pkg.web.types.Ctx, err: Error) -> () {
+  mut line := builder()
+  line.write("pkg.web: handler Err (")
+  line.write(c.method)
+  line.write(" ")
+  line.write(c.path)
+  line.write("): ")
+  match err {
+    NotFound => line.write("NotFound")
+    Invalid => line.write("Invalid")
+    Denied => line.write("Denied")
+    Code(code) => {
+      line.write("Code(")
+      line.write_int(code)
+      line.write(")")
+    }
+  }
+  line.write("\n")
+  io.stderr.write(line) else {}
 }
 
 // One framework-generated response (the 404/405/500 family): `code` + the fixed minimal JSON body
@@ -180,9 +207,9 @@ fn auto_response(code: i64, body: str) -> response_builder {
 // keep-alive). Concurrency is `serve`'s worker count, below.
 //
 // Automatic responses, all of which write the request handle exactly once:
-//   - no pattern matched              -> 404 with an empty body
+//   - no pattern matched              -> 404 with the fixed minimal JSON body
 //   - pattern matched, method did not -> 405 with `Allow` listing the path's method set
-//   - the handler returned `Err`      -> 500 with an empty body
+//   - the handler returned `Err`      -> log method/path/error + 500 minimal JSON
 //
 // That last one is the whole point of the framework holding the handle. When the handler owned it,
 // a handler that failed had already consumed it and there was nothing left to answer through, so a
@@ -250,9 +277,12 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
             Ok(s) => {
               // The pump OWNS the stream (finish/reject consume it; a dropped stream just closes).
               // `c`'s views stay valid for the whole call: `ctx` stays here, borrowed and spent.
-              // An `Err` after the head is committed has nothing left to answer through — the
-              // stream ends and the loop moves on (the W4+ logging story covers the trace).
-              pump(c, s) else {}
+              // An `Err` after the head is committed has nothing left to answer through — log it,
+              // let the owned stream close, and move on to the next request.
+              match pump(c, s) {
+                Ok(_) => {}
+                Err(e) => log_handler_error(c, e)
+              }
             }
             // `respond_stream` failing means the builder was invalid or the client is already
             // gone — either way there is no stream; serve the next request.
