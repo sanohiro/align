@@ -1,0 +1,518 @@
+module pkg.web.multipart
+
+// pkg.web multipart/form-data support (RFC 7578, over the RFC 2046 §5.1 multipart grammar) — the
+// body format an HTML `<form enctype="multipart/form-data">` and every file upload uses.
+//
+// A **public** submodule, not `internal`: `Part`/`Step` are types an application names when it
+// walks an upload, so consumers must be able to write `pkg.web.multipart.Part`.
+//
+// It is deliberately NOT wired into `pkg.web`'s core surface. That surface is routing, accessors,
+// responders, middleware and streaming — the minimalism constraint in `docs/impl/pkg-design/web.md`
+// — and multipart is a body CODEC, not a routing concern. Keeping it a sibling module also keeps it
+// dependency-free: it touches nothing but `slice<u8>` and `str`, so it is testable and usable
+// standalone. An application feeds it the two things `pkg.web` already hands out:
+//
+//   bd := pkg.web.multipart.boundary(pkg.web.header(c, "content-type") else { "" })
+//   if bd.len() == 0 {
+//     return pkg.web.status(400)          // not a multipart form
+//   }
+//   body := pkg.web.body(c)
+//   mut off := 0
+//   loop {
+//     match pkg.web.multipart.next(body, bd, off) {
+//       Found(p) => {
+//         // p.name / p.filename / p.content_type / p.data — all views into `body`/the header
+//         off = p.next
+//       }
+//       Done => { break }
+//       Invalid => { return pkg.web.status(400) }     // malformed body
+//     }
+//   }
+//
+// **Zero allocation, zero copy.** Every `str`/`slice<u8>` handed back is a view into the caller's
+// body (or into the `content-type` header for `boundary`). Nothing here allocates, so a 200 MB
+// upload costs no more than the buffer it already arrived in. Iteration state is one `i64` the
+// caller owns (`Part.next`) rather than a stateful parser handle, which is why the walk above is an
+// ordinary `loop` over pure calls.
+
+// Byte constants (Align has no byte literals; these are the ASCII codes we scan for).
+HTAB := 9
+LF := 10
+CR := 13
+SP := 32
+DQUOTE := 34   // '"'
+COLON := 58    // ':'
+SEMI := 59     // ';'
+EQ := 61       // '='
+UPPER_A := 65
+UPPER_Z := 90
+BSLASH := 92   // '\'
+DEL := 127
+CASE := 32     // 'a' - 'A'
+
+// The longest boundary RFC 2046 §5.1.1 permits (`1*70<bchars>`).
+MAX_BOUNDARY := 70
+
+// ── Byte helpers ──────────────────────────────────────────────────────────────────────────────
+
+// Whether the bytes of `s` appear in `b` starting at `i`. Out-of-range starts answer `false`
+// instead of aborting: every caller here is scanning untrusted input, where running off the end is
+// an ordinary outcome, not a bug.
+//
+// The range test is written `i > b.len() - n` rather than `i + n > b.len()` on purpose: integer
+// overflow is DEFINED to wrap in Align, so the sum form lets a near-`i64::MAX` index wrap negative,
+// pass the guard, and index out of bounds — an abort, from one bad number.
+fn bytes_at(b: slice<u8>, i: i64, s: str) -> bool {
+  sb := s.bytes()
+  n := sb.len()
+  if i < 0 || n > b.len() || i > b.len() - n {
+    return false
+  }
+  mut k := 0
+  loop {
+    if k >= n { break true }
+    if b[i + k] != sb[k] { break false }
+    k = k + 1
+  }
+}
+
+// ASCII-lowercase one byte value. Only A-Z folds: HTTP field names and parameter attributes are
+// case-insensitive over ASCII alone (RFC 9110 §5.1, §5.6.6), and folding beyond that would make
+// non-ASCII bytes compare equal by accident.
+fn lower(c: i64) -> i64 = if c >= UPPER_A && c <= UPPER_Z { c + CASE } else { c }
+
+// Whether `b[i..j]` equals `s` ignoring ASCII case, without materializing a `str`. Field names are
+// compared this way so an unrecognized header never has to be valid UTF-8 to be skipped.
+fn ci_eq_bytes(b: slice<u8>, i: i64, j: i64, s: str) -> bool {
+  sb := s.bytes()
+  if j - i != sb.len() {
+    return false
+  }
+  mut k := 0
+  loop {
+    if k >= sb.len() { break true }
+    if lower(b[i + k] as i64) != lower(sb[k] as i64) { break false }
+    k = k + 1
+  }
+}
+
+// Whether two `str`s are equal ignoring ASCII case.
+fn ci_eq(a: str, s: str) -> bool = ci_eq_bytes(a.bytes(), 0, a.len(), s)
+
+// `s` without leading/trailing SP/HTAB (the OWS of RFC 9110 §5.6.3). A view, never a copy.
+fn trim(s: str) -> str {
+  sb := s.bytes()
+  mut a := 0
+  mut z := s.len()
+  loop {
+    if a >= z { break }
+    c := sb[a] as i64
+    if c != SP && c != HTAB { break }
+    a = a + 1
+  }
+  loop {
+    if z <= a { break }
+    c := sb[z - 1] as i64
+    if c != SP && c != HTAB { break }
+    z = z - 1
+  }
+  s[a..z]
+}
+
+// The type/disposition token of a header value: everything before the first ';'. A ';' cannot occur
+// inside a token, so splitting at the first one is exact.
+fn head_token(s: str) -> str {
+  sb := s.bytes()
+  mut i := 0
+  loop {
+    if i >= s.len() { break s }
+    if sb[i] as i64 == SEMI { break s[0..i] }
+    i = i + 1
+  }
+}
+
+// The parameter list of a header value: everything after the first ';' (empty when there is none).
+fn tail_params(s: str) -> str {
+  sb := s.bytes()
+  mut i := 0
+  loop {
+    if i >= s.len() { break "" }
+    if sb[i] as i64 == SEMI { break s[i + 1..s.len()] }
+    i = i + 1
+  }
+}
+
+// ── Parameters ────────────────────────────────────────────────────────────────────────────────
+
+// The outcome of looking one parameter up. Three-way on purpose: "not there" and "there but
+// un-returnable" are different facts, and collapsing them would let a malformed `filename` read as
+// a file without one.
+Param {
+  Value(str),
+  Absent,
+  Invalid,
+}
+
+// The value of parameter `attr` in a header value's parameter list `params` (what `tail_params`
+// returns), unquoted-or-quoted, attribute name compared case-insensitively (RFC 9110 §5.6.6).
+//
+// `Invalid` means the header cannot be honoured rather than merely lacks the parameter:
+//   - an unterminated quoted-string — the rest of the list cannot be split reliably;
+//   - a quoted value carrying a `\` quoted-pair — the value the sender meant is NOT the bytes on
+//     the wire, so it cannot be handed back zero-copy, and returning the still-escaped bytes would
+//     silently give the caller a wrong filename. Refusing beats lying;
+//   - the attribute we were asked for present with no value at all.
+// A `\` inside some OTHER parameter's value is not fatal: it is scanned over correctly (a
+// quoted-pair never terminates the string) and skipped.
+fn param(params: str, attr: str) -> Param {
+  pb := params.bytes()
+  n := params.len()
+  mut i := 0
+  loop {
+    // Skip the ';' separators and any OWS around them.
+    loop {
+      if i >= n { break }
+      c := pb[i] as i64
+      if c != SEMI && c != SP && c != HTAB { break }
+      i = i + 1
+    }
+    if i >= n {
+      break Param.Absent
+    }
+    // The attribute name runs to '=' (it has a value) or ';' (it does not).
+    mut e := i
+    loop {
+      if e >= n { break }
+      c := pb[e] as i64
+      if c == EQ || c == SEMI { break }
+      e = e + 1
+    }
+    name := trim(params[i..e])
+    if e >= n || pb[e] as i64 == SEMI {
+      // A valueless parameter. Fatal only when it is the one we were asked for.
+      if ci_eq(name, attr) {
+        break Param.Invalid
+      }
+      i = e + 1
+    } else {
+      // Past the '=', tolerating the whitespace some senders leave around it.
+      mut v := e + 1
+      loop {
+        if v >= n { break }
+        c := pb[v] as i64
+        if c != SP && c != HTAB { break }
+        v = v + 1
+      }
+      if v < n && pb[v] as i64 == DQUOTE {
+        // quoted-string: scan to the closing '"', stepping OVER quoted-pairs so an escaped quote
+        // does not end it early.
+        mut q := v + 1
+        mut escaped := false
+        mut closed := false
+        loop {
+          if q >= n { break }
+          c := pb[q] as i64
+          if c == BSLASH {
+            escaped = true
+            q = q + 2
+          } else {
+            if c == DQUOTE {
+              closed = true
+              break
+            }
+            q = q + 1
+          }
+        }
+        if !closed {
+          break Param.Invalid
+        }
+        if ci_eq(name, attr) {
+          break if escaped { Param.Invalid } else { Param.Value(params[v + 1..q]) }
+        }
+        i = q + 1
+      } else {
+        // A bare token value: it runs to the next ';'.
+        mut te := v
+        loop {
+          if te >= n { break }
+          if pb[te] as i64 == SEMI { break }
+          te = te + 1
+        }
+        if ci_eq(name, attr) {
+          break Param.Value(trim(params[v..te]))
+        }
+        i = te
+      }
+    }
+  }
+}
+
+// ── Boundary ──────────────────────────────────────────────────────────────────────────────────
+
+// Whether a boundary value can be used as-is: 1..=70 bytes (RFC 2046 §5.1.1), no control byte and
+// no '"'. The length bound and the control bytes are the RFC's; the '"' is ours — a boundary
+// carrying one could only have reached us through a quoted-string, so accepting it would mean the
+// delimiter we scan for is not the one the sender wrote.
+fn usable_boundary(v: str) -> bool {
+  vb := v.bytes()
+  n := v.len()
+  if n < 1 || n > MAX_BOUNDARY {
+    return false
+  }
+  mut i := 0
+  loop {
+    if i >= n { break true }
+    c := vb[i] as i64
+    if c < 32 || c == DEL { break false }
+    if c == DQUOTE { break false }
+    i = i + 1
+  }
+}
+
+// The boundary of a `Content-Type: multipart/form-data; boundary=...` header value, or "" when the
+// request is not a multipart form (wrong media type, no `boundary` parameter) or the boundary is
+// unusable (see `usable_boundary`, and the quoted-pair refusal in `param`).
+//
+// "" is the one "this body is not walkable" answer, so an application checks once:
+// `if bd.len() == 0 { 400 }`. The result is a `str` view into `content_type` — no allocation.
+pub fn boundary(content_type: str) -> str {
+  if !ci_eq(trim(head_token(content_type)), "multipart/form-data") {
+    return ""
+  }
+  match param(tail_params(content_type), "boundary") {
+    Value(v) => if usable_boundary(v) { v } else { "" }
+    Absent => ""
+    Invalid => ""
+  }
+}
+
+// ── Iteration ─────────────────────────────────────────────────────────────────────────────────
+
+// One part of a multipart body. Every field is a view into the inputs of `next`; nothing is owned,
+// nothing is copied.
+//   name          — the `name` parameter of Content-Disposition; REQUIRED by RFC 7578 §4.2
+//   filename      — its `filename` parameter, "" when the part is not a file
+//   content_type  — the part's Content-Type header, "" when it declares none (the RFC 7578 §4.4
+//                   default is then `text/plain`, which is the application's call, not ours)
+//   data          — the part's body bytes; empty is legal
+//   next          — where to resume: pass it back as `next`'s `from`
+pub Part {
+  name: str,
+  filename: str,
+  content_type: str,
+  data: slice<u8>,
+  next: i64,
+}
+
+// The outcome of one step of the walk. The three real ones, spelled out: `Result<Option<Part>,
+// Error>` cannot be represented (a nested aggregate payload), and collapsing `Done` into `Invalid`
+// would make a TRUNCATED body look like a well-formed end of iteration — the exact confusion that
+// turns a cut-off upload into a silently short file.
+pub Step {
+  Found(Part),
+  Done,
+  Invalid,
+}
+
+// Whether `--boundary` appears at `i`. A candidate only — see `part_delim_end`/`close_delim_at`.
+fn dashed_at(b: slice<u8>, i: i64, bd: str) -> bool = bytes_at(b, i, "--") && bytes_at(b, i + 2, bd)
+
+// The index just past `i`'s run of transport padding — the SP/HTAB RFC 2046 §5.1.1 allows between
+// a delimiter and the CRLF that ends its line.
+fn skip_padding(b: slice<u8>, i: i64) -> i64 {
+  mut p := i
+  loop {
+    if p >= b.len() { break p }
+    c := b[p] as i64
+    if c != SP && c != HTAB { break p }
+    p = p + 1
+  }
+}
+
+// The index just past a body-part delimiter LINE starting at `i` (`--boundary`, transport padding,
+// CRLF) — i.e. where that part's header section begins — or -1 when no such line starts there.
+//
+// The line check is what keeps a boundary that is a PREFIX of a data line out of the delimiter set:
+// with boundary `SEP`, a data line `--SEPARATE` is not a delimiter, because RFC 2046 §5.1.1 defines
+// the delimiter as a line consisting ENTIRELY of `--`, the boundary, optional whitespace and CRLF.
+// Without it that line would end the part, and the upload would fail on legal content.
+fn part_delim_end(b: slice<u8>, i: i64, bd: str) -> i64 {
+  if !dashed_at(b, i, bd) {
+    return -1
+  }
+  p := skip_padding(b, i + 2 + bd.len())
+  if bytes_at(b, p, "\r\n") { p + 2 } else { -1 }
+}
+
+// Whether the CLOSE delimiter line (`--boundary--`) starts at `i`. Same line rule, except that the
+// body may simply end there: nothing is required after the closing `--` but padding and, if there
+// is any more body at all, a CRLF. What follows that is the epilogue, which §5.1.1 says to ignore.
+fn close_delim_at(b: slice<u8>, i: i64, bd: str) -> bool {
+  if !dashed_at(b, i, bd) {
+    return false
+  }
+  d := i + 2 + bd.len()
+  if !bytes_at(b, d, "--") {
+    return false
+  }
+  e := skip_padding(b, d + 2)
+  e >= b.len() || bytes_at(b, e, "\r\n")
+}
+
+// Whether a delimiter line of either kind starts at `i`.
+fn is_delim_at(b: slice<u8>, i: i64, bd: str) -> bool {
+  close_delim_at(b, i, bd) || part_delim_end(b, i, bd) >= 0
+}
+
+// The index of the CR of the first `CRLF` + delimiter line at or after `from`, or -1 when there is
+// none. The CRLF belongs to the delimiter, not to whatever precedes it (RFC 2046 §5.1.1) — which is
+// exactly why a part's data ends where this begins.
+fn crlf_delim_from(b: slice<u8>, bd: str, from: i64) -> i64 {
+  n := b.len()
+  mut i := from
+  loop {
+    if i + 1 >= n { break -1 }
+    if b[i] as i64 == CR && b[i + 1] as i64 == LF && is_delim_at(b, i + 2, bd) { break i }
+    i = i + 1
+  }
+}
+
+// The index of the first '-' of the delimiter to read at `from`, or -1 when there is none. `from`
+// normally points straight at one (that is what `Part.next` hands back). At `from == 0` it may
+// instead point at RFC 2046 §5.1.1's preamble — arbitrary bytes before the first delimiter, which
+// exist to be ignored — so the scan for a CRLF-preceded delimiter skips it.
+fn delim_at(b: slice<u8>, bd: str, from: i64) -> i64 {
+  if is_delim_at(b, from, bd) {
+    return from
+  }
+  c := crlf_delim_from(b, bd, from)
+  if c < 0 { -1 } else { c + 2 }
+}
+
+// The index just past the CRLF that ends the field line starting at `i`, or -1 when the line is not
+// terminated.
+fn line_end(b: slice<u8>, i: i64) -> i64 {
+  n := b.len()
+  mut k := i
+  loop {
+    if k + 1 >= n { break -1 }
+    if b[k] as i64 == CR && b[k + 1] as i64 == LF { break k }
+    k = k + 1
+  }
+}
+
+// The next part of `body` at or after `from`, where `from` is the index of the first '-' of a
+// delimiter (`--boundary`); callers start at 0 and then pass `Part.next` back.
+//
+// `Done` is the close-delimiter (`--boundary--`); the RFC 2046 epilogue after it is ignored.
+// `Invalid` is a body that does not parse — no delimiter at all, a header line with no ':' or an
+// obsolete `obs-fold` continuation (RFC 9110 §5.2 removed it, and guessing at its intent is how
+// smuggling bugs start), a Content-Disposition that is not `form-data`, a missing `name` parameter,
+// a header line that is not valid UTF-8 (`Part`'s fields are `str`), or a body that ends before its
+// closing delimiter. The application answers 400; there is nothing partial worth handing back.
+pub fn next(body: slice<u8>, boundary: str, from: i64) -> Step {
+  // An empty boundary would make `--` alone a delimiter and split the body at nonsense positions.
+  // It is what `boundary()` returns for a request that is not a walkable multipart form, so this
+  // catches the caller who forgot to check. An out-of-range `from` is refused here rather than
+  // deeper: every scan below then starts inside the body, so no internal index can run away.
+  if from < 0 || from > body.len() || boundary.len() == 0 {
+    return Step.Invalid
+  }
+  d := delim_at(body, boundary, from)
+  if d < 0 {
+    return Step.Invalid
+  }
+  // The close-delimiter ends the body: `--boundary--`.
+  if close_delim_at(body, d, boundary) {
+    return Step.Done
+  }
+  hs := part_delim_end(body, d, boundary)
+  if hs < 0 {
+    // `delim_at` reports only the two kinds, and the close one is already answered — so this cannot
+    // fire. The guard keeps that invariant checked here instead of assumed.
+    return Step.Invalid
+  }
+  mut hp := hs
+
+  // ── The part's header section: field lines up to the empty line.
+  mut part_name := ""
+  mut part_filename := ""
+  mut part_type := ""
+  mut have_name := false
+  mut data_start := -1
+  loop {
+    if hp >= body.len() {
+      return Step.Invalid            // truncated: the header section has no empty line
+    }
+    if bytes_at(body, hp, "\r\n") {
+      data_start = hp + 2
+      break
+    }
+    lead := body[hp] as i64
+    if lead == SP || lead == HTAB {
+      return Step.Invalid            // obs-fold continuation line
+    }
+    le := line_end(body, hp)
+    if le < 0 {
+      return Step.Invalid
+    }
+    // Split the field line at its first ':'.
+    mut ci := hp
+    loop {
+      if ci >= le { break }
+      if body[ci] as i64 == COLON { break }
+      ci = ci + 1
+    }
+    if ci >= le {
+      return Step.Invalid            // a field line with no ':'
+    }
+    if ci_eq_bytes(body, hp, ci, "content-disposition") {
+      value := match body[ci + 1..le].as_str() {
+        Ok(v) => v
+        Err(_) => { return Step.Invalid }
+      }
+      // RFC 7578 §4.2: every part is `Content-Disposition: form-data; name="..."`.
+      if !ci_eq(trim(head_token(value)), "form-data") {
+        return Step.Invalid
+      }
+      params := tail_params(value)
+      match param(params, "name") {
+        Value(v) => {
+          part_name = v
+          have_name = true
+        }
+        Absent => { return Step.Invalid }
+        Invalid => { return Step.Invalid }
+      }
+      match param(params, "filename") {
+        Value(v) => { part_filename = v }
+        Absent => {}
+        Invalid => { return Step.Invalid }
+      }
+    }
+    if ci_eq_bytes(body, hp, ci, "content-type") {
+      part_type = match body[ci + 1..le].as_str() {
+        Ok(v) => trim(v)
+        Err(_) => { return Step.Invalid }
+      }
+    }
+    // Any other field is skipped: it need not even be valid UTF-8 to be ignored.
+    hp = le + 2
+  }
+  if !have_name {
+    return Step.Invalid              // no Content-Disposition at all
+  }
+
+  // ── The part's data: everything up to the next delimiter's CRLF.
+  end := crlf_delim_from(body, boundary, data_start)
+  if end < 0 {
+    return Step.Invalid              // truncated: no terminating delimiter
+  }
+  return Step.Found(Part {
+    name: part_name,
+    filename: part_filename,
+    content_type: part_type,
+    data: body[data_start..end],
+    next: end + 2,
+  })
+}

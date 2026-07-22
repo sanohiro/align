@@ -8,7 +8,13 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **W4 is COMPLETE (#617): handler failures no longer vanish — unary
+_Last updated: 2026-07-22, **the REST-completeness backlog's last `TODO` is closed (#619):
+`pkg.web.multipart` walks an RFC 7578 upload body with zero allocation and zero copy — `boundary()`
+reads the delimiter out of the Content-Type, and `next(body, bd, from)` hands back
+`Found(Part)` / `Done` / `Invalid` where every name, filename, content-type and data run is a view
+into the caller's own bytes. A PUBLIC sibling module (`Part`/`Step` are named by applications), NOT
+wired into the core surface: multipart is a body codec, not a routing concern, so the module imports
+nothing.** Before that, **W4 was COMPLETE (#617): handler failures no longer vanish — unary
 handlers and stream pumps log one best-effort stderr line with the real request method/path and the
 complete builtin `Error`, while preserving the fixed 500/stream-close behavior and keeping the serve
 loop alive.** Before that, **the W4 malformed-request matrix was DONE (#616): pkg.web now drives
@@ -200,6 +206,21 @@ READMEs):**
    verdicts, logged 500s, and loop survival are E2E-pinned. The implementation also landed the two
    narrow language enablers the design required (function-value slices and Copy-struct
    `.to_array()`). Next: multipart.
+7. **DONE (#619) — `pkg.web.multipart`, the REST-completeness backlog's last `TODO`:** an RFC 7578
+   upload walk with **zero allocation and zero copy** — `boundary(content_type) -> str` (or `""`,
+   the single "not a walkable multipart form" answer) and `next(body, bd, from) -> Found(Part) |
+   Done | Invalid`, where `Part`'s name / filename / content_type / data are all views into the
+   caller's own bytes and iteration state is one `i64` the caller owns (`Part.next`). A **public
+   sibling** module like `cookie`/`cors` — `Part`/`Step` are named by applications — and
+   deliberately **not** wired into the core surface, which keeps it import-free: a body codec is not
+   a routing concern. Design decisions worth remembering: `Step` is a three-way or-kind because
+   collapsing `Done` into `Invalid` would make a TRUNCATED body read as a well-formed end of
+   iteration; a `\` quoted-pair in a quoted `filename`/`boundary` is REFUSED rather than returned
+   still-escaped (un-escaping would allocate, and the escaped bytes are the wrong filename); and a
+   delimiter is checked as a whole LINE (RFC 2046 §5.1.1), so a data line that merely starts with
+   the boundary (`--SEPARATE` for boundary `SEP`) stays inside the part. No compiler enabler was
+   needed. `crates/align_driver/tests/apps_web_multipart.rs` drives the shipped source
+   (`include_str!`) through 12 cases. **§2b of the plan now has no `TODO` rows left.**
 
 **DONE 2026-07-22 — borrow liveness ends at the owner's DROP, not only at its MOVE.** The one open
 item where the language accepted a program it must reject is closed. `MoveCheck` invalidated a view
@@ -645,12 +666,16 @@ apps/web/pkg/web/cookie.align           get / build (+CookieOpts) — RFC 6265; 
 apps/web/pkg/web/cors.align             CorsPolicy / valid / allow_origin / vary_origin /
                                         method_allowed — exact-origin match, wildcard+credentials
                                         rejected
+apps/web/pkg/web/multipart.align        boundary / next (+Part, Step) — RFC 7578 upload walk, zero
+                                        allocation and zero copy; a PUBLIC sibling module, unwired
+                                        from the core surface (a body codec, not routing)
 apps/jwt/pkg/jwt.align                  encode_hs256 / decode_hs256 / time_claims_valid — alg-pinned,
                                         constant-time compare, byte-identical to the jwt.io vector
 ```
 
 Driver tests: `apps_web_router.rs` (7), `apps_web_serve.rs` (3, real socket), `apps_web_query.rs` (3),
-`apps_web_cookie.rs` (3), `apps_web_cors.rs` (3), `apps_jwt.rs` (3), `pkg_foundation.rs` (6),
+`apps_web_cookie.rs` (3), `apps_web_cors.rs` (3), `apps_web_multipart.rs` (12), `apps_jwt.rs` (3),
+`pkg_foundation.rs` (6),
 `struct_handle_fields.rs` (9), `struct_slice_fields.rs` (5), `fn_values.rs` (21).
 
 **The designed handler contract runs end-to-end over a real socket** (`apps_web_serve.rs`): radix
@@ -703,9 +728,10 @@ Nothing there stands in for a missing compiler feature.
    enabler `ctx.headers()` (`std-design/http.md` item 10): an arbitrary-name lookup cannot ride a
    single stored view, so `Ctx` carries the detached header-table view and `web.header` forwards to
    `c.headers.get(name)`. pkg.web duplicates no lookup.
-4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data; OAuth —
-   client flows are buildable now, validating a PUBLIC provider's token is blocked on RS256
-   (std.crypto RSA verify over the already-linked libssl); JWT HS384/512.
+4. Backlog (`docs/impl/15-pkg-web-plan.md` §2b is the committed list): multipart/form-data is DONE
+   (#619, `pkg.web.multipart`); OAuth — client flows are buildable now, validating a PUBLIC
+   provider's token is blocked on RS256 (std.crypto RSA verify over the already-linked libssl);
+   JWT HS384/512.
 5. W3-W7 per the design doc: accessor surface, hardening matrix, the bench gate (`bench/web_router`,
    `bench/web_e2e`), middleware-lite + SSE, the Fiber comparison.
 

@@ -575,6 +575,103 @@ byte-identical before and after; only the prefork wrapper above is pkg-side work
    per-edge `Route` struct copy forced by `routes[i].pattern` being rejected through a
    `slice<struct>`.
 
+## multipart/form-data — a sibling module, SHIPPED 2026-07-22
+
+`pkg.web.multipart` (`apps/web/pkg/web/multipart.align`) walks an RFC 7578 upload body. It closes
+the last `TODO` in the plan's REST-completeness backlog: file upload is standard web-server
+functionality, so it is BUILT — but it is built where it belongs.
+
+**Why a sibling module and not core surface.** The Minimalism constraint above fixes the root
+surface at routing, accessors, responders, middleware and streaming. multipart is a body **codec**,
+not a routing concern: nothing about dispatch changes when a request carries a form. So it ships as
+a public sibling of `pkg.web.cookie` / `pkg.web.cors` — public, not `internal`, because `Part` and
+`Step` are types an application NAMES; and unwired from `web.align`, which keeps the module
+dependency-free (it imports nothing and touches only `slice<u8>` and `str`). An application joins
+the two halves itself out of what `pkg.web` already hands out — `header(c, "content-type")` and
+`body(c)` — so no request bytes take a detour through the framework.
+
+**Surface.**
+
+```text
+multipart.Part { name: str, filename: str, content_type: str, data: slice<u8>, next: i64 }
+multipart.Step { Found(Part), Done, Invalid }
+
+multipart.boundary(content_type: str) -> str
+//   the boundary of a `multipart/form-data` Content-Type value, or "" when the request is not a
+//   walkable multipart form. A view into `content_type`.
+multipart.next(body: slice<u8>, boundary: str, from: i64) -> Step
+//   the next part at or after `from` — the byte index of the first '-' of a delimiter. Callers
+//   start at 0 and then pass `Part.next` back.
+```
+
+```align
+fn upload(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {
+  bd := pkg.web.multipart.boundary(pkg.web.header(c, "content-type") else { "" })
+  if bd.len() == 0 {
+    return pkg.web.status(400)                     // not a multipart form
+  }
+  body := pkg.web.body(c)
+  mut off := 0
+  mut files := 0
+  loop {
+    match pkg.web.multipart.next(body, bd, off) {
+      Found(p) => {                                // p.name / p.filename / p.content_type / p.data
+        if p.filename.len() > 0 { files = files + 1 }
+        off = p.next
+      }
+      Done => { break }
+      Invalid => { return pkg.web.status(400) }    // malformed body
+    }
+  }
+  pkg.web.text(template "{files} files")
+}
+```
+
+**Decisions worth keeping.**
+
+- **Zero allocation, zero copy — invariant 1 holds through the codec.** Every name, filename,
+  content-type and data run is a view into the caller's inputs, so a 200 MB upload costs exactly the
+  buffer it arrived in. Iteration state is one `i64` the caller owns (`Part.next`), not a parser
+  handle: that is what keeps the walk an ordinary `loop` over pure functions with nothing to drop.
+- **Three outcomes, spelled out.** `Result<Option<Part>, Error>` is unrepresentable today (a nested
+  aggregate payload), and collapsing `Done` into `Invalid` would make a TRUNCATED body read as a
+  well-formed end of iteration — the exact confusion that stores a cut-off upload as a whole file.
+  So `Step` is the or-kind, the same reasoning that produced `types.Middleware`.
+- **Escapes are refused, never guessed.** A quoted `filename`/`boundary` carrying a `\` quoted-pair
+  is NOT the bytes on the wire, so it cannot be handed back zero-copy; returning the still-escaped
+  form would silently give the caller a wrong filename. `boundary` answers `""` and `next` answers
+  `Invalid` instead. Un-escaping would mean allocating — the one thing this module refuses to do
+  behind the caller's back.
+- **A delimiter is a whole LINE** (RFC 2046 §5.1.1): CRLF, `--`, the boundary, optional transport
+  padding, CRLF — or `--` for the close-delimiter. Checking the whole line is what keeps a data line
+  that merely STARTS with the boundary (`--SEPARATE` when the boundary is `SEP`) inside the part
+  instead of truncating legal content there. The preamble before the first delimiter and the
+  epilogue after the close one are ignored, as the RFC requires.
+- **Strict where HTTP is settled.** `name` is REQUIRED (RFC 7578 §4.2), the disposition must be
+  `form-data`, `obs-fold` continuations are rejected rather than interpreted (RFC 9110 §5.2 removed
+  them, and guessing at a folded header's intent is how smuggling bugs start), and field names /
+  parameter attributes fold ASCII case only. Unknown headers are skipped by a byte-level compare, so
+  they need not even be valid UTF-8; a RECOGNIZED header that is not UTF-8 is `Invalid`, because
+  `Part`'s fields are `str`.
+- **`boundary()` has one failure answer.** `""` means "not a walkable multipart form" for every
+  reason — wrong media type, no parameter, empty, over 70 bytes (§5.1.1), a control byte, a `"`, an
+  unterminated quote, an escape — so an application checks once. `next` refuses an empty boundary
+  for the caller who forgot: `--` alone would split the body at nonsense positions.
+
+**Not in v1, deliberately:** no field map or "collect into an array" convenience (that allocates, and
+which fields matter is the application's business), no streaming/chunked multipart (the body is one
+buffer today — `next` is a pure function of it, so a future streaming form is additive), no
+`Content-Transfer-Encoding` decoding (RFC 7578 §4.7 says it must not be used), and no RFC 5987
+`filename*` decoding (percent-decoding allocates; `std.encoding` is the visible step if a consumer
+needs it).
+
+**Tests:** `crates/align_driver/tests/apps_web_multipart.rs` — 12 cases over the shipped source
+(`include_str!`): the two-part text+file body, zero-length parts, preamble/epilogue/transport
+padding, case-insensitive names, quoted vs bare parameters, a `;` inside a quoted filename, missing
+`name` / wrong disposition / obs-fold / no-colon lines, truncation as `Invalid` rather than `Done`,
+the boundary appearing inside a part's data, a verbatim binary data view (NUL / 0xFF / bare CRLF),
+the `boundary()` accept/reject rows, and the empty-boundary and out-of-range `from` guards.
+
 ## Slices (F3 of the plan)
 
 - **W1 — router core.** Pattern parse + validation; the **radix tree** (static/param/wildcard
