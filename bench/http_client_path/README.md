@@ -15,10 +15,10 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        30998           340
-  align                6.00         480.0            0.0        34416           388
+  floor                0.00           0.0            0.0        30974           599
+  align                5.00         352.0            0.0        34241           536
 
-  http.get's CPU work above the floor:  3418 ns/req, 6.00 allocations
+  http.get's CPU work above the floor:  3267 ns/req, 5.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -100,6 +100,17 @@ idle map. Moving that key instead makes the common path **7 → 6 allocations** 
 480); three 100k-request runs measured **3219 / 3418 / 3575 ns** above the floor, CPU-neutral at this
 noise level. The harness now pins 6. The same cut makes the 200 KiB probe 10 → 9 allocations.
 
+The pool also discarded its idle bucket on every take of the last conn, then rebuilt the same
+`Vec<IdleConn>` on the corresponding put. Keeping that empty bucket while the request is in flight
+reuses its 128-byte allocation. Every terminal path that does not put removes the bucket if it is
+still empty; if another request refilled it concurrently, the conditional cleanup leaves that conn
+untouched. The common path is now **6 → 5 allocations** and **480 → 352 fresh B/request**. Three
+100k-request runs measured **3267 / 3181 / 3451 ns** above the floor, again CPU-neutral at this noise
+level. A temporary exact-size histogram made the cut explicit: the prior six allocations were 9 B
+(host key), 50 B (request bytes at the sampled port), 72 B (response handle), 93 B (response bytes),
+and two 128 B blocks (header spans and the idle bucket); this removes the bucket block. The harness
+pins 5; the 200 KiB probe is 9 → 8 allocations.
+
 ### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
 The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
@@ -162,9 +173,10 @@ Runtime-only stash/rebuild A/B, with the benchmark change retained in both arms:
 | 200 KiB, pair 3 | 5227 | 3390 | −1837 ns |
 
 The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. In that runtime-only #608 A/B,
-allocation events stayed 10 because both arms predated the pool-key move; the current total is 9.
+allocation events stayed 10 because both arms predated the pool-key and idle-bucket cuts; the current
+total is 8.
 Geometric growth capped at the framed total reduces retained growth from **229376 → 172116
-bytes/request**. The benchmark's 6-allocation regression ceiling now applies only to its default
+bytes/request**. The benchmark's 5-allocation regression ceiling now applies only to its default
 13-byte response; `BODY=...` is intentionally a buffer-growth probe and must print those counts
 rather than aborting before it can report them.
 
