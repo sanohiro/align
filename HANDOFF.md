@@ -8,8 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the HTTP response header-span inline cut is DONE (#611): the common
-`Content-Type` + `Content-Length` pair now lives inside the opaque response
+_Last updated: 2026-07-22, **the HTTP borrowed-host pool lookup is DONE (#612):
+authority splitting now returns a URL-backed host slice, and the pool is keyed by host first so
+`HashMap<String, ...>` can query it with `&str`; `(scheme, port)` remains the inner endpoint key.
+The common path falls 4 → 3 allocations/request and 272 → 263 fresh bytes with CPU flat at ~3.2 µs
+above the syscall floor.** Before that, **the HTTP response header-span inline cut landed (#611):
+the common `Content-Type` + `Content-Length` pair now lives inside the opaque response
 handle, while a third header spills losslessly to the existing heap representation. The common path
 falls 5 → 4 allocations/request and 352 → 272 fresh bytes with CPU flat at ~3.1 µs above the syscall
 floor.** Before that, **the HTTP idle-bucket reuse cut landed (#610):
@@ -118,6 +122,12 @@ READMEs):**
      a third header spills to a `Vec` with order, lookup, and the 128-header cap preserved. This makes
      the common path **5 → 4 allocations** and fresh bytes **352 → 272 B/request**; CPU stays flat
      (three 100k runs 3113/3363/3146 ns above the floor). The benchmark pins 4; 200 KiB is 8 → 7.
+   - **DONE (#612) — borrow host through pool lookup:** `http_split_authority` now
+     returns a host slice into the URL, and the idle pool's outer `String` host key supports borrowed
+     lookup; `(scheme, port)` is an inner map so schemes and ports still cannot cross. Host ownership
+     is allocated only when a new host bucket is first created, not per request. This makes the common
+     path **4 → 3 allocations** and fresh bytes **272 → 263 B/request**; CPU stays flat (three 100k
+     runs 3054/3468/3229 ns above the floor). The benchmark pins 3; 200 KiB is 7 → 6.
    - **DONE (#608) — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
      direct-read only a large framed body's middle into the response buffer, then leave the last
      32767 bytes to the original unclamped read. This keeps 13 B / 8 KiB flat, makes 200 KiB
@@ -136,10 +146,10 @@ READMEs):**
      `Incomplete`; an oversized head whose cap-crossing read also carried the final blank line
      returned `Ok` and bypassed it. The successful-head path now checks `body_start <= 256 KiB`,
      with a mutation-checked socket regression.
-   - The remaining four common-path allocations need representation/reuse work: the parsed host
-     `String` (9 B here), request bytes (~50 B), enlarged response `Box` (120 B, including two inline
-     spans), and response bytes (93 B here). Builder calls also retain two `String`s per caller header.
-     This is a bigger design question than the redundant ownership hops removed above.
+   - The remaining three common-path allocations need representation/reuse work: request bytes
+     (~50 B), the response `Box` (120 B, including two inline spans), and response bytes (93 B here).
+     Builder calls also retain two `String`s per caller header. This is a bigger design question than
+     the redundant ownership hops removed above.
 2. Then: `bench/web_router`'s scaling row redesign + CI gate, W4's remaining test matrices,
    middleware-lite (W6, designed only), multipart.
 

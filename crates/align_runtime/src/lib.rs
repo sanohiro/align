@@ -13331,8 +13331,8 @@ const HTTP_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 // The `SSL*` AND the fd are freed on EVERY error path.
 // ---------------------------------------------------------------------------------------------
 
-/// URL scheme — the pool key's first component (a TLS conn must never satisfy a plaintext bucket or
-/// vice versa) and the switch selecting the plaintext vs TLS connection path.
+/// URL scheme — an endpoint-key component (a TLS conn must never satisfy a plaintext bucket or vice
+/// versa) and the switch selecting the plaintext vs TLS connection path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum HttpScheme {
     Http,
@@ -13816,17 +13816,23 @@ struct IdleConn {
     idle_since: std::time::Instant,
 }
 
+/// Host is the outer key so a URL's borrowed host slice can query the pool without first allocating
+/// a `String`; scheme + port remain a separate endpoint key so TLS/plaintext and ports never cross.
+type HttpHostPool = std::collections::HashMap<(HttpScheme, i64), Vec<IdleConn>>;
+type HttpIdlePool = std::collections::HashMap<String, HttpHostPool>;
+
 /// A `client` (`std.http`) — the HTTP/1.1 client handle from `http.client()`. An owned **Move** handle
 /// (like `reader`/`writer`/`tcp_conn`). It owns a **keepalive connection pool** (http.md R3): idle
-/// conns keyed by the connect target `(host, port)`, reused by `get`/`post`/`request` to the same
-/// authority with zero opt-in, and all closed on `Drop` (http.md P5 — no fd leak across pool churn).
+/// conns keyed first by host (borrowed lookup), then `(scheme, port)`, reused by
+/// `get`/`post`/`request` to the same authority with zero opt-in, and all closed on `Drop` (http.md
+/// P5 — no fd leak across pool churn).
 ///
 /// The map is behind a `Mutex` so a future `get_many` (task_group over shared workers) can share one
 /// client across threads; the v1 bound-receiver norm is single-threaded and never contends. A conn is
 /// only ever *idle* in the map between requests — an in-flight exchange holds it out, so the lock is
 /// held only for the O(1) take/put, never across blocking I/O.
 pub struct HttpClient {
-    idle: std::sync::Mutex<std::collections::HashMap<(HttpScheme, String, i64), Vec<IdleConn>>>,
+    idle: std::sync::Mutex<HttpIdlePool>,
 }
 
 // SAFETY: `IdleConn` holds a raw `*mut c_void` (an OpenSSL `SSL*`), which makes it non-`Send`, so the
@@ -13839,8 +13845,9 @@ unsafe impl Send for HttpClient {}
 unsafe impl Sync for HttpClient {}
 
 impl HttpClient {
-    /// Take a live idle conn for `key`, freeing any idle past [`HTTP_POOL_IDLE_TIMEOUT`] (assumed
-    /// dead) as it scans. Returns the reusable conn's `(fd, ssl)` (`ssl` null for a plaintext bucket).
+    /// Take a live idle conn for `(scheme, host, port)`, freeing any idle past
+    /// [`HTTP_POOL_IDLE_TIMEOUT`] (assumed dead) as it scans. Returns the reusable conn's `(fd, ssl)`
+    /// (`ssl` null for a plaintext bucket).
     /// `None` if the bucket is empty or holds only stale conns. An emptied bucket stays in the map
     /// while the checked-out request is in flight, preserving its `Vec` allocation for the common
     /// take/put cycle. Every terminal path that does not put calls [`Self::remove_empty`], so distinct
@@ -13850,11 +13857,11 @@ impl HttpClient {
     /// close_notify record and block on a full/dead socket — runs OUTSIDE the lock: reaped conns are
     /// collected under the lock and closed after releasing it, so blocking TLS teardown never stalls a
     /// concurrent `get_many` worker. This preserves the plaintext pool's no-I/O-under-lock property.)
-    fn take_idle(&self, key: &(HttpScheme, String, i64)) -> Option<(i32, *mut c_void)> {
+    fn take_idle(&self, scheme: HttpScheme, host: &str, port: i64) -> Option<(i32, *mut c_void)> {
         let mut stale: Vec<(i32, *mut c_void)> = Vec::new();
         let found = {
             let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match map.get_mut(key) {
+            match map.get_mut(host).and_then(|endpoints| endpoints.get_mut(&(scheme, port))) {
                 None => None,
                 Some(bucket) => {
                     let mut found = None;
@@ -13875,41 +13882,58 @@ impl HttpClient {
         found
     }
 
-    /// Remove `key` only if its idle bucket is still empty. Called when an exchange terminates
+    /// Remove an endpoint only if its idle bucket is still empty. Called when an exchange terminates
     /// without returning a conn: if a concurrent request refilled the bucket meanwhile, its conn and
     /// key remain untouched. This bounds empty-key retention to an in-flight request while letting
     /// the single-threaded/common take/put cycle reuse the bucket's allocation.
-    fn remove_empty(&self, key: &(HttpScheme, String, i64)) {
+    fn remove_empty(&self, scheme: HttpScheme, host: &str, port: i64) {
         let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if map.get(key).is_some_and(Vec::is_empty) {
-            map.remove(key);
+        let remove_host = if let Some(endpoints) = map.get_mut(host) {
+            let endpoint = (scheme, port);
+            if endpoints.get(&endpoint).is_some_and(Vec::is_empty) {
+                endpoints.remove(&endpoint);
+            }
+            endpoints.is_empty()
+        } else {
+            false
+        };
+        if remove_host {
+            map.remove(host);
         }
     }
 
-    /// Return a reusable conn `(fd, ssl)` to `key`'s idle bucket. Expired idle conns are reaped
-    /// **first** (so a fresh conn is never dropped in favour of stale ones); only if the bucket is
-    /// still at [`HTTP_POOL_MAX_IDLE_PER_HOST`] after reaping is the new conn freed instead of pooled.
+    /// Return a reusable conn `(fd, ssl)` to `(scheme, host, port)`'s idle bucket. Expired idle conns
+    /// are reaped **first** (so a fresh conn is never dropped in favour of stale ones); only if the
+    /// bucket is still at [`HTTP_POOL_MAX_IDLE_PER_HOST`] after reaping is the new conn freed instead
+    /// of pooled.
     /// Every conn to be freed (reaped stale + a possibly-overflowing new conn) is collected under the
     /// lock and torn down AFTER releasing it — a TLS `close_tls` can WRITE a close_notify and block, so
     /// it must never run under the pool lock (preserving the no-I/O-under-lock property).
-    fn put_idle(&self, key: (HttpScheme, String, i64), fd: i32, ssl: *mut c_void) {
+    fn put_idle(&self, scheme: HttpScheme, host: &str, port: i64, fd: i32, ssl: *mut c_void) {
         let mut to_close: Vec<(i32, *mut c_void)> = Vec::new();
         {
             let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let bucket = map.entry(key).or_default();
-            bucket.retain(|c| {
-                let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
-                if !live {
-                    to_close.push((c.fd, c.ssl)); // reap stale FIRST, close outside the lock
+            if let Some(endpoints) = map.get_mut(host) {
+                let bucket = endpoints.entry((scheme, port)).or_default();
+                bucket.retain(|c| {
+                    let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
+                    if !live {
+                        to_close.push((c.fd, c.ssl)); // reap stale FIRST, close outside the lock
+                    }
+                    live
+                });
+                // Capacity check runs AFTER the reap above, so a fresh conn is never dropped in
+                // favour of stale ones.
+                if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
+                    to_close.push((fd, ssl)); // bucket full after reaping — free the new conn
+                } else {
+                    bucket.push(IdleConn { fd, ssl, idle_since: std::time::Instant::now() });
                 }
-                live
-            });
-            // Capacity check runs AFTER the reap above, so a fresh conn is never dropped in favour of
-            // stale ones.
-            if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
-                to_close.push((fd, ssl)); // bucket full even after reaping — free the new conn
             } else {
-                bucket.push(IdleConn { fd, ssl, idle_since: std::time::Instant::now() });
+                let bucket = vec![IdleConn { fd, ssl, idle_since: std::time::Instant::now() }];
+                let mut endpoints = HttpHostPool::new();
+                endpoints.insert((scheme, port), bucket);
+                map.insert(host.to_owned(), endpoints);
             }
         } // lock released here — the blocking teardown below runs unlocked
         for (fd, ssl) in to_close {
@@ -13940,7 +13964,10 @@ pub unsafe extern "C" fn align_rt_http_client_free(c: *mut HttpClient) {
     // the no-I/O-under-lock property uniform across every close_tls caller).
     let conns: Vec<(i32, *mut c_void)> = {
         let mut map = client.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.drain().flat_map(|(_key, v)| v.into_iter().map(|c| (c.fd, c.ssl))).collect()
+        map.drain()
+            .flat_map(|(_host, endpoints)| endpoints.into_values())
+            .flat_map(|bucket| bucket.into_iter().map(|c| (c.fd, c.ssl)))
+            .collect()
     };
     for (fd, ssl) in conns {
         unsafe { close_tls(ssl, fd) }; // TLS-aware (ssl null → just close the fd)
@@ -14001,12 +14028,12 @@ unsafe fn http_send_all(fd: i32, mut bytes: &[u8]) -> i32 {
     0
 }
 
-/// Split an HTTP authority `host[:port]` into `(host, port)` for the socket connect, handling a
-/// bracketed IPv6 literal (`[::1]:8080` → `("::1", 8080)`). Defaults to `default_port` (80 for
-/// `http://`, 443 for `https://`) when no `:port` is present. Returns `None` on an empty host or a
-/// non-numeric / out-of-range (`1..=65535`) port. The `Host:` header keeps the full authority
+/// Split an HTTP authority `host[:port]` into a borrowed `(host, port)` for the socket connect,
+/// handling a bracketed IPv6 literal (`[::1]:8080` → `("::1", 8080)`). Defaults to `default_port`
+/// (80 for `http://`, 443 for `https://`) when no `:port` is present. Returns `None` on an empty host
+/// or a non-numeric / out-of-range (`1..=65535`) port. The `Host:` header keeps the full authority
 /// (serialized separately); this split is only for the connect address.
-fn http_split_authority(authority: &str, default_port: i64) -> Option<(String, i64)> {
+fn http_split_authority(authority: &str, default_port: i64) -> Option<(&str, i64)> {
     // A default-or-parse helper for the optional `:port` suffix (empty → the scheme default).
     let parse_port = |s: &str| -> Option<i64> {
         if s.is_empty() {
@@ -14023,7 +14050,7 @@ fn http_split_authority(authority: &str, default_port: i64) -> Option<(String, i
             return None;
         }
         let port = parse_port(&rest[close + 1..])?;
-        Some((host.to_string(), port))
+        Some((host, port))
     } else {
         match authority.rfind(':') {
             Some(i) => {
@@ -14034,13 +14061,13 @@ fn http_split_authority(authority: &str, default_port: i64) -> Option<(String, i
                 if host.is_empty() || host.contains(':') {
                     return None;
                 }
-                Some((host.to_string(), parse_port(&authority[i..])?))
+                Some((host, parse_port(&authority[i..])?))
             }
             None => {
                 if authority.is_empty() {
                     return None;
                 }
-                Some((authority.to_string(), default_port))
+                Some((authority, default_port))
             }
         }
     }
@@ -14290,7 +14317,6 @@ unsafe fn http_client_perform(
         Err(s) => return s,
     };
     let client_ref: Option<&HttpClient> = unsafe { client.as_ref() };
-    let key = (scheme, host, port);
     // Block SIGPIPE for the whole HTTPS exchange (handshake + I/O + teardown) on THIS thread — the TLS
     // BIO's `write(2)` carries no `MSG_NOSIGNAL` (http.md Slice 5). Plaintext keeps `MSG_NOSIGNAL` and
     // needs no guard; `.then(..)` leaves the guard `None` there (a no-op). Held for the function.
@@ -14304,13 +14330,13 @@ unsafe fn http_client_perform(
         // else a fresh connect (a TLS handshake for https). On the retry (attempt 1) the pool is
         // BYPASSED — a stale pooled conn is exactly what failed, and the same host can hold several dead
         // idle conns (e.g. after a server restart), so re-taking could hand back another corpse.
-        let pooled = if attempt == 0 { client_ref.and_then(|c| c.take_idle(&key)) } else { None };
+        let pooled = if attempt == 0 { client_ref.and_then(|c| c.take_idle(scheme, host, port)) } else { None };
         let (mut conn, reused) = match pooled {
             Some((fd, ssl)) => (Conn::from_parts(fd, ssl), true),
             None => {
                 let fresh = match scheme {
-                    HttpScheme::Https => unsafe { http_tls_connect(&key.1, key.2) },
-                    HttpScheme::Http => unsafe { http_connect_fd(&key.1, key.2) }.map(|fd| Conn::Plain { fd }),
+                    HttpScheme::Https => unsafe { http_tls_connect(host, port) },
+                    HttpScheme::Http => unsafe { http_connect_fd(host, port) }.map(|fd| Conn::Plain { fd }),
                 };
                 match fresh {
                     Ok(c) => (c, false),
@@ -14318,7 +14344,7 @@ unsafe fn http_client_perform(
                     // ONLY on the fresh path, so they are never wrongly retried).
                     Err(s) => {
                         if let Some(c) = client_ref {
-                            c.remove_empty(&key);
+                            c.remove_empty(scheme, host, port);
                         }
                         return s;
                     }
@@ -14333,12 +14359,12 @@ unsafe fn http_client_perform(
                 // parse: a protocol failure returns `Failed` above and is never pooled.
                 let (fd, ssl) = conn.into_parts();
                 if reusable && let Some(c) = client_ref {
-                    c.put_idle(key, fd, ssl);
+                    c.put_idle(scheme, host, port, fd, ssl);
                 } else {
                     // Not reusable (or no client): free the conn (TLS-aware — ssl null → close fd).
                     unsafe { close_tls(ssl, fd) };
                     if let Some(c) = client_ref {
-                        c.remove_empty(&key);
+                        c.remove_empty(scheme, host, port);
                     }
                 }
                 unsafe { *out = Box::into_raw(Box::new(response)) };
@@ -14355,7 +14381,7 @@ unsafe fn http_client_perform(
                     continue;
                 }
                 if let Some(c) = client_ref {
-                    c.remove_empty(&key);
+                    c.remove_empty(scheme, host, port);
                 }
                 return status;
             }
@@ -24561,21 +24587,24 @@ mod tests {
     /// (80 http / 443 https), handling a bracketed IPv6 literal, and rejecting an empty host / bad port.
     #[test]
     fn http_split_authority_forms() {
-        assert_eq!(http_split_authority("example.com", 80), Some(("example.com".to_string(), 80)));
+        assert_eq!(http_split_authority("example.com", 80), Some(("example.com", 80)));
         // The default port follows the scheme: an authority with no `:port` under https defaults 443.
-        assert_eq!(http_split_authority("example.com", 443), Some(("example.com".to_string(), 443)));
-        assert_eq!(http_split_authority("example.com:8080", 80), Some(("example.com".to_string(), 8080)));
+        assert_eq!(http_split_authority("example.com", 443), Some(("example.com", 443)));
+        assert_eq!(http_split_authority("example.com:8080", 80), Some(("example.com", 8080)));
         // An explicit port wins over the scheme default (https to a non-standard port).
-        assert_eq!(http_split_authority("example.com:8443", 443), Some(("example.com".to_string(), 8443)));
-        assert_eq!(http_split_authority("127.0.0.1:65535", 80), Some(("127.0.0.1".to_string(), 65535)));
-        assert_eq!(http_split_authority("[::1]:8080", 80), Some(("::1".to_string(), 8080)));
-        assert_eq!(http_split_authority("[fe80::1]", 443), Some(("fe80::1".to_string(), 443)));
+        assert_eq!(http_split_authority("example.com:8443", 443), Some(("example.com", 8443)));
+        assert_eq!(http_split_authority("127.0.0.1:65535", 80), Some(("127.0.0.1", 65535)));
+        assert_eq!(http_split_authority("[::1]:8080", 80), Some(("::1", 8080)));
+        assert_eq!(http_split_authority("[fe80::1]", 443), Some(("fe80::1", 443)));
         assert_eq!(http_split_authority("", 80), None); // empty
         assert_eq!(http_split_authority(":80", 80), None); // empty host
         assert_eq!(http_split_authority("h:0", 80), None); // port 0
         assert_eq!(http_split_authority("h:99999", 80), None); // out of range
         assert_eq!(http_split_authority("h:abc", 80), None); // non-numeric
-        assert_eq!(http_split_authority("[::1]", 80), Some(("::1".to_string(), 80)));
+        assert_eq!(http_split_authority("[::1]", 80), Some(("::1", 80)));
+        let owned = String::from("[::1]:8080");
+        let (borrowed, _) = http_split_authority(&owned, 80).unwrap();
+        assert_eq!(borrowed.as_ptr(), owned.as_bytes()[1..].as_ptr(), "IPv6 host aliases the authority instead of allocating");
         // A multi-colon UNBRACKETED authority is malformed (RFC 3986 — a colon-bearing host must be
         // bracketed): reject, never split at the last colon into a garbage host.
         assert_eq!(http_split_authority("example.com:80:80", 80), None); // second colon, no brackets
@@ -25031,7 +25060,7 @@ mod tests {
         unsafe { align_rt_http_resp_free(out) };
         let pooled: usize = {
             let map = unsafe { &*client }.idle.lock().unwrap();
-            map.values().map(Vec::len).sum()
+            map.values().flat_map(|endpoints| endpoints.values()).map(Vec::len).sum()
         };
         assert_eq!(pooled, 0, "a conn whose leftover arrived after the framing must not be pooled");
         unsafe { align_rt_http_client_free(client) };
@@ -25076,7 +25105,7 @@ mod tests {
         unsafe { align_rt_http_resp_free(out) };
         let pooled: usize = {
             let map = unsafe { &*client }.idle.lock().unwrap();
-            map.values().map(Vec::len).sum()
+            map.values().flat_map(|endpoints| endpoints.values()).map(Vec::len).sum()
         };
         assert_eq!(pooled, 0, "the large-body overshoot must make the conn unpoolable");
         unsafe { align_rt_http_client_free(client) };
@@ -25106,11 +25135,11 @@ mod tests {
         let (port, server) = http_serve_pool(resp, 1, false); // exactly one REAL connect: the retry
         let client = align_rt_http_client_new();
         // Seed two dead idle conns under the exact key perform computes for this URL's authority.
-        let key = (HttpScheme::Http, "127.0.0.1".to_string(), port as i64);
+        let host = "127.0.0.1";
         unsafe {
             let cref = &*client;
-            cref.put_idle(key.clone(), dead_fd(), std::ptr::null_mut());
-            cref.put_idle(key.clone(), dead_fd(), std::ptr::null_mut());
+            cref.put_idle(HttpScheme::Http, host, port as i64, dead_fd(), std::ptr::null_mut());
+            cref.put_idle(HttpScheme::Http, host, port as i64, dead_fd(), std::ptr::null_mut());
         }
         let url = format!("http://127.0.0.1:{port}/");
         let mut out: *mut HttpResponse = std::ptr::null_mut();
@@ -25129,25 +25158,37 @@ mod tests {
     fn http_pool_retains_emptied_bucket_until_safe_cleanup() {
         let client = align_rt_http_client_new();
         let cref = unsafe { &*client };
-        let key = (HttpScheme::Http, "example.com".to_string(), 80i64);
+        let (scheme, host, port) = (HttpScheme::Http, "example.com", 80i64);
         let fd = dead_fd();
-        cref.put_idle(key.clone(), fd, std::ptr::null_mut());
-        assert!(cref.idle.lock().unwrap().contains_key(&key), "put creates the bucket");
-        assert_eq!(cref.take_idle(&key), Some((fd, std::ptr::null_mut())), "take returns the pooled fd");
-        assert!(cref.idle.lock().unwrap().contains_key(&key), "take retains the empty bucket for put reuse");
-        cref.remove_empty(&key);
-        assert!(!cref.idle.lock().unwrap().contains_key(&key), "terminal cleanup removes the empty bucket");
+        cref.put_idle(scheme, host, port, fd, std::ptr::null_mut());
+        let has_bucket = || {
+            cref.idle.lock().unwrap().get(host).is_some_and(|endpoints| endpoints.contains_key(&(scheme, port)))
+        };
+        assert!(has_bucket(), "put creates the bucket");
+        assert_eq!(cref.take_idle(scheme, host, port), Some((fd, std::ptr::null_mut())), "take returns the pooled fd");
+        assert!(has_bucket(), "take retains the empty bucket for put reuse");
+        cref.remove_empty(scheme, host, port);
+        assert!(!has_bucket(), "terminal cleanup removes the empty bucket");
 
         let refilled = dead_fd();
-        cref.put_idle(key.clone(), refilled, std::ptr::null_mut());
-        cref.remove_empty(&key);
+        cref.put_idle(scheme, host, port, refilled, std::ptr::null_mut());
+        cref.remove_empty(scheme, host, port);
         assert_eq!(
-            cref.take_idle(&key),
+            cref.take_idle(scheme, host, port),
             Some((refilled, std::ptr::null_mut())),
             "cleanup leaves a concurrently refilled bucket untouched"
         );
+        let sibling = dead_fd();
+        cref.put_idle(HttpScheme::Https, host, port, sibling, std::ptr::null_mut());
+        cref.remove_empty(scheme, host, port);
+        assert_eq!(
+            cref.take_idle(HttpScheme::Https, host, port),
+            Some((sibling, std::ptr::null_mut())),
+            "removing one empty endpoint retains a sibling endpoint under the same host"
+        );
         unsafe { close(fd) }; // we took it out of the pool — close it ourselves
         unsafe { close(refilled) };
+        unsafe { close(sibling) };
         unsafe { align_rt_http_client_free(client) };
     }
 
@@ -25161,8 +25202,7 @@ mod tests {
 
         let client = align_rt_http_client_new();
         let cref = unsafe { &*client };
-        let key = (HttpScheme::Http, "127.0.0.1".to_string(), port as i64);
-        cref.put_idle(key.clone(), dead_fd(), std::ptr::null_mut());
+        cref.put_idle(HttpScheme::Http, "127.0.0.1", port as i64, dead_fd(), std::ptr::null_mut());
 
         let url = format!("http://127.0.0.1:{port}/");
         let mut out: *mut HttpResponse = std::ptr::null_mut();
@@ -25186,22 +25226,22 @@ mod tests {
         };
         let client = align_rt_http_client_new();
         let cref = unsafe { &*client };
-        let key = (HttpScheme::Http, "h".to_string(), 80i64);
+        let (scheme, host, port) = (HttpScheme::Http, "h", 80i64);
         // Fill the bucket to capacity with STALE conns.
         let stale: Vec<i32> = (0..HTTP_POOL_MAX_IDLE_PER_HOST).map(|_| dead_fd()).collect();
         {
             let mut map = cref.idle.lock().unwrap();
-            let bucket = map.entry(key.clone()).or_default();
+            let bucket = map.entry(host.to_owned()).or_default().entry((scheme, port)).or_default();
             for &fd in &stale {
                 bucket.push(IdleConn { fd, ssl: std::ptr::null_mut(), idle_since: old });
             }
         }
         // A fresh put must reap all 8 stale conns and keep the fresh one (not drop it at capacity).
         let fresh = dead_fd();
-        cref.put_idle(key.clone(), fresh, std::ptr::null_mut());
+        cref.put_idle(scheme, host, port, fresh, std::ptr::null_mut());
         {
             let map = cref.idle.lock().unwrap();
-            let bucket = map.get(&key).expect("bucket present");
+            let bucket = map.get(host).and_then(|endpoints| endpoints.get(&(scheme, port))).expect("bucket present");
             assert_eq!(bucket.len(), 1, "8 stale conns reaped, the fresh one kept");
             assert_eq!(bucket[0].fd, fresh, "the retained conn is the fresh one");
         }
@@ -25612,12 +25652,15 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let client = align_rt_http_client_new();
         let cref = unsafe { &*client };
-        let http_key = (HttpScheme::Http, "h".to_string(), 443i64);
-        let https_key = (HttpScheme::Https, "h".to_string(), 443i64);
+        let (host, port) = ("h", 443i64);
         let fd = dead_fd();
-        cref.put_idle(http_key.clone(), fd, std::ptr::null_mut());
-        assert_eq!(cref.take_idle(&https_key), None, "an https bucket is never satisfied by an http conn");
-        assert_eq!(cref.take_idle(&http_key), Some((fd, std::ptr::null_mut())), "the http conn is still in its own bucket");
+        cref.put_idle(HttpScheme::Http, host, port, fd, std::ptr::null_mut());
+        assert_eq!(cref.take_idle(HttpScheme::Https, host, port), None, "an https bucket is never satisfied by an http conn");
+        assert_eq!(
+            cref.take_idle(HttpScheme::Http, host, port),
+            Some((fd, std::ptr::null_mut())),
+            "the http conn is still in its own bucket"
+        );
         unsafe { close(fd) };
         unsafe { align_rt_http_client_free(client) };
     }

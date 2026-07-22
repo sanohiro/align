@@ -15,10 +15,10 @@ bench/http_client_path/run.sh 200000 10    # requests-per-arm, blocks (blocks mu
 ```
 6 interleaved blocks x 16666 requests per arm (after 2000 warm-up)
   arm            allocs/req   fresh B/req   growth B/req   CPU ns/req   block spread
-  floor                0.00           0.0            0.0        30828           582
-  align                4.00         272.0            0.0        33942           275
+  floor                0.00           0.0            0.0        31481           295
+  align                3.00         263.0            0.0        34710           906
 
-  http.get's CPU work above the floor:  3113 ns/req, 4.00 allocations
+  http.get's CPU work above the floor:  3229 ns/req, 3.00 allocations
 ```
 
 ## Why this exists — `bench/http_client` cannot price this
@@ -118,6 +118,14 @@ but replaces the old 72 B handle + 128 B span allocation: the common path is **5
 and **352 → 272 fresh B/request**. Three 100k-request runs measured **3113 / 3363 / 3146 ns** above
 the floor, CPU-neutral at this noise level. The harness pins 4; the 200 KiB probe is 8 → 7.
 
+The parsed host was the 9-byte block: authority splitting returned an owned `String` because the old
+pool key was a `(scheme, String, port)` tuple. Splitting now returns a slice into the URL, and the pool
+uses host as its outer `HashMap<String, ...>` key so lookup accepts that `&str`; `(scheme, port)` is
+the inner key and keeps TLS/plaintext and distinct ports isolated. The host becomes owned only when a
+new host bucket is first created, outside the warmed per-request path. The common path is now **4 →
+3 allocations** and **272 → 263 fresh B/request**. Three 100k-request runs measured **3054 / 3468 /
+3229 ns** above the floor, CPU-neutral at this noise level. The harness pins 3; 200 KiB is 7 → 6.
+
 ### Negative result: unconditional read-into-the-response-buffer does NOT transfer from the server
 
 The roadmap's first target here was to apply #602's server-side fix — `http_socket_exchange` reads
@@ -180,10 +188,10 @@ Runtime-only stash/rebuild A/B, with the benchmark change retained in both arms:
 | 200 KiB, pair 3 | 5227 | 3390 | −1837 ns |
 
 The 200 KiB medians are **6330 → 3693 ns/req above the floor (−42%)**. In that runtime-only #608 A/B,
-allocation events stayed 10 because both arms predated the pool-key, idle-bucket, and inline-header
-cuts; the current total is 7.
+allocation events stayed 10 because both arms predated the pool-key, idle-bucket, inline-header, and
+borrowed-host cuts; the current total is 6.
 Geometric growth capped at the framed total reduces retained growth from **229376 → 172116
-bytes/request**. The benchmark's 4-allocation regression ceiling now applies only to its default
+bytes/request**. The benchmark's 3-allocation regression ceiling now applies only to its default
 13-byte response; `BODY=...` is intentionally a buffer-growth probe and must print those counts
 rather than aborting before it can report them.
 
