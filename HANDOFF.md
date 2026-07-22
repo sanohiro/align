@@ -8,8 +8,8 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-22, **the body-size-aware HTTP client read is implemented on the current
-branch: a 200 KiB response falls from 6330 → 3693 ns/request above the syscall floor (median,
+_Last updated: 2026-07-22, **the body-size-aware HTTP client read is DONE (#608): a 200 KiB response
+falls from 6330 → 3693 ns/request above the syscall floor (median,
 −42%), while 13 B and 8 KiB stay flat. Only the large body's middle reads directly into the returned
 buffer; the 32 KiB first read remains, growth is geometric rather than trusting Content-Length up
 front, and the last read stays unclamped to preserve dirty-connection detection.** Before that,
@@ -89,7 +89,7 @@ READMEs):**
      known: a 2 KiB start costs an extra `read` syscall for every response past 2 KiB (**+1200 ns at
      8 KiB, 3/3**) and starting bigger is not available because that buffer IS the returned response
      body. Full numbers + the two lessons in `bench/http_client_path/README.md`.
-   - **DONE on the current branch — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
+   - **DONE (#608) — BODY-SIZE-AWARE response reads:** keep the 32 KiB first read,
      direct-read only a large framed body's middle into the response buffer, then leave the last
      32767 bytes to the original unclamped read. This keeps 13 B / 8 KiB flat, makes 200 KiB
      **6330 → 3693 ns/request above the floor (median, −42%)**, and reduces retained growth
