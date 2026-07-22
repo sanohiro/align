@@ -15605,6 +15605,8 @@ const HTTP_CONNECTION_CLOSE: &[u8] = b"Connection: close\r\n";
 const HTTP_CONTENT_LENGTH_PREFIX: &[u8] = b"Content-Length: ";
 /// The streaming path's framing header (a 1.1 client only — a 1.0 stream is close-delimited).
 const HTTP_TE_CHUNKED: &[u8] = b"Transfer-Encoding: chunked\r\n";
+/// The terminal zero-length chunk — chunked's end-of-message, written by `finish`.
+const HTTP_CHUNKED_TERMINATOR: &[u8] = b"0\r\n\r\n";
 
 /// The exact serialized length of the head [`http_serialize_head`] writes — the capacity
 /// that makes the response one allocation. Mirrors that function line for line (status line,
@@ -15651,6 +15653,37 @@ fn http_decimal_len(mut n: usize) -> usize {
     d
 }
 
+/// The `extra` [`http_serialize_response_inner`] appends after the head: the framing header (when
+/// the status may carry a body), the terminating blank line, and the body bytes actually SENT (a
+/// HEAD writes the length but not the bytes). Named so the writer's own reservation is the thing a
+/// test can assert against — a formula re-typed in a test pins nothing.
+fn http_response_extra(rb: &ResponseBuilder, suppress_body: bool) -> usize {
+    let body_len = rb.body.as_ref().map_or(0, Vec::len);
+    let framing = match http_status_allows_a_body(rb.status) {
+        true => HTTP_CONTENT_LENGTH_PREFIX.len() + http_decimal_len(body_len) + 2,
+        false => 0,
+    };
+    let sent_body = match suppress_body {
+        true => 0, // HEAD: the length is written, the bytes are not
+        false => body_len,
+    };
+    framing.saturating_add(2).saturating_add(sent_body)
+}
+
+/// The `extra` the STREAMING head needs — and it is not only what
+/// [`align_rt_http_respond_stream`] itself appends (the transfer-framing header, then the blank
+/// line). A stream that never sent anything is finished by extending **this same buffer** with the
+/// chunked terminator, so its five bytes are reserved here too: without them an exactly-sized head
+/// guarantees a `realloc` + copy on every zero-event SSE response — the exact cost this pass exists
+/// to remove. When a `send` comes first the head is copied into the chunk buffer and dropped, so
+/// the five bytes are merely unused.
+fn http_stream_head_extra(framed: bool) -> usize {
+    match framed {
+        true => HTTP_TE_CHUNKED.len() + 2 + HTTP_CHUNKED_TERMINATOR.len(),
+        false => 2,
+    }
+}
+
 /// May a response with this status carry a body at all? `1xx` / `204` / `304` never do (RFC 9110
 /// §15.3.5, §15.4.5); every other status may, so a bodiless response of one of THOSE is framed
 /// `Content-Length: 0` rather than left unframed (see [`http_serialize_response_inner`]).
@@ -15690,20 +15723,9 @@ fn http_serialize_response_inner(rb: &ResponseBuilder, suppress_body: bool, pers
     if bodiless_status && rb.body.is_some() {
         return Err(AL_INVALID);
     }
-    let body_len = rb.body.as_ref().map_or(0, |b| b.len());
-    // Everything this function appends after the head, so the head serializer sizes the buffer for
-    // the whole response and nothing here can `realloc`: the framing header (when the status may
-    // carry a body), the terminating blank line, and the body bytes actually sent.
-    let framing = match bodiless_status {
-        true => 0,
-        false => HTTP_CONTENT_LENGTH_PREFIX.len() + http_decimal_len(body_len) + 2,
-    };
-    let sent_body = match suppress_body {
-        true => 0, // HEAD: the length is written, the bytes are not
-        false => body_len,
-    };
-    let extra = framing.saturating_add(2).saturating_add(sent_body);
-    let mut buf = http_serialize_head(rb, persistent, extra)?;
+    let body_len = rb.body.as_ref().map_or(0, Vec::len);
+    // Size the buffer for the WHOLE response up front, so nothing appended below can `realloc`.
+    let mut buf = http_serialize_head(rb, persistent, http_response_extra(rb, suppress_body))?;
     if !bodiless_status {
         buf.extend_from_slice(HTTP_CONTENT_LENGTH_PREFIX);
         http_push_decimal(&mut buf, body_len);
@@ -15913,10 +15935,10 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
     }
     // Shared head serialize (status line + caller headers + `Connection: close`), then the framing
     // header + the terminating blank line. A 1.1 request → chunked; a 1.0 request → raw (no TE).
-    // Both are reserved up front, so the stored head is one allocation like `respond`'s response.
+    // Both are reserved up front — along with the terminator `finish` may append to this same
+    // buffer ([`http_stream_head_extra`]) — so the stored head is one allocation, start to finish.
     let framed = c.http11;
-    let extra = (if framed { HTTP_TE_CHUNKED.len() } else { 0 }) + 2; // + the terminating blank line
-    let mut head = match http_serialize_head(&r, false, extra) {
+    let mut head = match http_serialize_head(&r, false, http_stream_head_extra(framed)) {
         Ok(b) => b,
         Err(s) => return s, // ctx unspent — the caller can still `respond` an error
     };
@@ -16048,8 +16070,10 @@ pub unsafe extern "C" fn align_rt_http_stream_finish(s: *mut HttpStream) -> i32 
     // The lazy head (nothing was ever sent) + the terminator share one buffer, one write.
     let mut buf = st.pending_head.take().unwrap_or_default();
     if st.framed {
-        // The terminal zero-length chunk. `Drop` closes the fd right after (RAII), so surface the errno.
-        buf.extend_from_slice(b"0\r\n\r\n");
+        // The terminal zero-length chunk — its room is already reserved in the head buffer
+        // ([`http_stream_head_extra`]), so this never reallocates. `Drop` closes the fd right after
+        // (RAII), so surface the errno.
+        buf.extend_from_slice(HTTP_CHUNKED_TERMINATOR);
     }
     if buf.is_empty() {
         0 // raw mode, head already written: close (via `Drop`) IS the terminator
@@ -25544,12 +25568,17 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert_eq!(out2, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
     }
 
-    /// **One allocation per response, and no `realloc`.** `http_head_len` + the caller's `extra`
-    /// must equal the bytes actually written, so the serialized buffer comes back exactly full —
-    /// `Vec::with_capacity(n)` reserves exactly `n`, so `len() == capacity()` is a byte-exact
-    /// assertion that the size computation still mirrors the writer. Any drift (a header line's
-    /// separator, a framing prefix, the blank line) leaves the buffer short (a `realloc` — the cost
-    /// this exists to remove, ≈206 ns each) or long, and either way fails here.
+    /// **One allocation per response, and no `realloc`.** The invariant asserted first is the real
+    /// one and it depends on no allocator behaviour: **the size functions equal the bytes actually
+    /// written** (`http_head_len` + the production `http_response_extra` == `out.len()`). Any drift
+    /// — a header line's separator, a framing prefix, the blank line — fails it, whether it leaves
+    /// the buffer short (a `realloc`, the ≈206 ns cost this exists to remove) or long.
+    ///
+    /// `len() == capacity()` is then asserted as the *corollary*: given the first assertion, it
+    /// says `Vec::with_capacity(n)` really did reserve exactly `n` — one allocation, no growth.
+    /// On its own it would be weaker than it looks (`RawVec` grows to `max(cap*2, required)`, so a
+    /// reservation of exactly half the final size would satisfy it after a real growth), which is
+    /// why it is the second assertion and not the only one.
     #[test]
     fn http_serialize_reserves_exactly_what_it_writes() {
         let hdr = |n: &str, v: &str| (n.to_string(), v.to_string());
@@ -25572,25 +25601,59 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         ];
         for (rb, suppress, persistent) in &cases {
             let out = http_serialize_response_inner(rb, *suppress, *persistent).unwrap();
-            assert_eq!(
-                out.len(),
-                out.capacity(),
-                "status {} suppress={suppress} persistent={persistent}: reserved {} for {} bytes",
-                rb.status,
-                out.capacity(),
-                out.len()
-            );
+            let sized = http_head_len(rb, *persistent) + http_response_extra(rb, *suppress);
+            let what = format!("status {} suppress={suppress} persistent={persistent}", rb.status);
+            assert_eq!(out.len(), sized, "{what}: sized {sized} for {} written bytes", out.len());
+            assert_eq!(out.capacity(), out.len(), "{what}: one allocation, no growth");
         }
-        // The streaming head sizes both framings the same way (mirrors `align_rt_http_respond_stream`).
-        for framed in [false, true] {
-            let rb = ResponseBuilder { status: 200, headers: vec![hdr("X-Tag", "v")], body: None };
-            let extra = (if framed { HTTP_TE_CHUNKED.len() } else { 0 }) + 2; // + the terminating blank line
-            let mut head = http_serialize_head(&rb, false, extra).unwrap();
-            if framed {
-                head.extend_from_slice(HTTP_TE_CHUNKED);
-            }
-            head.extend_from_slice(b"\r\n");
-            assert_eq!(head.len(), head.capacity(), "streaming head, framed={framed}");
+    }
+
+    /// The streaming head's reservation, asserted through the **real entry point** — a formula
+    /// re-typed in a test pins nothing (this was a review finding: mutating the production `extra`
+    /// to a 999-byte over-reserve left the whole crate green, because over/under-reserving changes
+    /// no wire byte). `align_rt_http_respond_stream` must leave the stored head with exactly the
+    /// chunked terminator's room spare — nothing more (the head write and the framing header
+    /// consumed the rest) and nothing less (`finish` on a stream that never sent extends THIS
+    /// buffer, so a tight fit would `realloc` on every zero-event SSE response).
+    #[test]
+    fn http_stream_head_reserves_room_for_the_terminator() {
+        use std::os::unix::io::IntoRawFd;
+        let hdr = |n: &str, v: &str| (n.to_string(), v.to_string());
+        for http11 in [false, true] {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let mut ctx = HttpRequestCtx {
+                fd: a.into_raw_fd(),
+                buf: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+                method_start: 0,
+                method_len: 3,
+                target_start: 4,
+                target_len: 1,
+                headers: Vec::new(),
+                body_start: 18,
+                body_len: 0,
+                http11,
+                keep_alive: false,
+                park: None,
+            };
+            let rb = Box::into_raw(Box::new(ResponseBuilder {
+                status: 200,
+                headers: vec![hdr("X-Tag", "v")],
+                body: None,
+            }));
+            let mut out: *mut HttpStream = core::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_respond_stream(&mut ctx, rb, &mut out) }, 0);
+            let st = unsafe { &*out };
+            let head = st.pending_head.as_ref().expect("the head is stored, not written");
+            let slack = head.capacity() - head.len();
+            let want = match st.framed {
+                true => HTTP_CHUNKED_TERMINATOR.len(),
+                false => 0, // a 1.0 stream is close-delimited — `finish` writes no terminator
+            };
+            assert_eq!(slack, want, "http11={http11}: {slack} spare bytes in the stored head, want {want}");
+            // And the head itself is the size function's answer — the writer and the sizer agree.
+            let rb_view = ResponseBuilder { status: 200, headers: vec![hdr("X-Tag", "v")], body: None };
+            assert_eq!(head.capacity(), http_head_len(&rb_view, false) + http_stream_head_extra(st.framed));
+            assert_eq!(unsafe { align_rt_http_stream_finish(out) }, 0, "finish writes cleanly");
         }
     }
 

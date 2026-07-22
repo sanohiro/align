@@ -202,13 +202,25 @@ into ONE exactly-sized buffer; `http_push_decimal` renders the length from the s
 the chunked path's `http_push_chunk_size_hex`. **14 → 9 allocations/request** and **−537 / −478 /
 −421 / −434 ns across four adjacent A/B pairs, 4/4 the same sign** (`bench/http_path`); the poll-floor
 budget is now ~2.5 µs. `respond_stream` reserves its `Transfer-Encoding` line the same way.
-- **The size function is the risk, and a test pins it exactly.** `http_head_len` mirrors the writer,
-  so any drift (a separator, a prefix, the blank line) silently costs a `realloc` — the very thing
-  removed. `Vec::with_capacity(n)` reserves exactly `n`, so `len() == capacity()` on the returned
-  buffer is a byte-exact assertion that the two still agree; the new test asserts it over a matrix
-  (no headers / many headers / bodied / set-but-empty body / HEAD-suppressed / persistent / the three
-  bodiless statuses / an unknown status's empty reason phrase) plus both streaming framings. The
-  four written literals are `const`s shared by writer and sizer, so they cannot drift at all.
+- **The size function is the risk, and the assertion has to be the right one.** `http_head_len` +
+  `http_response_extra` mirror the writer, so any drift (a separator, a prefix, the blank line)
+  silently costs a `realloc` — the very thing removed. The test asserts **`out.len()` == what the
+  size functions say**, which depends on no allocator behaviour, over a matrix (no headers / many
+  headers / bodied / set-but-empty body / HEAD-suppressed / persistent / the three bodiless statuses
+  / an unknown status's empty reason phrase). `len() == capacity()` follows as a *corollary* — on
+  its own it is weaker than it looks, since `RawVec` grows to `max(cap*2, required)` and a
+  half-sized reservation would satisfy it after a real growth. The five written literals are
+  `const`s shared by writer and sizer, so they cannot drift at all.
+- **The adversarial review found a realloc this pass ADDED, and a test that pinned nothing.**
+  ① `stream_finish` extends the *stored head* with the 5-byte chunked terminator, so an exactly
+  sized head guaranteed a `realloc` + copy on every zero-event SSE response (on `main` the head's
+  slack absorbed it). `http_stream_head_extra` now reserves those 5 bytes; when a `send` comes first
+  the head is copied out and dropped, so they are merely unused. ② The streaming reservation had
+  **no test at all** — the first version re-typed the formula in the test and asserted on its own
+  copy, so mutating the production line to a 999-byte over-reserve left all 292 tests green (nothing
+  about over/under-reserving changes a wire byte). It now goes through the real
+  `align_rt_http_respond_stream` and asserts the stored head's spare capacity is *exactly* the
+  terminator's room. Both mutations, and a body-forgetting response sizer, now fail.
 - The wrapper was **not** kept: `http_serialize_head` itself gained the parameter (one mechanism, per
   the repo's no-compat rule), and its three call sites each pass what they append.
 
