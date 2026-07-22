@@ -4389,8 +4389,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// would be poison — letting the optimizer assume in-bounds and drop later checks. Plain `gep`
     /// keeps unsafe pointer arithmetic well-defined (wrapping) as the caller intends.
     fn raw_elem_ptr(&mut self, ptr: &align_mir::Operand, offset: &align_mir::Operand) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
-        let base = self.operand(ptr).into_pointer_value();
-        let off = self.operand(offset).into_int_value();
+        let base = self.operand(ptr)?.into_pointer_value();
+        let off = self.operand(offset)?.into_int_value();
         unsafe {
             self.builder
                 .build_gep(self.ctx.i8_type(), base, &[off], "rawelem")
@@ -4758,18 +4758,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
                 Stmt::Store(slot, op) => {
-                    let val = self.operand(op);
+                    let val = self.operand(op)?;
                     let ptr = self.slots[slot];
                     self.builder.build_store(ptr, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::StoreField(slot, path, op) => {
                     let field_ptr = self.field_path_ptr(*slot, path)?;
-                    let val = self.operand(op);
+                    let val = self.operand(op)?;
                     self.builder.build_store(field_ptr, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::StoreIndex(slot, idx, op) => {
                     let ep = self.elem_ptr(*slot, idx)?;
-                    let val = self.operand(op);
+                    let val = self.operand(op)?;
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::StoreConstArray { slot, elems, elem } => {
@@ -4805,7 +4805,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 Stmt::StoreElemField(slot, idx, path, op) => {
                     let ep = self.elem_field_ptr(*slot, idx, path)?;
-                    let val = self.operand(op);
+                    let val = self.operand(op)?;
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::StoreElemFieldPtr { base, index, path, struct_id, value } => {
@@ -4813,10 +4813,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // write dual of `Rvalue::IndexFieldPtr`: extract the buffer pointer from the
                     // `{ptr,len}` aggregate and GEP `%Struct, ptr, index, *pfield(path)` (one struct
                     // GEP level per path segment, each through the logical→physical map).
-                    let agg = self.operand(base).into_struct_value();
+                    let agg = self.operand(base)?.into_struct_value();
                     let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                     let st = self.struct_types[*struct_id as usize];
-                    let idx = self.operand(index).into_int_value();
+                    let idx = self.operand(index)?.into_int_value();
                     // `[index]` reaches element `index` (stride `st`); each physical field index then
                     // descends one struct level to the leaf being written.
                     let mut indices = vec![idx];
@@ -4828,15 +4828,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_in_bounds_gep(st, buf, &indices, "aosfieldst")
                             .map_err(|e| self.err(e))?
                     };
-                    let val = self.operand(value);
+                    let val = self.operand(value)?;
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::PtrStore(ptr, idx, op) => {
                     // `ptr[idx] <- val` into a raw element buffer; the element LLVM type is
                     // the stored value's type (opaque pointers, so the ptr carries none).
-                    let p = self.operand(ptr).into_pointer_value();
-                    let index = self.operand(idx).into_int_value();
-                    let val = self.operand(op);
+                    let p = self.operand(ptr)?.into_pointer_value();
+                    let index = self.operand(idx)?.into_int_value();
+                    let val = self.operand(op)?;
                     let ep = unsafe {
                         self.builder
                             .build_in_bounds_gep(val.get_type(), p, &[index], "ptrstore")
@@ -4848,9 +4848,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // `dst[i] <- val` for a `map_into` loop: like `PtrStore`, plus the loop's `out`
                     // alias scope so the vectorizer knows it can't overlap the (`in`-scoped) source
                     // load. `alias.scope = {out}`, `noalias = {in}`.
-                    let p = self.operand(ptr).into_pointer_value();
-                    let idx = self.operand(index).into_int_value();
-                    let val = self.operand(value);
+                    let p = self.operand(ptr)?.into_pointer_value();
+                    let idx = self.operand(index)?.into_int_value();
+                    let val = self.operand(value)?;
                     let ep = unsafe {
                         self.builder
                             .build_in_bounds_gep(val.get_type(), p, &[idx], "ptrstore")
@@ -4865,10 +4865,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 // `s.store(i, v)` — `<n x T>` store into `&buf[i]` at the element alignment.
                 Stmt::VecStore { slice, index, value, elem, n: _ } => {
-                    let sv = self.operand(slice).into_struct_value();
+                    let sv = self.operand(slice)?.into_struct_value();
                     let buf = self.builder.build_extract_value(sv, 0, "vsbuf").map_err(|e| self.err(e))?.into_pointer_value();
-                    let index = self.operand(index).into_int_value();
-                    let val = self.operand(value);
+                    let index = self.operand(index)?.into_int_value();
+                    let val = self.operand(value)?;
                     let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vstoregep").map_err(|e| self.err(e))?
@@ -4883,8 +4883,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // Scatter `value` into column `field` at row `index` of the soa buffer `base`:
                     // `column_base(field) + index*size_field`. The write counterpart of
                     // `Rvalue::IndexColumn`, sharing the same per-column `align_up` offset chain.
-                    let buf = self.operand(base).into_pointer_value();
-                    let len_v = self.operand(len).into_int_value();
+                    let buf = self.operand(base)?.into_pointer_value();
+                    let len_v = self.operand(len)?.into_int_value();
                     let sizes = self.soa_field_sizes(*struct_id);
                     let off = self.soa_column_offset(len_v, &sizes, *field as usize)?;
                     let col_base = unsafe {
@@ -4896,22 +4896,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .and_then(|s| s.fields.get(*field as usize))
                         .ok_or_else(|| self.err("soa column field index out of bounds"))?;
                     let fty = scalar_type(self.ctx, field_def.ty, self.struct_types, self.enum_types);
-                    let idx_v = self.operand(index).into_int_value();
+                    let idx_v = self.operand(index)?.into_int_value();
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[idx_v], "colelem").map_err(|e| self.err(e))?
                     };
-                    let val = self.operand(value);
+                    let val = self.operand(value)?;
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::ArenaEnd(op) => {
-                    let handle = self.operand(op).into();
+                    let handle = self.operand(op)?.into();
                     self.builder
                         .build_call(self.funcs["arena_end"], &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::RawFree(op) => {
                     // `raw.free(p)` → `align_rt_free(p)` (a null-safe libc `free`).
-                    let p = self.operand(op).into();
+                    let p = self.operand(op)?.into();
                     self.builder
                         .build_call(self.funcs["free"], &[p], "")
                         .map_err(|e| self.err(e))?;
@@ -4922,18 +4922,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // offset may be misaligned for the scalar, so force alignment 1 (an unaligned
                     // store) — always correct, never LLVM-UB, at a possible perf cost on some targets.
                     let ep = self.raw_elem_ptr(ptr, offset)?;
-                    let val = self.operand(value);
+                    let val = self.operand(value)?;
                     let st = self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                     st.set_alignment(1).map_err(|e| self.err(e))?;
                 }
                 Stmt::TgWait(op) => {
-                    let handle = self.operand(op).into();
+                    let handle = self.operand(op)?.into();
                     self.builder
                         .build_call(self.funcs["tg_wait"], &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::TgEnd(op) => {
-                    let handle = self.operand(op).into();
+                    let handle = self.operand(op)?.into();
                     self.builder
                         .build_call(self.funcs["tg_end"], &[handle], "")
                         .map_err(|e| self.err(e))?;
@@ -5245,7 +5245,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // Free the buffer of an owned `{ptr, len}` value (an unbound temporary). An
                     // `array<string>` temporary would need the deep free, but none is produced today
                     // (`fs.read_dir` is always bound via `?`), so the shallow free stays correct here.
-                    let agg = self.operand(op).into_struct_value();
+                    let agg = self.operand(op)?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropvalptr").map_err(|e| self.err(e))?;
                     self.builder
                         .build_call(self.funcs["free"], &[ptr.into()], "")
@@ -5264,7 +5264,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
             }
             Term::Branch(cond, then_bb, else_bb) => {
-                let c = self.operand(cond).into_int_value();
+                let c = self.operand(cond)?.into_int_value();
                 self.builder
                     .build_conditional_branch(
                         c,
@@ -5274,7 +5274,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
             }
             Term::Return(Some(op)) => {
-                let v = self.operand(op);
+                let v = self.operand(op)?;
                 self.builder.build_return(Some(&v)).map_err(|e| self.err(e))?;
             }
             Term::Return(None) => {
@@ -5291,7 +5291,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `result_ty` is the type of the value being defined (needed to build a bare `None`).
     fn gen_rvalue(&mut self, result_id: ValueId, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let v: BasicValueEnum<'c> = match rv {
-            Rvalue::Use(op) => self.operand(op),
+            Rvalue::Use(op) => self.operand(op)?,
             Rvalue::Load(slot) => {
                 let ty = self.llvm_type(self.f.slots[*slot as usize]);
                 self.builder
@@ -5300,21 +5300,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Un(op, a) => match op {
                 UnOp::Neg if matches!(self.f.operand_ty(a), Ty::Float(_)) => {
-                    let a = self.operand(a).into_float_value();
+                    let a = self.operand(a)?.into_float_value();
                     self.builder.build_float_neg(a, "fneg").map_err(|e| self.err(e))?.into()
                 }
                 UnOp::Neg => {
-                    let a = self.operand(a).into_int_value();
+                    let a = self.operand(a)?.into_int_value();
                     self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?.into()
                 }
                 // `!` (boolean, i1) and `~` (integer bitwise complement) are both LLVM `not`.
                 UnOp::Not | UnOp::BitNot => {
-                    let a = self.operand(a).into_int_value();
+                    let a = self.operand(a)?.into_int_value();
                     self.builder.build_not(a, "not").map_err(|e| self.err(e))?.into()
                 }
             },
             Rvalue::Cast { operand, from, to } => {
-                let val = self.operand(operand);
+                let val = self.operand(operand)?;
                 self.gen_cast(val, *from, *to)?
             }
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
@@ -5328,8 +5328,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     BinOp::Mul => "mul",
                     _ => return Err(self.err("IntArith op must be add/sub/mul")),
                 };
-                let av = self.operand(a).into_int_value();
-                let bv = self.operand(b).into_int_value();
+                let av = self.operand(a)?.into_int_value();
+                let bv = self.operand(b)?.into_int_value();
                 match mode {
                     align_sema::ArithMode::Saturating if *op != BinOp::Mul => {
                         // add/sub: LLVM has the saturating intrinsic directly.
@@ -5399,7 +5399,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let is_float = matches!(elem, Ty::Float(_));
                 let signed = is_signed(elem);
                 let overload = scalar_type(self.ctx, *ty, self.struct_types, self.enum_types);
-                let ops: Vec<BasicValueEnum> = operands.iter().map(|o| self.operand(o)).collect();
+                let ops: Vec<BasicValueEnum> =
+                    operands.iter().map(|o| self.operand(o)).collect::<Result<_, _>>()?;
                 match fn_ {
                     align_sema::MathFn::Abs => {
                         if is_float {
@@ -5445,14 +5446,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A `mask` cond (`<N x i1>`, from `select(mask, a, b)`) blends two vectors lane-wise;
                 // a scalar `i1` cond (branchless `where`) blends two scalars.
                 if matches!(self.f.operand_ty(cond), Ty::Mask(..)) {
-                    let c = self.operand(cond).into_vector_value();
-                    let av = self.operand(a).into_vector_value();
-                    let bv = self.operand(b).into_vector_value();
+                    let c = self.operand(cond)?.into_vector_value();
+                    let av = self.operand(a)?.into_vector_value();
+                    let bv = self.operand(b)?.into_vector_value();
                     self.builder.build_select(c, av, bv, "vsel").map_err(|e| self.err(e))?
                 } else {
-                    let c = self.operand(cond).into_int_value();
-                    let av = self.operand(a);
-                    let bv = self.operand(b);
+                    let c = self.operand(cond)?.into_int_value();
+                    let av = self.operand(a)?;
+                    let bv = self.operand(b)?;
                     self.builder.build_select(c, av, bv, "sel").map_err(|e| self.err(e))?
                 }
             }
@@ -5492,7 +5493,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Err(self.err("Some result is not an Option"));
                 };
                 let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
-                let payload = self.operand(op);
+                let payload = self.operand(op)?;
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Start zeroed (not poison): an owned (Move) payload's drop frees the payload field
                 // null-safely, so the inactive arm must read as {null,0}, not garbage (slice 8a).
@@ -5515,7 +5516,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 option_struct_type(self.ctx, s, self.struct_types, self.enum_types).const_zero().into()
             }
             Rvalue::OptionIsSome(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 let tag = self
                     .builder
                     .build_extract_value(agg, 0, "tag")
@@ -5527,7 +5528,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::OptionUnwrap(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 self.builder
                     .build_extract_value(agg, 1, "some")
                     .map_err(|e| self.err(e))?
@@ -5546,7 +5547,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
-                    .build_insert_value(agg, self.operand(op), 1, "ok")
+                    .build_insert_value(agg, self.operand(op)?, 1, "ok")
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()
@@ -5565,13 +5566,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
-                    .build_insert_value(agg, self.operand(op), 2, "err")
+                    .build_insert_value(agg, self.operand(op)?, 2, "err")
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()
             }
             Rvalue::ResultIsOk(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 let tag = self
                     .builder
                     .build_extract_value(agg, 0, "tag")
@@ -5583,13 +5584,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::ResultUnwrapOk(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 self.builder
                     .build_extract_value(agg, 1, "ok")
                     .map_err(|e| self.err(e))?
             }
             Rvalue::ResultUnwrapErr(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 self.builder
                     .build_extract_value(agg, 2, "err")
                     .map_err(|e| self.err(e))?
@@ -5607,14 +5608,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 for (j, op) in payload.iter().enumerate() {
                     agg = self
                         .builder
-                        .build_insert_value(agg, self.operand(op), base + j as u32, "pl")
+                        .build_insert_value(agg, self.operand(op)?, base + j as u32, "pl")
                         .map_err(|e| self.err(e))?
                         .into_struct_value();
                 }
                 agg.into()
             }
             Rvalue::EnumTagEq { scrutinee, variant, .. } => {
-                let agg = self.operand(scrutinee).into_struct_value();
+                let agg = self.operand(scrutinee)?.into_struct_value();
                 let tag = self.builder.build_extract_value(agg, 0, "tag").map_err(|e| self.err(e))?.into_int_value();
                 let want = self.ctx.i32_type().const_int(*variant as u64, false);
                 self.builder
@@ -5623,7 +5624,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::EnumPayload { enum_id, variant, slot, operand } => {
-                let agg = self.operand(operand).into_struct_value();
+                let agg = self.operand(operand)?.into_struct_value();
                 let base = self.enums[*enum_id as usize].variants[*variant as usize].field_base;
                 self.builder
                     .build_extract_value(agg, base + *slot, "pl")
@@ -5645,8 +5646,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::SpawnTask { tg, closure, capture_tys, r, fallible } => {
                 let i64t = self.ctx.i64_type();
-                let tgv = self.operand(tg).into_pointer_value();
-                let clos = self.operand(closure).into_struct_value();
+                let tgv = self.operand(tg)?.into_pointer_value();
+                let clos = self.operand(closure)?.into_struct_value();
                 let thunk = self.builder.build_extract_value(clos, 0, "thunk").map_err(|e| self.err(e))?;
                 let frame_env = self.builder.build_extract_value(clos, 1, "fenv").map_err(|e| self.err(e))?.into_pointer_value();
                 // Snapshot the captures into a fresh env in the task-group region (so a deferred
@@ -5704,7 +5705,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 slot.into()
             }
             Rvalue::TgWaitResult { tg, fallible } => {
-                let tgv = self.operand(tg).into();
+                let tgv = self.operand(tg)?.into();
                 // `tg_wait` returns the first errored task's `err_slot` (null if all succeeded).
                 let errp = self
                     .builder
@@ -5761,7 +5762,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);
                 let argv = [
-                    self.operand(handle).into(),
+                    self.operand(handle)?.into(),
                     i64t.const_int(bytes, false).into(),
                     i64t.const_int(bytes, false).into(),
                 ];
@@ -5774,7 +5775,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("arena_alloc returns a pointer")
                     .into_pointer_value();
                 self.builder
-                    .build_store(ptr, self.operand(init))
+                    .build_store(ptr, self.operand(init)?)
                     .map_err(|e| self.err(e))?;
                 ptr.into()
             }
@@ -5784,7 +5785,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // **zero-extending** — a narrower unsigned size with its MSB set (e.g. a `u32` ≥ 2 GiB)
                 // must not become negative. `build_int_cast_sign_flag(.., false)` is a no-op at i64,
                 // zero-extends narrower widths, and truncates wider ones. The result `raw` is a `ptr`.
-                let sz = self.operand(size);
+                let sz = self.operand(size)?;
                 let i64t = self.ctx.i64_type();
                 let sz64 = self
                     .builder
@@ -5823,7 +5824,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                let ptr = self.operand(op).into_pointer_value();
+                let ptr = self.operand(op)?.into_pointer_value();
                 self.builder
                     .build_load(ty, ptr, "boxget")
                     .map_err(|e| self.err(e))?
@@ -5843,7 +5844,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let vty = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type();
                 let mut acc = vty.get_poison();
                 for (i, op) in elems.iter().enumerate() {
-                    let val = self.operand(op);
+                    let val = self.operand(op)?;
                     let idx = self.ctx.i32_type().const_int(i as u64, false);
                     acc = self.builder.build_insert_element(acc, val, idx, "vins").map_err(|e| self.err(e))?;
                 }
@@ -5851,29 +5852,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // Read lane `lane` of a vector (`extractelement`).
             Rvalue::VecExtract { vec, lane, .. } => {
-                let v = self.operand(vec).into_vector_value();
+                let v = self.operand(vec)?.into_vector_value();
                 let idx = self.ctx.i32_type().const_int(*lane as u64, false);
                 self.builder.build_extract_element(v, idx, "vext").map_err(|e| self.err(e))?
             }
             // Write `value` into lane `lane` (`insertelement`), yielding the new vector.
             Rvalue::VecInsert { vec, value, lane } => {
-                let v = self.operand(vec).into_vector_value();
-                let val = self.operand(value);
+                let v = self.operand(vec)?.into_vector_value();
+                let val = self.operand(value)?;
                 let idx = self.ctx.i32_type().const_int(*lane as u64, false);
                 self.builder.build_insert_element(v, val, idx, "vins").map_err(|e| self.err(e))?.into()
             }
             // `vec.sum_where(mask)` — `select(mask, vec, 0)` then add all N lanes (M6).
             Rvalue::VecSumWhere { vec, mask, elem, n } => {
-                let v = self.operand(vec).into_vector_value();
-                let m = self.operand(mask).into_vector_value();
+                let v = self.operand(vec)?.into_vector_value();
+                let m = self.operand(mask)?.into_vector_value();
                 let zero = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type().const_zero();
                 let masked = self.builder.build_select(m, v, zero, "swsel").map_err(|e| self.err(e))?.into_vector_value();
                 self.horizontal_sum(masked, matches!(elem, Ty::Float(_)), *n)?
             }
             // `dot(a, b)` — multiply lane-wise, then a horizontal sum.
             Rvalue::VecDot { a, b, elem, n } => {
-                let av = self.operand(a).into_vector_value();
-                let bv = self.operand(b).into_vector_value();
+                let av = self.operand(a)?.into_vector_value();
+                let bv = self.operand(b)?.into_vector_value();
                 let is_float = matches!(elem, Ty::Float(_));
                 let prod = if is_float {
                     self.builder.build_float_mul(av, bv, "dotmul").map_err(|e| self.err(e))?
@@ -5884,17 +5885,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // `v.min()` / `v.max()` — fold the lanes with the scalar min/max intrinsic.
             Rvalue::VecMinMax { vec, elem, n, max } => {
-                let v = self.operand(vec).into_vector_value();
+                let v = self.operand(vec)?.into_vector_value();
                 self.horizontal_minmax(v, *elem, *n, *max)?
             }
             // `v.sum()` — add all lanes (the shared horizontal sum).
             Rvalue::VecSum { vec, elem, n } => {
-                let v = self.operand(vec).into_vector_value();
+                let v = self.operand(vec)?.into_vector_value();
                 self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n)?
             }
             // Reduce a mask to `bool` = true iff any lane is set (OR-fold), the vector div/rem guard.
             Rvalue::MaskAny { mask, n } => {
-                let m = self.operand(mask).into_vector_value();
+                let m = self.operand(mask)?.into_vector_value();
                 self.horizontal_or(m, *n)?.into()
             }
             // `s.load(i)` — `<n x T>` load from `&buf[i]`. Default alignment is the element's (the GEP
@@ -5903,9 +5904,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `align(N)` binding at an N-aligned offset — `proven_vec_load_align`); use the larger of
             // it and the element alignment.
             Rvalue::VecLoad { slice, index, elem, n, align } => {
-                let sv = self.operand(slice).into_struct_value();
+                let sv = self.operand(slice)?.into_struct_value();
                 let buf = self.builder.build_extract_value(sv, 0, "vlbuf").map_err(|e| self.err(e))?.into_pointer_value();
-                let index = self.operand(index).into_int_value();
+                let index = self.operand(index)?.into_int_value();
                 let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
                 let ep = unsafe {
                     self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vloadgep").map_err(|e| self.err(e))?
@@ -5924,10 +5925,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
-                let agg = self.operand(base).into_struct_value();
+                let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
-                let index = self.operand(index).into_int_value();
+                let index = self.operand(index)?.into_int_value();
                 let f = self.ctx.i32_type().const_int(self.pfield(*struct_id, *field) as u64, false);
                 let ep = unsafe {
                     self.builder
@@ -5943,7 +5944,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // for a primitive), so mixed-width columns (`bool` + `i64`) stay naturally aligned
                 // for any `len`. Walk to column `field`'s byte offset, then element `index` is
                 // `column_base + index*size_field`. Reads only the touched column.
-                let agg = self.operand(base).into_struct_value();
+                let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let len = self.builder.build_extract_value(agg, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
                 let sizes = self.soa_field_sizes(*struct_id);
@@ -5952,7 +5953,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
                 };
                 let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[*field as usize].ty, self.struct_types, self.enum_types);
-                let index = self.operand(index).into_int_value();
+                let index = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder.build_in_bounds_gep(fty, col_base, &[index], "colelem").map_err(|e| self.err(e))?
                 };
@@ -5962,10 +5963,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `s[index]` — gather a whole struct from a soa: load every column's element at `index`
             // and build the struct aggregate (the multi-column counterpart of `IndexColumn`).
             Rvalue::SoaGather { base, index, struct_id } => {
-                let agg = self.operand(base).into_struct_value();
+                let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let len = self.builder.build_extract_value(agg, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
-                let index = self.operand(index).into_int_value();
+                let index = self.operand(index)?.into_int_value();
                 let sizes = self.soa_field_sizes(*struct_id);
                 let st = self.struct_types[*struct_id as usize];
                 let fields = &self.structs[*struct_id as usize].fields;
@@ -5989,10 +5990,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::IndexPtr { base, index, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index` and load
                 // the whole element (a `map(f)` consuming the struct by value).
-                let agg = self.operand(base).into_struct_value();
+                let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
-                let index = self.operand(index).into_int_value();
+                let index = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
                         .build_in_bounds_gep(st, buf, &[index], "aoselem")
@@ -6005,7 +6006,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let st = self.tuple_types[*tuple_id as usize];
                 let mut agg = st.get_poison();
                 for (i, el) in elems.iter().enumerate() {
-                    let v = self.operand(el);
+                    let v = self.operand(el)?;
                     agg = self
                         .builder
                         .build_insert_value(agg, v, i as u32, "tup")
@@ -6015,7 +6016,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 agg.into()
             }
             Rvalue::TupleIndex { tuple, index } => {
-                let agg = self.operand(tuple).into_struct_value();
+                let agg = self.operand(tuple)?.into_struct_value();
                 self.builder
                     .build_extract_value(agg, *index, "tupidx")
                     .map_err(|e| self.err(e))?
@@ -6049,10 +6050,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let elem_ty = self.llvm_type(*elem);
                 let elem_bytes = i64t.const_int(self.target_data.get_store_size(&elem_ty), false);
                 let elem_align = i64t.const_int(self.target_data.get_abi_alignment(&elem_ty) as u64, false);
-                let count_v = self.operand(count).into_int_value();
+                let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
-                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), bytes.into(), elem_align.into()], "buf")
+                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle)?.into(), bytes.into(), elem_align.into()], "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -6062,7 +6063,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // bytes = count * sizeof(elem); heap-allocate (freed by a later Drop).
                 let i64t = self.ctx.i64_type();
                 let elem_bytes = i64t.const_int(self.target_data.get_store_size(&self.llvm_type(*elem)), false);
-                let count_v = self.operand(count).into_int_value();
+                let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
                     .build_call(self.funcs["alloc"], &[bytes.into()], "buf")
@@ -6076,7 +6077,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // last column: the column-offset walk to the last field, plus that column's own
                 // `len*size` bytes. Buffer align = the widest field (so each column's `align_up`
                 // padding, computed relative to base, actually lands on an aligned address).
-                let len_v = self.operand(len).into_int_value();
+                let len_v = self.operand(len)?.into_int_value();
                 let sizes = self.soa_field_sizes(*struct_id);
                 // A soa struct always has ≥1 field (sema-enforced); guard the underflow anyway.
                 let last = sizes.len().checked_sub(1).ok_or_else(|| self.err("empty soa struct"))?;
@@ -6086,7 +6087,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let total = self.checked_allocation_add(last_off, last_bytes, "soabytes")?;
                 let max_align = sizes.iter().copied().max().unwrap_or(1);
                 self.builder
-                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
+                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle)?.into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -6094,8 +6095,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::MakeDynArray { ptr, len } => {
                 // Build the owned array value `{ ptr, len }` (same layout as a slice).
-                let p = self.operand(ptr);
-                let l = self.operand(len);
+                let p = self.operand(ptr)?;
+                let l = self.operand(len)?;
                 let sty = slice_struct_type(self.ctx);
                 let agg = self
                     .builder
@@ -6113,11 +6114,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // the runtime hash-aggregate for the op; `cap` = the column length (an upper bound on
                 // groups). `count` has no value column (the runtime entry point takes no values).
                 use align_sema::hir::GroupOp;
-                let kagg = self.operand(keys).into_struct_value();
+                let kagg = self.operand(keys)?.into_struct_value();
                 let kptr = self.builder.build_extract_value(kagg, 0, "kptr").map_err(|e| self.err(e))?;
                 let klen = self.builder.build_extract_value(kagg, 1, "klen").map_err(|e| self.err(e))?;
-                let ok = self.operand(out_keys);
-                let ov = self.operand(out_vals);
+                let ok = self.operand(out_keys)?;
+                let ov = self.operand(out_vals)?;
                 let call = if let GroupOp::Count = op {
                     self.builder.build_call(
                         self.funcs["group_count_i64"],
@@ -6127,7 +6128,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } else {
                     let vptr = self
                         .builder
-                        .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
+                        .build_extract_value(self.operand(vals)?.into_struct_value(), 0, "vptr")
                         .map_err(|e| self.err(e))?;
                     let f = match op {
                         GroupOp::Sum => "group_sum_i64",
@@ -6152,15 +6153,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // two-column str aggregate. `cap` = column length (upper bound on groups). All four
                 // ops share one signature; `count` ignores the value ptr (which is the key column).
                 use align_sema::hir::GroupOp;
-                let kagg = self.operand(keys).into_struct_value();
+                let kagg = self.operand(keys)?.into_struct_value();
                 let kptr = self.builder.build_extract_value(kagg, 0, "kptr").map_err(|e| self.err(e))?;
                 let klen = self.builder.build_extract_value(kagg, 1, "klen").map_err(|e| self.err(e))?;
                 let vptr = self
                     .builder
-                    .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
+                    .build_extract_value(self.operand(vals)?.into_struct_value(), 0, "vptr")
                     .map_err(|e| self.err(e))?;
-                let ok = self.operand(out_keys);
-                let ov = self.operand(out_vals);
+                let ok = self.operand(out_keys)?;
+                let ov = self.operand(out_vals)?;
                 let f = match op {
                     GroupOp::Sum => "group_sum_str_cols",
                     GroupOp::Min => "group_min_str_cols",
@@ -6202,8 +6203,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;
                 let i64t = self.ctx.i64_type();
-                let ok = self.operand(out_keys);
-                let ov = self.operand(out_vals);
+                let ok = self.operand(out_keys)?;
+                let ov = self.operand(out_vals)?;
                 self.builder
                     .build_call(
                         self.funcs[f],
@@ -6257,13 +6258,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let mut spec_val = spec_ty.get_poison();
                     spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(val_off, false), 0, "gmvoff").map_err(|e| self.err(e))?.into_struct_value();
                     spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(op_tag, false), 1, "gmop").map_err(|e| self.err(e))?.into_struct_value();
-                    spec_val = self.builder.build_insert_value(spec_val, self.operand(out), 2, "gmout").map_err(|e| self.err(e))?.into_struct_value();
+                    spec_val = self.builder.build_insert_value(spec_val, self.operand(out)?, 2, "gmout").map_err(|e| self.err(e))?.into_struct_value();
                     self.builder.build_store(entry, spec_val).map_err(|e| self.err(e))?;
                 }
                 let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
                 let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;
-                let ok = self.operand(out_keys);
+                let ok = self.operand(out_keys)?;
                 self.builder
                     .build_call(
                         self.funcs["group_multi_str"],
@@ -6297,8 +6298,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bptr = self.builder.build_extract_value(agg, 0, "encptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "enclen").map_err(|e| self.err(e))?;
                 let i64t = self.ctx.i64_type();
-                let oi = self.operand(out_ids);
-                let od = self.operand(out_dict);
+                let oi = self.operand(out_ids)?;
+                let od = self.operand(out_dict)?;
                 self.builder
                     .build_call(
                         self.funcs["dict_encode_str"],
@@ -6313,9 +6314,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::MakeDictEncoded { source, ids, dict } => {
                 // Assemble the 3-slice `dict_encoded` aggregate `{ source, ids, dict }`.
                 let ty = dictenc_struct_type(self.ctx);
-                let s = self.operand(source);
-                let i = self.operand(ids);
-                let d = self.operand(dict);
+                let s = self.operand(source)?;
+                let i = self.operand(ids)?;
+                let d = self.operand(dict)?;
                 let agg = self.builder.build_insert_value(ty.get_poison(), s, 0, "encsrc").map_err(|e| self.err(e))?.into_struct_value();
                 let agg = self.builder.build_insert_value(agg, i, 1, "encids").map_err(|e| self.err(e))?.into_struct_value();
                 self.builder.build_insert_value(agg, d, 2, "encdict").map_err(|e| self.err(e))?.into_struct_value().into()
@@ -6332,11 +6333,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align;
                 let off = self.field_byte_offset(*struct_id, *field);
-                let agg = self.operand(source).into_struct_value();
+                let agg = self.operand(source)?.into_struct_value();
                 let sptr = self.builder.build_extract_value(agg, 0, "gthptr").map_err(|e| self.err(e))?;
                 let slen = self.builder.build_extract_value(agg, 1, "gthlen").map_err(|e| self.err(e))?;
                 let i64t = self.ctx.i64_type();
-                let o = self.operand(out);
+                let o = self.operand(out)?;
                 self.builder
                     .build_call(
                         self.funcs["gather_i64"],
@@ -6348,12 +6349,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::DictLookup { ids, n, dict, out } => {
                 // Label a dense-id column back to str views: out[i] = dict[ids[i]].
-                let ids_ptr = self.operand(ids);
-                let nn = self.operand(n);
-                let dagg = self.operand(dict).into_struct_value();
+                let ids_ptr = self.operand(ids)?;
+                let nn = self.operand(n)?;
+                let dagg = self.operand(dict)?.into_struct_value();
                 let dptr = self.builder.build_extract_value(dagg, 0, "dictptr").map_err(|e| self.err(e))?;
                 let dlen = self.builder.build_extract_value(dagg, 1, "dictlen").map_err(|e| self.err(e))?;
-                let o = self.operand(out);
+                let o = self.operand(out)?;
                 self.builder
                     .build_call(self.funcs["dict_lookup"], &[ids_ptr.into(), nn.into(), dptr.into(), dlen.into(), o.into()], "")
                     .map_err(|e| self.err(e))?;
@@ -6362,10 +6363,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::Chunks { src, n, elem } => {
                 // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is
                 // the chunk array's `{chunk_buf, count}` (also a `{ptr,len}`).
-                let agg = self.operand(src).into_struct_value();
+                let agg = self.operand(src)?.into_struct_value();
                 let src_ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
                 let src_len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
-                let n = self.operand(n);
+                let n = self.operand(n)?;
                 let scalar = align_sema::ty_to_scalar(*elem).expect("chunks element is a scalar");
                 let esz = self.ctx.i64_type().const_int(scalar_bytes(scalar), false);
                 self.builder
@@ -6378,7 +6379,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ParMapParallel { src, func, elem_in, elem_out } => {
                 // Heap-allocate the output buffer, then run `func` over the input in parallel via
                 // a per-`func` thunk; the result is the owned `{ out_buf, count }` array.
-                let agg = self.operand(src).into_struct_value();
+                let agg = self.operand(src)?.into_struct_value();
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
                 let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
                 let in_ty = self.llvm_type(*elem_in);
@@ -6446,7 +6447,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrClone(op) => {
                 // Extract the source `{ptr,len}` view, deep-copy the bytes into a fresh heap
                 // buffer, and yield the owned `string` `{ptr,len}` the runtime returns.
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
                 self.builder
@@ -6464,7 +6465,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::StrTrimKind::Start => "str_trim_start",
                     align_sema::hir::StrTrimKind::End => "str_trim_end",
                 };
-                let agg = self.operand(recv).into_struct_value();
+                let agg = self.operand(recv)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "trimptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "trimlen").map_err(|e| self.err(e))?;
                 self.builder
@@ -6477,8 +6478,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrPredicate { kind, haystack, needle } => {
                 use align_sema::hir::StrPredKind;
                 // Extract both `{ptr,len}` views; the runtime call + result shaping differ per kind.
-                let ha = self.operand(haystack).into_struct_value();
-                let ne = self.operand(needle).into_struct_value();
+                let ha = self.operand(haystack)?.into_struct_value();
+                let ne = self.operand(needle)?.into_struct_value();
                 let hp = self.builder.build_extract_value(ha, 0, "hp").map_err(|e| self.err(e))?;
                 let hl = self.builder.build_extract_value(ha, 1, "hl").map_err(|e| self.err(e))?;
                 let np = self.builder.build_extract_value(ne, 0, "np").map_err(|e| self.err(e))?;
@@ -6550,7 +6551,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrFinderNew { needle } => {
                 // Split the needle `{ptr,len}` and build the hoisted plan (doc-13 §6.6). Allocator-
                 // class call (`align_rt_str_finder_new`); the returned handle is a bare `ptr`.
-                let ne = self.operand(needle).into_struct_value();
+                let ne = self.operand(needle)?.into_struct_value();
                 let np = self.builder.build_extract_value(ne, 0, "fnp").map_err(|e| self.err(e))?;
                 let nl = self.builder.build_extract_value(ne, 1, "fnl").map_err(|e| self.err(e))?;
                 self.builder
@@ -6565,8 +6566,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // returns an `i64` index or `-1` (MIR compares `>= 0`). The plan handle is a bare
                 // `ptr`; split the haystack `{ptr,len}` view. No CPU-feature detection here (it
                 // happened in `finder_new`), so the declaration carries `memory(argmem: read)`.
-                let plan_ptr = self.operand(plan);
-                let ha = self.operand(haystack).into_struct_value();
+                let plan_ptr = self.operand(plan)?;
+                let ha = self.operand(haystack)?.into_struct_value();
                 let hp = self.builder.build_extract_value(ha, 0, "fhp").map_err(|e| self.err(e))?;
                 let hl = self.builder.build_extract_value(ha, 1, "fhl").map_err(|e| self.err(e))?;
                 self.builder
@@ -6581,7 +6582,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // (`into_string` copies into a fresh malloc'd buffer), not arena-tied. `capacity`
                 // pre-sizes the backing buffer so appends don't reallocate (0 = default).
                 let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
-                let cap = self.operand(capacity);
+                let cap = self.operand(capacity)?;
                 if let Some(slot) = self.stack_header_new_values.get(&result_id).copied() {
                     let header = self.stack_headers[&slot];
                     return Ok(Some(
@@ -6605,8 +6606,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("builder_new returns a pointer")
             }
             Rvalue::BuilderWriteStr(bld, s) => {
-                let b = self.operand(bld).into();
-                let agg = self.operand(s).into_struct_value();
+                let b = self.operand(bld)?.into();
+                let agg = self.operand(s)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
                 self.builder
@@ -6615,10 +6616,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::BuilderWriteInt(bld, n) => {
-                let b = self.operand(bld).into();
+                let b = self.operand(bld)?.into();
                 // Widen the integer to `i64` (the runtime arg width), like `print`.
                 let ty = self.f.operand_ty(n);
-                let v = self.operand(n).into_int_value();
+                let v = self.operand(n)?.into_int_value();
                 let i64t = self.ctx.i64_type();
                 let wide = if int_bits(ty) < 64 {
                     if is_signed(ty) {
@@ -6637,12 +6638,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::BuilderWriteStrIntStr(bld, s1, n, s2) => {
                 // Fused `write(str1); write_int(n); write(str2)`: pass both `str`s as `ptr,len` (like
                 // BuilderWriteStr) and widen the int to i64 (like BuilderWriteInt).
-                let b = self.operand(bld).into();
-                let a1 = self.operand(s1).into_struct_value();
+                let b = self.operand(bld)?.into();
+                let a1 = self.operand(s1)?.into_struct_value();
                 let p1 = self.builder.build_extract_value(a1, 0, "wptr1").map_err(|e| self.err(e))?;
                 let l1 = self.builder.build_extract_value(a1, 1, "wlen1").map_err(|e| self.err(e))?;
                 let ty = self.f.operand_ty(n);
-                let v = self.operand(n).into_int_value();
+                let v = self.operand(n)?.into_int_value();
                 let i64t = self.ctx.i64_type();
                 let wide = if int_bits(ty) < 64 {
                     if is_signed(ty) {
@@ -6653,7 +6654,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } else {
                     v
                 };
-                let a2 = self.operand(s2).into_struct_value();
+                let a2 = self.operand(s2)?.into_struct_value();
                 let p2 = self.builder.build_extract_value(a2, 0, "wptr2").map_err(|e| self.err(e))?;
                 let l2 = self.builder.build_extract_value(a2, 1, "wlen2").map_err(|e| self.err(e))?;
                 self.builder
@@ -6667,8 +6668,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BuilderWriteBool(bld, v) => {
                 // Widen the i1 to i32 (the runtime arg width), like `print(bool)`.
-                let b = self.operand(bld).into();
-                let val = self.operand(v).into_int_value();
+                let b = self.operand(bld)?.into();
+                let val = self.operand(v)?.into_int_value();
                 let wide = self.builder.build_int_z_extend(val, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
                 self.builder
                     .build_call(self.funcs["builder_write_bool"], &[b, wide.into()], "")
@@ -6677,8 +6678,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BuilderWriteChar(bld, c) => {
                 // A `char` is a u32 scalar; the runtime emits its UTF-8.
-                let b = self.operand(bld).into();
-                let val = self.operand(c);
+                let b = self.operand(bld)?.into();
+                let val = self.operand(c)?;
                 self.builder
                     .build_call(self.funcs["builder_write_char"], &[b, val.into()], "")
                     .map_err(|e| self.err(e))?;
@@ -6686,9 +6687,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BuilderWriteFloat(bld, x) => {
                 // Pick the runtime fn by float width, like `print(float)`.
-                let b = self.operand(bld).into();
+                let b = self.operand(bld)?.into();
                 let ty = self.f.operand_ty(x);
-                let val = self.operand(x);
+                let val = self.operand(x)?;
                 let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
                 self.builder
                     .build_call(self.funcs[callee], &[b, val.into()], "")
@@ -6699,7 +6700,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // Finish into an owned `string` `{ptr,len}` (a fresh heap buffer); the builder
                 // object is freed by the runtime, or consumed in caller stack storage when the
                 // whole-MIR noescape proof selected that local.
-                let b = self.operand(bld).into();
+                let b = self.operand(bld)?.into();
                 let finish = if self.stack_header_slot_for_operand(bld).is_some() {
                     "builder_into_string_stack"
                 } else {
@@ -6747,7 +6748,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             // json.scan (J5). The scanner value IS the input `{ptr,len}` view — no allocation.
-            Rvalue::JsonScanNew { input } => self.operand(input),
+            Rvalue::JsonScanNew { input } => self.operand(input)?,
             // One streaming step: decode the next object at `*cursor` into the `row` slot, return the
             // i32 status (0 = row / 1 = done / 2 = malformed).
             Rvalue::JsonScanNext { scanner, struct_id, cursor, row, .. } => self.gen_json_scan_next(*struct_id, scanner, *cursor, *row)?,
@@ -6775,8 +6776,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("io_writer_std returns a pointer")
             }
             Rvalue::ReaderRead(r, buf) => {
-                let rp = self.operand(r).into();
-                let bp = self.operand(buf).into();
+                let rp = self.operand(r)?.into();
+                let bp = self.operand(buf)?.into();
                 self.builder
                     .build_call(self.funcs["io_reader_read"], &[rp, bp], "read")
                     .map_err(|e| self.err(e))?
@@ -6791,16 +6792,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return self.gen_reader_line_rvalue(rv);
             }
             Rvalue::IoCopy(r, w) => {
-                let rp = self.operand(r).into();
-                let wp = self.operand(w).into();
+                let rp = self.operand(r)?.into();
+                let wp = self.operand(w)?.into();
                 self.builder
                     .build_call(self.funcs["io_copy"], &[rp, wp], "copy")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_copy returns i64")
             }
             Rvalue::WriterWrite(w, s) => {
-                let wp = self.operand(w).into();
-                let agg = self.operand(s).into_struct_value();
+                let wp = self.operand(w)?.into();
+                let agg = self.operand(s)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
                 self.builder
@@ -6809,22 +6810,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("io_writer_write returns i32")
             }
             Rvalue::WriterWriteBuilder(w, bld) => {
-                let wp = self.operand(w).into();
-                let bp = self.operand(bld).into();
+                let wp = self.operand(w)?.into();
+                let bp = self.operand(bld)?.into();
                 self.builder
                     .build_call(self.funcs["io_writer_write_builder"], &[wp, bp], "wrb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_write_builder returns i32")
             }
             Rvalue::WriterFlush(w) => {
-                let wp = self.operand(w).into();
+                let wp = self.operand(w)?.into();
                 self.builder
                     .build_call(self.funcs["io_writer_flush"], &[wp], "wflush")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_flush returns i32")
             }
             Rvalue::BufferNew(cap) => {
-                let cap = self.operand(cap).into();
+                let cap = self.operand(cap)?.into();
                 self.builder
                     .build_call(self.funcs["buffer_new"], &[cap], "buf")
                     .map_err(|e| self.err(e))?
@@ -6832,7 +6833,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::BufferBytes(buf) => {
                 // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
-                let bp = self.operand(buf).into();
+                let bp = self.operand(buf)?.into();
                 let slot = self.alloca_at_entry(slice_struct_type(self.ctx).into(), "bytesslot")?;
                 self.builder
                     .build_call(self.funcs["buffer_bytes"], &[bp, slot.into()], "")
@@ -6840,7 +6841,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_load(slice_struct_type(self.ctx), slot, "bytes").map_err(|e| self.err(e))?
             }
             Rvalue::BufferLen(buf) => {
-                let bp = self.operand(buf).into();
+                let bp = self.operand(buf)?.into();
                 self.builder
                     .build_call(self.funcs["buffer_len"], &[bp], "buflen")
                     .map_err(|e| self.err(e))?
@@ -6854,7 +6855,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::BytesRead { bytes, offset, scalar, be } => {
                 let (ptr, _len) = self.split_str(bytes)?;
                 let ptr = ptr.into_pointer_value();
-                let off = self.operand(offset).into_int_value();
+                let off = self.operand(offset)?.into_int_value();
                 let addr = unsafe {
                     self.builder.build_gep(self.ctx.i8_type(), ptr, &[off], "byteaddr").map_err(|e| self.err(e))?
                 };
@@ -6887,19 +6888,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // a narrower int zero-extends, so its low `width` bytes are the two's-complement value),
             // then hand (bits, width, be) to the runtime, which appends `width` bytes in order.
             Rvalue::BufferPut { buffer, value, scalar, be } => {
-                let bp = self.operand(buffer).into();
+                let bp = self.operand(buffer)?.into();
                 let width = match scalar {
                     Ty::Int(IntTy { bits, .. }) | Ty::Float(FloatTy { bits }) => u64::from(*bits) / 8,
                     _ => return Err(self.err("buffer put scalar must be a fixed-width int/float")),
                 };
                 let i64t = self.ctx.i64_type();
                 let bits = if matches!(scalar, Ty::Float(_)) {
-                    let fv = self.operand(value).into_float_value();
+                    let fv = self.operand(value)?.into_float_value();
                     let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
                     let as_int = self.builder.build_bit_cast(fv, int_bits, "fbits").map_err(|e| self.err(e))?.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(as_int, i64t, "bits64").map_err(|e| self.err(e))?
                 } else {
-                    let iv = self.operand(value).into_int_value();
+                    let iv = self.operand(value)?.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
                 };
                 let width_c = i64t.const_int(width, false);
@@ -6911,7 +6912,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // `buf.append(data)` — copy the raw `slice<u8>` bytes onto the growable buffer.
             Rvalue::BufferAppend { buffer, data } => {
-                let bp = self.operand(buffer).into();
+                let bp = self.operand(buffer)?.into();
                 let (ptr, len) = self.split_str(data)?;
                 self.builder
                     .build_call(self.funcs["buffer_append"], &[bp, ptr.into(), len.into()], "")
@@ -6937,7 +6938,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::FsWriteFileBuilder { path, builder } => {
                 let (p_ptr, p_len) = self.split_str(path)?;
-                let bp = self.operand(builder).into();
+                let bp = self.operand(builder)?.into();
                 self.builder
                     .build_call(self.funcs["fs_write_file_builder"], &[p_ptr.into(), p_len.into(), bp], "fwfb")
                     .map_err(|e| self.err(e))?
@@ -6982,7 +6983,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (h_ptr, h_len) = self.split_str(host)?;
-                let port_v = self.operand(port).into();
+                let port_v = self.operand(port)?.into();
                 self.builder
                     .build_call(self.funcs["tcp_connect"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tconn")
                     .map_err(|e| self.err(e))?
@@ -6990,14 +6991,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // c.reader() / c.writer() — borrow an M9 reader/writer over the conn's fd (owns_fd:false).
             Rvalue::ConnReader(c) => {
-                let cp = self.operand(c).into();
+                let cp = self.operand(c)?.into();
                 self.builder
                     .build_call(self.funcs["tcp_conn_reader"], &[cp], "creader")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_conn_reader returns a pointer")
             }
             Rvalue::ConnWriter(c) => {
-                let cp = self.operand(c).into();
+                let cp = self.operand(c)?.into();
                 self.builder
                     .build_call(self.funcs["tcp_conn_writer"], &[cp], "cwriter")
                     .map_err(|e| self.err(e))?
@@ -7008,7 +7009,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (h_ptr, h_len) = self.split_str(host)?;
-                let port_v = self.operand(port).into();
+                let port_v = self.operand(port)?.into();
                 self.builder
                     .build_call(self.funcs["tcp_listen"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tlisten")
                     .map_err(|e| self.err(e))?
@@ -7018,7 +7019,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::TcpAccept { listener, out } => {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
-                let lp = self.operand(listener).into();
+                let lp = self.operand(listener)?.into();
                 self.builder
                     .build_call(self.funcs["tcp_accept"], &[lp, out_ptr.into()], "taccept")
                     .map_err(|e| self.err(e))?
@@ -7029,7 +7030,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (h_ptr, h_len) = self.split_str(host)?;
-                let port_v = self.operand(port).into();
+                let port_v = self.operand(port)?.into();
                 self.builder
                     .build_call(self.funcs["udp_bind"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "ubind")
                     .map_err(|e| self.err(e))?
@@ -7038,10 +7039,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // u.send_to — sendto the byte view `data` to host/port from the socket's fd; return i64
             // (bytes sent, or -(status)). `data` is a {ptr,len} byte view (str/string/slice<u8>).
             Rvalue::UdpSendTo { sock, data, host, port } => {
-                let sp = self.operand(sock).into();
+                let sp = self.operand(sock)?.into();
                 let (d_ptr, d_len) = self.split_str(data)?;
                 let (h_ptr, h_len) = self.split_str(host)?;
-                let port_v = self.operand(port).into();
+                let port_v = self.operand(port)?.into();
                 self.builder
                     .build_call(self.funcs["udp_send_to"], &[sp, d_ptr.into(), d_len.into(), h_ptr.into(), h_len.into(), port_v], "usend")
                     .map_err(|e| self.err(e))?
@@ -7050,8 +7051,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // u.recv_from — block for one datagram into the buffer; return i64 (bytes received, or
             // -(status)).
             Rvalue::UdpRecvFrom { sock, buffer } => {
-                let sp = self.operand(sock).into();
-                let bp = self.operand(buffer).into();
+                let sp = self.operand(sock)?.into();
+                let bp = self.operand(buffer)?.into();
                 self.builder
                     .build_call(self.funcs["udp_recv_from"], &[sp, bp], "urecv")
                     .map_err(|e| self.err(e))?
@@ -7075,7 +7076,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // ch.wait — waitpid the child (marking it reaped through the pointer); return i64 (exit
             // code >= 0, or -(status) on a double-wait / waitpid error).
             Rvalue::ChildWait { child } => {
-                let cp = self.operand(child).into();
+                let cp = self.operand(child)?.into();
                 self.builder
                     .build_call(self.funcs["child_wait"], &[cp], "cwait")
                     .map_err(|e| self.err(e))?
@@ -7084,8 +7085,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // ch.kill — libc kill(pid, sig); return i32 status (0 = ok, AL_INVALID for a bad sig /
             // reaped child, else the mapped errno). `child` is a *Child pointer, `sig` an i64.
             Rvalue::ChildKill { child, sig } => {
-                let cp = self.operand(child).into();
-                let sv = self.operand(sig).into();
+                let cp = self.operand(child)?.into();
+                let sv = self.operand(sig)?.into();
                 self.builder
                     .build_call(self.funcs["child_kill"], &[cp, sv], "ckill")
                     .map_err(|e| self.err(e))?
@@ -7108,7 +7109,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (p_ptr, p_len) = self.split_str(path)?;
-                let ah = self.operand(arena).into();
+                let ah = self.operand(arena)?.into();
                 self.builder
                     .build_call(self.funcs["fs_read_file_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
                     .map_err(|e| self.err(e))?
@@ -7120,7 +7121,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (p_ptr, p_len) = self.split_str(path)?;
-                let ah = self.operand(arena).into();
+                let ah = self.operand(arena)?.into();
                 self.builder
                     .build_call(self.funcs["fs_read_bytes_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frbv")
                     .map_err(|e| self.err(e))?
@@ -7210,7 +7211,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("crypto_ct_equal returns i32")
             }
             Rvalue::CryptoRandom { out } => {
-                let op = self.operand(out).into();
+                let op = self.operand(out)?.into();
                 self.builder
                     .build_call(self.funcs["crypto_random"], &[op], "")
                     .map_err(|e| self.err(e))?;
@@ -7250,7 +7251,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (sp, sl) = self.split_str(salt)?;
                 let (ip, il) = self.split_str(ikm)?;
                 let (np, nl) = self.split_str(info)?;
-                let lv = self.operand(len);
+                let lv = self.operand(len)?;
                 self.builder
                     .build_call(
                         self.funcs["crypto_hkdf_sha256"],
@@ -7298,10 +7299,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 let (pp, pl) = self.split_str(&a.password)?;
                 let (sp, sl) = self.split_str(&a.salt)?;
-                let m = self.operand(&a.m_cost);
-                let t = self.operand(&a.t_cost);
-                let p = self.operand(&a.parallelism);
-                let l = self.operand(&a.len);
+                let m = self.operand(&a.m_cost)?;
+                let t = self.operand(&a.t_cost)?;
+                let p = self.operand(&a.parallelism)?;
+                let l = self.operand(&a.len)?;
                 self.builder
                     .build_call(
                         self.funcs["crypto_argon2id"],
@@ -7324,7 +7325,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 let (dp, dl) = self.split_str(data)?;
-                let lv = self.operand(level);
+                let lv = self.operand(level)?;
                 self.builder
                     .build_call(self.funcs[fk], &[dp.into(), dl.into(), lv.into(), out_ptr.into()], "gzc")
                     .map_err(|e| self.err(e))?
@@ -7352,7 +7353,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let out_ptr = self.slots[out];
                 match seed {
                     Some(s) => {
-                        let sv = self.operand(s);
+                        let sv = self.operand(s)?;
                         self.builder
                             .build_call(self.funcs["rng_seed_with"], &[out_ptr.into(), sv.into()], "")
                             .map_err(|e| self.err(e))?;
@@ -7374,8 +7375,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::RandRange { rng, lo, hi } => {
                 let rng_ptr = self.slots[rng];
-                let lo = self.operand(lo);
-                let hi = self.operand(hi);
+                let lo = self.operand(lo)?;
+                let hi = self.operand(hi)?;
                 self.builder
                     .build_call(self.funcs["rng_range"], &[rng_ptr.into(), lo.into(), hi.into()], "rrange")
                     .map_err(|e| self.err(e))?
@@ -7394,7 +7395,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::RandSample { rng, xs, k, elem } => {
                 let rng_ptr = self.slots[rng];
                 let (xp, xl) = self.split_str(xs)?;
-                let kv = self.operand(k);
+                let kv = self.operand(k)?;
                 let esz = scalar_bytes(align_sema::ty_to_scalar(*elem).expect("sample element is a scalar"));
                 let esz = self.ctx.i64_type().const_int(esz, false);
                 self.builder
@@ -7413,7 +7414,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("cli_command returns a handle pointer")
             }
             Rvalue::CliFlag { cmd, kind, name, default } => {
-                let c = self.operand(cmd).into_pointer_value();
+                let c = self.operand(cmd)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 match kind {
                     align_sema::hir::CliFlagKind::Bool => {
@@ -7430,7 +7431,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     align_sema::hir::CliFlagKind::I64 => {
                         let d = default.as_ref().expect("flag_i64 carries an i64 default");
-                        let dv = self.operand(d);
+                        let dv = self.operand(d)?;
                         self.builder
                             .build_call(self.funcs["cli_flag_i64"], &[c.into(), np.into(), nl.into(), dv.into()], "")
                             .map_err(|e| self.err(e))?;
@@ -7439,7 +7440,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::CliParse { cmd, args, out } => {
-                let c = self.operand(cmd).into_pointer_value();
+                let c = self.operand(cmd)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
@@ -7451,7 +7452,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("cli_parse returns i32 status")
             }
             Rvalue::CliGetBool { parsed, name } => {
-                let p = self.operand(parsed).into_pointer_value();
+                let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
                     .build_call(self.funcs["cli_get_bool"], &[p.into(), np.into(), nl.into()], "cligetb")
@@ -7459,7 +7460,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("cli_get_bool returns i32")
             }
             Rvalue::CliGetI64 { parsed, name } => {
-                let p = self.operand(parsed).into_pointer_value();
+                let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
                     .build_call(self.funcs["cli_get_i64"], &[p.into(), np.into(), nl.into()], "cligeti")
@@ -7467,7 +7468,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("cli_get_i64 returns i64")
             }
             Rvalue::CliGetStr { parsed, name } => {
-                let p = self.operand(parsed).into_pointer_value();
+                let p = self.operand(parsed)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 self.builder
                     .build_call(self.funcs["cli_get_str"], &[p.into(), np.into(), nl.into()], "cligets")
@@ -7475,7 +7476,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("cli_get_str returns a {ptr,len}")
             }
             Rvalue::CliUsage { cmd } => {
-                let c = self.operand(cmd).into_pointer_value();
+                let c = self.operand(cmd)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["cli_usage"], &[c.into()], "cliusage")
                     .map_err(|e| self.err(e))?
@@ -7491,7 +7492,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_request returns a handle pointer")
             }
             Rvalue::HttpHeader { req, name, value } => {
-                let r = self.operand(req).into_pointer_value();
+                let r = self.operand(req)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
@@ -7500,7 +7501,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::HttpBody { req, data } => {
-                let r = self.operand(req).into_pointer_value();
+                let r = self.operand(req)?.into_pointer_value();
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
                     .build_call(self.funcs["http_body"], &[r.into(), dp.into(), dl.into()], "")
@@ -7519,14 +7520,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_parse returns i32 status")
             }
             Rvalue::HttpRespStatus { resp } => {
-                let p = self.operand(resp).into_pointer_value();
+                let p = self.operand(resp)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_resp_status"], &[p.into()], "httpstatus")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_resp_status returns i64")
             }
             Rvalue::HttpRespHeader { resp, name, out } => {
-                let p = self.operand(resp).into_pointer_value();
+                let p = self.operand(resp)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (np, nl) = self.split_str(name)?;
@@ -7536,7 +7537,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_resp_header returns i32 present flag")
             }
             Rvalue::HttpRespBody { resp } => {
-                let p = self.operand(resp).into_pointer_value();
+                let p = self.operand(resp)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_resp_body"], &[p.into()], "httpbody")
                     .map_err(|e| self.err(e))?
@@ -7551,7 +7552,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("http_client_new returns a handle pointer"),
             Rvalue::HttpClientGet { client, url, out } => {
-                let c = self.operand(client).into_pointer_value();
+                let c = self.operand(client)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (up, ul) = self.split_str(url)?;
@@ -7561,7 +7562,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_client_get returns i32 status")
             }
             Rvalue::HttpClientPost { client, url, body, out } => {
-                let c = self.operand(client).into_pointer_value();
+                let c = self.operand(client)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (up, ul) = self.split_str(url)?;
@@ -7572,8 +7573,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_client_post returns i32 status")
             }
             Rvalue::HttpClientRequest { client, req, out } => {
-                let c = self.operand(client).into_pointer_value();
-                let r = self.operand(req).into_pointer_value();
+                let c = self.operand(client)?.into_pointer_value();
+                let r = self.operand(req)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
@@ -7586,11 +7587,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // (the Err branch reads `{null,0}` → nothing to free), like `fs.read_dir`. `urls` is a
             // `slice<str>` (split to ptr+len); `max_concurrency` is an i64.
             Rvalue::HttpGetMany { client, urls, max_concurrency, out } => {
-                let c = self.operand(client).into_pointer_value();
+                let c = self.operand(client)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (up, ul) = self.split_str(urls)?;
-                let mc = self.operand(max_concurrency).into();
+                let mc = self.operand(max_concurrency)?.into();
                 self.builder
                     .build_call(self.funcs["http_get_many"], &[c.into(), up.into(), ul.into(), mc, out_ptr.into()], "httpgetmany")
                     .map_err(|e| self.err(e))?
@@ -7602,7 +7603,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // a builder; `rb_header`/`rb_body` are void; a header/body/status is passed by value.
             Rvalue::HttpServe { host, port, out, shared } => {
                 let (hp, hl) = self.split_str(host)?;
-                let port_v = self.operand(port);
+                let port_v = self.operand(port)?;
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let callee = if *shared { self.funcs["http_serve_shared"] } else { self.funcs["http_serve"] };
@@ -7612,7 +7613,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_serve returns i32 status")
             }
             Rvalue::HttpAccept { server, out } => {
-                let s = self.operand(server).into_pointer_value();
+                let s = self.operand(server)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
@@ -7621,21 +7622,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_accept returns i32 status")
             }
             Rvalue::HttpCtxMethod { ctx } => {
-                let p = self.operand(ctx).into_pointer_value();
+                let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_ctx_method"], &[p.into()], "httpmethod")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_method returns a {ptr,len}")
             }
             Rvalue::HttpCtxPath { ctx } => {
-                let p = self.operand(ctx).into_pointer_value();
+                let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_ctx_path"], &[p.into()], "httppath")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_path returns a {ptr,len}")
             }
             Rvalue::HttpCtxHeader { ctx, name, out } => {
-                let p = self.operand(ctx).into_pointer_value();
+                let p = self.operand(ctx)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
                 let (np, nl) = self.split_str(name)?;
@@ -7645,21 +7646,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_ctx_header returns i32 present flag")
             }
             Rvalue::HttpCtxBody { ctx } => {
-                let p = self.operand(ctx).into_pointer_value();
+                let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_ctx_body"], &[p.into()], "httpctxbody")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_body returns a {ptr,len}")
             }
             Rvalue::HttpResponseBuilder { status } => {
-                let status_v = self.operand(status);
+                let status_v = self.operand(status)?;
                 self.builder
                     .build_call(self.funcs["http_response_new"], &[status_v.into()], "httprb")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_response_new returns a handle pointer")
             }
             Rvalue::HttpRbHeader { rb, name, value } => {
-                let r = self.operand(rb).into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
                 let (np, nl) = self.split_str(name)?;
                 let (vp, vl) = self.split_str(value)?;
                 self.builder
@@ -7668,7 +7669,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::HttpRbBody { rb, data } => {
-                let r = self.operand(rb).into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
                     .build_call(self.funcs["http_rb_body"], &[r.into(), dp.into(), dl.into()], "")
@@ -7676,16 +7677,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::HttpRespond { ctx, rb } => {
-                let c = self.operand(ctx).into_pointer_value();
-                let r = self.operand(rb).into_pointer_value();
+                let c = self.operand(ctx)?.into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_respond"], &[c.into(), r.into()], "httprespond")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond returns i32 status")
             }
             Rvalue::HttpRespondStream { ctx, rb, out } => {
-                let c = self.operand(ctx).into_pointer_value();
-                let r = self.operand(rb).into_pointer_value();
+                let c = self.operand(ctx)?.into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 self.builder
@@ -7694,7 +7695,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_respond_stream returns i32 status")
             }
             Rvalue::HttpStreamSend { stream, chunk, event } => {
-                let s = self.operand(stream).into_pointer_value();
+                let s = self.operand(stream)?.into_pointer_value();
                 let (dp, dl) = self.split_str(chunk)?;
                 let f = if *event { "http_stream_send_event" } else { "http_stream_send" };
                 self.builder
@@ -7703,15 +7704,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("http_stream_send returns i32 status")
             }
             Rvalue::HttpStreamFinish { stream } => {
-                let s = self.operand(stream).into_pointer_value();
+                let s = self.operand(stream)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_stream_finish"], &[s.into()], "httpstreamfinish")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_finish returns i32 status")
             }
             Rvalue::HttpStreamReject { stream, rb } => {
-                let s = self.operand(stream).into_pointer_value();
-                let r = self.operand(rb).into_pointer_value();
+                let s = self.operand(stream)?.into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
                 self.builder
                     .build_call(self.funcs["http_stream_reject"], &[s.into(), r.into()], "httpstreamreject")
                     .map_err(|e| self.err(e))?
@@ -7751,7 +7752,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("process_cpu_count returns i64"),
             Rvalue::TimeSleep { ns } => {
-                let n = self.operand(ns).into();
+                let n = self.operand(ns)?.into();
                 self.builder
                     .build_call(self.funcs["time_sleep"], &[n], "")
                     .map_err(|e| self.err(e))?;
@@ -7760,8 +7761,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::MakeError { enum_id, tag, code } => {
                 // Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from runtime operands.
                 let sty = self.enum_types[*enum_id as usize];
-                let t = self.operand(tag);
-                let c = self.operand(code);
+                let t = self.operand(tag)?;
+                let c = self.operand(code)?;
                 let agg = self
                     .builder
                     .build_insert_value(sty.const_zero(), t, 0, "etag")
@@ -7773,18 +7774,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::SliceLen(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
             }
             Rvalue::SlicePtr(op) => {
-                let agg = self.operand(op).into_struct_value();
+                let agg = self.operand(op)?.into_struct_value();
                 self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?
             }
             Rvalue::SliceIndex(s, idx) => {
-                let agg = self.operand(s).into_struct_value();
+                let agg = self.operand(s)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                let index = self.operand(idx).into_int_value();
+                let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
                         .build_in_bounds_gep(ty, ptr, &[index], "slcidx")
@@ -7796,10 +7797,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // Like `SliceIndex`, plus the `map_into` loop's `in` alias scope so the vectorizer
                 // knows this source load can't overlap the (`out`-scoped) `dst` store.
                 // `alias.scope = {in}`, `noalias = {out}`.
-                let agg = self.operand(slice).into_struct_value();
+                let agg = self.operand(slice)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
-                let idx = self.operand(index).into_int_value();
+                let idx = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
                         .build_in_bounds_gep(ty, ptr, &[idx], "slcidx")
@@ -7820,16 +7821,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // Offset the base pointer by `start` elements (the `elem` type sets the GEP stride —
                 // `i8` bytes for a `str`) and pair it with the precomputed `len`, yielding a borrowed
                 // `{ptr,len}` view of the same backing storage (no allocation).
-                let agg = self.operand(base).into_struct_value();
+                let agg = self.operand(base)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "subptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let ety = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
-                let start_v = self.operand(start).into_int_value();
+                let start_v = self.operand(start)?.into_int_value();
                 let newptr = unsafe {
                     self.builder
                         .build_in_bounds_gep(ety, ptr, &[start_v], "subgep")
                         .map_err(|e| self.err(e))?
                 };
-                let l = self.operand(len);
+                let l = self.operand(len)?;
                 let sty = slice_struct_type(self.ctx);
                 let s0 = self
                     .builder
@@ -7854,7 +7855,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(
                         self.funcs["arena_alloc"],
-                        &[self.operand(handle).into(), i64t.const_int(bytes, false).into(), i64t.const_int(bytes, false).into()],
+                        &[self.operand(handle)?.into(), i64t.const_int(bytes, false).into(), i64t.const_int(bytes, false).into()],
                         "clone",
                     )
                     .map_err(|e| self.err(e))?
@@ -7862,13 +7863,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("arena_alloc returns a pointer")
                     .into_pointer_value();
-                let src_ptr = self.operand(src).into_pointer_value();
+                let src_ptr = self.operand(src)?.into_pointer_value();
                 let val = self.builder.build_load(ty, src_ptr, "cloneval").map_err(|e| self.err(e))?;
                 self.builder.build_store(new_ptr, val).map_err(|e| self.err(e))?;
                 new_ptr.into()
             }
             // `error(code)` is identity on the i32 code (the M2 Error repr).
-            Rvalue::Call(name, args) if name == "error" => self.operand(&args[0]),
+            Rvalue::Call(name, args) if name == "error" => self.operand(&args[0])?,
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) if name == "hash64" || name == "hash128" => {
                 return self.gen_hash(name, args);
@@ -7882,7 +7883,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Some(abi) => {
                         let mut v: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
                         for (o, pa) in args.iter().zip(&abi.params) {
-                            let val = self.operand(o);
+                            let val = self.operand(o)?;
                             match pa {
                                 ParamAbi::Direct => v.push(val.into()),
                                 ParamAbi::ViewPtr => {
@@ -7913,7 +7914,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         }
                         v
                     }
-                    None => args.iter().map(|o| self.operand(o).into()).collect(),
+                    None => args
+                        .iter()
+                        .map(|o| self.operand(o).map(Into::into))
+                        .collect::<Result<_, _>>()?,
                 };
                 let cs = self
                     .builder
@@ -7962,7 +7966,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let env_struct = self.ctx.struct_type(&env_fields, false);
                 let env_ptr = self.alloca_at_entry(env_struct.into(), "clos_env")?;
                 for (i, op) in captures.iter().enumerate() {
-                    let v = self.operand(op);
+                    let v = self.operand(op)?;
                     let fld = self
                         .builder
                         .build_struct_gep(env_struct, env_ptr, i as u32, "capg")
@@ -7988,14 +7992,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::CallIndirect { callee, args, param_tys, ret_ty } => {
                 // Extract `{ fn_ptr, env_ptr }` and call with the env-ABI `fn(env, args)`.
-                let clos = self.operand(callee).into_struct_value();
+                let clos = self.operand(callee)?.into_struct_value();
                 let fn_ptr = self.builder.build_extract_value(clos, 0, "cf").map_err(|e| self.err(e))?.into_pointer_value();
                 let env = self.builder.build_extract_value(clos, 1, "ce").map_err(|e| self.err(e))?;
                 let mut param_meta: Vec<BasicMetadataTypeEnum> =
                     vec![self.ctx.ptr_type(AddressSpace::default()).into()];
                 param_meta.extend(param_tys.iter().map(|t| BasicMetadataTypeEnum::from(self.llvm_type(*t))));
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
-                argv.extend(args.iter().map(|o| inkwell::values::BasicMetadataValueEnum::from(self.operand(o))));
+                for o in args {
+                    argv.push(inkwell::values::BasicMetadataValueEnum::from(self.operand(o)?));
+                }
                 if *ret_ty == Ty::Unit {
                     // Align `()` functions use LLVM `void`, including their env-ABI fn-value
                     // thunks. Calling such a thunk through an `i32` signature is an ABI mismatch
@@ -8043,7 +8049,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn elem_ptr(&self, slot: Slot, idx: &Operand) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
         let zero = self.ctx.i64_type().const_zero();
-        let index = self.operand(idx).into_int_value();
+        let index = self.operand(idx)?.into_int_value();
         unsafe {
             self.builder
                 .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index], "elemptr")
@@ -8078,7 +8084,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn elem_field_ptr(&self, slot: Slot, idx: &Operand, path: &[u32]) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
         let zero = self.ctx.i64_type().const_zero();
-        let index = self.operand(idx).into_int_value();
+        let index = self.operand(idx)?.into_int_value();
         let sid = self.array_elem_struct_id(slot);
         // `[0, index]` reaches element `index`; each physical field index descends one struct level.
         let mut indices = vec![zero, index];
@@ -8391,7 +8397,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `str`, `string`, and `slice<u8>` all lower to the same `{ptr, i64}` struct, so one path
     /// serves every input type. `hash64` returns an i64; `hash128` returns a `{i64,i64}` tuple value.
     fn gen_hash(&mut self, name: &str, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
-        let agg = self.operand(&args[0]).into_struct_value();
+        let agg = self.operand(&args[0])?.into_struct_value();
         let ptr = self.builder.build_extract_value(agg, 0, "hptr").map_err(|e| self.err(e))?;
         let len = self.builder.build_extract_value(agg, 1, "hlen").map_err(|e| self.err(e))?;
         let cs = self
@@ -8401,60 +8407,69 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(cs.try_as_basic_value().basic())
     }
 
+    /// Builtin `print`. Dispatches on [`align_sema::print_kind`] — the SAME single classification
+    /// sema's `print`/template-hole check and MIR's `TemplatePiece` selection use — and reads the
+    /// operand through the same `display_*` accessors as a template hole. One mechanism for both
+    /// display sites, so a printable type cannot be handled by one and mis-handled by the other.
+    ///
+    /// The old shape dispatched on `ty` with a **catch-all integer tail**, so an unprintable
+    /// argument (`print(array)` / `print(struct)` / `print(u())`) reached `into_int_value()` and
+    /// aborted the compiler if it ever got past the sema gate. `None` is now an error.
     fn gen_print(&mut self, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let arg = &args[0];
         let ty = self.f.operand_ty(arg);
-        // print(str)/print(string): pass { ptr, len } to the runtime (a `string` reads as a `str`).
-        if ty == Ty::Str || ty == Ty::String {
-            let agg = self.operand(arg).into_struct_value();
-            let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
-            let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;
-            self.builder
-                .build_call(self.funcs["print_str"], &[ptr.into(), len.into()], "")
-                .map_err(|e| self.err(e))?;
-            return Ok(None);
-        }
-        // print(bool): widen i1 to i32 and emit `true`/`false`.
-        if ty == Ty::Bool {
-            let v = self.operand(arg).into_int_value();
-            let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
-            self.builder
-                .build_call(self.funcs["print_bool"], &[wide.into()], "")
-                .map_err(|e| self.err(e))?;
-            return Ok(None);
-        }
-        // print(char): pass the u32 scalar; the runtime emits its UTF-8.
-        if ty == Ty::Char {
-            let v = self.operand(arg).into_int_value();
-            self.builder
-                .build_call(self.funcs["print_char"], &[v.into()], "")
-                .map_err(|e| self.err(e))?;
-            return Ok(None);
-        }
-        // print(float): the runtime renders the shortest round-trip decimal.
-        if matches!(ty, Ty::Float(_)) {
-            let v = self.operand(arg).into_float_value();
-            let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "print_f32" } else { "print_f64" };
-            self.builder
-                .build_call(self.funcs[callee], &[v.into()], "")
-                .map_err(|e| self.err(e))?;
-            return Ok(None);
-        }
-        let v = self.operand(arg).into_int_value();
-        let i64t = self.ctx.i64_type();
-        let wide = if int_bits(ty) < 64 {
-            if is_signed(ty) {
-                self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
-            } else {
-                self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
-            }
-        } else {
-            v
+        let Some(kind) = align_sema::print_kind(ty) else {
+            return Err(self.err(format!("'print' expects an int, float, str, bool, or char, got {ty:?}")));
         };
-        let callee = self.funcs["print"];
-        self.builder
-            .build_call(callee, &[wide.into()], "")
-            .map_err(|e| self.err(e))?;
+        match kind {
+            // print(str)/print(string): pass { ptr, len } to the runtime (a `string` reads as a `str`).
+            align_sema::PrintKind::Str => {
+                let (ptr, len) = self.display_view(arg, "'print' of a string")?;
+                self.builder
+                    .build_call(self.funcs["print_str"], &[ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+            }
+            // print(bool): widen i1 to i32 and emit `true`/`false`.
+            align_sema::PrintKind::Bool => {
+                let v = self.display_int(arg, "'print' of a bool")?;
+                let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["print_bool"], &[wide.into()], "")
+                    .map_err(|e| self.err(e))?;
+            }
+            // print(char): pass the u32 scalar; the runtime emits its UTF-8.
+            align_sema::PrintKind::Char => {
+                let v = self.display_int(arg, "'print' of a char")?;
+                self.builder
+                    .build_call(self.funcs["print_char"], &[v.into()], "")
+                    .map_err(|e| self.err(e))?;
+            }
+            // print(float): the runtime renders the shortest round-trip decimal.
+            align_sema::PrintKind::Float => {
+                let v = self.display_float(arg, "'print' of a float")?;
+                let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "print_f32" } else { "print_f64" };
+                self.builder
+                    .build_call(self.funcs[callee], &[v.into()], "")
+                    .map_err(|e| self.err(e))?;
+            }
+            align_sema::PrintKind::Int => {
+                let v = self.display_int(arg, "'print' of an integer")?;
+                let i64t = self.ctx.i64_type();
+                let wide = if int_bits(ty) < 64 {
+                    if is_signed(ty) {
+                        self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+                    } else {
+                        self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+                    }
+                } else {
+                    v
+                };
+                let callee = self.funcs["print"];
+                self.builder
+                    .build_call(callee, &[wide.into()], "")
+                    .map_err(|e| self.err(e))?;
+            }
+        }
         Ok(None)
     }
 
@@ -8524,8 +8539,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return self.gen_float_bin(op, a, b);
         }
         let signed = is_signed(self.f.operand_ty(a));
-        let l = self.operand(a).into_int_value();
-        let r = self.operand(b).into_int_value();
+        let l = self.operand(a)?.into_int_value();
+        let r = self.operand(b)?.into_int_value();
         let bld = self.builder;
         let v = match op {
             BinOp::Add => bld.build_int_add(l, r, "add"),
@@ -8647,25 +8662,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// (kind<<8)|width` tag and the nested sub-table pointer (non-null only for a `Struct` payload).
     /// Shared by a direct field and an `Option<T>` field's payload so both encode the payload
     /// identically. `null` is the null pointer constant for non-struct payloads.
-    fn json_payload_tag_sub(&mut self, ty: Ty, null: inkwell::values::PointerValue<'c>) -> (u64, inkwell::values::PointerValue<'c>) {
-        match ty {
+    fn json_payload_tag_sub(
+        &mut self,
+        ty: Ty,
+        null: inkwell::values::PointerValue<'c>,
+    ) -> Result<(u64, inkwell::values::PointerValue<'c>), CodegenError> {
+        Ok(match ty {
             Ty::Int(it) => (((it.signed as u64) << 16) | (it.bits / 8) as u64, null),
             Ty::Bool => ((1 << 8) | 1, null),
             Ty::Float(ft) => ((2 << 8) | (ft.bits / 8) as u64, null),
             Ty::Str => ((3 << 8) | 16, null),
-            Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)),
+            Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)?),
             // `array<Struct>` field (kind 5, REST-gateway runway Slice C): width 16 (the field's own
             // `{ptr,len}` slot); `sub` is the ELEMENT struct's schema (store_size = element stride),
             // which the runtime uses to decode the JSON array into an owned AoS. The nested `str`
             // element fields stay borrowed views into the input.
-            Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)),
+            Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)?),
             // `array<scalar>` field (kind 7, JSON completeness T1b): the field's own `{ptr,len}` slot is
             // width 16 (low byte); the ELEMENT scalar (int/float/bool) is packed into the upper bits so
             // one tag carries both — elem-signed bit 16, elem-kind (0=int/1=bool/2=float) bits 20-23,
             // elem-width bits 24-27. `sub` is null (scalars need no sub-schema). The element's own
             // (kind,width,sign) come from the scalar-field encoding, relocated here.
             Ty::DynArray(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool)) => {
-                let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(s), null);
+                let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(s), null)?;
                 let elem_kind = (etag >> 8) & 0xff;
                 let elem_width = etag & 0xff;
                 let elem_signed = (etag >> 16) & 1;
@@ -8675,9 +8694,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `JsonUnion` (not a `JsonSubTable`) — the runtime `field_width`/`write_value`/encode arms
             // reinterpret it by the kind. The width byte is unused (the size comes from
             // `JsonUnion.store_size`, like a nested struct's kind-4 `sub.store_size`).
-            Ty::Enum(eid) => (6 << 8, self.emit_json_union(eid)),
-            _ => unreachable!("json.decode payload is int/float/bool/str/nested-struct/array<struct>/enum-union (sema-checked)"),
-        }
+            Ty::Enum(eid) => (6 << 8, self.emit_json_union(eid)?),
+            // Not a JSON payload shape. Sema decides this domain — `decode_struct_fields_ok` for a
+            // decode target / a nested or `array<Struct>` element, and `json_encodable_scalar` for a
+            // `json.encode` `Option` payload or `array<T>` element — so reaching here is a compiler
+            // bug. It must still be an error, not an abort: `array<char>` / `array<enum>` fields
+            // reached this exact arm and killed the compiler before those gates existed.
+            other => return Err(self.err(format!("json descriptor: {other:?} is not an encodable/decodable payload type"))),
+        })
     }
 
     /// The byte offset of an `Option<s>`'s payload within its `{ i8 tag, payload }` LLVM layout
@@ -8703,17 +8727,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// (kind 4) — the struct graph is acyclic (sema's `struct_acyclic` rejects self-reference), so
     /// the recursion terminates. The table is a private constant global (no per-call alloca → safe
     /// inside a loop). Shared by single-struct and `array<Struct>` decode (MMv2 slice 8d).
-    fn emit_desc_table(&mut self, struct_id: u32) -> DescTable<'c> {
+    fn emit_desc_table(&mut self, struct_id: u32) -> Result<DescTable<'c>, CodegenError> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
         let desc_ty = self.json_desc_ty();
         let null = ptr_ty.const_null();
         let fields = self.structs[struct_id as usize].fields.clone();
-        let descs: Vec<inkwell::values::StructValue> = fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
+        let mut descs: Vec<inkwell::values::StructValue> = Vec::with_capacity(fields.len());
+        for (i, f) in fields.iter().enumerate() {
+            let desc = {
                 let (name_ptr, name_len) = self.str_global(&f.name);
                 // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
                 // 2 = float, 3 = str, 4 = nested struct. Bit 16 is the int sign flag (only meaningful
@@ -8729,11 +8752,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `offset` = the field itself.
                 let (tag, sub_ptr, offset, opt_tag): (u64, inkwell::values::PointerValue, u64, i64) = match f.ty {
                     Ty::Option(s) => {
-                        let (tag, sub_ptr) = self.json_payload_tag_sub(scalar_to_ty(s), null);
+                        let (tag, sub_ptr) = self.json_payload_tag_sub(scalar_to_ty(s), null)?;
                         (tag, sub_ptr, field_off + self.option_payload_offset(s), field_off as i64)
                     }
                     other => {
-                        let (tag, sub_ptr) = self.json_payload_tag_sub(other, null);
+                        let (tag, sub_ptr) = self.json_payload_tag_sub(other, null)?;
                         (tag, sub_ptr, field_off, -1)
                     }
                 };
@@ -8745,8 +8768,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     sub_ptr.into(),
                     i64t.const_int(opt_tag as u64, true).into(),
                 ])
-            })
-            .collect();
+            };
+            descs.push(desc);
+        }
         let table_val = desc_ty.const_array(&descs);
         let table = self.module.add_global(table_val.get_type(), None, "jfields");
         table.set_initializer(&table_val);
@@ -8771,13 +8795,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             None => (ptr_ty.const_null(), 0, 0),
         };
 
-        DescTable { descs: table.as_pointer_value(), n_fields: fields.len() as u64, phf_ptr, phf_len, phf_seed }
+        Ok(DescTable { descs: table.as_pointer_value(), n_fields: fields.len() as u64, phf_ptr, phf_len, phf_seed })
     }
 
     /// Emit the `JsonSubTable` global for a nested-struct field of type `struct_id` (its descriptor
     /// table, store size, and PHF), returning a pointer to it for the parent field's `sub` slot.
-    fn emit_json_subtable(&mut self, struct_id: u32) -> inkwell::values::PointerValue<'c> {
-        let inner = self.emit_desc_table(struct_id); // recurse — acyclic, so it terminates
+    fn emit_json_subtable(&mut self, struct_id: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let inner = self.emit_desc_table(struct_id)?; // recurse — acyclic, so it terminates
         let store_size = self.target_data.get_store_size(&self.struct_types[struct_id as usize]);
         let i64t = self.ctx.i64_type();
         let subtable_ty = self.json_subtable_ty();
@@ -8793,22 +8817,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_initializer(&val);
         g.set_constant(true);
         mark_private_unnamed_addr(g);
-        g.as_pointer_value()
+        Ok(g.as_pointer_value())
     }
 
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
     /// with the struct's store size. The table is a private constant global (safe inside a loop).
-    fn decode_field_table(&mut self, struct_id: u32) -> DecodeTable<'c> {
+    fn decode_field_table(&mut self, struct_id: u32) -> Result<DecodeTable<'c>, CodegenError> {
         let sty = self.struct_types[struct_id as usize];
-        let t = self.emit_desc_table(struct_id);
-        DecodeTable {
+        let t = self.emit_desc_table(struct_id)?;
+        Ok(DecodeTable {
             descs: t.descs,
             n_fields: t.n_fields,
             store_size: self.target_data.get_store_size(&sty),
             phf_ptr: t.phf_ptr,
             phf_len: t.phf_len,
             phf_seed: t.phf_seed,
-        }
+        })
     }
 
     /// The LLVM type of a shape-directed union descriptor, matching the runtime `JsonUnion`
@@ -8827,7 +8851,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// enum's codegen layout. Returns a pointer to the union global (a private constant → safe in a
     /// loop). Sema (`check_union_decodable`) guarantees each variant has one payload and the shape
     /// classes are pairwise distinct.
-    fn emit_json_union(&mut self, enum_id: u32) -> inkwell::values::PointerValue<'c> {
+    fn emit_json_union(&mut self, enum_id: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
@@ -8842,9 +8866,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let mut enum_tags: Vec<inkwell::values::IntValue> = Vec::with_capacity(variants.len());
         for (tag_idx, v) in variants.iter().enumerate() {
             // Sema guarantees exactly one payload per union variant; a missing one is a compiler bug.
-            let payload = *v.payload.first().expect("union variant carries exactly one payload");
+            let Some(&payload) = v.payload.first() else {
+                return Err(self.err(format!(
+                    "json union: variant '{}' carries no payload (sema's `check_union_decodable` admits only one-payload variants)",
+                    v.name
+                )));
+            };
             let pty = scalar_to_ty(payload);
-            let (tag, sub_ptr) = self.json_payload_tag_sub(pty, null);
+            let (tag, sub_ptr) = self.json_payload_tag_sub(pty, null)?;
             // The payload sits at enum LLVM element `field_base` (`field_base` is 1-based — it already
             // accounts for the i32 tag at element 0; `MakeEnum` stores the payload at `field_base + j`,
             // and a union variant has a single payload, j = 0).
@@ -8895,7 +8924,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_initializer(&val);
         g.set_constant(true);
         mark_private_unnamed_addr(g);
-        g.as_pointer_value()
+        Ok(g.as_pointer_value())
     }
 
     /// `json.decode` into a shape-directed union (`enum`) target (JSON completeness J1b): zero the out
@@ -8907,11 +8936,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the enum so an unset payload/tag reads as 0 (a failed decode leaves it zeroed).
         self.builder.build_store(out_ptr, ety.const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
-        let union_desc = self.emit_json_union(enum_id);
+        let union_desc = self.emit_json_union(enum_id)?;
         let cs = self
             .builder
             .build_call(
@@ -8929,12 +8958,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the struct so missing fields read as 0/false.
         self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id);
+        let t = self.decode_field_table(struct_id)?;
         let n = i64t.const_int(t.n_fields, false);
         let size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
@@ -8956,7 +8985,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_ptr = self.slots[&out];
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
         let (in_ptr, in_len) = self.split_str(input)?;
-        let ah = self.operand(arena);
+        let ah = self.operand(arena)?;
         let cs = self
             .builder
             .build_call(self.funcs["json_doc_parse"], &[in_ptr.into(), in_len.into(), ah.into(), out_ptr.into()], "jdoc")
@@ -9010,7 +9039,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_ptr = self.slots[&out];
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
         let (tape, node) = self.split_doc(doc)?;
-        let idx = self.operand(index);
+        let idx = self.operand(index)?;
         Ok(self
             .builder
             .build_call(self.funcs["json_doc_key"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "jkey")
@@ -9026,7 +9055,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_ptr = self.slots[&out];
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
         let (tape, node) = self.split_doc(doc)?;
-        let ah = self.operand(arena);
+        let ah = self.operand(arena)?;
         self.builder
             .build_call(self.funcs["json_doc_elems"], &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
@@ -9038,7 +9067,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_ptr = self.slots[&out];
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
         let (tape, node) = self.split_doc(doc)?;
-        let idx = self.operand(index);
+        let idx = self.operand(index)?;
         self.builder
             .build_call(self.funcs["json_doc_at"], &[tape.into(), node.into(), idx.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
@@ -9092,12 +9121,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id);
+        let t = self.decode_field_table(struct_id)?;
         let n = i64t.const_int(t.n_fields, false);
         let elem_size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
@@ -9124,7 +9153,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let cursor_ptr = self.slots[&cursor];
         let row_ptr = self.slots[&row];
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id);
+        let t = self.decode_field_table(struct_id)?;
         let n = i64t.const_int(t.n_fields, false);
         let out_size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
@@ -9150,13 +9179,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the {ptr,len} so a failed decode reads {null,0}.
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
-        let arena_v = self.operand(arena);
+        let arena_v = self.operand(arena)?;
 
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id);
+        let t = self.decode_field_table(struct_id)?;
         let n = i64t.const_int(t.n_fields, false);
         let phf_len = i64t.const_int(t.phf_len, false);
         let phf_seed = i64t.const_int(t.phf_seed, false);
@@ -9178,7 +9207,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop / unused value frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
         // Same tag encoding as struct fields: (signed << 16) | (kind << 8) | byte-width. kind 0 =
@@ -9211,7 +9240,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the scalar slot so a failed decode leaves a defined value (the Err path ignores it).
         let sty = self.llvm_type(scalar);
         self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
-        let agg = self.operand(input).into_struct_value();
+        let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jsin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jsin_l").map_err(|e| self.err(e))?;
         let tag: u64 = match scalar {
@@ -9239,7 +9268,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// for every runtime call that takes a view as a `ptr`+`len` pair (`fs.write_file`, `fs.exists`,
     /// `fs.remove`, `fs.read_dir`, `fs.read_file_view` paths).
     fn split_str(&mut self, op: &Operand) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
-        let agg = self.operand(op).into_struct_value();
+        let agg = self.operand(op)?.into_struct_value();
         let ptr = self.builder.build_extract_value(agg, 0, "sv_ptr").map_err(|e| self.err(e))?;
         let len = self.builder.build_extract_value(agg, 1, "sv_len").map_err(|e| self.err(e))?;
         Ok((ptr, len))
@@ -9250,7 +9279,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Zero the {ptr,len} so a failed read reads {null,0} (its Drop frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(path).into_struct_value();
+        let agg = self.operand(path)?.into_struct_value();
         let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
         let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
@@ -9267,7 +9296,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let v = match rv {
             // r.buffered() — upgrade the reader in place, return the (same) handle pointer.
             Rvalue::ReaderBuffered(r) => {
-                let rp = self.operand(r).into();
+                let rp = self.operand(r)?.into();
                 self.builder
                     .build_call(self.funcs["io_reader_buffered"], &[rp], "buffered")
                     .map_err(|e| self.err(e))?
@@ -9275,8 +9304,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // r.read_line(b) — fill the buffer with the stripped line body, return i64 consumed-or-status.
             Rvalue::ReaderReadLine(r, buf) => {
-                let rp = self.operand(r).into();
-                let bp = self.operand(buf).into();
+                let rp = self.operand(r)?.into();
+                let bp = self.operand(buf)?.into();
                 self.builder
                     .build_call(self.funcs["io_reader_read_line"], &[rp, bp], "readline")
                     .map_err(|e| self.err(e))?
@@ -9308,9 +9337,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::FileOpenRw { path, out } => self.gen_open_handle("io_file_open", path, *out)?,
             // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
             Rvalue::FilePread { file, buffer, offset } => {
-                let fp = self.operand(file).into();
-                let bp = self.operand(buffer).into();
-                let off = self.operand(offset).into();
+                let fp = self.operand(file)?.into();
+                let bp = self.operand(buffer)?.into();
+                let off = self.operand(offset)?.into();
                 self.builder
                     .build_call(self.funcs["io_file_pread"], &[fp, bp, off], "pread")
                     .map_err(|e| self.err(e))?
@@ -9318,11 +9347,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // f.pwrite(data, off) — split the `bytes` operand into ptr+len, return i64 count-or-status.
             Rvalue::FilePwrite { file, data, offset } => {
-                let fp = self.operand(file).into();
-                let agg = self.operand(data).into_struct_value();
+                let fp = self.operand(file)?.into();
+                let agg = self.operand(data)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "pwptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "pwlen").map_err(|e| self.err(e))?;
-                let off = self.operand(offset).into();
+                let off = self.operand(offset)?.into();
                 self.builder
                     .build_call(self.funcs["io_file_pwrite"], &[fp, ptr.into(), len.into(), off], "pwrite")
                     .map_err(|e| self.err(e))?
@@ -9330,7 +9359,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // f.len() — a live fstat, returns i64 length-or-status.
             Rvalue::FileLen { file } => {
-                let fp = self.operand(file).into();
+                let fp = self.operand(file)?.into();
                 self.builder
                     .build_call(self.funcs["io_file_len"], &[fp], "flen")
                     .map_err(|e| self.err(e))?
@@ -9348,7 +9377,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
             .map_err(|e| self.err(e))?;
-        let agg = self.operand(path).into_struct_value();
+        let agg = self.operand(path)?.into_struct_value();
         let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
         let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
@@ -9364,7 +9393,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// compiler bug must surface as an error, never an inkwell panic on a user program. That panic
     /// is exactly what an owned `string` hole used to produce ("expected the IntValue variant").
     fn display_int(&self, op: &Operand, what: &str) -> Result<IntValue<'c>, CodegenError> {
-        let v = self.operand(op);
+        let v = self.operand(op)?;
         match v {
             BasicValueEnum::IntValue(i) => Ok(i),
             other => Err(self.err(format!("{what} expects an integer operand, got {other:?}"))),
@@ -9373,7 +9402,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// Read a display operand as a float. Same contract as [`Self::display_int`].
     fn display_float(&self, op: &Operand, what: &str) -> Result<inkwell::values::FloatValue<'c>, CodegenError> {
-        let v = self.operand(op);
+        let v = self.operand(op)?;
         match v {
             BasicValueEnum::FloatValue(f) => Ok(f),
             other => Err(self.err(format!("{what} expects a float operand, got {other:?}"))),
@@ -9384,7 +9413,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// borrowed to one by sema). Same contract as [`Self::display_int`]: a shape mismatch is a
     /// compiler error, not a panic.
     fn display_view(&self, op: &Operand, what: &str) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
-        let v = self.operand(op);
+        let v = self.operand(op)?;
         let BasicValueEnum::StructValue(agg) = v else {
             return Err(self.err(format!("{what} expects a {{ptr, len}} view operand, got {v:?}")));
         };
@@ -9402,7 +9431,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // Pass the enclosing arena handle, or null for an individually owned finish retained by a
         // synthetic MIR string owner.
         let arena_ptr = match arena {
-            Some(op) => self.operand(op),
+            Some(op) => self.operand(op)?,
             None => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
         };
         // A template/json.encode builder uses the default capacity (0) — static-part presizing is a
@@ -9489,7 +9518,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let Ty::Option(s) = self.f.operand_ty(opt) else {
                         return Err(self.err("json.encode OptionField piece is not an Option"));
                     };
-                    let agg = self.operand(opt).into_struct_value();
+                    let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "otag").map_err(|e| self.err(e))?.into_int_value();
                     let payload = self.builder.build_extract_value(agg, 1, "opay").map_err(|e| self.err(e))?;
                     let is_some = self
@@ -9538,19 +9567,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             let callee = if fty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
                             self.builder.build_call(self.funcs[callee], &[bptr.into(), v.into()], "").map_err(|e| self.err(e))?;
                         }
-                        // Integers and `char` (a `u32` code point) render through the int writer.
-                        // Anything else is NOT an integer at the LLVM level, and blindly calling
-                        // `into_int_value()` on it aborts the compiler. The Move payloads
-                        // (`Scalar::String` / `DynArray` / …) are rejected at the struct-field
-                        // boundary ("an `Option` struct field must have a non-owned payload"), but
-                        // that gate only tests Move-ness, so the fallback arm below is **live**: a
-                        // non-Move `enum` payload (`C { R, G, B }` in `S { a: Option<C> }`) reaches
-                        // it and lowers to `%C = type { i32 }`, a StructValue. It used to panic
-                        // there; it now fails as a compiler error. That is still a codegen error
-                        // with no sema diagnostic behind it — the Gate-3 shape this file's template
-                        // holes just shed — so `json.encode`'s `Option` payload domain wants the
-                        // same sema-side gate. Recorded as a follow-up in `HANDOFF.md`.
-                        ity @ (Ty::Int(_) | Ty::IntVar(_) | Ty::Char) => {
+                        // Integers render through the int writer. Anything else is NOT an integer at
+                        // the LLVM level, and blindly calling `into_int_value()` on it aborts the
+                        // compiler. Two gates keep that from happening: the struct-field declaration
+                        // boundary rejects the **owned** payloads (`Scalar::String` / `DynArray` /
+                        // …, "an `Option` struct field must have a non-owned payload"), and
+                        // `json.encode` itself rejects every non-Move payload it cannot render
+                        // (`Option<enum>` / `Option<slice<T>>` / `Option<char>` / `Option<()>`) via
+                        // `json_encodable_scalar`. The tail below is therefore defense in
+                        // depth — a compiler error, never a panic.
+                        ity @ (Ty::Int(_) | Ty::IntVar(_)) => {
                             let BasicValueEnum::IntValue(v) = payload else {
                                 return Err(self.err(format!("json.encode Option field '{name}' payload is not an integer")));
                             };
@@ -9586,7 +9612,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
                 // to an entry alloca so the encoder can read it by field offset.
                 align_mir::TemplatePiece::OptionStructField { opt, name, struct_id, .. } => {
-                    let agg = self.operand(opt).into_struct_value();
+                    let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "ostag").map_err(|e| self.err(e))?.into_int_value();
                     let payload = self.builder.build_extract_value(agg, 1, "ospay").map_err(|e| self.err(e))?;
                     let is_some = self
@@ -9611,7 +9637,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let sty = self.struct_types[*struct_id as usize];
                     let slot = self.alloca_at_entry(sty.into(), "ostruct_v")?;
                     self.builder.build_store(slot, payload).map_err(|e| self.err(e))?;
-                    let t = self.emit_desc_table(*struct_id);
+                    let t = self.emit_desc_table(*struct_id)?;
                     let n = i64t.const_int(t.n_fields, false);
                     self.builder
                         .build_call(self.funcs["json_encode_object"], &[bptr.into(), slot.into(), t.descs.into(), n.into()], "")
@@ -9632,10 +9658,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // element schema (the same descriptor table decode uses) to the runtime encoder, which
                 // loops the elements emitting `[{...},...]` (a dynamic length can't unroll statically).
                 align_mir::TemplatePiece::StructArrayField { array, struct_id } => {
-                    let agg = self.operand(array).into_struct_value();
+                    let agg = self.operand(array)?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "sap").map_err(|e| self.err(e))?;
                     let len = self.builder.build_extract_value(agg, 1, "sal").map_err(|e| self.err(e))?;
-                    let t = self.emit_desc_table(*struct_id);
+                    let t = self.emit_desc_table(*struct_id)?;
                     let n = i64t.const_int(t.n_fields, false);
                     let esz = i64t.const_int(self.target_data.get_store_size(&self.struct_types[*struct_id as usize]), false);
                     self.builder
@@ -9650,11 +9676,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // the element scalar tag (`(kind<<8)|width|(signed<<16)`, computed from the element type)
                 // to the runtime encoder, which loops emitting `[e0,e1,…]` (dynamic length can't unroll).
                 align_mir::TemplatePiece::ScalarArrayField { array, elem } => {
-                    let agg = self.operand(array).into_struct_value();
+                    let agg = self.operand(array)?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "scap").map_err(|e| self.err(e))?;
                     let len = self.builder.build_extract_value(agg, 1, "scal").map_err(|e| self.err(e))?;
                     let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
-                    let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null);
+                    // NOTE the discarded `sub` pointer: this writer takes a bare tag, so an element
+                    // kind that needs a sub-descriptor cannot be rendered here. That is why sema's
+                    // `json_encodable_scalar` admits only int / float / bool / `str` elements — an
+                    // `array<enum>` used to reach this line, hand the runtime kind 6 with a NULL
+                    // sub, and silently print `[null,null]` (a payload-less enum aborted instead, in
+                    // `emit_json_union`). Encoding `array<enum>` properly means passing `sub` and
+                    // teaching `json_encode_scalar_array` about it — a feature, not hardening.
+                    let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null)?;
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
                         .build_call(self.funcs["json_encode_scalar_array"], &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
@@ -9665,12 +9698,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // payload via the descriptor-driven union encoder.
                 align_mir::TemplatePiece::UnionValue { value, enum_id, .. } => {
                     let ety = self.enum_types[*enum_id as usize];
-                    let v = self.operand(value);
+                    let v = self.operand(value)?;
                     // Hoist the scratch slot to the entry block so an `encode` inside a loop does not
                     // grow the stack per iteration (the shared `alloca_at_entry` discipline).
                     let slot = self.alloca_at_entry(ety.into(), "junion_v")?;
                     self.builder.build_store(slot, v).map_err(|e| self.err(e))?;
-                    let union_desc = self.emit_json_union(*enum_id);
+                    let union_desc = self.emit_json_union(*enum_id)?;
                     self.builder
                         .build_call(self.funcs["json_encode_union"], &[bptr.into(), slot.into(), union_desc.into()], "")
                         .map_err(|e| self.err(e))?;
@@ -9726,15 +9759,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // narrower int/bool/char zero-extends, so its low `elem_size` bytes are its value), then
             // hand the bits to the runtime, which writes the element's `elem_size` low bytes.
             Rvalue::ArrayBuilderPush { builder, value, scalar } => {
-                let bp = self.operand(builder).into();
+                let bp = self.operand(builder)?.into();
                 let i64t = self.ctx.i64_type();
                 let bits = if matches!(scalar, Ty::Float(_)) {
-                    let fv = self.operand(value).into_float_value();
+                    let fv = self.operand(value)?.into_float_value();
                     let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
                     let as_int = self.builder.build_bit_cast(fv, int_bits, "fbits").map_err(|e| self.err(e))?.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(as_int, i64t, "bits64").map_err(|e| self.err(e))?
                 } else {
-                    let iv = self.operand(value).into_int_value();
+                    let iv = self.operand(value)?.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
                 };
                 self.builder
@@ -9745,8 +9778,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `b.push(s)` (string element) — split the moved-in `string` `{ptr,len}` and hand it to the
             // runtime, which stores it as one element (its source slot was nulled at the move site).
             Rvalue::ArrayBuilderPushStr { builder, value } => {
-                let bp = self.operand(builder).into();
-                let agg = self.operand(value).into_struct_value();
+                let bp = self.operand(builder)?.into();
+                let agg = self.operand(value)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;
                 self.builder
@@ -9757,7 +9790,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `b.append(xs)` — hand the `slice<T>` `{ptr, count}` to the runtime, which bulk-copies
             // `count` elements at the builder's stored stride.
             Rvalue::ArrayBuilderAppend { builder, data } => {
-                let bp = self.operand(builder).into();
+                let bp = self.operand(builder)?.into();
                 let (ptr, count) = self.split_str(data)?;
                 self.builder
                     .build_call(self.funcs["array_builder_append"], &[bp, ptr.into(), count.into()], "")
@@ -9767,7 +9800,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `b.build()` — freeze into an owned `array<T>` `{ptr,len}` (zero-copy); the runtime hands
             // off the storage and frees only the builder header.
             Rvalue::ArrayBuilderBuild { builder } => {
-                let bp = self.operand(builder).into();
+                let bp = self.operand(builder)?.into();
                 let build = if self.stack_header_slot_for_operand(builder).is_some() {
                     "array_builder_build_stack"
                 } else {
@@ -9786,8 +9819,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// `str == str` / `str != str` via the runtime `align_rt_str_eq`.
     fn gen_str_eq(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let sa = self.operand(a).into_struct_value();
-        let sb = self.operand(b).into_struct_value();
+        let sa = self.operand(a)?.into_struct_value();
+        let sb = self.operand(b)?.into_struct_value();
         let ext = |b: &Builder<'c>, v: inkwell::values::StructValue<'c>, i, n| {
             b.build_extract_value(v, i, n)
         };
@@ -9822,8 +9855,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `a < b` ⇔ `cmp < 0`, `a <= b` ⇔ `cmp <= 0`, etc. Also backs `sort`'s `str`-key comparator
     /// (the sort loop lowers a `BinOp::Gt` on `str` operands, routed here by `gen_bin`).
     fn gen_str_cmp(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let sa = self.operand(a).into_struct_value();
-        let sb = self.operand(b).into_struct_value();
+        let sa = self.operand(a)?.into_struct_value();
+        let sb = self.operand(b)?.into_struct_value();
         let ext = |b: &Builder<'c>, v: inkwell::values::StructValue<'c>, i, n| {
             b.build_extract_value(v, i, n)
         };
@@ -9859,11 +9892,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// hardware broadcast at `-O2`.
     fn operand_as_vector(&mut self, op: &Operand, elem: Ty, n: u32) -> Result<inkwell::values::VectorValue<'c>, CodegenError> {
         if matches!(self.f.operand_ty(op), Ty::Vec(..)) {
-            return Ok(self.operand(op).into_vector_value());
+            return Ok(self.operand(op)?.into_vector_value());
         }
         // The canonical splat: insert the scalar into lane 0, then `shufflevector` with an all-zero
         // mask broadcasts lane 0 to every lane — two instructions regardless of width `N`.
-        let scalar = self.operand(op);
+        let scalar = self.operand(op)?;
         let vty = vec_llvm_ty(self.ctx, elem, n).into_vector_type();
         let poison = vty.get_poison();
         let init = self.builder.build_insert_element(poison, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
@@ -9975,8 +10008,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     fn gen_float_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let l = self.operand(a).into_float_value();
-        let r = self.operand(b).into_float_value();
+        let l = self.operand(a)?.into_float_value();
+        let r = self.operand(b)?.into_float_value();
         let bld = self.builder;
         let v: BasicValueEnum<'c> = match op {
             BinOp::Add => bld.build_float_add(l, r, "fadd").map_err(|e| self.err(e))?.into(),
@@ -9999,8 +10032,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(v)
     }
 
-    fn operand(&self, op: &Operand) -> BasicValueEnum<'c> {
-        match op {
+    /// Read an operand's LLVM value. **Fallible on purpose:** the two non-constant forms look the
+    /// value up in a table, and neither lookup is guaranteed by the type system alone.
+    ///
+    /// - `Operand::Value(id)` is only in [`Self::values`] if the statement that defined `id`
+    ///   produced a basic value. A `()`-returning call defines a `ValueId` whose LLVM call yields
+    ///   **void**, so nothing is recorded — reading it used to index a `HashMap` and abort the
+    ///   compiler.
+    /// - `Operand::Arg(i)` indexes the LLVM parameter list, which a MIR/ABI mismatch can outrun.
+    ///
+    /// The `Arg` case is a compiler bug when it fires. The `()` case is **not** hypothetical and is
+    /// **not** fully gated by sema: `print(u())` / `template "{u()}"` are sema-rejected, but
+    /// `x := u()`, `fn v() { return u() }`, `g(u())` with `g(a: ())`, `x := { u() }` and
+    /// `x := arena { u() }` all pass `alignc check` and reach here — a MIR **lowering** hole, not an
+    /// intended rejection (the same programs written with `if` / `match` / `loop { break u() }`
+    /// compile fine). They abort the compiler without this accessor. So this error is currently
+    /// user-reachable and carries no source span; fixing the lowering is a recorded follow-up.
+    /// Either way, a compiler bug on user input must surface as a diagnosable error, never a panic
+    /// (the Gate-3 rule).
+    fn operand(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        Ok(match op {
             Operand::Const(Const::Int(v, ty)) => {
                 int_type(self.ctx, *ty).const_int(*v as u64, is_signed(*ty)).into()
             }
@@ -10008,9 +10059,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Operand::Const(Const::Char(v)) => self.ctx.i32_type().const_int(*v as u64, false).into(),
             Operand::Const(Const::Bool(v)) => self.ctx.bool_type().const_int(*v as u64, false).into(),
             Operand::Const(Const::Unit) => self.ctx.i32_type().const_int(0, false).into(),
-            Operand::Value(id) => self.values[id],
-            Operand::Arg(i) => self.func.get_nth_param(*i).expect("param index in range"),
-        }
+            Operand::Value(id) => *self.values.get(id).ok_or_else(|| {
+                self.err(format!("value %{id} has no LLVM value (a `()`-valued operand is not a value)"))
+            })?,
+            Operand::Arg(i) => self
+                .func
+                .get_nth_param(*i)
+                .ok_or_else(|| self.err(format!("parameter index {i} is out of range")))?,
+        })
     }
 }
 
@@ -10169,6 +10225,217 @@ mod tests {
                 assert!(!optsize && !minsize, "{}: {name} must have no size attrs", profile.name());
             }
         }
+    }
+
+    // -- Gate 3: a malformed operand is a compiler ERROR, never an abort ---------------------------
+
+    /// Drive codegen with a hand-built MIR `Program`, bypassing sema entirely. Sema is the gate that
+    /// keeps these shapes out of a real compile; this is the belt-and-braces layer *behind* it, and
+    /// the only way to exercise it is to hand codegen the MIR the gate would have rejected. Same
+    /// technique the allocation-shape probes below use.
+    fn codegen_program(
+        stmts: Vec<Stmt>,
+        value_tys: Vec<Ty>,
+        slots: Vec<Ty>,
+        structs: Vec<StructDef>,
+        enums: Vec<EnumDef>,
+        extra_fns: Vec<Function>,
+    ) -> Result<String, CodegenError> {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let n = stmts.len();
+        let slot_align = vec![None; slots.len()];
+        let mut fns = vec![Function {
+            name: "main".to_string(),
+            params: vec![],
+            ret: i32_ty,
+            slots,
+            slot_align,
+            value_tys,
+            blocks: vec![Block {
+                id: 0,
+                stmts,
+                stmt_lines: vec![(0, 0); n],
+                term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        }];
+        fns.extend(extra_fns);
+        let program = Program {
+            fns,
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs,
+            enums,
+            tuples: vec![],
+        };
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+    }
+
+    /// `print` of a value that is not an int / float / str / bool / char. Sema's `print_kind` gate
+    /// rejects every one of these, but codegen used to dispatch on the type with a **catch-all
+    /// integer tail**, so an aggregate reaching it asked a `{ ptr, i64 }` / `[3 x i64]` / `%P` value
+    /// for its `IntValue` and aborted the compiler. It must be a `CodegenError`.
+    #[test]
+    fn print_of_an_unprintable_value_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let struct_def = StructDef {
+            name: "P".to_string(),
+            fields: vec![align_sema::FieldDef { name: "x".to_string(), ty: i64_ty }],
+            align: None,
+            c_repr: false,
+        };
+        let cases: &[(&str, Ty, Vec<StructDef>)] = &[
+            ("array", Ty::Array(Scalar::Int(IntTy { bits: 64, signed: true }), 3), vec![]),
+            ("struct", Ty::Struct(0), vec![struct_def]),
+            ("slice", Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true })), vec![]),
+        ];
+        for (name, ty, structs) in cases {
+            let err = codegen_program(
+                vec![
+                    Stmt::Let(0, Rvalue::Load(0)),
+                    Stmt::Let(1, Rvalue::Call("print".to_string(), vec![Operand::Value(0)])),
+                ],
+                vec![*ty, Ty::Unit],
+                vec![*ty],
+                structs.clone(),
+                vec![],
+                vec![],
+            )
+            .expect_err(&format!("print of a `{name}` must not reach the runtime call"));
+            let text = err.to_string();
+            assert!(
+                text.contains("'print' expects an int, float, str, bool, or char"),
+                "`print({name})` must name the display contract, got: {text}"
+            );
+        }
+    }
+
+    /// A `()`-valued operand. A `()`-returning call defines a `ValueId` whose LLVM call yields
+    /// **void**, so no LLVM value is recorded for it — and reading it used to index a `HashMap`
+    /// directly and abort. Real source reaches this: `x := u()` / `fn v() { return u() }` /
+    /// `g(u())` / `x := { u() }` / `x := arena { u() }` all check ok and abort the compiler on
+    /// `main` (`print(u())` / `template "{u()}"` are the two spellings sema *does* reject). Until
+    /// the lowering hole is closed the read must at least degrade to a `CodegenError`.
+    #[test]
+    fn a_unit_valued_operand_is_an_error_not_a_panic() {
+        let unit_fn = Function {
+            name: "u".to_string(),
+            params: vec![],
+            ret: Ty::Unit,
+            slots: vec![],
+            slot_align: vec![],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(None) }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Call("u".to_string(), vec![])),
+                Stmt::Let(1, Rvalue::Use(Operand::Value(0))),
+            ],
+            vec![Ty::Unit, Ty::Unit],
+            vec![],
+            vec![],
+            vec![],
+            vec![unit_fn],
+        )
+        .expect_err("a `()` operand has no LLVM value and must not be read from the value map");
+        let text = err.to_string();
+        assert!(
+            text.contains("has no LLVM value"),
+            "the missing-value read must say so, got: {text}"
+        );
+    }
+
+    /// The sibling lookup in the same accessor: an argument index past the LLVM parameter list (a
+    /// MIR/ABI mismatch). Also an error, not an out-of-range abort.
+    #[test]
+    fn an_out_of_range_argument_operand_is_an_error_not_a_panic() {
+        let err = codegen_program(
+            vec![Stmt::Let(0, Rvalue::Use(Operand::Arg(0)))],
+            vec![Ty::Int(IntTy { bits: 64, signed: true })],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("`main` takes no parameters, so Arg(0) is out of range");
+        assert!(
+            err.to_string().contains("parameter index 0 is out of range"),
+            "got: {err}"
+        );
+    }
+
+    /// The `json.encode` descriptor builders behind sema's encodable-domain gate. `array<char>` and
+    /// `array<enum>` fields reached these two sites with no diagnostic and killed the compiler —
+    /// `json_payload_tag_sub`'s `unreachable!` and `emit_json_union`'s one-payload `expect`. Sema
+    /// rejects both spellings now (`template_ownership.rs`), so these rows drive MIR directly to
+    /// keep the second layer honest.
+    #[test]
+    fn an_unrenderable_json_descriptor_payload_is_an_error_not_a_panic() {
+        // `array<char>`: no JSON leaf rendering at all.
+        let char_arr = Ty::DynArray(Scalar::Char);
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::Template(
+                        vec![align_mir::TemplatePiece::ScalarArrayField {
+                            array: Operand::Value(0),
+                            elem: Scalar::Char,
+                        }],
+                        None,
+                    ),
+                ),
+            ],
+            vec![char_arr, Ty::Str],
+            vec![char_arr],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("a `char` array element has no JSON descriptor tag");
+        assert!(
+            err.to_string().contains("is not an encodable/decodable payload type"),
+            "got: {err}"
+        );
+
+        // `array<enum>` over a payload-less enum: the union descriptor has no arm to build. Sema's
+        // `check_union_decodable` is what admits only one-payload variants.
+        let enum_def = EnumDef {
+            name: "C".to_string(),
+            variants: vec![
+                align_sema::hir::EnumVariant { name: "R".to_string(), payload: vec![], field_base: 1 },
+                align_sema::hir::EnumVariant { name: "G".to_string(), payload: vec![], field_base: 1 },
+            ],
+        };
+        let enum_arr = Ty::DynArray(Scalar::Enum(0));
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::Template(
+                        vec![align_mir::TemplatePiece::ScalarArrayField {
+                            array: Operand::Value(0),
+                            elem: Scalar::Enum(0),
+                        }],
+                        None,
+                    ),
+                ),
+            ],
+            vec![enum_arr, Ty::Str],
+            vec![enum_arr],
+            vec![],
+            vec![enum_def],
+            vec![],
+        )
+        .expect_err("a payload-less union variant has no descriptor arm");
+        assert!(err.to_string().contains("carries no payload"), "got: {err}");
     }
 
     fn allocation_case_ir(
