@@ -124,6 +124,10 @@ pub enum Scalar {
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
     Buffer,
+    /// A compiled `regex` payload (`Result<regex, Error>` from `regex.compile`). An owned **Move**
+    /// handle containing the compiled automaton; the enclosing `Result` owns and drops it. Opaque
+    /// pointer, free-standing and never region-tracked.
+    Regex,
     /// A `cli parsed` payload (`Result<parsed, Error>` from `cli.command(...).parse(args)`). An owned
     /// **Move** handle (the resolved flag map); the enclosing `Result`'s `Drop` frees it. Opaque
     /// pointer, like [`Scalar::Reader`]/[`Scalar::Writer`]/[`Scalar::Buffer`] — owned, never
@@ -199,7 +203,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder)
     }
 }
 
@@ -421,6 +425,10 @@ pub enum Ty {
     /// `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)` take a **mut** receiver and
     /// advance the state in place. Laid out in LLVM as `[4 x i64]`, passed/returned by value.
     Rng,
+    /// `regex` (`std.regex`) — an opaque owned **Move** handle containing a compiled regular
+    /// expression. Created fallibly by `regex.compile(pattern)`, borrowed by `is_match` / `find` /
+    /// `find_at`, and `Drop`-freed. It owns its compiled program and borrows no input storage.
+    Regex,
     /// A `cli command` (`std.cli`) — the flag-registration builder from `cli.command(name)`. An
     /// owned **Move** handle (like `reader`/`writer`/`buffer`) owning its heap flag table (each entry
     /// holds an owned `string` name / default), `Drop`-freed. `c.flag_bool/str/i64(...)` register a
@@ -602,6 +610,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Writer => Some(Scalar::Writer),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
+        // A compiled regex owned handle as the `Result` Ok payload of `regex.compile`.
+        Ty::Regex => Some(Scalar::Regex),
         // A `file` owned handle as a `Result` Ok payload (`fs.create_rw`/`fs.open_rw`).
         Ty::File => Some(Scalar::File),
         // A `cli parsed` owned handle as the `Result` Ok payload of `c.parse(args)`. (A `cli command`
@@ -682,6 +692,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Buffer => Ty::Buffer,
+        Scalar::Regex => Ty::Regex,
         Scalar::File => Ty::File,
         Scalar::CliParsed => Ty::CliParsed,
         Scalar::TcpConn => Ty::TcpConn,
@@ -819,6 +830,7 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::ArrayBuilder(_)
         | Ty::File
         | Ty::Rng
+        | Ty::Regex
         | Ty::CliCommand
         | Ty::CliParsed
         | Ty::TcpConn
@@ -923,7 +935,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
@@ -979,7 +991,7 @@ pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
 /// plain-struct payloads) owns nothing and leaves its struct non-Move (`enum_is_move` is table-only,
 /// no recursion into `struct_is_move` — an enum's struct payloads are always non-Move, pass 0c).
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, enums, visiting))
         || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
@@ -1179,7 +1191,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
@@ -1272,7 +1284,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -1556,7 +1568,7 @@ struct TypeEntry {
 type ModTypes = HashMap<String, HashMap<String, TypeEntry>>;
 
 /// Resolve a type-name path to its canonical key, applying module visibility. A single segment is a
-/// type in `cur_module` (or the builtin `Error`); a dotted `mod.Type` must name an imported module
+/// type in `cur_module` (or a builtin reserved type); a dotted `mod.Type` must name an imported module
 /// and a `pub` type. `None` (with a diagnostic, unless the single-segment miss is left to the
 /// caller) if it does not resolve. `emit_unknown` controls whether a single-segment miss reports an
 /// error here (callers that still want to try other interpretations pass `false`).
@@ -1580,6 +1592,10 @@ fn canonical_type_name(
         // everywhere (a reserved type name), so `argon2_params{...}` is an ordinary struct literal.
         if bare == "argon2_params" {
             return Some("argon2_params".to_string());
+        }
+        // `regex_match` is the builtin Copy span returned by `std.regex` searches.
+        if bare == "regex_match" {
+            return Some("regex_match".to_string());
         }
         match table.get(cur_module).and_then(|m| m.get(bare)) {
             Some(e) => Some(e.canonical.clone()),
@@ -2594,6 +2610,12 @@ pub fn check_program_with_effects(
                     span,
                 );
             }
+            if bare == "regex_match" {
+                diags.error(
+                    "'regex_match' is a reserved type name (the builtin std.regex match span struct)".to_string(),
+                    span,
+                );
+            }
             if tt.contains_key(bare) {
                 // Keep the first declaration; ignore this one so it cannot overwrite the valid
                 // `type_table` / `*_ids` entry and cascade into confusing secondary errors.
@@ -2810,6 +2832,23 @@ pub fn check_program_with_effects(
                 .into_iter()
                 .map(|v| hir::EnumVariant { name: v.to_string(), payload: Vec::new(), field_base: 1 })
                 .collect(),
+        });
+    }
+
+    // The builtin `regex_match` struct (`std.regex`) — a plain Copy pair of UTF-8 byte offsets.
+    // Visible everywhere and reserved, like `argon2_params`, so `find` can return an ordinary
+    // `Option<regex_match>` without adding another special aggregate representation.
+    {
+        let i64_field = Ty::Int(IntTy { bits: 64, signed: true });
+        struct_ids.insert("regex_match".to_string(), structs.len() as u32);
+        structs.push(StructDef {
+            name: "regex_match".to_string(),
+            fields: vec![
+                FieldDef { name: "start".to_string(), ty: i64_field },
+                FieldDef { name: "end".to_string(), ty: i64_field },
+            ],
+            align: None,
+            c_repr: false,
         });
     }
 
@@ -4444,6 +4483,18 @@ impl EffectScan<'_> {
                 self.expr(xs);
                 self.expr(k);
             }
+            ExprKind::RegexCompile { pattern } => self.expr(pattern),
+            ExprKind::RegexIsMatch { regex, text } => {
+                self.expr(regex);
+                self.expr(text);
+            }
+            ExprKind::RegexFind { regex, text, start } => {
+                self.expr(regex);
+                self.expr(text);
+                if let Some(s) = start {
+                    self.expr(s);
+                }
+            }
             // `std.cli` — **all pure** (no I/O; argv is already captured by `main(args)`): just
             // recurse into the operands so any effect *inside* them is still counted.
             ExprKind::CliCommand { name } => self.expr(name),
@@ -5313,6 +5364,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::StrFinder
             | Ty::File
             | Ty::Rng
+            | Ty::Regex
             | Ty::CliCommand
             | Ty::CliParsed
             | Ty::TcpConn
@@ -5961,6 +6013,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RandRange { .. }
             | ExprKind::RandShuffle { .. }
             | ExprKind::RandSample { .. }
+            | ExprKind::RegexCompile { .. }
+            | ExprKind::RegexIsMatch { .. }
+            | ExprKind::RegexFind { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -6239,6 +6294,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RandRange { .. }
             | ExprKind::RandShuffle { .. }
             | ExprKind::RandSample { .. }
+            | ExprKind::RegexCompile { .. }
+            | ExprKind::RegexIsMatch { .. }
+            | ExprKind::RegexFind { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -6981,6 +7039,18 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(xs, depth);
                 self.walk(k, depth);
             }
+            ExprKind::RegexCompile { pattern } => self.walk(pattern, depth),
+            ExprKind::RegexIsMatch { regex, text } => {
+                self.walk(regex, depth);
+                self.walk(text, depth);
+            }
+            ExprKind::RegexFind { regex, text, start } => {
+                self.walk(regex, depth);
+                self.walk(text, depth);
+                if let Some(s) = start {
+                    self.walk(s, depth);
+                }
+            }
             // `std.cli`: the command / parsed handles are owned Move (never region-borrows); a
             // `get_str` view borrows `parsed` but its escape is caught by `region_of` (a `Frame` view),
             // not here — just recurse so an escape *inside* the operands is still checked.
@@ -7603,6 +7673,18 @@ impl UnnecessaryHeapScan {
                 self.visit(rng);
                 self.visit(xs);
                 self.visit(k);
+            }
+            ExprKind::RegexCompile { pattern } => self.visit(pattern),
+            ExprKind::RegexIsMatch { regex, text } => {
+                self.visit(regex);
+                self.visit(text);
+            }
+            ExprKind::RegexFind { regex, text, start } => {
+                self.visit(regex);
+                self.visit(text);
+                if let Some(s) = start {
+                    self.visit(s);
+                }
             }
             // `std.cli` — no heap-narrowing pattern of its own; recurse into the operands.
             ExprKind::CliCommand { name } => self.visit(name),
@@ -8460,7 +8542,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
-            | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. } => {
+            | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
+            // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
+            // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
+            // whose `{start,end}` are Copy byte offsets, NOT a view into the text. None borrows.
+            | ExprKind::RegexCompile { .. } | ExprKind::RegexIsMatch { .. } | ExprKind::RegexFind { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -9421,6 +9507,18 @@ impl<'a> MoveCheck<'a> {
                 self.expr(rng, moved, false, false);
                 self.expr(xs, moved, false, false);
                 self.expr(k, moved, false, false);
+            }
+            ExprKind::RegexCompile { pattern } => self.expr(pattern, moved, false, false),
+            ExprKind::RegexIsMatch { regex, text } => {
+                self.expr(regex, moved, false, false);
+                self.expr(text, moved, false, false);
+            }
+            ExprKind::RegexFind { regex, text, start } => {
+                self.expr(regex, moved, false, false);
+                self.expr(text, moved, false, false);
+                if let Some(s) = start {
+                    self.expr(s, moved, false, false);
+                }
             }
             // `std.cli`: every receiver (`cmd` / `parsed`) is **borrowed, never consumed** — `parse`
             // reads the flag table without moving the command (so `usage()` stays callable after),
@@ -11506,7 +11604,7 @@ impl<'a, 't> Checker<'a, 't> {
         canonical_type_name(path, &self.cur_module, self.user_imports, self.type_table, true, span, self.diags)
     }
 
-    /// Resolve a bare type name to its canonical key in the current module (or the builtin `Error`),
+    /// Resolve a bare type name to its canonical key in the current module (or a builtin reserved type),
     /// without emitting an error — for speculative interpretations (e.g. `Name.Variant`) that fall
     /// through to other meanings when `Name` is not a type here.
     fn local_type(&self, bare: &str) -> Option<String> {
@@ -11515,6 +11613,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if bare == "argon2_params" {
             return Some("argon2_params".to_string());
+        }
+        if bare == "regex_match" {
+            return Some("regex_match".to_string());
         }
         self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
     }
@@ -13011,6 +13112,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
                 return self.check_encoding_op(method, args, span);
             }
+            // `std.regex` — compile once into an owned Move handle; searches dispatch on the
+            // handle below. This is library surface, not language syntax.
+            if module == "regex" && method == "compile" {
+                self.require_import("std.regex", "regex.compile", span);
+                return self.check_regex_compile(args, span);
+            }
             // `std.compress` — gzip via libz (M11 Slice 1) / zstd via libzstd (Slice 2). Impure
             // byte→byte codecs (owned `buffer` output) wrapping the tuned C engines (draft §15
             // keystone strategy). The codec is the method prefix; the direction is the suffix.
@@ -13577,6 +13684,11 @@ impl<'a, 't> Checker<'a, 't> {
             "get_bool" | "get_i64" | "get_str" if recv_ty == Ty::CliParsed => {
                 self.check_cli_parsed_method(recv_expr, method, args, span)
             }
+            // `std.regex` searches borrow a bound compiled handle. `find_at`'s start is a UTF-8
+            // byte offset; runtime validation follows the language's slice-boundary abort model.
+            "is_match" | "find" | "find_at" if recv_ty == Ty::Regex => {
+                self.check_regex_method(recv_expr, method, args, span)
+            }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
             // `r.body(data)` mutate the builder in place. Type-guarded, same as the cli methods above.
             "header" | "body" if recv_ty == Ty::HttpRequest => {
@@ -14018,7 +14130,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -18547,6 +18659,81 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `regex.compile(pattern)` — compile one `str` pattern into an owned Move [`Ty::Regex`].
+    /// Syntax errors and resource-limit rejections are `Error.Invalid`; compilation itself is Pure.
+    fn check_regex_compile(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'regex.compile' expects 1 argument (the pattern), got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let pattern = self.check_str_init(&args[0]);
+        if pattern.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::RegexCompile { pattern: Box::new(pattern) },
+            ty: Ty::Result(Scalar::Regex, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `re.is_match(text)` / `re.find(text)` / `re.find_at(text, start)` on a compiled regex.
+    /// The receiver must be a bound local because unbound Move-temporary drops are still deferred.
+    /// Every operation borrows the handle and text; no search consumes either input.
+    fn check_regex_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the compiled regex to a local first (`re := regex.compile(pattern)?`) — a temporary owned regex handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let want = if method == "find_at" { 2 } else { 1 };
+        if args.len() != want {
+            self.diags.error(
+                format!("'.{method}()' takes {want} argument{}, got {}", if want == 1 { "" } else { "s" }, args.len()),
+                span,
+            );
+            return err;
+        }
+        let text = self.check_str_init(&args[0]);
+        if text.ty == Ty::Error {
+            return err;
+        }
+        if method == "is_match" {
+            return Expr {
+                kind: ExprKind::RegexIsMatch { regex: Box::new(recv_expr), text: Box::new(text) },
+                ty: Ty::Bool,
+                span,
+            };
+        }
+        let start = if method == "find_at" {
+            let s = self.check_expr(&args[1], None);
+            if s.ty == Ty::Error || !self.require_i64_arg(s.ty, args[1].span, "'.find_at()' start") {
+                return err;
+            }
+            Some(Box::new(s))
+        } else {
+            None
+        };
+        let Some(&match_id) = self.struct_ids.get("regex_match") else {
+            self.diags.error("internal: builtin 'regex_match' struct is not registered".to_string(), span);
+            return err;
+        };
+        Expr {
+            kind: ExprKind::RegexFind { regex: Box::new(recv_expr), text: Box::new(text), start },
+            ty: Ty::Option(Scalar::Struct(match_id)),
+            span,
+        }
+    }
+
     /// `cli.command(name)` — build a Move `cli command` builder ([`Ty::CliCommand`]) named `name`
     /// (a `str`). A module function (dispatched like `encoding.*`), not a method.
     fn check_cli_command(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -21071,6 +21258,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(xs);
                 self.finalize_expr(k);
             }
+            ExprKind::RegexCompile { pattern } => self.finalize_expr(pattern),
+            ExprKind::RegexIsMatch { regex, text } => {
+                self.finalize_expr(regex);
+                self.finalize_expr(text);
+            }
+            ExprKind::RegexFind { regex, text, start } => {
+                self.finalize_expr(regex);
+                self.finalize_expr(text);
+                if let Some(s) = start {
+                    self.finalize_expr(s);
+                }
+            }
             ExprKind::CliCommand { name } => self.finalize_expr(name),
             ExprKind::CliFlag { cmd, name, default, .. } => {
                 self.finalize_expr(cmd);
@@ -21562,7 +21761,7 @@ fn leftmost_segment(e: &ast::Expr) -> Option<&str> {
 }
 
 /// Every importable builtin module (`draft.md` §18). `core.*` is language-intrinsic; `std.*` is the
-/// OS boundary. Both are compiler builtins today (std becomes real Align-over-FFI library code only
+/// OS/application-service boundary. Both are compiler builtins today (std becomes real library code
 /// post-M8). An `import` naming anything outside this set is an error — user-authored modules are a
 /// later slice (`open-questions.md` module system).
 const BUILTIN_MODULES: &[&str] = &[
@@ -21573,7 +21772,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "core.arena", "core.json", "core.template", "core.hash", "core.math",
     // std — the OS boundary
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
-    "std.cli", "std.encoding", "std.compress", "std.rand", "std.crypto", "std.http",
+    "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
 ];
 
 /// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
@@ -21725,6 +21924,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::ArrayBuilder(s) => format!("array_builder<{}>", scalar_name(s)),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
+        Ty::Regex => "regex".to_string(),
         Ty::CliCommand => "cli command".to_string(),
         Ty::CliParsed => "cli parsed".to_string(),
         Ty::TcpConn => "tcp_conn".to_string(),
@@ -21922,7 +22122,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -22258,6 +22458,15 @@ fn resolve_type(
             }
             Ty::Rng
         }
+        // `regex` (`std.regex`) — a compiled regular-expression Move handle. Nameable so a
+        // compiled plan can be passed between functions; it has no type arguments.
+        "regex" => {
+            if !args.is_empty() {
+                diags.error("regex takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Regex
+        }
         // `tcp_conn` (`std.net`) — a connected TCP socket Move handle (`tcp.connect`). A surface type
         // name so it can be threaded through functions (a Move handle; passed by value).
         "tcp_conn" => {
@@ -22586,6 +22795,7 @@ pub fn is_move_handle(ty: Ty) -> bool {
         Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::Regex
             | Ty::CliCommand
             | Ty::CliParsed
             | Ty::TcpConn

@@ -526,6 +526,7 @@ std.time
 std.net
 std.cli
 std.encoding
+std.regex
 std.compress
 std.rand
 std.crypto
@@ -572,6 +573,15 @@ flag has a value or its default, like `json.decode`), but the lookup itself is c
 runtime (Align has no comptime evaluator to statically validate against the builder's registered
 flags); input errors surface from `parse` as `Error.Invalid`. A v1 provisional pending derive — a
 future declarative flag-spec can move `get_*` validation to compile time. (`draft.md` §18.2, M10.)
+
+`std.regex` is an explicitly compiled library facility: `regex.compile(pattern: str) ->
+Result<regex, Error>` creates an owned Move handle; `re.is_match(text)`, `re.find(text)`, and
+`re.find_at(text, start)` borrow it. `find`/`find_at` return `Option<regex_match>`, where the builtin
+Copy struct `regex_match { start: i64, end: i64 }` stores half-open UTF-8 byte offsets at character
+boundaries. Invalid syntax/resource limits are `Error.Invalid`; an invalid `find_at` boundary is a
+programmer error and aborts. The engine guarantees automata-style predictable matching and excludes
+look-around/backreferences. No regex literal or implicit cache is part of the language. (`draft.md`
+§18.2.)
 
 ## Packages
 

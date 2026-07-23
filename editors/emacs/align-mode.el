@@ -19,7 +19,7 @@
   '("align" "layout" "link"))
 
 (defconst align-types
-  '("i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64" "bool" "char" "str" "string" "array" "slice" "soa" "box" "raw" "builder" "writer" "reader" "buffer" "array_builder" "file" "rng" "tcp_conn" "tcp_listener" "udp_socket" "child" "Option" "Result" "Error" "Num" "Ord" "Eq" "vec2" "vec4" "vec8" "vec16" "mask2" "mask4" "mask8" "mask16"))
+  '("i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64" "bool" "char" "str" "string" "array" "slice" "soa" "box" "raw" "builder" "writer" "reader" "buffer" "array_builder" "file" "rng" "regex" "regex_match" "tcp_conn" "tcp_listener" "udp_socket" "child" "Option" "Result" "Error" "Num" "Ord" "Eq" "vec2" "vec4" "vec8" "vec16" "mask2" "mask4" "mask8" "mask16"))
 
 (defconst align-constants
   '("true" "false"))

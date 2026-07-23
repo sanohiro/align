@@ -2091,7 +2091,9 @@ std.crypto.
 
 ## 18.2 std
 
-`std` is the boundary with the OS.
+`std` is the boundary for OS services and reusable application mechanisms that do not belong in
+language-intrinsic `core` (for example encoding and regex). An import makes that dependency explicit;
+only the individual module's contract determines whether it performs OS I/O.
 
 ```text
 std.io
@@ -2103,6 +2105,7 @@ std.time
 std.net
 std.cli
 std.encoding
+std.regex
 std.compress
 std.rand
 std.crypto
@@ -2382,6 +2385,33 @@ Decode returns an owned `buffer` — `bytes` carries no UTF-8 invariant, so a de
 `str` — consistent with the sink/owned-return convention above. SIMD (Lemire's
 Base64-at-memcpy-speed) is an internal optimization; it does not change these signatures. Encode
 returns `string`; a builder-sink variant is a later addition once bulk-output demand appears.
+
+### std.regex
+
+Regular expressions are a standard-library facility, not language syntax. Patterns are ordinary
+`str` values compiled explicitly into an owned Move handle:
+
+```text
+regex.compile(pattern: str) -> Result<regex, Error>
+re.is_match(text: str) -> bool
+re.find(text: str) -> Option<regex_match>
+re.find_at(text: str, start: i64) -> Option<regex_match>
+
+regex_match { start: i64, end: i64 }
+```
+
+`regex` owns a compiled automaton and is `Drop`-freed; search methods borrow it, so callers compile
+once and reuse it explicitly. `regex_match` is a builtin Copy struct. Its half-open `start..end`
+positions are UTF-8 **byte offsets** and always character boundaries. `find_at` takes the same kind
+of byte offset; a negative, past-end, or non-character-boundary start is a programmer error and
+aborts like an invalid slice boundary. Invalid pattern syntax, a pattern over 64 KiB, or a compiled
+program over the 10 MiB engine limit yields `Error.Invalid`.
+
+The v1 engine is the Rust `regex` crate: automata-based, worst-case linear in searched input for a
+fixed compiled pattern, with Unicode enabled by default. Look-around and backreferences are not
+supported; this is intentional to retain predictable search complexity. There is no implicit
+global cache, no `rx"..."` literal, and no compiler-time regex execution. Captures, replacement,
+iteration, and split remain additive library slices after a concrete application consumer appears.
 
 ### std.compress
 

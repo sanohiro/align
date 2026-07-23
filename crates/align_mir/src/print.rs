@@ -590,6 +590,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::RandRange { rng, lo, hi } => format!("rng_range(_{rng}, {}, {})", operand_str(lo), operand_str(hi)),
         Rvalue::RandShuffle { rng, xs, .. } => format!("rng_shuffle(_{rng}, {})", operand_str(xs)),
         Rvalue::RandSample { rng, xs, k, .. } => format!("rng_sample(_{rng}, {}, {})", operand_str(xs), operand_str(k)),
+        Rvalue::RegexCompile { pattern, out } => format!("regex_compile({}, -> _{out})", operand_str(pattern)),
+        Rvalue::RegexIsMatch { regex, text } => {
+            format!("regex_is_match({}, {})", operand_str(regex), operand_str(text))
+        }
+        Rvalue::RegexFind { regex, text, start, out } => format!(
+            "regex_find({}, {}, {}, -> _{out})",
+            operand_str(regex),
+            operand_str(text),
+            operand_str(start)
+        ),
         Rvalue::CliCommand { name } => format!("cli_command({})", operand_str(name)),
         Rvalue::CliFlag { cmd, kind, name, default } => match default {
             Some(d) => format!("cli_flag_{kind:?}({}, {}, {})", operand_str(cmd), operand_str(name), operand_str(d)),
