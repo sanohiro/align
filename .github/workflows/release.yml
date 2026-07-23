@@ -201,6 +201,7 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: release/*
+          body_path: RELEASE_NOTES_${{ steps.version.outputs.version }}.md
           generate_release_notes: true
 
       - name: Update Homebrew tap
