@@ -11095,6 +11095,61 @@ pub unsafe extern "C" fn align_rt_command_env_clear(c: *mut Command) {
     unsafe { &mut *c }.env_clear = true;
 }
 
+/// Empty the child's environment for `c.env_clear()` — the portable `clearenv(3)` replacement.
+/// glibc/musl have `clearenv`; **macOS/BSD do NOT**, so there we unset every currently-set name via
+/// `unsetenv`, reaching `environ` through `_NSGetEnviron()` (referencing `environ` directly from a
+/// dylib is unsupported on macOS). Returns `0` on success. Called ONLY in the post-fork child before
+/// `execvp` (single-threaded; same non-async-signal-safe caveat as `execvp` — the macOS shim
+/// allocates a small `Vec` per name, acceptable there just like the `execvp` PATH `malloc`).
+///
+/// # Safety
+/// Must run where mutating the process environment is sound (the post-fork, pre-exec child).
+#[cfg(target_os = "linux")]
+unsafe fn clearenv_portable() -> i32 {
+    unsafe { clearenv() }
+}
+
+/// See [`clearenv_portable`] (Linux). macOS/BSD: unset each name via `unsetenv` (`_NSGetEnviron`).
+///
+/// # Safety
+/// See [`clearenv_portable`] (Linux).
+#[cfg(not(target_os = "linux"))]
+unsafe fn clearenv_portable() -> i32 {
+    unsafe extern "C" {
+        fn _NSGetEnviron() -> *mut *const *const u8;
+        fn unsetenv(name: *const u8) -> i32;
+    }
+    let envp = unsafe { _NSGetEnviron() };
+    if envp.is_null() {
+        return 0;
+    }
+    // Remove the FIRST variable repeatedly: `unsetenv` deletes every occurrence of a name and compacts
+    // `environ`, so `(*envp)[0]` walks to the end and the loop terminates in one pass over the distinct
+    // names. The cap is a backstop so a misbehaving libc can never spin forever.
+    for _ in 0..65536 {
+        let env = unsafe { *envp }; // `char**` — the current `environ`
+        if env.is_null() {
+            return 0;
+        }
+        let entry = unsafe { *env }; // `char*` — "NAME=VALUE", or null at the end
+        if entry.is_null() {
+            return 0; // `environ` is empty
+        }
+        // NAME = the bytes before '=' (or the whole entry if it has none).
+        let mut n = 0usize;
+        while unsafe { *entry.add(n) } != 0 && unsafe { *entry.add(n) } != b'=' {
+            n += 1;
+        }
+        let mut name: Vec<u8> = Vec::with_capacity(n + 1);
+        name.extend_from_slice(unsafe { core::slice::from_raw_parts(entry, n) });
+        name.push(0);
+        if unsafe { unsetenv(name.as_ptr()) } != 0 {
+            return -1; // unexpected — bail rather than risk spinning
+        }
+    }
+    0
+}
+
 /// `out := c.run()` — fork a child running the command with BOTH stdout and stderr captured, drain
 /// both pipes to EOF, reap the child, and write an owned `RunOutput` handle to `*out`. Returns `0` on
 /// success, `AL_INVALID` for a null argument or non-UTF-8 captured output, `AL_TIMEOUT` when the run
@@ -11179,10 +11234,11 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
             // `setenv`s with overwrite=1 (so a pair after an `env_clear` survives; a later pair for the
             // same name wins). `clearenv`/`setenv` are NOT async-signal-safe, but the child already runs
             // the non-async-signal-safe `execvp` (PATH malloc) — the same documented `spawn`/Slice-4
-            // hazard — so this is acceptable. NO Rust allocation occurs here: the CStrings were built in
-            // the parent (`align_rt_command_env`); the child only reads their pointers.
+            // hazard — so this is acceptable. The `setenv` pairs read CStrings built in the parent
+            // (`align_rt_command_env`); the only child-side allocation is the macOS `clearenv_portable`
+            // shim (glibc `clearenv` allocates nothing), within that same execvp caveat.
             if cmd.env_clear {
-                clearenv();
+                clearenv_portable();
             }
             for (n, v) in &cmd.env {
                 setenv(n.as_ptr() as *const u8, v.as_ptr() as *const u8, 1);
@@ -11814,10 +11870,13 @@ unsafe extern "C" {
     // UB (POSIX — `setenv` is not thread-safe against `getenv`/`setenv` in other threads).
     fn getenv(name: *const u8) -> *const u8;
     fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
-    // POSIX `clearenv(3)` — `process.command(...).env_clear()` (Slice 6): empty the environment so the
-    // forked child starts from nothing before `setenv`ing its recorded overrides. Called ONLY in the
-    // child after `fork`, before `execvp` (same non-async-signal-safe caveat as `execvp` itself).
-    // Returns 0 on success. Present in glibc/musl and macOS libc.
+    // `clearenv(3)` — `process.command(...).env_clear()` (Slice 6): empty the environment so the forked
+    // child starts from nothing before `setenv`ing its recorded overrides. Called ONLY in the child
+    // after `fork`, before `execvp` (same non-async-signal-safe caveat as `execvp`). Returns 0 on
+    // success. **glibc/musl only** — macOS/BSD have NO `clearenv(3)`, so the non-Linux build uses the
+    // `clearenv_portable` shim below (declaring this unconditionally caused the v0.4.0 macOS release to
+    // fail with `Undefined symbols: _clearenv`).
+    #[cfg(target_os = "linux")]
     fn clearenv() -> i32;
     // OS CSPRNG seed for `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL`
     // on older silicon — `docs/open-questions.md` #342). Per-OS symbol (the C entry differs):
