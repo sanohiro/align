@@ -890,6 +890,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
   ships the pool's idle-expiry and the SIGPIPE-safe/stale-retry robustness, and **defers I/O timeouts
   to the net-rail non-blocking/deadline substrate** (unchanged from a semantics standpoint), rather
   than bolting in a half-measure. Recorded here as the standing v1 limitation.
+  - **→ RESOLVED BY DESIGN 2026-07-24 (align-llm Request 2). See "I/O timeouts" below.** align-llm
+    (LLM API calls to endpoints that can black-hole a connection) supplies the concrete client demand
+    and the missing configuration surface. The design lands the net-rail non-blocking-`connect`
+    substrate + `SO_RCVTIMEO`/`SO_SNDTIMEO` and a per-client-default / per-request-override
+    `timeout(ns)` — the two things this note said were missing. Not yet implemented.
   - **Sub-case — HEAD / 304 framing (inherited from Slice 1/2).** A `HEAD` response, or a `304 Not
     Modified`, legitimately carries a `Content-Length` header **but no body**. The v1 read loop frames
     purely by `Content-Length` (it does not special-case the request method or status), so it would
@@ -902,6 +907,76 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
   distinct `Error.Denied`; a bad TLS transport is `Error.Code`; a protocol violation is
   `Error.Invalid`. (The message-less `Error` enum is still a broader story, but the specific DC-1
   "HTTPS not supported" debt is gone — HTTPS *is* supported.)
+
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+
+Resolves the G3-1 deferral above. Motivated by `align-llm`'s LLM API calls (`POST
+/v1/chat/completions`) to endpoints that can hang or black-hole a connection: without a timeout, one
+request stalls the whole verify/repair loop indefinitely. Source:
+`../align-llm/docs/align-requests.md` Request 2 (priority: high).
+
+### Surface — one `timeout(ns)`, client default + per-request override
+
+Both are in-place setters on the existing bound-local Move builders (the `.header()`/`.body()`
+idiom — return `()`, no new argument on the frozen `get`/`post`/`request` signatures):
+
+```text
+cl := http.client()
+cl.timeout(ns: i64)              // default timeout for every request on this client   -> ()
+r := http.request("POST", url)
+r.timeout(ns: i64)               // per-request override (0 = "use the client default") -> ()
+```
+
+`ns == 0` on the client means "no timeout" (current blocking behavior — backward-safe default). A
+request's own `timeout` overrides the client's; an unset request timeout inherits the client's.
+Negative `ns` is rejected at build time (abort, like `r.header()` on CR/LF).
+
+**One knob, not connect/read/write separately** (owner criteria: one way, human-understandable). A
+single `ns` is applied as the deadline for **each** blocking operation — connect, send, and receive —
+so a peer that never accepts hits the connect bound and a peer that accepts then never responds hits
+the receive bound. This is a per-operation deadline, **not** a single wall-clock deadline across the
+whole request (which would need deadline arithmetic threaded through connect+send+recv and buys
+little for this workload). Documented as per-op; it satisfies the gate (a hung request returns within
+the bound) with the simplest surface.
+
+### A timeout is `Error.Timeout`
+
+Consistent with "transport/TLS/malformed-message failures are errors; an HTTP status is data," a
+timeout surfaces as the **`Error.Timeout`** variant (the shared new variant — canonical definition in
+`process.md`'s "Shared prerequisite: the `Error.Timeout` variant"; `AL_TIMEOUT = 4`). It is distinct
+from `Error.Code` (a transport errno), `Error.Denied` (a TLS verification failure), and a normal
+`Ok(response)` carrying a 4xx/5xx status.
+
+### Runtime design (raw-libc sockets; all hook sites already located)
+
+- **connect timeout** — the net-rail substrate (net.md). `align_rt_tcp_connect` (currently a blocking
+  `connect` at runtime `:679`, "no connect timeout" note at `:621`) gains a `timeout_ns` parameter:
+  set the fd non-blocking, `connect` (expect `EINPROGRESS`), `poll(POLLOUT)` with the ns deadline,
+  check `SO_ERROR`; on poll-timeout return **`AL_TIMEOUT`**. `timeout_ns == 0` keeps today's blocking
+  path unchanged. `http_connect_fd` (`:14748`) passes the effective request timeout down.
+- **read timeout** — `SO_RCVTIMEO` on the conn fd (`plain_read`/`read` at `:14001`; the TLS path's
+  `SSL_read` uses the same fd, so the socket option bounds it too). Expiry yields `EAGAIN`/
+  `EWOULDBLOCK`; at the read site that is converted to **`AL_TIMEOUT`** (not the generic errno path —
+  we know it is our deadline).
+- **write timeout** — `SO_SNDTIMEO` on the fd (`http_send_all`/`send` at `:14511`). Symmetric.
+- The effective timeout is set on the fd right after connect (both plain and TLS), before the first
+  I/O. A pooled keepalive conn reused for a new request re-applies the new request's effective
+  timeout (the pool stores conns, not deadlines).
+
+### New machinery
+
+`Error.Timeout` + `AL_TIMEOUT` (shared, see process.md). `align_rt_tcp_connect` gains a `timeout_ns`
+arg (net.md Slice, shared with `std.net`). A `timeout_ns` field on the client + request handles
+(`HttpClient` / `HttpRequest` runtime structs) with the new setters `align_rt_http_client_timeout` /
+`align_rt_http_timeout`, and sema `HttpClient`/`HttpRequest` method dispatch for `timeout`. The
+effective-timeout resolution (request override else client default) happens in `http_client_perform`.
+
+### Test / gate
+
+A request to an endpoint that **accepts the connection but never responds** returns `Err(Timeout)`
+within the configured bound instead of blocking indefinitely (the Request-2 acceptance gate). A
+connect to a black-holed (never-accepting) address returns `Err(Timeout)` within the bound. `ns == 0`
+preserves the current blocking behavior. A normal fast request is unaffected.
 
 ## Pitfalls
 

@@ -870,6 +870,11 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
   「理想形か、さもなくば先送り」に従い、スライス 3 はプールの idle 期限切れと SIGPIPE 安全/スタール再試行の
   堅牢性を出荷し、**I/O タイムアウトは net 基盤（レール）の non-blocking/deadline 基盤へ先送り**する
   (セマンティクス上は不変)。半端な実装を入れる代わりに、v1 の既知の制約としてここに記録する。
+  - **→ 2026-07-24 に設計で解決(align-llm Request 2)。下記「I/O timeouts」を参照。** align-llm
+    (コネクションをブラックホール化しうるエンドポイントへの LLM API 呼び出し)が、具体的なクライアント需要と
+    欠けていた設定面を提供する。設計は net 基盤（レール）の non-blocking-`connect` 基盤 +
+    `SO_RCVTIMEO`/`SO_SNDTIMEO` と、クライアント既定 / リクエスト単位上書きの `timeout(ns)` を着地させる —
+    本注記が欠けていると言っていた 2 つである。未実装。
   - **サブケース — HEAD / 304 のフレーミング(スライス 1/2 から継承)。** `HEAD` レスポンスや
     `304 Not Modified` は、正当に `Content-Length` ヘッダを持つが**ボディを持たない**。v1 の読み取り
     ループは純粋に `Content-Length` でフレーミングする(リクエストメソッドやステータスで特別扱いしない)
@@ -881,6 +886,73 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
   に写らず、検証済み TLS 経路にルーティングされる。検証失敗は明確な `Error.Denied`、TLS トランスポート不良は
   `Error.Code`、プロトコル違反は `Error.Invalid`。(メッセージレスな `Error` enum はより広い別課題として残る
   が、DC-1 の「HTTPS 未対応」負債は解消 — HTTPS は *対応済み*。)
+
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+
+上記 G3-1 の先送りを解決する。動機は `align-llm` の LLM API 呼び出し(`POST /v1/chat/completions`)であり、
+コネクションをハングまたはブラックホール化しうるエンドポイントが相手である。タイムアウトが無いと、1 リクエストが
+verify/repair ループ全体を無期限に停滞させる。出典:`../align-llm/docs/align-requests.md` の Request 2
+(優先度: high)。
+
+### Surface — one `timeout(ns)`, client default + per-request override
+
+どちらも既存の束縛ローカル Move ビルダへの in-place セッタである(`.header()`/`.body()` のイディオム — `()` を
+返し、凍結済みの `get`/`post`/`request` シグネチャに新引数を足さない):
+
+```text
+cl := http.client()
+cl.timeout(ns: i64)              // default timeout for every request on this client   -> ()
+r := http.request("POST", url)
+r.timeout(ns: i64)               // per-request override (0 = "use the client default") -> ()
+```
+
+クライアントの `ns == 0` は「タイムアウト無し」を意味する(現在のブロッキング挙動 — 後方安全な既定)。リクエスト
+自身の `timeout` はクライアントのものを上書きし、未設定のリクエストタイムアウトはクライアントのものを継承する。
+負の `ns` は構築時に拒否する(CR/LF に対する `r.header()` と同じく abort)。
+
+**connect/read/write を別々にではなく 1 つのノブ**(owner criteria: 一つのやり方、人間が理解できる)。単一の `ns` を
+**各**ブロッキング操作 — connect、send、receive — のデッドラインとして適用する。よって accept しない相手は connect
+の上限に当たり、accept した後に応答しない相手は receive の上限に当たる。これは操作ごとのデッドラインであり、
+リクエスト全体にわたる単一の実時間デッドラインでは**ない**(後者は connect+send+recv を貫くデッドライン算術を要し、
+このワークロードには利益が少ない)。操作ごとと文書化する;これが最も単純な表面でゲート(ハングしたリクエストが
+上限内に返る)を満たす。
+
+### A timeout is `Error.Timeout`
+
+「トランスポート/TLS/不正メッセージの失敗はエラー;HTTP ステータスはデータ」と一貫して、タイムアウトは
+**`Error.Timeout`** バリアントとして表面化する(共有の新バリアント — 正準定義は `process.md` の
+「Shared prerequisite: the `Error.Timeout` variant」;`AL_TIMEOUT = 4`)。これは `Error.Code`(トランスポート
+errno)、`Error.Denied`(TLS 検証失敗)、4xx/5xx ステータスを運ぶ通常の `Ok(response)` とは別である。
+
+### Runtime design (raw-libc sockets; all hook sites already located)
+
+- **connect タイムアウト** — net 基盤（レール）(net.md)。`align_rt_tcp_connect`(現在はランタイム `:679` の
+  ブロッキング `connect`、`:621` の「no connect timeout」注記)が `timeout_ns` パラメータを得る:fd を
+  non-blocking にし、`connect`(`EINPROGRESS` を期待)、ns デッドラインで `poll(POLLOUT)`、`SO_ERROR` を確認;
+  poll タイムアウト時に **`AL_TIMEOUT`** を返す。`timeout_ns == 0` は今日のブロッキング経路を不変に保つ。
+  `http_connect_fd`(`:14748`)が有効リクエストタイムアウトを下へ渡す。
+- **read タイムアウト** — conn fd への `SO_RCVTIMEO`(`plain_read`/`read`、`:14001`;TLS 経路の `SSL_read` も
+  同じ fd を使うので、ソケットオプションがそれも縛る)。期限切れは `EAGAIN`/`EWOULDBLOCK` を生む;read 箇所で
+  それを **`AL_TIMEOUT`** に変換する(汎用 errno 経路ではない — 自分のデッドラインだと分かっている)。
+- **write タイムアウト** — fd への `SO_SNDTIMEO`(`http_send_all`/`send`、`:14511`)。対称。
+- 有効タイムアウトは connect 直後(plain と TLS の両方)、最初の I/O の前に fd へ設定する。新リクエストで再利用
+  されるプール済み keepalive conn は、新リクエストの有効タイムアウトを再適用する(プールは conn を格納し、
+  デッドラインは格納しない)。
+
+### New machinery
+
+`Error.Timeout` + `AL_TIMEOUT`(共有、process.md 参照)。`align_rt_tcp_connect` が `timeout_ns` 引数を得る
+(net.md のスライス、`std.net` と共有)。クライアント + リクエストハンドル(`HttpClient` / `HttpRequest` ランタイム
+構造体)への `timeout_ns` フィールドと、新セッタ `align_rt_http_client_timeout` / `align_rt_http_timeout`、
+および `timeout` に対する sema の `HttpClient`/`HttpRequest` メソッドディスパッチ。有効タイムアウトの解決
+(リクエスト上書き、無ければクライアント既定)は `http_client_perform` で行う。
+
+### Test / gate
+
+**コネクションを accept するが決して応答しない**エンドポイントへのリクエストが、無期限にブロックする代わりに設定
+上限内で `Err(Timeout)` を返す(Request-2 の受け入れゲート)。ブラックホール化された(決して accept しない)アドレスへの
+connect が上限内で `Err(Timeout)` を返す。`ns == 0` は現在のブロッキング挙動を保つ。通常の高速リクエストは影響
+を受けない。
 
 ## Pitfalls
 

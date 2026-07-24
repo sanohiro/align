@@ -10464,6 +10464,416 @@ pub unsafe extern "C" fn align_rt_process_exec(
     io_error_to_status(&std::io::Error::last_os_error())
 }
 
+// --- process.command / run_output (std.process Slice 4) ----------------------------------------
+//
+// `process.command(cmd, args)` builds a `Command` Move handle; `c.cwd(dir)` sets its working
+// directory in place; `out := c.run()` forks a child with BOTH stdout and stderr captured through
+// pipes and returns a `RunOutput` handle owning the exit code + the two captured byte buffers.
+// The #1 correctness point is the TWO-pipe concurrent `poll` drain (P7): a child that fills its
+// stderr pipe while the parent only reads stdout would deadlock — so both fds are drained together.
+
+/// A `command` (`std.process` Slice 4) — a Move builder handle owning the `execvp` lookup path
+/// (`cmd`), the child's full marshalled argv (incl. `argv[0]`, P5), and an optional working
+/// directory. Built by [`align_rt_command_new`], configured by [`align_rt_command_cwd`], run by
+/// [`align_rt_command_run`], freed by [`align_rt_command_free`]. Slice 4 carries only argv + cwd
+/// (env / timeout are Slices 5–6). `cmd` is stored SEPARATELY from `argv` because the `execvp` lookup
+/// path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
+pub struct Command {
+    cmd: std::ffi::CString,
+    argv: Vec<std::ffi::CString>,
+    cwd: Option<std::ffi::CString>,
+}
+
+/// A `run_output` (`std.process` Slice 4) — a Move handle owning one completed run's exit code plus
+/// its fully captured stdout / stderr buffers. Both buffers are validated UTF-8 at capture time
+/// (`align_rt_command_run` returns `AL_INVALID` otherwise), so the zero-copy `str` accessors
+/// [`align_rt_run_output_stdout`] / [`align_rt_run_output_stderr`] can never expose non-UTF-8 bytes.
+/// Freed by [`align_rt_run_output_free`].
+pub struct RunOutput {
+    code: i64,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+/// Create a pipe whose BOTH ends are close-on-exec (`O_CLOEXEC`), so neither the parent's copies nor
+/// the read ends leak into the exec'd child (P3). `Ok([read, write])` or `Err(mapped-status)`. On
+/// Linux `pipe2` sets CLOEXEC atomically; elsewhere a `pipe` + best-effort `set_cloexec` on both ends.
+///
+/// # Safety
+/// Calls libc `pipe2`/`pipe`; no invariants beyond a valid process state.
+#[cfg(target_os = "linux")]
+unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
+    let mut fds = [0i32; 2];
+    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    Ok(fds)
+}
+
+/// See the Linux variant. Non-Linux: `pipe` then `set_cloexec` each end (best-effort — a failed
+/// `fcntl` only loses the leak protection, never fatal).
+///
+/// # Safety
+/// Calls libc `pipe`; no invariants beyond a valid process state.
+#[cfg(not(target_os = "linux"))]
+unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
+    let mut fds = [0i32; 2];
+    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    unsafe {
+        set_cloexec(fds[0]);
+        set_cloexec(fds[1]);
+    }
+    Ok(fds)
+}
+
+/// Set `O_NONBLOCK` on `fd` (best-effort). [`drain_two_pipes`] reads each ready fd in a loop until it
+/// would block (`EAGAIN`), which **requires** `O_NONBLOCK`: without it, that inner `read` blocks after
+/// the last available byte instead of returning to `poll`, and while blocked on one fd a full pipe on
+/// the *other* fd stalls the child — the exact two-pipe deadlock (P7) the concurrent drain exists to
+/// prevent. A failed `fcntl` is therefore a genuine (not merely cosmetic) risk; it is left best-effort
+/// only because `F_SETFL` on a freshly-created pipe fd does not fail in practice (no `EBADF`/`EINVAL`
+/// is reachable here). If that assumption is ever wrong on some platform, this must become a hard
+/// error that fails the run rather than risk the deadlock.
+///
+/// # Safety
+/// `fd` must be a valid open descriptor.
+unsafe fn set_nonblocking(fd: i32) {
+    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+    if flags >= 0 {
+        unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    }
+}
+
+/// Drain BOTH capture pipes concurrently until each reaches EOF (P7 — the two-pipe deadlock is the
+/// #1 correctness point). `poll`s whichever read fds are still open, then reads all currently
+/// available bytes from each ready fd into its buffer. Both fds are non-blocking, so a `read` that
+/// would block returns `EAGAIN`/`EWOULDBLOCK` and we return to `poll`. `EINTR` is retried on both
+/// `poll` and `read`. A `read` of `0` (EOF) or a hard error closes that side; the loop ends when both
+/// sides are closed. Never panics; allocates only into the caller's buffers.
+///
+/// # Safety
+/// `fd_out` / `fd_err` must be valid, open, non-blocking read descriptors.
+unsafe fn drain_two_pipes(fd_out: i32, fd_err: i32, out: &mut Vec<u8>, err: &mut Vec<u8>) {
+    let mut out_open = true;
+    let mut err_open = true;
+    let mut chunk = [0u8; 65536];
+    // A single `read` loop for one ready fd: drain until `EAGAIN`/EOF/error. Returns `false` when the
+    // fd hit EOF or a hard error (the side is now closed).
+    // (Inlined below rather than a closure to keep the borrow of the target `Vec` local per call.)
+    while out_open || err_open {
+        let mut fds: Vec<PollFd> = Vec::with_capacity(2);
+        if out_open {
+            fds.push(PollFd { fd: fd_out, events: POLLIN, revents: 0 });
+        }
+        if err_open {
+            fds.push(PollFd { fd: fd_err, events: POLLIN, revents: 0 });
+        }
+        if fds.is_empty() {
+            break;
+        }
+        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: re-poll
+            }
+            // An unexpected poll error (should not happen with valid pipe fds): stop draining rather
+            // than spin. The subsequent `waitpid` still reaps the child; captured-so-far bytes stand.
+            break;
+        }
+        // Any readiness (POLLIN) or hangup/error (POLLHUP/POLLERR/POLLNVAL) means "read now": a pipe
+        // reports POLLHUP once the write end is closed, and there may still be buffered bytes to read
+        // before EOF, so we drain on any revent and rely on `read == 0` to detect true EOF.
+        for pf in &fds {
+            if pf.revents == 0 {
+                continue;
+            }
+            let is_out = pf.fd == fd_out;
+            loop {
+                let r = unsafe { read(pf.fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
+                if r > 0 {
+                    let n = r as usize;
+                    let slice = &chunk[..n];
+                    if is_out {
+                        out.extend_from_slice(slice);
+                    } else {
+                        err.extend_from_slice(slice);
+                    }
+                    continue; // keep reading until this fd would block or hits EOF
+                } else if r == 0 {
+                    // EOF: the child closed (or exited and the kernel closed) this write end.
+                    if is_out {
+                        out_open = false;
+                    } else {
+                        err_open = false;
+                    }
+                    break;
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    match e.kind() {
+                        std::io::ErrorKind::Interrupted => continue, // EINTR: retry the read
+                        std::io::ErrorKind::WouldBlock => break,     // EAGAIN: nothing more right now
+                        _ => {
+                            // A hard read error: treat this side as closed (do not spin forever).
+                            if is_out {
+                                out_open = false;
+                            } else {
+                                err_open = false;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `process.command(cmd, args)` — build a `Command` Move handle. `cmd` is the `str` lookup path
+/// (resolved via `PATH` by `execvp`); `args` is the child's **full** argv (`args_len` `AlignStr`
+/// views, **including `argv[0]`**, P5), marshalled eagerly to NUL-terminated C strings (reusing
+/// [`marshal_cmd_argv`]). A malformed invocation is a programmer error — like a CR/LF header injection
+/// (`align_rt_http_header`) — so it **aborts** here (the surface `process.command(...)` returns a bare
+/// `command`, not a `Result`, so there is no graceful channel; align-llm builds argv from literals).
+/// "Malformed" is exactly what `marshal_cmd_argv` rejects: an empty argv (no `argv[0]`), a `cmd` that
+/// is empty / non-UTF-8 / interior-NUL, or an `arg` with an interior NUL. Note the asymmetry —
+/// `cmd` is UTF-8-gated (it is an `abi_str_view`) but an `arg` is NOT (it is a raw `bytes_view` +
+/// `CString::new`, so a non-UTF-8 arg is *accepted*, only an interior NUL is rejected). Returns the
+/// owned handle pointer.
+///
+/// # Safety
+/// `cmd`/`cmd_len` and `args`/`args_len` must describe valid byte / `AlignStr` ranges.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_new(
+    cmd: *const u8,
+    cmd_len: i64,
+    args: *const AlignStr,
+    args_len: i64,
+) -> *mut Command {
+    let (cmd_c, argv_owned, _argv_ptrs) = match unsafe { marshal_cmd_argv(cmd, cmd_len, args, args_len) } {
+        Ok(v) => v,
+        // A bad argv cannot be reported (the surface has no `Result`) — abort, like a header injection.
+        Err(_) => panic_abort("process.command: invalid command/argv (empty, interior NUL, or non-UTF-8)"),
+    };
+    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None }))
+}
+
+/// `c.cwd(dir)` — set the command's working directory (the child `chdir`s into it before `execvp`).
+/// `dir` is a `str` view copied into a NUL-terminated C string. A `dir` with an interior NUL (or
+/// non-UTF-8 bytes) cannot be a valid path — it **aborts** (a programmer error, like `command`'s argv
+/// and `http.header`'s CR/LF). Null command → abort (a null handle is a compiler-side invariant break,
+/// never reachable from a bound local). Overwrites any previously set cwd. No value.
+///
+/// # Safety
+/// `c` must be a valid `Command` pointer; `dir`/`dir_len` a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_cwd(c: *mut Command, dir: *const u8, dir_len: i64) {
+    if c.is_null() {
+        panic_abort("command.cwd: null command handle");
+    }
+    let Some(dir_c) = (unsafe { abi_c_string(dir, dir_len) }) else {
+        panic_abort("command.cwd: invalid working directory (interior NUL or non-UTF-8)");
+    };
+    unsafe { &mut *c }.cwd = Some(dir_c);
+}
+
+/// `out := c.run()` — fork a child running the command with BOTH stdout and stderr captured, drain
+/// both pipes to EOF, reap the child, and write an owned `RunOutput` handle to `*out`. Returns `0` on
+/// success, `AL_INVALID` for a null argument or non-UTF-8 captured output, or a mapped errno for a
+/// `pipe`/`fork` failure. `c` is BORROWED (re-runnable — not consumed). Leaves `*out = null` on
+/// failure. The child inherits nothing but the two pipe write-ends (dup2'd onto 1/2); all
+/// Align-owned fds are CLOEXEC (P3). A `chdir`/`execvp` failure in the child surfaces as exit code
+/// 127 in `out.code()` (the shell convention — the fork itself succeeded), NOT an `Err`.
+///
+/// # Safety
+/// `c` must be null or a valid `Command` pointer; `out` a writable `*mut RunOutput` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut RunOutput) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if c.is_null() {
+        return AL_INVALID;
+    }
+    let cmd = unsafe { &*c };
+
+    // Marshal the argv pointer vector in the PARENT (the child does no allocation between fork and
+    // exec — the async-signal-safety discipline shared with `spawn`). `argv_ptrs` borrows `cmd.argv`.
+    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr() as *const u8).collect();
+    argv_ptrs.push(core::ptr::null());
+    let cmd_ptr = cmd.cmd.as_ptr() as *const u8;
+    let cwd_ptr = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr() as *const u8);
+
+    // Two CLOEXEC pipes: `[read, write]` for stdout and stderr.
+    let out_pipe = match unsafe { make_pipe_cloexec() } {
+        Ok(p) => p,
+        Err(s) => return s,
+    };
+    let err_pipe = match unsafe { make_pipe_cloexec() } {
+        Ok(p) => p,
+        Err(s) => {
+            unsafe {
+                close(out_pipe[0]);
+                close(out_pipe[1]);
+            }
+            return s;
+        }
+    };
+
+    // SAFETY: `fork` takes no arguments. We marshalled everything (argv pointers, CStrings) in the
+    // parent above, so the child branch allocates nothing. Same `execvp`-not-async-signal-safe caveat
+    // as `align_rt_process_spawn` (a threaded parent holding the allocator lock at `fork` can deadlock
+    // the child in `execvp`'s PATH search) — `posix_spawn` is the recorded deferred fix.
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        let status = io_error_to_status(&std::io::Error::last_os_error());
+        unsafe {
+            close(out_pipe[0]);
+            close(out_pipe[1]);
+            close(err_pipe[0]);
+            close(err_pipe[1]);
+        }
+        return status;
+    }
+    if pid == 0 {
+        // Child. Only async-signal-safe-ish libc calls here (the `execvp` caveat above); no `malloc`.
+        unsafe {
+            if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 {
+                _exit(127); // a bad cwd → 127, the "command could not run" convention (P not an Err)
+            }
+            // Redirect stdout/stderr to the pipe write-ends, then close every pipe fd (the read ends
+            // and the now-duplicated write ends). The dup2'd fds 1/2 are NOT CLOEXEC, so they survive
+            // `execvp` and the exec'd program writes straight into our pipes.
+            //
+            // Assumption (shared with `align_rt_process_spawn`): fds 0/1/2 are open in the parent, so
+            // `pipe2` returned fds >= 3 and no pipe write-end can itself be fd 1 or 2. If a caller had
+            // pre-closed a std fd, a pipe write-end could land on fd 2 and the `close(out_pipe[1])`
+            // below would then close the *stderr* redirect (the classic dup2-shuffle hazard) — corrupt
+            // capture, never memory-unsafety. A normally-launched Align program always has 0/1/2 open,
+            // so this is unreachable from the surface; the robust fix (a dup-to-temp shuffle) is
+            // deferred as unwarranted complexity for an unreachable case.
+            dup2(out_pipe[1], 1);
+            dup2(err_pipe[1], 2);
+            close(out_pipe[0]);
+            close(out_pipe[1]);
+            close(err_pipe[0]);
+            close(err_pipe[1]);
+            execvp(cmd_ptr, argv_ptrs.as_ptr());
+            _exit(127); // execvp returned → not found / not executable (surfaces as code 127)
+        }
+    }
+
+    // Parent. Close the write ends (so our reads see EOF once the child's last writer closes), set
+    // both read ends non-blocking, and drain both concurrently to EOF (P7).
+    unsafe {
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        set_nonblocking(out_pipe[0]);
+        set_nonblocking(err_pipe[0]);
+    }
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut err_buf: Vec<u8> = Vec::new();
+    unsafe { drain_two_pipes(out_pipe[0], err_pipe[0], &mut out_buf, &mut err_buf) };
+    unsafe {
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+    }
+
+    // Reap the child (no zombie). `EINTR` is retried.
+    let mut status: i32 = 0;
+    loop {
+        let r = unsafe { waitpid(pid, &mut status, 0) };
+        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    let code = decode_wait_status(status);
+
+    // The `str` accessors cannot expose non-UTF-8 bytes (the `fs.read_file` string-vs-bytes rule):
+    // reject invalid captured output with `AL_INVALID` and free everything (leaving `*out = null`).
+    if std::str::from_utf8(&out_buf).is_err() || std::str::from_utf8(&err_buf).is_err() {
+        return AL_INVALID;
+    }
+
+    unsafe { *out = Box::into_raw(Box::new(RunOutput { code, out: out_buf, err: err_buf })) };
+    0
+}
+
+/// `out.code()` — the run's exit code (`WEXITSTATUS` `0..=255`, or `128 + signal`; `127` if the child
+/// could not `chdir`/`execvp`). Null handle → `0` (matches [`align_rt_http_resp_status`]'s null
+/// convention; unreachable from a bound local).
+///
+/// # Safety
+/// `o` must be null or a valid `RunOutput` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_output_code(o: *const RunOutput) -> i64 {
+    if o.is_null() {
+        return 0;
+    }
+    unsafe { &*o }.code
+}
+
+/// `out.stdout()` — a zero-copy `str` **view** over the captured stdout bytes (validated UTF-8 at
+/// capture, so a valid `str`), borrowing the handle (region-bound to `out` in sema). `{null,0}` on a
+/// null handle or empty output. Mirrors [`align_rt_http_resp_body`].
+///
+/// # Safety
+/// `o` must be null or a valid `RunOutput` pointer; the returned view borrows `o`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_output_stdout(o: *const RunOutput) -> AlignStr {
+    if o.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let r = unsafe { &*o };
+    if r.out.is_empty() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    AlignStr { ptr: r.out.as_ptr(), len: r.out.len() as i64 }
+}
+
+/// `out.stderr()` — a zero-copy `str` **view** over the captured stderr bytes. The stderr dual of
+/// [`align_rt_run_output_stdout`].
+///
+/// # Safety
+/// `o` must be null or a valid `RunOutput` pointer; the returned view borrows `o`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_output_stderr(o: *const RunOutput) -> AlignStr {
+    if o.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let r = unsafe { &*o };
+    if r.err.is_empty() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    AlignStr { ptr: r.err.as_ptr(), len: r.err.len() as i64 }
+}
+
+/// Free a `Command` handle (its owned CStrings). Null-safe (a moved-out / never-initialised owned slot
+/// drops harmlessly).
+///
+/// # Safety
+/// `c` must be null or a pointer from [`align_rt_command_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_free(c: *mut Command) {
+    if !c.is_null() {
+        drop(unsafe { Box::from_raw(c) });
+    }
+}
+
+/// Free a `RunOutput` handle (its exit code + the two owned byte buffers). Null-safe.
+///
+/// # Safety
+/// `o` must be null or a pointer from [`align_rt_command_run`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_output_free(o: *mut RunOutput) {
+    if !o.is_null() {
+        drop(unsafe { Box::from_raw(o) });
+    }
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer
@@ -10994,16 +11404,42 @@ unsafe extern "C" {
     // still performs the existence/permission check (the POSIX liveness probe). Identical prototype on
     // Linux and macOS/BSD.
     fn kill(pid: i32, sig: i32) -> i32;
+    // `dup2`/`chdir` — `process.command(...).run()` (Slice 4): the forked child `dup2`s the two capture
+    // pipe write-ends onto fds 1/2 and (if a cwd was set) `chdir`s into it before `execvp`. Both are
+    // async-signal-safe. Identical prototypes on Linux and macOS/BSD.
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn chdir(path: *const u8) -> i32;
+    // `pipe2` (Linux) — create a pipe with both ends `O_CLOEXEC` atomically (no `fcntl` race, and the
+    // read ends never leak into the exec'd child, P3). `fds` receives `[read, write]`. Returns `0` /
+    // `-1` (errno set). No `pipe2` on macOS/BSD (`pipe` + `set_cloexec` there — see `make_pipe_cloexec`).
+    #[cfg(target_os = "linux")]
+    fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    // `pipe` — the non-Linux capture-pipe primitive (CLOEXEC set afterwards via `set_cloexec`).
+    #[cfg(not(target_os = "linux"))]
+    fn pipe(fds: *mut i32) -> i32;
     // `accept4` (Linux) — `accept` plus a `flags` arg, so `SOCK_CLOEXEC` sets close-on-exec on the
     // connected fd atomically (no `accept`+`fcntl` race). No such call on macOS/BSD (see `set_cloexec`).
     #[cfg(target_os = "linux")]
     fn accept4(sockfd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i32;
-    // `fcntl` (non-Linux) — the `FD_CLOEXEC` fallback for platforms without an atomic CLOEXEC-at-creation
-    // variant. Variadic in C (`int fcntl(int, int, ...)`); the `F_GETFD`/`F_SETFD` cmds take one `i32`
-    // arg, which passes correctly through this fixed-arity declaration on the SysV/AAPCS ABIs.
-    #[cfg(not(target_os = "linux"))]
+    // `fcntl` — the non-Linux `FD_CLOEXEC` fallback (platforms without an atomic CLOEXEC-at-creation
+    // variant) AND the `O_NONBLOCK` `F_GETFL`/`F_SETFL` toggle used on every platform by the
+    // `command.run()` capture drain (`set_nonblocking`). Variadic in C (`int fcntl(int, int, ...)`); the
+    // `F_*FD`/`F_*FL` cmds each take one `i32` arg, which passes correctly through this fixed-arity
+    // declaration on the SysV/AAPCS ABIs.
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
 }
+
+/// `fcntl` file-status-flag commands (`F_GETFL`/`F_SETFL`) + the `O_NONBLOCK`/`O_CLOEXEC` bits used by
+/// the `command.run()` capture pipes. `F_GETFL`/`F_SETFL` are `3`/`4` on Linux and macOS/BSD alike; the
+/// `O_*` bit values differ per platform (octal on Linux, distinct hex on macOS/BSD).
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: i32 = 0o2000000;
+#[cfg(not(target_os = "linux"))]
+const O_NONBLOCK: i32 = 0x0004;
 
 /// `SOCK_CLOEXEC` (Linux) — OR'd into a `socket`/`accept4` type so the new fd is close-on-exec, kept
 /// out of a spawned child (`std.process` P3). macOS has no such flag (uses `set_cloexec` instead).
@@ -22418,11 +22854,10 @@ mod tests {
         items.iter().map(|s| AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }).collect()
     }
 
-    // `fcntl(F_GETFD)` — read the file-descriptor flags to prove `FD_CLOEXEC` is set (the runtime
-    // declares `fcntl` only on the non-Linux path, so the test declares its own). The signature
-    // matches the runtime's fixed-arity declaration exactly — on a non-Linux target both are in
-    // scope, and two `extern` declarations of one symbol must agree (`clashing_extern_declarations`).
-    // `F_GETFD` ignores the third argument.
+    // `fcntl(F_GETFD)` — read the file-descriptor flags to prove `FD_CLOEXEC` is set. The test
+    // declares its own `fcntl` (the runtime's is private to the parent module). The signature matches
+    // the runtime's fixed-arity declaration exactly — two `extern` declarations of one symbol must
+    // agree (`clashing_extern_declarations`). `F_GETFD` ignores the third argument.
     unsafe extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     }
@@ -22634,6 +23069,155 @@ mod tests {
         // A signal death: the terminating signal in the low 7 bits → 128 + signal (e.g. SIGKILL 9).
         assert_eq!(decode_wait_status(9), 128 + 9);
         assert_eq!(decode_wait_status(15), 128 + 15);
+    }
+
+    // --- std.process Slice 4 — command / cwd / run capture --------------------------------------
+
+    /// Read a `RunOutput`'s captured stdout as a `&str` (the accessor returns a borrowed view).
+    unsafe fn ro_stdout(o: *const RunOutput) -> String {
+        let v = unsafe { align_rt_run_output_stdout(o) };
+        if v.ptr.is_null() || v.len <= 0 {
+            return String::new();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(v.ptr, v.len as usize) };
+        String::from_utf8(bytes.to_vec()).expect("captured stdout is validated UTF-8")
+    }
+    unsafe fn ro_stderr(o: *const RunOutput) -> String {
+        let v = unsafe { align_rt_run_output_stderr(o) };
+        if v.ptr.is_null() || v.len <= 0 {
+            return String::new();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(v.ptr, v.len as usize) };
+        String::from_utf8(bytes.to_vec()).expect("captured stderr is validated UTF-8")
+    }
+
+    /// The Request-1 acceptance gate: a child that writes to BOTH stdout and stderr and exits
+    /// nonzero → the caller recovers the full stdout string, the full stderr string, and the code.
+    #[test]
+    fn command_run_captures_both_streams_and_code() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        // Write a known line to stdout, a known line to stderr, then exit 3.
+        let argv = argv_of(&["/bin/sh", "-c", "printf out-line; printf err-line 1>&2; exit 3"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        assert!(!c.is_null());
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert!(!out.is_null());
+        assert_eq!(unsafe { align_rt_run_output_code(out) }, 3, "exit 3");
+        assert_eq!(unsafe { ro_stdout(out) }, "out-line");
+        assert_eq!(unsafe { ro_stderr(out) }, "err-line");
+        unsafe { align_rt_run_output_free(out) };
+        // `c` is re-runnable (run borrows it) — a second run works and is independent.
+        let mut out2: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out2) }, 0);
+        assert_eq!(unsafe { align_rt_run_output_code(out2) }, 3);
+        unsafe { align_rt_run_output_free(out2) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// `c.cwd(dir)` → the child observes `dir` as its working directory.
+    #[test]
+    fn command_cwd_is_observed_by_the_child() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // A directory that reliably exists and whose realpath is stable.
+        let dir = "/";
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "pwd"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        let (dp, dl) = view_of(dir);
+        unsafe { align_rt_command_cwd(c, dp, dl) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_run_output_code(out) }, 0);
+        assert_eq!(unsafe { ro_stdout(out) }.trim_end(), "/", "the child's pwd is the set cwd");
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// A bad cwd makes the child `_exit(127)` (the fork itself succeeded — not an `Err`).
+    #[test]
+    fn command_bad_cwd_exits_127() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "echo unreachable"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        let (dp, dl) = view_of("/nonexistent/definitely/not/a/dir");
+        unsafe { align_rt_command_cwd(c, dp, dl) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_run_output_code(out) }, 127, "chdir failure → child _exit(127)");
+        assert_eq!(unsafe { ro_stdout(out) }, "", "the command never ran");
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// The two-pipe deadlock guard (P7): a child that writes MORE than one pipe buffer (64 KiB) to
+    /// BOTH stdout and stderr must be captured in full with no deadlock. `sh` + `yes`-style loops are
+    /// slow, so use `head -c` from `/dev/zero` mapped to printable bytes via `tr`.
+    #[test]
+    fn command_run_two_pipes_over_64k_no_deadlock() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // 200000 'a' bytes to stderr FIRST (the harder case for a naive stdout-first reader), then
+        // 200000 'b' to stdout — both well over a 64 KiB pipe. `head -c N /dev/zero | tr` produces
+        // exactly N bytes with no `yes`/SIGPIPE "broken pipe" diagnostic polluting the capture.
+        let n = 200_000usize;
+        let script = "head -c 200000 /dev/zero | tr '\\0' b 1>&2; head -c 200000 /dev/zero | tr '\\0' a";
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", script]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert!(!out.is_null());
+        let so = unsafe { ro_stdout(out) };
+        let se = unsafe { ro_stderr(out) };
+        assert_eq!(so.len(), n, "full stdout captured (no deadlock)");
+        assert_eq!(se.len(), n, "full stderr captured (no deadlock)");
+        assert!(so.bytes().all(|b| b == b'a'));
+        assert!(se.bytes().all(|b| b == b'b'));
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// Non-UTF-8 captured output → `AL_INVALID` (the string-tier rule), and no handle is written.
+    #[test]
+    fn command_run_non_utf8_output_is_invalid() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Emit a lone 0xFF byte on stdout (invalid UTF-8) via printf's octal escape.
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "printf '\\377'"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, AL_INVALID, "non-UTF-8 stdout → Err(Invalid)");
+        assert!(out.is_null(), "no run_output handle is written on invalid output");
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// Null-safety of every accessor / free and `run` with a null out slot.
+    #[test]
+    fn command_run_output_null_safety() {
+        assert_eq!(unsafe { align_rt_run_output_code(std::ptr::null()) }, 0);
+        let v = unsafe { align_rt_run_output_stdout(std::ptr::null()) };
+        assert!(v.ptr.is_null() && v.len == 0);
+        let v = unsafe { align_rt_run_output_stderr(std::ptr::null()) };
+        assert!(v.ptr.is_null() && v.len == 0);
+        unsafe { align_rt_run_output_free(std::ptr::null_mut()) }; // no-op
+        unsafe { align_rt_command_free(std::ptr::null_mut()) }; // no-op
+        // run with a null out slot, and with a null command → AL_INVALID (no crash).
+        assert_eq!(unsafe { align_rt_command_run(std::ptr::null_mut(), std::ptr::null_mut()) }, AL_INVALID);
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(std::ptr::null_mut(), &mut out) }, AL_INVALID);
+        assert!(out.is_null());
     }
 
     #[test]

@@ -159,3 +159,54 @@ just supplies the `task_group` + blocking-pool substrate, already available.)
 
 **Note**: v1 is blocking sockets on the blocking pool. Non-blocking/epoll/io_uring is a later
 Linux backend behind the same signatures, not a semantic change.
+
+---
+
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+
+`std.http`'s per-request timeout (http.md "I/O timeouts") rests on the net rail, so the substrate is
+designed here; net also exposes it directly for raw-socket callers. Motivated by `align-llm`'s LLM
+API calls (a black-holed connection must not stall the loop). Source:
+`../align-llm/docs/align-requests.md` Request 2.
+
+### Surface
+
+Read/write deadlines are in-place setters on the bound-local conn (the same Move-builder idiom):
+
+```text
+c := tcp.connect(host, port)?
+c.read_timeout_ns(ns: i64)      // SO_RCVTIMEO; 0 = block forever (default)   -> ()
+c.write_timeout_ns(ns: i64)     // SO_SNDTIMEO                                 -> ()
+```
+
+Negative `ns` is rejected at build time (abort). A read/write that exceeds the deadline returns
+`Err(Timeout)` — the shared `Error.Timeout` variant (canonical definition in `process.md`;
+`AL_TIMEOUT = 4`). Because a deadline expiry (`EAGAIN`/`EWOULDBLOCK` from `SO_RCVTIMEO`) is
+indistinguishable from a spurious wakeup only at the syscall boundary, the read/write sites convert a
+deadline-armed `EAGAIN` to `AL_TIMEOUT` explicitly (the generic errno path is unchanged for
+timeout-unarmed fds).
+
+### Connect timeout — the shared substrate
+
+The **connect** deadline lives in `align_rt_tcp_connect` (runtime `:679`; today "no connect timeout",
+`:621`): it gains a `timeout_ns` parameter — non-blocking `connect` → `EINPROGRESS` →
+`poll(POLLOUT)` with the ns deadline → check `SO_ERROR`; poll-timeout returns `AL_TIMEOUT`.
+`timeout_ns == 0` preserves the current blocking connect exactly. `std.http` passes its effective
+request timeout through this same parameter. The raw-`net` `tcp.connect(host, port)` signature stays
+timeout-less in v1 (it has no pre-connect handle to set a deadline on, and Align has no optional
+args); a `tcp.connect_timeout(host, port, ns)` sibling is a recorded follow-up if a raw-socket
+consumer needs a bounded connect. The point of doing it here is that the substrate exists once and
+`std.http` reuses it — not a second, http-local mechanism.
+
+### New machinery
+
+`Error.Timeout` + `AL_TIMEOUT` (shared, see process.md). `align_rt_tcp_connect` gains `timeout_ns`.
+`align_rt_tcp_read_timeout` / `align_rt_tcp_write_timeout` (`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`) +
+sema `TcpConn` method dispatch for `read_timeout_ns` / `write_timeout_ns`. No new Ty, no new I/O
+path — this is socket options on the existing blocking rail.
+
+### Test / gate
+
+Connect to a black-holed (never-accepting) address with a bound → `Err(Timeout)` within the bound. A
+conn whose peer accepts then never sends, with `read_timeout_ns` set → a read returns `Err(Timeout)`
+within the bound. `ns == 0` preserves blocking behavior.

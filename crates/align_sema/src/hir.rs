@@ -1046,6 +1046,34 @@ pub enum ExprKind {
     /// are `CLOEXEC` (Slice 2), so the new image does NOT inherit them; only the inherited standard
     /// streams (fds 0/1/2, not `CLOEXEC`) survive. Impure; both `cmd` and `args` are borrowed.
     ProcessExec { cmd: Box<Expr>, args: Box<Expr> },
+    /// `process.command(cmd, args)` (`std.process` Slice 4) — build a [`crate::Ty::Command`] Move
+    /// builder handle (the captured-run dual of [`ProcessSpawn`]). `cmd` is the borrowed `str` lookup
+    /// path; `args` is the borrowed `array<str>` / `slice<str>` full argv (incl. `argv[0]`, P5). The
+    /// `ty` is [`crate::Ty::Command`] (a bare handle — NOT a `Result`; a malformed argv aborts at
+    /// runtime, the `http.header` injection precedent). Impure. Both operands borrowed (never consumed).
+    ProcessCommand { cmd: Box<Expr>, args: Box<Expr> },
+    /// `c.cwd(dir)` (`std.process` Slice 4) — set the command `command`'s working directory in place
+    /// (the child `chdir`s into it before `execvp`), mutating the handle (not consumed — like
+    /// [`HttpBody`]). The `ty` is [`crate::Ty::Unit`]. `command` is a bound [`crate::Ty::Command`] local;
+    /// `dir` is a borrowed `str`. A `dir` with an interior NUL aborts at runtime. Impure.
+    CommandCwd { command: Box<Expr>, dir: Box<Expr> },
+    /// `c.run()` (`std.process` Slice 4) — fork a child running the command with BOTH stdout and stderr
+    /// captured, drain both pipes to EOF, reap the child, and yield `Result<run_output, Error>` (the
+    /// `ty` — an owned [`crate::Ty::RunOutput`] Ok payload). `command` is **borrowed** (re-runnable, like
+    /// [`ChildWait`]). A `pipe`/`fork` failure or non-UTF-8 captured output is `Err`; a `chdir`/`execvp`
+    /// failure in the child surfaces as exit code 127 in `out.code()` (not an `Err`). Impure.
+    CommandRun { command: Box<Expr> },
+    /// `out.code()` (`std.process` Slice 4) — the run's exit code (`i64`: `WEXITSTATUS` / `128+signal` /
+    /// `127`). `out` is a bound [`crate::Ty::RunOutput`] local. Pure (reads the owned handle). The
+    /// exit-code dual of [`HttpRespStatus`].
+    RunOutputCode { out: Box<Expr> },
+    /// `out.stdout()` / `out.stderr()` (`std.process` Slice 4) — the captured stdout / stderr as a `str`
+    /// **view** into `out`'s owned buffer (the `ty` is [`crate::Ty::Str`]), region-bound to `out` (an
+    /// escape past `out`'s `Drop` is a compile error, #297). `out` is a bound local. Pure. The
+    /// captured-output dual of [`HttpRespBody`]; `stderr` selects the error stream.
+    RunOutputStdout { out: Box<Expr> },
+    /// The stderr sibling of [`RunOutputStdout`] (a `str` view into `out`'s captured stderr buffer).
+    RunOutputStderr { out: Box<Expr> },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no

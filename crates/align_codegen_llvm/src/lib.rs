@@ -1525,6 +1525,43 @@ fn build_module<'c>(
         "process_exec".to_string(),
         module.add_function("align_rt_process_exec", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
     );
+    // `std.process` (Slice 4) — `process.command(...).run()` capture. `command_new(cmd{ptr,len},
+    // args{ptr,len}) -> *Command` (owned builder; aborts on a bad argv); `command_cwd(c, dir{ptr,len})`
+    // sets the working directory in place (void); `command_run(c, out: **RunOutput) -> i32` forks +
+    // captures both streams, writing an owned `run_output` handle to `out`; `run_output_code(o) -> i64`;
+    // `run_output_stdout/stderr(o) -> {ptr,len}` str views; the two `*_free` drop the handles.
+    funcs.insert(
+        "command_new".to_string(),
+        module.add_function("align_rt_command_new", ptr.fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "command_cwd".to_string(),
+        module.add_function("align_rt_command_cwd", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "command_run".to_string(),
+        module.add_function("align_rt_command_run", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "run_output_code".to_string(),
+        module.add_function("align_rt_run_output_code", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "run_output_stdout".to_string(),
+        module.add_function("align_rt_run_output_stdout", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "run_output_stderr".to_string(),
+        module.add_function("align_rt_run_output_stderr", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "command_free".to_string(),
+        module.add_function("align_rt_command_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "run_output_free".to_string(),
+        module.add_function("align_rt_run_output_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
         "fs_read_file_view".to_string(),
@@ -3457,6 +3494,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
         Scalar::Child => unreachable!("a child handle is not a box/array payload"),
+        Scalar::RunOutput => unreachable!("a run_output handle is not a box/array payload"),
         Scalar::Fn(_) => 16,
     }
 }
@@ -3491,6 +3529,8 @@ fn handle_free_fn(ty: Ty) -> Option<&'static str> {
         Ty::TcpListener => "tcp_listener_free",
         Ty::UdpSocket => "udp_socket_free",
         Ty::Child => "child_free",
+        Ty::Command => "command_free",
+        Ty::RunOutput => "run_output_free",
         Ty::HttpRequest => "http_request_free",
         Ty::HttpResponse => "http_resp_free",
         Ty::HttpClient => "http_client_free",
@@ -5044,7 +5084,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -5185,7 +5225,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::Regex) | Some(Scalar::Captures) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::Regex) | Some(Scalar::Captures) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) | Some(Scalar::RunOutput) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -5204,6 +5244,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::HttpRequestCtx) => "http_ctx_free",
                                         Some(Scalar::HttpStream) => "http_stream_free",
                                         Some(Scalar::ResponseBuilder) => "http_response_free",
+                                        Some(Scalar::RunOutput) => "run_output_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder
@@ -7609,6 +7650,57 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["http_body"], &[r.into(), dp.into(), dl.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
+            }
+            // std.process Slice 4 — `process.command(cmd, args)` allocates a `command` handle by value
+            // (the bound local `Drop`-frees it via `command_free`). The runtime marshals the argv and
+            // aborts on a malformed one.
+            Rvalue::Command { cmd, args } => {
+                let (cp, cl) = self.split_str(cmd)?;
+                let (ap, al) = self.split_str(args)?;
+                self.builder
+                    .build_call(self.funcs["command_new"], &[cp.into(), cl.into(), ap.into(), al.into()], "cmdnew")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("command_new returns a handle pointer")
+            }
+            // `c.cwd(dir)` — set the command handle's working directory in place; no value.
+            Rvalue::CommandCwd { command, dir } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let (dp, dl) = self.split_str(dir)?;
+                self.builder
+                    .build_call(self.funcs["command_cwd"], &[c.into(), dp.into(), dl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `c.run()` — fork + capture; write the owned `run_output` handle into `out`, return i32
+            // status. Null `out` first (the Err branch reads null → nothing to free), matching
+            // `http_parse`.
+            Rvalue::CommandRun { command, out } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["command_run"], &[c.into(), out_ptr.into()], "cmdrun")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("command_run returns i32 status")
+            }
+            // `out.code()` — the runtime returns the i64 exit code directly.
+            Rvalue::RunOutputCode { out } => {
+                let p = self.operand(out)?.into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["run_output_code"], &[p.into()], "rocode")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("run_output_code returns i64")
+            }
+            // `out.stdout()` / `out.stderr()` — a `str` view `{ptr,len}` into the run-output buffer.
+            Rvalue::RunOutputView { out, err } => {
+                let p = self.operand(out)?.into_pointer_value();
+                let fname = if *err { "run_output_stderr" } else { "run_output_stdout" };
+                self.builder
+                    .build_call(self.funcs[fname], &[p.into()], "roview")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("run_output_stdout/stderr returns a {ptr,len}")
             }
             // std.regex — compiled handle plus borrowed text. Compile/find write through explicit
             // out slots and return i32 status/present flags; MIR performs Result/Option branching.
