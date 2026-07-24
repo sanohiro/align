@@ -1543,6 +1543,17 @@ fn build_module<'c>(
         "command_timeout".to_string(),
         module.add_function("align_rt_command_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
+    // `command_env(c, name{ptr,len}, value{ptr,len})` adds/overrides one child env var in place (void;
+    // aborts on an interior NUL / non-UTF-8, or a name containing `=`); `command_env_clear(c)` starts the
+    // child environment empty (void).
+    funcs.insert(
+        "command_env".to_string(),
+        module.add_function("align_rt_command_env", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "command_env_clear".to_string(),
+        module.add_function("align_rt_command_env_clear", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         "command_run".to_string(),
         module.add_function("align_rt_command_run", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
@@ -7682,6 +7693,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let n = self.operand(ns)?;
                 self.builder
                     .build_call(self.funcs["command_timeout"], &[c.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `c.env(name, value)` — add/override one child environment variable in place; no value.
+            Rvalue::CommandEnv { command, name, value } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                let (vp, vl) = self.split_str(value)?;
+                self.builder
+                    .build_call(self.funcs["command_env"], &[c.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `c.env_clear()` — start the child environment empty in place; no value.
+            Rvalue::CommandEnvClear { command } => {
+                let c = self.operand(command)?.into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["command_env_clear"], &[c.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }

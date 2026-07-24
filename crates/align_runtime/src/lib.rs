@@ -10482,7 +10482,7 @@ pub unsafe extern "C" fn align_rt_process_exec(
 /// (`cmd`), the child's full marshalled argv (incl. `argv[0]`, P5), and an optional working
 /// directory. Built by [`align_rt_command_new`], configured by [`align_rt_command_cwd`], run by
 /// [`align_rt_command_run`], freed by [`align_rt_command_free`]. Slice 4 carries argv + cwd; Slice 5
-/// adds `timeout_ns` (env is Slice 6). `cmd` is stored SEPARATELY from `argv` because the `execvp`
+/// adds `timeout_ns`; Slice 6 adds the `env` overrides + `env_clear`. `cmd` is stored SEPARATELY from `argv` because the `execvp`
 /// lookup path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
 pub struct Command {
     cmd: std::ffi::CString,
@@ -10493,6 +10493,14 @@ pub struct Command {
     /// `align_rt_command_run`: past the deadline it `SIGKILL`s the child and returns [`AL_TIMEOUT`].
     /// Never negative (the setter aborts a negative `ns`).
     timeout_ns: i64,
+    /// Environment-variable overrides applied to the child before `execvp` (Slice 6), each a
+    /// `(name, value)` NUL-terminated C-string pair recorded by [`align_rt_command_env`]. The child
+    /// `setenv(name, value, 1)`s each pair in order (a later pair for the same name wins — overwrite=1),
+    /// AFTER any `clearenv` (see `env_clear`). Empty = inherit the parent environment unchanged.
+    env: Vec<(std::ffi::CString, std::ffi::CString)>,
+    /// When `true` (set by [`align_rt_command_env_clear`]) the child `clearenv()`s its inherited
+    /// environment before applying the `env` pairs, so it starts from empty. Default `false` = inherit.
+    env_clear: bool,
 }
 
 /// A `run_output` (`std.process` Slice 4) — a Move handle owning one completed run's exit code plus
@@ -10731,7 +10739,7 @@ pub unsafe extern "C" fn align_rt_command_new(
         // A bad argv cannot be reported (the surface has no `Result`) — abort, like a header injection.
         Err(_) => panic_abort("process.command: invalid command/argv (empty, interior NUL, or non-UTF-8)"),
     };
-    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None, timeout_ns: 0 }))
+    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None, timeout_ns: 0, env: Vec::new(), env_clear: false }))
 }
 
 /// `c.cwd(dir)` — set the command's working directory (the child `chdir`s into it before `execvp`).
@@ -10771,6 +10779,56 @@ pub unsafe extern "C" fn align_rt_command_timeout(c: *mut Command, ns: i64) {
         panic_abort("command.timeout_ns: negative timeout");
     }
     unsafe { &mut *c }.timeout_ns = ns;
+}
+
+/// `c.env(name, value)` — record one environment-variable override the child will `setenv` (overwrite=1)
+/// before `execvp` (Slice 6). Both `name` and `value` are `str` views copied into NUL-terminated C
+/// strings (the child does no allocation — the CStrings are built here in the parent). An interior NUL
+/// or non-UTF-8 in either **aborts** (a programmer error, like `cwd`'s bad path). A `name` containing
+/// `=` also aborts: `setenv` rejects it (`EINVAL`), and it can never be a valid variable name. Null
+/// command → abort (a null handle is a compiler-side invariant break, never reachable from a bound
+/// local). Pairs accumulate; a later pair for the same name overrides (child `setenv` overwrite=1). No
+/// value.
+///
+/// # Safety
+/// `c` must be null or a valid `Command` pointer; `name`/`value` valid byte ranges.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_env(
+    c: *mut Command,
+    name: *const u8,
+    name_len: i64,
+    value: *const u8,
+    value_len: i64,
+) {
+    if c.is_null() {
+        panic_abort("command.env: null command handle");
+    }
+    let Some(name_c) = (unsafe { abi_c_string(name, name_len) }) else {
+        panic_abort("command.env: invalid variable name (interior NUL or non-UTF-8)");
+    };
+    // `setenv` rejects a name containing `=` (`EINVAL`); reject it here rather than silently drop it.
+    if name_c.as_bytes().contains(&b'=') {
+        panic_abort("command.env: variable name contains '='");
+    }
+    let Some(value_c) = (unsafe { abi_c_string(value, value_len) }) else {
+        panic_abort("command.env: invalid variable value (interior NUL or non-UTF-8)");
+    };
+    unsafe { &mut *c }.env.push((name_c, value_c));
+}
+
+/// `c.env_clear()` — mark the command so the child `clearenv()`s its inherited environment before
+/// applying any [`align_rt_command_env`] pairs (Slice 6), starting the child from an empty environment.
+/// Null command → abort (a null handle is a compiler-side invariant break, never reachable from a bound
+/// local). No value.
+///
+/// # Safety
+/// `c` must be null or a valid `Command` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_env_clear(c: *mut Command) {
+    if c.is_null() {
+        panic_abort("command.env_clear: null command handle");
+    }
+    unsafe { &mut *c }.env_clear = true;
 }
 
 /// `out := c.run()` — fork a child running the command with BOTH stdout and stderr captured, drain
@@ -10851,6 +10909,19 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
             }
             if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 {
                 _exit(127); // a bad cwd → 127, the "command could not run" convention (P not an Err)
+            }
+            // Apply the environment overrides (Slice 6) BEFORE exec (env changes are process-wide in the
+            // child, so they must precede `execvp`). Order: `env_clear` wipes first, then each `env` pair
+            // `setenv`s with overwrite=1 (so a pair after an `env_clear` survives; a later pair for the
+            // same name wins). `clearenv`/`setenv` are NOT async-signal-safe, but the child already runs
+            // the non-async-signal-safe `execvp` (PATH malloc) — the same documented `spawn`/Slice-4
+            // hazard — so this is acceptable. NO Rust allocation occurs here: the CStrings were built in
+            // the parent (`align_rt_command_env`); the child only reads their pointers.
+            if cmd.env_clear {
+                clearenv();
+            }
+            for (n, v) in &cmd.env {
+                setenv(n.as_ptr() as *const u8, v.as_ptr() as *const u8, 1);
             }
             // Redirect stdout/stderr to the pipe write-ends, then close every pipe fd (the read ends
             // and the now-duplicated write ends). The dup2'd fds 1/2 are NOT CLOEXEC, so they survive
@@ -11479,6 +11550,11 @@ unsafe extern "C" {
     // UB (POSIX — `setenv` is not thread-safe against `getenv`/`setenv` in other threads).
     fn getenv(name: *const u8) -> *const u8;
     fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    // POSIX `clearenv(3)` — `process.command(...).env_clear()` (Slice 6): empty the environment so the
+    // forked child starts from nothing before `setenv`ing its recorded overrides. Called ONLY in the
+    // child after `fork`, before `execvp` (same non-async-signal-safe caveat as `execvp` itself).
+    // Returns 0 on success. Present in glibc/musl and macOS libc.
+    fn clearenv() -> i32;
     // OS CSPRNG seed for `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL`
     // on older silicon — `docs/open-questions.md` #342). Per-OS symbol (the C entry differs):
     //   Linux — `getrandom(2)` (glibc ≥ 2.25 / musl): fills `buf` with `buflen` bytes, returns the
@@ -23407,6 +23483,96 @@ mod tests {
         assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
         assert_eq!(unsafe { ro_stdout(out) }, "done");
         unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// `c.env(name, value)` → the child observes the variable (add/override), and multiple pairs
+    /// accumulate with the later pair for the same name winning (overwrite=1).
+    #[test]
+    fn command_env_is_observed_by_the_child() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "printf %s \"$ALIGN_TEST_V\""]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        let (np, nl) = view_of("ALIGN_TEST_V");
+        // First set to "42".
+        let (v1p, v1l) = view_of("42");
+        unsafe { align_rt_command_env(c, np, nl, v1p, v1l) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert_eq!(unsafe { ro_stdout(out) }, "42", "child sees the set env var");
+        unsafe { align_rt_run_output_free(out) };
+        // A later pair for the same name overrides (overwrite=1).
+        let (v2p, v2l) = view_of("override");
+        unsafe { align_rt_command_env(c, np, nl, v2p, v2l) };
+        let mut out2: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out2) }, 0);
+        assert_eq!(unsafe { ro_stdout(out2) }, "override", "a later env pair overrides");
+        unsafe { align_rt_run_output_free(out2) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// `c.env_clear()` starts the child environment empty: a variable set in THIS process (visible to a
+    /// normal child, which inherits our environment) is gone after `env_clear`. An `env` pair applied
+    /// after the clear still survives (order: wipe first, then apply pairs).
+    #[test]
+    fn command_env_clear_wipes_inherited_env() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Set a variable in our own process; a normal inheriting child would see it.
+        unsafe {
+            let (np, nl) = view_of("ALIGN_CLEAR_PROBE");
+            let (vp, vl) = view_of("present");
+            let cn = abi_c_string(np, nl).unwrap();
+            let cv = abi_c_string(vp, vl).unwrap();
+            setenv(cn.as_ptr() as *const u8, cv.as_ptr() as *const u8, 1);
+        }
+        // Sanity: without env_clear the child inherits it.
+        {
+            let (cp, cl) = view_of("/bin/sh");
+            let argv = argv_of(&["/bin/sh", "-c", "printf %s \"${ALIGN_CLEAR_PROBE:-EMPTY}\""]);
+            let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+            assert_eq!(unsafe { ro_stdout(out) }, "present", "inherited env is visible without clear");
+            unsafe { align_rt_run_output_free(out) };
+            unsafe { align_rt_command_free(c) };
+        }
+        // With env_clear the inherited variable is gone; a pair applied AFTER the clear survives.
+        {
+            let (cp, cl) = view_of("/bin/sh");
+            let argv = argv_of(&["/bin/sh", "-c", "printf '%s|%s' \"${ALIGN_CLEAR_PROBE:-EMPTY}\" \"${KEPT:-NONE}\""]);
+            let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+            unsafe { align_rt_command_env_clear(c) };
+            let (np, nl) = view_of("KEPT");
+            let (vp, vl) = view_of("yes");
+            unsafe { align_rt_command_env(c, np, nl, vp, vl) };
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+            assert_eq!(unsafe { ro_stdout(out) }, "EMPTY|yes", "env_clear wipes inherited, then env pair survives");
+            unsafe { align_rt_run_output_free(out) };
+            unsafe { align_rt_command_free(c) };
+        }
+    }
+
+    /// Null-safety of the Slice-6 setters (a null handle aborts, so only the accessor-style null checks
+    /// are exercised here — the abort paths are covered by the surface's bound-local gate).
+    #[test]
+    fn command_env_setters_do_not_leak() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // A command built, env-configured, and freed without ever running must not leak (Miri/ASan).
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "true"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        unsafe { align_rt_command_env_clear(c) };
+        let (np, nl) = view_of("A");
+        let (vp, vl) = view_of("B");
+        unsafe { align_rt_command_env(c, np, nl, vp, vl) };
         unsafe { align_rt_command_free(c) };
     }
 

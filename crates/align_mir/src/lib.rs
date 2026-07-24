@@ -983,6 +983,13 @@ pub enum Rvalue {
     /// `c.timeout_ns(ns)` — set the command handle `command`'s run timeout (`ns` an `i64` nanosecond
     /// count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at runtime. Impure.
     CommandTimeout { command: Operand, ns: Operand },
+    /// `c.env(name, value)` — add or override one environment variable the child sees (`name`/`value`
+    /// `{ptr,len}` str views), in place. No value. A `name`/`value` with an interior NUL, or a `name`
+    /// containing `=`, aborts at runtime. Impure.
+    CommandEnv { command: Operand, name: Operand, value: Operand },
+    /// `c.env_clear()` — start the child's environment empty (the child `clearenv`s before applying any
+    /// `env` pairs), in place. No value. Impure.
+    CommandEnvClear { command: Operand },
     /// `c.run()` — fork + capture: the runtime writes an owned `run_output` handle to `out` and returns
     /// an `i32` status (0 = ok; else `AL_INVALID` for non-UTF-8 output / a mapped errno). The caller
     /// branches `Ok(run_output)` / `Err`. `command` is borrowed (re-runnable). Impure.
@@ -3084,6 +3091,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ProcessCommand { .. }
         | hir::ExprKind::CommandCwd { .. }
         | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandEnv { .. }
+        | hir::ExprKind::CommandEnvClear { .. }
         | hir::ExprKind::CommandRun { .. }
         | hir::ExprKind::RunOutputCode { .. }
         | hir::ExprKind::RunOutputStdout { .. }
@@ -9047,6 +9056,22 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let n = lower_expr(b, ns);
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandTimeout { command: cm, ns: n }));
+            Operand::Const(Const::Unit)
+        }
+        // `c.env(name, value)` → add/override one child environment variable in place; no value.
+        hir::ExprKind::CommandEnv { command, name, value } => {
+            let cm = lower_expr(b, command);
+            let n = lower_expr(b, name);
+            let val = lower_expr(b, value);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CommandEnv { command: cm, name: n, value: val }));
+            Operand::Const(Const::Unit)
+        }
+        // `c.env_clear()` → start the child environment empty, in place; no value.
+        hir::ExprKind::CommandEnvClear { command } => {
+            let cm = lower_expr(b, command);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CommandEnvClear { command: cm }));
             Operand::Const(Const::Unit)
         }
         // `c.run()` → `Result<run_output, Error>` (shared out-slot + i32-status lowering, like

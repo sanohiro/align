@@ -8,9 +8,10 @@ module.
 
 > **Status:** M11 core complete (exit/abort, spawn/wait/kill, exec shipped). **Extension DESIGNED
 > 2026-07-24** (align-llm Request 1): captured output + cwd / env / timeout via a `process.command`
-> builder + `run_output` handle — see "Extension" at the end of this file. **Slices 4–5 SHIPPED**
-> (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant);
-> Slice 6 (`c.env`/`c.env_clear`) and the deferred bytes tier remain.
+> builder + `run_output` handle — see "Extension" at the end of this file. **Slices 4–6 SHIPPED**
+> (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant;
+> `c.env`/`c.env_clear`). The extension is now **COMPLETE** except the deferred bytes tier
+> (`c.run_bytes()`, ship on demand).
 
 ## Overview
 
@@ -407,7 +408,14 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
    open and wedges the drain), drains to EOF, `waitpid`s, and returns `Err(Error.Timeout)` (partial
    output discarded). `EINTR` on `poll` recomputes the remaining deadline; `timeout_ns == 0` keeps the
    infinite `-1` `poll` (Slice-4 behavior exactly).
-6. `c.env(name,value)` + `c.env_clear()`.
+6. `c.env(name,value)` + `c.env_clear()` — **SHIPPED.** Both are in-place bound-local setters (`()`).
+   `c.env(name, value)` records a `(name, value)` override; `c.env_clear()` marks the child to start
+   from an empty environment. The runtime `Command` gains `env: Vec<(CString, CString)>` + `env_clear:
+   bool`; in the forked child, AFTER `chdir` and before the `dup2`s, it runs `if env_clear { clearenv()
+   }` then `setenv(name, value, 1)` for each recorded pair (overwrite=1 — a later `env` for the same
+   name wins; an `env` after an `env_clear` survives). Names/values marshal to C strings in the PARENT
+   (the child does no allocation, the `spawn`/Slice-4 async-signal-safety discipline); an interior-NUL
+   / non-UTF-8 name or value aborts, and a name containing `=` aborts (`setenv` would reject it).
 7. *(deferred)* the bytes tier `c.run_bytes()` — ship on demand.
 
 ## Pitfalls
