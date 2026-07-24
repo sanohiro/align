@@ -8,7 +8,31 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-24, **`std.process` captured-output Slice 4 SHIPPED (#630) — align-llm Request
+_Last updated: 2026-07-24, **`std.process` timeout Slice 5 SHIPPED (#631) + the shared `Error.Timeout`
+core variant.** `c.timeout_ns(ns)` (in-place, bound-local, the `c.cwd` idiom; `ns==0` = no timeout,
+byte-identical to S4) bounds `c.run()`: past the deadline the child's process GROUP is `SIGKILL`ed and
+the run returns `Err(Error.Timeout)`. **`Error.Timeout` = a 5th builtin `Error` variant** inserted
+between `Denied` and `Code` (`Error { NotFound, Invalid, Denied, Timeout, Code(i32) }`; runtime
+`AL_TIMEOUT=4`, `AL_CODE` 4→5; sema `ERROR_VARIANT_CODE` 3→4; MIR branchless decode
+`tag=min(status-1,4)`/`Code(status-5)`; exit `Timeout`→4) — produced ONLY at explicit timeout sites
+(an unrelated `ETIMEDOUT` errno stays `Code`); it will be reused by the designed http/net I/O timeouts
+(Request 2). Adding it makes an exhaustive `match Error` fail closed — the 3 in-repo exhaustive matches
+(`apps/web/pkg/web.align`, `enum_match.rs`, `m5.rs`) gained a `Timeout` arm. Runtime: child
+`setpgid(0,0)` (race-free double-setpgid), `Instant` deadline via `checked_add` (huge `ns` → no-timeout,
+never panics), on expiry `kill(-pid,9)` reaps the tree (`sleep` under `sh -c` too), then **no re-drain**
+(partial capture discarded; an infinite re-drain would reintroduce an unbounded block if a descendant
+escaped the group — wall-clock is now unconditionally bounded). Docs updated everywhere `Error` is
+enumerated (`draft.md`, `language-spec.md`, guide 03/04 +ja, `open-questions.md` Settled, `process.md`
++ja). Reviewed via `/align-self-review` + an independent adversarial pass (its substantive finding — the
+infinite re-drain hang — fixed; + a checked_add panic-hardening). `cargo test --workspace` 2723/0
+(clean run — NOTE: editing `align_runtime/src` DURING a `cargo test --workspace` run triggers a
+"libalign_runtime.a is stale" cascade across all driver tests; always `cargo build --workspace` and
+leave the source untouched during the run — the memory's stale-archive rule at scale). **NEXT: S6 =
+`c.env(name,value)` / `c.env_clear()`** (mirror `CommandCwd`; child `clearenv`/`setenv` before
+`execvp`) — the last R1 wanted item. Then R2 (http/net timeout implementation): the connect substrate
+(`align_rt_tcp_connect` gains `timeout_ns` — non-blocking connect + `poll`), `SO_RCVTIMEO`/`SO_SNDTIMEO`,
+one `timeout(ns)` knob (http client default + per-request; net `read/write_timeout_ns`) → `Error.Timeout`
+(already landed). Before that, **`std.process` captured-output Slice 4 SHIPPED (#630) — align-llm Request
 1, the verify-loop blocker.** `c := process.command(cmd, args)` (Move builder, `Ty::Command`, no
 `Scalar` like `HttpRequest`) + `c.cwd(dir)` (in-place, bound-local) + `out := c.run()?` → a new
 `Ty::RunOutput`/`Scalar::RunOutput` Move handle (rides `Result<run_output, Error>` Ok like
