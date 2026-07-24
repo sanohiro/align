@@ -8,8 +8,27 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-24, **`std.regex` COMPLETE — the whole deferred surface shipped across three
-merged PRs on top of the first slice.** #627 `re.find_all(text)` / `re.split(text)` → owned
+_Last updated: 2026-07-24, **`std.process` captured-output Slice 4 SHIPPED (#630) — align-llm Request
+1, the verify-loop blocker.** `c := process.command(cmd, args)` (Move builder, `Ty::Command`, no
+`Scalar` like `HttpRequest`) + `c.cwd(dir)` (in-place, bound-local) + `out := c.run()?` → a new
+`Ty::RunOutput`/`Scalar::RunOutput` Move handle (rides `Result<run_output, Error>` Ok like
+`HttpResponse`) with `.code() -> i64` and `.stdout()/.stderr() -> str` zero-copy views region-bound to
+`out` (`Frame.shorter(region_of(out))` — escape past Drop rejected, #297/P9). Runtime = two CLOEXEC
+pipes + fork + dup2 + a concurrent two-pipe `poll` drain (P7 deadlock-avoiding core) + child `chdir` +
+blocking `waitpid` reap + UTF-8-validated capture (non-UTF-8 → `Error.Invalid`). `run` borrows `c`
+(re-runnable). Both new handles swept through every analysis pass (grep-parity vs `HttpResponse`);
+verified by `/align-self-review` (all gates) + an independent adversarial soundness pass (no soundness
+bug; 3 low doc-accuracy nits fixed pre-merge). 12 tests (6 runtime + 6 E2E incl. the two-pipe-no-
+deadlock, P9 view-escape, P10 array-element gates). **Design specs (this PR): `process.md` "Extension"
+(full R1 surface + the shared `Error.Timeout` core variant designed for S5), `http.md`/`net.md` "I/O
+timeouts" (align-llm Request 2, DESIGNED — connect substrate + `SO_RCVTIMEO`/`SO_SNDTIMEO` + one
+`timeout(ns)` knob), all + ja mirrors.** align-llm's `docs/align-requests.md` carries Align's response
+(both ACCEPTED). **NEXT: S5 = `c.timeout_ns(ns)` + the `Error.Timeout` core enum change** (5th variant
+between `Denied` and `Code`; `AL_TIMEOUT=4`, `AL_CODE` 4→5; MIR `make_error_from_status` clamp
+`min(status-1,4)`/`Code(status-5)`) — the "hung test freezes the loop" fix. Then S6 `env`/`env_clear`;
+then R2 (http/net timeouts) implementation. Before that, **`std.regex` COMPLETE — the whole deferred
+surface shipped across three merged PRs on top of the first slice.** #627 `re.find_all(text)` /
+`re.split(text)` → owned
 `array<regex_match>` (the `DynStructArray` materialization template; spans view nothing so the array
 freely escapes; `find_iter` handles empty-match advancement). #628 `re.replace(text,repl)` /
 `re.replace_all(...)` → owned `string` with `$1`/`${name}`/`$$` expansion (always an independent
