@@ -6897,6 +6897,41 @@ pub struct AlignRegexMatch {
     pub end: i64,
 }
 
+/// ABI layout of an owned `array<regex_match>` header (`{ptr, len}`) returned by `find_all`/`split`.
+/// The buffer is `len` contiguous [`AlignRegexMatch`] elements from [`align_rt_alloc`]; the generated
+/// `Drop` shallow-frees `ptr` (the elements are POD i64 pairs — no per-element free). Identical wire
+/// shape to [`AlignStr`]; a named type keeps the element pointer honest.
+#[repr(C)]
+pub struct AlignMatchArray {
+    pub ptr: *mut AlignRegexMatch,
+    pub len: i64,
+}
+
+/// Copy a match span vector into a fresh `align_rt_alloc` buffer and publish it through `out`. An
+/// empty vector owns no buffer (`{null, 0}`, `Drop`-safe). Shared by `find_all` and `split`.
+///
+/// # Safety
+/// `out` must point to writable storage for one [`AlignMatchArray`].
+unsafe fn publish_match_array(v: &[AlignRegexMatch], out: *mut AlignMatchArray) {
+    let count = v.len();
+    if count == 0 {
+        unsafe { out.write(AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 }) };
+        return;
+    }
+    let bytes = count
+        .checked_mul(core::mem::size_of::<AlignRegexMatch>())
+        .and_then(|b| i64::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("regex: result size overflow"));
+    let dst = align_rt_alloc(bytes) as *mut AlignRegexMatch;
+    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), dst, count) };
+    unsafe { out.write(AlignMatchArray { ptr: dst, len: count as i64 }) };
+}
+
+/// Convert a byte offset to `i64`, aborting past `i64::MAX` (mirrors `align_rt_regex_find`).
+fn regex_offset(off: usize) -> i64 {
+    i64::try_from(off).unwrap_or_else(|_| panic_abort("regex match offset exceeds i64"))
+}
+
 /// Compile one UTF-8 pattern. Returns `0` and writes a fresh handle on success; malformed patterns,
 /// invalid ABI views, and either resource-limit rejection return `AL_INVALID` with `out = null`.
 ///
@@ -6995,6 +7030,79 @@ pub unsafe extern "C" fn align_rt_regex_find(
         })
     };
     1
+}
+
+/// Find every leftmost, non-overlapping match and materialize an owned `array<regex_match>` into
+/// `out`. Returns `0` always (a search over valid UTF-8 is total). Empty input or no match yields an
+/// empty array (`{null, 0}`). The Rust `find_iter` advances past empty matches by one character, so
+/// no infinite loop and every offset is a UTF-8 char boundary.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `text_ptr`/`text_len` must be readable UTF-8; `out`
+/// must point to writable storage for one [`AlignMatchArray`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_find_all(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+    out: *mut AlignMatchArray,
+) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    unsafe { out.write(AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 }) };
+    if handle.is_null() || text_len < 0 || (text_len > 0 && text_ptr.is_null()) {
+        return 0;
+    }
+    let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
+        return 0;
+    };
+    let v: Vec<AlignRegexMatch> = unsafe { &*handle }
+        .inner
+        .find_iter(text)
+        .map(|m| AlignRegexMatch { start: regex_offset(m.start()), end: regex_offset(m.end()) })
+        .collect();
+    unsafe { publish_match_array(&v, out) };
+    0
+}
+
+/// Split `text` around every leftmost, non-overlapping match and materialize the between-match field
+/// spans as an owned `array<regex_match>` into `out`. Returns `0` always. Mirrors Rust `Regex::split`:
+/// leading/trailing/interior empty fields are kept, empty input yields one empty field `[0, 0)`, and
+/// a pattern matching the whole string yields two empty fields. Each span is a `[start, end)` byte
+/// range into `text`; the caller slices `text[p.start..p.end]`.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `text_ptr`/`text_len` must be readable UTF-8; `out`
+/// must point to writable storage for one [`AlignMatchArray`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_split(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+    out: *mut AlignMatchArray,
+) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    unsafe { out.write(AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 }) };
+    if handle.is_null() || text_len < 0 || (text_len > 0 && text_ptr.is_null()) {
+        return 0;
+    }
+    let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
+        return 0;
+    };
+    // Walk the match boundaries directly (Rust `split` yields substrings; we want the offsets).
+    // `find_iter` handles empty-match advancement, so a zero-width delimiter cannot loop.
+    let mut v: Vec<AlignRegexMatch> = Vec::new();
+    let mut last = 0usize;
+    for m in unsafe { &*handle }.inner.find_iter(text) {
+        v.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(m.start()) });
+        last = m.end();
+    }
+    v.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(text.len()) });
+    unsafe { publish_match_array(&v, out) };
+    0
 }
 
 /// Drop a compiled regex handle. Null-safe for moved/uninitialized drop slots.
@@ -28467,6 +28575,95 @@ mod regex_tests {
         assert_eq!(unsafe { align_rt_regex_is_match(core::ptr::null(), h as *const u8, 1) }, 0);
         // A negative length is rejected as no-match rather than read.
         assert_eq!(unsafe { align_rt_regex_is_match(h, "x".as_ptr(), -1) }, 0);
+        unsafe { align_rt_regex_free(h) };
+    }
+
+    /// Read a materialized `array<regex_match>` back into a `Vec` and free it via the same
+    /// `align_rt_free` the generated `Drop` uses (so this exercises the exact ownership contract).
+    fn find_all(h: *const RegexHandle, text: &str) -> Vec<(i64, i64)> {
+        let mut arr = AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 };
+        let code = unsafe { align_rt_regex_find_all(h, text.as_ptr(), text.len() as i64, &mut arr) };
+        assert_eq!(code, 0);
+        read_and_free_match_array(&arr)
+    }
+
+    fn split(h: *const RegexHandle, text: &str) -> Vec<(i64, i64)> {
+        let mut arr = AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 };
+        let code = unsafe { align_rt_regex_split(h, text.as_ptr(), text.len() as i64, &mut arr) };
+        assert_eq!(code, 0);
+        read_and_free_match_array(&arr)
+    }
+
+    fn read_and_free_match_array(arr: &AlignMatchArray) -> Vec<(i64, i64)> {
+        let out = if arr.len == 0 {
+            assert!(arr.ptr.is_null(), "an empty result must own no buffer");
+            Vec::new()
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts(arr.ptr, arr.len as usize) };
+            slice.iter().map(|m| (m.start, m.end)).collect()
+        };
+        unsafe { align_rt_free(arr.ptr as *mut u8) };
+        out
+    }
+
+    #[test]
+    fn find_all_leftmost_nonoverlapping() {
+        let d = compile("[0-9]+");
+        assert_eq!(find_all(d, "a12b345c9"), [(1, 3), (4, 7), (8, 9)]);
+        // No match and empty input both own no buffer.
+        assert_eq!(find_all(d, "abc"), []);
+        assert_eq!(find_all(d, ""), []);
+        unsafe { align_rt_regex_free(d) };
+        // Overlap: "aa" over "aaaa" is 2 matches, not 3.
+        let aa = compile("aa");
+        assert_eq!(find_all(aa, "aaaa"), [(0, 2), (2, 4)]);
+        unsafe { align_rt_regex_free(aa) };
+    }
+
+    #[test]
+    fn find_all_empty_match_advances() {
+        // An empty-match pattern must terminate (advance by a codepoint) and stay on char boundaries.
+        let star = compile("a*");
+        // Terminates; every span is a valid char boundary of a multibyte haystack.
+        let ms = find_all(star, "πa");
+        assert!(!ms.is_empty());
+        for (s, e) in ms {
+            assert!("πa".is_char_boundary(s as usize) && "πa".is_char_boundary(e as usize));
+        }
+        assert_eq!(find_all(star, ""), [(0, 0)]);
+        unsafe { align_rt_regex_free(star) };
+    }
+
+    #[test]
+    fn split_keeps_empty_fields() {
+        let comma = compile(",");
+        // Leading/interior/trailing empties are kept.
+        assert_eq!(split(comma, "a,,b,"), [(0, 1), (2, 2), (3, 4), (5, 5)]);
+        // Empty input → one empty field.
+        assert_eq!(split(comma, ""), [(0, 0)]);
+        // No delimiter → the whole string is one field.
+        assert_eq!(split(comma, "abc"), [(0, 3)]);
+        // A pattern matching the whole string → two empty fields.
+        unsafe { align_rt_regex_free(comma) };
+        let whole = compile("abc");
+        assert_eq!(split(whole, "abc"), [(0, 0), (3, 3)]);
+        unsafe { align_rt_regex_free(whole) };
+    }
+
+    #[test]
+    fn find_all_split_abi_guards() {
+        let h = compile("x");
+        // A pre-dirtied out slot: the guards must overwrite it with a Drop-safe `{null,0}`.
+        let junk = core::ptr::NonNull::<AlignRegexMatch>::dangling().as_ptr();
+        let mut arr = AlignMatchArray { ptr: junk, len: 7 };
+        // A null handle leaves a Drop-safe empty result, never reads.
+        assert_eq!(unsafe { align_rt_regex_find_all(core::ptr::null(), "x".as_ptr(), 1, &mut arr) }, 0);
+        assert!(arr.ptr.is_null() && arr.len == 0);
+        arr = AlignMatchArray { ptr: junk, len: 7 };
+        assert_eq!(unsafe { align_rt_regex_split(h, "x".as_ptr(), -1, &mut arr) }, 0);
+        assert!(arr.ptr.is_null() && arr.len == 0);
+        // A null out pointer is a no-op, not a crash.
+        assert_eq!(unsafe { align_rt_regex_find_all(h, "x".as_ptr(), 1, core::ptr::null_mut()) }, 0);
         unsafe { align_rt_regex_free(h) };
     }
 }

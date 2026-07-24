@@ -1105,6 +1105,14 @@ pub enum ExprKind {
     /// Returned offsets are UTF-8 byte offsets; an invalid start offset aborts like an invalid
     /// slice boundary. Both operands are borrowed. Pure.
     RegexFind { regex: Box<Expr>, text: Box<Expr>, start: Option<Box<Expr>> },
+    /// `re.find_all(text)` — every leftmost, non-overlapping match as an owned `array<regex_match>`
+    /// (`Ty::DynStructArray(regex_match, Aos)`). The spans are Copy `i64` pairs that view nothing, so
+    /// the array freely escapes; `Drop` shallow-frees the buffer. Both operands are borrowed. Pure.
+    RegexFindAll { regex: Box<Expr>, text: Box<Expr> },
+    /// `re.split(text)` — the between-match field spans as an owned `array<regex_match>` (same
+    /// representation as [`RegexFindAll`]). Empty leading/trailing/interior fields are kept; empty
+    /// input is one empty field. Both operands are borrowed. Pure.
+    RegexSplit { regex: Box<Expr>, text: Box<Expr> },
     /// `cli.command(name)` — a fresh [`crate::Ty::CliCommand`] builder named `name` (a `str`). A
     /// **Move** handle owning its registered-flag table; `Drop`-freed. Pure (no I/O — argv is
     /// already captured by `main(args)`). `name` is borrowed.

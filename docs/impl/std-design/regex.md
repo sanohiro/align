@@ -86,13 +86,78 @@ once the existing closure ownership rules can express that capture safely.
 No capability-specific native system library is linked; the Rust crate is compiled into the normal
 runtime archive.
 
-## Deferred surface
+## Second surface — iteration, replacement, split, captures (design locked 2026-07-24)
 
-Captures, named groups, find iteration, replacement, and split are deferred until an application
-consumer fixes their allocation and ownership shapes. A future capture result should prefer Copy
-byte spans (possibly an owned array of `Option<regex_match>`) over borrowed substring storage.
-Language literal syntax such as `rx"..."`, compile-time validation, implicit caching, and a
-backtracking compatibility engine are not part of this design.
+The deferred features all ship in their ideal form on existing plumbing; **no new
+language-capability gate is required**, and only `captures` adds one small opaque Move handle type
+(mechanically identical to the `regex` handle itself).
+
+```text
+re.find_all(text: str)               -> array<regex_match>     // owned Move; leftmost, non-overlapping
+re.split(text: str)                  -> array<regex_match>     // owned Move; the between-match field spans
+re.replace(text: str, repl: str)     -> string                // owned Move; first match only
+re.replace_all(text: str, repl: str) -> string                // owned Move; every non-overlapping match
+re.captures(text: str)               -> Option<captures>      // Move handle; None = no match at all
+re.group_count()                     -> i64                   // total groups, incl. group 0
+re.group_index(name: str)            -> Option<i64>           // name -> numbered index, on the pattern
+
+caps.group(i: i64)                   -> Option<regex_match>   // absent group = None; out-of-range aborts
+```
+
+Locked design decisions:
+
+- **Everything is a byte span.** `find_all` and `split` both return `array<regex_match>` — one
+  representation for the whole API. Spans are Copy `i64` pairs that view nothing (they are pure
+  offsets), so the array **freely escapes** and is region-tied to neither the regex nor the input,
+  matching the shipped `find` contract. `split` returns the field spans (`text[p.start..p.end]`);
+  it does not allocate substrings. An owned `array<str>` was rejected: it would either deep-copy N
+  substrings or tie the pieces' region to `text` — both worse than spans.
+- **`replace` / `replace_all` return an owned `string`** and expand the Rust `regex` replacement
+  contract — `$1`, `${name}`, and `$$` for a literal `$`. This is the one genuinely useful form and
+  is fully documented, so it is specified, not hidden. The result always owns a fresh buffer, even
+  when there was no match (never a borrow into `text`).
+- **`captures` returns an opaque Move `captures` handle**, not an array. `array<Option<regex_match>>`
+  is not representable (there is no Option-of-struct array element), and a handle is the ideal form
+  regardless: it owns a fixed buffer of optional Copy spans, borrows nothing, and mirrors
+  `CliParsed` exactly (opaque Move handle, total-or-abort/`Option` getters, `Drop` via a free fn).
+  `caps.group(i)` returns `Option<regex_match>` — group 0 is the whole match, a group that did not
+  participate is `None`, and an out-of-range `i` aborts as a programmer error (the `find_at`
+  boundary model).
+- **Named groups reduce to numbered groups.** The name→index map is a property of the *pattern*, so
+  it lives on the compiled `regex`: `re.group_index(name) -> Option<i64>` (unknown name = `None`),
+  then the ordinary `caps.group(i)`. This keeps one resolution path (no duplicate `caps.name(...)`
+  mechanism), per "one way".
+- All second-surface operations stay **Pure** and keep the receiver-bound rule (bind the handle
+  first). `caps` is likewise bound before `.group`.
+
+**Still deferred (no consumer yet, not blockers):** a captures-iterator over all matches
+(`array<captures>` = a Move-handle array, the `get_many` `DynResponseArray` pattern), a
+closure-callback replacement form (needs escaping first-class closures), language literal syntax
+(`rx"..."`), compile-time validation, implicit caching, and a backtracking compatibility engine.
+
+### Slice plan
+
+1. **R1 `find_all`** — establishes runtime-materialized `array<regex_match>` (the
+   `lower_json_decode_struct_array` template, minus the `Result`: out slot receives `{ptr, len}`,
+   `Load`, return). Runtime `align_rt_regex_find_all` collects `find_iter` into a fresh
+   `align_rt_alloc` buffer; empty result is `{null, 0}` (`Drop` is null-safe).
+2. **R2 `replace` / `replace_all`** — independent; owned `string` via `AlignStr` (the `str_clone` /
+   `PathJoin` return-by-value shape). Always materializes an owned buffer (a no-match `Cow::Borrowed`
+   is cloned out).
+3. **R3 `split`** — same representation and plumbing as R1; the runtime walks matches and emits the
+   between-match spans, including empty leading/trailing/interior fields and one empty field for empty
+   input.
+4. **R4 `captures` + `group_count` + `group_index` + `caps.group`** — adds `Ty::Captures` /
+   `Scalar::Captures` (swept through every Move/drop `matches!` list, the codegen ptr-type +
+   destructor arms, and every exhaustive HIR/MIR walk), `align_rt_regex_captures*` runtime.
+
+Soundness invariants for every slice (per `/align-self-review`): validate the `{ptr,len}` text view
+(`len < 0 || (len > 0 && ptr.is_null())`), `usize::try_from` every offset, `i64::try_from` back
+(abort past `i64`, mirroring `find`), zero the out slot before work, hand back exactly the allocation
+`align_rt_free` expects, and **advance empty matches by one codepoint** (never one byte) in
+`find_all` / `split` / `replace_all` to avoid an infinite loop and to stay on a char boundary. Every
+new HIR `ExprKind` / MIR `Rvalue` must be entered into the escape/region/effect/`MoveCheck`/drop
+passes it would otherwise silently skip.
 
 ## Validation handoff
 

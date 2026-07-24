@@ -329,3 +329,99 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1000\n");
 }
+
+// --- find_all / split (owned array<regex_match>) ------------------------------------------------
+
+/// `find_all` returns every leftmost, non-overlapping match as an owned `array<regex_match>`; each
+/// span slices the text. UTF-8 offsets shift with multibyte prefixes; no match / empty input own no
+/// buffer; the owned array `Drop`s at scope end.
+#[test]
+fn find_all_semantics() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  d := regex.compile(\"[0-9]+\")?
+  s := \"a12b345c9\"
+  ms := d.find_all(s)
+  print(ms.len())
+  mut i := 0
+  loop {
+    if i >= ms.len() { break }
+    m := ms[i]
+    print(s[m.start .. m.end])
+    i = i + 1
+  }
+  // Unicode: 'π' is two bytes, so the first digit run starts at byte 3.
+  u := d.find_all(\"π=3,π=14\")
+  print(u.len())
+  print(u[0].start)
+  print(u[1].start)
+  // No match / empty input → an empty array (owns no buffer).
+  print(d.find_all(\"abc\").len())
+  print(d.find_all(\"\").len())
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-find-all", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n12\n345\n9\n2\n3\n8\n0\n0\n");
+}
+
+/// `split` returns the between-match field spans, keeping empty leading/interior/trailing fields;
+/// empty input is one empty field; a whole-string match yields two empty fields.
+#[test]
+fn split_semantics() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  comma := regex.compile(\",\")?
+  s := \"a,,b,\"
+  parts := comma.split(s)
+  print(parts.len())
+  mut i := 0
+  loop {
+    if i >= parts.len() { break }
+    p := parts[i]
+    print(p.end - p.start)
+    i = i + 1
+  }
+  // Empty input → one empty field; no delimiter → the whole string.
+  print(comma.split(\"\").len())
+  print(comma.split(\"abc\").len())
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-split", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // parts = ["a","","b",""] → lengths 1,0,1,0; then 1 field for "", 1 field for "abc".
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n1\n0\n1\n0\n1\n1\n");
+}
+
+/// An empty-match pattern (`a*`) must terminate — the runtime advances past a zero-width match by a
+/// codepoint — and an unbound `find_all` temporary is dropped without leaking.
+#[test]
+fn find_all_empty_match_terminates() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  star := regex.compile(\"a*\")?
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= 1000 { break }
+    // An unbound owned-array temporary: created, measured, dropped every iteration.
+    total = total + star.find_all(\"aπbaa\").len()
+    i = i + 1
+  }
+  print(total)
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-find-all-empty", prog);
+    // A clean exit confirms termination + no leak/double-free across 1000 temporaries.
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // 1000 identical iterations, each finding the same fixed number of matches (> 0).
+    let s = String::from_utf8_lossy(&out.stdout);
+    let n: i64 = s.trim().parse().expect("one integer line");
+    assert!(n > 0 && n % 1000 == 0, "expected a positive multiple of 1000, got {n}");
+}

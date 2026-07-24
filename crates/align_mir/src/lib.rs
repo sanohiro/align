@@ -844,6 +844,11 @@ pub enum Rvalue {
     /// `re.find[_at](text, start)` — write the builtin `regex_match` struct into `out`, returning an
     /// i32 present flag. `start` is always explicit here (`find` lowers as zero).
     RegexFind { regex: Operand, text: Operand, start: Operand, out: Slot },
+    /// `re.find_all(text)` / `re.split(text)` — materialize an owned `array<regex_match>` `{ptr,len}`
+    /// into `out` (the buffer is `align_rt_alloc`-owned; `Drop` shallow-frees it). Returns an i32
+    /// status (always 0). `split` selects the between-match spans; `find_all` the match spans.
+    RegexFindAll { regex: Operand, text: Operand, out: Slot },
+    RegexSplit { regex: Operand, text: Operand, out: Slot },
     EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
     /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
@@ -3313,7 +3318,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // handles compile / match / find out of line.
         hir::ExprKind::RegexCompile { .. }
         | hir::ExprKind::RegexIsMatch { .. }
-        | hir::ExprKind::RegexFind { .. } => lower_regex_expr(b, e),
+        | hir::ExprKind::RegexFind { .. }
+        | hir::ExprKind::RegexFindAll { .. }
+        | hir::ExprKind::RegexSplit { .. } => lower_regex_expr(b, e),
         // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
         // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
         // match grows by exactly one arm (not seven). A deep expression tree recurses through
@@ -9306,6 +9313,25 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let result = b.fresh_value(e.ty);
             b.push(Stmt::Let(result, Rvalue::Load(rslot)));
             Operand::Value(result)
+        }
+        hir::ExprKind::RegexFindAll { regex, text } | hir::ExprKind::RegexSplit { regex, text } => {
+            // Owned `array<regex_match>` materialized by the runtime into `out` (a fresh, NOT
+            // drop-tracked temp — the loaded value is what the caller binds and drops, so the header
+            // is never freed twice). Status is always 0; the load carries the `{ptr,len}` out.
+            let is_split = matches!(e.kind, hir::ExprKind::RegexSplit { .. });
+            let out = b.new_slot(e.ty);
+            let re = lower_expr(b, regex);
+            let t = lower_expr(b, text);
+            let status = b.fresh_value(status_ty());
+            let rv = if is_split {
+                Rvalue::RegexSplit { regex: re, text: t, out }
+            } else {
+                Rvalue::RegexFindAll { regex: re, text: t, out }
+            };
+            b.push(Stmt::Let(status, rv));
+            let a = b.fresh_value(e.ty);
+            b.push(Stmt::Let(a, Rvalue::Load(out)));
+            Operand::Value(a)
         }
         _ => unreachable!("lower_regex_expr called for a non-regex expression"),
     }
