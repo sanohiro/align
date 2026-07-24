@@ -82,6 +82,27 @@ fn owned_struct_passed_by_value() {
 }
 
 #[test]
+fn uniformly_arena_owned_struct_uses_bulk_free_only() {
+    if !backend_available() {
+        return;
+    }
+    // Both owned fields belong to the visible arena. The struct's single cleanup bit must remain
+    // clear so its recursive Drop does not individually free either buffer before arena teardown.
+    let src = concat!(
+        "Pair { left: array<i64>, right: array<i64> }\n",
+        "fn main() -> i32 {\n",
+        "  mut n: i32 := 0\n",
+        "  arena {\n",
+        "    p := Pair { left: [1].to_array(), right: [2, 3].to_array() }\n",
+        "    n = (p.left.len() + p.right.len()) as i32\n",
+        "  }\n",
+        "  return n\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("arena-owned-struct", src).status.code(), Some(3));
+}
+
+#[test]
 fn owned_struct_in_a_branch() {
     if !backend_available() {
         return;

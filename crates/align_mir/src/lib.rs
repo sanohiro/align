@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Scalar, Ty};
+use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move, FloatTy, IntTy, Layout, Scalar, Ty};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -1828,18 +1828,18 @@ struct LoopFrame {
 }
 
 impl Builder {
-    /// Free every open arena (innermost first), join + free every open `task_group`, and drop
-    /// every owned free-standing local — emitted before any exit that leaves these scopes.
+    /// Join + free every open `task_group`, drop every owned free-standing local, then free every
+    /// open arena (innermost first) — emitted before any exit that leaves these scopes.
     fn emit_exit_cleanup(&mut self) {
-        for s in self.drop_locals.clone() {
-            self.emit_drop_if_live(s);
-        }
-        // An early exit out of a `task_group` still joins its tasks (structured concurrency) and
-        // frees the region.
+        // A task may legally borrow a frame-owned local or an enclosing arena value. Join every
+        // open group before either backing store is released, then free the task region.
         let tgs = self.task_groups.clone();
         for h in tgs.into_iter().rev() {
             self.push(Stmt::TgWait(Operand::Value(h)));
             self.push(Stmt::TgEnd(Operand::Value(h)));
+        }
+        for s in self.drop_locals.clone() {
+            self.emit_drop_if_live(s);
         }
         let handles = self.arenas.clone();
         for h in handles.into_iter().rev() {
@@ -2162,8 +2162,8 @@ fn field_path_leaf_ty(structs: &[hir::StructDef], struct_id: u32, path: &[u32]) 
 
 /// Null the slot of an owned `array<T>` local moved out at a (just-lowered) consuming site,
 /// so its exit [`Stmt::Drop`] becomes a no-op `free(null)` and the buffer is freed once — by
-/// the new owner. The moved expression is a bare `Local` (null its slot) or a block/arena whose
-/// trailing value is the move (recurse into the tail). Other shapes (fresh temporaries like
+/// the new owner. The moved expression is a bare `Local` (null its slot) or a value-carrying scope
+/// whose trailing value is the move (recurse into the tail). Other shapes (fresh temporaries like
 /// `make()` / `.to_array()`) own no slot, and sema rejects moving a bound owned local out
 /// through an `if`/`else` arm, so no other case reaches here. Restricted to free-standing owned
 /// slots (`DynArray`, owned `string`) — `box<T>` is arena-regioned and never free-standing-dropped.
@@ -2171,19 +2171,10 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
-                Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
-                        || payload_is_move(ty)
-                        // A Move tuple (holds an owned element) moved away must be nulled so its
-                        // exit `Drop` frees nulls, not the buffers the new owner took.
-                        || matches!(ty, Ty::Tuple(tid) if b.tuples[tid as usize].elems.iter().any(|s| s.is_move()))
-                        // A Move struct (owns a `string`/owned field) moved away must be nulled too,
-                        // so its exit `Drop` frees null, not the buffers the new owner took.
-                        || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs, &b.enums))
-                        // A Move enum (owns an `array<Struct>` payload, J2) moved away must be nulled
-                        // so its exit tag-switched `Drop` frees null, not the buffer the new owner took.
-                        || matches!(ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums))
-                }
+                // Share the exact sema/MIR ownership predicate. A handwritten type list previously
+                // omitted `DynSliceArray` (`chunks`) and could drift again when another owned form
+                // is added. Every type with a cleanup flag transfers by clearing that flag.
+                Some(&ty) => needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums),
                 None => false,
             };
             if moved {
@@ -2191,7 +2182,10 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 b.set_drop_flag(*id, false);
             }
         }
-        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
+        hir::ExprKind::Block(blk)
+        | hir::ExprKind::Arena(blk)
+        | hir::ExprKind::Unsafe(blk)
+        | hir::ExprKind::TaskGroup(blk) => {
             if let Some(v) = &blk.value {
                 null_moved_source(b, v);
             }
@@ -2262,7 +2256,10 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
             b.push(Stmt::Let(live, Rvalue::Load(flag)));
             Some(Operand::Value(live))
         }
-        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
+        hir::ExprKind::Block(blk)
+        | hir::ExprKind::Arena(blk)
+        | hir::ExprKind::Unsafe(blk)
+        | hir::ExprKind::TaskGroup(blk) => {
             blk.value.as_ref().and_then(|v| moved_drop_flag(b, v))
         }
         hir::ExprKind::OptionSome(inner)
@@ -2301,9 +2298,13 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
         | hir::ExprKind::TupleIndex { .. }
         | hir::ExprKind::Index { .. }
         | hir::ExprKind::ElemField { .. } => Some(Operand::Const(Const::Bool(false))),
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) | hir::ExprKind::TaskGroup(block) => {
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
             block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
         }
+        // A task_group is not borrow-transparent: its tail local dies with the scope, so the
+        // wrapper is a fresh value in the caller. Forward that local's ordinary ownership bit to
+        // the synthetic owner instead of classifying the inner Local as a borrowed place.
+        hir::ExprKind::TaskGroup(_) => lowered_drop_flag(b, e, operand),
         _ => lowered_drop_flag(b, e, operand),
     }
 }
@@ -2335,6 +2336,12 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
     let live = temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
     b.push(Stmt::Store(owner, operand.clone()));
     b.set_drop_flag_operand(owner, live);
+    // A task_group result is fresh to the enclosing expression but may be backed by a bound tail
+    // local inside the scope. The hidden borrow owner takes that value, so clear the inner source
+    // exactly as the consumed-call path does before both cleanups can observe it as live.
+    if matches!(e.kind, hir::ExprKind::TaskGroup(_)) {
+        null_moved_source(b, e);
+    }
     if let Operand::Value(value) = operand {
         b.attach_borrow_owners(value, [owner]);
         Operand::Value(value)
@@ -2500,6 +2507,23 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // A struct literal initializes its slot field by field; there is no scalar value to
                 // bind. A nested struct-literal field is expanded in place (its leaves stored at the
                 // extended path), so no intermediate struct value is materialized.
+                hir::ExprKind::StructLit { .. }
+                    if needs_drop_flag(init.ty, &b.structs, &b.tuples, &b.enums) =>
+                {
+                    // A Move struct must use the guarded aggregate materializer. Completed fresh
+                    // fields remain owned until every later field succeeds, and the destination
+                    // inherits the runtime mode of a heap/arena-joined source member.
+                    let (op, owners) = lower_consumed_call_arg(b, init);
+                    if b.is_terminated() {
+                        return;
+                    }
+                    inherited_flag = lowered_drop_flag(b, init, &op);
+                    b.push(Stmt::Store(*local, op));
+                    null_consumed_struct_sources(b, init);
+                    for owner in owners {
+                        b.set_drop_flag(owner, false);
+                    }
+                }
                 hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
                 // An array literal stores its elements into the slot. A pooled all-constant literal
                 // (doc-13 §8.4, S3) instead copies once from a per-unit rodata global (the #514
@@ -2508,7 +2532,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 hir::ExprKind::ArrayLit { elems, elem, pooled: true } => {
                     store_const_array_pooled(b, *local, elems, *elem)
                 }
-                hir::ExprKind::ArrayLit { elems, elem, pooled: false } => store_array_elems(b, *local, elems, *elem),
+                hir::ExprKind::ArrayLit { elems, elem, pooled: false } => {
+                    inherited_flag = store_array_elems(b, *local, elems, *elem);
+                    if b.is_terminated() {
+                        return;
+                    }
+                }
                 _ => {
                     let op = lower_expr(b, init);
                     if b.is_terminated() {
@@ -2519,6 +2548,9 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     // If the initializer moved an owned local, clear its storage and runtime flag.
                     null_moved_source(b, init);
                 }
+            }
+            if b.is_terminated() {
+                return;
             }
             match inherited_flag {
                 Some(flag) => b.set_drop_flag_operand(*local, flag),
@@ -2734,7 +2766,18 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             b.push(Stmt::Store(*local, Operand::Value(newv)));
         }
         hir::Stmt::Return(value) => {
-            let op = value.as_ref().map(|e| lower_expr(b, e));
+            // Evaluate an explicit Unit return for its effects, but keep the function ABI `void`.
+            // Other Unit-producing control-flow expressions already canonicalize to Const::Unit;
+            // a direct/indirect Unit call now does too.
+            let op = value.as_ref().and_then(|e| {
+                let op = lower_expr(b, e);
+                (e.ty != Ty::Unit).then_some(op)
+            });
+            // A diverging Unit expression (`process.exit` / `process.abort`, until Align has
+            // `Never`) already emitted cleanup as required and terminated the block.
+            if b.is_terminated() {
+                return;
+            }
             // A returned owned array is moved out: null its slot so the exit cleanup below frees
             // null (the caller now owns the buffer), then free open arenas / drop owned locals.
             if let Some(e) = value {
@@ -3528,9 +3571,25 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Loop { .. } => lower_loop(b, e),
         // `Type.Variant(payload…)` — build the sum-type aggregate `{ i32 tag, … }`.
         hir::ExprKind::EnumValue { enum_id, variant, payload } => {
-            let ops: Vec<Operand> = payload.iter().map(|p| lower_expr(b, p)).collect();
+            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
+                lower_consumed_aggregate_parts(b, payload)
+            else {
+                return Operand::Const(Const::Unit);
+            };
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::MakeEnum { enum_id: *enum_id, variant: *variant, payload: ops }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::MakeEnum {
+                    enum_id: *enum_id,
+                    variant: *variant,
+                    payload: operands,
+                },
+            ));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(v, flag.clone());
+                b.attach_value_temp_drop_flag(v, flag);
+            }
+            finish_consumed_aggregate(b, payload, owners);
             Operand::Value(v)
         }
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, false),
@@ -3546,9 +3605,24 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Tuple { tuple_id, elems } => {
-            let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
+            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
+                lower_consumed_aggregate_parts(b, elems)
+            else {
+                return Operand::Const(Const::Unit);
+            };
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::MakeTuple { tuple_id: *tuple_id, elems: ops }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::MakeTuple {
+                    tuple_id: *tuple_id,
+                    elems: operands,
+                },
+            ));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(v, flag.clone());
+                b.attach_value_temp_drop_flag(v, flag);
+            }
+            finish_consumed_aggregate(b, elems, owners);
             Operand::Value(v)
         }
         hir::ExprKind::TupleIndex { recv, index } => {
@@ -3563,7 +3637,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Block(blk) => {
-            lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
+            lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit))
         }
         // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
         // inner block; the enforcement + impurity were handled in sema.
@@ -3616,6 +3690,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             if b.is_terminated() {
                 Operand::Const(Const::Unit)
             } else {
+                // Structured concurrency joins every task before the scope-owned task region is
+                // released. An explicit `wait()` may already have drained the list; the runtime
+                // wait operation is idempotent for an empty list.
+                b.push(Stmt::TgWait(Operand::Value(handle)));
                 b.push(Stmt::TgEnd(Operand::Value(handle)));
                 tail.unwrap_or(Operand::Const(Const::Unit))
             }
@@ -3655,6 +3733,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::OptionSome(inner) => {
             let op = lower_expr(b, inner);
+            if b.is_terminated() {
+                return Operand::Const(Const::Unit);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::OptionSome(op)));
             Operand::Value(v)
@@ -3667,12 +3748,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, false),
         hir::ExprKind::ResultOk(inner) => {
             let op = lower_expr(b, inner);
+            if b.is_terminated() {
+                return Operand::Const(Const::Unit);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ResultOk(op)));
             Operand::Value(v)
         }
         hir::ExprKind::ResultErr(inner) => {
             let op = lower_expr(b, inner);
+            if b.is_terminated() {
+                return Operand::Const(Const::Unit);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ResultErr(op)));
             Operand::Value(v)
@@ -4052,11 +4139,154 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // straight into its own slot — see `lower_stmt` — avoiding this copy.)
         hir::ExprKind::StructLit { .. } => {
             let slot = b.new_slot(e.ty);
-            store_value_at(b, slot, &mut Vec::new(), e);
+            let mut owners = Vec::new();
+            let mut drop_flag = None;
+            if !store_consumed_struct_fields(
+                b,
+                slot,
+                &mut Vec::new(),
+                e,
+                &mut owners,
+                &mut drop_flag,
+            ) {
+                return Operand::Const(Const::Unit);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Load(slot)));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(v, flag.clone());
+                b.attach_value_temp_drop_flag(v, flag);
+            }
+            null_consumed_struct_sources(b, e);
+            for owner in owners {
+                b.set_drop_flag(owner, false);
+            }
             Operand::Value(v)
         }
+    }
+}
+
+/// Lower the ordered parts of an aggregate that will own each part. A fresh Move part is kept in a
+/// hidden owner until the complete aggregate exists. If a later part returns or diverges, cleanup
+/// drops those completed temporaries while bound source locals remain live for normal exit cleanup.
+struct LoweredAggregateParts {
+    operands: Vec<Operand>,
+    owners: Vec<Vec<Slot>>,
+    drop_flag: Option<Operand>,
+}
+
+fn lower_consumed_aggregate_parts(
+    b: &mut Builder,
+    parts: &[hir::Expr],
+) -> Option<LoweredAggregateParts> {
+    let mut operands = Vec::with_capacity(parts.len());
+    let mut owners = Vec::with_capacity(parts.len());
+    let mut aggregate_drop_flag = None;
+    for part in parts {
+        let (operand, owner) = lower_consumed_call_arg(b, part);
+        if b.is_terminated() {
+            return None;
+        }
+        if needs_drop_flag(part.ty, &b.structs, &b.tuples, &b.enums) {
+            let part_flag = lowered_drop_flag(b, part, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+            // One aggregate flag gates recursive Drop of every owned member, so dropping the whole
+            // value is safe only when every such member is individually allocated.
+            aggregate_drop_flag = Some(match aggregate_drop_flag {
+                None => part_flag,
+                Some(previous) => {
+                    let both = b.fresh_value(Ty::Bool);
+                    b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, part_flag)));
+                    Operand::Value(both)
+                }
+            });
+        }
+        operands.push(operand);
+        owners.push(owner);
+    }
+    Some(LoweredAggregateParts {
+        operands,
+        owners,
+        drop_flag: aggregate_drop_flag,
+    })
+}
+
+/// Transfer every completed part into its now-materialized aggregate. Direct bound sources are
+/// nulled only after all parts succeed; hidden owners are then cleared because the aggregate is the
+/// sole owner.
+fn finish_consumed_aggregate(b: &mut Builder, parts: &[hir::Expr], owners: Vec<Vec<Slot>>) {
+    for part in parts {
+        null_consumed_struct_sources(b, part);
+    }
+    for owner in owners.into_iter().flatten() {
+        b.set_drop_flag(owner, false);
+    }
+}
+
+/// Materialize a struct literal into `slot`, retaining each completed fresh Move leaf until every
+/// later field has succeeded. The slot itself is deliberately not an owner yet: on early exit its
+/// initialized fields alias either still-live source locals or the hidden owners collected here.
+fn store_consumed_struct_fields(
+    b: &mut Builder,
+    slot: Slot,
+    path: &mut Vec<u32>,
+    value: &hir::Expr,
+    owners: &mut Vec<Slot>,
+    aggregate_drop_flag: &mut Option<Operand>,
+) -> bool {
+    match &value.kind {
+        hir::ExprKind::StructLit { fields, .. } => {
+            for (index, field) in fields.iter().enumerate() {
+                path.push(index as u32);
+                let complete = store_consumed_struct_fields(
+                    b,
+                    slot,
+                    path,
+                    field,
+                    owners,
+                    aggregate_drop_flag,
+                );
+                path.pop();
+                if !complete {
+                    return false;
+                }
+            }
+        }
+        _ => {
+            let (operand, owner) = lower_consumed_call_arg(b, value);
+            if b.is_terminated() {
+                return false;
+            }
+            if needs_drop_flag(value.ty, &b.structs, &b.tuples, &b.enums) {
+                let flag = lowered_drop_flag(b, value, &operand)
+                    .unwrap_or(Operand::Const(Const::Bool(false)));
+                *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
+                    None => flag,
+                    Some(previous) => {
+                        let both = b.fresh_value(Ty::Bool);
+                        b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, flag)));
+                        Operand::Value(both)
+                    }
+                });
+            }
+            b.push(Stmt::StoreField(slot, path.clone(), operand));
+            owners.extend(owner);
+        }
+    }
+    true
+}
+
+/// Complete the delayed source transfer for a materialized struct literal. `null_moved_source`
+/// intentionally has no `StructLit` arm because ordinary local initialization stores and nulls
+/// leaves through `store_value_at`; value-position literals use the guarded materializer above and
+/// must recurse over the same leaves only after every field has succeeded.
+fn null_consumed_struct_sources(b: &mut Builder, value: &hir::Expr) {
+    match &value.kind {
+        hir::ExprKind::StructLit { fields, .. } => {
+            for field in fields {
+                null_consumed_struct_sources(b, field);
+            }
+        }
+        _ => null_moved_source(b, value),
     }
 }
 
@@ -4068,21 +4298,174 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         unreachable!("lower_call_fn_value on a non-call expression");
     };
     let c = lower_expr(b, callee);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
     // The function type for the indirect call comes from the (sema-checked) arg types and the
     // call's result type — no signature table is threaded into MIR.
-    let (param_tys, ops): (Vec<Ty>, Vec<Operand>) = args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
+    let mut param_tys = Vec::with_capacity(args.len());
+    let mut ops = Vec::with_capacity(args.len());
+    let mut arg_owners = Vec::with_capacity(args.len());
+    for arg in args {
+        param_tys.push(arg.ty);
+        let (op, owner) = lower_consumed_call_arg(b, arg);
+        ops.push(op);
+        arg_owners.push(owner);
+        // A nested `return`, `?`, or diverging expression already terminated the block. Do not
+        // evaluate later arguments, transfer ownership, or emit the unreachable outer call.
+        if b.is_terminated() {
+            return Operand::Const(Const::Unit);
+        }
+    }
     // A by-value owned argument is MOVED into the callee, exactly as in a direct call
     // (`lower_direct_call`) — null the source so the caller's exit `Drop` doesn't free the buffer the
     // callee now owns. Without this a bound owned local passed indirectly is double-freed (an inline
     // temporary was safe only because it has no source local to null). No-op for a Copy / borrowed
     // argument. An indirect call has no borrow-only intrinsics, so every argument transfers.
-    for a in args {
-        null_moved_source(b, a);
+    for arg in args {
+        null_consumed_struct_sources(b, arg);
     }
-    let v = b.fresh_value(e.ty);
-    inherit_borrow_owners(b, v, std::iter::once(&c).chain(ops.iter()));
-    b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
-    Operand::Value(v)
+    // Every argument succeeded, so the outer call takes ownership. The hidden owners only protect
+    // temporaries while later arguments are being evaluated.
+    for owner in arg_owners.into_iter().flatten() {
+        b.set_drop_flag(owner, false);
+    }
+    let result = emit_indirect_call(b, c.clone(), ops.clone(), param_tys, e.ty);
+    if let Operand::Value(v) = &result {
+        inherit_borrow_owners(b, *v, std::iter::once(&c).chain(ops.iter()));
+    } else {
+        // Unit has no MIR value to carry borrowed temporary owners. The call has completed and a
+        // Unit result cannot borrow from its callee or arguments, so release them here.
+        drop_borrow_owners(b, &c);
+        for op in &ops {
+            drop_borrow_owners(b, op);
+        }
+    }
+    result
+}
+
+/// The indirect-call counterpart of [`emit_named_call`]. Function-value calls and the specialized
+/// `Result.map_err` lowering must share the same LLVM-void / source-Unit normalization.
+fn emit_indirect_call(b: &mut Builder, callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty) -> Operand {
+    let v = b.fresh_value(ret_ty);
+    b.push(Stmt::Let(v, Rvalue::CallIndirect { callee, args, param_tys, ret_ty }));
+    // Align Unit is a value, but its function ABI is LLVM `void`. Keep the call statement for its
+    // effects while giving every enclosing value context the canonical MIR Unit operand.
+    if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+}
+
+/// Emit a named call and return its source-language value. Align represents Unit as an ordinary
+/// value, while its function ABI is LLVM `void`; the `ValueId` remains as statement bookkeeping,
+/// but every consumer must receive `Const::Unit` instead of referring to that valueless definition.
+/// Pipeline callables use this helper as well as ordinary call expressions so the rule cannot drift.
+fn emit_named_call(b: &mut Builder, func: String, args: Vec<Operand>, ret_ty: Ty) -> Operand {
+    let v = b.fresh_value(ret_ty);
+    b.push(Stmt::Let(v, Rvalue::Call(func, args)));
+    if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+}
+
+/// Lower an argument whose value will transfer into a call. A fresh Move temporary needs a hidden
+/// owner while later arguments are evaluated: if one of them returns or diverges, function cleanup
+/// drops the already-created value. Once every argument succeeds, the caller clears the owner flag
+/// immediately before emitting the call and the callee becomes the sole owner.
+fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot>) {
+    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums) || !may_need_synthetic_owner(e) {
+        return (lower_expr(b, e), Vec::new());
+    }
+    // An aggregate may combine individually owned and arena-owned members. A single hidden owner
+    // cannot represent that mixed provenance: dropping the whole value would free arena storage,
+    // while suppressing it would leak heap members. Keep each fresh member's owner separately and
+    // leave bound sources live until every outer argument succeeds. A later early exit then cleans
+    // each component through its own exact flag.
+    match &e.kind {
+        hir::ExprKind::Tuple { tuple_id, elems } => {
+            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
+                lower_consumed_aggregate_parts(b, elems)
+            else {
+                return (Operand::Const(Const::Unit), Vec::new());
+            };
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::MakeTuple {
+                    tuple_id: *tuple_id,
+                    elems: operands,
+                },
+            ));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(value, flag.clone());
+                b.attach_value_temp_drop_flag(value, flag);
+            }
+            return (Operand::Value(value), owners.into_iter().flatten().collect());
+        }
+        hir::ExprKind::EnumValue { enum_id, variant, payload } => {
+            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
+                lower_consumed_aggregate_parts(b, payload)
+            else {
+                return (Operand::Const(Const::Unit), Vec::new());
+            };
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::MakeEnum {
+                    enum_id: *enum_id,
+                    variant: *variant,
+                    payload: operands,
+                },
+            ));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(value, flag.clone());
+                b.attach_value_temp_drop_flag(value, flag);
+            }
+            return (Operand::Value(value), owners.into_iter().flatten().collect());
+        }
+        hir::ExprKind::StructLit { .. } => {
+            let slot = b.new_slot(e.ty);
+            let mut owners = Vec::new();
+            let mut drop_flag = None;
+            if !store_consumed_struct_fields(
+                b,
+                slot,
+                &mut Vec::new(),
+                e,
+                &mut owners,
+                &mut drop_flag,
+            ) {
+                return (Operand::Const(Const::Unit), Vec::new());
+            }
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::Load(slot)));
+            if let Some(flag) = drop_flag {
+                b.attach_value_drop_flag(value, flag.clone());
+                b.attach_value_temp_drop_flag(value, flag);
+            }
+            return (Operand::Value(value), owners);
+        }
+        _ => {}
+    }
+    let owner = b.new_synthetic_owner(e.ty);
+    let operand = lower_expr(b, e);
+    if b.is_terminated() {
+        return (operand, vec![owner]);
+    }
+    // This is a transferring context, not a borrow. Transparent region wrappers may end with a
+    // bound local whose ownership is moving into this hidden slot, so preserve its ordinary
+    // runtime bit (the borrow-only classifier would deliberately report that local as not owned).
+    let live = lowered_drop_flag(b, e, &operand)
+        .unwrap_or(Operand::Const(Const::Bool(false)));
+    b.push(Stmt::Store(owner, operand.clone()));
+    b.set_drop_flag_operand(owner, live.clone());
+    if let Operand::Value(value) = &operand {
+        // Downstream aggregate/map_err lowering may query provenance after the wrapped source has
+        // been cleared. Carry the captured pre-clear bit on the SSA value as well as the owner.
+        b.attach_value_drop_flag(*value, live.clone());
+        b.attach_value_temp_drop_flag(*value, live);
+    }
+    // The hidden owner now holds the completed argument. Transfer any wrapped local sources into it
+    // immediately, before a later argument can return and run cleanup; otherwise both the source
+    // local and owner would drop the same buffer.
+    null_moved_source(b, e);
+    (operand, vec![owner])
 }
 
 /// Lower a named call out-of-line for the same recursive-stack reason as
@@ -4094,26 +4477,48 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         unreachable!("lower_direct_call on a non-call expression");
     };
     let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
-    let ops: Vec<_> = args
-        .iter()
-        .map(|a| if borrows_args { lower_borrowed_owned(b, a) } else { lower_expr(b, a) })
-        .collect();
+    let mut ops = Vec::with_capacity(args.len());
+    let mut arg_owners = Vec::with_capacity(args.len());
+    for arg in args {
+        let (op, owners) = if borrows_args {
+            (lower_borrowed_owned(b, arg), Vec::new())
+        } else {
+            lower_consumed_call_arg(b, arg)
+        };
+        ops.push(op);
+        arg_owners.push(owners);
+        // Preserve left-to-right evaluation, but stop once an argument has transferred control.
+        // In particular, never emit the outer call after a nested `return`.
+        if b.is_terminated() {
+            return Operand::Const(Const::Unit);
+        }
+    }
     // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
     // source, matching their sema contract.
     if !borrows_args {
-        for a in args {
-            null_moved_source(b, a);
+        for arg in args {
+            null_consumed_struct_sources(b, arg);
+        }
+        for owner in arg_owners.into_iter().flatten() {
+            b.set_drop_flag(owner, false);
         }
     }
-    let v = b.fresh_value(e.ty);
-    inherit_borrow_owners(b, v, &ops);
-    b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops.clone())));
-    if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums) {
+    let result = emit_named_call(b, func.clone(), ops.clone(), e.ty);
+    if let Operand::Value(v) = &result {
+        inherit_borrow_owners(b, *v, &ops);
+        if borrows_args && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums) {
+            for op in &ops {
+                drop_borrow_owners(b, op);
+            }
+        }
+    } else {
+        // `emit_named_call` canonicalizes a void ABI result to Const::Unit, which cannot retain
+        // owners from borrowed fresh arguments.
         for op in &ops {
             drop_borrow_owners(b, op);
         }
     }
-    Operand::Value(v)
+    result
 }
 
 /// The i64 type used for array indices / loop counters.
@@ -4967,8 +5372,24 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
         hir::ExprKind::ArrayLit { elems, elem, .. } => {
             // A pipeline/reduce source literal is a fresh temporary, never a `pooled` binding
             // (sema sets `pooled` only at a `let`), so it always takes the per-element store path.
-            let slot = b.new_slot(source.ty);
-            store_array_elems(b, slot, elems, *elem);
+            // A fixed Move-struct array owns its completed elements, so its anonymous backing slot
+            // must participate in cleanup just like any other unbound Move temporary. Register the
+            // owner before lowering because an element can return early; guarded element lowering
+            // keeps the flag clear until the whole array is initialized.
+            let owns_elements =
+                needs_drop_flag(source.ty, &b.structs, &b.tuples, &b.enums);
+            let slot = if owns_elements {
+                b.new_synthetic_owner(source.ty)
+            } else {
+                b.new_slot(source.ty)
+            };
+            let live = store_array_elems(b, slot, elems, *elem);
+            if owns_elements && !b.is_terminated() {
+                b.set_drop_flag_operand(
+                    slot,
+                    live.unwrap_or(Operand::Const(Const::Bool(false))),
+                );
+            }
             (slot, elems.len() as i128)
         }
         hir::ExprKind::Local(id) => {
@@ -5009,10 +5430,16 @@ fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir:
                 path.push(i as u32);
                 store_value_at(b, slot, path, fe);
                 path.pop();
+                if b.is_terminated() {
+                    return;
+                }
             }
         }
         _ => {
             let op = lower_expr(b, value);
+            if b.is_terminated() {
+                return;
+            }
             b.push(Stmt::StoreField(slot, path.clone(), op));
             // An **owned** local moved into this field (`T { a: xs }` where `xs` is a
             // `string`/`array`/handle/Move-struct local) is consumed by the construction — null the
@@ -5049,7 +5476,51 @@ fn store_const_array_pooled(b: &mut Builder, slot: Slot, elems: &[hir::Expr], el
     b.push(Stmt::StoreConstArray { slot, elems: cvals, elem });
 }
 
-fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty) {
+fn store_array_elems(
+    b: &mut Builder,
+    slot: Slot,
+    elems: &[hir::Expr],
+    elem: Ty,
+) -> Option<Operand> {
+    if let Ty::Struct(sid) = elem
+        && struct_is_move(sid, &b.structs, &b.enums)
+    {
+        // A fixed Move-struct array has one cleanup bit for every element. Keep each completed
+        // element's fresh members under their exact hidden owners until the whole array succeeds;
+        // bound source structs likewise remain live until that point. A later element that returns
+        // then cleans every completed member without treating the still-incomplete array as live.
+        let mut owners = Vec::new();
+        let mut array_drop_flag = None;
+        for (i, e) in elems.iter().enumerate() {
+            let (operand, element_owners) = lower_consumed_call_arg(b, e);
+            if b.is_terminated() {
+                return None;
+            }
+            let element_flag = lowered_drop_flag(b, e, &operand)
+                .unwrap_or(Operand::Const(Const::Bool(false)));
+            array_drop_flag = Some(match array_drop_flag {
+                None => element_flag,
+                Some(previous) => {
+                    let both = b.fresh_value(Ty::Bool);
+                    b.push(Stmt::Let(
+                        both,
+                        Rvalue::Bin(BinOp::And, previous, element_flag),
+                    ));
+                    Operand::Value(both)
+                }
+            });
+            b.push(Stmt::StoreIndex(slot, index_const(i), operand));
+            owners.extend(element_owners);
+        }
+        for e in elems {
+            null_consumed_struct_sources(b, e);
+        }
+        for owner in owners {
+            b.set_drop_flag(owner, false);
+        }
+        return array_drop_flag;
+    }
+
     if matches!(elem, Ty::Struct(_)) {
         for (i, e) in elems.iter().enumerate() {
             if let hir::ExprKind::StructLit { fields, .. } = &e.kind {
@@ -5057,6 +5528,9 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
                 // materialized.
                 for (j, fe) in fields.iter().enumerate() {
                     let v = lower_expr(b, fe);
+                    if b.is_terminated() {
+                        return None;
+                    }
                     b.push(Stmt::StoreElemField(slot, index_const(i), vec![j as u32], v));
                 }
             } else {
@@ -5065,6 +5539,9 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
                 // element. This arm previously stored NOTHING, silently leaving the element
                 // uninitialised (a zeroed scalar, a garbage `str`/fn pointer).
                 let v = lower_expr(b, e);
+                if b.is_terminated() {
+                    return None;
+                }
                 b.push(Stmt::StoreIndex(slot, index_const(i), v));
                 null_moved_source(b, e);
             }
@@ -5072,9 +5549,13 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
     } else {
         for (i, e) in elems.iter().enumerate() {
             let v = lower_expr(b, e);
+            if b.is_terminated() {
+                return None;
+            }
             b.push(Stmt::StoreIndex(slot, index_const(i), v));
         }
     }
+    None
 }
 
 /// `src.map(f).where(p)….{sum,reduce}` → one loop folding the post-stage elements into
@@ -5547,9 +6028,7 @@ fn lower_array_reduce(
                     }
                 };
                 let call_args = stage_call_args(b, arg, captures);
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
-                cur = Some(Operand::Value(v));
+                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { func, captures } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
@@ -5653,9 +6132,7 @@ fn lower_array_reduce(
             for c in captures {
                 args.push(lower_expr(b, c));
             }
-            let folded = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
-            Operand::Value(folded)
+            emit_named_call(b, func.clone(), args, acc_ty)
         }
         // `any`/`all` are likewise guarded after `where`. They deliberately remain a full fold (no
         // early exit), preserving exactly-once predicate calls for every surviving element.
@@ -5809,9 +6286,7 @@ fn lower_json_scan_reduce(
             hir::StageKind::Map { func, captures } => {
                 let arg = cur.take().unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
                 let call_args = stage_call_args(b, arg, captures);
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
-                cur = Some(Operand::Value(v));
+                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { func, captures } => {
                 let arg = match &cur {
@@ -5865,9 +6340,7 @@ fn lower_json_scan_reduce(
             for c in captures {
                 args.push(lower_expr(b, c));
             }
-            let folded = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
-            Operand::Value(folded)
+            emit_named_call(b, func.clone(), args, acc_ty)
         }
         // `any(p)`/`all(p)`: `acc = acc || p(cur)` / `acc && p(cur)` — a full fold (no early exit),
         // exactly-once predicate calls per surviving row. `p`'s arg is a projected scalar or (no
@@ -6076,9 +6549,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                     }
                 };
                 let call_args = stage_call_args(b, arg, captures);
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
-                cur = Some(Operand::Value(v));
+                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { func, captures } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
@@ -6139,14 +6610,13 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         (CollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
             let prev = b.fresh_value(elem);
             b.push(Stmt::Let(prev, Rvalue::Load(acc_slot)));
-            let folded = b.fresh_value(elem);
             let mut args = vec![Operand::Value(prev), cur];
             for c in captures {
                 args.push(lower_expr(b, c));
             }
-            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
-            b.push(Stmt::Store(acc_slot, Operand::Value(folded)));
-            Operand::Value(folded)
+            let folded = emit_named_call(b, func.clone(), args, elem);
+            b.push(Stmt::Store(acc_slot, folded.clone()));
+            folded
         }
         _ => cur,
     };
@@ -6304,9 +6774,7 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                     }
                 };
                 let call_args = stage_call_args(b, arg, captures);
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
-                cur = Some(Operand::Value(v));
+                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. } => {
                 unreachable!("map_into rejects filtering `where` stages in sema")
@@ -6854,9 +7322,7 @@ fn lower_array_partition(
                     }
                 };
                 let call_args = stage_call_args(b, arg, captures);
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
-                cur = Some(Operand::Value(v));
+                cur = Some(emit_named_call(b, func.clone(), call_args, stage.out_ty));
             }
             hir::StageKind::Where { func, captures } => {
                 let arg = match &cur {
@@ -10220,12 +10686,26 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
         Ty::Result(_, e2) => align_sema::scalar_to_ty(e2),
         _ => out_ty,
     };
-    let rv = lower_expr(b, result);
+    // The receiver is evaluated before the mapper expression. Keep a fresh Move receiver under a
+    // hidden owner until the mapper value is ready: a `return`/`?` inside that expression must
+    // clean up the already-created Result just like a later explicit call argument does.
+    let (rv, result_owners) = lower_consumed_call_arg(b, result);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
+    let source_flag = lowered_drop_flag(b, result, &rv)
+        .unwrap_or(Operand::Const(Const::Bool(false)));
     let fv = lower_expr(b, f);
+    if b.is_terminated() {
+        return Operand::Const(Const::Unit);
+    }
     // `map_err` unwraps the result on both branches — if it was an owned local, null its slot so
     // the exit cleanup doesn't double-free the moved-out payload.
     null_moved_source(b, result);
-    let rslot = b.new_slot(out_ty);
+    for owner in result_owners {
+        b.set_drop_flag(owner, false);
+    }
+    let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, out_ty);
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(rv.clone())));
     let ok_bb = b.new_block();
@@ -10238,25 +10718,47 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     b.push(Stmt::Let(okp, Rvalue::ResultUnwrapOk(rv.clone())));
     let okr = b.fresh_value(out_ty);
     b.push(Stmt::Let(okr, Rvalue::ResultOk(Operand::Value(okp))));
-    b.push(Stmt::Store(rslot, Operand::Value(okr)));
+    if let Some(flag_slot) = result_flag {
+        b.push(Stmt::Store(flag_slot, source_flag.clone()));
+    }
+    if let Some(flag_slot) = result_temp_flag {
+        b.push(Stmt::Store(flag_slot, source_flag));
+    }
+    if let Some(slot) = result_slot {
+        b.push(Stmt::Store(slot, Operand::Value(okr)));
+    }
     b.terminate(Term::Goto(join));
     // Err: apply `f` to the error, re-wrap.
     b.cur = err_bb;
     let errp = b.fresh_value(align_sema::scalar_to_ty(e_s));
     b.push(Stmt::Let(errp, Rvalue::ResultUnwrapErr(rv)));
-    let conv = b.fresh_value(e2_ty);
-    b.push(Stmt::Let(
-        conv,
-        Rvalue::CallIndirect { callee: fv, args: vec![Operand::Value(errp)], param_tys: vec![align_sema::scalar_to_ty(e_s)], ret_ty: e2_ty },
-    ));
+    let conv = emit_indirect_call(
+        b,
+        fv,
+        vec![Operand::Value(errp)],
+        vec![align_sema::scalar_to_ty(e_s)],
+        e2_ty,
+    );
     let errr = b.fresh_value(out_ty);
-    b.push(Stmt::Let(errr, Rvalue::ResultErr(Operand::Value(conv))));
-    b.push(Stmt::Store(rslot, Operand::Value(errr)));
+    b.push(Stmt::Let(errr, Rvalue::ResultErr(conv)));
+    let mapped_flag = Operand::Const(Const::Bool(needs_drop_flag(
+        e2_ty,
+        &b.structs,
+        &b.tuples,
+        &b.enums,
+    )));
+    if let Some(flag_slot) = result_flag {
+        b.push(Stmt::Store(flag_slot, mapped_flag.clone()));
+    }
+    if let Some(flag_slot) = result_temp_flag {
+        b.push(Stmt::Store(flag_slot, mapped_flag));
+    }
+    if let Some(slot) = result_slot {
+        b.push(Stmt::Store(slot, Operand::Value(errr)));
+    }
     b.terminate(Term::Goto(join));
     b.cur = join;
-    let r = b.fresh_value(out_ty);
-    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
-    Operand::Value(r)
+    load_control_result(b, out_ty, result_slot, result_flag, result_temp_flag)
 }
 
 /// Lower a short-circuiting `&&` / `||`. The left operand is always evaluated; the right operand is
@@ -10348,7 +10850,7 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
         // No `break`: the exit is unreachable. Terminate it so the CFG is well-formed; the returned
         // operand is never used (code after a diverging loop is dead — `lower_block` stops here).
         b.terminate(Term::Unreachable);
-        return Operand::Const(Const::Bool(false));
+        return Operand::Const(Const::Unit);
     }
     match result_slot {
         Some(slot) => {
@@ -10356,8 +10858,8 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::Load(slot)));
             Operand::Value(v)
         }
-        // A unit-valued loop: the value is unused by the caller (statement position).
-        None => Operand::Const(Const::Bool(false)),
+        // A unit-valued loop remains a source-language value in bindings and call arguments.
+        None => Operand::Const(Const::Unit),
     }
 }
 
@@ -10488,7 +10990,11 @@ mod tests {
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
-        assert!(!d.has_errors());
+        assert!(
+            !d.has_errors(),
+            "test source failed to check: {:?}",
+            d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
+        );
         lower_program(&hir)
     }
 
@@ -10505,6 +11011,422 @@ mod tests {
         let p = lower("fn f(n: i64) -> i64 {\n  if n < 2 { return n }\n  return n\n}\n");
         let f = &p.fns[0];
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Branch(..))));
+    }
+
+    #[test]
+    fn unit_calls_keep_effects_but_use_const_unit_as_the_value() {
+        let p = lower(
+            "fn u() {}\nfn take(x: ()) {}\nfn tail() { return u() }\nfn main() -> i32 {\n  a := u()\n  f := u\n  b := f()\n  empty := {}\n  looped := loop { break u() }\n  take(u())\n  take(empty)\n  take(looped)\n  tail()\n  return 0\n}\n",
+        );
+        let main = p.fns.iter().find(|f| f.name == "main").expect("main MIR");
+        let stmts: Vec<&Stmt> = main.blocks.iter().flat_map(|b| &b.stmts).collect();
+        assert!(
+            stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::Call(name, _)) if name == "u")),
+            "the direct Unit call must remain for its effects:\n{}",
+            print::function_to_string(main)
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::CallIndirect { ret_ty: Ty::Unit, .. }))),
+            "the indirect Unit call must remain for its effects:\n{}",
+            print::function_to_string(main)
+        );
+        for stmt in &stmts {
+            if let Stmt::Store(slot, operand) = stmt
+                && main.slots[*slot as usize] == Ty::Unit
+            {
+                assert!(
+                    matches!(operand, Operand::Const(Const::Unit)),
+                    "every Unit binding must store Const::Unit, got {operand:?}:\n{}",
+                    print::function_to_string(main)
+                );
+            }
+        }
+        assert!(
+            stmts.iter().any(
+                |s| matches!(s, Stmt::Let(_, Rvalue::Call(name, args)) if name == "take" && matches!(args.as_slice(), [Operand::Const(Const::Unit)]))
+            ),
+            "a Unit call argument must be Const::Unit:\n{}",
+            print::function_to_string(main)
+        );
+        let tail = p.fns.iter().find(|f| f.name == "tail").expect("tail MIR");
+        assert!(
+            tail.blocks.iter().any(|b| matches!(b.term, Term::Return(None))),
+            "an explicit Unit return must keep the void ABI:\n{}",
+            print::function_to_string(tail)
+        );
+    }
+
+    #[test]
+    fn explicit_return_of_a_diverging_unit_expression_adds_no_late_cleanup() {
+        let p = lower(
+            "import std.process\nfn quit() {\n  s := \"x\".clone()\n  return process.abort()\n}\nfn main() -> i32 = 0\n",
+        );
+        let quit = p.fns.iter().find(|f| f.name == "quit").expect("quit MIR");
+        assert!(
+            quit.blocks.iter().any(|b| matches!(b.term, Term::Unreachable)),
+            "process.abort must retain its diverging terminator:\n{}",
+            print::function_to_string(quit)
+        );
+        assert!(
+            quit.blocks.iter().flat_map(|b| &b.stmts).all(|s| !matches!(s, Stmt::Drop(_))),
+            "process.abort must not gain return cleanup after it terminates:\n{}",
+            print::function_to_string(quit)
+        );
+    }
+
+    #[test]
+    fn terminated_call_argument_drops_earlier_owned_temporaries() {
+        let p = lower(
+            "Pair { text: string, n: i64 }\nfn make() -> string = \"x\".clone()\nfn take(s: string, x: ()) {}\nfn take_tuple(t: (string, i64)) {}\nfn take_pair(p: Pair) {}\nfn direct() -> i32 {\n  take(make(), { return 0 })\n  return 1\n}\nfn indirect() -> i32 {\n  f := take\n  f(make(), { return 0 })\n  return 1\n}\nfn task_group_tail() -> i32 {\n  take(task_group { s := make(); s }, { return 0 })\n  return 1\n}\nfn partial_tuple() -> i32 {\n  take_tuple((make(), { return 0 }))\n  return 1\n}\nfn partial_struct() -> i32 {\n  take_pair(Pair { text: make(), n: { return 0 } })\n  return 1\n}\nfn main() -> i32 = 0\n",
+        );
+        for name in [
+            "direct",
+            "indirect",
+            "task_group_tail",
+            "partial_tuple",
+            "partial_struct",
+        ] {
+            let f = p.fns.iter().find(|f| f.name == name).expect("call test MIR");
+            assert!(
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.stmts)
+                    .any(|s| matches!(s, Stmt::Drop(slot) if f.slots[*slot as usize] == Ty::String)),
+                "{name} must drop the earlier fresh string when a later argument returns:\n{}",
+                print::function_to_string(f)
+            );
+            assert!(
+                f.blocks.iter().flat_map(|b| &b.stmts).all(|s| {
+                    !matches!(s, Stmt::Let(_, Rvalue::Call(callee, _)) if matches!(callee.as_str(), "take" | "take_tuple" | "take_pair"))
+                        && !matches!(s, Stmt::Let(_, Rvalue::CallIndirect { .. }))
+                }),
+                "{name} must not emit the outer call after the later argument returns:\n{}",
+                print::function_to_string(f)
+            );
+        }
+    }
+
+    #[test]
+    fn task_group_tail_moves_clear_the_inner_source_and_forward_ownership() {
+        let p = lower(
+            "fn make() -> string {\n  return task_group { s := \"hello\".clone(); s }\n}\nfn take(s: string) -> i64 = s.len()\nfn call() -> i64 = take(task_group { s := \"world\".clone(); s })\nfn main() -> i32 = 0\n",
+        );
+        for name in ["make", "call"] {
+            let f = p.fns.iter().find(|f| f.name == name).expect("task_group move MIR");
+            let cleared_live_flag = f.slots.iter().enumerate().any(|(slot, ty)| {
+                *ty == Ty::Bool
+                    && f.blocks
+                        .iter()
+                        .flat_map(|block| &block.stmts)
+                        .filter(|stmt| {
+                            matches!(
+                                stmt,
+                                Stmt::Store(dst, Operand::Const(Const::Bool(false)))
+                                    if *dst as usize == slot
+                            )
+                        })
+                        .count()
+                        >= 2
+                    && f.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                        matches!(
+                            stmt,
+                            Stmt::Store(dst, Operand::Const(Const::Bool(true)))
+                                if *dst as usize == slot
+                        )
+                    })
+            });
+            assert!(
+                cleared_live_flag,
+                "{name} must clear a live task_group tail flag after moving it:\n{}",
+                print::function_to_string(f)
+            );
+        }
+
+        let call = p.fns.iter().find(|f| f.name == "call").expect("call MIR");
+        assert!(
+            call.blocks.iter().flat_map(|block| &block.stmts).any(
+                |stmt| matches!(
+                    stmt,
+                    Stmt::Store(slot, Operand::Value(value))
+                        if call.slots[*slot as usize] == Ty::Bool
+                            && call.value_tys[*value as usize] == Ty::Bool
+                )
+            ),
+            "a consumed task_group value must forward its runtime ownership bit:\n{}",
+            print::function_to_string(call)
+        );
+    }
+
+    #[test]
+    fn direct_struct_and_array_lets_guard_partial_fields_and_forward_ownership() {
+        let p = lower(
+            "Wrap { xs: array<i64>, n: i64 }\nfn make() -> array<i64> = [1].to_array()\nfn partial() -> i32 {\n  w := Wrap { xs: make(), n: { return 0 } }\n  return 1\n}\nfn partial_array() -> i32 {\n  rows := [Wrap { xs: make(), n: { return 0 } }]\n  return 1\n}\nfn joined(c: bool) -> i64 {\n  arena {\n    mut xs := make()\n    if c {\n      xs = [2].to_array()\n    }\n    w := Wrap { xs: xs, n: 0 }\n    return w.xs.len()\n  }\n}\nfn main() -> i32 = 0\n",
+        );
+        for (name, shape) in [
+            ("partial", "direct struct let"),
+            ("partial_array", "fixed Move-struct array let"),
+        ] {
+            let partial = p.fns.iter().find(|f| f.name == name).expect("partial aggregate MIR");
+            assert!(
+                partial
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .any(|stmt| matches!(stmt, Stmt::Drop(slot) if partial.slots[*slot as usize] == Ty::DynArray(scalar_of(i64_ty())))),
+                "a {shape} must retain its completed fresh field across a later return:\n{}",
+                print::function_to_string(partial)
+            );
+        }
+
+        let joined = p.fns.iter().find(|f| f.name == "joined").expect("joined MIR");
+        let forwards_runtime_flag = joined.blocks.iter().any(|block| {
+            let stores_struct = block.stmts.iter().any(
+                |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(_)) if matches!(joined.slots[*slot as usize], Ty::Struct(_))),
+            );
+            let stores_dynamic_bool = block.stmts.iter().any(
+                |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(value)) if joined.slots[*slot as usize] == Ty::Bool && joined.value_tys[*value as usize] == Ty::Bool),
+            );
+            stores_struct && stores_dynamic_bool
+        });
+        assert!(
+            forwards_runtime_flag,
+            "a struct with one path-dependent owned member must inherit that member's runtime flag:\n{}",
+            print::function_to_string(joined)
+        );
+    }
+
+    #[test]
+    fn move_struct_array_pipeline_literal_has_a_hidden_owner() {
+        let p = lower(
+            "Wrap { xs: array<i64> }\nfn main() -> i32 {\n  return [Wrap { xs: [1, 2].to_array() }].count() as i32\n}\n",
+        );
+        let main = p.fns.iter().find(|f| f.name == "main").expect("main MIR");
+        assert!(
+            main.blocks.iter().flat_map(|block| &block.stmts).any(
+                |stmt| matches!(
+                    stmt,
+                    Stmt::Drop(slot)
+                        if matches!(main.slots[*slot as usize], Ty::StructArray(..))
+                )
+            ),
+            "an anonymous fixed Move-struct array source must be dropped after the pipeline:\n{}",
+            print::function_to_string(main)
+        );
+    }
+
+    #[test]
+    fn consumed_region_tails_preserve_the_preclear_ownership_flag() {
+        let p = lower(
+            "Wrap { value: string }\nContent { Values(array<i64>), Empty }\nE { Bad }\nfn conv(e: E) -> Error = Error.Code(1)\nfn tupled() -> i32 {\n  t := (task_group { s := \"tuple\".clone(); s }, 1)\n  return 0\n}\nfn structured() -> i32 {\n  w := Wrap { value: task_group { s := \"struct\".clone(); s } }\n  return 0\n}\nfn enumed() -> i32 {\n  e := Content.Values(task_group { [1, 2].to_array() })\n  return 0\n}\nfn mapped() -> i32 {\n  mapped := (task_group {\n    r: Result<string, E> := Ok(\"map\".clone())\n    r\n  }).map_err(conv)\n  return 0\n}\nfn arena_exit() -> i32 {\n  take(arena { s := \"arena\".clone(); s }, { return 0 })\n  return 1\n}\nfn take(s: string, x: ()) {}\nfn main() -> i32 = 0\n",
+        );
+
+        let assert_no_post_clear_reload = |name: &str, marker: &dyn Fn(&Stmt) -> bool| {
+            let f = p.fns.iter().find(|f| f.name == name).expect("ownership test MIR");
+            let block = f
+                .blocks
+                .iter()
+                .find(|block| block.stmts.iter().any(marker))
+                .expect("marker block");
+            let marker_index = block
+                .stmts
+                .iter()
+                .position(marker)
+                .expect("marker");
+            let armed_index = block.stmts[..marker_index]
+                .iter()
+                .rposition(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Store(slot, live)
+                            if f.slots[*slot as usize] == Ty::Bool
+                                && !matches!(live, Operand::Const(Const::Bool(false)))
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} has no armed wrapped source before its marker:\n{}",
+                        print::function_to_string(f)
+                    )
+                });
+            let source_flag = match &block.stmts[armed_index] {
+                Stmt::Store(slot, _) => *slot,
+                _ => unreachable!(),
+            };
+            let clear_index = block.stmts[armed_index + 1..]
+                .iter()
+                .position(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Store(slot, Operand::Const(Const::Bool(false)))
+                            if *slot == source_flag
+                    )
+                })
+                .map(|index| armed_index + 1 + index)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} never clears its wrapped source:\n{}",
+                        print::function_to_string(f)
+                    )
+                });
+            assert!(
+                clear_index >= marker_index
+                    || block.stmts[clear_index + 1..marker_index]
+                        .iter()
+                        .all(|stmt| {
+                            !matches!(
+                                stmt,
+                                Stmt::Let(value, Rvalue::Load(slot))
+                                    if f.value_tys[*value as usize] == Ty::Bool
+                                        && *slot == source_flag
+                            )
+                        }),
+                "{name} must carry the pre-clear flag instead of reloading the cleared source:\n{}",
+                print::function_to_string(f)
+            );
+        };
+
+        assert_no_post_clear_reload("tupled", &|stmt| {
+            matches!(stmt, Stmt::Let(_, Rvalue::MakeTuple { .. }))
+        });
+        assert_no_post_clear_reload("structured", &|stmt| {
+            matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_))))
+        });
+        assert_no_post_clear_reload("enumed", &|stmt| {
+            matches!(stmt, Stmt::Let(_, Rvalue::MakeEnum { .. }))
+        });
+        assert_no_post_clear_reload("mapped", &|stmt| {
+            matches!(stmt, Stmt::Let(_, Rvalue::ResultIsOk(_)))
+        });
+
+        let arena_exit = p.fns.iter().find(|f| f.name == "arena_exit").expect("arena exit MIR");
+        assert!(
+            arena_exit.blocks.iter().any(|block| {
+                block.stmts.windows(2).any(|pair| {
+                    matches!(
+                        pair,
+                        [
+                            Stmt::Store(owner, Operand::Value(_)),
+                            Stmt::Store(flag, live)
+                        ] if arena_exit.slots[*owner as usize] == Ty::String
+                            && arena_exit.slots[*flag as usize] == Ty::Bool
+                            && !matches!(live, Operand::Const(Const::Bool(false)))
+                    )
+                })
+            }),
+            "a consumed arena tail must arm its hidden owner before a later argument exits:\n{}",
+            print::function_to_string(arena_exit)
+        );
+    }
+
+    #[test]
+    fn map_err_forwards_path_specific_ok_ownership() {
+        let p = lower(
+            "E { Bad }\nfn make() -> array<i64> = [1].to_array()\nfn load() -> Result<array<i64>, E> = Ok(make())\nfn convert(e: E) -> Error = Error.Code(1)\nfn early(c: bool) -> i32 {\n  mapped := load().map_err({\n    if c { return 0 }\n    convert\n  })\n  return 1\n}\nfn run(c: bool) -> Result<i64, Error> {\n  arena {\n    mut r: Result<array<i64>, E> := Ok(make())\n    if c {\n      r = Ok([2].to_array())\n    }\n    mapped := r.map_err(convert)\n    xs := mapped?\n    return Ok(xs.sum())\n  }\n}\nfn main() -> i32 = 0\n",
+        );
+        let early = p.fns.iter().find(|f| f.name == "early").expect("early MIR");
+        assert!(
+            early
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(stmt, Stmt::Drop(slot) if matches!(early.slots[*slot as usize], Ty::Result(..)))),
+            "an early exit in the mapper expression must drop the already-created receiver:\n{}",
+            print::function_to_string(early)
+        );
+
+        let run = p.fns.iter().find(|f| f.name == "run").expect("run MIR");
+        let stores_dynamic_result_flag = run.blocks.iter().any(|block| {
+            block.stmts.windows(2).any(|pair| {
+                matches!(
+                    pair,
+                    [
+                        Stmt::Store(result_slot, Operand::Value(_)),
+                        Stmt::Store(flag_slot, Operand::Value(flag_value))
+                    ] if matches!(run.slots[*result_slot as usize], Ty::Result(..))
+                        && run.slots[*flag_slot as usize] == Ty::Bool
+                        && run.value_tys[*flag_value as usize] == Ty::Bool
+                )
+            })
+        });
+        assert!(
+            stores_dynamic_result_flag,
+            "map_err's bound result must inherit the selected Ok/Err runtime flag:\n{}",
+            print::function_to_string(run)
+        );
+    }
+
+    #[test]
+    fn aggregate_arguments_keep_member_owners_until_the_call_succeeds() {
+        let p = lower(
+            "Content { Nums(array<i64>) }\nfn make() -> array<i64> = [1].to_array()\nfn take_tuple(t: (array<i64>, i64), x: ()) {}\nfn take_enum(e: Content, x: ()) {}\nfn take_mixed(t: (array<i64>, string), x: ()) {}\nfn tuple_exit() -> i32 {\n  take_tuple((make(), 0), { return 0 })\n  return 1\n}\nfn enum_exit() -> i32 {\n  take_enum(Content.Nums(make()), { return 0 })\n  return 1\n}\nfn mixed_exit() -> i32 {\n  take_mixed((make(), \"x\".clone()), { return 0 })\n  return 1\n}\nfn main() -> i32 = 0\n",
+        );
+        for (name, callee, owned_member_tys) in [
+            ("tuple_exit", "take_tuple", vec![Ty::DynArray(scalar_of(i64_ty()))]),
+            ("enum_exit", "take_enum", vec![Ty::DynArray(scalar_of(i64_ty()))]),
+            (
+                "mixed_exit",
+                "take_mixed",
+                vec![Ty::DynArray(scalar_of(i64_ty())), Ty::String],
+            ),
+        ] {
+            let dynamic = p.fns.iter().find(|f| f.name == name).expect("dynamic aggregate MIR");
+            let take = p.fns.iter().find(|f| f.name == callee).expect("aggregate consumer MIR");
+            let aggregate_ty = take.slots[take.params[0] as usize];
+            let has_aggregate_owner = dynamic.blocks.iter().any(|block| {
+                block.stmts.windows(2).any(|pair| {
+                    matches!(
+                        pair,
+                        [
+                            Stmt::Store(owner, Operand::Value(value)),
+                            Stmt::Store(flag, Operand::Value(_))
+                        ] if dynamic.slots[*owner as usize] == aggregate_ty
+                            && dynamic.value_tys[*value as usize] == aggregate_ty
+                            && dynamic.slots[*flag as usize] == Ty::Bool
+                    )
+                })
+            });
+            assert!(
+                !has_aggregate_owner,
+                "{name} must keep component ownership instead of collapsing it into one aggregate flag:\n{}",
+                print::function_to_string(dynamic)
+            );
+            for owned_member_ty in owned_member_tys {
+                assert!(
+                    dynamic
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.stmts)
+                        .any(|stmt| matches!(stmt, Stmt::Drop(slot) if dynamic.slots[*slot as usize] == owned_member_ty)),
+                    "{name}'s early-exit cleanup must retain its {owned_member_ty:?} member owner:\n{}",
+                    print::function_to_string(dynamic)
+                );
+            }
+            assert!(
+                dynamic
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .all(|stmt| !matches!(stmt, Stmt::Let(_, Rvalue::Call(called, _)) if called == callee)),
+                "{name}'s outer call must not be emitted after its later argument returns:\n{}",
+                print::function_to_string(dynamic)
+            );
+        }
+    }
+
+    #[test]
+    fn unit_calls_release_borrowed_temporary_owners_at_the_call() {
+        let p = lower(
+            "fn use(s: str) {}\nfn f() {\n  use(\"first\".clone())\n  use(\"second\".clone())\n}\nfn main() -> i32 = 0\n",
+        );
+        let f = p.fns.iter().find(|f| f.name == "f").expect("borrowed Unit call MIR");
+        let rendered = print::function_to_string(f);
+        let first_call = rendered.find("call use").expect("first use call");
+        let second_call = rendered.rfind("call use").expect("second use call");
+        let first_drop = rendered[first_call..].find("drop ").map(|offset| first_call + offset).expect("first temporary drop");
+        assert!(
+            first_call < first_drop && first_drop < second_call,
+            "the first borrowed temporary must be released before the second Unit call:\n{rendered}"
+        );
     }
 
     #[test]
@@ -10564,11 +11486,11 @@ mod tests {
         p.fns.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.stmts).filter(|s| pred(s)).count()
     }
 
-    const BUILDER_REDUCE_SRC: &str = "pub fn build(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x {\n    b.write(\"item-\")\n    b.write_int(x)\n    b.write(\"-status \")\n    b\n  })\n  res := b.to_string()\n  return res.len()\n}\n";
+    const BUILDER_WRITE_SRC: &str = "pub fn build() -> i64 {\n  b := builder()\n  b.write(\"item-\")\n  b.write_int(1)\n  b.write(\"-status \")\n  res := b.to_string()\n  return res.len()\n}\n";
 
     #[test]
     fn builder_str_int_str_is_fused() {
-        let p = lower(BUILDER_REDUCE_SRC);
+        let p = lower(BUILDER_WRITE_SRC);
         // The `str,int,str` triple collapses to one fused write; the two component writes are gone.
         assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 1);
         assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 0);
@@ -10578,7 +11500,7 @@ mod tests {
     #[test]
     fn builder_int_str_str_is_not_fused() {
         // Wrong shape (`int,str,str`): the peephole only fuses `str,int,str`, so nothing collapses.
-        let src = "pub fn build(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x {\n    b.write_int(x)\n    b.write(\"-a-\")\n    b.write(\"-b-\")\n    b\n  })\n  res := b.to_string()\n  return res.len()\n}\n";
+        let src = "pub fn build() -> i64 {\n  b := builder()\n  b.write_int(1)\n  b.write(\"-a-\")\n  b.write(\"-b-\")\n  res := b.to_string()\n  return res.len()\n}\n";
         let p = lower(src);
         assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 0);
         assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteInt(..)))), 1);

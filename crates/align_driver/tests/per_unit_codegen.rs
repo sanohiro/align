@@ -124,6 +124,43 @@ fn gate_b_multi_file_run_matches_whole_program() {
     assert_eq!(String::from_utf8_lossy(&per_out.stdout), "30\n5\n3\n");
 }
 
+#[test]
+fn cross_unit_unit_call_is_a_value_in_both_build_paths() {
+    if !backend() {
+        return;
+    }
+    let lib = "\
+module lib
+pub fn unit(n: i32) {
+  print(n)
+}
+";
+    let main = "\
+import lib
+fn take(x: ()) {
+  print(9)
+}
+fn main() -> i32 {
+  a := lib.unit(1)
+  take(lib.unit(2))
+  b := { lib.unit(3) }
+  return 0
+}
+";
+    let files = &[("lib.align", lib), ("main.align", main)];
+    let whole = build_and_run_multi("unit-cross-whole", files, "main.align");
+    let per = build_per_unit_multi("unit-cross-per", files, "main.align");
+    let per_out = per.link_and_run();
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(per_out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&whole.stdout),
+        String::from_utf8_lossy(&per_out.stdout),
+        "cross-unit Unit calls must match between whole-program and per-unit builds"
+    );
+    assert_eq!(String::from_utf8_lossy(&per_out.stdout), "1\n2\n9\n3\n");
+}
+
 // ---- Gate c: visibility (llvm-nm) ---------------------------------------------------------------
 
 const LIB_C: &str = "\

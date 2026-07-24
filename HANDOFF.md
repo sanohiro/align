@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-25. `main` includes the macOS `env_clear` portability fix
-#636 and its handoff update (`388aef4`)._
+_Last updated: 2026-07-25. `main` includes the shipped wave through #638.
+The Unit-call lowering and call-ownership fix is under review in #639._
 
 ## Start here
 
@@ -48,19 +48,41 @@ facts must live in this repository.
 #634  std.http client/request I/O timeouts, including TLS and pooled reuse
 #635  core.json array<str> struct-field decode
 #636  portable env_clear for macOS/BSD
+#637  unified Claude/Codex guidance + compact handoff
+#638  Copy-struct array materialization
 ```
+
+PR #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
+lowering. Its final review also hardened call ownership: temporary aggregate
+arguments keep per-member cleanup until the call is reached, and arena-owned
+Move values cannot transfer to a callee. Bound aggregates require one uniform
+owned allocation mode so their single path-local cleanup bit remains exact.
+The same transfer rule covers `Result.map_err`; fused pipeline functions reject
+Move source and result elements until explicit per-iteration cleanup exists.
+The review follow-up carries `map_err` and one-owner struct runtime provenance
+through their result slots, guards partial direct struct and fixed-array initialization, and
+rejects mutation when aggregate ownership is path-dependent. `map_err` also
+retains its receiver during mapper evaluation and tracks mapper-capture borrows.
+Move values leaving a `task_group` forward the tail local's cleanup bit and
+clear that inner source before return or call transfer.
+Early exits join open task groups before dropping captured frame or arena storage.
+The task-group runtime region is reserved for spawned environments and result slots:
+ordinary owned values inside the block retain individual cleanup, and general arena-only
+allocation still requires an explicit nested `arena {}`.
+Both `reduce` and materializing `scan` require a Copy accumulator until MIR has
+explicit per-iteration transfer and error-path cleanup for Move values.
 
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
-and the macOS release-build CI path. A local
-`cargo build --release --workspace` was rerun after #636.
+and the macOS release-build CI path. A local `cargo build --release --workspace`
+was rerun after #636.
 
 ## Next work
 
-There is no active mandatory implementation slice or in-progress PR recorded
-here. Select the next task from an owner request, a real consumer, or the
-current **Open** section of `docs/open-questions.md`; do not resurrect a
-superseded `NEXT` item from the archived journal.
+Finish review, CI, and merge for #639. Then select the next task from an owner
+request, a real consumer, or the current **Open** section of
+`docs/open-questions.md`; do not resurrect a superseded `NEXT` item from the
+archived journal.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -79,15 +101,7 @@ Consumer-gated deferrals that remain intentional:
 These were found by prior hardening work and remain useful starting points, but
 none is currently selected:
 
-1. **`structArray.to_array()` MIR panic.** Sema accepts a Copy-struct element,
-   but `align_mir` reaches
-   `expect("to_array/scan needs a scalar element")`. Load the whole struct at
-   the append point as the map/where paths already do.
-2. **Direct `()`-valued bindings are a lowering gap.** Shapes such as
-   `x := u()`, `g(u())`, and `x := { u() }` pass sema but reach codegen without
-   an LLVM value. Codegen now diagnoses instead of panicking; the real fix is
-   MIR `Const::Unit` lowering or an explicit language rejection.
-3. **Cold/cache build-result parity.** Codegen can visit an unreachable function
+1. **Cold/cache build-result parity.** Codegen can visit an unreachable function
    already pruned from the unit hash, allowing a cold failure that a cache hit
    masks. The durable record is
    `docs/impl/10-cache-first-optimization.md`. Until its reachability boundaries

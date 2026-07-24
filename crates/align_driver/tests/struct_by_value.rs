@@ -60,6 +60,26 @@ fn struct_to_struct_assignment() {
 }
 
 #[test]
+fn copy_struct_construction_stops_after_early_return() {
+    if !backend_available() {
+        return;
+    }
+    // Once a field initializer returns, later fields must not be lowered into the terminated block.
+    let src = concat!(
+        "Point { x: i64, y: i64 }\n",
+        "fn side() -> i64 { print(9); return 9 }\n",
+        "fn build() -> i32 {\n",
+        "  p := Point { x: { return 0; 0 }, y: side() }\n",
+        "  return 1\n",
+        "}\n",
+        "fn main() -> i32 = build()\n",
+    );
+    let out = build_and_run("copy-struct-early-return", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "later field side effect must not run");
+}
+
+#[test]
 fn nested_struct_by_value_param() {
     if !backend_available() {
         return;

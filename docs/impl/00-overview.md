@@ -73,16 +73,11 @@ alignc/                  workspace root
 
 Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 
-## Known implementation gaps (2026-07-23)
+## Known implementation gaps (2026-07-25)
 
 These are mismatches between accepted/intended source and the current lowering, not new language
 rules:
 
-- A bare identity collect of Copy structs, such as `[E { c: 1 }].to_array()`, is accepted by sema
-  but currently reaches an `align_mir` panic. A preceding `map`/`where` works because those stages
-  perform the whole-struct element load that the identity path is missing.
-- Binding a `()`-valued call (`x := u()`) reaches a MIR/codegen lowering gap. Until the language
-  chooses whether Unit may be bound as a value, do not present that form as a working example.
 - Direct owned-`string` comparison is specified but not lowered; compare through `str`-typed helper
   parameters for now (`draft.md` §5).
 - A codegen cache hit can mask a failure in a pruned unreachable function. Compiler audits and

@@ -198,6 +198,31 @@ copy operation. In the current implementation `str.clone()` always produces a fr
 heap-owned `string` with its own `Drop`, even when called inside an arena;
 `array<Struct>.clone()` is not implemented.
 
+Passing a Move value by value is also a move-out across a function boundary. The callee assumes
+ownership and performs its own type-directed drop, so the argument must be free-standing. An
+arena-owned argument is rejected even when the call occurs before the arena ends; pass a
+non-owning slice/view instead. Aggregates follow their members recursively. During left-to-right
+argument evaluation, ownership remains with the caller until every argument succeeds and the call
+is emitted. MIR therefore retains component-wise cleanup owners for temporary tuples, structs, and
+sum values; a `return` or `?` in a later argument cleans up each earlier free-standing member
+without individually freeing arena members. Synthesized call sites use the same ownership boundary:
+`Result.map_err` rejects an arena-owned Move error, and fused pipeline functions reject Move
+source or result elements until MIR can move/null sources and clean up each iteration explicitly.
+`map_err` carries the selected branch's runtime ownership bit through its rebuilt result, retains a
+fresh receiver while evaluating the mapper expression, and joins mapper-capture borrow provenance.
+A materializing `scan` also rejects a Move accumulator because it retains every intermediate
+value. `reduce` rejects a Move accumulator until per-iteration transfer and scanner error cleanup
+are explicit.
+
+The path-local cleanup carrier is one bit per owning slot. Consequently, every directly owned
+member of a tuple, struct, sum value, or owned array must share one allocation mode. Sema rejects a
+mixed free-standing/arena aggregate; uniform free-standing aggregates use recursive `Drop`, while
+uniform arena aggregates use bulk-free. Borrowed members affect Region but not this ownership-mode
+check. An owned field or element assignment must keep the aggregate's existing mode.
+A one-owner aggregate may forward a heap/arena path-dependent runtime bit, but mutation requires a
+definite mode. Move-struct materialization retains each completed field owner until construction
+succeeds, including direct struct and fixed-array `let` paths.
+
 ---
 
 ## 7. Drop insertion (MIR level)
