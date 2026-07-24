@@ -8,8 +8,43 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-24, **`std.process` capture extension COMPLETE — align-llm Request 1 fully
-shipped across #630/#631/#632** (bar the deferred bytes tier). S6 (#632) added `c.env(name,value)` /
+_Last updated: 2026-07-24, **align-llm Request 2 (http/net I/O timeouts) COMPLETE — both align-llm
+requests now shipped.** #634 = the http surface: `http.client().timeout(ns)` (client default,
+`AtomicI64`) + `http.request(...).timeout(ns)` (per-request override) resolve an effective per-op
+deadline in `http_client_perform` (`req>0 ? req : client`), threaded into connect (`→ tcp_connect(…,
+ns)`, `0` = blocking) + `SO_RCVTIMEO`/`SO_SNDTIMEO` arming (guard `if has_deadline || reused` — a fresh
+no-timeout conn does zero setsockopt = byte-identical; a reused conn always re-arms/clears so a pooled
+timeout can't leak). Expiry → `AL_TIMEOUT`: plaintext via `io_read_write_status`; **TLS**
+`tls_read`/`tls_write_all` gained a `has_deadline` gate (errno captured before `SSL_get_error`;
+`WANT_*`/`SSL_ERROR_SYSCALL` + `EAGAIN` → timeout, both OpenSSL surfacings; errno-0 → EOF; handshake fd
+armed before `SSL_connect`). effective-0 = byte-identical (all http/TLS/pool tests unchanged). New
+`HttpRequestTimeout`/`HttpClientTimeout` `Ty::Unit` Pure exprs swept through the `HttpBody` passes.
+Adversarially reviewed: no regression / no soundness bug (effective-0 non-regression + TLS/plaintext
+no-mis-fire + pool re-arm all confirmed). #633 = the net-rail substrate (below). `cargo test
+--workspace` 2746/0; clippy clean. **Both requests DONE (R1 #630/#631/#632, R2 #633/#634).** NEXT (not
+started): the owner-filed **align-llm Request 3** — `core.json` should accept scalar-array struct
+fields (`array<str>`/`array<i64>`/`array<f64>`) in `json.decode`/`encode` (only `array<struct>` today);
+marked NOT blocking. Also still deferred: the `std.process` bytes tier (`run_bytes`). #633 = the
+net-rail substrate: `align_rt_tcp_connect` gained a `timeout_ns`
+param (`0` = the EXACT original blocking `connect`, byte-identical; `>0` = `connect_with_deadline`:
+non-blocking `connect` + `poll(POLLOUT)` deadline + `getsockopt(SO_ERROR)`, restore blocking on
+success, `AL_TIMEOUT` on expiry), plus `conn.read_timeout_ns(ns)`/`write_timeout_ns(ns)` on `tcp_conn`
+(`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`; sub-µs clamps to 1µs; new `TcpReadTimeout`/`TcpWriteTimeout`
+`Ty::Unit` borrow-only exprs swept through the `CommandTimeout` passes), and `io_read_write_status`
+mapping a blocking-fd `EAGAIN`→`AL_TIMEOUT` at the 3 shared M9 byte sites (sound — every runtime io fd
+is blocking; the capture drain's non-blocking pipes use a separate loop; the one honest exception,
+inherited-`O_NONBLOCK` stdio, is documented as an already-error relabel). `cargo test --workspace`
+2736/0; adversarially reviewed (EAGAIN-mapping safety traced across all io consumers; 0-path
+byte-identical confirmed). **IN PROGRESS: the http surface** — `http.client().timeout(ns)` +
+`http.request(...).timeout(ns)` threading the effective timeout (request override else client default)
+through `http_connect_fd`→`tcp_connect` + arming `SO_*TIMEO` per request (re-arm/clear on pooled reuse),
+mapping a plaintext AND **TLS (`SSL_read`/`SSL_write`) timeout to `AL_TIMEOUT`**; effective-0 =
+byte-identical to today. After that, R2 is COMPLETE (both align-llm requests done). **A NEW align-llm
+Request 3 was filed** (in `../align-llm/docs/align-requests.md`, by the owner): `core.json` should
+accept `array<str>`/`array<i64>`/`array<f64>` **scalar-array struct fields** in `json.decode`/`encode`
+(only `array<struct>` is admitted today) — marked NOT blocking; a future item after R2. Before R2,
+**`std.process` capture extension COMPLETE — align-llm Request 1 fully shipped across #630/#631/#632**
+(bar the deferred bytes tier). S6 (#632) added `c.env(name,value)` /
 `c.env_clear()` (mirror `c.cwd`; child `clearenv`/`setenv` after `chdir`, before `execvp`; `=`-in-name
 rejected). The full R1 surface: `c := process.command(cmd, args)` (Move builder) + `c.cwd(dir)` +
 `c.timeout_ns(ns)` + `c.env(n,v)` + `c.env_clear()` → `out := c.run()?` (Move `run_output`:
