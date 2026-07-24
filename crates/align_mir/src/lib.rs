@@ -852,6 +852,16 @@ pub enum Rvalue {
     /// `re.replace[_all](text, repl)` — return a fresh owned `string` `{ptr,len}` by value with
     /// matches replaced by `repl` (`$`-expanded). `all` selects first-only vs every match.
     RegexReplace { regex: Operand, text: Operand, repl: Operand, all: bool },
+    /// `re.captures(text)` — write an owned `captures` handle ptr into `out`, returning an i32
+    /// present flag (1 = a match, 0 = none). Lowering builds the `Option<captures>`.
+    RegexCaptures { regex: Operand, text: Operand, out: Slot },
+    /// `re.group_count()` — the pattern's total capture-group count (incl. group 0) as an i64.
+    RegexGroupCount { regex: Operand },
+    /// `re.group_index(name)` — a named group's index, or `-1` if absent. Lowering builds `Option<i64>`.
+    RegexGroupIndex { regex: Operand, name: Operand },
+    /// `caps.group(i)` — write the builtin `regex_match` into `out`, returning an i32 present flag
+    /// (0 = non-participating group). An out-of-range `i` aborts in the runtime.
+    CapturesGroup { caps: Operand, index: Operand, out: Slot },
     EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
     /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
@@ -2117,7 +2127,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -3324,7 +3334,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::RegexFind { .. }
         | hir::ExprKind::RegexFindAll { .. }
         | hir::ExprKind::RegexSplit { .. }
-        | hir::ExprKind::RegexReplace { .. } => lower_regex_expr(b, e),
+        | hir::ExprKind::RegexReplace { .. }
+        | hir::ExprKind::RegexCaptures { .. }
+        | hir::ExprKind::RegexGroupCount { .. }
+        | hir::ExprKind::RegexGroupIndex { .. }
+        | hir::ExprKind::CapturesGroup { .. } => lower_regex_expr(b, e),
         // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
         // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
         // match grows by exactly one arm (not seven). A deep expression tree recurses through
@@ -6903,6 +6917,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Writer
         | Scalar::Buffer
         | Scalar::Regex
+        | Scalar::Captures
         | Scalar::CliParsed
         | Scalar::TcpConn
         | Scalar::TcpListener
@@ -9251,6 +9266,38 @@ fn lower_http_get_many(
     Operand::Value(r)
 }
 
+/// Build an `Option<payload>` from a runtime present-flag + out-slot: `flag != 0` → `Some(Load(out))`,
+/// else `None` (the out slot was zeroed, so `None` owns nothing). Shared by `re.captures` (payload =
+/// owned `captures` handle) and `caps.group` (payload = Copy `regex_match`), mirroring `env.get`.
+fn lower_present_flag_option(b: &mut Builder, flag: ValueId, out: Slot, payload_ty: Ty, result_ty: Ty) -> Operand {
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    b.cur = some_bb;
+    let v = b.fresh_value(payload_ty);
+    b.push(Stmt::Let(v, Rvalue::Load(out)));
+    let somev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(v))));
+    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let nonev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
 /// Lower the complete first `std.regex` slice out of line: fallible compile to an owned handle,
 /// boolean search, and optional byte-span search. Keeping it outside the recursive dispatcher
 /// preserves the expression-depth headroom established for later std modules.
@@ -9345,6 +9392,67 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RegexReplace { regex: re, text: t, repl: r, all: *all }));
             Operand::Value(v)
+        }
+        hir::ExprKind::RegexCaptures { regex, text } => {
+            // `Option<captures>` (owned Move handle) — the `env.get` out-slot + present-flag shape.
+            let out = b.new_slot(Ty::Captures);
+            let re = lower_expr(b, regex);
+            let t = lower_expr(b, text);
+            let flag = b.fresh_value(status_ty());
+            b.push(Stmt::Let(flag, Rvalue::RegexCaptures { regex: re, text: t, out }));
+            lower_present_flag_option(b, flag, out, Ty::Captures, e.ty)
+        }
+        hir::ExprKind::CapturesGroup { caps, index } => {
+            // `Option<regex_match>` — the `RegexFind` out-slot + present-flag shape.
+            let Ty::Option(Scalar::Struct(match_id)) = e.ty else {
+                unreachable!("CapturesGroup must return Option<regex_match>")
+            };
+            let out = b.new_slot(Ty::Struct(match_id));
+            let c = lower_expr(b, caps);
+            let idx = lower_expr(b, index);
+            let flag = b.fresh_value(status_ty());
+            b.push(Stmt::Let(flag, Rvalue::CapturesGroup { caps: c, index: idx, out }));
+            lower_present_flag_option(b, flag, out, Ty::Struct(match_id), e.ty)
+        }
+        hir::ExprKind::RegexGroupCount { regex } => {
+            let re = lower_expr(b, regex);
+            let v = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(v, Rvalue::RegexGroupCount { regex: re }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::RegexGroupIndex { regex, name } => {
+            // Runtime returns the index or `-1`; build `Option<i64>` by branching on `>= 0`.
+            let re = lower_expr(b, regex);
+            let n = lower_expr(b, name);
+            let idx = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(idx, Rvalue::RegexGroupIndex { regex: re, name: n }));
+            let present = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                present,
+                Rvalue::Bin(BinOp::Ge, Operand::Value(idx), Operand::Const(Const::Int(0, i64_ty()))),
+            ));
+            let some_bb = b.new_block();
+            let none_bb = b.new_block();
+            let join = b.new_block();
+            let rslot = b.new_slot(e.ty);
+            b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+            b.cur = some_bb;
+            let somev = b.fresh_value(e.ty);
+            b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(idx))));
+            b.push(Stmt::Store(rslot, Operand::Value(somev)));
+            b.terminate(Term::Goto(join));
+
+            b.cur = none_bb;
+            let nonev = b.fresh_value(e.ty);
+            b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+            b.push(Stmt::Store(rslot, Operand::Value(nonev)));
+            b.terminate(Term::Goto(join));
+
+            b.cur = join;
+            let r = b.fresh_value(e.ty);
+            b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+            Operand::Value(r)
         }
         _ => unreachable!("lower_regex_expr called for a non-regex expression"),
     }
@@ -10158,6 +10266,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::HttpHeaders => "http_headers".to_string(),
         Ty::Regex => "regex".to_string(),
+        Ty::Captures => "captures".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),

@@ -2305,6 +2305,41 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `captures(handle, text, out) -> i32` present flag (writes a captures handle ptr);
+    // `captures_group(caps, i, out_match) -> i32`; `group_count(handle) -> i64`;
+    // `group_index(handle, name) -> i64` (-1 = none); `captures_free` drops the handle.
+    funcs.insert(
+        "regex_captures".to_string(),
+        module.add_function(
+            "align_rt_regex_captures",
+            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "regex_captures_group".to_string(),
+        module.add_function(
+            "align_rt_regex_captures_group",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "regex_group_count".to_string(),
+        module.add_function("align_rt_regex_group_count", ctx.i64_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "regex_group_index".to_string(),
+        module.add_function(
+            "align_rt_regex_group_index",
+            ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "regex_captures_free".to_string(),
+        module.add_function("align_rt_regex_captures_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         "regex_free".to_string(),
         module.add_function("align_rt_regex_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
@@ -3035,7 +3070,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -3410,6 +3445,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
         Scalar::Regex => unreachable!("a regex handle is not a box/array payload"),
+        Scalar::Captures => unreachable!("a captures handle is not a box/array payload"),
         Scalar::File => unreachable!("a file handle is not a box/array payload"),
         Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
         Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
@@ -3448,6 +3484,7 @@ fn handle_free_fn(ty: Ty) -> Option<&'static str> {
         Ty::Buffer => "buffer_free",
         Ty::File => "io_file_free",
         Ty::Regex => "regex_free",
+        Ty::Captures => "regex_captures_free",
         Ty::CliCommand => "cli_command_free",
         Ty::CliParsed => "cli_parsed_free",
         Ty::TcpConn => "tcp_conn_free",
@@ -5007,7 +5044,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -5148,7 +5185,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::Regex) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::Regex) | Some(Scalar::Captures) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) | Some(Scalar::ResponseBuilder) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -5157,6 +5194,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::Buffer) => "buffer_free",
                                         Some(Scalar::File) => "io_file_free",
                                         Some(Scalar::Regex) => "regex_free",
+                                        Some(Scalar::Captures) => "regex_captures_free",
                                         Some(Scalar::TcpConn) => "tcp_conn_free",
                                         Some(Scalar::TcpListener) => "tcp_listener_free",
                                         Some(Scalar::UdpSocket) => "udp_socket_free",
@@ -7637,6 +7675,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_replace returns a {ptr,len}")
             }
+            Rvalue::RegexCaptures { regex, text, out } => {
+                // Write the owned `captures` handle ptr into `out` (zeroed first so a None reads null).
+                let re = self.operand(regex)?.into_pointer_value();
+                let (tp, tl) = self.split_str(text)?;
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["regex_captures"], &[re.into(), tp.into(), tl.into(), out_ptr.into()], "recaps")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_captures returns i32 flag")
+            }
+            Rvalue::CapturesGroup { caps, index, out } => {
+                let c = self.operand(caps)?.into_pointer_value();
+                let iv = self.operand(index)?;
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_call(self.funcs["regex_captures_group"], &[c.into(), iv.into(), out_ptr.into()], "recapg")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_captures_group returns i32 flag")
+            }
+            Rvalue::RegexGroupCount { regex } => {
+                let re = self.operand(regex)?.into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["regex_group_count"], &[re.into()], "regcount")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_group_count returns i64")
+            }
+            Rvalue::RegexGroupIndex { regex, name } => {
+                let re = self.operand(regex)?.into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["regex_group_index"], &[re.into(), np.into(), nl.into()], "regidx")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_group_index returns i64")
+            }
             Rvalue::HttpParse { data, out } => {
                 let out_ptr = self.slots[out];
                 self.builder
@@ -8160,7 +8235,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),

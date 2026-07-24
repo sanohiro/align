@@ -1118,6 +1118,17 @@ pub enum ExprKind {
     /// `$$` (the Rust `regex` contract). The result never aliases `text`. All operands are borrowed.
     /// Pure.
     RegexReplace { regex: Box<Expr>, text: Box<Expr>, repl: Box<Expr>, all: bool },
+    /// `re.captures(text)` — the first match's capture-group spans as an owned Move `captures`
+    /// handle, yielding `Option<captures>` (`None` = no match). Both operands are borrowed. Pure.
+    RegexCaptures { regex: Box<Expr>, text: Box<Expr> },
+    /// `re.group_count()` — total capture groups in the pattern (incl. group 0), an `i64`. Pure.
+    RegexGroupCount { regex: Box<Expr> },
+    /// `re.group_index(name)` — a named group's numbered index as `Option<i64>` (`None` = no such
+    /// name). Both operands are borrowed. Pure.
+    RegexGroupIndex { regex: Box<Expr>, name: Box<Expr> },
+    /// `caps.group(i)` — capture group `i`'s span as `Option<regex_match>` (`None` = the group did
+    /// not participate). An out-of-range `i` aborts. The handle is borrowed. Pure.
+    CapturesGroup { caps: Box<Expr>, index: Box<Expr> },
     /// `cli.command(name)` — a fresh [`crate::Ty::CliCommand`] builder named `name` (a `str`). A
     /// **Move** handle owning its registered-flag table; `Drop`-freed. Pure (no I/O — argv is
     /// already captured by `main(args)`). `name` is borrowed.

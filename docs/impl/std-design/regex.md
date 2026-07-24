@@ -1,8 +1,15 @@
 # std.regex design
 
-Status: first slice SHIPPED 2026-07-23 — built, tested, and IR-verified. `regex` 1.13.1 in the
-runtime archive (`Cargo.lock` updated); workspace suite green (2686 passed / 0 failed), 8 runtime
-FFI unit tests (`regex_tests`) + 13 driver E2E tests (`std_regex.rs`), `clippy -D warnings` clean.
+> 🌐 **English** · [Japanese](./ja/regex.md)
+
+Status: **COMPLETE 2026-07-24** — the first slice (2026-07-23) plus the whole second surface
+(find_all / split / replace / replace_all / captures / group_count / group_index / caps.group) are
+shipped, built, tested, and IR-verified. `regex` 1.13.1 in the runtime archive; `regex_tests` +
+`std_regex.rs` cover every operation (spans, Unicode offsets, empty-match termination, split empty
+fields, `$`-expansion + named groups, non-participating groups, out-of-range abort, Move/Drop
+soundness across `block`/`if`/`match`/loop). `clippy -D warnings` clean. Nothing regex-shaped remains
+deferred except the adjacent extras noted below (captures-iterator, closure-callback replace,
+`rx"..."` literals) — none has a consumer yet.
 
 ## Placement and goals
 
