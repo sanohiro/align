@@ -980,6 +980,9 @@ pub enum Rvalue {
     /// `c.cwd(dir)` — set the command handle `command`'s working directory (`dir` a `{ptr,len}` str
     /// view), in place. No value. A `dir` with an interior NUL aborts at runtime. Impure.
     CommandCwd { command: Operand, dir: Operand },
+    /// `c.timeout_ns(ns)` — set the command handle `command`'s run timeout (`ns` an `i64` nanosecond
+    /// count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at runtime. Impure.
+    CommandTimeout { command: Operand, ns: Operand },
     /// `c.run()` — fork + capture: the runtime writes an owned `run_output` handle to `out` and returns
     /// an `i32` status (0 = ok; else `AL_INVALID` for non-UTF-8 output / a mapped errno). The caller
     /// branches `Ok(run_output)` / `Err`. `command` is borrowed (re-runnable). Impure.
@@ -3080,6 +3083,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // Routed through one out-of-line helper (the `expr_depth` #296 headroom discipline).
         hir::ExprKind::ProcessCommand { .. }
         | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandTimeout { .. }
         | hir::ExprKind::CommandRun { .. }
         | hir::ExprKind::RunOutputCode { .. }
         | hir::ExprKind::RunOutputStdout { .. }
@@ -8137,8 +8141,9 @@ fn make_error_code(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
 /// Decode a std runtime **errno-status** into the builtin `Error` value — the one fixed table
 /// (`draft.md` §18.2), decoded from the encoding `align_rt_io_*` produces (`io_error_to_status` in
 /// `align_runtime`): `1 -> NotFound` (tag 0), `2 -> Invalid` (tag 1), `3 -> Denied` (tag 2),
-/// `>= 4 -> Code(status - 4)` (tag 3, the raw errno). Branchless — `tag = min(status-1, 3)`,
-/// `code = max(status-4, 0)` (a `select` each) — built into the `{i32 tag, i32 code}` `Error`
+/// `4 -> Timeout` (tag 3, the explicit `AL_TIMEOUT` sentinel — payload unused),
+/// `>= 5 -> Code(status - 5)` (tag 4, the raw errno). Branchless — `tag = min(status-1, 4)`,
+/// `code = max(status-5, 0)` (a `select` each) — built into the `{i32 tag, i32 code}` `Error`
 /// aggregate by [`Rvalue::MakeError`].
 fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Operand {
     let error_id = match result_ty {
@@ -8147,20 +8152,20 @@ fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Op
     };
     let i32t = status_ty();
     let s = Operand::Value(status);
-    // tag = min(status - 1, 3)
+    // tag = min(status - 1, 4)  (Code is now tag 4 — a `Timeout` category was inserted at tag 3)
     let sm1 = b.fresh_value(i32t);
     b.push(Stmt::Let(sm1, Rvalue::Bin(BinOp::Sub, s.clone(), Operand::Const(Const::Int(1, i32t)))));
-    let ge3 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ge3, Rvalue::Bin(BinOp::Ge, Operand::Value(sm1), Operand::Const(Const::Int(3, i32t)))));
+    let ge4 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(ge4, Rvalue::Bin(BinOp::Ge, Operand::Value(sm1), Operand::Const(Const::Int(4, i32t)))));
     let tag = b.fresh_value(i32t);
-    b.push(Stmt::Let(tag, Rvalue::Select { cond: Operand::Value(ge3), a: Operand::Const(Const::Int(3, i32t)), b: Operand::Value(sm1) }));
-    // code = max(status - 4, 0)
-    let sm4 = b.fresh_value(i32t);
-    b.push(Stmt::Let(sm4, Rvalue::Bin(BinOp::Sub, s, Operand::Const(Const::Int(4, i32t)))));
+    b.push(Stmt::Let(tag, Rvalue::Select { cond: Operand::Value(ge4), a: Operand::Const(Const::Int(4, i32t)), b: Operand::Value(sm1) }));
+    // code = max(status - 5, 0)  (a raw errno rides `AL_CODE = 5` + errno)
+    let sm5 = b.fresh_value(i32t);
+    b.push(Stmt::Let(sm5, Rvalue::Bin(BinOp::Sub, s, Operand::Const(Const::Int(5, i32t)))));
     let ge0 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ge0, Rvalue::Bin(BinOp::Ge, Operand::Value(sm4), Operand::Const(Const::Int(0, i32t)))));
+    b.push(Stmt::Let(ge0, Rvalue::Bin(BinOp::Ge, Operand::Value(sm5), Operand::Const(Const::Int(0, i32t)))));
     let code = b.fresh_value(i32t);
-    b.push(Stmt::Let(code, Rvalue::Select { cond: Operand::Value(ge0), a: Operand::Value(sm4), b: Operand::Const(Const::Int(0, i32t)) }));
+    b.push(Stmt::Let(code, Rvalue::Select { cond: Operand::Value(ge0), a: Operand::Value(sm5), b: Operand::Const(Const::Int(0, i32t)) }));
     let ev = b.fresh_value(Ty::Enum(error_id));
     b.push(Stmt::Let(ev, Rvalue::MakeError { enum_id: error_id, tag: Operand::Value(tag), code: Operand::Value(code) }));
     Operand::Value(ev)
@@ -9034,6 +9039,14 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let d = lower_expr(b, dir);
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CommandCwd { command: cm, dir: d }));
+            Operand::Const(Const::Unit)
+        }
+        // `c.timeout_ns(ns)` → set the command handle's run timeout in place; no value.
+        hir::ExprKind::CommandTimeout { command, ns } => {
+            let cm = lower_expr(b, command);
+            let n = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CommandTimeout { command: cm, ns: n }));
             Operand::Const(Const::Unit)
         }
         // `c.run()` → `Result<run_output, Error>` (shared out-slot + i32-status lowering, like

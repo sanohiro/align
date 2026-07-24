@@ -8,7 +8,9 @@ module.
 
 > **Status:** M11 core complete (exit/abort, spawn/wait/kill, exec shipped). **Extension DESIGNED
 > 2026-07-24** (align-llm Request 1): captured output + cwd / env / timeout via a `process.command`
-> builder + `run_output` handle — see "Extension" at the end of this file. Not yet implemented.
+> builder + `run_output` handle — see "Extension" at the end of this file. **Slices 4–5 SHIPPED**
+> (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant);
+> Slice 6 (`c.env`/`c.env_clear`) and the deferred bytes tier remain.
 
 ## Overview
 
@@ -218,6 +220,14 @@ not a planned gap.
 
 ## Shared prerequisite — the `Error.Timeout` variant (canonical definition; `std.http`/`std.net` reuse it)
 
+> **SHIPPED (Slice 5).** The five-variant `Error` enum landed: sema registers `Timeout` between
+> `Denied` and `Code` (`ERROR_VARIANT_CODE` is now `4`, `Code` stays last); the runtime carries
+> `AL_TIMEOUT = 4` / `AL_CODE = 5`; and the MIR `make_error_from_status` branchless decode is
+> `tag = min(status-1, 4)` / `Code = status-5`. The generic errno→`Error` mapping is unchanged — a
+> timeout is surfaced ONLY by returning `AL_TIMEOUT` explicitly at a timeout site (an unrelated
+> `ETIMEDOUT`/`EAGAIN` errno still maps to `Error.Code`). `Error.Timeout` is user-visible: it names a
+> `match` arm alongside `NotFound`/`Invalid`/`Denied`/`Code(c)`.
+
 A timeout must be **distinguishable** from a nonzero exit and from a transport error (align-llm must
 tell "the test hung" apart from "the test failed"). The builtin `Error` enum has four variants
 (`NotFound`, `Invalid`, `Denied`, `Code(i32)`) and no timeout. This extension adds a fifth,
@@ -389,7 +399,14 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
    child-side `chdir` is trivial, so S4 is a complete must-have delivery (a `command` with a real
    setter, not empty scaffolding).
 5. `c.timeout_ns(ns)` + the `Error.Timeout` core change — the "a hung test freezes the loop" fix
-   (kill + `Err(Timeout)`).
+   (kill + `Err(Timeout)`). **SHIPPED.** `c.timeout_ns(ns: i64)` is an in-place bound-local setter
+   (`()`); `ns == 0` = no timeout (the Slice-4 default), a negative `ns` aborts at build. `c.run()`
+   threads the deadline into the two-pipe drain (`poll` with the remaining ns→ms, clamped `>= 1`);
+   past the deadline it `SIGKILL`s the child's whole **process group** (the child `setpgid`s into its
+   own group, so a `sh -c "sleep 10"` grandchild is reaped too — otherwise it holds the capture pipes
+   open and wedges the drain), drains to EOF, `waitpid`s, and returns `Err(Error.Timeout)` (partial
+   output discarded). `EINTR` on `poll` recomputes the remaining deadline; `timeout_ns == 0` keeps the
+   infinite `-1` `poll` (Slice-4 behavior exactly).
 6. `c.env(name,value)` + `c.env_clear()`.
 7. *(deferred)* the bytes tier `c.run_bytes()` — ship on demand.
 

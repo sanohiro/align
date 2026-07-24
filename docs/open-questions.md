@@ -13,6 +13,20 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### `Error.Timeout` — a 5th builtin `Error` category (SHIPPED 2026-07-24, std.process Slice 5)
+**Decision: a run/transport deadline is a distinct `Error` variant, not an errno-mapped `Code`.** The
+builtin `Error` sum type gains a payload-less `Timeout` variant between `Denied` and `Code`:
+`Error { NotFound, Invalid, Denied, Timeout, Code(i32) }`. It is produced ONLY by an explicit timeout
+site (a `std.process` `run`'s `timeout_ns`; the designed `std.http`/`std.net` I/O timeouts), never
+inferred from an errno — an unrelated `ETIMEDOUT` still maps to `Code`. Rationale: a caller must be
+able to tell "the operation timed out" apart from "it failed" and apart from "it exited nonzero"
+(align-llm's verify loop needs "the test hung" ≠ "the test failed"). Encoding: `AL_TIMEOUT = 4`,
+`AL_CODE` shifted 4→5; the branchless status→variant decode became `tag = min(status-1, 4)` /
+`Code(status-5)`; `ERROR_VARIANT_CODE` 3→4; main-boundary exit code `Timeout` → 4. The full design
+record is the canonical "Shared prerequisite — the `Error.Timeout` variant" section in
+`docs/impl/std-design/process.md`. Adding the variant makes an exhaustive `match Error` fail closed
+(missing-`Timeout` diagnostic); the three in-repo exhaustive matches were updated.
+
 ### Regular expressions — `std.regex`, explicitly compiled (SHIPPED 2026-07-23)
 **Decision: regex is a standard-library service, not syntax.** `import std.regex` exposes
 `regex.compile(str) -> Result<regex, Error>` and borrowed `is_match` / `find` / `find_at` methods.

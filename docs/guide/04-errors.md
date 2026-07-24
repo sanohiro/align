@@ -91,7 +91,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-If an `Err` propagates out of `main`, the process exits non-zero — each `Error` category maps to a small fixed code (`NotFound` → 1, `Invalid` → 2, `Denied` → 3), and `Error.Code(c)` exits with `c`. `error(c)` is shorthand for constructing that carrier: `return Err(error(7))` exits with 7. No handler boilerplate at the top of `main`; the mapping is part of the language.
+If an `Err` propagates out of `main`, the process exits non-zero — each `Error` category maps to a small fixed code (`NotFound` → 1, `Invalid` → 2, `Denied` → 3, `Timeout` → 4), and `Error.Code(c)` exits with `c`. `error(c)` is shorthand for constructing that carrier: `return Err(error(7))` exits with 7. No handler boilerplate at the top of `main`; the mapping is part of the language.
 
 (That signature also shows how programs receive arguments: `main(args: array<str>)` is the only argv there is — `args[1]` is the first user argument. No global, no `env.args`.)
 

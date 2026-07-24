@@ -567,12 +567,14 @@ variable; needing the error *is* the signal to `match`. So each intent has exact
 `Error` is the canonical builtin error sum type — universal categories plus a generic code:
 
 ```align
-Error { NotFound, Invalid, Denied, Code(i32) }
+Error { NotFound, Invalid, Denied, Timeout, Code(i32) }
 ```
 
 Construct it with `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar for `Error.Code(c)`),
 discriminate it with `match`, and at `main` it becomes the process exit code (`Code(c)` → `c`, a
-category → a small distinct code). The standard fallible operations (`fs.read_file`, `json.decode`,
+category → a small distinct code). `Timeout` is the category for a run/transport deadline (a
+`std.process` `run` that overran its `timeout_ns`, or — once shipped — a `std.http`/`std.net` I/O
+timeout); it is produced only by an explicit timeout site, never inferred from an errno. The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
 
 A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
@@ -2157,6 +2159,11 @@ EACCES, EPERM    -> Error.Denied
 EINVAL           -> Error.Invalid
 (anything else)  -> Error.Code(errno)
 ```
+
+`Error.Timeout` is **not** part of this errno table — an `ETIMEDOUT` from an unrelated syscall still
+maps to `Error.Code`. `Timeout` is produced only where a deadline is enforced explicitly (a
+`std.process` run's `timeout_ns`; the `std.http`/`std.net` I/O timeouts), so a caller can tell "the
+operation timed out" apart from any other failure.
 
 ### std.io
 

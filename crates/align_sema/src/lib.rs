@@ -1553,8 +1553,16 @@ enum Place {
 }
 
 /// The tag of the builtin `Error` enum's `Code(i32)` variant (the generic error-code category).
-/// Must match the variant order registered in `check_file`.
-pub const ERROR_VARIANT_CODE: u32 = 3;
+/// Must match the variant order registered in `check_file`. `Code` stays LAST, so its tag shifts
+/// up by one whenever a payload-less category is inserted before it (the `Timeout` variant did).
+pub const ERROR_VARIANT_CODE: u32 = 4;
+
+/// The tag of the builtin `Error` enum's `Timeout` variant (no payload) — a run/transport timeout,
+/// distinguishable from a nonzero exit (`Code`) and a transport failure. Surfaced by the runtime
+/// returning `AL_TIMEOUT` explicitly at a timeout site (never inferred from an errno). Recorded here
+/// in case a direct MIR construction is ever needed; the current runtime status path does not use it
+/// (the branchless status→variant decode in `make_error_from_status` maps the sentinel positionally).
+pub const ERROR_VARIANT_TIMEOUT: u32 = 3;
 
 /// One source module compiled together with the others (multi-file, slice B1). The entry module is
 /// the file passed on the command line; the rest are reached transitively through `import`.
@@ -2827,6 +2835,10 @@ pub fn check_program_with_effects(
             hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
             hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
             hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
+            // A timeout (no payload). Inserted BEFORE `Code` so `Code` stays last (its tag is
+            // `ERROR_VARIANT_CODE`). Shared with the `std.http`/`std.net` I/O-timeout work; landed
+            // first via `std.process` Slice 5 (`c.timeout_ns`).
+            hir::EnumVariant { name: "Timeout".to_string(), payload: Vec::new(), field_base: 1 },
             hir::EnumVariant {
                 name: "Code".to_string(),
                 payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
@@ -4494,6 +4506,11 @@ impl EffectScan<'_> {
                 self.expr(command);
                 self.expr(dir);
             }
+            ExprKind::CommandTimeout { command, ns } => {
+                self.impure_direct = true;
+                self.expr(command);
+                self.expr(ns);
+            }
             ExprKind::CommandRun { command } => {
                 self.impure_direct = true;
                 self.expr(command);
@@ -6098,6 +6115,7 @@ impl<'a> EscapeCheck<'a> {
             // (The `out.stdout()`/`out.stderr()` VIEWS are `Frame`-regioned in the arm above.)
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
+            | ExprKind::CommandTimeout { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. }
             | ExprKind::EncodingEncode { .. }
@@ -6394,6 +6412,7 @@ impl<'a> EscapeCheck<'a> {
             // local-backed-slice check; all six therefore report "not a local-backed slice".
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
+            | ExprKind::CommandTimeout { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. }
             | ExprKind::RunOutputStdout { .. }
@@ -7143,6 +7162,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(command, depth);
                 self.walk(dir, depth);
             }
+            ExprKind::CommandTimeout { command, ns } => {
+                self.walk(command, depth);
+                self.walk(ns, depth);
+            }
             ExprKind::CommandRun { command } => self.walk(command, depth),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.walk(out, depth)
@@ -7810,6 +7833,10 @@ impl UnnecessaryHeapScan {
             ExprKind::CommandCwd { command, dir } => {
                 self.visit(command);
                 self.visit(dir);
+            }
+            ExprKind::CommandTimeout { command, ns } => {
+                self.visit(command);
+                self.visit(ns);
             }
             ExprKind::CommandRun { command } => self.visit(command),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
@@ -8719,7 +8746,7 @@ impl<'a> MoveCheck<'a> {
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
             // `out.code` (`i64`) borrow nothing; `out.stdout()`/`out.stderr()` (which DO borrow `out`)
             // are in the `storage_roots` group above.
-            | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandRun { .. }
+            | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandTimeout { .. } | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. } | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
@@ -9688,6 +9715,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CommandCwd { command, dir } => {
                 self.expr(command, moved, false, false);
                 self.expr(dir, moved, false, false);
+            }
+            ExprKind::CommandTimeout { command, ns } => {
+                self.expr(command, moved, false, false);
+                self.expr(ns, moved, false, false);
             }
             ExprKind::CommandRun { command } => self.expr(command, moved, false, false),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
@@ -13935,7 +13966,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.process` (Slice 4) `command` methods on a `command`: `c.cwd(dir)` sets the working
             // directory in place (`()`); `c.run()` forks + captures → `Result<run_output, Error>`.
             // Type-guarded, same as the `http request` builder methods.
-            "cwd" | "run" if recv_ty == Ty::Command => {
+            "cwd" | "timeout_ns" | "run" if recv_ty == Ty::Command => {
                 self.check_command_method(recv_expr, method, args, span)
             }
             // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.code()` (`i64`) /
@@ -18371,8 +18402,9 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `c.cwd(dir)` / `c.run()` on a `command` ([`Ty::Command`]), the receiver already evaluated. The
     /// receiver must be a **bound local** (the v1 Move-temporary gate, `check_http_request_method`
-    /// precedent): both methods borrow the handle (not consumed — `cwd` mutates in place, `run` is
-    /// re-runnable). `cwd(dir: str)` yields `()`; `run()` yields `Result<run_output, Error>`.
+    /// precedent): every method borrows the handle (not consumed — `cwd`/`timeout_ns` mutate in place,
+    /// `run` is re-runnable). `cwd(dir: str)` / `timeout_ns(ns: i64)` yield `()`; `run()` yields
+    /// `Result<run_output, Error>`.
     fn check_command_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -18396,6 +18428,33 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::CommandCwd { command: Box::new(recv_expr), dir: Box::new(dir) }, ty: Ty::Unit, span }
             }
+            "timeout_ns" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.timeout_ns()' takes 1 argument (the timeout in nanoseconds, i64), got {}", args.len()), span);
+                    return err;
+                }
+                let ns = self.check_expr(&args[0], None);
+                if ns.ty == Ty::Error {
+                    return err;
+                }
+                // Require *exactly* `i64` (binding a bare int literal's inference var), mirroring
+                // `ch.kill(sig)` / `process.exit`: a narrower operand would mismatch the runtime
+                // `align_rt_command_timeout(c, i64)`. `ns == 0` = no timeout; a negative `ns` aborts
+                // at runtime (validated there, like `cwd`'s bad-path abort).
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                match self.resolve(ns.ty) {
+                    Ty::Int(IntTy { bits: 64, signed: true }) => {}
+                    Ty::IntVar(_) => self.constrain(ns.ty, Some(i64_ty), args[0].span),
+                    other => {
+                        self.diags.error(
+                            format!("'.timeout_ns()' expects a timeout in nanoseconds (i64), got {}", ty_name(other)),
+                            args[0].span,
+                        );
+                        return err;
+                    }
+                }
+                Expr { kind: ExprKind::CommandTimeout { command: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
+            }
             "run" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.run()' takes no arguments, got {}", args.len()), span);
@@ -18408,7 +18467,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / run)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / timeout_ns / run)"), span);
                 err
             }
         }
@@ -21691,6 +21750,10 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::CommandCwd { command, dir } => {
                 self.finalize_expr(command);
                 self.finalize_expr(dir);
+            }
+            ExprKind::CommandTimeout { command, ns } => {
+                self.finalize_expr(command);
+                self.finalize_expr(ns);
             }
             ExprKind::CommandRun { command } => self.finalize_expr(command),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {

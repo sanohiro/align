@@ -1114,7 +1114,7 @@ fn json_scan_malformed_row_errors() {
     // A malformed row mid-stream makes the terminal `Err`, and it is the SAME error `json.decode` of
     // the same malformed input produces — `Error.Code(1)` (pitfall P2: scan and decode agree). The
     // `describe` fold maps `Code(c)` to `20 + c`, so a correct scan exits 21 (not `NotFound`=10).
-    let src = "import core.json\nUser { id: i64, score: i64 }\nfn describe(r: Result<i64, Error>) -> i32 = match r {\n  Ok(_)  => -1,\n  Err(e) => match e {\n    NotFound => 10,\n    Invalid  => 11,\n    Denied   => 12,\n    Code(c)  => 20 + c,\n  },\n}\nfn main() -> i32 {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10}, oops]\")\n  return describe(rows.score.sum())\n}\n";
+    let src = "import core.json\nUser { id: i64, score: i64 }\nfn describe(r: Result<i64, Error>) -> i32 = match r {\n  Ok(_)  => -1,\n  Err(e) => match e {\n    NotFound => 10,\n    Invalid  => 11,\n    Denied   => 12,\n    Timeout  => 13,\n    Code(c)  => 20 + c,\n  },\n}\nfn main() -> i32 {\n  rows: json.scanner<User> := json.scan(\"[{\\\"id\\\":1,\\\"score\\\":10}, oops]\")\n  return describe(rows.score.sum())\n}\n";
     let out = build_and_run("json-scan-bad", src);
     assert_eq!(out.status.code(), Some(21));
 }

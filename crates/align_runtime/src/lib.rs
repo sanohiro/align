@@ -6796,16 +6796,22 @@ pub unsafe extern "C" fn align_rt_builder_free_stack(b: *mut Builder) {
 //   AL_NOT_FOUND success->Error.NotFound   (ENOENT)
 //   AL_INVALID   ->Error.Invalid           (EINVAL)
 //   AL_DENIED    ->Error.Denied            (EACCES / EPERM)
+//   AL_TIMEOUT   ->Error.Timeout           (returned EXPLICITLY at a timeout site — see below)
 //   >= AL_CODE   ->Error.Code(status - AL_CODE)   (anything else — the raw errno)
-// The three category sentinels sit below `AL_CODE` so they never collide with an encoded errno.
+// The four category sentinels sit below `AL_CODE` so they never collide with an encoded errno.
 // ---------------------------------------------------------------------------------------------
 
 const AL_NOT_FOUND: i32 = 1;
 const AL_INVALID: i32 = 2;
 const AL_DENIED: i32 = 3;
+/// `Error.Timeout` sentinel — a run/transport timeout. Surfaced ONLY by returning `AL_TIMEOUT`
+/// **explicitly** at a timeout site (e.g. `align_rt_command_run` on a `timeout_ns` overrun); it is
+/// never produced by `io_error_to_status`, so an unrelated `ETIMEDOUT` errno still maps to
+/// `Error.Code`, not `Error.Timeout`.
+const AL_TIMEOUT: i32 = 4;
 /// Base offset for `Error.Code(errno)`: an encoded status is `AL_CODE + errno`, kept above the
-/// three category sentinels so a small errno (e.g. `ESRCH` = 3) can never look like a category.
-const AL_CODE: i32 = 4;
+/// four category sentinels so a small errno (e.g. `ESRCH` = 3) can never look like a category.
+const AL_CODE: i32 = 5;
 
 /// The one fixed errno→`Error` table (`draft.md` §18.2). Uses `std::io::ErrorKind` so the mapping
 /// is portable (the kernel errno numbers differ per platform): `NotFound`←ENOENT, `PermissionDenied`
@@ -10475,13 +10481,18 @@ pub unsafe extern "C" fn align_rt_process_exec(
 /// A `command` (`std.process` Slice 4) — a Move builder handle owning the `execvp` lookup path
 /// (`cmd`), the child's full marshalled argv (incl. `argv[0]`, P5), and an optional working
 /// directory. Built by [`align_rt_command_new`], configured by [`align_rt_command_cwd`], run by
-/// [`align_rt_command_run`], freed by [`align_rt_command_free`]. Slice 4 carries only argv + cwd
-/// (env / timeout are Slices 5–6). `cmd` is stored SEPARATELY from `argv` because the `execvp` lookup
-/// path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
+/// [`align_rt_command_run`], freed by [`align_rt_command_free`]. Slice 4 carries argv + cwd; Slice 5
+/// adds `timeout_ns` (env is Slice 6). `cmd` is stored SEPARATELY from `argv` because the `execvp`
+/// lookup path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
 pub struct Command {
     cmd: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
     cwd: Option<std::ffi::CString>,
+    /// The run timeout in nanoseconds set by [`align_rt_command_timeout`], or `0` for "no timeout"
+    /// (the Slice-4 default — `run()` blocks until both pipes hit EOF). A positive value bounds
+    /// `align_rt_command_run`: past the deadline it `SIGKILL`s the child and returns [`AL_TIMEOUT`].
+    /// Never negative (the setter aborts a negative `ns`).
+    timeout_ns: i64,
 }
 
 /// A `run_output` (`std.process` Slice 4) — a Move handle owning one completed run's exit code plus
@@ -10546,16 +10557,42 @@ unsafe fn set_nonblocking(fd: i32) {
     }
 }
 
+/// Convert a remaining `Duration` until a deadline into the `poll` timeout argument (milliseconds).
+/// Returns `None` when the deadline has already passed (the caller must treat that as a timeout);
+/// otherwise `Some(ms)` clamped to `>= 1` (never a busy-spin `0`, which would be `poll`-returns-
+/// immediately) and to `i32::MAX` (a multi-week wait saturates rather than overflowing the `c_int`).
+fn poll_timeout_ms(remaining: std::time::Duration) -> Option<i32> {
+    if remaining.is_zero() {
+        return None;
+    }
+    let ms = remaining.as_millis();
+    // ns→ms rounds DOWN, so a sub-millisecond remainder (`0 < remaining < 1ms`) yields `ms == 0`;
+    // clamp up to `1` so `poll` still waits (a `0` timeout would return immediately and busy-spin).
+    Some(ms.clamp(1, i32::MAX as u128) as i32)
+}
+
 /// Drain BOTH capture pipes concurrently until each reaches EOF (P7 — the two-pipe deadlock is the
 /// #1 correctness point). `poll`s whichever read fds are still open, then reads all currently
 /// available bytes from each ready fd into its buffer. Both fds are non-blocking, so a `read` that
 /// would block returns `EAGAIN`/`EWOULDBLOCK` and we return to `poll`. `EINTR` is retried on both
-/// `poll` and `read`. A `read` of `0` (EOF) or a hard error closes that side; the loop ends when both
-/// sides are closed. Never panics; allocates only into the caller's buffers.
+/// `poll` and `read` (the deadline is recomputed on retry). A `read` of `0` (EOF) or a hard error
+/// closes that side; the loop ends when both sides are closed. Never panics; allocates only into the
+/// caller's buffers.
+///
+/// When `deadline` is `Some`, each `poll` waits only until that instant; on expiry the drain STOPS
+/// and returns `true` (timed out) with whatever was captured so far — the caller then `SIGKILL`s the
+/// child and drains again (with `deadline = None`) to EOF (P8). `None` = drain to EOF with no bound
+/// (the Slice-4 behavior — an infinite `-1` `poll`). Returns `true` iff it stopped on the deadline.
 ///
 /// # Safety
 /// `fd_out` / `fd_err` must be valid, open, non-blocking read descriptors.
-unsafe fn drain_two_pipes(fd_out: i32, fd_err: i32, out: &mut Vec<u8>, err: &mut Vec<u8>) {
+unsafe fn drain_two_pipes(
+    fd_out: i32,
+    fd_err: i32,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    deadline: Option<std::time::Instant>,
+) -> bool {
     let mut out_open = true;
     let mut err_open = true;
     let mut chunk = [0u8; 65536];
@@ -10573,10 +10610,29 @@ unsafe fn drain_two_pipes(fd_out: i32, fd_err: i32, out: &mut Vec<u8>, err: &mut
         if fds.is_empty() {
             break;
         }
-        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        // Compute this iteration's `poll` timeout from the deadline (recomputed each loop / EINTR
+        // retry). A passed deadline → stop now, reporting the timeout.
+        let timeout_ms = match deadline {
+            Some(d) => match poll_timeout_ms(d.saturating_duration_since(std::time::Instant::now())) {
+                Some(ms) => ms,
+                None => return true, // deadline already reached
+            },
+            None => -1, // infinite (Slice-4 behavior)
+        };
+        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
+        if rc == 0 {
+            // `poll` timed out. With a deadline set, that means we hit it (the clamp-to-1ms wait is
+            // always >= the true remaining, so a `0` return implies the instant has passed) — confirm
+            // and report the timeout. Without a deadline `poll(-1)` never returns 0, so this is
+            // unreachable there; treat a spurious 0 as "keep polling".
+            match deadline {
+                Some(d) if std::time::Instant::now() >= d => return true,
+                _ => continue,
+            }
+        }
         if rc < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: re-poll
+                continue; // EINTR: re-poll (deadline recomputed at the top of the loop)
             }
             // An unexpected poll error (should not happen with valid pipe fds): stop draining rather
             // than spin. The subsequent `waitpid` still reaps the child; captured-so-far bytes stand.
@@ -10628,6 +10684,25 @@ unsafe fn drain_two_pipes(fd_out: i32, fd_err: i32, out: &mut Vec<u8>, err: &mut
             }
         }
     }
+    false // both sides reached EOF (or a hard error / unexpected poll error) — not a timeout
+}
+
+/// Blocking `waitpid` reap of `pid`, retrying `EINTR`, so the child cannot become a zombie. Returns
+/// the raw wait status (feed to [`decode_wait_status`]). Shared by the normal and timeout paths of
+/// [`align_rt_command_run`].
+///
+/// # Safety
+/// `pid` must be a child of this process that has not yet been reaped.
+unsafe fn reap_child_blocking(pid: i32) -> i32 {
+    let mut status: i32 = 0;
+    loop {
+        let r = unsafe { waitpid(pid, &mut status, 0) };
+        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    status
 }
 
 /// `process.command(cmd, args)` — build a `Command` Move handle. `cmd` is the `str` lookup path
@@ -10656,7 +10731,7 @@ pub unsafe extern "C" fn align_rt_command_new(
         // A bad argv cannot be reported (the surface has no `Result`) — abort, like a header injection.
         Err(_) => panic_abort("process.command: invalid command/argv (empty, interior NUL, or non-UTF-8)"),
     };
-    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None }))
+    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None, timeout_ns: 0 }))
 }
 
 /// `c.cwd(dir)` — set the command's working directory (the child `chdir`s into it before `execvp`).
@@ -10678,11 +10753,33 @@ pub unsafe extern "C" fn align_rt_command_cwd(c: *mut Command, dir: *const u8, d
     unsafe { &mut *c }.cwd = Some(dir_c);
 }
 
+/// `c.timeout_ns(ns)` — set the command's run timeout in nanoseconds (the child is `SIGKILL`ed and
+/// `run()` returns `Err(Error.Timeout)` if it overruns). `ns == 0` means "no timeout" (the Slice-4
+/// default — `run()` blocks until EOF). A **negative** `ns` cannot be a duration — it **aborts** (a
+/// programmer error, like `kill`'s out-of-range signal and `cwd`'s bad path). Null command → abort (a
+/// null handle is a compiler-side invariant break, never reachable from a bound local). Overwrites any
+/// previously set timeout. No value.
+///
+/// # Safety
+/// `c` must be null or a valid `Command` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_timeout(c: *mut Command, ns: i64) {
+    if c.is_null() {
+        panic_abort("command.timeout_ns: null command handle");
+    }
+    if ns < 0 {
+        panic_abort("command.timeout_ns: negative timeout");
+    }
+    unsafe { &mut *c }.timeout_ns = ns;
+}
+
 /// `out := c.run()` — fork a child running the command with BOTH stdout and stderr captured, drain
 /// both pipes to EOF, reap the child, and write an owned `RunOutput` handle to `*out`. Returns `0` on
-/// success, `AL_INVALID` for a null argument or non-UTF-8 captured output, or a mapped errno for a
-/// `pipe`/`fork` failure. `c` is BORROWED (re-runnable — not consumed). Leaves `*out = null` on
-/// failure. The child inherits nothing but the two pipe write-ends (dup2'd onto 1/2); all
+/// success, `AL_INVALID` for a null argument or non-UTF-8 captured output, `AL_TIMEOUT` when the run
+/// overruns the command's `timeout_ns` (the child is `SIGKILL`ed and reaped, partial output
+/// discarded), or a mapped errno for a `pipe`/`fork` failure. `c` is BORROWED (re-runnable — not
+/// consumed). Leaves `*out = null` on any non-success. The child inherits nothing but the two pipe
+/// write-ends (dup2'd onto 1/2); all
 /// Align-owned fds are CLOEXEC (P3). A `chdir`/`execvp` failure in the child surfaces as exit code
 /// 127 in `out.code()` (the shell convention — the fork itself succeeded), NOT an `Err`.
 ///
@@ -10705,6 +10802,11 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
     argv_ptrs.push(core::ptr::null());
     let cmd_ptr = cmd.cmd.as_ptr() as *const u8;
     let cwd_ptr = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr() as *const u8);
+    // With a timeout, run the child in its OWN process group so the deadline kill reaps the whole
+    // tree it spawns (e.g. `sh -c "sleep 10"`'s `sleep` grandchild), not just the direct child —
+    // otherwise a surviving grandchild holds the capture pipes open and wedges the drain-to-EOF.
+    // Without a timeout, the group is unnecessary; keep the Slice-4 behavior byte-identical.
+    let use_pgroup = cmd.timeout_ns > 0;
 
     // Two CLOEXEC pipes: `[read, write]` for stdout and stderr.
     let out_pipe = match unsafe { make_pipe_cloexec() } {
@@ -10740,6 +10842,13 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
     if pid == 0 {
         // Child. Only async-signal-safe-ish libc calls here (the `execvp` caveat above); no `malloc`.
         unsafe {
+            // New process group (leader = this pid) so a timeout kill(-pgid) reaps the whole tree.
+            // Done in BOTH child and parent (the classic race-free double `setpgid`): whichever runs
+            // first wins, the other is a harmless no-op / EACCES-after-exec. Errors are ignored (a
+            // failure only loses the group-kill, never memory safety).
+            if use_pgroup {
+                setpgid(0, 0);
+            }
             if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 {
                 _exit(127); // a bad cwd → 127, the "command could not run" convention (P not an Err)
             }
@@ -10765,31 +10874,62 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
         }
     }
 
-    // Parent. Close the write ends (so our reads see EOF once the child's last writer closes), set
-    // both read ends non-blocking, and drain both concurrently to EOF (P7).
+    // Parent. Race-free half of the `setpgid` pair (see the child): ensure the child is in its own
+    // process group before we might signal it. Ignore the result (EACCES if the child already exec'd,
+    // ESRCH if it already exited — both fine; the child's own `setpgid` covers those cases).
+    if use_pgroup {
+        unsafe { setpgid(pid, pid) };
+    }
+    // Close the write ends (so our reads see EOF once the child's last writer closes), set both read
+    // ends non-blocking, and drain both concurrently to EOF (P7).
     unsafe {
         close(out_pipe[1]);
         close(err_pipe[1]);
         set_nonblocking(out_pipe[0]);
         set_nonblocking(err_pipe[0]);
     }
+    // A positive `timeout_ns` bounds the drain: past the deadline the child is `SIGKILL`ed and the run
+    // reports `Error.Timeout` (P8). `0` (or the default) means no timeout — drain to EOF (Slice-4).
+    // `checked_add`, not `+`: `Instant + Duration` PANICS if the result is unrepresentable, and
+    // `timeout_ns` is an arbitrary user `i64` (`c.timeout_ns(...)`) — a near-`i64::MAX` value (~292
+    // years) would overflow the platform `Instant`. An overflow falls back to `None` (no bound); a
+    // timeout that far out is indistinguishable from "no timeout" anyway. Never panics.
+    let deadline = if cmd.timeout_ns > 0 {
+        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(cmd.timeout_ns as u64))
+    } else {
+        None
+    };
     let mut out_buf: Vec<u8> = Vec::new();
     let mut err_buf: Vec<u8> = Vec::new();
-    unsafe { drain_two_pipes(out_pipe[0], err_pipe[0], &mut out_buf, &mut err_buf) };
+    let timed_out = unsafe { drain_two_pipes(out_pipe[0], err_pipe[0], &mut out_buf, &mut err_buf, deadline) };
+    if timed_out {
+        // The child overran the deadline (P8). `SIGKILL` the whole process GROUP (signal 9 to `-pid`
+        // — the child leads its own group here, so this reaps grandchildren like a `sleep` under
+        // `sh -c`). Then **do NOT re-drain**: the partial capture is DISCARDED anyway ("report the
+        // timeout, don't return a half-answer"; `*out` stays null), so draining buys nothing — and a
+        // `deadline = None` (infinite) re-drain would REINTRODUCE the very unbounded block this
+        // feature exists to prevent. `kill(-pid)` cannot reach a descendant that escaped the group
+        // (a `setsid`/daemonizing grandchild), and such a descendant inherits the pipe write-end
+        // (fds 1/2 are not CLOEXEC), so an EOF-drain could wait on it forever. Instead: close our read
+        // ends now (a surviving writer just gets EPIPE on its next write — harmless to us) and reap
+        // the leader. The SIGKILL'd direct child dies promptly, so `reap_child_blocking` does not
+        // block; any escaped grandchild is reparented to init, which reaps it. Wall-clock is thus
+        // bounded unconditionally.
+        unsafe { kill(-pid, 9) };
+        unsafe {
+            close(out_pipe[0]);
+            close(err_pipe[0]);
+        }
+        unsafe { reap_child_blocking(pid) };
+        return AL_TIMEOUT;
+    }
     unsafe {
         close(out_pipe[0]);
         close(err_pipe[0]);
     }
 
     // Reap the child (no zombie). `EINTR` is retried.
-    let mut status: i32 = 0;
-    loop {
-        let r = unsafe { waitpid(pid, &mut status, 0) };
-        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        break;
-    }
+    let status = unsafe { reap_child_blocking(pid) };
     let code = decode_wait_status(status);
 
     // The `str` accessors cannot expose non-UTF-8 bytes (the `fs.read_file` string-vs-bytes rule):
@@ -11404,6 +11544,12 @@ unsafe extern "C" {
     // still performs the existence/permission check (the POSIX liveness probe). Identical prototype on
     // Linux and macOS/BSD.
     fn kill(pid: i32, sig: i32) -> i32;
+    // `setpgid(2)` — `process.command(...).run()` with a `timeout_ns` (Slice 5): the forked child puts
+    // itself in a NEW process group (its own pid as pgid) so a timeout `kill(-pgid)` reaps the WHOLE
+    // tree the command spawns — not just the direct child. Without it, `sh -c "sleep 10"` leaves the
+    // `sleep` grandchild holding the capture pipes open past the kill, wedging the drain-to-EOF.
+    // Async-signal-safe. Identical prototype on Linux and macOS/BSD.
+    fn setpgid(pid: i32, pgid: i32) -> i32;
     // `dup2`/`chdir` — `process.command(...).run()` (Slice 4): the forked child `dup2`s the two capture
     // pipe write-ends onto fds 1/2 and (if a cwd was set) `chdir`s into it before `execvp`. Both are
     // async-signal-safe. Identical prototypes on Linux and macOS/BSD.
@@ -23200,6 +23346,67 @@ mod tests {
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, AL_INVALID, "non-UTF-8 stdout → Err(Invalid)");
         assert!(out.is_null(), "no run_output handle is written on invalid output");
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// P8 — a child that overruns `timeout_ns` is `SIGKILL`ed and the run reports `AL_TIMEOUT`,
+    /// promptly (well under the child's own 10 s sleep, proving it was killed, not waited out) and
+    /// with no leaked handle. The internal `reap_child_blocking` means it cannot leave a zombie.
+    #[test]
+    fn command_timeout_kills_a_hung_child() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "sleep 10"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        // 100 ms timeout on a 10 s child.
+        unsafe { align_rt_command_timeout(c, 100_000_000) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        let start = std::time::Instant::now();
+        let rc = unsafe { align_rt_command_run(c, &mut out) };
+        let elapsed = start.elapsed();
+        assert_eq!(rc, AL_TIMEOUT, "a hung child past its timeout → AL_TIMEOUT");
+        assert!(out.is_null(), "no run_output handle on a timeout (partial output discarded)");
+        assert!(elapsed < std::time::Duration::from_secs(5), "killed promptly, not waited out (took {elapsed:?})");
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// A child that finishes WITHIN its timeout runs normally: `0` + the correct captured output (the
+    /// timeout path is not taken). Re-uses the handle to prove a set-but-unexceeded timeout is inert.
+    #[test]
+    fn command_timeout_not_triggered_when_child_finishes_in_time() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "printf fast-line; exit 4"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        // A generous 30 s timeout the quick child never approaches.
+        unsafe { align_rt_command_timeout(c, 30_000_000_000) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0, "finished in time → normal success");
+        assert!(!out.is_null());
+        assert_eq!(unsafe { align_rt_run_output_code(out) }, 4);
+        assert_eq!(unsafe { ro_stdout(out) }, "fast-line");
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    /// `timeout_ns == 0` (the default) is "no timeout" — a slow-ish child still runs to completion.
+    #[test]
+    fn command_timeout_zero_is_no_timeout() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "sleep 0.2; printf done"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        unsafe { align_rt_command_timeout(c, 0) }; // explicit "no timeout"
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert_eq!(unsafe { ro_stdout(out) }, "done");
+        unsafe { align_rt_run_output_free(out) };
         unsafe { align_rt_command_free(c) };
     }
 

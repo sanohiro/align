@@ -109,7 +109,7 @@ fn builtin_error_categories_and_match() {
     }
     // 4b-2: the canonical `Error` is a sum type — `Error.NotFound` / `Error.Code(c)` construct it,
     // and `match` discriminates the categories. Here the error is matched into an exit code.
-    let src = "fn check(n: i32) -> Result<i32, Error> {\n  if n == 0 { return Err(Error.NotFound) }\n  if n < 0  { return Err(Error.Code(n)) }\n  return Ok(n)\n}\nfn describe(r: Result<i32, Error>) -> i32 = match r {\n  Ok(v)  => v,\n  Err(e) => match e {\n    NotFound => 100,\n    Invalid  => 101,\n    Denied   => 102,\n    Code(c)  => c,\n  },\n}\nfn main() -> i32 {\n  return describe(check(5)) + describe(check(0))\n}\n";
+    let src = "fn check(n: i32) -> Result<i32, Error> {\n  if n == 0 { return Err(Error.NotFound) }\n  if n < 0  { return Err(Error.Code(n)) }\n  return Ok(n)\n}\nfn describe(r: Result<i32, Error>) -> i32 = match r {\n  Ok(v)  => v,\n  Err(e) => match e {\n    NotFound => 100,\n    Invalid  => 101,\n    Denied   => 102,\n    Timeout  => 103,\n    Code(c)  => c,\n  },\n}\nfn main() -> i32 {\n  return describe(check(5)) + describe(check(0))\n}\n";
     let out = build_and_run("error-categories", src);
     assert_eq!(out.status.code(), Some(105)); // 5 + NotFound(100)
 }

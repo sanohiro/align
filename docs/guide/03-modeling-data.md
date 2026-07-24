@@ -116,7 +116,7 @@ Construct with `(a, b)`, destructure with `(q, r) :=`, or index positionally: `t
 
 ## The built-in `Error`
 
-One sum type ships with the language: `Error`, the standard error payload of `Result<T, Error>`. Its variants are the categories the OS boundary needs — `NotFound`, `Invalid`, `Denied`, and `Code(i32)` for everything else. You cannot redeclare `Error`; you can match on it like any sum type:
+One sum type ships with the language: `Error`, the standard error payload of `Result<T, Error>`. Its variants are the categories the OS boundary needs — `NotFound`, `Invalid`, `Denied`, `Timeout` (a run/transport deadline), and `Code(i32)` for everything else. You cannot redeclare `Error`; you can match on it like any sum type:
 
 ```align
 fn describe(e: Error) -> i64 = match e {
