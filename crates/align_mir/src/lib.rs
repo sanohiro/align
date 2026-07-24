@@ -5314,11 +5314,11 @@ fn lower_field_access(
     v
 }
 
-/// Load a **whole** struct element `src[index]` for a `map(f)` whose `f` consumes the struct by
-/// value (the whole-element companion of [`lower_field_access`]). A fixed stack `array<Struct>`
-/// (`struct_view == None`) loads the aggregate straight from its slot ([`Rvalue::Index`]); an
-/// owned dynamic `array<Struct>` view loads through the buffer pointer ([`Rvalue::IndexPtr`]). The
-/// `match layout` mirrors the field seam: `Layout::Soa` (M6) makes it non-exhaustive here too.
+/// Load a **whole** struct element `src[index]` for a consumer that needs it by value (the
+/// whole-element companion of [`lower_field_access`]). A fixed stack `array<Struct>`
+/// (`struct_view == None`) loads the aggregate straight from its slot ([`Rvalue::Index`]); an owned
+/// dynamic `array<Struct>` view loads through the buffer pointer ([`Rvalue::IndexPtr`]); and a
+/// borrowed `soa<Struct>` gathers the aggregate from its columns ([`Rvalue::SoaGather`]).
 fn lower_struct_elem(
     b: &mut Builder,
     struct_view: Option<(u32, Layout)>,
@@ -5338,10 +5338,16 @@ fn lower_struct_elem(
                     struct_id: sid,
                 },
             )),
-            // Loading a whole struct out of a `soa` would gather every column at `index`. The first
-            // soa cut allows only field projection / `where(.field)`, so sema rejects a whole-struct
-            // stage over soa and this is unreachable.
-            Layout::Soa => unreachable!("whole-struct access over a soa source is rejected in sema"),
+            // Sema rejects a whole-struct map/where stage over soa, but a direct `.to_array()`
+            // deliberately gathers every column to materialize the AoS result.
+            Layout::Soa => b.push(Stmt::Let(
+                v,
+                Rvalue::SoaGather {
+                    base: slice_val.clone().expect("a soa source has a {ptr,len} value"),
+                    index: index.clone(),
+                    struct_id: sid,
+                },
+            )),
         },
         None => b.push(Stmt::Let(v, Rvalue::Index(slot, index.clone()))),
     }
@@ -6115,8 +6121,20 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     }
 
     // append: out_ptr[out_idx] = <value>; out_idx += 1. For `to_array` the value is the
-    // element; for `scan` it is the updated accumulator `acc = f(acc, element)`.
-    let cur = cur.expect("to_array/scan needs a scalar element");
+    // element; for `scan` it is the updated accumulator `acc = f(acc, element)`. A struct source
+    // deliberately has no eager scalar `cur`: load the whole element here, just as a whole-struct
+    // `map`/`where` argument does above. This also preserves the element after `where`, whose
+    // predicate load does not replace `cur`.
+    let cur = match cur {
+        Some(cur) => cur,
+        None => {
+            let sid = match source.ty {
+                Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => id,
+                _ => unreachable!("a collect without a loaded element must be over a struct array"),
+            };
+            Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+        }
+    };
     let value = match (&kind, scan_acc) {
         (CollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
             let prev = b.fresh_value(elem);
