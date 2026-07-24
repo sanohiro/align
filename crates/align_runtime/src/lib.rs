@@ -7150,6 +7150,139 @@ pub unsafe extern "C" fn align_rt_regex_replace(
     AlignStr { ptr: dst, len }
 }
 
+/// Opaque owned handle for one match's capture-group spans. `spans` holds `2 * group_count` `i64`s
+/// (`start`, `end` per group); a non-participating group is the sentinel `start == -1`. Group 0 is
+/// the whole match. Freed through [`align_rt_regex_captures_free`].
+pub struct CapturesHandle {
+    spans: Box<[i64]>,
+}
+
+/// Total capture groups in the pattern, including group 0 (the whole match). A property of the
+/// compiled pattern, so it takes the regex handle, not a `captures`.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_group_count(handle: *const RegexHandle) -> i64 {
+    if handle.is_null() {
+        return 0;
+    }
+    regex_offset(unsafe { &*handle }.inner.captures_len())
+}
+
+/// Resolve a named group to its numbered index, or `-1` if the pattern has no such name. A property
+/// of the compiled pattern.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `name_ptr`/`name_len` must be readable UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_group_index(
+    handle: *const RegexHandle,
+    name_ptr: *const u8,
+    name_len: i64,
+) -> i64 {
+    if handle.is_null() || name_len < 0 || (name_len > 0 && name_ptr.is_null()) {
+        return -1;
+    }
+    let Some(name) = (unsafe { abi_str_view(name_ptr, name_len) }) else {
+        return -1;
+    };
+    unsafe { &*handle }
+        .inner
+        .capture_names()
+        .position(|n| n == Some(name))
+        .map_or(-1, regex_offset)
+}
+
+/// Capture the first match in `text`, materializing its group spans into a fresh handle. Returns `1`
+/// and writes the handle on a match, else `0` and `out = null` (no match). Non-participating groups
+/// are stored as the sentinel `start == -1`.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `text_ptr`/`text_len` must be readable UTF-8; `out`
+/// must point to writable storage for one handle pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_captures(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+    out: *mut *mut CapturesHandle,
+) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if handle.is_null() || text_len < 0 || (text_len > 0 && text_ptr.is_null()) {
+        return 0;
+    }
+    let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
+        return 0;
+    };
+    let Some(caps) = unsafe { &*handle }.inner.captures(text) else {
+        return 0;
+    };
+    let mut spans: Vec<i64> = Vec::with_capacity(caps.len() * 2);
+    for i in 0..caps.len() {
+        match caps.get(i) {
+            Some(m) => {
+                spans.push(regex_offset(m.start()));
+                spans.push(regex_offset(m.end()));
+            }
+            None => {
+                spans.push(-1);
+                spans.push(-1);
+            }
+        }
+    }
+    let boxed = Box::new(CapturesHandle { spans: spans.into_boxed_slice() });
+    unsafe { *out = Box::into_raw(boxed) };
+    1
+}
+
+/// Read capture group `index` from a `captures` handle. Returns `1` and writes the half-open span on
+/// a participating group, `0` for a non-participating group (`None`). An out-of-range `index` is a
+/// programmer error and aborts, matching `find_at`'s slice-boundary model.
+///
+/// # Safety
+/// `caps` must point to a live captures handle; `out` must point to writable storage for one
+/// [`AlignRegexMatch`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_captures_group(
+    caps: *const CapturesHandle,
+    index: i64,
+    out: *mut AlignRegexMatch,
+) -> i32 {
+    if caps.is_null() || out.is_null() {
+        return 0;
+    }
+    unsafe { out.write(AlignRegexMatch { start: 0, end: 0 }) };
+    let spans = &unsafe { &*caps }.spans;
+    let count = spans.len() / 2;
+    let Ok(i) = usize::try_from(index) else {
+        panic_abort("regex captures.group: index must be a non-negative group number");
+    };
+    if i >= count {
+        panic_abort("regex captures.group: group index is out of range");
+    }
+    let start = spans[2 * i];
+    if start < 0 {
+        return 0; // non-participating group
+    }
+    unsafe { out.write(AlignRegexMatch { start, end: spans[2 * i + 1] }) };
+    1
+}
+
+/// Drop a captures handle. Null-safe for moved/uninitialized drop slots.
+///
+/// # Safety
+/// `caps` must be null or a pointer returned by [`align_rt_regex_captures`] not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_captures_free(caps: *mut CapturesHandle) {
+    if !caps.is_null() {
+        drop(unsafe { Box::from_raw(caps) });
+    }
+}
+
 /// Drop a compiled regex handle. Null-safe for moved/uninitialized drop slots.
 ///
 /// # Safety
@@ -28771,5 +28904,74 @@ mod regex_tests {
         // A null out pointer is a no-op, not a crash.
         assert_eq!(unsafe { align_rt_regex_find_all(h, "x".as_ptr(), 1, core::ptr::null_mut()) }, 0);
         unsafe { align_rt_regex_free(h) };
+    }
+
+    /// Capture `text`, returning the group spans (`None` = the group did not participate), then free.
+    fn captures(h: *const RegexHandle, text: &str) -> Option<Vec<Option<(i64, i64)>>> {
+        let mut caps: *mut CapturesHandle = core::ptr::null_mut();
+        let flag =
+            unsafe { align_rt_regex_captures(h, text.as_ptr(), text.len() as i64, &mut caps) };
+        if flag == 0 {
+            assert!(caps.is_null(), "a no-match must leave the out pointer null");
+            return None;
+        }
+        let count = unsafe { align_rt_regex_group_count(h) };
+        let mut groups = Vec::new();
+        for i in 0..count {
+            let mut m = AlignRegexMatch { start: 0, end: 0 };
+            let g = unsafe { align_rt_regex_captures_group(caps, i, &mut m) };
+            groups.push(if g == 1 { Some((m.start, m.end)) } else { None });
+        }
+        unsafe { align_rt_regex_captures_free(caps) };
+        Some(groups)
+    }
+
+    #[test]
+    fn group_count_and_index() {
+        let re = compile(r"(?P<y>[0-9]{4})-(?P<m>[0-9]{2})");
+        assert_eq!(unsafe { align_rt_regex_group_count(re) }, 3); // group 0 + y + m
+        let idx = |name: &str| unsafe { align_rt_regex_group_index(re, name.as_ptr(), name.len() as i64) };
+        assert_eq!(idx("y"), 1);
+        assert_eq!(idx("m"), 2);
+        assert_eq!(idx("zzz"), -1); // unknown name
+        unsafe { align_rt_regex_free(re) };
+    }
+
+    #[test]
+    fn captures_spans_and_nonparticipating() {
+        let re = compile(r"(?P<y>[0-9]{4})-(?P<m>[0-9]{2})");
+        let g = captures(re, "2026-07").expect("a match");
+        assert_eq!(g[0], Some((0, 7))); // whole match
+        assert_eq!(g[1], Some((0, 4))); // year
+        assert_eq!(g[2], Some((5, 7))); // month
+        assert!(captures(re, "nope").is_none());
+        unsafe { align_rt_regex_free(re) };
+        // A non-participating alternation group is None, group 0 is always the whole match.
+        let alt = compile("(a)|(b)");
+        let g = captures(alt, "b").expect("a match");
+        assert_eq!(g[0], Some((0, 1)));
+        assert_eq!(g[1], None); // (a) did not participate
+        assert_eq!(g[2], Some((0, 1)));
+        unsafe { align_rt_regex_free(alt) };
+    }
+
+    #[test]
+    fn captures_abi_guards() {
+        let re = compile("x");
+        // A null handle / negative len → no match, null out.
+        let mut caps: *mut CapturesHandle = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_regex_captures(core::ptr::null(), "x".as_ptr(), 1, &mut caps) }, 0);
+        assert!(caps.is_null());
+        assert_eq!(unsafe { align_rt_regex_captures(re, "x".as_ptr(), -1, &mut caps) }, 0);
+        assert!(caps.is_null());
+        // group_count / group_index null-handle guards.
+        assert_eq!(unsafe { align_rt_regex_group_count(core::ptr::null()) }, 0);
+        assert_eq!(unsafe { align_rt_regex_group_index(core::ptr::null(), "y".as_ptr(), 1) }, -1);
+        // captures_group on a null handle / null out is a no-op returning 0 (not a crash).
+        let mut m = AlignRegexMatch { start: 0, end: 0 };
+        assert_eq!(unsafe { align_rt_regex_captures_group(core::ptr::null(), 0, &mut m) }, 0);
+        // captures_free is null-safe.
+        unsafe { align_rt_regex_captures_free(core::ptr::null_mut()) };
+        unsafe { align_rt_regex_free(re) };
     }
 }

@@ -613,6 +613,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(text),
             operand_str(repl)
         ),
+        Rvalue::RegexCaptures { regex, text, out } => {
+            format!("regex_captures({}, {}, -> _{out})", operand_str(regex), operand_str(text))
+        }
+        Rvalue::RegexGroupCount { regex } => format!("regex_group_count({})", operand_str(regex)),
+        Rvalue::RegexGroupIndex { regex, name } => {
+            format!("regex_group_index({}, {})", operand_str(regex), operand_str(name))
+        }
+        Rvalue::CapturesGroup { caps, index, out } => {
+            format!("captures_group({}, {}, -> _{out})", operand_str(caps), operand_str(index))
+        }
         Rvalue::CliCommand { name } => format!("cli_command({})", operand_str(name)),
         Rvalue::CliFlag { cmd, kind, name, default } => match default {
             Some(d) => format!("cli_flag_{kind:?}({}, {}, {})", operand_str(cmd), operand_str(name), operand_str(d)),

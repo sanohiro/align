@@ -480,3 +480,98 @@ pub fn main() -> Result<(), Error> {
     // "banana"->"bXnXnX" (6) + "none" (4) = 10 per iteration * 1000 = 10000.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10000\n");
 }
+
+// --- captures / group_count / group_index / caps.group ------------------------------------------
+
+/// `captures` returns an owned Move handle (`Option<captures>`); `group_count` counts groups incl.
+/// group 0; `group_index` resolves a named group to its numbered index (`None` = unknown); `group(i)`
+/// reads a group's `Option<regex_match>` (group 0 = whole match, non-participating = `None`).
+#[test]
+fn captures_semantics() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  re := regex.compile(\"(?P<y>[0-9]{4})-(?P<m>[0-9]{2})-(?P<d>[0-9]{2})\")?
+  print(re.group_count())              // 4
+  s := \"2026-07-24\"
+  match re.captures(s) {
+    Some(caps) => {
+      match caps.group(0) { Some(m) => print(s[m.start .. m.end]), None => print(\"n0\") }
+      match re.group_index(\"m\") {
+        Some(i) => { match caps.group(i) { Some(m) => print(s[m.start .. m.end]), None => print(\"nm\") } }
+        None => print(\"noidx\"),
+      }
+      match re.group_index(\"zzz\") { Some(i) => print(i), None => print(\"unknown\") }
+    }
+    None => print(\"no-match\"),
+  }
+  match re.captures(\"hello\") { Some(caps) => print(\"m?!\"), None => print(\"nomatch-ok\") }
+  // A non-participating alternation group is None; group 0 is the whole match.
+  alt := regex.compile(\"(a)|(b)\")?
+  match alt.captures(\"b\") {
+    Some(caps) => {
+      match caps.group(1) { Some(m) => print(\"part\"), None => print(\"g1-none\") }
+      match caps.group(2) { Some(m) => print(s[0 .. 0]), None => print(\"n2\") }
+    }
+    None => print(\"no\"),
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-captures", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // group_count, whole match, ${m}, unknown name, no-match, non-participating group, empty g2 slice.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n2026-07-24\n07\nunknown\nnomatch-ok\ng1-none\n\n");
+}
+
+/// `caps.group(i)` with `i` past the group count is a programmer error and aborts (the `find_at`
+/// slice-boundary model), not a silent wrong read.
+#[test]
+fn captures_group_out_of_range_aborts() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  re := regex.compile(\"(a)(b)\")?
+  match re.captures(\"ab\") {
+    Some(caps) => {
+      match caps.group(3) { Some(m) => print(\"got\"), None => print(\"none\") }
+    }
+    None => print(\"no\"),
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-captures-oob", prog);
+    // Aborts (a signal), not a clean exit.
+    assert_ne!(out.status.code(), Some(0), "an out-of-range group index must abort");
+}
+
+/// Capturing many times in a loop exits cleanly — the `Option<captures>` Move handle `Drop`s each
+/// iteration (its `align_rt_regex_captures_free`) with no leak or double-free.
+#[test]
+fn captures_drop_in_a_loop_is_clean() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  re := regex.compile(\"(a+)(b+)\")?
+  mut i := 0
+  mut total := 0
+  loop {
+    if i >= 1000 { break }
+    match re.captures(\"aaabbb\") {
+      Some(caps) => {
+        match caps.group(1) { Some(m) => { total = total + (m.end - m.start) } None => { total = total + 0 } }
+      }
+      None => { total = total + 0 }
+    }
+    i = i + 1
+  }
+  print(total)
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-captures-loop", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // group 1 = "aaa" (3) each iteration * 1000.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3000\n");
+}
