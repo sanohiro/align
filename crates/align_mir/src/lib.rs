@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Scalar, Ty};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -836,6 +836,14 @@ pub enum Rvalue {
     /// (`{ptr,len}`) into an owned `buffer` handle written to `out`; yields an `i32` status
     /// (0 = ok, `AL_INVALID` -> `Error.Invalid`; see [`make_error_from_status`]). The caller branches
     /// `Ok(buffer)` / `Err`. Pure.
+    /// `regex.compile(pattern)` — compile `pattern` (`{ptr,len}`) into an owned regex handle written
+    /// to `out`, returning an `i32` status (0 success, `AL_INVALID` for syntax/resource rejection).
+    RegexCompile { pattern: Operand, out: Slot },
+    /// `re.is_match(text)` — runtime i32 present flag; lowering compares it with zero for Align bool.
+    RegexIsMatch { regex: Operand, text: Operand },
+    /// `re.find[_at](text, start)` — write the builtin `regex_match` struct into `out`, returning an
+    /// i32 present flag. `start` is always explicit here (`find` lowers as zero).
+    RegexFind { regex: Operand, text: Operand, start: Operand, out: Slot },
     EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
     /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
@@ -2101,7 +2109,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -3301,6 +3309,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::CliUsage { cmd: cop }));
             Operand::Value(v)
         }
+        // `std.regex` stays one recursive-match arm for expression-depth headroom; the dispatcher
+        // handles compile / match / find out of line.
+        hir::ExprKind::RegexCompile { .. }
+        | hir::ExprKind::RegexIsMatch { .. }
+        | hir::ExprKind::RegexFind { .. } => lower_regex_expr(b, e),
         // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
         // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
         // match grows by exactly one arm (not seven). A deep expression tree recurses through
@@ -6878,6 +6891,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Buffer
+        | Scalar::Regex
         | Scalar::CliParsed
         | Scalar::TcpConn
         | Scalar::TcpListener
@@ -9226,6 +9240,77 @@ fn lower_http_get_many(
     Operand::Value(r)
 }
 
+/// Lower the complete first `std.regex` slice out of line: fallible compile to an owned handle,
+/// boolean search, and optional byte-span search. Keeping it outside the recursive dispatcher
+/// preserves the expression-depth headroom established for later std modules.
+#[inline(never)]
+fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::RegexCompile { pattern } => {
+            let out = b.new_slot(Ty::Regex);
+            let p = lower_expr(b, pattern);
+            lower_http_response_result(b, Rvalue::RegexCompile { pattern: p, out }, out, Ty::Regex, e.ty)
+        }
+        hir::ExprKind::RegexIsMatch { regex, text } => {
+            let re = lower_expr(b, regex);
+            let t = lower_expr(b, text);
+            let flag = b.fresh_value(status_ty());
+            b.push(Stmt::Let(flag, Rvalue::RegexIsMatch { regex: re, text: t }));
+            let matched = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                matched,
+                Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty()))),
+            ));
+            Operand::Value(matched)
+        }
+        hir::ExprKind::RegexFind { regex, text, start } => {
+            let Ty::Option(Scalar::Struct(match_id)) = e.ty else {
+                unreachable!("RegexFind must return Option<regex_match>")
+            };
+            let out = b.new_slot(Ty::Struct(match_id));
+            let re = lower_expr(b, regex);
+            let t = lower_expr(b, text);
+            let start = start
+                .as_ref()
+                .map(|s| lower_expr(b, s))
+                .unwrap_or(Operand::Const(Const::Int(0, i64_ty())));
+            let flag = b.fresh_value(status_ty());
+            b.push(Stmt::Let(flag, Rvalue::RegexFind { regex: re, text: t, start, out }));
+
+            let present = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                present,
+                Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty()))),
+            ));
+            let some_bb = b.new_block();
+            let none_bb = b.new_block();
+            let join = b.new_block();
+            let rslot = b.new_slot(e.ty);
+            b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+            b.cur = some_bb;
+            let m = b.fresh_value(Ty::Struct(match_id));
+            b.push(Stmt::Let(m, Rvalue::Load(out)));
+            let some = b.fresh_value(e.ty);
+            b.push(Stmt::Let(some, Rvalue::OptionSome(Operand::Value(m))));
+            b.push(Stmt::Store(rslot, Operand::Value(some)));
+            b.terminate(Term::Goto(join));
+
+            b.cur = none_bb;
+            let none = b.fresh_value(e.ty);
+            b.push(Stmt::Let(none, Rvalue::OptionNone));
+            b.push(Stmt::Store(rslot, Operand::Value(none)));
+            b.terminate(Term::Goto(join));
+
+            b.cur = join;
+            let result = b.fresh_value(e.ty);
+            b.push(Stmt::Let(result, Rvalue::Load(rslot)));
+            Operand::Value(result)
+        }
+        _ => unreachable!("lower_regex_expr called for a non-regex expression"),
+    }
+}
+
 /// The shared Ok/Err lowering for the ops that write an owned handle of type `ok_ty` into `out` and
 /// return an `i32` status (`code_rv` is the runtime-call Rvalue, its `out` slot already set to `out`):
 /// `http.parse` and the Slice-2 client `get`/`post`/`request` (`ok_ty = HttpResponse`), plus the Slice-4
@@ -10033,6 +10118,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::HttpHeaders => "http_headers".to_string(),
+        Ty::Regex => "regex".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
@@ -10117,9 +10203,10 @@ mod tests {
     fn struct_lowers_to_field_stores_and_loads() {
         let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
         let p = lower(src);
-        // `Point` plus the always-registered builtin `argon2_params` struct (the std.crypto Argon2
-        // parameters type — present in every program's struct table, like the builtin `Error` enum).
-        assert_eq!(p.structs.len(), 2);
+        // `Point` plus the always-registered builtin structs `argon2_params` (the std.crypto Argon2
+        // parameters type) and `regex_match` (the std.regex match span) — both present in every
+        // program's struct table, like the builtin `Error` enum.
+        assert_eq!(p.structs.len(), 3);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.

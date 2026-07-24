@@ -683,6 +683,24 @@ converge on this:
   model (`pub` + the `internal` path rule) is deliberately the whole story; a second granularity
   (`pub(pkg)`, export lists, re-exports) is the complexity budget Align refuses.
 
+## Why regex is `std.regex`, not language syntax
+
+Regex is useful application machinery, but it does not change Align's grammar, type system, or
+optimization model. Making patterns ordinary `str` values and compilation an explicit fallible
+operation preserves the language's existing rules: allocation is visible through an owned Move
+handle, malformed input is a `Result`, repeated work is avoided by binding and reusing the handle,
+and there is no hidden global cache. A regex literal would add lexer/parser/constant-evaluation
+surface before any demonstrated need and would create a second way to compile the same pattern.
+
+The engine choice follows the resource-oriented north star: an automata implementation with
+predictable worst-case search behavior is preferable to a more expressive backtracking engine whose
+runtime may explode on adversarial input. Therefore v1 deliberately excludes backreferences and
+look-around, returns byte spans rather than allocating matched strings, and starts with only
+compile/is_match/find/find_at. Captures/replacement/split can be added at the library boundary when a
+real consumer establishes their ownership and allocation shapes; none requires a language change.
+
+---
+
 ## In one sentence
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.

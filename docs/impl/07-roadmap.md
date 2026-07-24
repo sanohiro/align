@@ -3382,6 +3382,22 @@ The two recorded post-M15 follow-ups are therefore complete. No mandatory implem
 queued; fully-escaping function values stay deferred until the heap-owned environment/drop model
 is settled and has a consumer.
 
+### Post-M15 std.regex first slice — SHIPPED (2026-07-23)
+
+Application-side text processing now has an explicit `std.regex` design and implementation:
+`regex.compile(pattern) -> Result<regex, Error>`, borrowed `is_match` / `find` / `find_at`, and the
+builtin Copy `regex_match { start, end }` byte span. The owned compiled handle is swept through
+sema/HIR/MIR/LLVM/drop lowering and backed by the Rust `regex` crate (1.13.1) with a 64 KiB pattern
+limit and 10 MiB compiled-program limit. The module is intentionally library-only (no literal syntax
+or implicit cache); captures/replace/split/iteration wait for an application consumer. Built, tested,
+and IR-verified 2026-07-23 after porting from the Windows authoring machine: `regex` 1.13.1 added to
+`Cargo.lock`, workspace suite green (2686 passed / 0 failed), 8 runtime FFI unit tests (`regex_tests`)
++ 13 driver E2E tests (`std_regex.rs`), `clippy -D warnings` clean, and MIR/LLVM IR checked (i32
+status ABI, `{i64,i64}` match slot, exactly one `regex_free` on the drop path). An independent
+adversarial soundness review found no memory-safety or drop defects and no missing analysis-pass
+entry; its one finding — `find_at` anchors from the true input start, not the offset — is now
+documented and pinned by a test.
+
 **WRAPPER-HIDDEN LOCAL-SLICE ESCAPES FIXED — MERGED as #459 (2026-07-15; workspace 2078 green =
 2077 passed + one ignored manual probe; clippy `-D warnings` clean).** The direct local-array slice
 return check only ran when the outer expression itself was `slice<T>`, so `Ok(xs[..])` or

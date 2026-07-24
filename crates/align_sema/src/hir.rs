@@ -1092,6 +1092,19 @@ pub enum ExprKind {
     /// owned `array<T>` (`ty` = [`crate::Ty::DynArray`]); `k < 0` or `k > xs.len()` aborts at
     /// runtime. `rng` is a bound mut local. Impure.
     RandSample { rng: Box<Expr>, xs: Box<Expr>, k: Box<Expr>, elem: crate::Ty },
+    /// `regex.compile(pattern)` — compile `pattern` into a fresh owned [`crate::Ty::Regex`] handle,
+    /// yielding `Result<regex, Error>`. Invalid syntax or a pattern/compiled program over the
+    /// documented resource limits is `Error.Invalid`. The handle borrows nothing and is
+    /// `Drop`-freed. Pure (allocation and compilation only; no external effects).
+    RegexCompile { pattern: Box<Expr> },
+    /// `re.is_match(text)` — whether the compiled regex matches anywhere in `text`. Both operands
+    /// are borrowed; the regex handle is not consumed. Pure.
+    RegexIsMatch { regex: Box<Expr>, text: Box<Expr> },
+    /// `re.find(text)` / `re.find_at(text, start)` — the first match as an
+    /// `Option<regex_match>`. `start` is `None` for `find` and an `i64` byte offset for `find_at`.
+    /// Returned offsets are UTF-8 byte offsets; an invalid start offset aborts like an invalid
+    /// slice boundary. Both operands are borrowed. Pure.
+    RegexFind { regex: Box<Expr>, text: Box<Expr>, start: Option<Box<Expr>> },
     /// `cli.command(name)` — a fresh [`crate::Ty::CliCommand`] builder named `name` (a `str`). A
     /// **Move** handle owning its registered-flag table; `Drop`-freed. Pure (no I/O — argv is
     /// already captured by `main(args)`). `name` is borrowed.

@@ -13,6 +13,22 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Regular expressions — `std.regex`, explicitly compiled (SHIPPED 2026-07-23)
+**Decision: regex is a standard-library service, not syntax.** `import std.regex` exposes
+`regex.compile(str) -> Result<regex, Error>` and borrowed `is_match` / `find` / `find_at` methods.
+The compiled `regex` is an owned Move handle with no implicit cache. `find` returns the builtin Copy
+`regex_match { start: i64, end: i64 }`; offsets are half-open UTF-8 byte positions. The engine is the
+automata-based Rust `regex` crate, deliberately excluding backreferences/look-around for predictable
+matching. Invalid patterns/resource caps map to `Error.Invalid`; invalid `find_at` boundaries abort
+as programmer errors. Language-level `rx"..."` syntax is rejected for this slice. Captures,
+replacement, iteration, and split remain additive future library work. Built, tested, and
+IR-verified on 2026-07-23 (`regex` 1.13.1 in the runtime archive): workspace suite green
+(2686 passed / 0 failed), 8 runtime FFI unit tests + 13 driver E2E tests, `clippy -D warnings`
+clean. `find_at` anchoring is measured from the true start of the input (not the offset) —
+documented in `regex.md` and pinned by a test.
+Record: `draft.md` §18.2, `docs/language-spec.md`, `docs/design-notes.md`,
+`docs/impl/std-design/regex.md` + `ja/regex.md`, `docs/impl/07-roadmap.md`
+
 ### Compiler backend
 **Decision: LLVM. But always go through a backend-agnostic MIR.**
 "C backend first → LLVM later" is not adopted (deferral trap + loss of SIMD control). Semantics live in MIR; `MIR → LLVM` is pure lowering. Future alternate backends are handled by adding lowering.
@@ -4686,8 +4702,8 @@ The proposals' application domains are **not core-language work** and must not p
 framework concerns into the core (per `non-goals.md` and `draft.md` §18 layering):
 
 ```text
-- std (OS boundary): std.fs / std.net / std.io fast paths, std.regex (RE2-style linear-time
-  NFA/DFA; a compile-time `rx"…"` literal is a *language* add tracked separately if pursued),
+- std (OS/application boundary): std.fs / std.net / std.io fast paths; the first `std.regex`
+  slice is implemented as an explicitly compiled automata handle (no `rx"…"` syntax),
   std.compress (FFI wrappers over libzstd/zlib-ng — gated on FFI). Reference pointer (std.encoding,
   recorded 2026-07-04, external design-note review adoption): Lemire Base64-at-memcpy-speed.
 - pkg (frameworks/ecosystem, kept out of core/std): HTTP/3 client+server, socket tuning
