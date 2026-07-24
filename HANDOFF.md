@@ -8,8 +8,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-24, **`std.process` timeout Slice 5 SHIPPED (#631) + the shared `Error.Timeout`
-core variant.** `c.timeout_ns(ns)` (in-place, bound-local, the `c.cwd` idiom; `ns==0` = no timeout,
+_Last updated: 2026-07-24, **`std.process` capture extension COMPLETE — align-llm Request 1 fully
+shipped across #630/#631/#632** (bar the deferred bytes tier). S6 (#632) added `c.env(name,value)` /
+`c.env_clear()` (mirror `c.cwd`; child `clearenv`/`setenv` after `chdir`, before `execvp`; `=`-in-name
+rejected). The full R1 surface: `c := process.command(cmd, args)` (Move builder) + `c.cwd(dir)` +
+`c.timeout_ns(ns)` + `c.env(n,v)` + `c.env_clear()` → `out := c.run()?` (Move `run_output`:
+`.code()/.stdout()/.stderr()`, str views region-bound to `out`); timeout → `Err(Error.Timeout)` via a
+process-group kill. **align-llm can now build its verify/repair loop** (run build/test/lint, capture
+output, cwd, timeout, env). `cargo test --workspace` 2730/0; clippy clean. **NEXT: align-llm Request 2
+— http/net I/O timeouts (DESIGNED, spec in `http.md`/`net.md` "I/O timeouts"; the shared `Error.Timeout`
+already landed).** The work: (1) net-rail connect substrate — `align_rt_tcp_connect` (runtime ~:679,
+currently blocking `connect`, no timeout) gains a `timeout_ns` param: non-blocking `connect` →
+`poll(POLLOUT)` deadline → `SO_ERROR`; poll-timeout → `AL_TIMEOUT`; `timeout_ns==0` keeps today's
+blocking path. (2) read/write timeout — `SO_RCVTIMEO`/`SO_SNDTIMEO` at the `plain_read`(~:14001)/
+`http_send_all`(~:14511) sites; a deadline-armed `EAGAIN` → `AL_TIMEOUT` (not the generic errno path).
+(3) surface — one `timeout(ns)` knob: `http.client().timeout(ns)` default + `http.request(...).timeout(ns)`
+override (in-place `()` setters, the `.header` idiom; stored in `HttpClient`/`HttpRequest`, resolved in
+`http_client_perform`); `std.net` `conn.read_timeout_ns(ns)`/`write_timeout_ns(ns)`. NOTE the raw-libc
+socket sites are all located (Explore-verified). Before that, **`std.process` timeout Slice 5 SHIPPED
+(#631) + the shared `Error.Timeout` core variant.** `c.timeout_ns(ns)` (in-place, bound-local, the `c.cwd` idiom; `ns==0` = no timeout,
 byte-identical to S4) bounds `c.run()`: past the deadline the child's process GROUP is `SIGKILL`ed and
 the run returns `Err(Error.Timeout)`. **`Error.Timeout` = a 5th builtin `Error` variant** inserted
 between `Denied` and `Code` (`Error { NotFound, Invalid, Denied, Timeout, Code(i32) }`; runtime
