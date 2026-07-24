@@ -1,121 +1,186 @@
-# CLAUDE.md
+# Repository Agent Instructions
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the canonical repository guidance for both Claude Code and Codex.
+`AGENTS.md` is a compatibility symlink for Codex. Shared guidance must be edited
+here, not copied between tool-specific files.
+
+Project skills are canonical under `.claude/skills/`. Matching entries under
+`.agents/skills/` are Codex compatibility symlinks. Keep tool-specific
+permissions, sandbox settings, hooks, and plugin manifests in their native
+configuration files.
 
 ## What this repository is
 
-This is the **design specification + early implementation of "Align"**, an AOT-compiled, data-oriented programming language. The authoritative design lives in Markdown (`draft.md` + `docs/`); the compiler implementation has begun under `crates/` (Rust workspace, milestone M0).
+Align is the design specification and implementation of an AOT-compiled,
+data-oriented programming language.
 
 Two kinds of work coexist:
-- **Docs** (`draft.md`, `docs/`): design spec. "Correctness" = internal consistency across documents. Editing rules below still apply.
-- **Code** (`crates/`): the `alignc` compiler. `cargo build` / `cargo test` apply. Code must stay consistent with the spec, not redefine it.
 
-## Document layout and roles
+- **Docs** (`draft.md`, `docs/`): the language and implementation design.
+  Correctness means internal consistency across the documentation set.
+- **Code** (`crates/`): the Rust workspace implementing `alignc`. Code must
+  implement the specification, not redefine it.
 
-- `draft.md` — the **authoritative, most complete** spec (Language Specification Draft v0.1, sections 1–21). When the design needs detail, this is the source of truth. Written in English prose with `align` code blocks.
-- `docs/language-spec.md` — a condensed (English) summary of `draft.md`. Keep it consistent with `draft.md`; it is a digest, not an independent spec.
-- `docs/design-notes.md` — the **rationale** ("why") behind each decision. Consult before changing any design choice; a change that contradicts a stated principle here needs justification.
-- `docs/history.md` — chronology of decisions and rejected alternatives (e.g. exceptions, GC, visible lifetimes were all rejected). Use to avoid re-proposing already-discarded ideas.
-- `docs/non-goals.md` — explicit out-of-scope items. Check before adding any feature; many "obvious" additions (OOP, async-everywhere, trait/template complexity, GC, framework-in-core) are deliberately excluded.
-- `docs/open-questions.md` — design-decision tracker, split into **Settled** / **Open** / **Future**. Read the Settled section before proposing anything — those decisions are locked (see "Settled decisions" below). Genuinely open items are tied to milestones; new design discussion belongs here until resolved.
-- `docs/impl/` — **implementation plan** for the compiler (now real under `crates/`). `00-overview.md` (strategy: Rust + LLVM-via-MIR + walking-skeleton-then-widen) → `01-pipeline.md` (stages/IR boundaries) → `02..06` (per-stage design) → `07-roadmap.md` (the milestone roadmap, M0 onward — the milestone source of truth). Later focused records include `09-explain-opt.md`, the cache/artifact identity source of truth `10-cache-first-optimization.md`, the parallel runtime/generated-IR audit `11-parallel-execution-optimization.md`, the pipeline/closure/memory/I/O/SIMD audit `12-pipeline-closure-memory-io-simd-audit.md`, and the string/array allocation-copy and short-input audit `13-string-array-allocation-short-input-audit.md`. These describe how `draft.md` is built; they must stay consistent with the spec, not redefine it.
-- `docs/impl/14-llm-inference-focus-audit.md` — measured engine-level priorities for model page-in/layout, KV attention layout, MoE route grouping/placement, and profiling. It adds no language surface and consumes the M12 runway plus Future resource-oriented north star.
-- `docs/impl/15-pkg-web-plan.md` — the plan of record for **`pkg.web`, the zero-copy REST framework** (owner-directed 2026-07-20: speed is the headline; primary reference Go's Fiber + the httprouter radix-tree router; gateway/LLM apps are merely later consumers). Phases: F1 field-eligibility widening (fn / Move-handle / `slice<str>` struct fields — the hard compiler gate) ∥ F0 pkg-foundation rules → F3 framework slices W1–W7 at `apps/web/pkg/web/` → F4 the LLM gateway app LATER. The design itself is `docs/impl/pkg-design/web.md` (performance contract, surface, slices).
-- `editors/` — editor support shipped by #393 (Vim / Emacs / VS Code: syntax, snippets; plus `.ctags` and `.vscode/tasks.json` at root).
+## Sources of truth
 
-The two language layers — `draft.md` (detailed) and `docs/language-spec.md` (summary) — can drift. When editing one, check the other.
+Read the narrowest relevant source before changing a design or implementation:
 
-## Core design invariants (do not violate when extending the spec)
+- `HANDOFF.md` — living project status and immediate next work. Trust it over
+  historical status summaries.
+- `draft.md` — authoritative and most complete language specification.
+- `docs/language-spec.md` — condensed digest of `draft.md`; keep both aligned.
+- `docs/design-notes.md` — rationale behind design decisions.
+- `docs/history.md` — decision chronology and rejected alternatives.
+- `docs/non-goals.md` — deliberately excluded features.
+- `docs/open-questions.md` — **Settled**, **Open**, and **Future** decisions.
+  Settled items are locked; read them before proposing language changes.
+- `docs/impl/00-overview.md` through `07-roadmap.md` — compiler strategy,
+  pipeline, and milestone truth.
+- `docs/impl/09-explain-opt.md` through
+  `15-pkg-web-plan.md` — focused implementation plans and audits. Read the
+  relevant audit before modifying its optimization or safety path.
+- `docs/impl/std-design/`, `core-design/`, and `pkg-design/` — shipped and
+  planned library surfaces. English files are authoritative; `ja/` mirrors
+  must not drift.
 
-These are the load-bearing principles. Any proposed syntax or feature must respect them or it contradicts the project's identity:
+For `pkg.web`, `docs/impl/15-pkg-web-plan.md` is the plan of record and
+`docs/impl/pkg-design/web.md` is the design source of truth.
 
-- **Four-way alignment**: every design serves Human + AI + Compiler + Hardware simultaneously, not just human ergonomics.
-- **One way to do things** — prefer convergence over expressiveness. One error model (`Result<T,E>` + `?`), one optional model (`Option<T>`, no null), one ownership model (value / arena / explicit heap), one parallel model (`map`/`reduce`/`chunks`/`task_group`).
-- **Nothing hidden**: allocation, errors, side effects, parallelism, and `unsafe` must always be visible in source. No hidden copies, exceptions, or thread creation.
-- **Compiler-friendly by restriction**: restrictions exist to let the compiler infer contiguous memory, no-alias, non-null, arena lifetime, cold error paths — *without* Rust-style visible lifetimes.
-- **Data-oriented core**: array/slice processing is the center of the language. SIMD/cache/GPU friendliness comes from normal `map`/`reduce`/`scan`/`filter`/`mask` code lowering well, not from hand-written intrinsics.
-- **AI-friendliness is a constraint, not a feature**: avoid macros, complex generics, multiple paradigms, lifetime annotations.
+## Core design invariants
 
-## Settled decisions (do not re-litigate)
+Every extension must preserve these load-bearing principles:
 
-These are locked. Full rationale + record locations in `docs/open-questions.md` Settled.
+- **Four-way alignment:** serve Human + AI + Compiler + Hardware together.
+- **One way to do things:** one error model, optional model, ownership model,
+  and parallel model.
+- **Nothing hidden:** allocation, copies, errors, side effects, parallelism,
+  and `unsafe` stay visible in source.
+- **Compiler-friendly by restriction:** infer contiguous memory, no-alias,
+  non-null, and region properties without visible lifetime syntax.
+- **Data-oriented core:** normal array and slice pipelines must lower well to
+  SIMD, cache-friendly execution, and future accelerators.
+- **AI-friendliness is a constraint, not a feature:** avoid macros, complex
+  generics, multiple paradigms, and lifetime annotations.
 
-- **Compiler implemented in Rust.** Backend = **LLVM, but always lower through a backend-agnostic MIR** (never "C-backend-first"). Semantics live in MIR; `MIR → LLVM` is pure lowering.
-- **Syntax = Go style.** Newline terminates a statement; `;` is an optional separator only for cramming multiple statements on one line. Braces `{}` delimit blocks → indentation is insignificant (NOT Python). A line starting with `.`/binary-operator continues the previous line (multi-line chains).
-- **Expression-oriented.** `if` / `match` / `else`-unwrap / `arena` / blocks are expressions; a block's trailing expression is its value. Single-expression function bodies use `fn f() -> T = expr`.
-- **Type declarations are keyword-less.** `Name { field: Type, ... }` = struct, `Name { Variant, Variant(payload) }` = sum type — disambiguated by content. Fields/variants are `,`-separated.
-- **Integer overflow = defined two's-complement wrap** (no UB, zero-cost, doesn't block SIMD). Explicit `checked_*`/`saturating_*`/`wrapping_*` ops. Div-by-zero etc. is a hard error, never silent.
-- **Ownership = a property of the type** (array/string/buffer/heap are Move; primitives/small-structs/slice are Copy). No `owned` keyword. Lifetimes are inferred (regions), never written.
-- **Purity is inferred** (effect inference); `par_map`-style closures must be Pure.
-- **Formatter normalizes only meaningless variation** (spacing, `;` placement, trailing comma, alignment); it does NOT force one-line ↔ multi-line. "One way" = one correct *formatting* per layout, not one allowed layout.
-- **Sequential control = one `loop` expression** (`loop { ... break value }`; breaks unify like `match` arms; no `for`/`while`/`continue`/labels). The pipeline owns the data path; `loop` owns the control path. Recursion is not iteration — **no TCO is guaranteed** (scope-end drops and `?` make tail position fragile). Implementation deferred; design in `draft.md` §4 "Loop".
-- **2026-07-09 spec-vacuum settlements:** `print`/display contract (primitives only, floats shortest-round-trip, aggregates unprintable); literal/escape set (single-line strings, `\u{...}`, unknown escape = error); **`==` = scalars + strings only** (no structural equality); **no shadowing** (one binding per name per scope chain); **floats = IEEE 754, never abort** (only integer division aborts); **`Ord(str)`** (byte-lexicographic — strings sort/compare; collation = pkg); **`else` on `Result`** (deliberate fallback discards the error; `?` propagates / `else` falls back / `match` inspects). Remaining unrecorded holes: `open-questions.md` Open → "Unrecorded spec vacuums — remainder".
+## Locked language decisions
 
-## Current status & next step (handoff)
+Do not re-litigate these. Full rationale is in `docs/open-questions.md`:
 
-> **2026-07-15 current correction:** M15 separate compilation is COMPLETE through SV: per-unit
-> interfaces/sema/codegen/link, the default-on incremental object cache, parallel unit codegen, and
-> the doc-10 §7 verification bundle are green. Intra-frame borrow liveness is enforced as shared flow
-> state in `MoveCheck` (#460); escape provenance classification is compile-enforced exhaustive
-> across HIR expressions and types (#461), its region/local-slice state joins branches and reaches
-> loop fixpoints (#462), resource-owning locals use path-local MIR drop flags (#463), and the
-> exhaustive syntax walk now lowers into a compact checked-HIR escape CFG whose shared worklist owns
-> every branch join and loop fixpoint (#464), and concrete function-value types now carry the
-> inferred three-valued effect consumed by indirect calls (#465) (workspace 2137 tests: 2136 passed
-> + one ignored; clippy clean). Region-changing owned
-> reassignment is therefore legal when the lifetime target check passes, without leaking or
-> double-freeing either allocation path. Escape diagnostics and provenance remain at the
-> safety-verified HIR boundary. The 1:1 table and regression matrix for region composition plus
-> owned move/drop behavior across every value-carrying control form (`block`, `if`, `match`,
-> `else`-unwrap, and `?`) is complete as #466; four result-join ownership-bit gaps were fixed. The
-> recorded fd-test flake hardening (#457), qualified cross-module function values (#458), and
-> wrapper-hidden local-slice escape fix (#459) are also merged. Fully-escaping
-> function values remain deliberately deferred until their heap-owned environment/drop model has a
-> consumer and is settled.
-> `HANDOFF.md` remains the living source of truth.
+- The compiler is Rust. LLVM lowering always goes through backend-agnostic MIR;
+  semantics belong in MIR, and MIR-to-LLVM is pure lowering.
+- Syntax is Go-style: newlines terminate statements, braces delimit blocks,
+  indentation is insignificant, and leading `.` or binary operators continue a
+  line.
+- The language is expression-oriented. `if`, `match`, `else`-unwrap, `arena`,
+  and blocks produce values; `fn f() -> T = expr` is the single-expression
+  function form.
+- Type declarations are keyword-less structs or sum types, disambiguated by
+  their contents.
+- Integer overflow is defined two's-complement wrap. Checked, saturating, and
+  wrapping operations are explicit; invalid integer division is a hard error.
+- Ownership is a property of the type. Values are Copy or Move; arenas and
+  explicit heap allocation are visible; lifetimes are inferred and never
+  written.
+- Purity is inferred. Parallel closures must be Pure.
+- The formatter normalizes meaningless variation but does not force one-line
+  versus multi-line layout.
+- Sequential control uses one `loop` expression with value-carrying `break`.
+  There is no `for`, `while`, `continue`, labels, or guaranteed TCO.
+- Printing supports primitives only; strings are single-line with the settled
+  escape set; `==` supports scalars and strings only; shadowing is forbidden;
+  floats follow IEEE 754 and never abort; `Ord(str)` is byte-lexicographic; and
+  `else` on `Result` deliberately discards the error while `?` propagates and
+  `match` inspects it.
 
-> **⚠️ This section's per-milestone narrative below is a historical record kept for its M0–M4 decision detail; it lags the real state.** For the current phase, always trust — in order — `HANDOFF.md` (living note), `docs/impl/07-roadmap.md` (milestone truth), and `docs/open-questions.md` (Settled + Open). **As of 2026-07-10: M0–M5 + Memory-Model-v2 COMPLETE; M7 COMPLETE (`par_map`/`chunks`/purity + first-class closures ①–③ + `task_group`/`spawn`/`wait()?` on real threads; only fully-escaping fn values — return / struct-field / array-element — stay deferred); M6 COMPLETE (SIMD `vecN<T>`/`maskN<T>`, `soa<T>`, columnar `group_by`, `align(N)` — both completion conditions met: real `<N x T>` LLVM IR, and branchless `where` for every reducer; owned SoA columns / `soa_slice<T>` / packed-bool columns / dynamic over-aligned arrays deferred as post-M6 backlog, not blockers). M8 COMPLETE (formatter `align_fmt` #233; `unsafe`/`raw.*` #262–264; `extern "C"` FFI v1 #265–269 plus by-value struct passing shipped beyond v1 — x86-64 SysV, #329; the lint suite's full profile-independent slice — unhandled-`Result`/huge-struct-copy/lossy-cast/wasteful-default/unnecessary-heap-narrow — #138/#234/#313/#323; the frequency-dependent lints, `prefer-pipeline-over-vecN`, and the hot/cold field-split suggestion are deferred as post-M8 backlog, not blockers). M9 COMPLETE (std.io/std.fs/std.path/std.env/std.time, PRs #336–#340: `reader`/`writer`/`buffer` Move types + shared errno→`Error` mapping, non-consuming `io.copy`, `std.fs` complete plus the arena-scoped `mmap` view `read_file_view`, and `path`/`env`/`time` round-trips; v1 limits = the `io.copy` bound-receiver restriction (covers a bound `.buffered()` writer) and unbound Move-temporary drop still pending, plus a non-UTF-8-filename caveat on `read_dir`; post-M9 backlog = `io.copy` syscall fast paths (`sendfile`/`splice`/`io_uring`), no `SIGBUS` handler, streaming×pipeline integration, and the M10+ module set). M9 formally closed (#341). M10 (std second wave) COMPLETE: `std.encoding` (base64/hex/utf8_valid, #346), `std.rand` (Copy `rng`, OS seed, Xoshiro256++, #347), and `std.cli` (Move `CliCommand`/`CliParsed`, parse borrows / getters total-or-abort / `get_str` Frame view, #356) all SHIPPED. M12 (align-LLM runway: offset file I/O #413, array_builder<T> #414, streaming line reads #415, arena-reuse #416 measured-below-gate, SSE respond_stream/http_stream #417) COMPLETE 2026-07-11 — the align-LLM Phase-0→4 + gateway language prerequisites are all in place; **M13 (codegen quality & link hygiene, the pre-LLVM-upgrade wave) COMPLETE 2026-07-11** (PRs #418–#424: symbol internalization; capability-based linking + gc-sections; `emit-llvm --stage` + the vectorization IR-shape suite; `alignc explain-opt` with debug-loc-anchored LLVM-remark translation; build profiles + `alignc size`; the re-scoped runtime-declare contract attributes — A8 above-gate, a loop-invariant `hash64` now hoists AND vectorizes; the Slice-V verification bundle incl. the clang-IR harness where all 5 kernels MATCH idiomatic C — the shape/size/bench net is the LLVM-upgrade gate); next is the LLVM/inkwell upgrade checkpoint (roadmap), then the post-upgrade M14 wave (ThinLTO → runtime bitcode → PGO → BOLT; the deferred ABI-flattening/fn-arg-attr/nsw items wait for those boundaries). M11 (std third wave) COMPLETE (formally closed 2026-07-10): `std.net` (#371–#374), `std.process` (#376–#378), `std.compress` (#380–#381), `std.crypto` (#383–#388), and `std.http` in full — Slices 1–5 + `get_many` (#391/#392/#398/#409/#411/#412: types+parse, plaintext client, keepalive pool, server primitive, the `array<response>` Move-handle-array + batched `get_many`, HTTPS/TLS via libssl with mandatory hostname-bound verification) — R1–R6 all met. The full std design is written out at Opus-implementable depth in `docs/impl/std-design/*.md` (cli + the M11 set: net/http/process/compress/crypto — signatures, Move/effect classification, error policy, slice breakdown, pitfalls; #348) — these are the source of truth when implementing each module. A hands-on tutorial now lives at `docs/guide/` (English + `ja/` mirror).** `cargo test` ≈ 1601 green. The 2026-07-02 external soundness audit is fully addressed (PRs #270–#277: escape/effect/move coverage holes, `&&`/`||` short-circuit, arena double-free, negate-unsigned sign loss, parser/diagnostic papercuts); the only audit item left is the structural follow-ups (escape check → MIR dataflow, purity-as-effect-bit, fuzzing) recorded as **open** in `open-questions.md` → "External soundness audit".
+## Editing conventions
 
-> **2026-07-13 audit correction:** M6's masked vector shape remains shipped; post-`where` general
-> callables are now guarded, while safe builtin suffixes retain mask/select. Ordinary sequential
-> callables may be Impure with exact guarded source order; explicit `par_map` remains Pure-required.
-> Lifted-closure effects now propagate, and unknown higher-order targets fail closed at Pure/parallel
-> boundaries while remaining legal sequentially.
-> **2026-07-15 update (#465):** concrete function values now store that inferred fact in `FnTy`;
-> name-edge propagation is gone, while unresolved HOF parameters retain the fail-closed behavior.
-> Saturated `task_group -> par_map` now shares caller-drained range claims; a forced-worker
-> child-process watchdog pins progress with zero idle pool workers.
-> Dynamic heap/arena/SoA byte sizes now use checked LLVM arithmetic and abort before allocation on
-> negative counts, overflow, or results outside the signed allocator ABI.
-> Production build/run/size artifacts now use private staging and publish complete executables by
-> same-directory atomic rename; concurrent same-basename gates pin isolation.
-> M9's portable `io.copy` lookahead P0, the spawn-capture and closure-result region gaps, and the Unit
-> indirect-call ABI mismatch are fixed and regression-pinned in
-> `docs/impl/source-correctness-fixes-2026-07-13.md`. Read
-> `docs/impl/12-pipeline-closure-memory-io-simd-audit.md` before touching either optimization path.
+- Core code, comments, identifiers, diagnostics, the authoritative
+  specification, and internal implementation docs are English.
+- Repository-facing GitHub text is English: commit messages, PR titles and
+  descriptions, review comments and replies, release notes, and GitHub Release
+  titles and descriptions.
+- End-user guides and library design specs may be bilingual:
+  `docs/guide/`, `docs/little-aligner/`, and the `std-design`, `core-design`,
+  and `pkg-design` trees keep an English original plus a synchronized `ja/`
+  mirror. Update English first.
+- Match the house style: terse declarative prose, fenced `align` examples, and
+  fenced `text` blocks for concept lists.
+- Keep library layering strict: `core` for language intrinsics, `std` for OS
+  boundaries, and `pkg` for frameworks and ecosystem packages.
+- When changing a design decision, update `draft.md`,
+  `docs/language-spec.md`, `docs/design-notes.md`, the relevant implementation
+  documents, and the Settled section of `docs/open-questions.md`.
+- Align is pre-release. Change APIs and behavior outright: no deprecated
+  aliases, compatibility shims, legacy syntax, or parallel old/new paths.
+- Ship the ideal unified design or defer it. Do not land compromise
+  implementations that add magic special cases or violate an invariant.
 
-- **Where things are:** spec = `draft.md` (authoritative). Design rationale + decisions = `docs/*.md` (`open-questions.md` Settled is locked). Implementation plan + milestone truth = `docs/impl/00–07`; std module design specs = `docs/impl/std-design/*.md`; core library surface docs (shipped signatures + drift vs §18.1) = `docs/impl/core-design/*.md`. The Rust workspace under `crates/` (all 10 crates per `docs/impl/00-overview.md`) flows end-to-end `lexer → parser → sema → MIR → LLVM → executable`; `cargo build` / `cargo test` are green.
-- **Per-milestone decision detail (M0–M11): see `docs/impl/07-roadmap.md` and `git log`.** The blow-by-blow M0–M4 narrative that used to live here was removed on 2026-07-04 as redundant with the roadmap — that is the milestone source of truth, and `HANDOFF.md` is the living note. The key locked decisions are summarized under "Settled decisions" above and in full in `open-questions.md`.
-- **Toolchain:** Rust 1.96, LLVM 22 via `inkwell` (`llvm22-1`), llvm-sys 221 (upgraded from LLVM 19 post-M13, 2026-07-12; apt.llvm.org `llvm-22 llvm-22-dev clang-22`). `llvm-sys` is kept on dynamic linking via the `prefer-dynamic` feature + `.cargo/config.toml` (`LLVM_SYS_221_PREFER_DYNAMIC=1`) — the apt.llvm.org llvm-22 ships static archives (so static would now work) but dynamic links smaller and matches rustc's LLVM. LLVM 19 stays installed for rollback/shape-diff triage.
-- **No design item is blocking.** Open items wait on their milestone; genuinely open questions live in `open-questions.md` Open.
+## Build and verification
 
-## align-llm request register + release cadence
+The workspace runs end to end from lexer through executable generation.
+Use the checks appropriate to the change:
 
-`align-llm` (a local LLM coding system living **outside this repo** at `../align-llm`, i.e. `/home/hiro/prj/align-llm`) is a real client that drives Align's feature needs. It records the Align capabilities it depends on in one file:
+```text
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets
+```
 
-- **The register: `../align-llm/docs/align-requests.md`** (`/home/hiro/prj/align-llm/docs/align-requests.md`). Read it when starting align-llm-driven work. Each numbered request is implemented **here**, in Align's own discipline (author a design spec under `docs/impl/std-design/` or `docs/impl/core-design/`, then implement + test + review — never a workaround).
-- **A response is required.** For every request, write Align's answer back **into that same file**: update the top status banner, and add/keep an "Align response" block under the request (ACCEPTED/COMPLETE, the shipped surface, the ownership model + any limits a client must know, and the PR numbers). The register belongs to align-llm; the response is Align's obligation — keep it current as each request ships. (`align-llm` is a separate git repo, so leave the edit in its working tree for its owner to commit; do not commit into `../align-llm` from here unless asked.)
-- **When a request batch is complete, do a release BUILD.** "Release build" means exactly `cargo build --release --workspace` — an optimized build of `alignc` + the runtime archive in **this** repo's `target/release/`. `align-llm` reads the align directory directly (it consumes the locally-built compiler), so a release-flag build is what a finished request batch needs. **"Release build" ≠ a versioned release.** Do **not** bump the version, write `RELEASE_NOTES`, tag, or push a `v*` tag as part of this — that is a separate, heavier thing.
-- **A versioned RELEASE (publish) is a distinct step, done ONLY when the user explicitly asks to "release" (リリース).** That flow is: bump `Cargo.toml` (+ `Cargo.lock`), write `RELEASE_NOTES_X.Y.Z.md` (mirror the previous ones — headline + sections + the standing "Backward Compatibility Warning" / "Known Intentional Limitations"), commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z` — the `v*` tag triggers `.github/workflows/release.yml` (the public build/publish, which cross-builds Linux x86-64/aarch64 + macOS aarch64). 0.x additive batches are a minor bump. **Terminology, do not conflate:** "release build" / "ビルドして" / "リリースビルド" = `cargo build --release`; "release" / "リリースして" = the publish flow above.
+Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
+milestone gates, and specialized verification bundles.
 
-## Conventions when editing
+## align-llm requests and releases
 
-- **Language: English for the core; user-facing guides may be bilingual.** All **code** (comments, identifiers, CLI output, diagnostic messages), all **commit messages**, and the **authoritative spec + internal docs** (`draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, `docs/history.md`, `docs/non-goals.md`, `docs/open-questions.md`, `docs/impl/*` **English originals**) are **English only** — Align is intended for global adoption, so the source of truth stays in one language. **Exception:** end-user documentation may be bilingual — the tutorial (`docs/guide/`), the drill book (`docs/little-aligner/`), and the library design specs (`docs/impl/std-design/`, `docs/impl/core-design/`, `docs/impl/pkg-design/`) keep an English original plus a Japanese mirror under a `ja/` subdirectory, cross-linked at the top of each file. The English file is authoritative; the `ja/` version is a translation that must not drift from it (update English first, then the mirror). Do not introduce Japanese anywhere else. (The repo was originally written with Japanese docs; it was converted to English on 2026-06-17, then reopened to bilingual *guides* on 2026-07-04.)
-- Match the existing house style: terse declarative sentences, fenced code blocks tagged `align` for language examples and `text` for bullet-like lists of concepts.
-- Library is layered `core` (language-intrinsic primitives) → `std` (OS boundary) → `pkg` (frameworks/ecosystem, kept out of core/std). Place any new library surface in the correct layer; `draft.md` §18 defines the boundaries.
-- When changing a design decision, update *all* of: `draft.md`, the `docs/language-spec.md` digest, the rationale in `docs/design-notes.md`, the relevant `docs/impl/*.md`, and the **Settled** section of `docs/open-questions.md` (move items out of **Open** as they settle).
-- **No backward compatibility (pre-release).** Align has not shipped, so nothing depends on old behavior. When a design or API changes, change it **outright** — do not keep deprecated aliases, dual code paths, old syntax accepted alongside new, compat shims, or "legacy" fallbacks. Update every call site / test / doc to the new form instead. Backward-compat layers are pure bloat here; the only correct version is the current one. (Example: when `reduce`/`scan` moved to init-first arguments, the old order was removed entirely, not aliased.)
-- **Ideal form, or defer — no compromise implementations.** This is the language-design stage, so ship only what is the **ideal form** ("あるべき姿"): beautiful, internally unified/consistent, and aligned with the core design invariants (Nothing hidden / One way / four-way alignment / data-oriented). If a feature can't be done that way — it would need a magic special-case, a second mechanism for something that already has one, or it breaks a principle — do **not** ship a half-hearted version. Present the ideal design, and **defer implementation** until it can be done right. Timing is not a constraint; design quality is. (Example: `task_group`'s `spawn` takes a lambda with escape-driven first-class closures — the ideal form — deferred, rather than a magic bare-call special form that only dodged the closure work.)
-- **Before opening a PR that changes `crates/`, run `/align-self-review`.** It is a checklist (in `.claude/skills/align-self-review/`) distilled from every past `gemini-code-assist` finding on this repo — the recurring bug classes in AI-written compiler code: FFI/allocation memory-safety (`i64 as usize`, `checked_mul`, null `from_raw_parts`), soundness holes when a new IR variant skips an analysis pass (`region_of`/`tracks_region`/`MoveCheck`/`null_moved_source`), compiler panics instead of diagnostics (`unwrap`/`expect`/direct indexing on user input), and cross-stage size/ABI mismatches. It reduces review findings; it does not replace the review below.
-- **MANDATORY: review before merging.** After opening a PR that changes code, run a review on the branch and reflect it before merging — do **not** open-then-immediately-merge. Workflow: open PR → run the review (use `high` effort for anything non-trivial) → **scrutinize each finding (verify against the code, don't blindly apply)** → apply the valid ones, and for any you reject, say why → push the follow-up → then merge. This reflect-before-merge discipline **lapsed once before** — #160–#165 were opened-and-immediately-merged, a regression the user called out; don't let it lapse again.
-  - **Which review command:** a human runs **`/code-review`** (use `high` effort). But **Claude cannot invoke `/code-review` itself** — that skill is `disable-model-invocation` (user-triggered only); calling it via the Skill tool errors. So when **Claude** is driving the merge flow autonomously, use the **`review`** skill on the open PR (`/review <PR#>`, which *is* model-invocable and reviews a GitHub PR), and additionally spawn an **independent adversarial subagent** (a fresh reviewer that reads the diff and hunts soundness bugs — this is what caught the capturing-closure escape UAF in #589). Do not silently skip the review just because `/code-review` refused. *(History: until its consumer version sunset on **2026-07-17**, every PR was auto-reviewed by the `gemini-code-assist` bot, and this step meant waiting for and reflecting that bot's review. The bot no longer reviews, so the review paths above are the replacement.)*
+`../align-llm/docs/align-requests.md` is the request register for the external
+align-llm client. For align-llm-driven work:
+
+1. Read the register before starting.
+2. Implement the request in Align's normal design-first discipline.
+3. Update the same register with Align's status, shipped surface, ownership
+   model, limits, and PR numbers. Leave that separate repository's edit
+   uncommitted unless asked.
+4. When a request batch is complete, run exactly:
+
+```text
+cargo build --release --workspace
+```
+
+A **release build** only produces optimized local artifacts. A versioned
+**release** is different and happens only when the user explicitly asks to
+release: bump `Cargo.toml` and `Cargo.lock`, write matching release notes,
+commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z`.
+Never infer the publish flow from “build” or “release build.”
+
+## Review before merging
+
+Before opening a PR that changes Rust under `crates/`, run the
+`align-self-review` skill. Its canonical source is
+`.claude/skills/align-self-review/SKILL.md`.
+
+Every code PR must receive an independent review after it is opened and before
+it is merged:
+
+1. Open the PR.
+2. Run the host-native review with high effort for non-trivial changes.
+3. Also use a fresh independent adversarial reviewer/subagent to inspect the
+   diff for soundness and regression risks.
+4. Verify every finding against the code. Apply valid findings and explain
+   rejected ones.
+5. Push any follow-up and only then merge.
+
+Do not open and immediately merge a code PR.
+
+### Claude Code review adapter
+
+- A human starts the dedicated review with `/code-review`.
+- When Claude drives the PR flow autonomously, use the model-invocable `review`
+  skill on the open PR and an independent adversarial subagent.
+
+### Codex review adapter
+
+- A human starts the dedicated reviewer with `/review`.
+- Non-interactive automation may use `codex review --base <branch>`,
+  `codex review --uncommitted`, or `codex review --commit <sha>`.
+- When Codex drives the PR flow autonomously, inspect the PR/base diff and use
+  a fresh independent adversarial subagent; do not pretend to invoke a
+  user-only composer command from inside the turn.
