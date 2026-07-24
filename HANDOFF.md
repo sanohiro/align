@@ -321,7 +321,14 @@ Tests: 6 runtime keep-alive units + the `serve_shared` double-bind unit, driver 
 worker while the others answer — the property the sequential loop could not have; `workers < 1`
 abort).
 
-> **⚠️ macOS release-publish bug (for the eventual `v*` tag, NOT the local release build):** the v0.4.0 CI publish failed on `alignc-macos-aarch64` — `Undefined symbols: _clearenv`. `clearenv()` (S6 `c.env_clear()`, runtime) is glibc/POSIX-only and does NOT exist on macOS/BSD. Fix before the next real release: gate the `env_clear` child path per-OS (macOS: iterate `*_NSGetEnviron()` and `unsetenv` each, or rebuild `environ`). Linux x86-64/aarch64 release builds pass. The local `cargo build --release` (what align-llm consumes from this dir) is unaffected.
+> **macOS `clearenv` portability — FIXED (#636).** The v0.4.0 CI publish had failed on
+> `alignc-macos-aarch64` (`Undefined symbols: _clearenv`; `clearenv(3)` is glibc/musl-only, absent on
+> macOS/BSD). #636 splits it: the `clearenv()` extern is now `#[cfg(target_os = "linux")]`, and a
+> `clearenv_portable()` wrapper on macOS/BSD unsets each name via `unsetenv` (reaching `environ` via
+> `_NSGetEnviron()`). Verified by CI's macos-15 build (green). Linux behavior byte-identical. **The
+> `v0.4.0` git tag still points at the pre-fix commit (88ee798) — a future `v*` release should be cut
+> from current `main` (or the tag re-pointed) so the macOS publish job passes.** No local action needed
+> now — the fix is on `main` and the local `cargo build --release` was re-run.
 
 **NEXT (recommended order — W5 and W7 are both DONE; details of each below and in the bench
 READMEs):**
