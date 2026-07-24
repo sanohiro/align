@@ -70,6 +70,24 @@ fn an_aligned_struct_as_a_field_or_dynamic_array_element_is_rejected() {
     assert!(check_errs("align-nested", nested));
     let array = "align(16) S {\n  x: i32,\n}\nfn f(a: array<S>) -> i32 = 0\nfn main() -> i32 = 0\n";
     assert!(check_errs("align-array", array));
+
+    // `.to_array()` also creates a dynamic `array<S>` buffer. A fixed aligned source is valid,
+    // but materializing it must stay rejected until heap/arena allocations preserve `align(N)`.
+    let materialized = "\
+align(16) S {
+  x: i32,
+}
+fn main() -> i32 {
+  xs := [S { x: 1 }, S { x: 2 }]
+  ys := xs.to_array()
+  return ys[0].x
+}
+";
+    let diagnostics = check_diagnostics("align-to-array", materialized);
+    assert!(
+        diagnostics.contains("'to_array' cannot collect `align(N)` struct 'S'"),
+        "expected a dynamic over-alignment diagnostic:\n{diagnostics}"
+    );
 }
 
 #[test]

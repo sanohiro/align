@@ -45,6 +45,69 @@ fn main() -> i32 {
 }
 
 #[test]
+fn copy_struct_array_to_array_preserves_whole_elements() {
+    if !backend_available() {
+        return;
+    }
+    // A struct pipeline starts without a scalar `cur`; materialization must load and append the
+    // whole Copy struct, including after a whole-struct predicate that leaves `cur` unset.
+    let src = "\
+Point { x: i32, y: i32 }
+fn main() -> i32 {
+  points := [Point{x: 1, y: 2}, Point{x: 3, y: 4}]
+  all := points.to_array()
+  selected := points.where(fn p: Point { p.x > 1 }).to_array()
+  return all[0].y + selected[0].x
+}
+";
+    assert_eq!(build_and_run("arr-copy-struct", src).status.code(), Some(5));
+}
+
+#[test]
+fn dynamic_copy_struct_array_to_array_preserves_whole_elements() {
+    if !backend_available() {
+        return;
+    }
+    // The same whole-element path must load through an owned dynamic AoS `{ptr,len}` source.
+    let src = "\
+import core.json
+Point { x: i32, y: i32 }
+fn main() -> Result<(), Error> {
+  arena {
+    points: array<Point> := json.decode(\"[{\\\"x\\\":10,\\\"y\\\":1},{\\\"x\\\":20,\\\"y\\\":2}]\")?
+    copied := points.to_array()
+    print(copied[1].x + copied[0].y)
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run("arr-dynamic-copy-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "21\n");
+}
+
+#[test]
+fn soa_copy_struct_to_array_gathers_whole_elements() {
+    if !backend_available() {
+        return;
+    }
+    // A soa source also starts without `cur`; materializing it transposes each gathered Copy
+    // struct back into the owned AoS result.
+    let src = "\
+Point { x: i32, y: i32 }
+fn main() -> i32 {
+  arena {
+    points := [Point{x: 1, y: 2}, Point{x: 3, y: 4}]
+    columns := points.to_soa()
+    copied := columns.to_array()
+    return copied[0].y + copied[1].x
+  }
+}
+";
+    assert_eq!(build_and_run("arr-soa-copy-struct", src).status.code(), Some(5));
+}
+
+#[test]
 fn bare_literal_in_owned_array_context_is_rejected() {
     // A bare fixed literal can't become an owned `array<T>` — it must be `.to_array()`'d (visible
     // heap allocation). Rejected in every owned-array context (was silently miscompiled to garbage):
