@@ -7,7 +7,9 @@ description: Pre-PR self-review checklist for the Align compiler. Run before ope
 
 Derived from 388 `gemini-code-assist` findings on past PRs, refreshed against the **#234–#298** record (~88 more inline findings, ~27% high-severity — the M6 `vec`/`soa`/`mask` arc, M8 `unsafe`/FFI, fuzz suite). Every high/critical finding to date lives in Gates 1–5 below. **Run these gates against your working diff before opening a PR.** Scope by what you touched — skip a gate whose files you didn't change. Gate 6 is a light sweep; don't let it crowd out 1–5.
 
-**`gemini-code-assist` stops reviewing on 2026-07-17.** After that this checklist + `/code-review` are the *only* pre-merge defense — treat these gates as the reviewer, not a warm-up for it.
+**`gemini-code-assist` stopped reviewing on 2026-07-17.** This checklist plus a
+host-native independent review are now the pre-merge defense. Treat these gates
+as part of the review, not a warm-up for a bot.
 
 Start by listing the diff so you review the actual change, not the whole tree:
 `git diff --stat origin/main...HEAD` and `git diff origin/main...HEAD`.
@@ -111,10 +113,22 @@ The M6 builtin arc surfaced a whole class of sema bugs around type variables and
 - **Tests actually exercise the case**: no silent bypass — `None => continue`, `unwrap_or_default()` on `read_dir`, or an empty input set makes a test pass without asserting (#286); an "out-of-range" test must use an out-of-range index, not `s[0]` on a len-1 array (#247); every new guard/rejection deserves a negative test (null/zero/non-pow-2 align #293, leading-`-` lib name #268, assign-from-local #283). Print the diagnostics on failure so the runner shows them (#286).
 - **Tests/bench portability**: unique temp paths (PID) + RAII cleanup, no leaks/races (#20, #37, #132, #134); branch on `cfg!(target_os/arch)`, don't hardcode `.so` / drop `.exe` / x86-only `target-cpu` on ARM (#128, #152, #167); a process exit code is the **low byte** on Unix but full 32-bit on Windows — `cfg!(windows)` the expected value (#287).
 - **Constant-operand fast path**: when an operand is a compile-time constant, skip the runtime guard — a known non-zero divisor needs no div-by-zero / `INT_MIN / -1` check (#294). Extract a bit flag with `(x & MASK) != 0`, not `(x >> n) & 1 == 1` (arithmetic shift on signed) (#295).
-- **Docs**: if the diff touches `draft.md` / `docs/`, verify §-cross-references resolve and no wording contradicts a settled decision (no turbofish, leading `.` on field predicates, columnar-not-map group_by). Also — this recurs — **don't leave a note that this same PR obsoletes**: grep the diff for `pending`/`parallel`/`deferred`/`FIXED (this PR`/`well underway` and update it to the landed state (#271, #278, #292); **re-read comments adjacent to changed code** for staleness (a doc comment referencing removed code, or split by an inserted fn) (#257, #258); enumerations must be **1:1** (6 reducers vs 5 identities #292); keep cross-file status consistent (`CLAUDE.md` ↔ `README.md` ↔ `07-roadmap.md` #271). Spelling/backtick/proper-noun nits are editorial — fix in passing, don't gate.
+- **Docs**: if the diff touches `draft.md` / `docs/`, verify §-cross-references resolve and no wording contradicts a settled decision (no turbofish, leading `.` on field predicates, columnar-not-map group_by). Also — this recurs — **don't leave a note that this same PR obsoletes**: grep the diff for `pending`/`parallel`/`deferred`/`FIXED (this PR`/`well underway` and update it to the landed state (#271, #278, #292); **re-read comments adjacent to changed code** for staleness (a doc comment referencing removed code, or split by an inserted fn) (#257, #258); enumerations must be **1:1** (6 reducers vs 5 identities #292); keep cross-file status consistent (`CLAUDE.md`/`AGENTS.md` ↔ `README.md` ↔ `07-roadmap.md` #271). Spelling/backtick/proper-noun nits are editorial — fix in passing, don't gate.
 
 ---
 
 ## After the gates
 
-Fix what the gates surface, then — **until 2026-07-17** — still open the PR and **wait for the gemini review** (the repo mandate); this checklist reduces findings, it doesn't replace the review. When the review lands, scrutinize each finding against the code (some are false positives — verify, e.g. PR #232's "wyhash final-mix" claim was wrong) before applying or rejecting with a reason. **After 2026-07-17** there is no bot: run `/code-review` on the branch and treat these gates as the last line of defense.
+Fix what the gates surface, then open the PR and run the host-native independent
+review required by the repository instructions:
+
+- **Claude Code:** a human uses `/code-review`; an autonomous flow uses the
+  model-invocable `review` skill plus a fresh adversarial subagent.
+- **Codex:** a human uses `/review`; non-interactive automation may use
+  `codex review`; an autonomous flow inspects the PR/base diff plus a fresh
+  adversarial subagent.
+
+Scrutinize every finding against the code before applying or rejecting it with
+a reason. Some findings are false positives; for example, PR #232's
+"wyhash final-mix" claim was wrong. This checklist reduces findings but does
+not replace the independent review.
