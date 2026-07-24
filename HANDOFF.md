@@ -8,8 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-24, **align-llm Request 2 (http/net I/O timeouts) COMPLETE — both align-llm
-requests now shipped.** #634 = the http surface: `http.client().timeout(ns)` (client default,
+_Last updated: 2026-07-25, **align-llm Request 3 (core.json `array<str>` struct fields) SHIPPED (#635)
+— all three align-llm requests now done.** #635: `json.decode` admits a struct field of type
+`array<str>` (the C0 eval-task `argv` shape). A `str` element is a zero-copy `{ptr,len}` view into the
+input (the top-level `str`-field rule) — the owned spine borrows the input, so the decoded struct is
+already input-region-bound; `.clone()` copies past it, an escaped element `Err`s (the pre-existing
+zero-copy limit). Minimal: widen the existing kind-7 `array<scalar>` machinery — sema admit
+`DynArray(Scalar::Str)`, codegen kind-7 guard admit `Scalar::Str`, and the kind-7 `elem_width` field
+widened 4→5 bits (`& 0xf`→`& 0x1f` at both unpack sites) since a `str` element is width 16. `array<i64/
+f64/bool>` decode + `array<str>` encode already worked. Top-level `array<str> := json.decode` stays
+deferred (needs the array result to carry the input region; the scalar top-level array is deliberately
+Static/returnable). Adversarially reviewed (5-bit packing correct/complete, borrowed-view spine
+leak/double-free/UAF-free across success-Drop / decode-error cleanup / escape-fail). `cargo test
+--workspace` 2748/0; clippy clean; docs `core-design/json.md` (+ja) updated. **All of align-llm's filed
+requests (R1 process capture #630/#631/#632, R2 http/net timeouts #633/#634, R3 json array<str> #635)
+are shipped.** Deferred by design (no consumer yet): the `std.process` bytes tier (`run_bytes`);
+top-level `array<str>` json.decode. Before R3, **align-llm Request 2 (http/net I/O timeouts) COMPLETE.**
+#634 = the http surface: `http.client().timeout(ns)` (client default,
 `AtomicI64`) + `http.request(...).timeout(ns)` (per-request override) resolve an effective per-op
 deadline in `http_client_perform` (`req>0 ? req : client`), threaded into connect (`→ tcp_connect(…,
 ns)`, `0` = blocking) + `SO_RCVTIMEO`/`SO_SNDTIMEO` arming (guard `if has_deadline || reused` — a fresh
