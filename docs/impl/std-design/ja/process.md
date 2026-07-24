@@ -8,8 +8,9 @@
 > **ステータス:** M11 のコアは完了済みです（exit/abort、spawn/wait/kill、exec は実装済み）。**拡張は
 > 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
 > よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。**スライス
-> 4〜5 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
-> バリアント）。スライス 6（`c.env`/`c.env_clear`）と後回しの bytes 層は未実装です。
+> 4〜6 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
+> バリアント、`c.env`/`c.env_clear`）。これで拡張は後回しの bytes 層（`c.run_bytes()`、需要に応じて出荷）を
+> 除いて**完了**です。
 
 ## Overview
 
@@ -396,7 +397,14 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
    プロセスも回収される。さもないとキャプチャパイプを開いたままドレインをハングさせる)、EOF までドレイン、
    `waitpid`、そして `Err(Error.Timeout)` を返す(部分出力は破棄)。`poll` の `EINTR` は残りデッドラインを
    再計算する。`timeout_ns == 0` は無限の `-1` `poll`(スライス 4 の挙動そのまま)を保つ。
-6. `c.env(name,value)` + `c.env_clear()`。
+6. `c.env(name,value)` + `c.env_clear()` — **実装済み。** どちらもその場で書き換える束縛ローカルのセッタ
+   (`()`)。`c.env(name, value)` は `(name, value)` の上書きを記録し、`c.env_clear()` は子環境を空から
+   始めるよう印を付ける。ランタイムの `Command` に `env: Vec<(CString, CString)>` と `env_clear: bool` を
+   追加。フォークした子では、`chdir` の後・`dup2` の前に `if env_clear { clearenv() }` を実行し、続いて
+   記録された各ペアを `setenv(name, value, 1)`(overwrite=1 — 同名の後発 `env` が勝ち、`env_clear` 後の
+   `env` は残る)。name/value は**親側**で C 文字列にマーシャルする(子は割り当てをしない。`spawn`/スライス 4 の
+   非同期シグナル安全性の規律)。name/value の内部 NUL・非 UTF-8 は abort し、`=` を含む name も abort する
+   (`setenv` が拒否するため)。
 7. *(先送り)* bytes 層 `c.run_bytes()` — 需要に応じて出荷。
 
 ## Pitfalls

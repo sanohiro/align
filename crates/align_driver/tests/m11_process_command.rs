@@ -66,6 +66,99 @@ pub fn main() -> Result<(), Error> {\n\
     assert_eq!(s.trim_end(), "/", "the child's pwd is the set cwd; got: {s:?}");
 }
 
+/// Slice 6 — `c.env(name, value)` → the child observes the added/overridden variable.
+#[test]
+fn command_env_is_observed_by_the_child() {
+    if !backend_available() {
+        return;
+    }
+    if !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    let src = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf %s \\\"$ALIGN_E2E_V\\\"\"])\n\
+  c.env(\"ALIGN_E2E_V\", \"hello-env\")\n\
+  out := c.run()?\n\
+  print(out.stdout())\n\
+  Ok(())\n\
+}\n";
+    let out = build_and_run("cmd-env", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(s.trim_end(), "hello-env", "the child sees the env var set by c.env; got: {s:?}");
+}
+
+/// Slice 6 — `c.env_clear()` starts the child environment empty, then an `env` pair applied AFTER the
+/// clear still survives (order: wipe first, then apply pairs). `HOME` is inherited from the parent and
+/// (unlike `PATH`) is NOT re-synthesized by `sh` when unset, so it is the reliable "was it wiped?"
+/// probe: a normal child would see it; after `env_clear` it is gone.
+#[test]
+fn command_env_clear_wipes_then_env_survives() {
+    if !backend_available() {
+        return;
+    }
+    if !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    if std::env::var_os("HOME").is_none() {
+        return; // the contrast relies on an inherited HOME being present to wipe
+    }
+    let src = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf '%s|%s' \\\"${HOME:-EMPTY}\\\" \\\"${KEPT:-NONE}\\\"\"])\n\
+  c.env_clear()\n\
+  c.env(\"KEPT\", \"yes\")\n\
+  out := c.run()?\n\
+  print(out.stdout())\n\
+  Ok(())\n\
+}\n";
+    let out = build_and_run("cmd-env-clear", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(s.trim_end(), "EMPTY|yes", "env_clear wipes inherited HOME, then the env pair survives; got: {s:?}");
+}
+
+/// Slice 6 — `c.env` / `c.env_clear` require a BOUND receiver (the v1 Move-temporary gate), like the
+/// other command setters. Calling them on a temporary `process.command(...)` must error.
+#[test]
+fn command_env_requires_a_bound_receiver() {
+    let temp_env = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"]).env(\"K\", \"V\")\n\
+  Ok(())\n\
+}\n";
+    assert!(check_errs("command-temp-env", temp_env), "env() on a temporary command must error (bind it first)");
+    let temp_clear = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"]).env_clear()\n\
+  Ok(())\n\
+}\n";
+    assert!(check_errs("command-temp-env-clear", temp_clear), "env_clear() on a temporary command must error (bind it first)");
+}
+
+/// Slice 6 — `.env()` takes exactly two `str` arguments; a wrong arity or a non-`str` arg is a
+/// diagnostic (mirrors `.timeout_ns()` requiring an `i64`).
+#[test]
+fn command_env_requires_two_str_args() {
+    let one_arg = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"])\n\
+  c.env(\"K\")\n\
+  out := c.run()?\n\
+  Ok(())\n\
+}\n";
+    assert!(check_errs("cmd-env-arity", one_arg), "env with one argument must error");
+    let bad_arg = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"])\n\
+  c.env(\"K\", 42)\n\
+  out := c.run()?\n\
+  Ok(())\n\
+}\n";
+    assert!(check_errs("cmd-env-badarg", bad_arg), "env with a non-str value must error");
+}
+
 /// Slice 5 — `c.timeout_ns(ns)` bounds the run: a child that overruns is killed and `c.run()` yields
 /// `Err(Error.Timeout)`, matchable as the `Timeout` variant DISTINCTLY from `Ok`/a nonzero exit. The
 /// `sleep 10` child with a 100 ms timeout returns the `Timeout` arm's exit code (42), not `Ok` (1).

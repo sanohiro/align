@@ -4511,6 +4511,16 @@ impl EffectScan<'_> {
                 self.expr(command);
                 self.expr(ns);
             }
+            ExprKind::CommandEnv { command, name, value } => {
+                self.impure_direct = true;
+                self.expr(command);
+                self.expr(name);
+                self.expr(value);
+            }
+            ExprKind::CommandEnvClear { command } => {
+                self.impure_direct = true;
+                self.expr(command);
+            }
             ExprKind::CommandRun { command } => {
                 self.impure_direct = true;
                 self.expr(command);
@@ -6116,6 +6126,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandEnv { .. }
+            | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. }
             | ExprKind::EncodingEncode { .. }
@@ -6413,6 +6425,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandEnv { .. }
+            | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. }
             | ExprKind::RunOutputStdout { .. }
@@ -7166,6 +7180,12 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(command, depth);
                 self.walk(ns, depth);
             }
+            ExprKind::CommandEnv { command, name, value } => {
+                self.walk(command, depth);
+                self.walk(name, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::CommandEnvClear { command } => self.walk(command, depth),
             ExprKind::CommandRun { command } => self.walk(command, depth),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.walk(out, depth)
@@ -7838,6 +7858,12 @@ impl UnnecessaryHeapScan {
                 self.visit(command);
                 self.visit(ns);
             }
+            ExprKind::CommandEnv { command, name, value } => {
+                self.visit(command);
+                self.visit(name);
+                self.visit(value);
+            }
+            ExprKind::CommandEnvClear { command } => self.visit(command),
             ExprKind::CommandRun { command } => self.visit(command),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.visit(out)
@@ -8746,7 +8772,8 @@ impl<'a> MoveCheck<'a> {
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
             // `out.code` (`i64`) borrow nothing; `out.stdout()`/`out.stderr()` (which DO borrow `out`)
             // are in the `storage_roots` group above.
-            | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandTimeout { .. } | ExprKind::CommandRun { .. }
+            | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. } | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
@@ -9720,6 +9747,12 @@ impl<'a> MoveCheck<'a> {
                 self.expr(command, moved, false, false);
                 self.expr(ns, moved, false, false);
             }
+            ExprKind::CommandEnv { command, name, value } => {
+                self.expr(command, moved, false, false);
+                self.expr(name, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
+            ExprKind::CommandEnvClear { command } => self.expr(command, moved, false, false),
             ExprKind::CommandRun { command } => self.expr(command, moved, false, false),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.expr(out, moved, false, false)
@@ -13966,7 +13999,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.process` (Slice 4) `command` methods on a `command`: `c.cwd(dir)` sets the working
             // directory in place (`()`); `c.run()` forks + captures → `Result<run_output, Error>`.
             // Type-guarded, same as the `http request` builder methods.
-            "cwd" | "timeout_ns" | "run" if recv_ty == Ty::Command => {
+            "cwd" | "timeout_ns" | "env" | "env_clear" | "run" if recv_ty == Ty::Command => {
                 self.check_command_method(recv_expr, method, args, span)
             }
             // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.code()` (`i64`) /
@@ -18402,9 +18435,9 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `c.cwd(dir)` / `c.run()` on a `command` ([`Ty::Command`]), the receiver already evaluated. The
     /// receiver must be a **bound local** (the v1 Move-temporary gate, `check_http_request_method`
-    /// precedent): every method borrows the handle (not consumed — `cwd`/`timeout_ns` mutate in place,
-    /// `run` is re-runnable). `cwd(dir: str)` / `timeout_ns(ns: i64)` yield `()`; `run()` yields
-    /// `Result<run_output, Error>`.
+    /// precedent): every method borrows the handle (not consumed — `cwd`/`timeout_ns`/`env`/`env_clear`
+    /// mutate in place, `run` is re-runnable). `cwd(dir: str)` / `timeout_ns(ns: i64)` /
+    /// `env(name: str, value: str)` / `env_clear()` yield `()`; `run()` yields `Result<run_output, Error>`.
     fn check_command_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -18455,6 +18488,28 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::CommandTimeout { command: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
             }
+            "env" => {
+                if args.len() != 2 {
+                    self.diags.error(format!("'.env()' takes 2 arguments (the variable name and value), got {}", args.len()), span);
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                if name.ty == Ty::Error {
+                    return err;
+                }
+                let value = self.check_str_init(&args[1]);
+                if value.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::CommandEnv { command: Box::new(recv_expr), name: Box::new(name), value: Box::new(value) }, ty: Ty::Unit, span }
+            }
+            "env_clear" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.env_clear()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::CommandEnvClear { command: Box::new(recv_expr) }, ty: Ty::Unit, span }
+            }
             "run" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.run()' takes no arguments, got {}", args.len()), span);
@@ -18467,7 +18522,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / timeout_ns / run)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / timeout_ns / env / env_clear / run)"), span);
                 err
             }
         }
@@ -21755,6 +21810,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(command);
                 self.finalize_expr(ns);
             }
+            ExprKind::CommandEnv { command, name, value } => {
+                self.finalize_expr(command);
+                self.finalize_expr(name);
+                self.finalize_expr(value);
+            }
+            ExprKind::CommandEnvClear { command } => self.finalize_expr(command),
             ExprKind::CommandRun { command } => self.finalize_expr(command),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.finalize_expr(out)

@@ -515,6 +515,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Command { cmd, args } => format!("command({}, {})", operand_str(cmd), operand_str(args)),
         Rvalue::CommandCwd { command, dir } => format!("command_cwd({}, {})", operand_str(command), operand_str(dir)),
         Rvalue::CommandTimeout { command, ns } => format!("command_timeout({}, {})", operand_str(command), operand_str(ns)),
+        Rvalue::CommandEnv { command, name, value } => format!("command_env({}, {}, {})", operand_str(command), operand_str(name), operand_str(value)),
+        Rvalue::CommandEnvClear { command } => format!("command_env_clear({})", operand_str(command)),
         Rvalue::CommandRun { command, out } => format!("command_run({}, -> _{out})", operand_str(command)),
         Rvalue::RunOutputCode { out } => format!("run_output_code({})", operand_str(out)),
         Rvalue::RunOutputView { out, err } => {
