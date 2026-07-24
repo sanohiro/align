@@ -849,6 +849,9 @@ pub enum Rvalue {
     /// status (always 0). `split` selects the between-match spans; `find_all` the match spans.
     RegexFindAll { regex: Operand, text: Operand, out: Slot },
     RegexSplit { regex: Operand, text: Operand, out: Slot },
+    /// `re.replace[_all](text, repl)` — return a fresh owned `string` `{ptr,len}` by value with
+    /// matches replaced by `repl` (`$`-expanded). `all` selects first-only vs every match.
+    RegexReplace { regex: Operand, text: Operand, repl: Operand, all: bool },
     EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
     /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
@@ -3320,7 +3323,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::RegexIsMatch { .. }
         | hir::ExprKind::RegexFind { .. }
         | hir::ExprKind::RegexFindAll { .. }
-        | hir::ExprKind::RegexSplit { .. } => lower_regex_expr(b, e),
+        | hir::ExprKind::RegexSplit { .. }
+        | hir::ExprKind::RegexReplace { .. } => lower_regex_expr(b, e),
         // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
         // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
         // match grows by exactly one arm (not seven). A deep expression tree recurses through
@@ -9332,6 +9336,15 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let a = b.fresh_value(e.ty);
             b.push(Stmt::Let(a, Rvalue::Load(out)));
             Operand::Value(a)
+        }
+        hir::ExprKind::RegexReplace { regex, text, repl, all } => {
+            // Owned `string` returned by value (the `PathNormalize` shape); the bound local `Drop`s it.
+            let re = lower_expr(b, regex);
+            let t = lower_expr(b, text);
+            let r = lower_expr(b, repl);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RegexReplace { regex: re, text: t, repl: r, all: *all }));
+            Operand::Value(v)
         }
         _ => unreachable!("lower_regex_expr called for a non-regex expression"),
     }

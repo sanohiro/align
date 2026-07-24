@@ -1113,6 +1113,11 @@ pub enum ExprKind {
     /// representation as [`RegexFindAll`]). Empty leading/trailing/interior fields are kept; empty
     /// input is one empty field. Both operands are borrowed. Pure.
     RegexSplit { regex: Box<Expr>, text: Box<Expr> },
+    /// `re.replace(text, repl)` (`all == false`) / `re.replace_all(text, repl)` (`all == true`) —
+    /// a fresh owned `string` with matches replaced by `repl`, which expands `$1` / `${name}` /
+    /// `$$` (the Rust `regex` contract). The result never aliases `text`. All operands are borrowed.
+    /// Pure.
+    RegexReplace { regex: Box<Expr>, text: Box<Expr>, repl: Box<Expr>, all: bool },
     /// `cli.command(name)` — a fresh [`crate::Ty::CliCommand`] builder named `name` (a `str`). A
     /// **Move** handle owning its registered-flag table; `Drop`-freed. Pure (no I/O — argv is
     /// already captured by `main(args)`). `name` is borrowed.

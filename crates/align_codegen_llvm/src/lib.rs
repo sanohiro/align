@@ -2293,6 +2293,18 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `replace(handle, text, repl, all)` -> {ptr,len} owned string (by-value AlignStr return).
+    funcs.insert(
+        "regex_replace".to_string(),
+        module.add_function(
+            "align_rt_regex_replace",
+            slice_struct_type(ctx).fn_type(
+                &[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ctx.i32_type().into()],
+                false,
+            ),
+            None,
+        ),
+    );
     funcs.insert(
         "regex_free".to_string(),
         module.add_function("align_rt_regex_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
@@ -7609,6 +7621,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs[fname], &[re.into(), tp.into(), tl.into(), out_ptr.into()], "refindall")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_find_all/split returns i32 status")
+            }
+            Rvalue::RegexReplace { regex, text, repl, all } => {
+                // Fresh owned `string` returned by value; the bound local `Drop`-frees it.
+                let re = self.operand(regex)?.into_pointer_value();
+                let (tp, tl) = self.split_str(text)?;
+                let (rp, rl) = self.split_str(repl)?;
+                let allv = self.ctx.i32_type().const_int(u64::from(*all), false);
+                self.builder
+                    .build_call(
+                        self.funcs["regex_replace"],
+                        &[re.into(), tp.into(), tl.into(), rp.into(), rl.into(), allv.into()],
+                        "rereplace",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_replace returns a {ptr,len}")
             }
             Rvalue::HttpParse { data, out } => {
                 let out_ptr = self.slots[out];
