@@ -8,7 +8,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-23, **`std.regex` FIRST SLICE SHIPPED (branch `feat/std-regex`, PR open):
+_Last updated: 2026-07-24, **`std.regex` COMPLETE — the whole deferred surface shipped across three
+merged PRs on top of the first slice.** #627 `re.find_all(text)` / `re.split(text)` → owned
+`array<regex_match>` (the `DynStructArray` materialization template; spans view nothing so the array
+freely escapes; `find_iter` handles empty-match advancement). #628 `re.replace(text,repl)` /
+`re.replace_all(...)` → owned `string` with `$1`/`${name}`/`$$` expansion (always an independent
+buffer, never aliases `text`; owner-confirmed the `$`-expansion + named-groups-via-`group_index`
+surface). #629 `re.captures(text)` → `Option<captures>` (a NEW opaque Move handle `Ty::Captures`,
+mechanically like `regex`), `re.group_count()` → `i64`, `re.group_index(name)` → `Option<i64>`,
+`caps.group(i)` → `Option<regex_match>` (group 0 = whole match, non-participating = `None`,
+out-of-range aborts). Each slice swept every Move/drop/region/escape/`MoveCheck` pass a new IR
+variant must not skip (`Ty::Captures` reached `null_moved_source` + the Option-payload destructor →
+`regex_captures_free`, so no leak/double-free), was verified by an independent adversarial
+soundness review (Codex still unavailable), and shipped with runtime unit + driver E2E tests
+(runtime `regex_tests` + `std_regex.rs`, 21 E2E cases). `docs/impl/std-design/regex.md` (+ its ja
+mirror) marks the module COMPLETE. Still deferred (no consumer): captures-iterator, closure-callback
+replace, `rx"..."` literals. Full workspace suite green after each merge; clippy clean. **First slice
+(2026-07-23):**
 `regex.compile(str) -> Result<regex, Error>` + bound-receiver `is_match` / `find` / `find_at`
 returning the builtin Copy `regex_match { start, end }` (half-open UTF-8 byte span). Owned Move
 handle backed by the Rust `regex` crate 1.13.1 (added to `Cargo.lock`), swept through
