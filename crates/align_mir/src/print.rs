@@ -512,6 +512,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ChildWait { child } => format!("child_wait({})", operand_str(child)),
         Rvalue::ChildKill { child, sig } => format!("child_kill({}, {})", operand_str(child), operand_str(sig)),
         Rvalue::ProcessExec { cmd, args } => format!("process_exec({}, {})", operand_str(cmd), operand_str(args)),
+        Rvalue::Command { cmd, args } => format!("command({}, {})", operand_str(cmd), operand_str(args)),
+        Rvalue::CommandCwd { command, dir } => format!("command_cwd({}, {})", operand_str(command), operand_str(dir)),
+        Rvalue::CommandRun { command, out } => format!("command_run({}, -> _{out})", operand_str(command)),
+        Rvalue::RunOutputCode { out } => format!("run_output_code({})", operand_str(out)),
+        Rvalue::RunOutputView { out, err } => {
+            format!("run_output_{}({})", if *err { "stderr" } else { "stdout" }, operand_str(out))
+        }
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

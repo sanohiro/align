@@ -5,7 +5,9 @@
 
 > 🌐 [English](../process.md) · **日本語**
 
-> **ステータス:** M11 で完了済みです。exit/abort、spawn/wait/kill、exec は実装済みです。
+> **ステータス:** M11 のコアは完了済みです（exit/abort、spawn/wait/kill、exec は実装済み）。**拡張は
+> 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
+> よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。未実装です。
 
 ## Overview
 
@@ -194,3 +196,219 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 - child を array の要素にすると拒否される
 - CLOEXEC が子プロセスへの fd リークを防ぐ(P3)
 - import が必須であること
+
+# Extension — captured output + cwd / env / timeout (align-llm Request 1)
+
+> **ステータス:** 2026-07-24 に設計済み、未実装。実クライアントである `align-llm`(コアループが
+> build/test/lint コマンドを走らせ、その**出力をパースする**)が動機である。出典:
+> `../align-llm/docs/align-requests.md` の Request 1(優先度: critical — このループを塞ぐため)。
+
+## Why this is genuinely new
+
+上記のスライス 1–3 は `spawn`/`wait`/`kill`/`exec` を出荷しているが、`spawn` は素の `fork` + `execvp` を
+**パイプも `dup2` も無し**で行う。子は親の fd を継承し、その出力はそのまま端末へ流れる。`child` ハンドルは
+`{ pid, reaped }` だけである。したがって `stdout`/`stderr` を文字列としてキャプチャすること、指定した作業
+ディレクトリで実行すること、子ごとの環境を渡すこと、タイムアウトで実行を打ち切ることは、いずれも**今日は
+不可能**であり、そのどれも本モジュールの記録済み設計空間には無い(過去の先送りは `detach()` と `Never` 型
+だけだった)。これは実ワークロードの要件であって、計画済みのギャップではない。
+
+## Shared prerequisite — the `Error.Timeout` variant (canonical definition; `std.http`/`std.net` reuse it)
+
+タイムアウトは、非ゼロの終了とトランスポートエラーから**区別可能**でなければならない(align-llm は「テストが
+ハングした」と「テストが失敗した」を区別する必要がある)。組み込みの `Error` enum は 4 つのバリアント
+(`NotFound`, `Invalid`, `Denied`, `Code(i32)`)を持ち、timeout は無い。本拡張は 5 つ目の
+**`Error.Timeout`**(ペイロード無し)を追加する。これは `std.http`/`std.net` の I/O タイムアウト作業
+(http.md / net.md G3-1)と共有する。Request 1 が先に着地するため、ここで定義する。
+
+5 バリアントの enum と、その分岐なしの status↔variant マッピング(唯一の非機械的な部分):
+
+```text
+variant order (must match ERROR_VARIANT_CODE):  NotFound, Invalid, Denied, Timeout, Code(i32)
+AL_ status sentinels (align_runtime):            AL_NOT_FOUND=1  AL_INVALID=2  AL_DENIED=3
+                                                 AL_TIMEOUT=4  (NEW)   AL_CODE=5  (was 4)
+MIR status→Error decode (make_error_from_status): tag = min(status-1, 4);  Code payload = status-5
+```
+
+タッチポイント(いずれも既に 4 バリアントを扱っている — 再構築せず拡張する):
+- `crates/align_sema/src/lib.rs` ~`:2795` — `Denied` と `Code` の**間**に `Timeout` バリアントを追加し
+  (ペイロード `Vec::new()`、`field_base: 1`)、`Code` を末尾に保つ。
+- `crates/align_runtime/src/lib.rs` ~`:6803` — `AL_TIMEOUT = 4` を挿入し、`AL_CODE` を 4→5 へ繰り上げ、
+  `io_error_to_status` 内の `AL_CODE.saturating_add(errno)` の基準値を更新する。汎用の errno マッピングは
+  不変であり、タイムアウトは**タイムアウト箇所で明示的に** `AL_TIMEOUT` を返すことで表面化させる。errno の
+  分類によるのではない(無関係な箇所からの `EAGAIN`/`ETIMEDOUT` は依然として `Code` を意味する)。
+- `crates/align_mir/src/lib.rs` ~`:8117` の `make_error_from_status` — 分岐なしのクランプを
+  `min(status-1, 3)` / `Code(status-4)` から `min(status-1, 4)` / `Code(status-5)` へ変更する。
+
+これは言語コアの変更である(`Error` enum は std ではなくコア)。意図的に小さく、一方向的である(新バリアントを
+足すだけで、リネームも削除もしない)。
+
+## Surface
+
+実行ごとの任意設定(cwd / env / timeout)は、末尾の `opts?` 引数にはできない — **Align には任意/デフォルト/
+名前付き引数が無い**。任意設定の既存の唯一のイディオムは `std.http` のリクエストビルダ
+(`r := http.request(...)`; `r.header(...)`; `r.body(...)` — それぞれ束縛ローカルの Move ハンドルへの in-place な
+変更で、`()` を返す。連鎖する fluent 呼び出しでは*ない*)である。本拡張はこのイディオムに正確に従うので、二つ目の
+機構ではなく同じ「一つのやり方」である:
+
+```text
+c := process.command(cmd: str, args: array<str>) -> command   // Move handle (opaque, Ty::Command)
+c.cwd(dir: str)                    // set working directory       -> ()   (in-place, bound-local)
+c.env(name: str, value: str)       // add/override one variable    -> ()
+c.env_clear()                      // start the child env empty    -> ()
+c.timeout_ns(ns: i64)              // kill + Err(Timeout) past ns   -> ()
+out := c.run() -> Result<run_output, Error>   // fork+capture; borrows c (re-runnable)
+
+// run_output — an opaque Move handle (Ty::RunOutput), NOT a by-value struct (see below).
+out.code() -> i64        // exit code (decode_wait_status: WEXITSTATUS, or 128+signal)
+out.stdout() -> str      // captured stdout, zero-copy view into out (region-bound to out)
+out.stderr() -> str      // captured stderr, zero-copy view into out (region-bound to out)
+```
+
+使用例(align-llm の verify ループ):
+
+```align
+c := process.command("git", ["git", "status", "--porcelain"])
+c.cwd(repo_dir)
+c.timeout_ns(30_000_000_000)          // 30 s
+out := c.run()?                        // Err(Timeout) if it overruns
+match out.code() {
+  0 => parse_clean(out.stdout()),
+  _ => report(out.stderr()),
+}
+```
+
+### Why `run_output` is a handle, not `{ code, stdout, stderr }`
+
+リクエストは `output = { code, stdout, stderr }` を素描していた。**2 つ**のヒープ文字列を所有する値渡しの
+組み込み構造体は、まさに net.md(`datagram { n, peer }`)と http.md(`response_builder` が深く所有して回避)が
+ともに**先送り**と記録した「ファーストクラスの組み込み構造体の返却」である — `Result` の `Ok` ペイロードは
+単一の `Scalar` であり、複数の所有アロケーションを集約した値を返す機構は無い。「ヒープを所有する返却物」の
+実現済み Align イディオムは、内部にアロケーションを所有する単一の不透明な `*mut Handle` をアクセサ経由で読む
+ことである — これはまさに `http.response` の動作そのもの(`resp.status()` / `resp.header()` / `resp.body()`)である。
+よって `run_output` は `response` を鏡写しにする: 1 つの Move ハンドル、`.code()` / `.stdout()` / `.stderr()`
+アクセサ、文字列アクセサはリージョン束縛のゼロコピービューを返す。これは Align の現在の一貫した設計の中での
+**理想形**であって妥協ではない。値渡し構造体の綴りは、別のより大きな先送り機能を先に作る必要があり(その上で
+同じことをする二つ目のやり方になってしまう)。
+
+## Type & ownership classification
+
+- `command` — **Move** 型(`Ty::Command`)。cmd + 完全な argv + 任意の cwd + env 上書きリスト + タイムアウトを
+  所有する。`Ty::HttpRequest`(所有内部を持つビルダ Move ハンドル)を手本とする。Drop = free。設定メソッドは
+  借用(束縛レシーバ、in-place)、`run()` も借用(再実行可能)。
+- `run_output` — **Move** 型(`Ty::RunOutput`)。終了コード + 2 つの所有バイトバッファを所有する。
+  `Ty::HttpResponse` を手本とする。`Result<run_output, Error>` の `Ok` 位置に乗る(`Scalar::RunOutput`)。
+  `.stdout()`/`.stderr()` ビューは `region_of(out)` である(P3 スタイルの escape ゲート: ビューは `out` の Drop を
+  越えて escape してはならない)。Drop = 両バッファを free。
+- どちらも自身のコンストラクタの `Result` Ok スロットを除いて集約要素としては拒否される — 標準の Move ハンドル
+  制限である。どちらも**新 Ty の完全なスイープ**が必要(New machinery を参照)。
+
+## Runtime design (`align_rt_command_*` + `align_rt_command_run`)
+
+ビルダハンドル `Command { argv: Vec<CString>, cwd: Option<CString>, env: Vec<(CString,CString)>,
+env_clear: bool, timeout_ns: i64 }` を `align_rt_command_new(cmd, args)` で構築する(argv は
+`marshal_cmd_argv` を再利用。内部 NUL / 空 argv / 非 UTF-8 の拒否も同じ)。`cwd` / `env` / `env_clear` /
+`timeout_ns` は薄いセッタである(env のペアは `*const AlignStr, len` のスライス ABI で marshal、`env` 呼び出し
+1 回につき 1 ペア)。`run_output` ハンドルは `RunOutput { code: i64, out: Vec<u8>, err: Vec<u8> }`。
+
+`align_rt_command_run(c, out: *mut *mut RunOutput) -> i32`:
+
+1. パイプを 2 本(`stdout`, `stderr`)作り、両端を `O_CLOEXEC` にする(P3 — 子へリークせず、read 端が exec 後の
+   イメージに届かない)。
+2. `fork`。**子**(async-signal-safety の注意点は `spawn` と同一 — スレッド化された親から fork した後の
+   `execvp`/`chdir`/`setenv` は既知の既存ハザードであり、`posix_spawn` が記録済みの理想的な修正):cwd が設定
+   されていれば `chdir(cwd)`(失敗 → `_exit(127)`);`env_clear` なら `clearenv()`、続いて各上書きを `setenv`;
+   2 つのパイプ write 端を fd 1 と 2 に `dup2`;すべてのパイプ fd を close;`execvp`;失敗時 `_exit(127)`。
+3. **親**:write 端を close する。両 read fd を non-blocking にする。**両 read fd を一緒に `poll`** し、データが
+   届くたびに `out.out` / `out.err` へドレインする。両方を同時にドレインするのは必須である。さもないと、親が
+   stdout を読む間に子が stderr パイプを満たすと**デッドロック**する(古典的な 2 パイプキャプチャバグ)。両方が
+   EOF に達するまでループする。
+4. **タイムアウト**:`timeout_ns > 0` なら、残りのデッドラインで `poll` する(ns→ms、≥1 にクランプ)。期限切れ時:
+   `kill(pid, SIGKILL)`、EOF までドレインし続け(子は死につつある — 有界の non-blocking なドレインなので、パイプが
+   reap を詰まらせない)、`waitpid` の後 **`AL_TIMEOUT`** を返す(部分出力は捨てる — 「タイムアウトを報告せよ、
+   半端な答えを返すな」)。`timeout_ns == 0` = タイムアウト無し(ブロック)。負の `timeout_ns` は
+   `c.timeout_ns()` の構築時に拒否する(`kill` のシグナル範囲と同じく abort)。
+5. 子を `waitpid`(ここで reap — ゾンビ無し);`out.code = decode_wait_status(status)`。
+6. **UTF-8**:`out.out` / `out.err` を UTF-8 として検証する。不正 → free して `AL_INVALID` を返す
+   (`fs.read_file` の先例 — `string` 型のアクセサは非 UTF-8 バイトを晒せない)。下記参照。
+7. `*out = Box::into_raw(Box::new(RunOutput{...}))`;`0` を返す。
+
+`.stdout()`/`.stderr()` は `AlignStr { ptr: out.out.as_ptr(), len }` を返す — 借用ビューであり、
+`align_rt_http_resp_body` とまったく同じ。
+
+## UTF-8 policy (decision + the deferred bytes tier)
+
+v1 の `run()` は `str` アクセサを返すので、**UTF-8 を検証し、不正バイトでエラー(`Error.Invalid`)にする** —
+`fs.read_file`(string、検証あり)対 `read_bytes_view`(bytes)と一貫する。build / test / lint の出力は実際上
+UTF-8 であり、クライアントはそれをテキストとしてパースする。任意のバイナリなツール出力に対する堅牢性の逃げ道は、
+**先送りの bytes 層** `c.run_bytes() -> Result<run_bytes, Error>` であり、その `.stdout()`/`.stderr()` は
+`slice<u8>` を返す(検証なし)— `read_file` 対 `read_bytes_view` を一対一で鏡写しにする。最初のスライスでは
+出荷しない先送りだが、string 層を乱さず落とし込めるよう設計する(兄弟ハンドル + アクセサ)。非 UTF-8 のツール
+出力が消費者にとって現実だと判明したら出荷する。
+
+## Effect classification
+
+すべて impure(プロセスを fork する / マシンを観測する)。
+
+## Error policy
+
+fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイムアウトは `Error.Timeout`(タイムアウト箇所
+での明示的な `AL_TIMEOUT` — errno から推論しない)。非 UTF-8 のキャプチャ出力 → `Error.Invalid`。子内での
+`chdir`/`exec` 失敗は子の `_exit(127)` → `out.code()` の終了コード 127 として表面化する(`spawn` と同じ規約)。
+`Err` では**ない** — fork 自体は成功しているため。
+
+## New machinery required
+
+- `Error.Timeout` + `AL_TIMEOUT`(上記の共有前提)。
+- 2 つの新しい不透明 Move ハンドル型 `Ty::Command` / `Ty::RunOutput`(+ `Scalar::Command` /
+  `Scalar::RunOutput`)。それぞれ、新しい Move ハンドルが飛ばしてはならない**新 Ty の完全なスイープ**を通す
+  必要がある(最近の `Ty::Captures` / 既存の `Ty::HttpResponse` を手本とする):sema の `scalar_of`/逆写像、
+  `needs_drop` / 4 つの move 分類 `matches!` リスト、`tracks_region`、`region_of`、要素借用インターセプト、
+  `ty_name`、`scalar_arg` の Move 拒否チョークポイント;MIR の move 分類器 / owning-expr セット / 表示名 /
+  `new_slot`;codegen の LLVM ポインタ型、`handle_free_fn`(`Ty::Command => "command_free"`、
+  `Ty::RunOutput => "run_output_free"`)、move 時のゼロ初期化セット、ランタイム free-fn の extern 宣言。
+  `handle_free_fn` は `is_field_ok` の許可集合と一致していなければならない。このスイープこそ soundness の穴が
+  潜む場所である — `/align-self-review` gate 2(「新しい IR バリアントが解析パスを飛ばす」)。
+- ランタイム:`align_rt_command_new/cwd/env/env_clear/timeout_ns/run/free` +
+  `align_rt_run_output_code/stdout/stderr/free`。
+
+## Slice breakdown
+
+4. `process.command` + `c.cwd(dir)` + `run()` — **両方 must-have**(出力キャプチャ + 作業ディレクトリ)。
+   `Command`/`RunOutput` ハンドル + 新 Ty の完全なスイープ(機構の大半)、pipe+fork+dup2+2 パイプ `poll`
+   ドレイン、子側の `chdir`、`.code()`/`.stdout()`/`.stderr()`、UTF-8 検証。タイムアウト/env はまだ無し。`cwd` は
+   must-have であり子側の `chdir` が些細なのでここに畳み込む。よって S4 は完結した must-have の提供になる(空の
+   足場ではなく、実セッタを持つ `command`)。
+5. `c.timeout_ns(ns)` + `Error.Timeout` のコア変更 — 「ハングしたテストがループを凍らせる」の修正
+   (kill + `Err(Timeout)`)。
+6. `c.env(name,value)` + `c.env_clear()`。
+7. *(先送り)* bytes 層 `c.run_bytes()` — 需要に応じて出荷。
+
+## Pitfalls
+
+- **P7(2 パイプデッドロック)** — 第 1 の正しさポイント。**両方**の read fd を `poll` し両方をドレインせよ。
+  さもないと、子が一方のパイプを満たす間に親が他方を読むとデッドロックする。テスト:*両方*のストリームに
+  >64 KiB を書き、非ゼロで終了する子 → 両方が完全にキャプチャされ、コードも正しい。
+- **P8(タイムアウトは実際に kill + reap すべし)** — 期限切れ時 `SIGKILL`、続いて EOF までドレインして
+  `waitpid`;ゾンビをリークせず、満杯のパイプで詰まらせない。テスト:100 ms タイムアウトの `sleep 10` →
+  ~100 ms 以内に `Err(Timeout)`、ゾンビ無し。
+- **P9(ビューのリージョン、http P3 と同様)** — `.stdout()`/`.stderr()` は `out` へのビュー;`region_of =
+  region_of(out)`。`out` の Drop を越える escape は拒否。
+- **P10(新 Ty スイープ)** — `Ty::Command`/`Ty::RunOutput` は New machinery の全パスを叩かねばならない;飛ばした
+  パスは leak/double-free/UAF になる。`/align-self-review` gate 2 を回す。
+- **P11(子の async-signal-safety)** — スレッド化された親から `fork` した後の `chdir`/`clearenv`/`setenv`/`execvp`
+  は既存の `spawn` ハザードを持つ(文書化済み;`posix_spawn` が先送りの理想)。
+- **P12(無制限キャプチャ)** — 暴走する子(`yes`)はキャプチャを無制限に増やす。v1 は無制限(`read_file` が
+  ファイル全体を読むのと同じ);`max_capture` の上限は記録済みの将来ノブであって v1 ではない。
+
+## Test checklist / gate
+
+- 子が **stdout と stderr の両方**に書いて非ゼロで終了する → 呼び出し側が完全な stdout 文字列、完全な stderr
+  文字列、終了コードを回収する(Request-1 の受け入れゲート)。
+- `c.cwd(dir)` → 子が `dir` を作業ディレクトリとして観測する。
+- `timeout_ns` を超えるコマンド → `Err(Timeout)`(非ゼロ終了とは別)、kill 済み、ゾンビ無し。
+- `c.env(n,v)` の上書き / `c.env_clear()` が空から始まる → 子が期待どおりの環境を見る。
+- 非 UTF-8 出力 → `Error.Invalid`(string 層)。
+- 2 パイプ各 >64 KiB → デッドロック無し(P7)。
+- `.stdout()` ビューが `out` の Drop を越えて escape → 拒否(P9)。
+- `command` / `run_output` を array の要素にする → 拒否。
+- import が必須であること。

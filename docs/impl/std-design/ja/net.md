@@ -158,3 +158,50 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 
 **Note**: v1 はブロッキングプール上のブロッキングソケットである。Non-blocking/epoll/io_uring は、同じ
 シグネチャの背後に置く後日の Linux バックエンドであって、意味論上の変更ではない。
+
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+
+`std.http` のリクエスト単位タイムアウト(http.md「I/O timeouts」)は net 基盤（レール）に載るので、基盤はここで
+設計する;net は raw-socket 呼び出し側向けにこれを直接も公開する。動機は `align-llm` の LLM API 呼び出し
+(ブラックホール化されたコネクションがループを停滞させてはならない)である。出典:
+`../align-llm/docs/align-requests.md` の Request 2。
+
+### Surface
+
+read/write デッドラインは束縛ローカルの conn への in-place セッタである(同じ Move ビルダのイディオム):
+
+```text
+c := tcp.connect(host, port)?
+c.read_timeout_ns(ns: i64)      // SO_RCVTIMEO; 0 = block forever (default)   -> ()
+c.write_timeout_ns(ns: i64)     // SO_SNDTIMEO                                 -> ()
+```
+
+負の `ns` は構築時に拒否する(abort)。デッドラインを超える read/write は `Err(Timeout)` を返す — 共有の
+`Error.Timeout` バリアント(正準定義は `process.md`;`AL_TIMEOUT = 4`)。デッドライン期限切れ
+(`SO_RCVTIMEO` からの `EAGAIN`/`EWOULDBLOCK`)は syscall 境界でのみ spurious wakeup と区別不能なので、
+read/write 箇所はデッドライン武装済みの `EAGAIN` を明示的に `AL_TIMEOUT` に変換する(タイムアウト非武装の fd では
+汎用 errno 経路は不変)。
+
+### Connect timeout — the shared substrate
+
+**connect** デッドラインは `align_rt_tcp_connect`(ランタイム `:679`;現在は「no connect timeout」、`:621`)に
+宿る:これが `timeout_ns` パラメータを得る — non-blocking `connect` → `EINPROGRESS` → ns デッドラインで
+`poll(POLLOUT)` → `SO_ERROR` を確認;poll タイムアウトは `AL_TIMEOUT` を返す。`timeout_ns == 0` は現在の
+ブロッキング connect を正確に保つ。`std.http` はこの同じパラメータを通して有効リクエストタイムアウトを渡す。
+raw-`net` の `tcp.connect(host, port)` シグネチャは v1 ではタイムアウト無しのまま(デッドラインを設定する
+connect 前のハンドルが無く、Align には任意引数が無い);raw-socket の消費者が有界 connect を必要とするなら、
+`tcp.connect_timeout(host, port, ns)` という兄弟が記録済みのフォローアップである。ここで行う要点は、基盤が一度
+存在し `std.http` がそれを再利用することであって、二つ目の http ローカルな機構ではない。
+
+### New machinery
+
+`Error.Timeout` + `AL_TIMEOUT`(共有、process.md 参照)。`align_rt_tcp_connect` が `timeout_ns` を得る。
+`align_rt_tcp_read_timeout` / `align_rt_tcp_write_timeout`(`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`)+
+`read_timeout_ns` / `write_timeout_ns` に対する sema の `TcpConn` メソッドディスパッチ。新 Ty も新 I/O 経路も
+無い — 既存のブロッキングレール上のソケットオプションである。
+
+### Test / gate
+
+ブラックホール化された(決して accept しない)アドレスへ上限付きで connect → 上限内で `Err(Timeout)`。相手が
+accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が上限内で `Err(Timeout)` を返す。
+`ns == 0` はブロッキング挙動を保つ。

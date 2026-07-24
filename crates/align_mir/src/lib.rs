@@ -972,6 +972,23 @@ pub enum Rvalue {
     /// `r.body(data)` — copy the byte view `data` (`{ptr,len}`) into the request handle `req`'s body.
     /// No value. Pure.
     HttpBody { req: Operand, data: Operand },
+    /// `process.command(cmd, args)` (`std.process` Slice 4) — allocate a `command` builder handle
+    /// (opaque pointer), returned by value (the bound local `Drop`-frees it via `command_free`).
+    /// `cmd`/`args` are `{ptr,len}` str views (the argv is marshalled to C strings by the runtime; a
+    /// malformed argv aborts). Impure.
+    Command { cmd: Operand, args: Operand },
+    /// `c.cwd(dir)` — set the command handle `command`'s working directory (`dir` a `{ptr,len}` str
+    /// view), in place. No value. A `dir` with an interior NUL aborts at runtime. Impure.
+    CommandCwd { command: Operand, dir: Operand },
+    /// `c.run()` — fork + capture: the runtime writes an owned `run_output` handle to `out` and returns
+    /// an `i32` status (0 = ok; else `AL_INVALID` for non-UTF-8 output / a mapped errno). The caller
+    /// branches `Ok(run_output)` / `Err`. `command` is borrowed (re-runnable). Impure.
+    CommandRun { command: Operand, out: Slot },
+    /// `out.code()` — the run's exit code (`i64`) of the run-output handle `out`. Pure.
+    RunOutputCode { out: Operand },
+    /// `out.stdout()` / `out.stderr()` — the captured stdout / stderr as a `str` **view** `{ptr,len}`
+    /// into `out`'s owned buffer (region-bound to `out`). `err` selects the stderr buffer. Pure.
+    RunOutputView { out: Operand, err: bool },
     /// `http.parse(data)` — parse the response byte view `data` (`{ptr,len}`) into an owned `http
     /// response` handle written to `out`, returning an `i32` status (0 = ok, `AL_INVALID` ->
     /// `Error.Invalid`). The caller branches `Ok(response)` / `Err`. Pure.
@@ -2127,7 +2144,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -3059,6 +3076,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
         hir::ExprKind::ChildKill { child, sig } => lower_child_kill(b, child, sig, e.ty),
         hir::ExprKind::ProcessExec { cmd, args } => lower_process_exec(b, cmd, args, e.ty),
+        // `std.process` Slice 4 — `process.command` / `c.cwd` / `c.run` / the `run_output` accessors.
+        // Routed through one out-of-line helper (the `expr_depth` #296 headroom discipline).
+        hir::ExprKind::ProcessCommand { .. }
+        | hir::ExprKind::CommandCwd { .. }
+        | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::RunOutputCode { .. }
+        | hir::ExprKind::RunOutputStdout { .. }
+        | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -6929,6 +6954,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::RunOutput
         | Scalar::Fn(_) => KeyOrder::PartialFloat,
     }
 }
@@ -8986,6 +9012,57 @@ fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty
     Operand::Value(r)
 }
 
+/// Lower any `std.process` Slice 4 op (`process.command` / `c.cwd` / `c.run` / the `run_output`
+/// accessors). Out-of-line (`#[inline(never)]`) and reached through a single `lower_expr` arm, so its
+/// locals stay off the recursive `lower_expr` frame (the `expr_depth` #296 headroom lesson). Never
+/// called for a non-command `e`.
+#[inline(never)]
+fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        // `process.command(cmd, args)` → an owned `command` handle returned by value (the bound local
+        // `Drop`-frees it via `command_free`).
+        hir::ExprKind::ProcessCommand { cmd, args } => {
+            let c = lower_expr(b, cmd);
+            let a = lower_expr(b, args);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Command { cmd: c, args: a }));
+            Operand::Value(v)
+        }
+        // `c.cwd(dir)` → set the command handle's working directory in place; no value.
+        hir::ExprKind::CommandCwd { command, dir } => {
+            let cm = lower_expr(b, command);
+            let d = lower_expr(b, dir);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CommandCwd { command: cm, dir: d }));
+            Operand::Const(Const::Unit)
+        }
+        // `c.run()` → `Result<run_output, Error>` (shared out-slot + i32-status lowering, like
+        // `http.parse` / `cl.get`). `command` is borrowed (re-runnable).
+        hir::ExprKind::CommandRun { command } => {
+            let out = b.new_slot(Ty::RunOutput);
+            let cm = lower_expr(b, command);
+            lower_http_response_result(b, Rvalue::CommandRun { command: cm, out }, out, Ty::RunOutput, e.ty)
+        }
+        // `out.code()` → the runtime returns the i64 exit code directly.
+        hir::ExprKind::RunOutputCode { out } => {
+            let o = lower_expr(b, out);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RunOutputCode { out: o }));
+            Operand::Value(v)
+        }
+        // `out.stdout()` / `out.stderr()` → a `str` view `{ptr,len}` into the run-output buffer
+        // (region-bound to `out`; not owned — no `Drop`).
+        hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
+            let is_err = matches!(&e.kind, hir::ExprKind::RunOutputStderr { .. });
+            let o = lower_expr(b, out);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RunOutputView { out: o, err: is_err }));
+            Operand::Value(v)
+        }
+        other => unreachable!("lower_command called with non-command expr: {other:?}"),
+    }
+}
+
 /// Lower any `std.http` (Slice 1) request/response op. Out-of-line (`#[inline(never)]`) and reached
 /// through a single `lower_expr` arm, so all its locals — and the seven ops' distinct shapes — stay
 /// off the recursive `lower_expr` frame (the `expr_depth` #296 headroom lesson). Never called for a
@@ -10259,6 +10336,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Child => "child".to_string(),
+        Ty::Command => "command".to_string(),
+        Ty::RunOutput => "run output".to_string(),
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
         Ty::HttpClient => "http client".to_string(),

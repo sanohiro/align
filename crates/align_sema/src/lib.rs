@@ -187,6 +187,12 @@ pub enum Scalar {
     /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
     /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
     HttpStream,
+    /// A `run_output` payload (`Result<run_output, Error>` from `c.run()`, `std.process` Slice 4). An
+    /// owned **Move** handle (the exit code + two captured byte buffers); the enclosing `Result`'s
+    /// `Drop` frees it (`run_output_free`). Opaque pointer, like [`Scalar::HttpResponse`] — owned, never
+    /// region-tracked (a `run_output` borrows nothing; its `.stdout()`/`.stderr()` VIEWS are what
+    /// region-bind to it). (There is no `Scalar::Command`: a `command` builder never rides an aggregate.)
+    RunOutput,
     /// A first-class **function value** payload (`Ty::Fn`, indexed into `Program.fn_types`). A
     /// sum-type variant may carry one — the `Handler { Respond(fn(Ctx) -> …), Stream(fn(Ctx, …) -> …) }`
     /// or-kind that lets pkg.web's stream and unary routes share one table. A fn value is a **Copy**
@@ -207,7 +213,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput)
     }
 }
 
@@ -476,6 +482,21 @@ pub enum Ty {
     /// exit code) and flips the reaped flag through the borrow so the later `Drop` is a no-op — the
     /// receiver is read, not consumed (mirrors `l.accept()`). Impure. Opaque pointer.
     Child,
+    /// A `command` (`std.process` Slice 4) — the captured-run builder from `process.command(cmd, args)`.
+    /// An owned **Move** handle (the build-dual of `child`, modeled on [`Ty::HttpRequest`]) owning the
+    /// `execvp` lookup path + the full argv + an optional working directory, `Drop`-freed
+    /// (`command_free`). `c.cwd(dir)` mutates it in place (not consumed); `c.run()` **borrows** it
+    /// (re-runnable, like `ch.wait()`) and yields `Result<run_output, Error>`. Never rides an aggregate
+    /// (a builder — like `http request` — so it has no `Scalar`). Impure. Opaque pointer.
+    Command,
+    /// A `run_output` (`std.process` Slice 4) — one completed run's captured output, the `Ok` payload of
+    /// `c.run()`'s `Result<run_output, Error>`. An owned **Move** handle (modeled on [`Ty::HttpResponse`])
+    /// owning the exit code + two owned byte buffers (stdout / stderr, validated UTF-8), `Drop`-freed
+    /// (`run_output_free`). `out.code()` reads the `i64` exit code; `out.stdout()` / `out.stderr()`
+    /// return a `str` **view** region-bound to `out` (an escape past its `Drop` is a compile error,
+    /// #297). Rides `Result`'s Ok slot as [`Scalar::RunOutput`]. Impure to produce, pure to read. Opaque
+    /// pointer.
+    RunOutput,
     /// An `http request` (`std.http`) — the request builder from `http.request(method, url)`. An
     /// owned **Move** handle (like `reader`/`writer`/`buffer`/`cli command`) owning its method / url /
     /// header list / body buffer, `Drop`-freed. `r.header(name, value)` / `r.body(data)` mutate it in
@@ -645,6 +666,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::ResponseBuilder => Some(Scalar::ResponseBuilder),
         // A `http_stream` owned handle as the `Result` Ok payload of `ctx.respond_stream()`.
         Ty::HttpStream => Some(Scalar::HttpStream),
+        // A `run_output` owned handle as the `Result` Ok payload of `c.run()` (std.process Slice 4).
+        // (A `command` builder is never a payload — like `http request`, it has no `Scalar`, `None` here.)
+        Ty::RunOutput => Some(Scalar::RunOutput),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -715,6 +739,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
         Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
+        Scalar::RunOutput => Ty::RunOutput,
         Scalar::Fn(fid) => Ty::Fn(fid),
     }
 }
@@ -856,6 +881,10 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        // `command`/`run_output` are opaque owned handles — they hold no slice (`run_output`'s
+        // `.stdout()`/`.stderr()` views are separate `str` exprs, escape-checked via `region_of`).
+        | Ty::Command
+        | Ty::RunOutput
         // A `http_headers` view is a bare ctx pointer, not a `slice<T>`; like `json.doc` below, its
         // escape is enforced through `tracks_region`, not `mentions_slice`.
         | Ty::HttpHeaders
@@ -947,7 +976,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
@@ -1003,7 +1032,7 @@ pub fn enum_is_move(id: u32, enums: &[hir::EnumDef]) -> bool {
 /// plain-struct payloads) owns nothing and leaves its struct non-Move (`enum_is_move` is table-only,
 /// no recursion into `struct_is_move` — an enum's struct payloads are always non-Move, pass 0c).
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, enums, visiting))
         || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
@@ -1203,7 +1232,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
@@ -1296,7 +1325,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -4451,6 +4480,27 @@ impl EffectScan<'_> {
                 self.expr(cmd);
                 self.expr(args);
             }
+            // `std.process` Slice 4 — `process.command`/`c.cwd(dir)`/`c.run()` fork or observe the
+            // machine → **Impure** (excluded from `par_map`). The `run_output` accessors read owned
+            // memory → **Pure** (like `resp.status()`/`resp.body()`). Recurse into the operands either
+            // way so an effect *inside* them is still counted.
+            ExprKind::ProcessCommand { cmd, args } => {
+                self.impure_direct = true;
+                self.expr(cmd);
+                self.expr(args);
+            }
+            ExprKind::CommandCwd { command, dir } => {
+                self.impure_direct = true;
+                self.expr(command);
+                self.expr(dir);
+            }
+            ExprKind::CommandRun { command } => {
+                self.impure_direct = true;
+                self.expr(command);
+            }
+            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.expr(out);
+            }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
@@ -5407,6 +5457,11 @@ impl<'a> EscapeCheck<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            // `command`/`run_output` are owned handles that borrow nothing (like `http response`): a
+            // `run_output`'s `.stdout()`/`.stderr()` VIEWS carry its region, but the handle itself does
+            // not, so it is freely returnable. The view exprs get their region in `region_of`.
+            | Ty::Command
+            | Ty::RunOutput
             | Ty::Error
             | Ty::Unit => false,
         }
@@ -5812,6 +5867,13 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
                 Region::Frame.shorter(self.region_of(resp, depth))
             }
+            // `out.stdout()`/`out.stderr()` are `str` **views** into the `run_output` handle's owned
+            // buffers (freed at frame exit), so — like the `resp.*` / `p.get_str` views — they are
+            // `Frame`-regioned and bound to `out` (or shorter if `out` is arena-scoped). An escape past
+            // `out`'s `Drop` reads freed memory (#297, P9). `.clone()` copies past `out`.
+            ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                Region::Frame.shorter(self.region_of(out, depth))
+            }
             // `ctx.method()`/`path()`/`body()`/`headers()` are the read-duals: `str` / `slice<u8>` /
             // header-table **views** into the `http_request_ctx` handle's owned buffer (freed at frame
             // exit), so — like the `resp.*` views above — they are `Frame`-regioned and bound to `ctx`
@@ -6031,6 +6093,13 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. }
             | ExprKind::ProcessExec { .. }
+            // `process.command` owns its result handle; `c.cwd(dir)` is `()`; `c.run()` owns its
+            // `Result<run_output, Error>`; `out.code()` copies an `i64` — none borrows, so `Static`.
+            // (The `out.stdout()`/`out.stderr()` VIEWS are `Frame`-regioned in the arm above.)
+            | ExprKind::ProcessCommand { .. }
+            | ExprKind::CommandCwd { .. }
+            | ExprKind::CommandRun { .. }
+            | ExprKind::RunOutputCode { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
@@ -6319,6 +6388,16 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. }
             | ExprKind::ProcessExec { .. }
+            // `process.command`/`c.cwd`/`c.run`/`out.code` produce a handle / `()` / `Result` / `i64` —
+            // none is a `slice`. `out.stdout()`/`out.stderr()` return a `str` (not a `slice<u8>`), so —
+            // like `HttpCtxMethod` — their escape is governed by `tracks_region` + `region_of`, not this
+            // local-backed-slice check; all six therefore report "not a local-backed slice".
+            | ExprKind::ProcessCommand { .. }
+            | ExprKind::CommandCwd { .. }
+            | ExprKind::CommandRun { .. }
+            | ExprKind::RunOutputCode { .. }
+            | ExprKind::RunOutputStdout { .. }
+            | ExprKind::RunOutputStderr { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
@@ -7053,6 +7132,21 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(cmd, depth);
                 self.walk(args, depth);
             }
+            // `std.process` Slice 4 — the `command`/`run_output` handles are owned Move (never
+            // region-borrows); an `out.stdout()`/`out.stderr()` view borrows `out` but its escape is
+            // caught by `region_of`, not here. Just recurse to check an escape *inside* the operands.
+            ExprKind::ProcessCommand { cmd, args } => {
+                self.walk(cmd, depth);
+                self.walk(args, depth);
+            }
+            ExprKind::CommandCwd { command, dir } => {
+                self.walk(command, depth);
+                self.walk(dir, depth);
+            }
+            ExprKind::CommandRun { command } => self.walk(command, depth),
+            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.walk(out, depth)
+            }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
@@ -7706,6 +7800,20 @@ impl UnnecessaryHeapScan {
             ExprKind::ProcessExec { cmd, args } => {
                 self.visit(cmd);
                 self.visit(args);
+            }
+            // `std.process` Slice 4 — recurse into the operands (the handles own their result / are
+            // borrowed; a `run_output` view's escape is governed by `region_of`).
+            ExprKind::ProcessCommand { cmd, args } => {
+                self.visit(cmd);
+                self.visit(args);
+            }
+            ExprKind::CommandCwd { command, dir } => {
+                self.visit(command);
+                self.visit(dir);
+            }
+            ExprKind::CommandRun { command } => self.visit(command),
+            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.visit(out)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
@@ -8375,7 +8483,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpCtxHeaders { ctx: buffer }
             | ExprKind::HttpCtxHeader { headers: buffer, .. }
             | ExprKind::ConnReader { conn: buffer }
-            | ExprKind::ConnWriter { conn: buffer } => self.storage_roots(buffer),
+            | ExprKind::ConnWriter { conn: buffer }
+            // `out.stdout()`/`out.stderr()` are `str` views into the `run_output` handle's owned
+            // buffers, so they carry `out`'s storage provenance (region-bound in `region_of`).
+            | ExprKind::RunOutputStdout { out: buffer }
+            | ExprKind::RunOutputStderr { out: buffer } => self.storage_roots(buffer),
             // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
             // (notably `c.reader().buffered()` still borrows `c`).
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
@@ -8603,7 +8715,12 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
             | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
             | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
-            | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. } | ExprKind::EncodingEncode { .. }
+            | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. }
+            // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
+            // `out.code` (`i64`) borrow nothing; `out.stdout()`/`out.stderr()` (which DO borrow `out`)
+            // are in the `storage_roots` group above.
+            | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandRun { .. }
+            | ExprKind::RunOutputCode { .. } | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
@@ -9560,6 +9677,21 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ProcessExec { cmd, args } => {
                 self.expr(cmd, moved, false, false);
                 self.expr(args, moved, false, false);
+            }
+            // `std.process` Slice 4 — `command`/`cwd`/`run` all BORROW the command (`run` is
+            // re-runnable, `cwd` mutates in place — neither consumes it, like `ch.wait()`/`ch.kill()`);
+            // the `run_output` accessors borrow `out`. So every operand is a read (no move).
+            ExprKind::ProcessCommand { cmd, args } => {
+                self.expr(cmd, moved, false, false);
+                self.expr(args, moved, false, false);
+            }
+            ExprKind::CommandCwd { command, dir } => {
+                self.expr(command, moved, false, false);
+                self.expr(dir, moved, false, false);
+            }
+            ExprKind::CommandRun { command } => self.expr(command, moved, false, false),
+            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.expr(out, moved, false, false)
             }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
@@ -13193,6 +13325,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", "process.exec", span);
                 return self.check_process_exec(args, span);
             }
+            // `std.process` (Slice 4) — `process.command(cmd, args)` builds a Move `command` builder;
+            // the `cwd`/`run` methods dispatch on the receiver type below (like `http.request`).
+            if module == "process" && method == "command" {
+                self.require_import("std.process", "process.command", span);
+                return self.check_process_command(args, span);
+            }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
             if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
@@ -13794,6 +13932,17 @@ impl<'a, 't> Checker<'a, 't> {
             "group" if recv_ty == Ty::Captures => {
                 self.check_captures_group(recv_expr, args, span)
             }
+            // `std.process` (Slice 4) `command` methods on a `command`: `c.cwd(dir)` sets the working
+            // directory in place (`()`); `c.run()` forks + captures → `Result<run_output, Error>`.
+            // Type-guarded, same as the `http request` builder methods.
+            "cwd" | "run" if recv_ty == Ty::Command => {
+                self.check_command_method(recv_expr, method, args, span)
+            }
+            // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.code()` (`i64`) /
+            // `out.stdout()` / `out.stderr()` (`str` views into `out`). Type-guarded.
+            "code" | "stdout" | "stderr" if recv_ty == Ty::RunOutput => {
+                self.check_run_output_method(recv_expr, method, args, span)
+            }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
             // `r.body(data)` mutate the builder in place. Type-guarded, same as the cli methods above.
             "header" | "body" if recv_ty == Ty::HttpRequest => {
@@ -14235,7 +14384,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -18197,6 +18346,112 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `process.command(cmd, args)` (`std.process` Slice 4) -> `command` — build a Move `command`
+    /// builder handle (the captured-run dual of `spawn`, modeled on `http.request`). `cmd` is the
+    /// borrowed `str` lookup path; `args` is the borrowed full argv (incl. `argv[0]`, P5 — same
+    /// `check_argv` forms as `spawn`/`exec`). Returns a bare `command` (NOT a `Result`; a malformed
+    /// argv aborts at runtime, the `http.header` injection precedent). Builtin, dispatched like
+    /// `http.request`.
+    fn check_process_command(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'process.command' expects 2 arguments (the command path and the argv `array<str>`), got {}", args.len()), span);
+            return err;
+        }
+        let cmd = Box::new(self.check_str_init(&args[0]));
+        let Some(argv) = self.check_argv("process.command", &args[1]) else {
+            return err;
+        };
+        if cmd.ty == Ty::Error {
+            return err;
+        }
+        Expr { kind: ExprKind::ProcessCommand { cmd, args: Box::new(argv) }, ty: Ty::Command, span }
+    }
+
+    /// `c.cwd(dir)` / `c.run()` on a `command` ([`Ty::Command`]), the receiver already evaluated. The
+    /// receiver must be a **bound local** (the v1 Move-temporary gate, `check_http_request_method`
+    /// precedent): both methods borrow the handle (not consumed — `cwd` mutates in place, `run` is
+    /// re-runnable). `cwd(dir: str)` yields `()`; `run()` yields `Result<run_output, Error>`.
+    fn check_command_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the command to a local first, then call the method (`c := process.command(\"git\", [\"git\", \"status\"])` then `c.cwd(dir)` / `c.run()`) — a temporary owned command handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        match method {
+            "cwd" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.cwd()' takes 1 argument (the working directory), got {}", args.len()), span);
+                    return err;
+                }
+                let dir = self.check_str_init(&args[0]);
+                if dir.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::CommandCwd { command: Box::new(recv_expr), dir: Box::new(dir) }, ty: Ty::Unit, span }
+            }
+            "run" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.run()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CommandRun { command: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::RunOutput, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / run)"), span);
+                err
+            }
+        }
+    }
+
+    /// `out.code()` / `out.stdout()` / `out.stderr()` on a `run_output` ([`Ty::RunOutput`]), the
+    /// receiver already evaluated. The receiver must be a bound local (the v1 gate). `code` yields
+    /// `i64`; `stdout`/`stderr` yield a `str` **view** into `out` (region-bound — the `region_of` arm
+    /// rejects an escape past `out`'s `Drop`, P9). The captured-output dual of
+    /// `check_http_response_method`.
+    fn check_run_output_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // A bound `run_output` local (`out := c.run()?`) is a stable place; a bare temporary owned
+        // handle is not dropped yet and is rejected. (A `run_output` never rides an aggregate in S4,
+        // so — unlike `http response` — there is no `array<run_output>` element-borrow form.)
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the run output to a local first, then read it (`out := c.run()?` then `out.code()`) — a temporary owned run output handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags.error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        match method {
+            "code" => Expr {
+                kind: ExprKind::RunOutputCode { out: Box::new(recv_expr) },
+                ty: Ty::Int(IntTy { bits: 64, signed: true }),
+                span,
+            },
+            "stdout" => Expr { kind: ExprKind::RunOutputStdout { out: Box::new(recv_expr) }, ty: Ty::Str, span },
+            "stderr" => Expr { kind: ExprKind::RunOutputStderr { out: Box::new(recv_expr) }, ty: Ty::Str, span },
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on a run output (try code / stdout / stderr)"), span);
+                err
+            }
+        }
+    }
+
     /// `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
     /// transforms, no state / Move types of their own:
     /// - `base64_encode`/`base64url_encode`/`hex_encode(data)` take a byte view (`str` / owned
@@ -21429,6 +21684,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(cmd);
                 self.finalize_expr(args);
             }
+            ExprKind::ProcessCommand { cmd, args } => {
+                self.finalize_expr(cmd);
+                self.finalize_expr(args);
+            }
+            ExprKind::CommandCwd { command, dir } => {
+                self.finalize_expr(command);
+                self.finalize_expr(dir);
+            }
+            ExprKind::CommandRun { command } => self.finalize_expr(command),
+            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.finalize_expr(out)
+            }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::Compress { data, level, .. } => {
@@ -22143,6 +22410,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Child => "child".to_string(),
+        Ty::Command => "command".to_string(),
+        Ty::RunOutput => "run output".to_string(),
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
         Ty::HttpClient => "http client".to_string(),
@@ -22334,7 +22603,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -23032,6 +23301,10 @@ pub fn is_move_handle(ty: Ty) -> bool {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            // `command` / `run_output` (std.process Slice 4) — bare opaque-pointer Move handles freed
+            // by `command_free` / `run_output_free`. Kept in lockstep with codegen's `handle_free_fn`.
+            | Ty::Command
+            | Ty::RunOutput
     )
 }
 
