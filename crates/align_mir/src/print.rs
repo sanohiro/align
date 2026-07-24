@@ -500,9 +500,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
         Rvalue::FsReadDir { path, out } => format!("fs_read_dir({}, -> _{out})", operand_str(path)),
         Rvalue::DnsResolve { host, out } => format!("dns_resolve({}, -> _{out})", operand_str(host)),
-        Rvalue::TcpConnect { host, port, out } => format!("tcp_connect({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::TcpConnect { host, port, timeout_ns, out } => {
+            format!("tcp_connect({}, {}, timeout={}, -> _{out})", operand_str(host), operand_str(port), operand_str(timeout_ns))
+        }
         Rvalue::ConnReader(c) => format!("conn_reader({})", operand_str(c)),
         Rvalue::ConnWriter(c) => format!("conn_writer({})", operand_str(c)),
+        Rvalue::TcpReadTimeout { conn, ns } => format!("tcp_read_timeout({}, {})", operand_str(conn), operand_str(ns)),
+        Rvalue::TcpWriteTimeout { conn, ns } => format!("tcp_write_timeout({}, {})", operand_str(conn), operand_str(ns)),
         Rvalue::TcpListen { host, port, out } => format!("tcp_listen({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::TcpAccept { listener, out } => format!("tcp_accept({}, -> _{out})", operand_str(listener)),
         Rvalue::UdpBind { host, port, out } => format!("udp_bind({}, {}, -> _{out})", operand_str(host), operand_str(port)),

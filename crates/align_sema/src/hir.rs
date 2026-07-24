@@ -917,6 +917,16 @@ pub enum ExprKind {
     /// socket fd (`owns_fd: false`; only the conn's `Drop` closes it). The `ty` is
     /// [`crate::Ty::Writer`], its region bound to `conn`. `conn` is borrowed (never consumed).
     ConnWriter { conn: Box<Expr> },
+    /// `c.read_timeout_ns(ns)` (`std.net`) — set a receive deadline (`SO_RCVTIMEO`) on the `tcp_conn`
+    /// `conn`'s socket in place (a later `c.reader()` read past the deadline yields `Err(Error.Timeout)`),
+    /// mutating nothing the caller sees — like [`CommandTimeout`], the `ty` is [`crate::Ty::Unit`].
+    /// `conn` is a bound [`crate::Ty::TcpConn`] local, borrowed (never consumed); `ns` is a Copy `i64`
+    /// (`0` clears the deadline; a negative `ns` aborts at runtime). Impure.
+    TcpReadTimeout { conn: Box<Expr>, ns: Box<Expr> },
+    /// `c.write_timeout_ns(ns)` (`std.net`) — set a send deadline (`SO_SNDTIMEO`) on the `tcp_conn`
+    /// `conn`'s socket in place. Same shape/contract as [`TcpReadTimeout`]. The `ty` is
+    /// [`crate::Ty::Unit`]. Impure.
+    TcpWriteTimeout { conn: Box<Expr>, ns: Box<Expr> },
     /// `tcp.listen(host, port)` (`std.net`) — resolve `host` (via `getaddrinfo` with `AI_PASSIVE`; a
     /// null/empty host binds the wildcard address) and open a listening TCP socket bound to `port`
     /// (`SO_REUSEADDR` set before `bind`, then `listen` with a fixed backlog). The `ty` is
