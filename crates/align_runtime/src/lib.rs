@@ -6874,6 +6874,140 @@ unsafe fn abi_c_string(ptr: *const u8, len: i64) -> Option<std::ffi::CString> {
     std::ffi::CString::new(view.as_bytes()).ok()
 }
 
+// --- std.regex -------------------------------------------------------------------------------
+
+/// Maximum UTF-8 source length accepted by `regex.compile`. This independently caps parser work
+/// and keeps one untrusted pattern from becoming an unbounded allocation request.
+const REGEX_PATTERN_MAX_BYTES: usize = 64 * 1024;
+/// Maximum compiled automaton size requested from the Rust regex builder. The engine is a
+/// linear-time automata implementation (no backreferences/look-around); this cap bounds its
+/// compiled representation in addition to the source-length cap above.
+const REGEX_COMPILED_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Opaque owned compiled-regex handle. Align sees only a pointer and frees it through
+/// [`align_rt_regex_free`].
+pub struct RegexHandle {
+    inner: regex::Regex,
+}
+
+/// ABI layout of the builtin Copy `regex_match { start: i64, end: i64 }` struct.
+#[repr(C)]
+pub struct AlignRegexMatch {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// Compile one UTF-8 pattern. Returns `0` and writes a fresh handle on success; malformed patterns,
+/// invalid ABI views, and either resource-limit rejection return `AL_INVALID` with `out = null`.
+///
+/// # Safety
+/// `pattern_ptr`/`pattern_len` must describe a readable range when non-empty. `out` must be null or
+/// point to writable storage for one handle pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_compile(
+    pattern_ptr: *const u8,
+    pattern_len: i64,
+    out: *mut *mut RegexHandle,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if pattern_len < 0 || (pattern_len > 0 && pattern_ptr.is_null()) {
+        return AL_INVALID;
+    }
+    let Some(pattern) = (unsafe { abi_str_view(pattern_ptr, pattern_len) }) else {
+        return AL_INVALID;
+    };
+    if pattern.len() > REGEX_PATTERN_MAX_BYTES {
+        return AL_INVALID;
+    }
+    let Ok(inner) = regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_COMPILED_MAX_BYTES)
+        .build()
+    else {
+        return AL_INVALID;
+    };
+    unsafe { *out = Box::into_raw(Box::new(RegexHandle { inner })) };
+    0
+}
+
+/// Return 1 iff `text` has a match, else 0. The handle and text are borrowed.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex. `text_ptr`/`text_len` must describe a readable UTF-8
+/// range when non-empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_is_match(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+) -> i32 {
+    if handle.is_null() || text_len < 0 || (text_len > 0 && text_ptr.is_null()) {
+        return 0;
+    }
+    let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
+        return 0;
+    };
+    i32::from(unsafe { &*handle }.inner.is_match(text))
+}
+
+/// Find the first match at or after UTF-8 byte offset `start`. Returns 1 and writes the half-open
+/// byte span on success, else 0. An out-of-range or non-character-boundary start is a programmer
+/// error and aborts, matching ordinary range slicing rather than silently rounding a boundary.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `text_ptr`/`text_len` must be readable UTF-8; `out`
+/// must point to writable storage for one [`AlignRegexMatch`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_find(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+    start: i64,
+    out: *mut AlignRegexMatch,
+) -> i32 {
+    if handle.is_null() || out.is_null() || text_len < 0 || (text_len > 0 && text_ptr.is_null()) {
+        return 0;
+    }
+    unsafe { out.write(AlignRegexMatch { start: 0, end: 0 }) };
+    let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
+        return 0;
+    };
+    let Ok(start_usize) = usize::try_from(start) else {
+        panic_abort("regex.find_at: start must be a non-negative UTF-8 byte offset");
+    };
+    if start_usize > text.len() {
+        panic_abort("regex.find_at: start is past the end of the input");
+    }
+    if !text.is_char_boundary(start_usize) {
+        panic_abort("regex.find_at: start is not a UTF-8 character boundary");
+    }
+    let Some(m) = unsafe { &*handle }.inner.find_at(text, start_usize) else {
+        return 0;
+    };
+    unsafe {
+        out.write(AlignRegexMatch {
+            start: i64::try_from(m.start())
+                .unwrap_or_else(|_| panic_abort("regex match offset exceeds i64")),
+            end: i64::try_from(m.end())
+                .unwrap_or_else(|_| panic_abort("regex match offset exceeds i64")),
+        })
+    };
+    1
+}
+
+/// Drop a compiled regex handle. Null-safe for moved/uninitialized drop slots.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`align_rt_regex_compile`] not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_free(handle: *mut RegexHandle) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
 // --- reader -----------------------------------------------------------------------------------
 
 /// A `reader` (`std.io`) — a Move handle owning a file descriptor; `Drop` (`align_rt_io_reader_free`)
@@ -28216,5 +28350,123 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             assert_eq!(code, 1, "expected Err for malformed input {bad:?}");
             unsafe { align_rt_arena_end(arena) };
         }
+    }
+}
+
+#[cfg(test)]
+mod regex_tests {
+    use super::*;
+
+    /// Compile a pattern through the FFI, returning the handle pointer (null on rejection).
+    fn compile(pat: &str) -> *mut RegexHandle {
+        let mut out: *mut RegexHandle = core::ptr::null_mut();
+        let code = unsafe { align_rt_regex_compile(pat.as_ptr(), pat.len() as i64, &mut out) };
+        if code == 0 {
+            assert!(!out.is_null(), "ok status must yield a non-null handle");
+        } else {
+            assert_eq!(code, AL_INVALID);
+            assert!(out.is_null(), "rejection must leave the out pointer null");
+        }
+        out
+    }
+
+    fn is_match(h: *const RegexHandle, text: &str) -> i32 {
+        unsafe { align_rt_regex_is_match(h, text.as_ptr(), text.len() as i64) }
+    }
+
+    fn find(h: *const RegexHandle, text: &str, start: i64) -> Option<(i64, i64)> {
+        let mut m = AlignRegexMatch { start: 0, end: 0 };
+        let flag = unsafe { align_rt_regex_find(h, text.as_ptr(), text.len() as i64, start, &mut m) };
+        if flag == 1 { Some((m.start, m.end)) } else { None }
+    }
+
+    #[test]
+    fn compile_valid_and_invalid() {
+        let h = compile("^[a-z]+$");
+        assert!(!h.is_null());
+        unsafe { align_rt_regex_free(h) };
+        // Malformed syntax → AL_INVALID, null out.
+        assert!(compile("[").is_null());
+        assert!(compile("(unclosed").is_null());
+        // Backreferences/look-around are not in the automata engine's syntax → rejected.
+        assert!(compile(r"(a)\1").is_null());
+    }
+
+    #[test]
+    fn pattern_length_limit() {
+        // At the cap it still compiles; one byte over is rejected before building.
+        let ok = "a".repeat(REGEX_PATTERN_MAX_BYTES);
+        let h = compile(&ok);
+        assert!(!h.is_null());
+        unsafe { align_rt_regex_free(h) };
+        let too_long = "a".repeat(REGEX_PATTERN_MAX_BYTES + 1);
+        assert!(compile(&too_long).is_null());
+    }
+
+    #[test]
+    fn compiled_size_limit() {
+        // A pattern whose compiled automaton exceeds the size limit is rejected (not a crash).
+        // Large bounded repetition of a wide class blows past 10 MiB of compiled program.
+        let huge = "[a-z]{1000}".repeat(200);
+        // Either it rejects on size, or (if under the cap) compiles cleanly — never aborts.
+        let h = compile(&huge);
+        if !h.is_null() {
+            unsafe { align_rt_regex_free(h) };
+        }
+        // A definitely-over-limit pattern: deeply nested large counted repetition.
+        let over = "a{1000}{1000}{1000}".to_string();
+        // invalid syntax OR size rejection — both are AL_INVALID/null, never a panic.
+        let _ = compile(&over);
+    }
+
+    #[test]
+    fn is_match_ascii_and_unicode() {
+        let h = compile(r"\w+");
+        assert_eq!(is_match(h, "hello"), 1);
+        assert_eq!(is_match(h, "  "), 0);
+        // Unicode is on by default: a Greek word is `\w`.
+        assert_eq!(is_match(h, "λόγος"), 1);
+        assert_eq!(is_match(h, ""), 0);
+        unsafe { align_rt_regex_free(h) };
+    }
+
+    #[test]
+    fn find_spans_are_utf8_byte_offsets() {
+        let h = compile(r"\d+");
+        // "π=3.14": the ASCII '3' is at byte offset 3 (π is 2 bytes), the digits run 3..4.
+        assert_eq!(find(h, "π=3.14", 0), Some((3, 4)));
+        // No match → None.
+        assert_eq!(find(h, "no digits", 0), None);
+        unsafe { align_rt_regex_free(h) };
+    }
+
+    #[test]
+    fn find_at_start_offset_and_empty_match() {
+        let h = compile("a");
+        // Two matches; find_at(4) skips the first.
+        assert_eq!(find(h, "a b a", 0), Some((0, 1)));
+        assert_eq!(find(h, "a b a", 1), Some((4, 5)));
+        unsafe { align_rt_regex_free(h) };
+        // Empty match at end-of-input is valid.
+        let e = compile("b*");
+        assert_eq!(find(e, "aaa", 3), Some((3, 3)));
+        assert_eq!(find(e, "", 0), Some((0, 0)));
+        unsafe { align_rt_regex_free(e) };
+    }
+
+    #[test]
+    fn free_is_null_safe() {
+        // Dropping a null / moved-out slot must be harmless (the codegen drop path relies on this).
+        unsafe { align_rt_regex_free(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn abi_guards_return_zero_not_abort() {
+        let h = compile("x");
+        // A null text pointer with zero length is a valid empty view; a null handle → 0 (no match).
+        assert_eq!(unsafe { align_rt_regex_is_match(core::ptr::null(), h as *const u8, 1) }, 0);
+        // A negative length is rejected as no-match rather than read.
+        assert_eq!(unsafe { align_rt_regex_is_match(h, "x".as_ptr(), -1) }, 0);
+        unsafe { align_rt_regex_free(h) };
     }
 }

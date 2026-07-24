@@ -8,7 +8,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-23, **v0.2.0 RELEASE PREP: the workspace version is bumped to 0.2.0 and
+_Last updated: 2026-07-23, **`std.regex` FIRST SLICE SHIPPED (branch `feat/std-regex`, PR open):
+`regex.compile(str) -> Result<regex, Error>` + bound-receiver `is_match` / `find` / `find_at`
+returning the builtin Copy `regex_match { start, end }` (half-open UTF-8 byte span). Owned Move
+handle backed by the Rust `regex` crate 1.13.1 (added to `Cargo.lock`), swept through
+sema/HIR/MIR/LLVM/drop with 64 KiB pattern + 10 MiB compiled-size limits. Ported from the Windows
+authoring clone onto current `main`, then built/tested/IR-verified here: workspace 2686 passed / 0
+failed, 8 runtime FFI unit tests + 13 driver E2E tests, `clippy -D warnings` clean. Codex review was
+unavailable (usage limit until 2026-07-29) so an independent adversarial soundness review ran
+instead — no memory-safety/drop defect, no missing analysis-pass entry; its one finding (`find_at`
+anchors from the true input start, not the offset) is documented + tested. NOTE: the regex work
+originated in a SEPARATE clone `~/winhome/prj/align` (Windows-side home) on an old base; the rebase's
+non-conflicting auto-merge silently reverted `main`'s `lower_owned_handle_result`→`lower_http_response_result`
+rename, so the port was redone surgically (reset the 4 compiler files to `main`, re-apply regex
+additions, token-set-audit that NET REMOVED = {}).** Before that, **v0.2.0 RELEASE PREP: the workspace version is bumped to 0.2.0 and
 `RELEASE_NOTES_0.2.0.md` is written (headline: `pkg.web`, the zero-copy REST framework — 1.31x Go
 Fiber-prefork; plus the JSON/`std.http` waves and the three soundness fixes). Tagging `v0.2.0` and
 pushing the tag — which is what triggers the public release build — is the OWNER's step, deliberately
