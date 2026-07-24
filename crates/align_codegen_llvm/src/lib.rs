@@ -2275,6 +2275,24 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `find_all(handle, text, out)` / `split(handle, text, out)` materialize an owned
+    // `array<regex_match>` (`{ptr,len}`) into `out` and return i32 status (always 0).
+    funcs.insert(
+        "regex_find_all".to_string(),
+        module.add_function(
+            "align_rt_regex_find_all",
+            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "regex_split".to_string(),
+        module.add_function(
+            "align_rt_regex_split",
+            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
     funcs.insert(
         "regex_free".to_string(),
         module.add_function("align_rt_regex_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
@@ -7576,6 +7594,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("regex_find returns i32 flag")
+            }
+            Rvalue::RegexFindAll { regex, text, out } | Rvalue::RegexSplit { regex, text, out } => {
+                // Materialize an owned `array<regex_match>` `{ptr,len}` into `out`. Zero it first so a
+                // defensive early return in the runtime still leaves a `Drop`-safe `{null,0}`.
+                let re = self.operand(regex)?.into_pointer_value();
+                let (tp, tl) = self.split_str(text)?;
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, slice_struct_type(self.ctx).const_zero())
+                    .map_err(|e| self.err(e))?;
+                let fname = if matches!(rv, Rvalue::RegexSplit { .. }) { "regex_split" } else { "regex_find_all" };
+                self.builder
+                    .build_call(self.funcs[fname], &[re.into(), tp.into(), tl.into(), out_ptr.into()], "refindall")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("regex_find_all/split returns i32 status")
             }
             Rvalue::HttpParse { data, out } => {
                 let out_ptr = self.slots[out];

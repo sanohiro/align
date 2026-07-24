@@ -4484,7 +4484,9 @@ impl EffectScan<'_> {
                 self.expr(k);
             }
             ExprKind::RegexCompile { pattern } => self.expr(pattern),
-            ExprKind::RegexIsMatch { regex, text } => {
+            ExprKind::RegexIsMatch { regex, text }
+            | ExprKind::RegexFindAll { regex, text }
+            | ExprKind::RegexSplit { regex, text } => {
                 self.expr(regex);
                 self.expr(text);
             }
@@ -6016,6 +6018,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RegexCompile { .. }
             | ExprKind::RegexIsMatch { .. }
             | ExprKind::RegexFind { .. }
+            | ExprKind::RegexFindAll { .. }
+            | ExprKind::RegexSplit { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -6297,6 +6301,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RegexCompile { .. }
             | ExprKind::RegexIsMatch { .. }
             | ExprKind::RegexFind { .. }
+            | ExprKind::RegexFindAll { .. }
+            | ExprKind::RegexSplit { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -7040,7 +7046,9 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(k, depth);
             }
             ExprKind::RegexCompile { pattern } => self.walk(pattern, depth),
-            ExprKind::RegexIsMatch { regex, text } => {
+            ExprKind::RegexIsMatch { regex, text }
+            | ExprKind::RegexFindAll { regex, text }
+            | ExprKind::RegexSplit { regex, text } => {
                 self.walk(regex, depth);
                 self.walk(text, depth);
             }
@@ -7675,7 +7683,9 @@ impl UnnecessaryHeapScan {
                 self.visit(k);
             }
             ExprKind::RegexCompile { pattern } => self.visit(pattern),
-            ExprKind::RegexIsMatch { regex, text } => {
+            ExprKind::RegexIsMatch { regex, text }
+            | ExprKind::RegexFindAll { regex, text }
+            | ExprKind::RegexSplit { regex, text } => {
                 self.visit(regex);
                 self.visit(text);
             }
@@ -8545,8 +8555,10 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
             // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
             // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
-            // whose `{start,end}` are Copy byte offsets, NOT a view into the text. None borrows.
-            | ExprKind::RegexCompile { .. } | ExprKind::RegexIsMatch { .. } | ExprKind::RegexFind { .. } => {
+            // whose `{start,end}` are Copy byte offsets, NOT a view into the text; `find_all`/`split`
+            // yield an owned `array<regex_match>` of the same Copy offsets. None borrows the input.
+            | ExprKind::RegexCompile { .. } | ExprKind::RegexIsMatch { .. } | ExprKind::RegexFind { .. }
+            | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -9509,7 +9521,9 @@ impl<'a> MoveCheck<'a> {
                 self.expr(k, moved, false, false);
             }
             ExprKind::RegexCompile { pattern } => self.expr(pattern, moved, false, false),
-            ExprKind::RegexIsMatch { regex, text } => {
+            ExprKind::RegexIsMatch { regex, text }
+            | ExprKind::RegexFindAll { regex, text }
+            | ExprKind::RegexSplit { regex, text } => {
                 self.expr(regex, moved, false, false);
                 self.expr(text, moved, false, false);
             }
@@ -13686,7 +13700,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `std.regex` searches borrow a bound compiled handle. `find_at`'s start is a UTF-8
             // byte offset; runtime validation follows the language's slice-boundary abort model.
-            "is_match" | "find" | "find_at" if recv_ty == Ty::Regex => {
+            "is_match" | "find" | "find_at" | "find_all" | "split" if recv_ty == Ty::Regex => {
                 self.check_regex_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
@@ -18714,6 +18728,18 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
         }
+        if method == "find_all" || method == "split" {
+            let Some(&match_id) = self.struct_ids.get("regex_match") else {
+                self.diags.error("internal: builtin 'regex_match' struct is not registered".to_string(), span);
+                return err;
+            };
+            let kind = if method == "find_all" {
+                ExprKind::RegexFindAll { regex: Box::new(recv_expr), text: Box::new(text) }
+            } else {
+                ExprKind::RegexSplit { regex: Box::new(recv_expr), text: Box::new(text) }
+            };
+            return Expr { kind, ty: Ty::DynStructArray(match_id, Layout::Aos), span };
+        }
         let start = if method == "find_at" {
             let s = self.check_expr(&args[1], None);
             if s.ty == Ty::Error || !self.require_i64_arg(s.ty, args[1].span, "'.find_at()' start") {
@@ -21259,7 +21285,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(k);
             }
             ExprKind::RegexCompile { pattern } => self.finalize_expr(pattern),
-            ExprKind::RegexIsMatch { regex, text } => {
+            ExprKind::RegexIsMatch { regex, text }
+            | ExprKind::RegexFindAll { regex, text }
+            | ExprKind::RegexSplit { regex, text } => {
                 self.finalize_expr(regex);
                 self.finalize_expr(text);
             }
