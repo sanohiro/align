@@ -9080,11 +9080,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // element fields stay borrowed views into the input.
             Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)?),
             // `array<scalar>` field (kind 7, JSON completeness T1b): the field's own `{ptr,len}` slot is
-            // width 16 (low byte); the ELEMENT scalar (int/float/bool) is packed into the upper bits so
-            // one tag carries both — elem-signed bit 16, elem-kind (0=int/1=bool/2=float) bits 20-23,
-            // elem-width bits 24-27. `sub` is null (scalars need no sub-schema). The element's own
-            // (kind,width,sign) come from the scalar-field encoding, relocated here.
-            Ty::DynArray(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool)) => {
+            // width 16 (low byte); the ELEMENT scalar (int/float/bool/str) is packed into the upper bits
+            // so one tag carries both — elem-signed bit 16, elem-kind (0=int/1=bool/2=float/3=str) bits
+            // 20-23, elem-width bits 24-28 (5 bits — a `str` element's `{ptr,len}` is width 16, which
+            // does not fit the original 4). `sub` is null (scalars/str views need no sub-schema). The
+            // element's own (kind,width,sign) come from the scalar-field encoding, relocated here. A
+            // `str` element decodes/encodes as a zero-copy view into the input (the top-level `str` rule).
+            Ty::DynArray(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)) => {
                 let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(s), null)?;
                 let elem_kind = (etag >> 8) & 0xff;
                 let elem_width = etag & 0xff;

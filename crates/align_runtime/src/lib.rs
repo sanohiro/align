@@ -2206,7 +2206,7 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
         7 => {
             let elem_kind = (d.tag >> 20) & 0xf;
             let elem_signed = (d.tag & (1 << 16)) != 0;
-            let elem_width = ((d.tag >> 24) & 0xf) as usize;
+            let elem_width = ((d.tag >> 24) & 0x1f) as usize; // 5 bits: a `str` element is width 16
             unsafe { json_encode_scalar_array_at(b, fp, elem_kind, elem_width, elem_signed) };
         }
         // A shape-directed union (`enum`) field (JSON completeness J1b-2b): `d.sub` is a [`JsonUnion`];
@@ -3232,15 +3232,20 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// array allocates nothing (`{null, 0}`). Returns `None` on any malformed element / structure.
 ///
 /// Decode a JSON array of **scalars** (`array<i64>` / `array<f64>` / `array<bool>` — JSON completeness
-/// T1b) into a freshly heap-allocated owned buffer, returning its `{ptr, count}`. Each element is
-/// parsed by the shared per-scalar [`write_value`] into an `elem_width`-byte slot — so the same range /
-/// sign / float-width checks a scalar *field* gets apply per element. `elem_kind` is the scalar kind
-/// (0 = int, 1 = bool, 2 = float), `elem_signed` the int sign. The buffer is owned (freed by the
-/// struct's `Drop` — `drop_struct_fields`'s flat `DynArray` free; scalars own nothing, so no deep
-/// free). An empty array allocates nothing (`{null, 0}`). Returns `None` on any malformed element.
+/// T1b — or `array<str>`) into a freshly heap-allocated owned buffer, returning its `{ptr, count}`.
+/// Each element is parsed by the shared per-scalar [`write_value`] into an `elem_width`-byte slot — so
+/// the same range / sign / float-width checks a scalar *field* gets apply per element. `elem_kind` is
+/// the scalar kind (0 = int, 1 = bool, 2 = float, 3 = str), `elem_signed` the int sign. A `str` element
+/// (kind 3, `elem_width == 16`) is a zero-copy `{ptr,len}` VIEW into the input `p` — the same borrowed
+/// model as a top-level `str` field — so the returned spine is owned but its elements borrow `p`. The
+/// buffer is owned (freed by the struct's `Drop` — `drop_struct_fields`'s flat `DynArray` free; a
+/// scalar/str-view element owns nothing, so no deep free). An empty array allocates nothing
+/// (`{null, 0}`). Returns `None` on any malformed element.
 ///
 /// # Safety
-/// `p` must be positioned at (optional whitespace then) the array's `[`; `elem_width ∈ {1,2,4,8}`.
+/// `p` must be positioned at (optional whitespace then) the array's `[`; `elem_width ∈ {1,2,4,8,16}`
+/// (16 = a `str` view element). For a `str` element the returned spine's `{ptr,len}` entries borrow
+/// `p`'s input, so the result must not outlive `p`.
 unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<AlignStr> {
     p.ws();
     p.expect(b'[')?;
@@ -3539,7 +3544,7 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
             }
             let elem_kind = (d.tag >> 20) & 0xf;
             let elem_signed = (d.tag & (1 << 16)) != 0;
-            let elem_width = ((d.tag >> 24) & 0xf) as usize;
+            let elem_width = ((d.tag >> 24) & 0x1f) as usize; // 5 bits: a `str` element is width 16
             let arr = unsafe { decode_scalar_array_value(p, elem_kind, elem_width, elem_signed)? };
             let ptr_bytes = (arr.ptr as usize as u64).to_le_bytes();
             let len_bytes = arr.len.to_le_bytes();

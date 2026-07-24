@@ -17311,11 +17311,14 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 // An `array<scalar>` field (JSON completeness T1b): decode a JSON array of numbers /
-                // bools into an owned scalar buffer. The element is a numeric / bool scalar — a Copy,
-                // non-borrowing element, so the array is owned + `Static` (freely returnable) and freed
-                // by one flat `Drop`. `array<str>` (a borrowed view element) and `array<char>` are
-                // deferred (str borrows the input; char has no JSON form).
-                Ty::DynArray(Scalar::Int(_)) | Ty::DynArray(Scalar::Float(_)) | Ty::DynArray(Scalar::Bool) => {}
+                // bools into an owned scalar buffer. `array<str>` is admitted too — its elements are
+                // zero-copy `{ptr,len}` VIEWS into the input (the same borrowed-view model as a
+                // top-level `str` field, MMv2 slice 6), so the decoded struct is already input-region-
+                // bound (via `region_of(JsonDecode) = region_of(input)`) and its `array<str>` field's
+                // `Drop` flat-frees only the owned spine while the elements borrow the input. A numeric
+                // / bool element is Copy (owns nothing either); `.clone()` copies past the input. Only
+                // `array<char>` stays deferred (char has no JSON form).
+                Ty::DynArray(Scalar::Int(_)) | Ty::DynArray(Scalar::Float(_)) | Ty::DynArray(Scalar::Bool) | Ty::DynArray(Scalar::Str) => {}
                 // A shape-directed union (`enum`) field (J1b-2b): the `Message { content: Content }`
                 // shape. The enum must be union-decodable (pairwise-distinct shape classes); an object
                 // payload's struct is validated recursively by `check_union_decodable`.
