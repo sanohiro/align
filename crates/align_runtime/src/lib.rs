@@ -11115,7 +11115,7 @@ unsafe fn clearenv_portable() -> i32 {
 /// See [`clearenv_portable`] (Linux).
 #[cfg(not(target_os = "linux"))]
 unsafe fn clearenv_portable() -> i32 {
-    extern "C" {
+    unsafe extern "C" {
         fn _NSGetEnviron() -> *mut *const *const u8;
         fn unsetenv(name: *const u8) -> i32;
     }
