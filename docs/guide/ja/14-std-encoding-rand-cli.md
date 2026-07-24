@@ -28,8 +28,6 @@ pub fn main() -> Result<(), Error> {
 
 ## `std.regex`
 
-*実装進行中: この節は未マージの [PR #625](https://github.com/sanohiro/align/pull/625) で追加される仕様を説明します。*
-
 パターンを一度コンパイルし、その Move ハンドルをローカル変数へ束縛して再利用します。
 
 ```align

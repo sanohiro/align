@@ -12,7 +12,7 @@ Record { score: i64, valid: bool }
 fn total(data: str) -> Result<i64, Error> {
     arena {
         rows: soa<Record> := json.decode(data)?
-        return rows.where(.valid).score.sum()
+        return Ok(rows.where(.valid).score.sum())
     }
 }
 ```
@@ -139,11 +139,11 @@ If one answer is foggy, you have found the part of the program you do not unders
 **A18.**
 
 ```align
-return rows
+return Ok(rows
     .where(.valid)
     .score
     .where(fn s { s > 100 })
-    .count()
+    .count())
 ```
 
 If you wrote that from the sentence without copying an earlier chain, the pipeline chapters have become a tool.

@@ -28,8 +28,6 @@ The types state the trust boundary. **Encoding** can't fail → returns `string`
 
 ## `std.regex`
 
-*Implementation in progress: this section describes [PR #625](https://github.com/sanohiro/align/pull/625), pending merge.*
-
 Compile a pattern once, bind its Move handle, and reuse it:
 
 ```align

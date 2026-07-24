@@ -12,7 +12,7 @@ Record { score: i64, valid: bool }
 fn total(data: str) -> Result<i64, Error> {
     arena {
         rows: soa<Record> := json.decode(data)?
-        return rows.where(.valid).score.sum()
+        return Ok(rows.where(.valid).score.sum())
     }
 }
 ```
@@ -139,11 +139,11 @@ rows.where(.valid).score.to_array().sum()
 **A18.**
 
 ```align
-return rows
+return Ok(rows
     .where(.valid)
     .score
     .where(fn s { s > 100 })
-    .count()
+    .count())
 ```
 
 前の chain を写さず、文からこれを書けたなら、pipeline の章は道具になっています。
