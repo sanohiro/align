@@ -205,9 +205,11 @@ current-frame + global flush. (Record the gap honestly.)
 
 # Extension — captured output + cwd / env / timeout (align-llm Request 1)
 
-> **Status:** DESIGNED 2026-07-24, not yet implemented. Motivated by `align-llm` (a real client)
+> **Status: SHIPPED (Slices 4–6, #630/#631/#632, 2026-07-24).** `process.command` + `cwd` +
+> `timeout_ns` + `env`/`env_clear` + `run` capture are built end-to-end; only the bytes tier
+> (`run_bytes`) stays deferred (Slice 7, no consumer yet). Motivated by `align-llm` (a real client)
 > whose core loop runs build/test/lint commands and **parses their output**. Source:
-> `../align-llm/docs/align-requests.md` Request 1 (priority: critical — it blocks that loop).
+> `../align-llm/docs/align-requests.md` Request 1 (priority: critical — it blocked that loop).
 
 ## Why this is genuinely new
 

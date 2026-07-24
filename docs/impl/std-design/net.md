@@ -162,15 +162,15 @@ Linux backend behind the same signatures, not a semantic change.
 
 ---
 
-## I/O timeouts (align-llm Request 2 — net rail IMPLEMENTED 2026-07-24; http surface pending)
+## I/O timeouts (align-llm Request 2 — COMPLETE: net rail #633 + http surface #634, 2026-07-24)
 
 > **Status:** the net rail below is implemented — `align_rt_tcp_connect` gained a `timeout_ns`
 > parameter (non-blocking connect + `poll(POLLOUT)` deadline; `timeout_ns == 0` is the unchanged
 > blocking connect), and `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` (`setsockopt(SO_RCVTIMEO/
 > SO_SNDTIMEO)`) set an in-place deadline whose expiry the reader/writer byte path surfaces as
 > `Err(Error.Timeout)`. The raw `tcp.connect(host, port)` surface stays timeout-less and lowers a
-> literal `0`. The `std.http` `cl.timeout(ns)` / `r.timeout(ns)` surface (http.md "I/O timeouts") is a
-> LATER PR that threads its effective timeout through the same `align_rt_tcp_connect` parameter.
+> literal `0`. The `std.http` `cl.timeout(ns)` / `r.timeout(ns)` surface (http.md "I/O timeouts")
+> SHIPPED in #634, threading its effective timeout through this same `align_rt_tcp_connect` parameter.
 
 `std.http`'s per-request timeout (http.md "I/O timeouts") rests on the net rail, so the substrate is
 designed here; net also exposes it directly for raw-socket callers. Motivated by `align-llm`'s LLM

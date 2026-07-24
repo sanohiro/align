@@ -159,14 +159,14 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 **Note**: v1 はブロッキングプール上のブロッキングソケットである。Non-blocking/epoll/io_uring は、同じ
 シグネチャの背後に置く後日の Linux バックエンドであって、意味論上の変更ではない。
 
-## I/O timeouts (align-llm Request 2 — net レール実装済み 2026-07-24;http サーフェスは保留)
+## I/O timeouts (align-llm Request 2 — 完了: net レール #633 + http サーフェス #634、2026-07-24)
 
 > **ステータス:** 以下の net レールは実装済み — `align_rt_tcp_connect` に `timeout_ns` パラメータが加わり
 > (ノンブロッキング connect + `poll(POLLOUT)` デッドライン;`timeout_ns == 0` は従来どおりのブロッキング
 > connect)、`c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)`(`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`)は
 > その場でデッドラインを設定し、その満了を reader/writer のバイト経路が `Err(Error.Timeout)` として表面化する。
 > raw な `tcp.connect(host, port)` サーフェスはタイムアウト無しのままでリテラル `0` を渡す。`std.http` の
-> `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は後続 PR で、同じ
+> `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は #634 で出荷済みで、同じ
 > `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。
 
 `std.http` のリクエスト単位タイムアウト(http.md「I/O timeouts」)は net 基盤（レール）に載るので、基盤はここで

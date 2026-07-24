@@ -202,9 +202,11 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 
 # Extension — captured output + cwd / env / timeout (align-llm Request 1)
 
-> **ステータス:** 2026-07-24 に設計済み、未実装。実クライアントである `align-llm`(コアループが
-> build/test/lint コマンドを走らせ、その**出力をパースする**)が動機である。出典:
-> `../align-llm/docs/align-requests.md` の Request 1(優先度: critical — このループを塞ぐため)。
+> **ステータス: 出荷済み(Slice 4〜6、#630/#631/#632、2026-07-24)。** `process.command` + `cwd` +
+> `timeout_ns` + `env`/`env_clear` + `run` キャプチャがエンドツーエンドで構築済み。後回しは bytes 層
+> (`run_bytes`、Slice 7、需要待ち)のみ。実クライアントである `align-llm`(コアループが build/test/lint
+> コマンドを走らせ、その**出力をパースする**)が動機である。出典:
+> `../align-llm/docs/align-requests.md` の Request 1(優先度: critical — このループを塞いでいた)。
 
 ## Why this is genuinely new
 
