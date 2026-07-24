@@ -4,7 +4,7 @@
 
 Align is an AOT-compiled, data-oriented programming language. Before the syntax, the mindset — because Align asks you to write differently than a scalar, object-oriented language does.
 
-> **Status.** Align is pre-release. The compiler (`alignc`) builds real native executables, and everything in this book compiles and runs today unless a section is explicitly marked **implementation in progress** — those parts are designed (the design lives in the spec) but not built yet, and the book says so wherever it applies. There is no stability promise: pre-release, the language changes outright, with no deprecation cycles.
+> **Status.** Align is an early 0.x release. The compiler (`alignc`) builds real native executables, and everything in this book compiles and runs today unless a section is explicitly marked **implementation in progress** — those parts are designed (the design lives in the spec) but not built yet, and the book says so wherever it applies. There is no stability promise during 0.x: the language changes outright, with no deprecation cycles.
 
 ## Four-way alignment
 

@@ -116,6 +116,98 @@ src.map(dbl).map_into(dst)
 
 ---
 
+**Q13.** fusion は、副作用を `where` の向こうへ動かしてよいですか？
+
+```align
+xs.map(log).where(is_wanted).count()
+xs.where(is_wanted).map(log).count()
+```
+
+**A13.** いいえ。1つ目はすべての入力で `log` を呼び、2つ目は生き残った要素だけで呼びます。fusion が消すのは中間 storage であり、意味ではありません。逐次 callable は書かれた stage 順に動き、拒まれた要素は後ろの stage に届きません。
+
+---
+
+**Q14.** では「一つの loop」は「順序がもう重要でない」という意味ではない？
+
+**A14.** そのとおり。一つの物理 loop が、一つの論理的な文を運びます。compiler は、その文を守る範囲でだけ機械の動かし方を変えられます。
+
+---
+
+**Q15.** 「temperature から正のものを残し、摂氏を2倍した半度単位へ変換し、最大値を求める」を書いてください。
+
+**A15.**
+
+```align
+temps.where(fn t { t > 0 }).map(fn t { t * 2 }).max()
+```
+
+名詞が source と答えを、動詞が stage を与えます。
+
+---
+
+**Q16.** 変換後の値の count も必要です。materialize しますか？
+
+**A16.** 問いが2つだけで入力を安く走査できるなら、2つの fused reduction のほうが単純かもしれません。変換が高価、または多くの問いに再利用するなら一度 materialize します。
+
+```align
+warm := temps.where(fn t { t > 0 }).map(fn t { t * 2 }).to_array()
+hi := warm.max()
+n := warm.count()
+```
+
+答えは再利用の量で変わります。「隠れた allocation がない」は「絶対に allocation しない」ではありません。
+
+---
+
+**Q17.** `[1, 2, 3, 4, 5, 6, 7]` を3枚ずつ配り、各 hand を合計してください。
+
+**A17.**
+
+```align
+[1, 2, 3, 4, 5, 6, 7]
+    .chunks(3)
+    .map(fn hand { hand.sum() })
+    .to_array()
+```
+
+`[6, 15, 7]`。chunk は view なので、最後の短い hand に padding も copy も要りません。
+
+---
+
+**Q18.** Q17 が `sum` ではなく `to_array` で終わるのはなぜ？
+
+**A18.** 求める答えが入力全体の一つの合計ではなく、hand ごとの合計だからです。答えの形が終端を選びます。
+
+---
+
+**Q19.** すでに destination buffer を持ち、2倍した値をそこへ入れたい。どの終端？
+
+**A19.**
+
+```align
+src.map(fn x { x * 2 }).map_into(dst)
+```
+
+`to_array` は新しい storage を求め、`map_into` は既存の storage を名指します。同じ変換で、ownership の物語が違います。
+
+---
+
+**Q20.** chain が読みにくくなりました。半端な pipeline に分割しますか？
+
+**A20.** いいえ。callable に名前をつけるか、chain を複数行にします。ただしデータの文は一つのままにします。
+
+```align
+answer := xs
+    .where(is_wanted)
+    .map(normalize)
+    .map(score)
+    .sum()
+```
+
+考えは名前つき関数へ分け、stream を未完成のまま分けてはいけません。
+
+---
+
 > **第五の戒律**
 >
 > *chain は左から右へ読み、早めに絞り、そして終わる。ひとつの文、ひとつのループ、ひとつの答え。*

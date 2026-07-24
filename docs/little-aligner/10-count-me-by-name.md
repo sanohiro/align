@@ -111,6 +111,94 @@ print(g.1.max())        // the largest of the per-name maxima
 
 ---
 
+**Q13.** Does “one pass” mean “no extra memory”?
+
+**A13.** No. Grouping needs a table of accumulators and then its result columns — roughly one entry per distinct key. `agg` shares that table and the trip through the input; it does not make the groups cease to exist.
+
+---
+
+**Q14.** What if every row has a different key?
+
+**A14.** Then the grouped result is nearly as large as the input. The operation is still direct and visible, but not free. Always ask two sizes: *how many rows?* and *how many groups?*
+
+---
+
+**Q15.** Should we `dict_encode` before every string grouping?
+
+**A15.** No. A single string `group_by` already does the necessary interning for that aggregation. `dict_encode` earns its place when the encoded column will be reused for several groupings or comparisons. Pay once only when there really is a twice.
+
+---
+
+**Q16.** Orders by customer:
+
+```text
+7  10
+9   4
+7   3
+9   8
+7   2
+```
+
+What per-customer sums must come back?
+
+**A16.** Customer `7 → 15`; customer `9 → 12`. Do the grouping in your head before touching syntax.
+
+---
+
+**Q17.** Say it over fields `.customer` and `.amount`.
+
+**A17.**
+
+```align
+g := orders.group_by(.customer).sum(.amount)
+```
+
+`g.0` holds the customers; `g.1` holds the aligned sums.
+
+---
+
+**Q18.** We also need each customer's largest order and order count. Three groupings?
+
+**A18.** One:
+
+```align
+g := orders.group_by(.customer).agg(
+    sum(.amount),
+    max(.amount),
+    count(),
+)
+```
+
+One key table, three accumulators per group.
+
+---
+
+**Q19.** What is the sum of `g.1`, the per-customer sums?
+
+**A19.** `27`, the same as the sum of every input amount. Grouping changes association, not the total contribution.
+
+---
+
+**Q20.** What is the maximum of the per-customer maxima?
+
+**A20.** `10`, the largest order in the whole input. A reduction may follow a grouped reduction; just keep track of which column now flows.
+
+---
+
+**Q21.** Five reports reuse customer names, but each report groups a different value. What is the shape of the optimization?
+
+**A21.**
+
+```align
+encoded := orders.dict_encode(.customer)
+sales := encoded.group_by(.customer).sum(.amount)
+counts := encoded.group_by(.customer).count()
+```
+
+Encode the repeated key column once, then ask several grouped questions. The reusable thing is not a half-`group_by`; it is the explicitly encoded data.
+
+---
+
 > **The Tenth Commandment**
 >
 > *Group and fold in one breath. Ask all your questions in one pass, and pay for a string key once.*

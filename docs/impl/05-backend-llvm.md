@@ -1,15 +1,17 @@
-# Backend: MIR → LLVM (draft)
+# Backend: MIR → LLVM
 
-Design sketch for `align_codegen_llvm`. It commits to **pure lowering**—Align's semantic decisions (desugaring, fusion, SIMD-ization, region) are already done in MIR (`04-mir.md`), and here we just mechanically lower MIR to LLVM IR. Types, Region, and parallel units are carried in MIR, so we **do not recompute** them (anti-rewrite, `00-overview.md`).
+Implementation model for `align_codegen_llvm`. It commits to **pure lowering**—Align's semantic
+decisions (desugaring, fusion, SIMD legality, ownership/region) are already represented by MIR
+(`04-mir.md`), and here we mechanically lower MIR to LLVM IR. Types and explicit runtime operations
+are carried in MIR, so we **do not recompute** them (anti-rewrite, `00-overview.md`).
 
 ```text
 MIR (optimized)  →  LLVM IR  →  object (.o)  →  [driver links] → executable
                                                   + align_runtime (06)
 ```
 
-The implementation takes Rust's LLVM bindings (`inkwell`) as the baseline. `// OPEN:` version-pinning strategy (how to absorb LLVM version dependence).
-
-This document is a **draft**. Open items are at the end + inline `// OPEN:`.
+The implementation uses LLVM 22 through Rust's `inkwell` bindings. Remaining portability and
+optimization-policy questions are collected in §10.
 
 ---
 
@@ -22,18 +24,20 @@ Bool              i1 (i8 when stored)
 Int(w, signed)    iW            (sign distinguished by the operation)
 Float(32|64)      float | double
 Char              i32 (Unicode scalar)
-Unit              {} (empty) / void (return)
+Unit              void for a function return; it has no ordinary SSA value
 Vec(n, T)         <n x T'>      ← maps directly to LLVM vector type
 Mask(T)           <n x i1>
 Bitset            iN / [iW]
-Array(T)          { T* ptr, i64 len, i64 cap }   owned, contiguous
+fixed array<T,N>  [N x T]                        inline, contiguous
+owned array<T>    { T* ptr, i64 len }            owned, contiguous
 Slice(T, _)       { T* ptr, i64 len }            view (Region does not surface in the type)
 Str               { i8* ptr, i64 len }           (+ meta is separate, §6)
-String/Buffer/Builder  owned header struct
+String/Buffer     { i8* ptr, i64 len }            owned headers
+Builder           pointer to runtime builder state
 Named(struct)     %struct.S = type { each field }   (layout is §2)
-Named(sum)        { iT tag, [payload bytes] }    tagged union
-Option(T)         null representation for types that can be made non-null, otherwise { i1, T }   // OPEN: representation TBD
-Result(T,E)       { i1 is_ok, union{T,E} }
+Named(sum)        { i32 tag, payload fields... } tagged aggregate
+Option(T)         { i8 tag, T payload }          tag 0=None, 1=Some
+Result(T,E)       { i8 tag, T ok, E err }        tag 0=Ok, 1=Err; inactive owned payloads are zero
 Fn(..)            function pointer (+ environment pointer if there is a capture)
 ```
 
@@ -84,8 +88,10 @@ offset walk to the last column + its `len*size`, aligned to the widest field), t
 scatters each AoS element's fields into their columns (`StoreColumn`), yielding the `{ptr,len}` view.
 The allocation uses a checked mirror of the offset walk: negative counts, product/addition wrap,
 and byte totals above the signed `i64` allocator ABI abort before allocation.
-`s: soa<T> := json.decode(d)?` reuses this: decode to a temporary AoS (the array length is unknown
-until parsed), `transpose_to_soa`, then free the AoS temp. `str`/owned columns are a later slice.
+`s: soa<T> := json.decode(d)?` takes a separate direct-fill rail: the runtime first counts rows,
+arena-allocates the final column layout, then parses values directly into their columns. There is no
+AoS intermediate and no transpose. Primitive and zero-copy `str` columns are supported; owned and
+nested columns remain deferred. `.to_soa()` itself still uses the transpose loop described above.
 
 JSON field dispatch is O(1): codegen bakes a **compile-time perfect-hash table** from the (known)
 field names (`build_phf` finds a collision-free seed + power-of-two size; emits a `[i32]`
@@ -113,12 +119,12 @@ narrow struct, since unknown keys are skipped; see `open-questions.md`.)
 ```text
 Goto         br
 Branch       conditional br
-Switch       switch
 Return       ret
-TryEdge      conditional br. attach cold metadata to err_bb
-Loop         br structure of header/body/exit (vectorized in §5)
-ParLoop      to a call of the runtime's parallel API (§7)
+Unreachable  unreachable
 ```
+
+Source `match`, `?`, and loops have already become `Branch`/`Goto` CFG in MIR. Calls,
+`ParMapParallel`, and allocation are rvalues rather than terminators.
 
 ### cold path (error)
 The failure edge of `?` (`04 §2.1`) is cold. In LLVM:
@@ -240,17 +246,23 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 
 ---
 
-## 7. Parallelism (ParLoop → runtime)
+## 7. Parallelism (`ParMapParallel` → runtime)
 
-MIR's `ParLoop` (`04 §6`) goes to the runtime's parallel API.
+MIR's dedicated non-capturing `ParMapParallel` materializer (`04 §6`) goes to the runtime's
+parallel-map API.
 
 ```text
-ParLoop(chunk, body)          → align_rt_par_for(items, chunk, body_fn, ctx)
-ParLoop(.., reduce)           → allocate a partial-result array → run in parallel → combine reduce serially/tree-wise
-task_group spawn/wait         → align_rt_task_spawn / align_rt_task_wait
+ParMapParallel { src, func, elem_in, elem_out }
+  → synthesize one element thunk
+  → align_rt_par_map(in_buf, count, in_stride, out_stride, thunk)
+  → owned array<elem_out>
+
+task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
 ```
 
-The `body` is the fused body from MIR, **carved out as a separate function**, and a function pointer + capture environment (`ctx`) is passed to the runtime. Because the parallel unit comes from MIR, codegen makes no parallelism decisions. The ABI is in `06`.
+The thunk loads one input element, calls the named Pure Align function, and stores one output
+element. Capturing or staged `par_map` forms use the sequential pipeline fallback before codegen.
+There is no generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---
 
@@ -278,7 +290,7 @@ The `body` is the fused body from MIR, **carved out as a separate function**, an
 
 ---
 
-## 10. Open items (to be settled)
+## 10. Settled backend choices and remaining refinements
 
 ### Settled (M0; upgraded to LLVM 22 post-M13): inkwell / LLVM version and linking method
 Use LLVM 22 via `inkwell 0.9` (feature `llvm22-1`), with `llvm-sys` 221. `llvm-sys` is pinned to
@@ -293,12 +305,11 @@ crt0), and the driver links the object with `cc`. (History: M0 shipped on LLVM 1
 `07-roadmap.md`.)
 
 ```text
-- finalize the LLVM representation of Option/Result (null-ization vs. tagged, niche optimization)
-- trigger for the SoA transform (automatic vs. annotation) and its impact on the array<T> ABI
 - the scope of multi-ISA support: the vector width is a backend, per-target choice (§5) — MIR stays width-agnostic (04 §4) — so the open part is how far to carry scalable-ISA (SVE/RVV) predicated codegen, not whether MIR fixes a W (common with 04 §9)
 - the scope of adopting the LLVM optimization pipeline (non-overlap with Align's optimizations)
 - by which M and how far to raise the precision of debug info
 - linking: static runtime, and how far to depend on libc (linked with 06)
 ```
 
-Once settled, reflect into `draft.md` (the relevant feature) and this document.
+`Option`/`Result` use tagged aggregates, and SoA is selected by an explicit `soa<T>` type; neither
+is an open backend decision.

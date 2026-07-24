@@ -36,7 +36,7 @@ ConnectionState {
 }
 ```
 
-Now, it is physically impossible to have a `user_id` while you are `Disconnected`. It is impossible to be `Authenticating` without a socket. The shape of the data perfectly matches the reality of the domain. (Payloads are positional, and today they are scalars or plain structs — when one deserves a name, give it a struct, e.g. `Connected(Session)`.)
+Now, it is physically impossible to have a `user_id` while you are `Disconnected`. It is impossible to be `Authenticating` without a socket. The shape of the data perfectly matches the reality of the domain. Payloads are positional; when several values deserve one domain name, give them a struct, for example `Connected(Session)`. Borrowed text and supported owned arrays may also be payloads, with the ordinary region and Move rules from chapter [05](05-memory.md).
 
 ## Transitions as Pure Functions
 

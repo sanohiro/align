@@ -116,6 +116,98 @@ src.map(dbl).map_into(dst)
 
 ---
 
+**Q13.** Does fusion let the compiler move an effect across a `where`?
+
+```align
+xs.map(log).where(is_wanted).count()
+xs.where(is_wanted).map(log).count()
+```
+
+**A13.** No. The first calls `log` for every input; the second calls it only for survivors. Fusion removes intermediate storage, not meaning. Sequential callables run in written stage order, and a rejected element never reaches a later stage.
+
+---
+
+**Q14.** So “one loop” does not mean “the order no longer matters”?
+
+**A14.** Exactly. One physical loop carries one logical sentence. The compiler may change the machinery only while preserving the sentence.
+
+---
+
+**Q15.** Write this request: “From the temperatures, keep positive ones, convert each from Celsius to doubled half-degrees, and find the maximum.”
+
+**A15.**
+
+```align
+temps.where(fn t { t > 0 }).map(fn t { t * 2 }).max()
+```
+
+Nouns give the source and answer; verbs give the stages.
+
+---
+
+**Q16.** We also need the count of those converted values. Should we materialize?
+
+**A16.** If these are the only two questions and the input is cheap to scan, two fused reductions may be simpler. If the conversion is expensive or the result will answer many questions, materialize once:
+
+```align
+warm := temps.where(fn t { t > 0 }).map(fn t { t * 2 }).to_array()
+hi := warm.max()
+n := warm.count()
+```
+
+The right answer depends on reuse. “No hidden allocation” does not mean “never allocate.”
+
+---
+
+**Q17.** Split `[1, 2, 3, 4, 5, 6, 7]` into hands of three and total each hand.
+
+**A17.**
+
+```align
+[1, 2, 3, 4, 5, 6, 7]
+    .chunks(3)
+    .map(fn hand { hand.sum() })
+    .to_array()
+```
+
+`[6, 15, 7]`. A chunk is a view, so the last short hand costs no padding and no copy.
+
+---
+
+**Q18.** Why does Q17 end in `to_array` rather than `sum`?
+
+**A18.** Because the requested answer is one total *per hand*, not one total for the whole input. The shape of the answer chooses the ending.
+
+---
+
+**Q19.** We already own a destination buffer and want doubled values in it. Which ending says that?
+
+**A19.**
+
+```align
+src.map(fn x { x * 2 }).map_into(dst)
+```
+
+`to_array` asks for new storage; `map_into` names existing storage. Same transformation, different ownership story.
+
+---
+
+**Q20.** The chain is getting hard to read. Should we break it into half-pipelines?
+
+**A20.** No. Name callables, or lay the chain across lines, but keep the data sentence whole:
+
+```align
+answer := xs
+    .where(is_wanted)
+    .map(normalize)
+    .map(score)
+    .sum()
+```
+
+Break thoughts into named functions, not unfinished streams.
+
+---
+
 > **The Fifth Commandment**
 >
 > *A chain reads left to right, filters early, and ends. One sentence, one loop, one answer.*

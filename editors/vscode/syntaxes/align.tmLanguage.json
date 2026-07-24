@@ -31,7 +31,11 @@
         },
         {
           "name": "support.type.align",
-          "match": "\\b(i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|bool|char|str|string|array|slice|soa|box|raw|builder|writer|reader|buffer|array_builder|file|rng|tcp_conn|tcp_listener|udp_socket|child|Option|Result|Error|Num|Ord|Eq|vec[248]|vec16|mask[248]|mask16)\\b"
+          "match": "\\bjson\\.(?:doc|kind|scanner)\\b"
+        },
+        {
+          "name": "support.type.align",
+          "match": "\\b(i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|bool|char|str|string|array|slice|soa|box|raw|builder|writer|reader|buffer|array_builder|file|rng|regex|regex_match|tcp_conn|tcp_listener|udp_socket|child|http_request_ctx|http_headers|response_builder|http_stream|Option|Result|Error|Num|Ord|Eq|vec[248]|vec16|mask[248]|mask16)\\b"
         },
         {
           "name": "constant.language.boolean.align",
@@ -39,7 +43,7 @@
         },
         {
           "name": "support.function.builtin.align",
-          "match": "\\b(map|par_map|where|reduce|scan|partition|group_by|agg|sort|sort_by_key|chunks|zip|to_array|map_into|to_soa|dict_encode|sum|min|max|count|any|all|dot|sum_where|select|fma|abs|sqrt|floor|ceil|round|trunc|pow|Some|None|Ok|Err|error|map_err|spawn|wait|print)\\b"
+          "match": "\\b(map|par_map|where|reduce|scan|partition|group_by|agg|sort|sort_by_key|chunks|zip|to_array|map_into|to_soa|dict_encode|sum|min|max|count|any|all|dot|sum_where|select|fma|abs|sqrt|floor|ceil|round|trunc|pow|hash64|hash128|Some|None|Ok|Err|error|map_err|spawn|wait|print)\\b"
         }
       ]
     },

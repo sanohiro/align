@@ -4,11 +4,12 @@ Milestones. The principle is as in `00-overview.md` — **fix the whole design f
 
 ---
 
-## Status & forward plan (snapshot)
+## Status & forward plan (historical snapshot)
 
-This section is the **live sequence** — what is done and what is next, in order. The per-milestone
-detail further below is the historical / spec record; consult it for *how* a milestone is built,
-but read the order from here.
+This section captures the sequence as of the date printed below. It is not a live backlog:
+`HANDOFF.md` and the current `core-design` / `std-design` / `pkg-design` contracts govern work that
+landed afterward. The per-milestone detail further below is historical implementation evidence;
+consult it for *how* a milestone was built, not as the newest feature-status list.
 
 **Standing principles** (full text in `CLAUDE.md`):
 - **Ideal form, or defer** — ship only the ideal / unified / philosophy-aligned form; if a feature
@@ -16,7 +17,7 @@ but read the order from here.
 - **No backward compatibility** (pre-release) — change APIs outright; no aliases / shims / dual paths.
 - **Finish all of `core` + the language before `std`** — the OS-boundary layer (`std`/`pkg`) waits.
 
-**Current (2026-07-17): M0–M15 are complete; the post-M15 ThinLTO and instrument-PGO arcs are
+**Snapshot (2026-07-17): M0–M15 are complete; the post-M15 ThinLTO and instrument-PGO arcs are
 also closed.** M11–M13, the LLVM 19→22 checkpoint, M14's LTO ceiling/runtime-bitcode slices,
 and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV

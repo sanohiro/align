@@ -11,7 +11,8 @@ Predictable                 the same code always resolves to the same type. If a
 Hand info to the compiler    put no-alias / non-null / region / cold path on the HIR so MIR/codegen don't recompute
 ```
 
-This document is a **draft**. Open items are at the end under "Open items" + `// OPEN:` in the body.
+This document records the implemented type-system model together with a small set of remaining
+refinements. Historical slice labels are retained where they explain why a restriction exists.
 
 ---
 
@@ -40,7 +41,7 @@ Ty =
 
 `Named` is **nominal** (identity determined by name). Both struct and sum type are represented as `Named`, and the definition (fields/variants) is looked up via `DefId`.
 
-`Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements: primitive scalars (Copy / `Static`), `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, the struct-with-`str`-field rule), and owned `string`/`array<T>` (which make the tuple **Move**). An owned tuple is restricted to a **temporary** — returned or destructured, not bound to a variable or passed as a parameter — so it never occupies a drop slot; building `(a, b)` from owned locals nulls those source slots (move-out), and the destructure targets are ordinary owned locals freed by the normal drop set. Lifting that cut (and `partition`/`chunks`/`min_with_index`) is the additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
+`Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements: primitive scalars (Copy / `Static`), `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, the struct-with-`str`-field rule), and owned `string`/`array<T>` (which make the tuple **Move**). An owned tuple is restricted to a **temporary** — returned or destructured, not bound to a variable or passed as a parameter — so it never occupies a drop slot; building `(a, b)` from owned locals nulls those source slots (move-out), and the destructure targets are ordinary owned locals freed by the normal drop set. `partition`/`chunks` and their tuple/view machinery have shipped; lifting the owned-tuple binding/parameter cut remains an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 
 ### Region (lifetime tag)
 Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.
@@ -121,7 +122,8 @@ Picking up the homework from the frontend.
 if c { a } else { b }   : check(c, Bool); T = unify(type(a), type(b)); result T
 match s { p1 => e1, ... }: unify each ei. The result is the common type
 if with no else          : has no value (allowed only as a Unit statement)
-match must be exhaustive or it is an error (// OPEN: details of exhaustiveness checking)
+match must be exhaustive or it is an error; variant and or-pattern coverage is checked, while
+a wildcard arm covers all remaining variants
 ```
 
 ```align
@@ -160,7 +162,7 @@ users.where(.active)   // .active : Fn([User], bool, Pure)
 ## 5. Option / Result / ? / else
 
 ```text
-?         for expr: Result(T, E), where the enclosing function returns Result(_, E') and E is convertible to E' → the value is T
+?         for expr: Result(T, E), where the enclosing function returns Result(_, E) → the value is T
           ? on anything but Result is an error (draft.md §5)
 else      lhs: Option(T) or Result(T, _).
           rhs either (a) diverges (return etc.) or (b) supplies a T. The result is T
@@ -172,7 +174,9 @@ user := find_user(id) else return ...;   // Option(User) → User
 port := get_env("PORT") else { 8080 };   // the else arm supplies an i64
 ```
 
-`?` / `else` are kept as dedicated nodes in HIR, and desugared in MIR to early return + cold path (`04-mir.md`). The `E → E'` conversion rule is `// OPEN:` (error type design, M2).
+`?` / `else` are kept as dedicated nodes in HIR, and desugared in MIR to early return + cold path
+(`04-mir.md`). `?` performs no implicit error conversion: use `result.map_err(f)?` to make an
+`E → E'` conversion visible.
 
 ---
 
@@ -183,16 +187,18 @@ port := get_env("PORT") else { 8080 };   // the else arm supplies an i64
 Copy (value, safe to bit-copy)
   bool / integer / float / char / Unit
   Vec / Mask / Bitset
-  structs that are all-Copy and small
+  structs whose fields are all Copy
   Slice (copying the view; the pointed-to data is not copied. Region constraints handled separately)
 
 Move (owning, linear)
   Array / String / Buffer / Builder
   Heap box
-  structs containing a Move type / large structs
+  structs containing a Move type
 ```
 
-`// OPEN:` the threshold for "small" (layout size). Passing a large struct by value is a **lint** (not an error, `draft.md` §6.2).
+Copy/Move is field-derived, not controlled by an ABI-size threshold. A large all-Copy struct remains
+Copy; passing it by value may be diagnosed as a performance lint without changing ownership
+semantics (`draft.md` §6.2).
 
 ### Checking
 Flow analysis over the CFG. When a Move-type value is consumed (assigned as a value / passed as a value argument / returned by value), the original binding becomes dead. Using a dead binding is a **compile error**.
@@ -240,7 +246,10 @@ arena {
 }
 ```
 
-Region propagation is inferred by flow analysis; users write nothing. Only on violation does the error message surface a region (e.g. "this view is bound to an arena block"). `// OPEN:` region ordering for nested arenas, and integration with explicit allocators (`arena a {}`, open-questions).
+Region propagation is inferred by flow analysis; users write nothing. Only on violation does the
+error message surface a region (for example, "this view is bound to an arena block"). Nested arenas
+use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`; named/explicit allocator syntax is a
+separate possible language extension, not an unsettled part of this checker.
 
 ---
 
@@ -280,7 +289,7 @@ The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked e
 
 ---
 
-## 9. Generics (minimal) — 4c-1 built
+## 9. Generics (minimal) — complete
 
 Monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
@@ -354,15 +363,14 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 
 ---
 
-## 12. Open items (to be settled)
+## 12. Remaining refinements
 
 ```text
-- the rule for E → E' (error type conversion)      → M2 (error type design)
-- the exact algorithm for match exhaustiveness checking
-- the struct size threshold dividing Copy/Move
-- region ordering for nested arenas / integration with explicit allocators  → M3
-- generics constraints: structural inference vs explicit bounds / monomorphization unit  → M4
 - lint for the numeric default type (when i64 is excessive in large arrays)
+- precise per-function return-borrow summaries, so a call result is tied only to the argument
+  it actually borrows rather than to a conservative aggregate region
 ```
 
-Reflected into `draft.md` and this document as they are settled.
+Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is
+field-derived; nested arena ordering is implemented; and minimal generics monomorphize before MIR.
+Those are settled rules, not open design questions.

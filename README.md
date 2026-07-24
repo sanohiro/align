@@ -7,7 +7,7 @@ Align is an AOT-compiled, data-oriented programming language. It aligns four rea
 ## Platforms
 
 Currently supported platforms:
-- **Linux x86-64**
+- **Linux x86-64 and ARM64**
 - **macOS Apple Silicon (aarch64)**
 - *Windows is not supported.*
 
@@ -85,10 +85,11 @@ Prefer drills? **[The Little Aligner](docs/little-aligner/README.md)** ([Japanes
 ## Layout
 
 - `draft.md` — authoritative language specification
-- `docs/guide/` — hands-on tutorial, 23 chapters (`00`–`22`, English + Japanese)
+- `docs/guide/` — hands-on tutorial, 24 chapters (`00`–`23`, English + Japanese)
 - `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs
+- `apps/` — first-party package workspaces, including `pkg.web` and `pkg.jwt`
 - `editors/` — Vim / Emacs / VS Code support (syntax, snippets)
 - `crates/` — the `alignc` compiler workspace
 

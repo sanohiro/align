@@ -19,13 +19,16 @@
   '("align" "layout" "link"))
 
 (defconst align-types
-  '("i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64" "bool" "char" "str" "string" "array" "slice" "soa" "box" "raw" "builder" "writer" "reader" "buffer" "array_builder" "file" "rng" "tcp_conn" "tcp_listener" "udp_socket" "child" "Option" "Result" "Error" "Num" "Ord" "Eq" "vec2" "vec4" "vec8" "vec16" "mask2" "mask4" "mask8" "mask16"))
+  '("i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64" "bool" "char" "str" "string" "array" "slice" "soa" "box" "raw" "builder" "writer" "reader" "buffer" "array_builder" "file" "rng" "regex" "regex_match" "tcp_conn" "tcp_listener" "udp_socket" "child" "http_request_ctx" "http_headers" "response_builder" "http_stream" "Option" "Result" "Error" "Num" "Ord" "Eq" "vec2" "vec4" "vec8" "vec16" "mask2" "mask4" "mask8" "mask16"))
+
+(defconst align-qualified-type-regexp
+  "\\_<json\\.\\(?:doc\\|kind\\|scanner\\)\\_>")
 
 (defconst align-constants
   '("true" "false"))
 
 (defconst align-builtins
-  '("map" "par_map" "where" "reduce" "scan" "partition" "group_by" "agg" "sort" "sort_by_key" "chunks" "zip" "to_array" "map_into" "to_soa" "dict_encode" "sum" "min" "max" "count" "any" "all" "dot" "sum_where" "select" "fma" "abs" "sqrt" "floor" "ceil" "round" "trunc" "pow" "Some" "None" "Ok" "Err" "error" "map_err" "spawn" "wait" "print"))
+  '("map" "par_map" "where" "reduce" "scan" "partition" "group_by" "agg" "sort" "sort_by_key" "chunks" "zip" "to_array" "map_into" "to_soa" "dict_encode" "sum" "min" "max" "count" "any" "all" "dot" "sum_where" "select" "fma" "abs" "sqrt" "floor" "ceil" "round" "trunc" "pow" "hash64" "hash128" "Some" "None" "Ok" "Err" "error" "map_err" "spawn" "wait" "print"))
 
 (defconst align-number-regexp
   "\\_<\\(?:0[xX][[:xdigit:]_]+\\|0[oO][0-7_]+\\|0[bB][01_]+\\|[0-9][0-9_]*\\(?:\\.[0-9][0-9_]*\\)?\\(?:[eE][+-]?[0-9][0-9_]*\\)?\\)\\_>")
@@ -43,6 +46,7 @@
 (defconst align-font-lock-keywords
   `((,(regexp-opt align-keywords 'words) . font-lock-keyword-face)
     (,align-attribute-regexp . font-lock-preprocessor-face)
+    (,align-qualified-type-regexp . font-lock-type-face)
     (,(regexp-opt align-types 'words) . font-lock-type-face)
     (,(regexp-opt align-builtins 'words) . font-lock-builtin-face)
     (,(regexp-opt align-constants 'words) . font-lock-constant-face)

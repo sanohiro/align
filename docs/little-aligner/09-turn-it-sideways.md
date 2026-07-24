@@ -123,6 +123,69 @@ The parser fills columns as it reads; no row-shaped middleman, and string column
 
 ---
 
+**Q16.** Is `rows.to_soa()` free?
+
+**A16.** No. It allocates columns and transposes every row into them. The win comes afterward: several hot column scans repay that one visible conversion. Turning data sideways for one tiny whole-row operation would spend more than it saves.
+
+---
+
+**Q17.** Then what does “at the door” really mean?
+
+**A17.** Choose the layout once, before the repeated work begins. If JSON is the door, decode into `soa<T>` and avoid constructing a row-shaped middle. If an AoS already exists, transpose only when the coming field-wise passes justify it. Layout is a decision, not a reflex.
+
+---
+
+**Q18.** Choose AoS or SoA: a million particles, every frame updating only `x`, `y`, and `velocity`, while names and metadata stay cold.
+
+**A18.** SoA. The hot loop should stream the few hot columns without hauling cold fields through cache.
+
+---
+
+**Q19.** Choose again: twelve configuration records, usually loaded, validated, and printed one whole record at a time.
+
+**A19.** AoS. Small, whole-row work gets no useful repayment from a transpose.
+
+---
+
+**Q20.** Orders have `price`, `quantity`, and `active`. Total the value of active orders.
+
+**A20.**
+
+```align
+orders
+    .where(.active)
+    .map(fn o { o.price * o.quantity })
+    .sum()
+```
+
+Over `soa<Order>`, the pipeline reads the three named columns and no others.
+
+---
+
+**Q21.** Why not write `orders.price.sum() * orders.quantity.sum()`?
+
+**A21.** Because multiplication belongs row by row before the sum. The first order's price pairs with the first order's quantity. Columnar layout changes storage, never relationships.
+
+---
+
+**Q22.** Analyze only rows 100 through 199.
+
+**A22.** Slice the columns or the SoA window before reducing. A projected column is an ordinary slice:
+
+```align
+orders.price[100..200].sum()
+```
+
+The half-open range contains one hundred prices.
+
+---
+
+**Q23.** You need one customer's entire record after finding its index. Is gathering one row a failure of SoA?
+
+**A23.** No. `orders[i]` gathers it. A layout is chosen for the dominant work, not sworn as a religion. Occasional row gathers are the price paid for cheap repeated column scans.
+
+---
+
 > **The Ninth Commandment**
 >
 > *Scan columns, not rows. Turn data sideways once, at the door, and the machine will thank you all day.*

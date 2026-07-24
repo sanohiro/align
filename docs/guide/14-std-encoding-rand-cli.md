@@ -1,8 +1,8 @@
-# std: encoding, rand, cli
+# std: encoding, regex, rand, cli
 
 > 🌐 **English** · [Japanese](./ja/14-std-encoding-rand-cli.md)
 
-The second wave of `std`: converting bytes at the boundary, random numbers, and command-line parsing. Same three rules as chapter [13](13-std-os.md) — explicit imports, `Result` + the one errno table, Move where a resource is owned.
+The second wave of `std`: converting bytes at the boundary, searching text, random numbers, and command-line parsing. Same three rules as chapter [13](13-std-os.md) — explicit imports, `Result` + the one errno table, Move where a resource is owned.
 
 ## `std.encoding`
 
@@ -25,6 +25,30 @@ pub fn main() -> Result<(), Error> {
 ```
 
 The types state the trust boundary. **Encoding** can't fail → returns `string` directly. **Decoding** is parsing untrusted input → returns `Result<buffer, Error>`, and the payload is a `buffer` — raw bytes — because decoded data carries no UTF-8 guarantee; run `utf8_valid` (or hand it to something binary-safe) before treating it as text. `base64url_*` uses the URL-safe alphabet without padding, and hex decoding accepts both cases.
+
+## `std.regex`
+
+*Implementation in progress: this section describes [PR #625](https://github.com/sanohiro/align/pull/625), pending merge.*
+
+Compile a pattern once, bind its Move handle, and reuse it:
+
+```align
+import std.regex
+
+pub fn main() -> Result<(), Error> {
+    re := regex.compile("[A-Za-z_][A-Za-z0-9_]*")?
+    print(re.is_match("answer = 42"))
+    match re.find("answer = 42") {
+        Some(m) => print("answer = 42"[m.start..m.end]),
+        None    => print("no identifier"),
+    }
+    return Ok(())
+}
+```
+
+`regex.compile(pattern: str) -> Result<regex, Error>` returns the owning compiled handle; `is_match` returns `bool`, while `find` and `find_at` return `Option<regex_match>`. A `regex_match` is a Copy value whose `start` and `end` fields are half-open UTF-8 byte offsets at character boundaries, so they can be used directly in a checked string slice. Invalid pattern syntax or a resource-limit rejection is `Error.Invalid`; no match is simply `None`. Passing `find_at` an offset that is outside the string or not a character boundary aborts as a programming error.
+
+The engine deliberately omits look-around and backreferences. There is no regex literal and no implicit global cache: a `regex` value is the compiled plan, and its ownership and reuse stay visible in the source.
 
 ## `std.rand`
 

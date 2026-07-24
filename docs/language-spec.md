@@ -180,6 +180,11 @@ library concern), so strings sort and compare. `else` works on `Result` as well 
 the intent triangle is `?` propagates / `else` falls back / `match` inspects. Details:
 `draft.md` §4 / §5 / §12.
 
+Implementation status: comparison operators and `Eq`/`Ord` bounds currently accept borrowed
+`str`; direct owned-`string` comparison is still pending. To compare owned strings today, pass
+them through a `str`-typed helper so the normal `string` → `str` borrow coercion is explicit in
+the program's type flow.
+
 ### Generics
 
 A function may declare type parameters — `fn f<T>(...)` — and is **monomorphized** per distinct
@@ -188,7 +193,7 @@ are **inferred** (from arguments or the expected type via the binding annotation
 A bare type parameter is **opaque**: passed / returned / stored by value, with no operations of its
 own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities — `fn f<T: Bound>`
 — in a fixed `Num ⊃ Ord ⊃ Eq` hierarchy: `Num` = arithmetic+ordering+equality (numbers), `Ord` =
-ordering+equality (numbers, `char`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
+ordering+equality (numbers, `char`, `str`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
 
 A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
@@ -297,8 +302,8 @@ for hand-written register kernels. (`draft.md` §9.)
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
 AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
-(`s: soa<User> := json.decode(d)?` produces a column-major `soa<T>` result; the mechanism is currently
-decode-to-AoS-then-transpose), both arena-allocated. `json.decode`'s field contract is strict and
+(`s: soa<User> := json.decode(d)?` counts the rows, allocates the columns, and fills them directly
+without an AoS intermediate or transpose), both arena-allocated. `json.decode`'s field contract is strict and
 exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped),
 enforced on both the strict fallback and the Mison speculative fast path (a duplicate at an unqueried
 position is re-checked against the declared set and rejected). A struct field may itself be a
@@ -309,8 +314,9 @@ A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing
 `decode(encode(x))` round-trips (a non-`Option` field still errors when missing). A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
-OpenAI request/response round-trips; the element struct must be non-owned in v1. `soa<T>` columns
-stay primitive/`str`. The settled completeness design (draft §14): a JSON `oneOf` maps to a sum
+OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;
+bare `array<string>` fields remain deferred. `soa<T>` columns stay primitive/`str`. The settled
+completeness design (draft §14): a JSON `oneOf` maps to a sum
 type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1) dispatch, encode
 writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
 `json.doc` view (no serde-style value tree, no map type) — `d := json.doc(s)?` in an `arena {}`, then
@@ -420,7 +426,9 @@ by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point {
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
 order, natural alignment, no reordering). Only such a struct may be written to / read from `raw`
 memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
-FFI-mappable scalars; by-value struct passing is a later slice.
+FFI-mappable scalars. On x86-64 SysV, a `layout(C)` struct in the ABI's register classes and no
+larger than 16 bytes may also cross by value; MEMORY-class/larger structs and other platform ABIs
+remain pointer-only.
 
 An `align(N)` attribute (`align(N) S { … }`, a power of two, composes with `layout(C)`) over-aligns a
 struct's storage — the max of `N` and the natural alignment, so it never under-aligns — for SIMD /
@@ -440,8 +448,9 @@ An `extern "C" link("name")` clause names an external library to link (`-lname`)
 always-linked libc/libm — the visible dependency the `std`/`pkg` C-engine wrappers ride on. A block
 names one library; a repeated name links once.
 
-Deliberately out of FFI v1 (draft §15): a struct **by value** (register/`byval` ABI — struct-by-pointer
-covers the common case), `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
+Deliberately out of FFI v1 (draft §15): MEMORY-class or larger-than-16-byte structs by value, and
+all by-value struct ABIs other than x86-64 SysV (struct-by-pointer covers the portable case);
+`bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
 Align `char` is a Unicode scalar, not a C `char`), and a typed pointer cast `raw.ptr_cast<T>` (waits
 on typed pointers).
 
@@ -473,8 +482,8 @@ transitively, through arrays/tuples/generics) — a private type cannot leak thr
 so a module's public interface is self-contained. A **generic** `pub` fn's *body* is part of its
 interface (its template is instantiated in importers), so it may reference only `pub` same-module
 items — a private same-module fn/type/const in a generic `pub` body is rejected. The import graph must be a DAG —
-cyclic imports are a compile error. (Constructing an imported sum type's
-variant — `geom.Color.Red` — is a later slice.) (`draft.md` §17.)
+cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
+qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
 
 **Packages (the `pkg` layer).** A *package* is a distribution-layer subtree under `pkg/<name>/` (root
 `pkg/<name>.align` + optional submodules), discovered from imports + the filesystem with no manifest —

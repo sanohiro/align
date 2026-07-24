@@ -118,6 +118,94 @@ fn describe(p: Page) -> i64 = match p {
 
 ---
 
+**Q14.** もう一つの one-of-many です。
+
+```align
+Reading { Good(i64), Missing, Bad(i64) }
+```
+
+「Good の値を使い、それ以外は0にする」を書いてください。
+
+**A14.**
+
+```align
+fn value_or_zero(r: Reading) -> i64 = match r {
+    Good(n) => n,
+    Missing => 0,
+    Bad(_)  => 0,
+}
+```
+
+2つの0は、答えが同じでも意味が違います。
+
+---
+
+**Q15.** 最後の2 arm を `_ => 0` にできますか？
+
+**A15.** できます。今日の答えは同じです。しかし将来 `Stale(i64)` が増えたとき、明示した arm は新しい判断を要求します。wildcard は短さと引き換えに、その未来の問いを手放します。
+
+---
+
+**Q16.** reading の array にある Good の値をすべて足してください。
+
+**A16.**
+
+```align
+readings.map(value_or_zero).sum()
+```
+
+sum type が一つの要素を扱い、pipeline が多数を扱います。それぞれが自分の仕事だけをするので、道具を合成できます。
+
+---
+
+**Q17.** Bad の reading を数えるには？
+
+**A17.**
+
+```align
+readings.where(fn r {
+    match r {
+        Good(_) => false,
+        Missing => false,
+        Bad(_)  => true,
+    }
+}).count()
+```
+
+`match` が predicate の `bool` を作ります。
+
+---
+
+**Q18.** Q17 の `match` が `1` または `0` を返し、最後に `sum` してもよいですか？
+
+**A18.** はい。
+
+```align
+readings.map(fn r {
+    match r {
+        Good(_) => 0,
+        Missing => 0,
+        Bad(_)  => 1,
+    }
+}).sum()
+```
+
+答えは同じです。「どの要素か」という考えなら `where(...).count()`、各 variant が量を寄与するなら `map(...).sum()` のほうが明瞭です。
+
+---
+
+**Q19.** `Reading` に `Stale(i64)` を足します。どの code が手を挙げますか？
+
+**A19.** exhaustive なすべての `match` です。`value_or_zero`、Q17 の predicate、Q18 の寄与。これは恐れるべき破壊ではなく、新しい variant が判断を求める場所の一覧です。
+
+---
+
+**Q20.** sum type を作る前に、何を問うべき？
+
+**A20.** 「どの不可能な組み合わせを、書けなくしたいのか？」です。「reading は Good でありながら Missing にはなれない」なら、variant は本当の modeling をしています。状態が同居できるなら、field かもしれません。
+
+---
+
 > **第六の戒律**
 >
 > *あるものが多くのうちの一つなら、その多くを言え。それから `match` し、リストの管理はコンパイラに任せよ。*

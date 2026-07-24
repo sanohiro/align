@@ -26,7 +26,7 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 ## Part III — The standard library and the edges
 
 - [13 — std: files, I/O, and the OS boundary](13-std-os.md)
-- [14 — std: encoding, rand, cli](14-std-encoding-rand-cli.md)
+- [14 — std: encoding, regex, rand, cli](14-std-encoding-rand-cli.md)
 - [15 — The edges: unsafe and C FFI](15-unsafe-and-ffi.md)
 - [16 — The toolchain: alignc, the formatter, the lints](16-toolchain.md)
 - [17 — The Align way](17-the-align-way.md)
@@ -38,3 +38,7 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 - [20 — Beyond arenas: pools and lifetimes](20-beyond-arenas.md)
 - [21 — State machines](21-state-machines.md)
 - [22 — Building a system: ECS](22-building-a-system.md)
+
+## Part V — Packages
+
+- [23 — Packages: vendored source, pkg.web, and pkg.jwt](23-packages.md)

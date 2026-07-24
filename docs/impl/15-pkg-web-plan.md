@@ -1,13 +1,14 @@
 # pkg.web plan — the zero-copy REST framework (foundation included)
 
-> Status: plan record, 2026-07-20 (v2 — reframed per the owner's restored brief). **The deliverable
+> Status: **completed plan record** — F0–F3 shipped; W1–W7 completed by 2026-07-22. This file
+> preserves the execution rationale and ordering; `pkg-design/web.md` is the current package
+> contract. **The deliverable
 > is `pkg.web`: a blazing-fast, zero-copy REST framework for Align** — primary reference Go's
 > **Fiber** (fasthttp's zero-allocation philosophy + Express-derived API), router reference the
 > **httprouter/fasthttp radix-tree lineage**. The gateway / LLM apps are merely the framework's
 > first consumers and are explicitly LATER ("what we build with it happens to be LLM-related").
 > This supersedes both the 2026-07-18 "extraction over invention" note and this doc's own v1
-> (gateway-centric) framing. Execution happens in a separate session; this doc + the design doc
-> are that session's source of truth. Read: `pkg-design/web.md` (THE design — surface, performance
+> (gateway-centric) framing. Read: `pkg-design/web.md` (THE design — surface, performance
 > contract, W1–W7 slices), `open-questions.md` → pkg-foundation proposal (the package model),
 > `work/proposals/api-server-db.md` (the end-to-end performance blueprint).
 
@@ -46,29 +47,27 @@ constructors (`web.get/post/...`), `:name` + `*name` pattern syntax (Fiber/httpr
 static > param > wildcard priority), one-ctx handlers (`fn(c: web.Ctx) -> Result<(), Error>`) with
 named param access `web.param(c, "id")`. Full surface: `pkg-design/web.md`.
 
-**D-E — the compiler prerequisite is F1 field-eligibility widening**, probed 2026-07-20: struct
-fields today are limited to "primitive scalar, str, or a plain struct"; `Route`/`Ctx` need ① fn
-value fields, ② a Move-handle field (`http_request_ctx`), ③ `slice<str>` fields. Each reuses
-existing classification machinery (FnTy effects #465; Move-field drop from J3a; str-view region
-tracking). Capturing escaping closures stay deferred (middleware-lite runs without them —
-design doc "Middleware").
+**D-E — the compiler prerequisite was F1 field-eligibility widening, now shipped.** `Route`/`Ctx`
+needed ① fn-value fields, ② a Move-handle field (`http_request_ctx`), and ③ `slice<str>` fields.
+Those shapes now run through layout, move/drop, region, MIR, and codegen. Capturing escaping
+closures remain outside the feature; middleware-lite does not require them.
 
-## 2. Phases (execute in order; each slice lands PR → review → merge)
+## 2. Phases (completed record)
 
-- **F1 — field-eligibility widening (compiler; the hard gate).** ①②③ above through the usual
+- **F1 — DONE: field-eligibility widening (compiler; formerly the hard gate).** ①②③ above through the usual
   exhaustive sweeps (`is_field_ok`, layout/ABI, Move/Copy + drop, region/escape, MIR, codegen).
   Acceptance: a `Route { pattern: str, handler: fn(...) }` array dispatched by lookup runs
   end-to-end; a Move-handle-bearing struct moves/drops exactly once; a `slice<str>` field is
   region-tracked like a `str` field; effect inference stays fail-closed through stored fn values.
-  Probe first, per item — any that already works shrinks the slice.
-- **F0 — pkg-foundation v1 (parallelizable with F1).** The `internal` path rule + the
+  The acceptance shapes shipped.
+- **F0 — DONE: pkg-foundation v1.** The `internal` path rule + the
   pkg-layering rule (import-edge checks) + spec text (draft §17 rules, §18.3 the package model,
   language-spec digest, design-notes rationale); move the open-questions proposal → Settled.
   Acceptance: positive/negative import tests; the verified pkg smoke shape pinned as a driver test.
 - **F2 — the design: DONE** (`pkg-design/web.md` + ja, 2026-07-20 v2 — Fiber-informed,
   performance-contract-first). Revisit only if F1 probing invalidates a shape (e.g. `Option<Ctx>`
   for middleware — fallback recorded in the doc).
-- **F3 — pkg.web implementation, W1–W7** (per the design doc): W1 router core (radix tree +
+- **F3 — DONE: pkg.web implementation, W1–W7** (per the design doc): W1 router core (radix tree +
   differential oracle) → W2 Ctx/serve/dispatch (+ the std.http query floor lands here if not
   before) → W3 accessors/responders → W4 hardening → W5 bench gate (zero-overhead + contract
   regression) → W6 middleware-lite + SSE sugar (consumer-gated) → W7 the Fiber comparison,

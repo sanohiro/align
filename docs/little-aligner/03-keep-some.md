@@ -92,6 +92,87 @@ items.where(.active).price.map(fn p { p * 108 / 100 }).sum()
 
 ---
 
+**Q13.** A smaller table:
+
+```align
+Reading { value: i64, valid: bool }
+
+readings := [
+    Reading { value: 5,  valid: true },
+    Reading { value: 40, valid: false },
+    Reading { value: 12, valid: true },
+]
+```
+
+What is `readings.where(.valid).value.to_array()`?
+
+**A13.** `[5, 12]`. Keep rows first; project the surviving field second.
+
+---
+
+**Q14.** What is `readings.value.where(fn x { x > 10 }).to_array()`?
+
+**A14.** `[40, 12]`. This question never looked at `valid`. A field projection forgets the other fields; after `.value`, only numbers flow.
+
+---
+
+**Q15.** Keep readings that are both valid and greater than ten.
+
+**A15.**
+
+```align
+readings
+    .where(.valid)
+    .where(fn r { r.value > 10 })
+    .value
+    .to_array()
+```
+
+The answer is `[12]`. The second predicate still receives a `Reading`, because projection has not happened yet.
+
+---
+
+**Q16.** Could we project `.value` before the second `where`?
+
+**A16.** Yes, after valid rows have been selected:
+
+```align
+readings.where(.valid).value.where(fn x { x > 10 }).to_array()
+```
+
+Same answer. Now the second predicate receives an `i64`. Choose the order that says the thought most plainly.
+
+---
+
+**Q17.** Double those surviving values and sum them.
+
+**A17.**
+
+```align
+readings
+    .where(.valid)
+    .value
+    .where(fn x { x > 10 })
+    .map(fn x { x * 2 })
+    .sum()
+```
+
+`24`.
+
+---
+
+**Q18.** How many temporary arrays did Q17 make?
+
+**A18.** None. Three readings entered; one reached the multiply; one number reached the accumulator. Trace elements, not imaginary collections.
+
+---
+
+**Q19.** Say Q17 without syntax.
+
+**A19.** “Take the readings; keep valid ones; take their values; keep values over ten; double them; add them.” If the sentence and the chain disagree, one of them is wrong.
+
+---
+
 > **The Third Commandment**
 >
 > *Filter with `where`, point with `.field`, and let the data flow to its answer.*

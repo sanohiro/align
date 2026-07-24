@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/01-getting-started.md)
 
-Align is pre-release. The release automation packages tagged builds for macOS Apple Silicon and Ubuntu 24.04 (x86_64 and ARM64); those install endpoints become available after the first distribution release and repository setup. Until then, build the compiler from source.
+Align is an early 0.x project and does not yet promise backward compatibility. Tagged releases are packaged for macOS Apple Silicon and Ubuntu 24.04 (x86_64 and ARM64); the commands below install the latest published release. Build from source when you need the current repository state.
 
 ## Installing a packaged build
 

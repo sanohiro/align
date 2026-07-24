@@ -1,13 +1,15 @@
 # 08 — Memory Model v2: borrow regions + owned heap/drop
 
-Status: **IMPLEMENTED through slice 8d** (see the §11 slice ledger for the per-slice record).
+Status: **IMPLEMENTED** (see the §11 slice ledger for the foundation record).
 This was the foundation phase slotted **after the foundation-safe scalar work and before M6
 (SIMD)** (`07-roadmap.md`, `open-questions.md` Settled "Memory model v2"). It was designed **as
 a whole here first**, then implemented in ordered slices (§11) — nothing it gated shipped in a
-corner-cut form before it landed. **`draft.md` §19 now runs end-to-end except the `fs`/`io` std
-boundary.** The text below is the original design narrative, kept as the authoritative model;
-the still-deferred, deliberately un-rushed tracks (tuples/`partition`, `array<slice>`/`chunks`,
-`array<Struct>.clone()`, element indexing) are called out in §11.
+corner-cut form before it landed. **`draft.md` §19 now runs end-to-end, including the `fs`/`io`
+boundary.** The text below retains the original design narrative, while §11 records what actually
+shipped. Later slices also delivered tuples, `partition`, `array<slice>`/`chunks`, whole-struct
+indexing for supported element shapes, deep-drop `array<string>` producers, and `buffer`.
+Important remaining boundaries include `array<Struct>.clone()`, Move-element indexing, and precise
+per-function return-borrow summaries.
 
 It exists because the deferred "ideal forms" of M4 and M5 both rest on one foundation:
 - M5 `json.decode` for `str` / `array<T>` / nested fields → zero-copy views region-tied to
@@ -15,7 +17,7 @@ It exists because the deferred "ideal forms" of M4 and M5 both rest on one found
 - M4 carryover `where` / `scan` / `partition` / `sort` / `chunks` + array-valued results →
   built on owned, dynamic heap arrays with drop (materialization).
 
-Today these are handled by three unrelated **point solutions** in `align_sema`'s
+Before v2 these were handled by three unrelated **point solutions** in `align_sema`'s
 `EscapeCheck` (see `lib.rs`):
 1. **arena depth** — a `box` / arena-backed `str`'s region is the `arena {}` nesting depth at
    which it was allocated; escaping to a shallower depth is an error (`region_of`,
@@ -191,9 +193,10 @@ scope. An *arena-allocated* owned value is `Arena(k)` — its buffer lives in th
 bulk-freed at the block's `}`. The single escape rule (§4) therefore **forbids moving or
 returning an arena-allocated owned value to a longer-lived region**: doing so would leave a
 dangling pointer after the bulk-free. To produce an owned `array`/`string` that must outlive
-the arena, allocate it free-standing (the default outside an arena) or `.clone()` it out.
-`.clone()` deep-copies: in an arena it allocates in that arena (`Arena(k)`); outside, it is
-heap-owned with its own `Drop`.
+the arena, allocate it free-standing (the default outside an arena) or use a type-specific explicit
+copy operation. In the current implementation `str.clone()` always produces a free-standing,
+heap-owned `string` with its own `Drop`, even when called inside an arena;
+`array<Struct>.clone()` is not implemented.
 
 ---
 
@@ -218,9 +221,9 @@ Free-standing owned values (§6) need their backing freed exactly once, on every
 - **Skip when arena-allocated:** arena values are bulk-freed; they are not on the drop stack.
 - **Visible:** the `Drop` is explicit in MIR (honoring "nothing hidden" at the IR level; the
   source-level signal is that the type is a Move/owning type and the allocation was written).
-- **Runtime:** `Drop` of an `array`/`string` lowers to a single `align_rt_free`-style call
-  (the buffer is one allocation). No element-wise destructors in v1 (elements are scalars /
-  owned-flat); nested-owning-element drop is a later refinement.
+- **Runtime:** the foundation cut lowered flat `array`/`string` drop to one
+  `align_rt_free`-style call. Later slices added recursive struct drop and deep-drop collections
+  such as the `array<string>` returned by `fs.read_dir` and `dns.resolve`.
 
 Order: drops run in reverse declaration order at a scope exit, after arena frees of inner
 arenas but consistent with lexical nesting.
@@ -393,8 +396,9 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
        enclosing arena). Scalar accumulators are unaffected (no region). (Note: the precise region
        is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
        allocates its fresh accumulator at `depth`.)
-   - **Deferred:** array / nested-struct field decode; and precise per-fn borrow inference
-     (which arg, if any, a call result actually borrows) to lift the conservatism of 6b.
+   - **Since shipped:** array and nested-struct field decode. Precise per-function borrow inference
+     (which argument, if any, a call result actually borrows) remains a refinement that could lift
+     the conservative region join described in 6b.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
    owned/drop machinery.
    - **[done] 7a — owned `string` + `str.clone()`.** Added `Ty::String`, the heap-owned dual of
@@ -460,9 +464,9 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      assigned to a frame-local binding; the target is now `Frame.shorter(arena(decl_depth))`
      (escape past the frame is still caught by the return / struct-field-store checks; a deeper
      arena value into a shallower binding stays rejected).
-   - **Deferred (7e+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); and `bytes`/`buffer` (the spec defines only the type
-     names + one-line roles so far — surface API to be fleshed out in the spec first).
+   - **Later status:** `buffer` and its I/O surface have shipped. The in-arena bump-clone
+     optimization remains optional: `str.clone()` is heap-owned, which is sound but does not turn
+     the clone into an arena bump allocation.
 8. **Owned (Move) payloads in `Option`/`Result`.** The remaining "ideal form" carryover (a
    materializing `json.decode` into `array<T>`, fallible functions returning owned values) is gated on
    one type-system gap: `Ty::Result(Scalar, Scalar)` could only carry *scalars*, so a fallible
@@ -552,13 +556,11 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `check_field_access` when the receiver is an `Index` over a struct array. A `str` field is a
      view region-tied to the array (so it cannot escape the array's input); a Move-type field is
      rejected (same double-free concern as 8e).
-   - **Deferred (later):** a bare whole-struct element value `users[i]` (no field) — needs a
-     whole-struct value load + region tie + the Move-field question; `array<Struct>.clone()` (the
-     escape hatch); and collecting terminals' broader use over struct arrays beyond the fused
-     reduction. The `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate
-     from MMv2). Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`)
-     remain a **separate** type-system track — open design items (do not fake them); they reuse this
-     same owned-aggregate + drop foundation once their surface is designed.
+   - **Later status:** whole-struct element values for supported Copy structs, broader struct-array
+     pipelines, the `fs.read_file` / `io.stdout.write` boundary, tuples/`partition`, and
+     `array<slice<T>>`/`chunks` have shipped on this foundation. `array<Struct>.clone()` remains an
+     escape-hatch gap, and indexing an element whose value itself is Move remains restricted because
+     a read must define whether it borrows or transfers that element.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
@@ -591,15 +593,14 @@ decode-escape semantics and lifted several deferrals. All of the following are n
 
 ---
 
-## 13. Open sub-questions (decide within the phase, not before)
+## 13. Historical sub-questions — resolved
 
-- `where`/`partition` result sizing: two-pass count vs growable buffer vs over-allocate +
-  shrink (per-terminal, slice 3/5).
-- Drop order across mixed arena + free-standing owned values at one scope exit (likely:
-  inner arenas freed first, then per-binding drops in reverse declaration order).
-- `chunks` element type: `array<slice<T>>` (views into one buffer) vs `array<array<T>>`
-  (owned). Views are cheaper and fit the region model — leaning views.
-- Whether owned dynamic `array<T>` and fixed `Array(Scalar, N)` share one `Ty` variant or
-  stay distinct (affects ABI; `05-backend-llvm.md` §2 SoA interacts).
-- Nested-owning-element drop (an `array<string>`): element-wise free — v1 keeps elements
-  flat/scalar and defers this.
+- Materializing terminals choose their sizing strategy per operation; this is an implementation
+  choice, not a source-level semantic distinction.
+- Arena ends and per-binding drops are explicit in MIR; owned bindings drop in reverse lexical
+  order and task/arena cleanup is emitted on early exits.
+- `chunks` uses borrowed `slice<T>` elements in an owned outer collection.
+- Fixed arrays and owned dynamic arrays remain distinct types/layouts.
+- Deep element drop is implemented for producer-owned `array<string>`. It does not imply that every
+  container position accepts a Move element: struct fields, sum-type payloads, and element indexing
+  retain their documented ownership restrictions.

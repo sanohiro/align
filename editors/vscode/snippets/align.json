@@ -131,13 +131,18 @@
   },
   "Array partition": {
     "prefix": "partition",
-    "body": "partition(.${1:field})",
-    "description": "Array partition"
+    "body": "partition(${1:predicate})",
+    "description": "Partition scalar elements with a predicate"
   },
   "Array group_by": {
     "prefix": "group_by",
-    "body": "group_by(.${1:field})",
-    "description": "Array group_by"
+    "body": "group_by(.${1:key}).sum(.${2:value})",
+    "description": "Group by a field and aggregate (group_by cannot stand alone)"
+  },
+  "Array grouped aggregates": {
+    "prefix": "agg",
+    "body": "group_by(.${1:key}).agg(sum(.${2:value}), max(.${3:value}), count())",
+    "description": "Group by a field and compute multiple aggregates in one pass"
   },
   "Array sort": {
     "prefix": "sort",
@@ -146,8 +151,8 @@
   },
   "Array sort_by_key": {
     "prefix": "sort_by_key",
-    "body": "sort_by_key(.${1:field})",
-    "description": "Array sort by key"
+    "body": "sort_by_key(${1:key_func})",
+    "description": "Sort primitive elements by a key function"
   },
   "Array chunks": {
     "prefix": "chunks",
@@ -163,6 +168,16 @@
     "prefix": "map_into",
     "body": "map_into(${1:destination})",
     "description": "Write a length-preserving pipeline into caller storage"
+  },
+  "Array to_soa": {
+    "prefix": "to_soa",
+    "body": "to_soa()",
+    "description": "Transpose an array of structs into arena-backed column storage"
+  },
+  "Array dict_encode": {
+    "prefix": "dict_encode",
+    "body": "dict_encode(.${1:key})",
+    "description": "Dictionary-encode a string key for repeated group_by operations"
   },
   "Array zip": {
     "prefix": "zip",
@@ -191,17 +206,56 @@
   },
   "Array any": {
     "prefix": "any",
-    "body": "any()",
-    "description": "Array any reduction"
+    "body": "any(${1:predicate})",
+    "description": "Test whether a predicate holds for any element"
   },
   "Array all": {
     "prefix": "all",
-    "body": "all()",
-    "description": "Array all reduction"
+    "body": "all(${1:predicate})",
+    "description": "Test whether a predicate holds for all elements"
   },
   "Array dot": {
     "prefix": "dot",
     "body": "dot(${1:other_array})",
     "description": "Array dot product reduction"
+  },
+  "Array builder": {
+    "prefix": "array_builder",
+    "body": [
+      "mut ${1:builder}: array_builder<${2:i64}> := array_builder()",
+      "${1:builder}.push(${3:value})",
+      "${4:values} := ${1:builder}.build()"
+    ],
+    "description": "Grow and freeze an owned array"
+  },
+  "Compile regex": {
+    "prefix": "regex.compile",
+    "body": "${1:re} := regex.compile(\"${2:pattern}\")?",
+    "description": "Compile a std.regex pattern into an owned regex handle"
+  },
+  "Test regex match": {
+    "prefix": "regex.is_match",
+    "body": "${1:re}.is_match(${2:text})",
+    "description": "Test whether a compiled regex matches text"
+  },
+  "Find regex match": {
+    "prefix": "regex.find",
+    "body": [
+      "match ${1:re}.find(${2:text}) {",
+      "\tSome(${3:m}) => $0,",
+      "\tNone => ${4:()},",
+      "}"
+    ],
+    "description": "Find the first regex match as half-open UTF-8 byte offsets"
+  },
+  "Find regex match at offset": {
+    "prefix": "regex.find_at",
+    "body": [
+      "match ${1:re}.find_at(${2:text}, ${3:start}) {",
+      "\tSome(${4:m}) => $0,",
+      "\tNone => ${5:()},",
+      "}"
+    ],
+    "description": "Find a regex match at or after a validated UTF-8 byte offset"
   }
 }

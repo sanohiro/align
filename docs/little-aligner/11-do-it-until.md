@@ -96,14 +96,53 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 ---
 
+**Q12.** Sort these without syntax:
+
+- double every element of an array
+- read blocks until EOF
+- visit every branch of a tree
+- total sales per region
+
+**A12.** Pipeline; `loop`; recursion; `group_by`. Name the shape before choosing the tool.
+
+---
+
+**Q13.** This code counts from zero to `xs.len()` and adds `xs[i]`. Rewrite the thought.
+
+**A13.** `xs.sum()`. If the loop's state is only an index and an accumulator, a reducer was probably waiting underneath it.
+
+---
+
+**Q14.** Now we repeatedly call `step(state)` until `state.done` becomes true. Pipeline?
+
+**A14.** No known collection is flowing. The next state decides whether another round exists. Use `loop`, keep `state` in a `mut` binding, and `break` with the final value.
+
+---
+
+**Q15.** A loop reads blocks. For every block, every byte must be transformed. One tool or two?
+
+**A15.** Two shapes, nested honestly: `loop` owns “until EOF”; a pipeline over the block owns “for each byte.” Control on the outside, data flow on the inside.
+
+---
+
+**Q16.** The inner pipeline fails on one byte and uses `?`. Which boundary does it leave?
+
+**A16.** The function, not merely the pipeline or loop. `?` keeps its one meaning everywhere. If the caller should receive the failure, that is exactly the right door.
+
+---
+
+**Q17.** A directory contains subdirectories, each containing more directories. Should a `loop` hold a manual stack?
+
+**A17.** It can, but first recognize the recursive data shape. A recursive helper often says the structure more directly. Choose an explicit stack only when depth, memory bounds, or traversal order require that machinery.
+
+---
+
 > **The Eleventh Commandment**
 >
 > *Pipelines for the many, `loop` for the until, recursion for the nested. And before you loop at all — ask if it wasn't a pipeline.*
 
 ---
 
-**Q12.** Is that the end?
+**Q18.** Is that the end?
 
-**A12.** Of the drills, yes. Of Align — [the guide](../guide/README.md) has the rest: strings, JSON, parallelism, SIMD, the standard library. But you no longer read Align like a foreign language. You read it like a menu.
-
-*Go cook something.*
+**A18.** Of the control-path drills. Next we give independent work to many hands, then look down at four hardware lanes and ten gigabytes as one flat flow. After that, one last chapter will make us read the whole story at once.

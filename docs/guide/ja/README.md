@@ -26,7 +26,7 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 ## 第 III 部 —— 標準ライブラリと境界
 
 - [13 — std: ファイル、I/O、そして OS 境界](13-std-os.md)
-- [14 — std: encoding、rand、cli](14-std-encoding-rand-cli.md)
+- [14 — std: encoding、regex、rand、cli](14-std-encoding-rand-cli.md)
 - [15 — 境界: unsafe と C FFI](15-unsafe-and-ffi.md)
 - [16 — ツールチェーン: alignc、フォーマッタ、lint](16-toolchain.md)
 - [17 — Align の流儀](17-the-align-way.md)
@@ -38,3 +38,7 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 - [20 — Arena の先へ: プールとライフタイム](20-beyond-arenas.md)
 - [21 — ステートマシン](21-state-machines.md)
 - [22 — システムの構築: ECS](22-building-a-system.md)
+
+## 第 V 部 —— パッケージ
+
+- [23 — パッケージ: vendoring、pkg.web、pkg.jwt](23-packages.md)

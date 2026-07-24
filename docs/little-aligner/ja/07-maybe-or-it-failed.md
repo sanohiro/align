@@ -65,7 +65,7 @@ fn load(path: str) -> Result<i64, Error> {
 fs.write_file("log.txt", "hi")
 ```
 
-**A9.** コンパイラはノーと言います — *未処理の Result*、これはハードエラーです。ちゃんと処理してください(`?`、`match`、あるいは変数に束縛して後で決める)。Align では失敗してもよいのですが、失敗を *黙って握りつぶす* ことは許されません。
+**A9.** コンパイラはノーと言います — *未処理の Result*、これはハードエラーです。ちゃんと処理してください(`?`、`match`、`else`、あるいは変数に束縛して後で決める)。Align では失敗してもよいのですが、失敗を *黙って握りつぶす* ことは許されません。
 
 ---
 
@@ -89,7 +89,73 @@ v := inner(n).map_err(to_error)?
 
 **Q12.** `Result` に `else` を — 使えますか？
 
-**A12.** いいえ。`else` は Option のためのものです。`Result` は理由を運び、その理由はちゃんと確認すべきだからです — `match` するか、`?` で先へ渡してください。(それでも代替値が欲しいですか? なら `match` で正直に2行、そう書いてください。)
+**A12.** はい。`value := result else fallback` と書けます。これは `Err` のペイロードを捨て、代替値を使うことを明示します。理由が本当に不要な場合だけ使い、理由を確認するなら `match`、失敗を先へ渡すなら `?` を使ってください。
+
+---
+
+**Q13.** `safe_head` を3回呼びます。
+
+```align
+a := safe_head([7, 8]) else 0
+b := safe_head([]) else 0
+c := safe_head([]) else -1
+```
+
+それぞれは？
+
+**A13.** `a` は `7`、`b` は `0`、`c` は `-1`。producer は absence だけを報告し、caller がそれぞれの意味を与えました。
+
+---
+
+**Q14.** 任意の nickname がないことと、必須の入力 file がないこと。同じ型？
+
+**A14.** いいえ。nickname は `Option<str>`。なくても普通です。必須 file は `Result<string, Error>`。理由が必要になりうる失敗です。
+
+---
+
+**Q15.** happy path を追ってください。
+
+```align
+fn load_score(path: str) -> Result<i64, Error> {
+    text := fs.read_file(path)?
+    score := parse_score(text).map_err(to_error)?
+    return Ok(score)
+}
+```
+
+**A15.** `read_file` が `Ok(text)`、`parse_score` が `Ok(score)` を返し、関数がその score を `Ok` に入れて caller へ返します。
+
+---
+
+**Q16.** file がありません。`parse_score` は動きますか？
+
+**A16.** いいえ。最初の `?` が file の `Err` をただちに `load_score` から返します。後ろの仕事は途中まで行われるのではなく、始まりません。
+
+---
+
+**Q17.** file はあるが text が不正です。どの error が外へ出ますか？
+
+**A17.** `parse_score` の error が `map_err(to_error)` で明示的に `Error` へ変換され、2つ目の `?` が上へ渡します。
+
+---
+
+**Q18.** 不正な score は0にするが、file がないことは失敗のままにしたい。`else 0` はどこ？
+
+**A18.**
+
+```align
+text := fs.read_file(path)?
+score := parse_score(text) else 0
+return Ok(score)
+```
+
+policy は、それが変える境界に置きます。file error は物語を保ち、parse error だけを意図的に捨てます。
+
+---
+
+**Q19.** `fs.read_file(path) else ""` にもしないのはなぜ？
+
+**A19.** 「読めない file は空の入力」というのが本当に application の policy なら、そうしてもかまいません。`else` は短い `?` ではなく、別の問いへの答えです。文字数ではなく意味で選びます。
 
 ---
 

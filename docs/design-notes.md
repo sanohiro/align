@@ -347,9 +347,9 @@ mask
 These should lower naturally to vectorized code. The point is *structural*: contiguous arrays mean a
 pipeline walks memory sequentially (no random jumps), and safe primitive conditional reductions can
 lower to a mask + `select` — so the predictable shape, not hand-tuning, is what keeps hot loops
-vectorizable. A callable after `where` **must be guarded** unless it is separately proven safe on an
-inactive lane; the current reducing lowering does not yet do this. Pure alone is insufficient because
-a Pure function may trap (audit: `impl/12` §3.1).
+vectorizable. A callable after `where` **is control-flow guarded** unless it is separately proven safe
+on an inactive lane; safe field operations and builtin reducers retain the mask/identity-select
+shape. Pure alone is insufficient because a Pure function may trap (audit: `impl/12` §3.1).
 
 **Branchless is for vectorization, not because branches are slow (recorded 2026-07-04, external
 design-note review adoption).** Modern branch predictors (TAGE-class) make well-predicted branches

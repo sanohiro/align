@@ -69,7 +69,7 @@ fn main() -> i32 {
 }
 ```
 
-Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional: scalars or plain-data structs. (Owning payloads like `string` are rejected today; `Option`/`Result` cover the common cases.)
+Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional. They may be scalars, borrowed `str` views, plain-data structs, or supported owned arrays; an owned-array payload makes the whole sum value a Move value whose live arm is dropped by tag. A bare owned `string` payload is still rejected today, as are the remaining shapes whose discarded arm cannot yet be deep-dropped.
 
 ## `match`
 
@@ -116,7 +116,7 @@ Construct with `(a, b)`, destructure with `(q, r) :=`, or index positionally: `t
 
 ## The built-in `Error`
 
-One sum type ships with the language: `Error`, the standard error payload of `Result<T, Error>`. Its variants are the categories the OS boundary needs — `NotFound`, `Invalid`, `Denied`, and `Code(i64)` for everything else. You cannot redeclare `Error`; you can match on it like any sum type:
+One sum type ships with the language: `Error`, the standard error payload of `Result<T, Error>`. Its variants are the categories the OS boundary needs — `NotFound`, `Invalid`, `Denied`, and `Code(i32)` for everything else. You cannot redeclare `Error`; you can match on it like any sum type:
 
 ```align
 fn describe(e: Error) -> i64 = match e {

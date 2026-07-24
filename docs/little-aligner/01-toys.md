@@ -134,6 +134,90 @@ fn main() -> i32 {
 
 ---
 
+**Q19.** May a smaller block introduce a second `x` over an existing `x`?
+
+```align
+x := 1
+{
+    x := 2
+    print(x)
+}
+```
+
+**A19.** No. Align does not shadow names. Call the second thing what it is — `double`, `next`, `inner` — so that every `x` in sight means the same `x`.
+
+---
+
+**Q20.** Why forbid a convenience that many languages allow?
+
+**A20.** Because reading should not require a search for the nearest declaration. A new binding gets a new name; a changing binding says `mut`. The source then answers both questions — *which value?* and *may it change?* — at the place you read it.
+
+---
+
+**Q21.** Do this one without running it:
+
+```align
+x := 4
+y := if x % 2 == 0 { x / 2 } else { x * 3 + 1 }
+print(y)
+```
+
+**A21.** `2`. The condition chooses an expression; the chosen expression becomes `y`.
+
+---
+
+**Q22.** Change only `x := 4` to `x := 5`. Now?
+
+**A22.** `16`. Same program shape, other arm. Tiny changes are where reading becomes a habit.
+
+---
+
+**Q23.** Give that choice a name we can use twice.
+
+**A23.**
+
+```align
+fn step(x: i64) -> i64 =
+    if x % 2 == 0 { x / 2 } else { x * 3 + 1 }
+```
+
+Then `step(4)` is `2`, and `step(5)` is `16`. A function is a named transformation, not a place to hide state.
+
+---
+
+**Q24.** What is `step(step(5))`?
+
+**A24.** `8`: first `16`, then half of `16`. Read from the inside out when calls nest.
+
+---
+
+**Q25.** Which line is the first error?
+
+```align
+x := 3
+x = 4
+y := [10, 20][2]
+```
+
+**A25.** `x = 4`. The missing `mut` is caught before the out-of-bounds access can ever run. Read compile-time promises before runtime behavior.
+
+---
+
+**Q26.** Repair it so that it compiles and prints `20`, changing as little as possible.
+
+**A26.**
+
+```align
+mut x := 3
+x = 4
+y := [10, 20][1]
+print(y)
+```
+
+Announce the changeable name; ask for an index that exists.
+
+---
+
 > **The First Commandment**
 >
 > *Bind with `:=`. Reassign with `=`, and only what is `mut`.*

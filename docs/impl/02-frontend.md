@@ -13,7 +13,8 @@ Separators              , (fields, args, variants). Since newlines are meaningle
 Normalization           the official formatter converges to a single normal form (One Way)
 ```
 
-This document is a **draft**. Open items are collected under "Open items" at the end of the document; in the body they are flagged with `// OPEN:`.
+This document records the implemented frontend model. Inline `// OPEN:` notes are narrow syntax or
+tooling refinements; §11 summarizes the current boundaries.
 
 ---
 
@@ -137,7 +138,7 @@ vis         = "pub"
 
 **Import resolution (slice A — `open-questions.md` module system).** `module_decl`/`import_decl` are parsed into `File.module`/`File.imports`. sema's `collect_imports` validates each import against `BUILTIN_MODULES` (the `core.*`/`std.*` table from `draft.md` §18; unknown → error, duplicate → error) and threads the imported set into every per-function `Checker`. At a prefix-accessed builtin dispatch (`json.encode`/`json.decode` → `core.json`, `fs.read_file` → `std.fs`, `io.stdout.write` → `std.io`), `require_import` errors if the module is not imported (checked once per *source* function — skipped for monomorph instances). The language-syntactic core (the array pipeline, `Option`/`Result`, `arena`, numeric methods, `template`) is dispatched by method/keyword and needs no import.
 
-**Multi-file user modules (slice B1 — DONE).** The driver (`align_driver::check`) resolves user-module imports (any import not under `core`/`std`) by **filename convention**: `import geom` → `geom.align` in the entry file's directory, loaded transitively (BFS, dedup, cycle-safe), each verified to declare `module geom`. sema's `check_file` is now a one-module wrapper over `check_program(&[Module])`, which checks all modules together: functions are **per-module mangled** (`module$fn`; the entry module is unmangled, so single-file output is byte-identical and two modules may share a name), a bare call resolves in the caller's module (`resolve_local_fn`), and `mod.fn(...)` resolves cross-module with `pub` visibility (`resolve_qualified_fn`). **Nested paths (B2 — DONE):** `import util.math` → `util/math.align` (declaring `module util.math`); the driver joins import segments into a directory path, and sema's `flatten_module_path` collapses the dotted call receiver (`util.math.fn`) to resolve it. **Cross-module type export (DONE):** types are **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry unmangled), recorded in a `type_table` (module → bare → canonical + `pub`). `pub` exports a struct/enum; an importer names it qualified (`geom.Point`); a bare type resolves in the current module (`canonical_type_name`), so an imported type must be qualified. `StructLit.name` is a `Path` (the parser detects a dotted `Path { ident :`). Deferred: qualified variant construction (`geom.Color.Red`), cross-module field/payload types, the unused-import lint.
+**Multi-file user modules (slice B1 — DONE).** The driver (`align_driver::check`) resolves user-module imports (any import not under `core`/`std`) by **filename convention**: `import geom` → `geom.align` in the entry file's directory, loaded transitively (BFS, dedup, cycle-safe), each verified to declare `module geom`. sema's `check_file` is now a one-module wrapper over `check_program(&[Module])`, which checks all modules together: functions are **per-module mangled** (`module$fn`; the entry module is unmangled, so single-file output is byte-identical and two modules may share a name), a bare call resolves in the caller's module (`resolve_local_fn`), and `mod.fn(...)` resolves cross-module with `pub` visibility (`resolve_qualified_fn`). **Nested paths (B2 — DONE):** `import util.math` → `util/math.align` (declaring `module util.math`); the driver joins import segments into a directory path, and sema's `flatten_module_path` collapses the dotted call receiver (`util.math.fn`) to resolve it. **Cross-module type export (DONE):** types are **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry unmangled), recorded in a `type_table` (module → bare → canonical + `pub`). `pub` exports a struct/enum; an importer names it qualified (`geom.Point`); a bare type resolves in the current module (`canonical_type_name`), so an imported type must be qualified. `StructLit.name` is a `Path` (the parser detects a dotted `Path { ident :`). **Completed follow-ons:** qualified imported variant construction (`geom.Color.Red` / `geom.Color.Code(40)`), imported `pub` types in struct fields and enum payloads, and the unused-import warning are all shipped and test-pinned.
 
 **Qualified cross-module function values (DONE 2026-07-15).** `mod.fn` / `a.b.fn` may be used wherever a named function is accepted, not only called directly: every pipeline/reducer callable and a normal binding (`f := util.dbl`) resolves to the imported `pub` function's mangled target. `NamedFnRef` retains the optional dotted module prefix; checked resolution reuses the direct-call import/visibility contract, while quiet signature peeks constrain literal element and fold-accumulator types without duplicate diagnostics. A local that shadows the leftmost module segment remains a value receiver. Whole-program and per-unit paths share this sema code, including imported effect summaries at `par_map`.
 
@@ -421,10 +422,9 @@ body := html "<p>{name}</p>"
 ## 7. Patterns (match)
 
 ```ebnf
-pattern   = "_"                           // wildcard
-          | literal
-          | ident                         // binding
-          | path ( "(" pattern ("," pattern)* ")" )?   // variant destructuring
+pattern   = "_"                                      // wildcard
+          | ident ( "(" ident ("," ident)* ")" )?    // variant + positional payload bindings
+          | ident ("|" ident)+                       // bare-variant or-pattern; binds no payload
 ```
 ```align
 match shape {
@@ -432,7 +432,9 @@ match shape {
   Rect(w, h)    => w * h,
 }
 ```
-`// OPEN:` guards (`if`), multiple patterns via `|`, and exhaustiveness-checking details.
+Bare-variant or-patterns (`A | B`) are implemented and participate in exhaustiveness checking.
+They bind no payload; write separate arms when payload names are needed. Match guards remain
+outside the current grammar.
 
 ---
 
@@ -537,7 +539,8 @@ forms; `Stmt` includes `break`. Generic actual arguments at expression position 
 
 ```text
 - Sum variants use the one positional payload model; structs carry named fields.
-- match is exhaustive; guards and `|` pattern alternatives are not part of the current surface.
+- match is exhaustive; `A | B` or-pattern alternatives are implemented and bind nothing. Guards
+  and recursive/nested patterns are not part of the current surface.
 - There are no expression-position generic arguments (no turbofish); context/annotations infer them.
 - Lambda parameter types are inferred at a typed use site and written when a lambda is a value.
 - Plain `template` holes contain full expressions. html/raw/JSON-template variants remain deferred.

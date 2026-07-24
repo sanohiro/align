@@ -1,6 +1,13 @@
 # Open Questions
 
-Design questions are managed in three groups: "Settled", "Open", and "Out of v1 scope". Settled items keep their decision and record location (to prevent reopening).
+Design questions are managed in three groups: "Settled", "Open", and "Out of v1 scope". Settled
+items keep their decision and record location (to prevent reopening).
+
+This file is also chronological evidence: an older paragraph may describe a limitation that a later
+`UPDATE`, `DONE`, or `SHIPPED` paragraph in the same item closes. Read the latest status in an item
+as current; do not lift an earlier implementation plan into the language specification. For the
+current callable surface use `draft.md` / `language-spec.md`; for current subsystem contracts use
+`impl/core-design/` and `impl/std-design/`.
 
 ---
 
