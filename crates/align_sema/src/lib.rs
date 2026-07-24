@@ -4642,6 +4642,16 @@ impl EffectScan<'_> {
                 self.expr(req);
                 self.expr(data);
             }
+            // `r.timeout(ns)` / `cl.timeout(ns)` store a field on the handle — no I/O (the deadline is
+            // applied at perform time), so like `HttpHeader`/`HttpBody` they are Pure; just recurse.
+            ExprKind::HttpRequestTimeout { req, ns } => {
+                self.expr(req);
+                self.expr(ns);
+            }
+            ExprKind::HttpClientTimeout { client, ns } => {
+                self.expr(client);
+                self.expr(ns);
+            }
             ExprKind::HttpParse { data } => self.expr(data),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp),
             ExprKind::HttpRespHeader { resp, name } => {
@@ -6171,6 +6181,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpRequest { .. }
             | ExprKind::HttpHeader { .. }
             | ExprKind::HttpBody { .. }
+            | ExprKind::HttpRequestTimeout { .. }
+            | ExprKind::HttpClientTimeout { .. }
             | ExprKind::HttpParse { .. }
             | ExprKind::HttpRespStatus { .. }
             | ExprKind::HttpClient
@@ -6476,6 +6488,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpRequest { .. }
             | ExprKind::HttpHeader { .. }
             | ExprKind::HttpBody { .. }
+            | ExprKind::HttpRequestTimeout { .. }
+            | ExprKind::HttpClientTimeout { .. }
             | ExprKind::HttpParse { .. }
             | ExprKind::HttpRespStatus { .. }
             | ExprKind::HttpRespHeader { .. }
@@ -7303,6 +7317,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(req, depth);
                 self.walk(data, depth);
             }
+            // `r.timeout`/`cl.timeout` borrow the handle in place (no escape) and take a Copy `i64` —
+            // just recurse to check an escape *inside* the operands (like `HttpBody`/`CommandTimeout`).
+            ExprKind::HttpRequestTimeout { req, ns } => {
+                self.walk(req, depth);
+                self.walk(ns, depth);
+            }
+            ExprKind::HttpClientTimeout { client, ns } => {
+                self.walk(client, depth);
+                self.walk(ns, depth);
+            }
             ExprKind::HttpParse { data } => self.walk(data, depth),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.walk(resp, depth),
             ExprKind::HttpRespHeader { resp, name } => {
@@ -7979,6 +8003,14 @@ impl UnnecessaryHeapScan {
             ExprKind::HttpBody { req, data } => {
                 self.visit(req);
                 self.visit(data);
+            }
+            ExprKind::HttpRequestTimeout { req, ns } => {
+                self.visit(req);
+                self.visit(ns);
+            }
+            ExprKind::HttpClientTimeout { client, ns } => {
+                self.visit(client);
+                self.visit(ns);
             }
             ExprKind::HttpParse { data } => self.visit(data),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.visit(resp),
@@ -8809,6 +8841,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CliCommand { .. } | ExprKind::CliFlag { .. } | ExprKind::CliParse { .. }
             | ExprKind::CliGetBool { .. } | ExprKind::CliGetI64 { .. } | ExprKind::CliUsage { .. }
             | ExprKind::HttpRequest { .. } | ExprKind::HttpHeader { .. } | ExprKind::HttpBody { .. }
+            | ExprKind::HttpRequestTimeout { .. } | ExprKind::HttpClientTimeout { .. }
             | ExprKind::HttpParse { .. } | ExprKind::HttpRespStatus { .. } | ExprKind::HttpClient
             | ExprKind::HttpClientGet { .. } | ExprKind::HttpClientPost { .. } | ExprKind::HttpClientRequest { .. }
             | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
@@ -9885,6 +9918,16 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpBody { req, data } => {
                 self.expr(req, moved, false, false);
                 self.expr(data, moved, false, false);
+            }
+            // `r.timeout`/`cl.timeout` BORROW the handle (in-place field set, never consumed — like
+            // `r.body`/`c.timeout_ns`); every operand is a read (no move).
+            ExprKind::HttpRequestTimeout { req, ns } => {
+                self.expr(req, moved, false, false);
+                self.expr(ns, moved, false, false);
+            }
+            ExprKind::HttpClientTimeout { client, ns } => {
+                self.expr(client, moved, false, false);
+                self.expr(ns, moved, false, false);
             }
             ExprKind::HttpParse { data } => self.expr(data, moved, false, false),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp, moved, false, false),
@@ -14054,8 +14097,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_run_output_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
-            // `r.body(data)` mutate the builder in place. Type-guarded, same as the cli methods above.
-            "header" | "body" if recv_ty == Ty::HttpRequest => {
+            // `r.body(data)` mutate the builder in place; `r.timeout(ns)` sets a per-request I/O
+            // deadline. Type-guarded, same as the cli methods above.
+            "header" | "body" | "timeout" if recv_ty == Ty::HttpRequest => {
                 self.check_http_request_method(recv_expr, method, args, span)
             }
             // `std.http` response getters on an `http response`: `resp.status()` / `resp.header(name)`
@@ -14066,7 +14110,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.http` (Slice 2) client requests on an `http client`: `cl.get(url)` /
             // `cl.post(url, body)` / `cl.request(req)` each yield `Result<response, Error>`. Impure
             // (network). Type-guarded, same as the response getters above.
-            "get" | "post" | "request" | "get_many" if recv_ty == Ty::HttpClient => {
+            "get" | "post" | "request" | "get_many" | "timeout" if recv_ty == Ty::HttpClient => {
                 self.check_http_client_method(recv_expr, method, args, span)
             }
             // (`srv.accept()` on an `http_server` is dispatched by the early `method == "accept"`
@@ -19535,10 +19579,44 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::HttpRequest { method: Box::new(method), url: Box::new(url) }, ty: Ty::HttpRequest, span }
     }
 
-    /// `r.header(name, value)` / `r.body(data)` on an `http request` ([`Ty::HttpRequest`]), the
-    /// receiver already evaluated. The receiver must be a **bound local** (the v1 Move-temporary gate,
-    /// `check_cli_command_method` precedent); both methods mutate the builder in place (no `mut`
-    /// needed) and yield `()`. A CR/LF/NUL in a header name/value aborts at runtime (P6).
+    /// Type-check the single `i64` nanosecond argument of `cl.timeout(ns)` / `r.timeout(ns)` (the
+    /// http.md "I/O timeouts" setters), mirroring `c.timeout_ns(ns)`: require *exactly* `i64` (binding
+    /// a bare int literal's inference var — a narrower operand would mismatch the runtime setter's
+    /// `i64`). Returns the checked `ns` expr, or `None` after emitting a diagnostic (wrong arity /
+    /// non-i64 / an errored operand). `ns == 0` and a negative `ns` are validated at runtime (the
+    /// `command.timeout_ns` abort class).
+    fn check_http_timeout_arg(&mut self, args: &[ast::Expr], span: Span) -> Option<Expr> {
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'.timeout()' takes 1 argument (the timeout in nanoseconds, i64), got {}", args.len()),
+                span,
+            );
+            return None;
+        }
+        let ns = self.check_expr(&args[0], None);
+        if ns.ty == Ty::Error {
+            return None;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(ns.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(ns.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(
+                    format!("'.timeout()' expects a timeout in nanoseconds (i64), got {}", ty_name(other)),
+                    args[0].span,
+                );
+                return None;
+            }
+        }
+        Some(ns)
+    }
+
+    /// `r.header(name, value)` / `r.body(data)` / `r.timeout(ns)` on an `http request`
+    /// ([`Ty::HttpRequest`]), the receiver already evaluated. The receiver must be a **bound local**
+    /// (the v1 Move-temporary gate, `check_cli_command_method` precedent); all mutate the builder in
+    /// place (no `mut` needed) and yield `()`. A CR/LF/NUL in a header name/value aborts at runtime
+    /// (P6); a negative `timeout` aborts at runtime.
     fn check_http_request_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -19574,8 +19652,12 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::HttpBody { req: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
             }
+            "timeout" => {
+                let Some(ns) = self.check_http_timeout_arg(args, span) else { return err };
+                Expr { kind: ExprKind::HttpRequestTimeout { req: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request (try header / body)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request (try header / body / timeout)"), span);
                 err
             }
         }
@@ -19774,8 +19856,12 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "timeout" => {
+                let Some(ns) = self.check_http_timeout_arg(args, span) else { return err };
+                Expr { kind: ExprKind::HttpClientTimeout { client: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many / timeout)"), span);
                 err
             }
         }
@@ -22001,6 +22087,14 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpBody { req, data } => {
                 self.finalize_expr(req);
                 self.finalize_expr(data);
+            }
+            ExprKind::HttpRequestTimeout { req, ns } => {
+                self.finalize_expr(req);
+                self.finalize_expr(ns);
+            }
+            ExprKind::HttpClientTimeout { client, ns } => {
+                self.finalize_expr(client);
+                self.finalize_expr(ns);
             }
             ExprKind::HttpParse { data } => self.finalize_expr(data),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.finalize_expr(resp),

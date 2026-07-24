@@ -2231,6 +2231,12 @@ fn build_module<'c>(
         "http_body".to_string(),
         module.add_function("align_rt_http_body", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
     );
+    // `http_timeout(r, ns: i64)` sets the request's per-request I/O timeout in place (void; aborts on a
+    // negative ns). `http_client_timeout(c, ns: i64)` sets the client's default I/O timeout in place.
+    funcs.insert(
+        "http_timeout".to_string(),
+        module.add_function("align_rt_http_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
     funcs.insert(
         "http_parse".to_string(),
         module.add_function("align_rt_http_parse", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
@@ -2262,6 +2268,10 @@ fn build_module<'c>(
     funcs.insert(
         "http_client_new".to_string(),
         module.add_function("align_rt_http_client_new", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        "http_client_timeout".to_string(),
+        module.add_function("align_rt_http_client_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
     funcs.insert(
         "http_client_get".to_string(),
@@ -7698,6 +7708,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
                     .build_call(self.funcs["http_body"], &[r.into(), dp.into(), dl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `r.timeout(ns)` — set the request handle's per-request I/O timeout in place; no value.
+            Rvalue::HttpRequestTimeout { req, ns } => {
+                let r = self.operand(req)?.into_pointer_value();
+                let n = self.operand(ns)?;
+                self.builder
+                    .build_call(self.funcs["http_timeout"], &[r.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `cl.timeout(ns)` — set the client handle's default I/O timeout in place; no value.
+            Rvalue::HttpClientTimeout { client, ns } => {
+                let c = self.operand(client)?.into_pointer_value();
+                let n = self.operand(ns)?;
+                self.builder
+                    .build_call(self.funcs["http_client_timeout"], &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }

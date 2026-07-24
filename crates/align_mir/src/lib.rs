@@ -982,6 +982,14 @@ pub enum Rvalue {
     /// `r.body(data)` — copy the byte view `data` (`{ptr,len}`) into the request handle `req`'s body.
     /// No value. Pure.
     HttpBody { req: Operand, data: Operand },
+    /// `r.timeout(ns)` — set the request handle `req`'s per-request I/O timeout (`ns` an `i64`
+    /// nanosecond count), in place. No value. `ns == 0` = inherit the client default; a negative `ns`
+    /// aborts at runtime. Pure (a field store; the deadline is applied at perform time).
+    HttpRequestTimeout { req: Operand, ns: Operand },
+    /// `cl.timeout(ns)` — set the client handle `client`'s default I/O timeout (`ns` an `i64`
+    /// nanosecond count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at
+    /// runtime. Pure (a field store; applied per request at perform time).
+    HttpClientTimeout { client: Operand, ns: Operand },
     /// `process.command(cmd, args)` (`std.process` Slice 4) — allocate a `command` builder handle
     /// (opaque pointer), returned by value (the bound local `Drop`-frees it via `command_free`).
     /// `cmd`/`args` are `{ptr,len}` str views (the argv is marshalled to C strings by the runtime; a
@@ -3411,6 +3419,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::HttpRequest { .. }
         | hir::ExprKind::HttpHeader { .. }
         | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpRequestTimeout { .. }
+        | hir::ExprKind::HttpClientTimeout { .. }
         | hir::ExprKind::HttpParse { .. }
         | hir::ExprKind::HttpRespStatus { .. }
         | hir::ExprKind::HttpRespHeader { .. }
@@ -9162,6 +9172,22 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let d = lower_expr(b, data);
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpBody { req: rq, data: d }));
+            Operand::Const(Const::Unit)
+        }
+        // `r.timeout(ns)` → set the request handle's per-request I/O timeout in place; no value.
+        hir::ExprKind::HttpRequestTimeout { req, ns } => {
+            let rq = lower_expr(b, req);
+            let n = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpRequestTimeout { req: rq, ns: n }));
+            Operand::Const(Const::Unit)
+        }
+        // `cl.timeout(ns)` → set the client handle's default I/O timeout in place; no value.
+        hir::ExprKind::HttpClientTimeout { client, ns } => {
+            let cl = lower_expr(b, client);
+            let n = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpClientTimeout { client: cl, ns: n }));
             Operand::Const(Const::Unit)
         }
         // `http.parse(data)` → `Result<response, Error>` (out-slot + i32 status; see below).

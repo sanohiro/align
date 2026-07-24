@@ -890,11 +890,12 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
   ships the pool's idle-expiry and the SIGPIPE-safe/stale-retry robustness, and **defers I/O timeouts
   to the net-rail non-blocking/deadline substrate** (unchanged from a semantics standpoint), rather
   than bolting in a half-measure. Recorded here as the standing v1 limitation.
-  - **→ RESOLVED BY DESIGN 2026-07-24 (align-llm Request 2). See "I/O timeouts" below.** align-llm
-    (LLM API calls to endpoints that can black-hole a connection) supplies the concrete client demand
-    and the missing configuration surface. The design lands the net-rail non-blocking-`connect`
-    substrate + `SO_RCVTIMEO`/`SO_SNDTIMEO` and a per-client-default / per-request-override
-    `timeout(ns)` — the two things this note said were missing. Not yet implemented.
+  - **→ RESOLVED (align-llm Request 2). See "I/O timeouts" below.** align-llm (LLM API calls to
+    endpoints that can black-hole a connection) supplied the concrete client demand and the missing
+    configuration surface. The net-rail non-blocking-`connect` substrate + `SO_RCVTIMEO`/`SO_SNDTIMEO`
+    and a per-client-default / per-request-override `timeout(ns)` — the two things this note said were
+    missing — are **IMPLEMENTED** (the G3-1 deferral is fully resolved on the client). The
+    server-side escalation above remains its own post-v1 hardening item.
   - **Sub-case — HEAD / 304 framing (inherited from Slice 1/2).** A `HEAD` response, or a `304 Not
     Modified`, legitimately carries a `Content-Length` header **but no body**. The v1 read loop frames
     purely by `Content-Length` (it does not special-case the request method or status), so it would
@@ -908,7 +909,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
   `Error.Invalid`. (The message-less `Error` enum is still a broader story, but the specific DC-1
   "HTTPS not supported" debt is gone — HTTPS *is* supported.)
 
-## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, IMPLEMENTED 2026-07-24)
 
 Resolves the G3-1 deferral above. Motivated by `align-llm`'s LLM API calls (`POST
 /v1/chat/completions`) to endpoints that can hang or black-hole a connection: without a timeout, one
@@ -971,12 +972,50 @@ arg (net.md Slice, shared with `std.net`). A `timeout_ns` field on the client + 
 `align_rt_http_timeout`, and sema `HttpClient`/`HttpRequest` method dispatch for `timeout`. The
 effective-timeout resolution (request override else client default) happens in `http_client_perform`.
 
+### As built (2026-07-24)
+
+- **Language.** New HIR/MIR/codegen variants `HttpRequestTimeout { req, ns }` /
+  `HttpClientTimeout { client, ns }` (`Ty::Unit`, i64 arg, bound-local receiver — the exact
+  `r.body`/`c.timeout_ns` shape), swept through every sema pass (EffectScan — **Pure**, a field store;
+  `region_of`→Static; `slice_is_local`; EscapeCheck walk/visit; MoveCheck — borrow-only, consumes
+  nothing; `borrow_sources`; finalize) and lowered through `lower_http` → `align_rt_http_timeout` /
+  `align_rt_http_client_timeout`. A negative `ns` aborts at the setter; a non-i64 arg is a type error.
+- **Effective timeout.** `http_client_perform` resolves `req.timeout_ns > 0 ? req : client` (the
+  client default is an `AtomicI64` so `get_many`'s shared workers read it safely) and threads it as
+  ONE `ns` into: `http_connect_fd`/`http_tls_connect` (→ `align_rt_tcp_connect(…, ns, …)`) for the
+  connect + handshake, and `http_arm_conn_timeout(fd, ns)` (both `SO_RCVTIMEO` + `SO_SNDTIMEO`) armed
+  on **every** request — fresh AND reused pooled conn — before the exchange. **Re-arm/clear:** because
+  `SO_*TIMEO` persists on a pooled fd, a reused conn is always re-armed, and `ns == 0` **clears** it
+  back to a zero `timeval` = "block forever" (so a conn pooled by a timeout-armed request never carries
+  a stale deadline into a later no-timeout request). A fresh conn with `ns == 0` skips the arm entirely
+  (byte-identical to the pre-timeout path — no `setsockopt`).
+- **Expiry → `AL_TIMEOUT`.** Plaintext `plain_read`/`http_send_all` map a blocking-fd
+  `EAGAIN`/`EWOULDBLOCK` via `io_read_write_status` (a blocking socket yields `EAGAIN` only when a
+  deadline is armed, so with `ns == 0` the mapping is byte-identical). **TLS** is the subtle case: a
+  `SO_*TIMEO` expiry makes the underlying `recv`/`send` return `EAGAIN`, which OpenSSL surfaces as
+  `SSL_ERROR_SYSCALL` **or** `SSL_ERROR_WANT_READ`/`WANT_WRITE` (version-dependent). `tls_read`/
+  `tls_write_all` capture `errno` **before** `SSL_get_error`, and when a deadline is armed
+  (`has_deadline`) key on `err ∈ {SYSCALL, WANT_READ, WANT_WRITE}` **and** `errno ∈
+  {EAGAIN, EWOULDBLOCK}` → `AL_TIMEOUT` (otherwise `WANT_*` retries and `SYSCALL` maps its errno,
+  exactly as before — so `ns == 0` is byte-identical, no spin). The handshake (`SSL_connect`) runs over
+  the same armed fd and maps the identical condition to `AL_TIMEOUT`.
+
 ### Test / gate
 
 A request to an endpoint that **accepts the connection but never responds** returns `Err(Timeout)`
 within the configured bound instead of blocking indefinitely (the Request-2 acceptance gate). A
 connect to a black-holed (never-accepting) address returns `Err(Timeout)` within the bound. `ns == 0`
-preserves the current blocking behavior. A normal fast request is unaffected.
+preserves the current blocking behavior. A normal fast request is unaffected. **Shipped tests:**
+`align_runtime` units — setter store + request-overrides-client, accept-then-no-response → `AL_TIMEOUT`
+(read path, `SO_RCVTIMEO` + plaintext mapping end-to-end), a full-backlog loopback black hole →
+`AL_TIMEOUT` (connect path, Linux), and fast-response-unaffected — plus `crates/align_driver/tests/
+http_timeout.rs` E2E through the Align surface (`cl.timeout` / `r.timeout` → `Err(Error.Timeout)` on a
+silent server, per-request override, inert-when-fast, and the unbound-receiver / non-i64 compile
+gates). The TLS timeout path is covered by the shared `SO_*TIMEO` mechanism and the plaintext E2E (the
+positive TLS round-trip is not drivable from the driver harness — the `#[cfg(test)]` trust hook is
+absent there, as recorded in Slice 5); the `has_deadline` mapping in `tls_read`/`tls_write_all` is the
+one place the TLS transport differs, documented above. Every pre-existing http/TLS/pool/get_many/stream
+test passes unchanged (the effective-0 byte-identical invariant).
 
 ## Pitfalls
 

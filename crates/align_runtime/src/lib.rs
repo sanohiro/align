@@ -13978,6 +13978,10 @@ pub struct HttpRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The per-request I/O timeout in nanoseconds set by [`align_rt_http_timeout`], or `0` for "inherit
+    /// the client default" (http.md "I/O timeouts"). A positive value overrides the client default; the
+    /// effective per-op deadline (connect + send + receive) is resolved in [`http_client_perform`].
+    timeout_ns: i64,
 }
 
 /// The request fields the serializer and client exchange only borrow. Builder-backed requests use
@@ -13989,11 +13993,21 @@ struct HttpRequestView<'a> {
     url: &'a str,
     headers: &'a [(String, String)],
     body: &'a [u8],
+    /// The per-request timeout override (`0` = inherit the client default). Carried so
+    /// [`http_client_perform`] can resolve the effective per-op deadline (http.md "I/O timeouts"); the
+    /// convenience `get`/`post` views (no request handle) always set `0` (inherit).
+    timeout_ns: i64,
 }
 
 impl HttpRequest {
     fn as_view(&self) -> HttpRequestView<'_> {
-        HttpRequestView { method: &self.method, url: &self.url, headers: &self.headers, body: &self.body }
+        HttpRequestView {
+            method: &self.method,
+            url: &self.url,
+            headers: &self.headers,
+            body: &self.body,
+            timeout_ns: self.timeout_ns,
+        }
     }
 }
 
@@ -14102,7 +14116,7 @@ pub unsafe extern "C" fn align_rt_http_request_new(
 ) -> *mut HttpRequest {
     let method = String::from_utf8_lossy(unsafe { bytes_view(method_ptr, method_len) }).into_owned();
     let url = String::from_utf8_lossy(unsafe { bytes_view(url_ptr, url_len) }).into_owned();
-    Box::into_raw(Box::new(HttpRequest { method, url, headers: Vec::new(), body: Vec::new() }))
+    Box::into_raw(Box::new(HttpRequest { method, url, headers: Vec::new(), body: Vec::new(), timeout_ns: 0 }))
 }
 
 /// `r.header(name, value)` — append a header. **Aborts** (http.md P6) if either the name or the
@@ -14151,6 +14165,26 @@ pub unsafe extern "C" fn align_rt_http_body(req: *mut HttpRequest, data_ptr: *co
     }
     let r = unsafe { &mut *req };
     r.body = unsafe { bytes_view(data_ptr, data_len) }.to_vec();
+}
+
+/// `r.timeout(ns)` — set the request's per-request I/O timeout in nanoseconds (http.md "I/O timeouts").
+/// `ns == 0` = inherit the client default; a positive `ns` overrides it. A **negative** `ns` **aborts**
+/// (a programmer error, mirroring `command.timeout_ns` — validated here, not silently clamped). A null
+/// handle aborts (a compiler-invariant break, never reachable from a bound local). No value. The
+/// effective per-op deadline (connect + send + receive) is resolved and applied in
+/// [`http_client_perform`].
+///
+/// # Safety
+/// `req` must be null or a pointer from [`align_rt_http_request_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_timeout(req: *mut HttpRequest, ns: i64) {
+    if req.is_null() {
+        panic_abort("http.timeout: null request handle");
+    }
+    if ns < 0 {
+        panic_abort("http.timeout: negative timeout");
+    }
+    unsafe { &mut *req }.timeout_ns = ns;
 }
 
 /// An RFC 7230 `token`: one or more `tchar` (ALPHA / DIGIT / a fixed set of symbols — no control
@@ -14840,6 +14874,14 @@ impl Conn {
         if ssl.is_null() { Conn::Plain { fd } } else { Conn::Tls { ssl, fd } }
     }
 
+    /// The underlying socket fd (both variants own one). Used to arm the per-request `SO_*TIMEO`
+    /// deadline before the exchange (http.md "I/O timeouts").
+    fn fd(&self) -> i32 {
+        match *self {
+            Conn::Plain { fd } | Conn::Tls { fd, .. } => fd,
+        }
+    }
+
     /// Decompose into `(fd, ssl)` for pooling (`ssl` null for plaintext). Does NOT close anything —
     /// `Conn` has no `Drop`, so this just moves the fields out.
     fn into_parts(self) -> (i32, *mut c_void) {
@@ -14850,35 +14892,40 @@ impl Conn {
     }
 
     /// Write all of `bytes`, `0` on success else a mapped status. Plaintext reuses the SIGPIPE-safe
-    /// `http_send_all`; TLS loops `SSL_write` with `SSL_get_error` retry on `WANT_*`.
+    /// `http_send_all`; TLS loops `SSL_write` with `SSL_get_error` retry on `WANT_*`. `has_deadline`
+    /// (a `SO_SNDTIMEO` armed for this request — http.md "I/O timeouts") is only consulted by the TLS
+    /// path, to map a deadline-expiry `WANT_*`/`SYSCALL(EAGAIN)` to `AL_TIMEOUT` instead of spinning;
+    /// the plaintext path maps a blocking-fd `EAGAIN` unconditionally (it can only occur when armed).
     ///
     /// # Safety
     /// The conn must be live (a valid connected fd / handshaken `SSL*`).
-    unsafe fn write_all(&mut self, bytes: &[u8]) -> i32 {
+    unsafe fn write_all(&mut self, bytes: &[u8], has_deadline: bool) -> i32 {
         match *self {
             Conn::Plain { fd } => unsafe { http_send_all(fd, bytes) },
-            Conn::Tls { ssl, .. } => unsafe { tls_write_all(ssl, bytes) },
+            Conn::Tls { ssl, .. } => unsafe { tls_write_all(ssl, bytes, has_deadline) },
         }
     }
 
-    /// Read up to `buf.len()` bytes into `buf`.
+    /// Read up to `buf.len()` bytes into `buf`. See [`Conn::read_raw`] for `has_deadline`.
     ///
     /// # Safety
     /// The conn must be live.
-    unsafe fn read(&mut self, buf: &mut [u8]) -> ConnRead {
-        unsafe { self.read_raw(buf.as_mut_ptr(), buf.len()) }
+    unsafe fn read(&mut self, buf: &mut [u8], has_deadline: bool) -> ConnRead {
+        unsafe { self.read_raw(buf.as_mut_ptr(), buf.len(), has_deadline) }
     }
 
     /// Read up to `len` bytes into raw writable storage. Unlike [`Conn::read`], the destination may
     /// be a `Vec`'s uninitialised spare capacity; the transport initialises exactly the bytes named
-    /// by `ConnRead::Data`.
+    /// by `ConnRead::Data`. `has_deadline` (a `SO_RCVTIMEO` armed for this request) is only consulted
+    /// by the TLS path (the plaintext `plain_read` maps a blocking-fd `EAGAIN` unconditionally — it
+    /// can only occur when a deadline is armed).
     ///
     /// # Safety
     /// The conn must be live, and `dst..dst+len` must be valid writable storage.
-    unsafe fn read_raw(&mut self, dst: *mut u8, len: usize) -> ConnRead {
+    unsafe fn read_raw(&mut self, dst: *mut u8, len: usize, has_deadline: bool) -> ConnRead {
         match *self {
             Conn::Plain { fd } => unsafe { plain_read(fd, dst, len) },
-            Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, dst, len) },
+            Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, dst, len, has_deadline) },
         }
     }
 
@@ -14930,7 +14977,11 @@ unsafe fn plain_read(fd: i32, dst: *mut u8, len: usize) -> ConnRead {
         if e.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        return ConnRead::Err(io_error_to_status(&e));
+        // A blocking client socket yields `EAGAIN`/`EWOULDBLOCK` only when an armed `SO_RCVTIMEO`
+        // (http.md "I/O timeouts") has fired, so `io_read_write_status` relabels it `AL_TIMEOUT`. With
+        // no timeout armed this branch never sees `EAGAIN`, so the mapping is byte-identical to the
+        // pre-timeout `io_error_to_status`.
+        return ConnRead::Err(io_read_write_status(&e));
     }
 }
 
@@ -14962,7 +15013,7 @@ unsafe fn ssl_error_status(ssl: *const c_void, err: c_int) -> i32 {
 ///
 /// # Safety
 /// `ssl` must be a live handshaken `SSL*`.
-unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8]) -> i32 {
+unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8], has_deadline: bool) -> i32 {
     while !bytes.is_empty() {
         let want = bytes.len().min(c_int::MAX as usize) as c_int;
         let n = unsafe { SSL_write(ssl, bytes.as_ptr() as *const c_void, want) };
@@ -14970,9 +15021,24 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8]) -> i32 {
             bytes = &bytes[n as usize..];
             continue;
         }
+        // Capture errno BEFORE `SSL_get_error` so a `WANT_*`/`SYSCALL` from an armed `SO_SNDTIMEO`
+        // (http.md "I/O timeouts") is recognisable by its `EAGAIN`/`EWOULDBLOCK`.
+        let e = std::io::Error::last_os_error();
         let err = unsafe { SSL_get_error(ssl, n) };
         if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
+            // On a blocking socket a `WANT_*` means the underlying `write(2)` returned `EAGAIN`; with a
+            // deadline armed that is our timeout firing → `AL_TIMEOUT` (otherwise we would re-`SSL_write`
+            // forever over a socket that keeps timing out). With no deadline, retry exactly as before.
+            if has_deadline && e.kind() == std::io::ErrorKind::WouldBlock {
+                return AL_TIMEOUT;
+            }
             continue;
+        }
+        // A `SYSCALL` error whose errno is `EAGAIN` (some OpenSSL versions surface the deadline here
+        // instead of `WANT_*`) is likewise the timeout when armed. Otherwise fall through to the
+        // unchanged taxonomy.
+        if has_deadline && err == SSL_ERROR_SYSCALL && e.kind() == std::io::ErrorKind::WouldBlock {
+            return AL_TIMEOUT;
         }
         return unsafe { ssl_error_status(ssl, err) };
     }
@@ -14984,27 +15050,41 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8]) -> i32 {
 ///
 /// # Safety
 /// `ssl` must be a live handshaken `SSL*`, and `dst..dst+len` must be writable.
-unsafe fn tls_read(ssl: *mut c_void, dst: *mut u8, len: usize) -> ConnRead {
+unsafe fn tls_read(ssl: *mut c_void, dst: *mut u8, len: usize, has_deadline: bool) -> ConnRead {
     loop {
         let want = len.min(c_int::MAX as usize) as c_int;
         let n = unsafe { SSL_read(ssl, dst as *mut c_void, want) };
         if n > 0 {
             return ConnRead::Data(n as usize);
         }
+        // Capture errno BEFORE `SSL_get_error` so a deadline-expiry `WANT_*`/`SYSCALL` is recognisable
+        // by its `EAGAIN`/`EWOULDBLOCK` (http.md "I/O timeouts").
+        let e = std::io::Error::last_os_error();
         let err = unsafe { SSL_get_error(ssl, n) };
         if err == SSL_ERROR_ZERO_RETURN {
             return ConnRead::Eof;
         }
         if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
+            // On a blocking socket a `WANT_*` means the underlying `recv(2)` returned `EAGAIN`; with a
+            // `SO_RCVTIMEO` armed that is our deadline firing → `AL_TIMEOUT` (else we would spin forever
+            // re-reading a socket that keeps timing out). With no deadline, retry exactly as before.
+            if has_deadline && e.kind() == std::io::ErrorKind::WouldBlock {
+                return ConnRead::Err(AL_TIMEOUT);
+            }
             continue;
         }
         // An unclean transport EOF (`SSL_ERROR_SYSCALL` with errno 0) is reported as EOF so the
         // exchange loop's Content-Length framing decides (an incomplete body at EOF → Invalid); a
         // clean read-to-close body also ends here. A real errno / library error surfaces as Err.
         if err == SSL_ERROR_SYSCALL {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error().unwrap_or(0) == 0 {
+            let raw = e.raw_os_error().unwrap_or(0);
+            if raw == 0 {
                 return ConnRead::Eof;
+            }
+            // A `SYSCALL(EAGAIN)` from an armed deadline (some OpenSSL versions surface it here rather
+            // than `WANT_*`) is the timeout; otherwise map the errno unchanged.
+            if has_deadline && e.kind() == std::io::ErrorKind::WouldBlock {
+                return ConnRead::Err(AL_TIMEOUT);
             }
             return ConnRead::Err(io_error_to_status(&e));
         }
@@ -15018,14 +15098,19 @@ unsafe fn tls_read(ssl: *mut c_void, dst: *mut u8, len: usize) -> ConnRead {
 /// Returns the handshaken [`Conn::Tls`], or a mapped status — the `SSL*` AND fd are freed on EVERY
 /// error path. Must run with SIGPIPE blocked on the calling thread (see [`http_client_perform`]).
 ///
+/// `timeout_ns` bounds the whole establishment (http.md "I/O timeouts"): the TCP connect (via
+/// [`http_connect_fd`]) AND the TLS handshake — armed as a `SO_*TIMEO` deadline on the fd BEFORE
+/// `SSL_connect`, so a peer that completes TCP then stalls the handshake surfaces `AL_TIMEOUT` rather
+/// than hanging. `timeout_ns == 0` leaves the socket blocking (byte-identical to the pre-timeout path).
+///
 /// # Safety
 /// Callers must eventually [`Conn::close`] the returned conn.
-unsafe fn http_tls_connect(host: &str, port: i64) -> Result<Conn, i32> {
+unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64) -> Result<Conn, i32> {
     let ctx = tls_client_ctx();
     if ctx.is_null() {
         return Err(AL_INVALID); // engine init failed (OOM-class)
     }
-    let fd = unsafe { http_connect_fd(host, port) }?; // TCP first; connect errno → Error.Code
+    let fd = unsafe { http_connect_fd(host, port, timeout_ns) }?; // TCP first; connect errno → Error.Code
     let ssl = unsafe { SSL_new(ctx) };
     if ssl.is_null() {
         unsafe { close(fd) };
@@ -15066,12 +15151,26 @@ unsafe fn http_tls_connect(host: &str, port: i64) -> Result<Conn, i32> {
     // non-zero return (only on OOM) is non-fatal; the server may ignore ALPN for HTTP/1.1.
     const ALPN_HTTP11: [u8; 9] = *b"\x08http/1.1";
     unsafe { SSL_set_alpn_protos(ssl, ALPN_HTTP11.as_ptr(), ALPN_HTTP11.len() as c_uint) };
+    // Arm the handshake I/O deadline on the (now blocking) fd BEFORE `SSL_connect` so a peer that
+    // completes TCP then stalls the handshake times out rather than hanging (http.md "I/O timeouts").
+    // `timeout_ns == 0` leaves the socket blocking, so the handshake is byte-identical to the
+    // pre-timeout path. The subsequent request/response I/O re-applies this deadline per request in
+    // `http_client_perform`.
+    if timeout_ns > 0 {
+        unsafe { http_arm_conn_timeout(fd, timeout_ns) };
+    }
     // Handshake. On failure, distinguish Denied (verify/host/cert) from Code (syscall) from Invalid
-    // (alert/protocol) via `ssl_error_status`, which checks `SSL_get_verify_result` first.
+    // (alert/protocol) via `ssl_error_status`, which checks `SSL_get_verify_result` first. With a
+    // deadline armed, a `WANT_*`/`SYSCALL` whose errno is `EAGAIN`/`EWOULDBLOCK` is that deadline
+    // firing → `AL_TIMEOUT` (not a generic transport error).
     let rc = unsafe { SSL_connect(ssl) };
     if rc != 1 {
+        let e = std::io::Error::last_os_error(); // capture errno before `SSL_get_error`
         let err = unsafe { SSL_get_error(ssl, rc) };
-        let status = unsafe { ssl_error_status(ssl, err) };
+        let timed_out = timeout_ns > 0
+            && matches!(err, SSL_ERROR_SYSCALL | SSL_ERROR_WANT_READ | SSL_ERROR_WANT_WRITE)
+            && e.kind() == std::io::ErrorKind::WouldBlock;
+        let status = if timed_out { AL_TIMEOUT } else { unsafe { ssl_error_status(ssl, err) } };
         return fail(status);
     }
     Ok(Conn::Tls { ssl, fd })
@@ -15195,6 +15294,12 @@ type HttpIdlePool = std::collections::HashMap<String, HttpHostPool>;
 pub struct HttpClient {
     idle: std::sync::Mutex<HttpIdlePool>,
     request_buffers: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The client-default I/O timeout in nanoseconds set by [`align_rt_http_client_timeout`], or `0`
+    /// for "no timeout" (the default — current blocking behavior; http.md "I/O timeouts"). Applied to
+    /// every request whose own `timeout` is unset (`0`). An `AtomicI64` because `get_many` shares one
+    /// client across worker threads that read this field concurrently; it is only written by the
+    /// (single-threaded, bound-local) setter before requests run.
+    timeout_ns: std::sync::atomic::AtomicI64,
 }
 
 // SAFETY: `IdleConn` holds a raw `*mut c_void` (an OpenSSL `SSL*`), which makes it non-`Send`, so the
@@ -15360,7 +15465,27 @@ pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
     Box::into_raw(Box::new(HttpClient {
         idle: std::sync::Mutex::new(std::collections::HashMap::new()),
         request_buffers: std::sync::Mutex::new(Vec::new()),
+        timeout_ns: std::sync::atomic::AtomicI64::new(0),
     }))
+}
+
+/// `cl.timeout(ns)` — set the client's default I/O timeout in nanoseconds applied to every request
+/// whose own `timeout` is unset (http.md "I/O timeouts"). `ns == 0` = no timeout (the default —
+/// current blocking behavior). A **negative** `ns` **aborts** (a programmer error, mirroring
+/// `command.timeout_ns` / `align_rt_http_timeout`); a null handle aborts (a compiler-invariant break,
+/// never reachable from a bound local). No value.
+///
+/// # Safety
+/// `c` must be null or a pointer from [`align_rt_http_client_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_client_timeout(c: *mut HttpClient, ns: i64) {
+    if c.is_null() {
+        panic_abort("http.client.timeout: null client handle");
+    }
+    if ns < 0 {
+        panic_abort("http.client.timeout: negative timeout");
+    }
+    unsafe { &*c }.timeout_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Free a `client`, closing every pooled idle conn (http.md P5 — no fd leak across pool churn).
@@ -15437,10 +15562,35 @@ unsafe fn http_send_all(fd: i32, mut bytes: &[u8]) -> i32 {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return io_error_to_status(&e);
+            // A blocking socket yields `EAGAIN`/`EWOULDBLOCK` only when an armed `SO_SNDTIMEO`
+            // (the client's per-request write deadline — http.md "I/O timeouts") has fired, so
+            // `io_read_write_status` relabels it `AL_TIMEOUT`. Without an armed deadline this branch
+            // never sees `EAGAIN` (the server stream path never arms one), so the mapping is
+            // byte-identical to the pre-timeout `io_error_to_status` for every existing caller.
+            return io_read_write_status(&e);
         }
     }
     0
+}
+
+/// Arm (or clear, when `ns == 0`) BOTH the receive and send deadlines on the client conn's socket `fd`
+/// for one request (http.md "I/O timeouts"). Applied to every request — a fresh conn OR a reused
+/// pooled conn — right after acquiring it and before any request I/O, so a conn pooled by a
+/// timeout-armed request never carries a stale deadline into a later request: `ns == 0` writes a zero
+/// `timeval` = "block forever" = the pre-timeout default (exactly clearing any inherited deadline).
+/// Best effort — a connected socket does not reject `SO_*TIMEO`. `ns >= 0` is the caller's contract
+/// (the effective timeout is a max of two non-negative fields).
+///
+/// # Safety
+/// `fd` must be a valid connected socket.
+unsafe fn http_arm_conn_timeout(fd: i32, ns: i64) {
+    let tv = timeval_from_ns(ns);
+    let tvp = &tv as *const Timeval as *const core::ffi::c_void;
+    let len = core::mem::size_of::<Timeval>() as u32;
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tvp, len);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tvp, len);
+    }
 }
 
 /// Split an HTTP authority `host[:port]` into a borrowed `(host, port)` for the socket connect,
@@ -15516,6 +15666,7 @@ unsafe fn http_conn_read_into(
     buf: &mut Vec<u8>,
     framed_total: usize,
     read_limit: usize,
+    has_deadline: bool,
 ) -> ConnRead {
     let len = buf.len();
     debug_assert!(framed_total > len);
@@ -15528,7 +15679,7 @@ unsafe fn http_conn_read_into(
     buf.reserve_exact(desired - len);
     let writable = (buf.capacity() - len).min(read_limit);
     debug_assert!(writable > 0);
-    let result = unsafe { conn.read_raw(buf.as_mut_ptr().add(len), writable) };
+    let result = unsafe { conn.read_raw(buf.as_mut_ptr().add(len), writable, has_deadline) };
     match result {
         ConnRead::Data(n) if n <= writable => {
             // The transport initialised exactly these `n` bytes, and `n <= writable <= spare`.
@@ -15547,13 +15698,17 @@ unsafe fn http_conn_read_into(
 /// (the caller decides pool-return vs close). Returns an [`HttpExchange`] carrying the parsed
 /// response + reuse verdict, or a failure + whether any byte was received.
 ///
+/// `has_deadline` (an effective per-request timeout is armed on the fd via `SO_*TIMEO`) is threaded to
+/// the read/write steps so the TLS path maps a deadline expiry to `AL_TIMEOUT` (http.md "I/O
+/// timeouts"); with no deadline it is byte-identical to the pre-timeout exchange.
+///
 /// # Safety
 /// `conn` must be live (a valid connected fd / handshaken `SSL*`).
-unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange {
+unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8], has_deadline: bool) -> HttpExchange {
     // One write of the whole request (start-line + headers + body already in one buffer). SIGPIPE is
     // suppressed by `MSG_NOSIGNAL`/`SO_NOSIGPIPE` on plaintext, and by the caller's `pthread_sigmask`
     // block on TLS.
-    let ws = unsafe { conn.write_all(request) };
+    let ws = unsafe { conn.write_all(request, has_deadline) };
     if ws != 0 {
         // The write itself failed (a dead reused conn typically fails here with EPIPE/ECONNRESET):
         // nothing was received.
@@ -15623,8 +15778,8 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
                 .then(|| (t, remaining - (HTTP_CLIENT_READ_CHUNK - 1)))
         });
         let (read_result, appended_directly) = match direct {
-            Some((t, limit)) => (unsafe { http_conn_read_into(conn, &mut buf, t, limit) }, true),
-            None => (unsafe { conn.read(&mut chunk) }, false),
+            Some((t, limit)) => (unsafe { http_conn_read_into(conn, &mut buf, t, limit, has_deadline) }, true),
+            None => (unsafe { conn.read(&mut chunk, has_deadline) }, false),
         };
         let n = match read_result {
             ConnRead::Data(n) => n,
@@ -15662,15 +15817,19 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
 /// Connect a fresh TCP conn to `(host, port)` and lift its fd out of the net rail's `TcpConn` box (the
 /// pool owns the fd's lifetime from here — `TcpConn` has no `Drop`, so dropping the box frees only its
 /// bytes and leaves the fd open). Sets `TCP_NODELAY` (http.md R4) and, on macOS/BSD, `SO_NOSIGPIPE`.
-/// Returns the fd, or a mapped connect status.
+/// Returns the fd, or a mapped connect status. `timeout_ns` bounds the connect handshake (http.md
+/// "I/O timeouts"): `> 0` uses the net rail's non-blocking-`connect` + `poll` deadline (returning
+/// `AL_TIMEOUT` on a black-holed peer), `0` keeps the pre-timeout blocking `connect` unchanged.
 ///
 /// # Safety
 /// Callers must eventually pool or `close` the returned fd.
-unsafe fn http_connect_fd(host: &str, port: i64) -> Result<i32, i32> {
+unsafe fn http_connect_fd(host: &str, port: i64, timeout_ns: i64) -> Result<i32, i32> {
     let mut conn: *mut TcpConn = core::ptr::null_mut();
-    // `timeout_ns = 0` = no connect deadline (the pre-timeout blocking behavior). The `std.http`
-    // request-timeout PR will thread the client/request deadline through here.
-    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, 0, &mut conn) };
+    // The effective request timeout bounds the handshake (`0` = the pre-timeout blocking path, so a
+    // no-timeout request is byte-identical). `align_rt_tcp_connect` restores the fd to BLOCKING before
+    // returning, so the subsequent request/response I/O sees a normal blocking socket (its deadline is
+    // then armed separately via `SO_*TIMEO` in `http_client_perform`).
+    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, timeout_ns, &mut conn) };
     if rc != 0 {
         return Err(rc);
     }
@@ -15729,7 +15888,16 @@ unsafe fn http_client_perform(
         return AL_INVALID;
     };
     let client_ref: Option<&HttpClient> = unsafe { client.as_ref() };
-    // 3. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
+    // 3. Resolve the effective per-request I/O timeout (http.md "I/O timeouts"): the request's own
+    //    `timeout > 0` overrides; otherwise inherit the client default (`0` for a null client). `0`
+    //    means "no timeout" — the pre-timeout blocking path, byte-identical for every existing caller.
+    //    Both operands are non-negative (validated at their setters), so `effective_timeout >= 0`.
+    let client_timeout = client_ref
+        .map(|c| c.timeout_ns.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0);
+    let effective_timeout = if req.timeout_ns > 0 { req.timeout_ns } else { client_timeout };
+    let has_deadline = effective_timeout > 0;
+    // 4. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
     // A real client lends bounded scratch storage; a null client keeps the no-pool behavior.
     let mut request_bytes = client_ref
         .map(HttpClient::request_buffer)
@@ -15755,13 +15923,14 @@ unsafe fn http_client_perform(
             Some((fd, ssl)) => (Conn::from_parts(fd, ssl), true),
             None => {
                 let fresh = match scheme {
-                    HttpScheme::Https => unsafe { http_tls_connect(host, port) },
-                    HttpScheme::Http => unsafe { http_connect_fd(host, port) }.map(|fd| Conn::Plain { fd }),
+                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout) },
+                    HttpScheme::Http => unsafe { http_connect_fd(host, port, effective_timeout) }.map(|fd| Conn::Plain { fd }),
                 };
                 match fresh {
                     Ok(c) => (c, false),
                     // A fresh-connect / handshake failure surfaces directly (handshake failures happen
-                    // ONLY on the fresh path, so they are never wrongly retried).
+                    // ONLY on the fresh path, so they are never wrongly retried). A connect/handshake
+                    // deadline expiry arrives here as `AL_TIMEOUT` (http.md "I/O timeouts").
                     Err(s) => {
                         if let Some(c) = client_ref {
                             c.remove_empty(scheme, host, port);
@@ -15771,8 +15940,17 @@ unsafe fn http_client_perform(
                 }
             }
         };
+        // Arm (or clear) the send/receive deadline on this conn's fd for THIS request, on both a fresh
+        // AND a reused pooled conn, before any request I/O (http.md "I/O timeouts"). Clearing
+        // (`effective_timeout == 0`) is REQUIRED on a reused conn so a conn pooled by an earlier
+        // timeout-armed request cannot carry a stale deadline into this one; on a fresh conn with no
+        // timeout it is skipped (the socket is already deadline-free — byte-identical to today). A
+        // fresh TLS conn was already armed for its handshake; re-arming with the same value is a no-op.
+        if has_deadline || reused {
+            unsafe { http_arm_conn_timeout(conn.fd(), effective_timeout) };
+        }
         // Exchange over this conn.
-        match unsafe { http_socket_exchange(&mut conn, request_bytes.as_slice()) } {
+        match unsafe { http_socket_exchange(&mut conn, request_bytes.as_slice(), has_deadline) } {
             HttpExchange::Complete { response, reusable } => {
                 // The exchange has already parsed the head and moved both its spans and the socket
                 // receive buffer into `response`. Decide the conn's fate only after that successful
@@ -15810,7 +15988,7 @@ unsafe fn http_client_perform(
 }
 
 fn http_get_request(url: String) -> HttpRequest {
-    HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new() }
+    HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new(), timeout_ns: 0 }
 }
 
 /// `cl.get(url)` — perform a `GET url` (plaintext or verified TLS for `https://`) over a pooled or
@@ -15835,7 +16013,7 @@ pub unsafe extern "C" fn align_rt_http_client_get(
     let Some(url) = (unsafe { abi_str_view(url_ptr, url_len) }) else {
         return AL_INVALID;
     };
-    let req = HttpRequestView { method: "GET", url, headers: &[], body: &[] };
+    let req = HttpRequestView { method: "GET", url, headers: &[], body: &[], timeout_ns: 0 };
     unsafe { http_client_perform(client, req, out) }
 }
 
@@ -16026,7 +16204,7 @@ pub unsafe extern "C" fn align_rt_http_client_post(
         return AL_INVALID;
     };
     let body = unsafe { bytes_view(body_ptr, body_len) };
-    let req = HttpRequestView { method: "POST", url, headers: &[], body };
+    let req = HttpRequestView { method: "POST", url, headers: &[], body, timeout_ns: 0 };
     unsafe { http_client_perform(client, req, out) }
 }
 
@@ -26152,9 +26330,9 @@ mod tests {
         let headers = vec![("Accept".to_string(), "application/json".to_string())];
         let body = b"{\"k\":1}";
         let cases = [
-            HttpRequestView { method: "GET", url: "http://localhost:8080", headers: &[], body: &[] },
-            HttpRequestView { method: "", url: "https://example.com/path?q=1", headers: &[], body: &[] },
-            HttpRequestView { method: "POST", url: "http://example.com/submit", headers: &headers, body },
+            HttpRequestView { method: "GET", url: "http://localhost:8080", headers: &[], body: &[], timeout_ns: 0 },
+            HttpRequestView { method: "", url: "https://example.com/path?q=1", headers: &[], body: &[], timeout_ns: 0 },
+            HttpRequestView { method: "POST", url: "http://example.com/submit", headers: &headers, body, timeout_ns: 0 },
         ];
         for req in cases {
             let out = http_serialize_core(req).expect("representative request serializes");
@@ -26180,6 +26358,7 @@ mod tests {
             url: "http://example.com/path",
             headers: &[],
             body: &[],
+            timeout_ns: 0,
         };
 
         let (first_ptr, first_capacity) = {
@@ -26213,6 +26392,7 @@ mod tests {
                 url: "http://example.com/upload",
                 headers: &[],
                 body: &large_body,
+                timeout_ns: 0,
             };
             http_serialize_into(post, lease.bytes_mut()).expect("large request still serializes");
             assert!(lease.bytes.capacity() > HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX);
@@ -26623,6 +26803,117 @@ mod tests {
         assert!(got.starts_with("PUT /create HTTP/1.1\r\n"), "request line: {got:?}");
         assert!(got.contains("X-Test: 1\r\n"), "caller header missing: {got:?}");
         assert!(got.contains("Content-Length: 3\r\n") && got.ends_with("\r\nabc"), "body missing: {got:?}");
+    }
+
+    /// The two `timeout(ns)` setters store their nanosecond deadline on the handle, `0` clears, and a
+    /// request's own timeout is stored independently of (and overrides) the client default. This is
+    /// the field that `http_client_perform` reads to resolve the effective per-op deadline (http.md
+    /// "I/O timeouts").
+    #[test]
+    fn http_timeout_setters_store_and_request_overrides_client() {
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 1_234) };
+        assert_eq!(unsafe { &*client }.timeout_ns.load(std::sync::atomic::Ordering::Relaxed), 1_234);
+        unsafe { align_rt_http_client_timeout(client, 0) }; // 0 clears — no timeout, the default
+        assert_eq!(unsafe { &*client }.timeout_ns.load(std::sync::atomic::Ordering::Relaxed), 0);
+        unsafe { align_rt_http_client_free(client) };
+
+        let (mp, ml) = http_s("GET");
+        let (up, ul) = http_s("http://x/");
+        let req = unsafe { align_rt_http_request_new(mp, ml, up, ul) };
+        assert_eq!(unsafe { &*req }.timeout_ns, 0, "a fresh request inherits the client default (0)");
+        unsafe { align_rt_http_timeout(req, 9_999) };
+        assert_eq!(unsafe { &*req }.timeout_ns, 9_999);
+        // The view (what `http_client_perform` reads for the override) carries the request's timeout.
+        assert_eq!(unsafe { &*req }.as_view().timeout_ns, 9_999);
+        unsafe { align_rt_http_request_free(req) };
+    }
+
+    /// The Request-2 acceptance gate: a server that accepts the connection and reads the request but
+    /// NEVER responds makes `cl.get()` return `Err(Error.Timeout)` (`AL_TIMEOUT`) within the configured
+    /// bound instead of blocking indefinitely. Exercises the client-default timeout, the `SO_RCVTIMEO`
+    /// arming, and the plaintext `EAGAIN → AL_TIMEOUT` mapping end to end.
+    #[test]
+    fn http_client_read_timeout_accept_then_no_response_returns_timeout() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut tmp = [0u8; 512];
+                let _ = sock.read(&mut tmp); // drain the request head, then stall — never write a response
+                std::thread::sleep(std::time::Duration::from_millis(1500)); // hold open past the client bound
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/hang");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 200_000_000) }; // 200 ms
+        let start = std::time::Instant::now();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        let elapsed = start.elapsed();
+        assert_eq!(rc, AL_TIMEOUT, "accept-then-no-response must return Error.Timeout");
+        assert!(out.is_null(), "a timed-out request leaves the out slot null");
+        assert!(elapsed < std::time::Duration::from_secs(1), "must return near the 200 ms bound, took {elapsed:?}");
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join();
+    }
+
+    /// An armed timeout is inert for a response that arrives well within the bound: a fast round-trip
+    /// still succeeds (the deadline never fires).
+    #[test]
+    fn http_client_timeout_does_not_affect_a_fast_response() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_once(resp);
+        let url = format!("http://127.0.0.1:{port}/fast");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 5_000_000_000) }; // 5 s — inert for a fast reply
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0, "a fast response is unaffected by an armed timeout");
+        assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+        unsafe { align_rt_http_resp_free(out) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join();
+    }
+
+    /// A connect to a black-holed (never-completing) peer returns `Err(Error.Timeout)` within the
+    /// bound — the connect-deadline half of http.md "I/O timeouts", threaded into `align_rt_tcp_connect`.
+    /// The black hole is a loopback listener whose accept queue is shrunk (a second `listen(fd, 0)`)
+    /// and filled with unaccepted connections, so a further connect's SYN is dropped and the connect
+    /// blocks — deterministic and offline-safe. Linux-only (the backlog-overflow behaviour is
+    /// Linux-specific; WSL2/CI run Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn http_client_connect_timeout_black_hole_returns_timeout() {
+        use std::os::unix::io::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        // Minimise the accept queue (Linux honours a second listen(2)) so a couple of unaccepted
+        // connections overflow it.
+        unsafe { listen(listener.as_raw_fd(), 0) };
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let mut fillers: Vec<std::net::TcpStream> = Vec::new();
+        for _ in 0..8 {
+            // A short connect timeout on the fillers: once the queue is full the overflow filler's SYN
+            // is dropped and this returns `Err(TimedOut)` — at which point the queue is full enough.
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)) {
+                Ok(s) => fillers.push(s),
+                Err(_) => break,
+            }
+        }
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 200_000_000) }; // 200 ms
+        let start = std::time::Instant::now();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        let elapsed = start.elapsed();
+        assert_eq!(rc, AL_TIMEOUT, "a connect to a black-holed (full-backlog) peer must time out");
+        assert!(out.is_null());
+        assert!(elapsed < std::time::Duration::from_secs(2), "must return near the 200 ms bound, took {elapsed:?}");
+        unsafe { align_rt_http_client_free(client) };
+        drop(fillers);
     }
 
     /// A malformed URL (unknown scheme / no host / no scheme) is rejected before any connect with
