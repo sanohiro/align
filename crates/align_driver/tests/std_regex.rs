@@ -425,3 +425,58 @@ pub fn main() -> Result<(), Error> {
     let n: i64 = s.trim().parse().expect("one integer line");
     assert!(n > 0 && n % 1000 == 0, "expected a positive multiple of 1000, got {n}");
 }
+
+// --- replace / replace_all (owned string) -------------------------------------------------------
+
+/// `replace` rewrites the first match, `replace_all` every match, returning a fresh owned `string`
+/// that never aliases the input. The replacement expands `$0`/`${name}`/`$$` (the Rust contract);
+/// a no-match returns an owned copy; an empty result owns no buffer.
+#[test]
+fn replace_semantics() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  d := regex.compile(\"[0-9]+\")?
+  print(d.replace(\"a12b345\", \"#\"))          // first only
+  print(d.replace_all(\"a12b345\", \"#\"))      // every match
+  print(d.replace_all(\"abc\", \"#\"))          // no match -> owned copy
+  // $0 = whole match, $$ = literal dollar.
+  print(d.replace_all(\"x9y\", \"[$0]\"))
+  print(d.replace_all(\"9\", \"$$\"))
+  // Named groups via ${name}.
+  date := regex.compile(\"(?P<y>[0-9]{4})-(?P<m>[0-9]{2})\")?
+  print(date.replace(\"2026-07\", \"${m}/${y}\"))
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-replace", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a#b345\na#b#\nabc\nx[9]y\n$\n07/2026\n");
+}
+
+/// Building a replaced `string` many times in a loop exits cleanly — the owned result `Drop`s each
+/// iteration with no leak or double-free, including the no-match owned-copy path.
+#[test]
+fn replace_drop_in_a_loop_is_clean() {
+    let prog = "\
+import std.regex
+pub fn main() -> Result<(), Error> {
+  re := regex.compile(\"a\")?
+  mut i := 0
+  mut total := 0
+  loop {
+    if i >= 1000 { break }
+    // Owned strings created and dropped every iteration (match + no-match paths).
+    total = total + re.replace_all(\"banana\", \"X\").len()
+    total = total + re.replace_all(\"none\", \"X\").len()
+    i = i + 1
+  }
+  print(total)
+  return Ok(())
+}
+";
+    let out = build_and_run("regex-replace-loop", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // "banana"->"bXnXnX" (6) + "none" (4) = 10 per iteration * 1000 = 10000.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10000\n");
+}

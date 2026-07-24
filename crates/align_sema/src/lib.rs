@@ -4497,6 +4497,11 @@ impl EffectScan<'_> {
                     self.expr(s);
                 }
             }
+            ExprKind::RegexReplace { regex, text, repl, .. } => {
+                self.expr(regex);
+                self.expr(text);
+                self.expr(repl);
+            }
             // `std.cli` — **all pure** (no I/O; argv is already captured by `main(args)`): just
             // recurse into the operands so any effect *inside* them is still counted.
             ExprKind::CliCommand { name } => self.expr(name),
@@ -6020,6 +6025,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RegexFind { .. }
             | ExprKind::RegexFindAll { .. }
             | ExprKind::RegexSplit { .. }
+            | ExprKind::RegexReplace { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -6303,6 +6309,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RegexFind { .. }
             | ExprKind::RegexFindAll { .. }
             | ExprKind::RegexSplit { .. }
+            | ExprKind::RegexReplace { .. }
             | ExprKind::CliCommand { .. }
             | ExprKind::CliFlag { .. }
             | ExprKind::CliParse { .. }
@@ -7059,6 +7066,11 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(s, depth);
                 }
             }
+            ExprKind::RegexReplace { regex, text, repl, .. } => {
+                self.walk(regex, depth);
+                self.walk(text, depth);
+                self.walk(repl, depth);
+            }
             // `std.cli`: the command / parsed handles are owned Move (never region-borrows); a
             // `get_str` view borrows `parsed` but its escape is caught by `region_of` (a `Frame` view),
             // not here — just recurse so an escape *inside* the operands is still checked.
@@ -7695,6 +7707,11 @@ impl UnnecessaryHeapScan {
                 if let Some(s) = start {
                     self.visit(s);
                 }
+            }
+            ExprKind::RegexReplace { regex, text, repl, .. } => {
+                self.visit(regex);
+                self.visit(text);
+                self.visit(repl);
             }
             // `std.cli` — no heap-narrowing pattern of its own; recurse into the operands.
             ExprKind::CliCommand { name } => self.visit(name),
@@ -8556,9 +8573,10 @@ impl<'a> MoveCheck<'a> {
             // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
             // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
             // whose `{start,end}` are Copy byte offsets, NOT a view into the text; `find_all`/`split`
-            // yield an owned `array<regex_match>` of the same Copy offsets. None borrows the input.
+            // yield an owned `array<regex_match>` of the same Copy offsets; `replace`/`replace_all`
+            // yield a freshly owned `string`. None borrows the input.
             | ExprKind::RegexCompile { .. } | ExprKind::RegexIsMatch { .. } | ExprKind::RegexFind { .. }
-            | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } => {
+            | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } | ExprKind::RegexReplace { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -9533,6 +9551,11 @@ impl<'a> MoveCheck<'a> {
                 if let Some(s) = start {
                     self.expr(s, moved, false, false);
                 }
+            }
+            ExprKind::RegexReplace { regex, text, repl, .. } => {
+                self.expr(regex, moved, false, false);
+                self.expr(text, moved, false, false);
+                self.expr(repl, moved, false, false);
             }
             // `std.cli`: every receiver (`cmd` / `parsed`) is **borrowed, never consumed** — `parse`
             // reads the flag table without moving the command (so `usage()` stays callable after),
@@ -13700,7 +13723,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `std.regex` searches borrow a bound compiled handle. `find_at`'s start is a UTF-8
             // byte offset; runtime validation follows the language's slice-boundary abort model.
-            "is_match" | "find" | "find_at" | "find_all" | "split" if recv_ty == Ty::Regex => {
+            "is_match" | "find" | "find_at" | "find_all" | "split" | "replace" | "replace_all"
+                if recv_ty == Ty::Regex =>
+            {
                 self.check_regex_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
@@ -18709,7 +18734,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        let want = if method == "find_at" { 2 } else { 1 };
+        let want = if matches!(method, "find_at" | "replace" | "replace_all") { 2 } else { 1 };
         if args.len() != want {
             self.diags.error(
                 format!("'.{method}()' takes {want} argument{}, got {}", if want == 1 { "" } else { "s" }, args.len()),
@@ -18739,6 +18764,22 @@ impl<'a, 't> Checker<'a, 't> {
                 ExprKind::RegexSplit { regex: Box::new(recv_expr), text: Box::new(text) }
             };
             return Expr { kind, ty: Ty::DynStructArray(match_id, Layout::Aos), span };
+        }
+        if method == "replace" || method == "replace_all" {
+            let repl = self.check_str_init(&args[1]);
+            if repl.ty == Ty::Error {
+                return err;
+            }
+            return Expr {
+                kind: ExprKind::RegexReplace {
+                    regex: Box::new(recv_expr),
+                    text: Box::new(text),
+                    repl: Box::new(repl),
+                    all: method == "replace_all",
+                },
+                ty: Ty::String,
+                span,
+            };
         }
         let start = if method == "find_at" {
             let s = self.check_expr(&args[1], None);
@@ -21297,6 +21338,11 @@ impl<'a, 't> Checker<'a, 't> {
                 if let Some(s) = start {
                     self.finalize_expr(s);
                 }
+            }
+            ExprKind::RegexReplace { regex, text, repl, .. } => {
+                self.finalize_expr(regex);
+                self.finalize_expr(text);
+                self.finalize_expr(repl);
             }
             ExprKind::CliCommand { name } => self.finalize_expr(name),
             ExprKind::CliFlag { cmd, name, default, .. } => {

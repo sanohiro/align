@@ -7105,6 +7105,51 @@ pub unsafe extern "C" fn align_rt_regex_split(
     0
 }
 
+/// Replace matches of the compiled regex in `text` with `repl`, returning a fresh owned `string`.
+/// `all == 0` replaces only the first match, else every non-overlapping match. `repl` uses the Rust
+/// `regex` expansion contract — `$1` / `${name}` insert a capture group, `$$` a literal `$`. The
+/// result **always owns a fresh buffer** (even a no-match `Cow::Borrowed` is copied out), so it never
+/// aliases `text` and its `Drop` is the ordinary `align_rt_free`. An empty result owns no buffer.
+///
+/// # Safety
+/// `handle` must point to a live compiled regex; `text`/`repl` `ptr`/`len` must be readable UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_regex_replace(
+    handle: *const RegexHandle,
+    text_ptr: *const u8,
+    text_len: i64,
+    repl_ptr: *const u8,
+    repl_len: i64,
+    all: i32,
+) -> AlignStr {
+    let empty = AlignStr { ptr: core::ptr::null(), len: 0 };
+    if handle.is_null()
+        || text_len < 0
+        || (text_len > 0 && text_ptr.is_null())
+        || repl_len < 0
+        || (repl_len > 0 && repl_ptr.is_null())
+    {
+        return empty;
+    }
+    let (Some(text), Some(repl)) =
+        (unsafe { abi_str_view(text_ptr, text_len) }, unsafe { abi_str_view(repl_ptr, repl_len) })
+    else {
+        return empty;
+    };
+    let re = &unsafe { &*handle }.inner;
+    // `replace`/`replacen` return a Cow; a borrowed (no-match) Cow still points into `text`, so we
+    // must copy in every case to return an independently owned, `align_rt_free`-compatible buffer.
+    let out = if all == 0 { re.replace(text, repl) } else { re.replace_all(text, repl) };
+    let bytes = out.as_bytes();
+    if bytes.is_empty() {
+        return empty;
+    }
+    let len = regex_offset(bytes.len());
+    let dst = align_rt_alloc(len);
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    AlignStr { ptr: dst, len }
+}
+
 /// Drop a compiled regex handle. Null-safe for moved/uninitialized drop slots.
 ///
 /// # Safety
@@ -28648,6 +28693,67 @@ mod regex_tests {
         let whole = compile("abc");
         assert_eq!(split(whole, "abc"), [(0, 0), (3, 3)]);
         unsafe { align_rt_regex_free(whole) };
+    }
+
+    fn replace(h: *const RegexHandle, text: &str, repl: &str, all: bool) -> String {
+        let s = unsafe {
+            align_rt_regex_replace(
+                h,
+                text.as_ptr(),
+                text.len() as i64,
+                repl.as_ptr(),
+                repl.len() as i64,
+                i32::from(all),
+            )
+        };
+        let out = if s.len == 0 {
+            assert!(s.ptr.is_null(), "an empty replace owns no buffer");
+            String::new()
+        } else {
+            let bytes = unsafe { core::slice::from_raw_parts(s.ptr, s.len as usize) };
+            String::from_utf8(bytes.to_vec()).expect("owned utf8")
+        };
+        unsafe { align_rt_free(s.ptr as *mut u8) };
+        out
+    }
+
+    #[test]
+    fn replace_first_and_all() {
+        let d = compile("[0-9]+");
+        assert_eq!(replace(d, "a12b345", "#", false), "a#b345");
+        assert_eq!(replace(d, "a12b345", "#", true), "a#b#");
+        // No match returns an independently owned copy of the original (never aliases the input).
+        assert_eq!(replace(d, "abc", "#", true), "abc");
+        // An empty result owns no buffer.
+        assert_eq!(replace(d, "12", "", true), "");
+        unsafe { align_rt_regex_free(d) };
+    }
+
+    #[test]
+    fn replace_expands_groups_and_dollar() {
+        // `$0` = whole match, `$$` = a literal `$`.
+        let n = compile("[0-9]+");
+        assert_eq!(replace(n, "x9y", "[$0]", true), "x[9]y");
+        assert_eq!(replace(n, "9", "$$", true), "$");
+        unsafe { align_rt_regex_free(n) };
+        // Named groups via `${name}`.
+        let date = compile(r"(?P<y>[0-9]{4})-(?P<m>[0-9]{2})");
+        assert_eq!(replace(date, "2026-07", "${m}/${y}", false), "07/2026");
+        unsafe { align_rt_regex_free(date) };
+    }
+
+    #[test]
+    fn replace_abi_guards() {
+        let h = compile("x");
+        // A null handle / negative len returns an empty owned result, never reads.
+        let s = unsafe { align_rt_regex_replace(core::ptr::null(), "x".as_ptr(), 1, "y".as_ptr(), 1, 1) };
+        assert!(s.ptr.is_null() && s.len == 0);
+        let s = unsafe { align_rt_regex_replace(h, "x".as_ptr(), -1, "y".as_ptr(), 1, 1) };
+        assert!(s.ptr.is_null() && s.len == 0);
+        // A null replacement pointer with a positive len is rejected (empty, no read).
+        let s = unsafe { align_rt_regex_replace(h, "x".as_ptr(), 1, core::ptr::null(), 3, 1) };
+        assert!(s.ptr.is_null() && s.len == 0);
+        unsafe { align_rt_regex_free(h) };
     }
 
     #[test]
