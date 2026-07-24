@@ -232,7 +232,7 @@ value outlives its scope, without leaking heap storage or individually freeing a
 ```text
 Result<T,E>
 ?
-Error { NotFound, Invalid, Denied, Code(i32) }   // canonical builtin error sum type
+Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // canonical builtin error sum type
 ```
 
 No exceptions. `E` is any sum type (a domain may use its own error enum). `Error` is the builtin

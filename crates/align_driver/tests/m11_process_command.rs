@@ -66,6 +66,77 @@ pub fn main() -> Result<(), Error> {\n\
     assert_eq!(s.trim_end(), "/", "the child's pwd is the set cwd; got: {s:?}");
 }
 
+/// Slice 5 — `c.timeout_ns(ns)` bounds the run: a child that overruns is killed and `c.run()` yields
+/// `Err(Error.Timeout)`, matchable as the `Timeout` variant DISTINCTLY from `Ok`/a nonzero exit. The
+/// `sleep 10` child with a 100 ms timeout returns the `Timeout` arm's exit code (42), not `Ok` (1).
+#[test]
+fn command_timeout_yields_err_timeout() {
+    if !backend_available() {
+        return;
+    }
+    if !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    let src = "import std.process\n\
+pub fn main() -> i32 {\n\
+  c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"sleep 10\"])\n\
+  c.timeout_ns(100_000_000)\n\
+  match c.run() {\n\
+    Ok(out) => out.code() as i32,\n\
+    Err(e) => match e {\n\
+      Timeout => 42,\n\
+      _       => 2,\n\
+    },\n\
+  }\n\
+}\n";
+    let out = build_and_run("cmd-timeout", src);
+    assert_eq!(out.status.code(), Some(42), "a hung child past its timeout → Err(Error.Timeout); stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A `Timeout` set but NOT exceeded is inert: a quick child finishes and `c.run()` is `Ok`, with the
+/// captured output and exit code intact (the timeout path is not taken). Also proves `Error.Timeout`
+/// is a user-nameable variant usable in an ordinary `match` arm alongside the other categories.
+#[test]
+fn command_timeout_not_triggered_and_variant_is_nameable() {
+    if !backend_available() {
+        return;
+    }
+    if !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    let src = "import std.process\n\
+pub fn main() -> i32 {\n\
+  c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf hi; exit 5\"])\n\
+  c.timeout_ns(30_000_000_000)\n\
+  match c.run() {\n\
+    Ok(out) => out.code() as i32,\n\
+    Err(e)  => match e {\n\
+      NotFound => 90,\n\
+      Invalid  => 91,\n\
+      Denied   => 92,\n\
+      Timeout  => 93,\n\
+      Code(n)  => n,\n\
+    },\n\
+  }\n\
+}\n";
+    let out = build_and_run("cmd-timeout-inert", src);
+    assert_eq!(out.status.code(), Some(5), "finished in time → Ok(out), exit code 5; stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `.timeout_ns()` requires an `i64` argument — a non-integer is a type error.
+#[test]
+fn command_timeout_requires_i64() {
+    let bad = "import std.process\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"])\n\
+  c.timeout_ns(\"soon\")\n\
+  out := c.run()?\n\
+  print(out.code())\n\
+  Ok(())\n\
+}\n";
+    assert!(check_errs("cmd-timeout-badarg", bad), "timeout_ns with a non-i64 argument must error");
+}
+
 /// `process.command` requires `import std.process`; without it the call is a diagnostic.
 #[test]
 fn command_requires_the_import() {

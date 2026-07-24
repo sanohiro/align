@@ -237,6 +237,7 @@ fn log_request_error(kind: str, c: pkg.web.types.Ctx, err: Error) -> () {
     NotFound => line.write("NotFound")
     Invalid => line.write("Invalid")
     Denied => line.write("Denied")
+    Timeout => line.write("Timeout")
     Code(code) => {
       line.write("Code(")
       line.write_int(code)

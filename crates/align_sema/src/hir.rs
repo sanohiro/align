@@ -1057,6 +1057,12 @@ pub enum ExprKind {
     /// [`HttpBody`]). The `ty` is [`crate::Ty::Unit`]. `command` is a bound [`crate::Ty::Command`] local;
     /// `dir` is a borrowed `str`. A `dir` with an interior NUL aborts at runtime. Impure.
     CommandCwd { command: Box<Expr>, dir: Box<Expr> },
+    /// `c.timeout_ns(ns)` (`std.process` Slice 5) — set the command `command`'s run timeout in place
+    /// (`c.run()` kills the child and yields `Err(Error.Timeout)` if it overruns `ns` nanoseconds),
+    /// mutating the handle (not consumed — like [`CommandCwd`]). The `ty` is [`crate::Ty::Unit`].
+    /// `command` is a bound [`crate::Ty::Command`] local; `ns` is a borrowed `i64`. `ns == 0` means no
+    /// timeout (the Slice-4 default); a negative `ns` aborts at runtime (like a bad `cwd` path). Impure.
+    CommandTimeout { command: Box<Expr>, ns: Box<Expr> },
     /// `c.run()` (`std.process` Slice 4) — fork a child running the command with BOTH stdout and stderr
     /// captured, drain both pipes to EOF, reap the child, and yield `Result<run_output, Error>` (the
     /// `ty` — an owned [`crate::Ty::RunOutput`] Ok payload). `command` is **borrowed** (re-runnable, like

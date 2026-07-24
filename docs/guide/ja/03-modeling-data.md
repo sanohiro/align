@@ -116,7 +116,7 @@ fn main() -> i32 {
 
 ## 組み込みの `Error`
 
-Align には言語組み込みの直和型が1つだけ存在します。それが `Error` 型であり、`Result<T, Error>` の標準的なエラーペイロードとして使用されます。バリアントは OS との境界で必要とされるカテゴリ（`NotFound`、`Invalid`、`Denied`、およびその他のエラーを表現する `Code(i32)`）です。`Error` 型を再定義することはできませんが、他の直和型とまったく同じように `match` で処理できます。
+Align には言語組み込みの直和型が1つだけ存在します。それが `Error` 型であり、`Result<T, Error>` の標準的なエラーペイロードとして使用されます。バリアントは OS との境界で必要とされるカテゴリ（`NotFound`、`Invalid`、`Denied`、`Timeout`（実行・転送のデッドライン）、およびその他のエラーを表現する `Code(i32)`）です。`Error` 型を再定義することはできませんが、他の直和型とまったく同じように `match` で処理できます。
 
 ```align
 fn describe(e: Error) -> i64 = match e {

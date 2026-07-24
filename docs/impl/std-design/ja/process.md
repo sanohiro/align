@@ -7,7 +7,9 @@
 
 > **ステータス:** M11 のコアは完了済みです（exit/abort、spawn/wait/kill、exec は実装済み）。**拡張は
 > 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
-> よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。未実装です。
+> よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。**スライス
+> 4〜5 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
+> バリアント）。スライス 6（`c.env`/`c.env_clear`）と後回しの bytes 層は未実装です。
 
 ## Overview
 
@@ -214,6 +216,14 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 
 ## Shared prerequisite — the `Error.Timeout` variant (canonical definition; `std.http`/`std.net` reuse it)
 
+> **実装済み(スライス 5)。** 5 バリアントの `Error` enum が着地した。sema は `Denied` と `Code` の間に
+> `Timeout` を登録し(`ERROR_VARIANT_CODE` は `4` になり、`Code` は末尾のまま)、ランタイムは
+> `AL_TIMEOUT = 4` / `AL_CODE = 5` を持ち、MIR の `make_error_from_status` の分岐レス復号は
+> `tag = min(status-1, 4)` / `Code = status-5` になった。一般の errno→`Error` の対応は不変で、タイムアウトは
+> タイムアウト箇所で `AL_TIMEOUT` を**明示的に**返すことでのみ表面化する(無関係な `ETIMEDOUT`/`EAGAIN` errno
+> は依然として `Error.Code` に対応づく)。`Error.Timeout` はユーザから見える。`NotFound`/`Invalid`/`Denied`/
+> `Code(c)` と並んで `match` のアームを名指しできる。
+
 タイムアウトは、非ゼロの終了とトランスポートエラーから**区別可能**でなければならない(align-llm は「テストが
 ハングした」と「テストが失敗した」を区別する必要がある)。組み込みの `Error` enum は 4 つのバリアント
 (`NotFound`, `Invalid`, `Denied`, `Code(i32)`)を持ち、timeout は無い。本拡張は 5 つ目の
@@ -379,7 +389,13 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
    must-have であり子側の `chdir` が些細なのでここに畳み込む。よって S4 は完結した must-have の提供になる(空の
    足場ではなく、実セッタを持つ `command`)。
 5. `c.timeout_ns(ns)` + `Error.Timeout` のコア変更 — 「ハングしたテストがループを凍らせる」の修正
-   (kill + `Err(Timeout)`)。
+   (kill + `Err(Timeout)`)。**実装済み。** `c.timeout_ns(ns: i64)` はバインド済みローカルへのインプレース
+   セッタ(`()`)。`ns == 0` = タイムアウト無し(スライス 4 の既定)、負の `ns` はビルド時に abort。`c.run()`
+   はデッドラインを 2 パイプのドレインに通す(残り時間 ns→ms、`>= 1` にクランプして `poll`)。期限切れ時は子の
+   **プロセスグループ**全体を `SIGKILL` し(子は自分のグループに `setpgid` するので、`sh -c "sleep 10"` の孫
+   プロセスも回収される。さもないとキャプチャパイプを開いたままドレインをハングさせる)、EOF までドレイン、
+   `waitpid`、そして `Err(Error.Timeout)` を返す(部分出力は破棄)。`poll` の `EINTR` は残りデッドラインを
+   再計算する。`timeout_ns == 0` は無限の `-1` `poll`(スライス 4 の挙動そのまま)を保つ。
 6. `c.env(name,value)` + `c.env_clear()`。
 7. *(先送り)* bytes 層 `c.run_bytes()` — 需要に応じて出荷。
 

@@ -1538,6 +1538,11 @@ fn build_module<'c>(
         "command_cwd".to_string(),
         module.add_function("align_rt_command_cwd", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
     );
+    // `command_timeout(c, ns: i64)` sets the child run timeout in place (void; aborts on a negative ns).
+    funcs.insert(
+        "command_timeout".to_string(),
+        module.add_function("align_rt_command_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
     funcs.insert(
         "command_run".to_string(),
         module.add_function("align_rt_command_run", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
@@ -7668,6 +7673,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (dp, dl) = self.split_str(dir)?;
                 self.builder
                     .build_call(self.funcs["command_cwd"], &[c.into(), dp.into(), dl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `c.timeout_ns(ns)` — set the command handle's run timeout in place; no value.
+            Rvalue::CommandTimeout { command, ns } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let n = self.operand(ns)?;
+                self.builder
+                    .build_call(self.funcs["command_timeout"], &[c.into(), n.into()], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
