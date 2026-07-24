@@ -870,11 +870,12 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
   「理想形か、さもなくば先送り」に従い、スライス 3 はプールの idle 期限切れと SIGPIPE 安全/スタール再試行の
   堅牢性を出荷し、**I/O タイムアウトは net 基盤（レール）の non-blocking/deadline 基盤へ先送り**する
   (セマンティクス上は不変)。半端な実装を入れる代わりに、v1 の既知の制約としてここに記録する。
-  - **→ 2026-07-24 に設計で解決(align-llm Request 2)。下記「I/O timeouts」を参照。** align-llm
-    (コネクションをブラックホール化しうるエンドポイントへの LLM API 呼び出し)が、具体的なクライアント需要と
-    欠けていた設定面を提供する。設計は net 基盤（レール）の non-blocking-`connect` 基盤 +
-    `SO_RCVTIMEO`/`SO_SNDTIMEO` と、クライアント既定 / リクエスト単位上書きの `timeout(ns)` を着地させる —
-    本注記が欠けていると言っていた 2 つである。未実装。
+  - **→ 解決(align-llm Request 2)。下記「I/O timeouts」を参照。** align-llm(コネクションを
+    ブラックホール化しうるエンドポイントへの LLM API 呼び出し)が、具体的なクライアント需要と欠けていた
+    設定面を提供した。net 基盤（レール）の non-blocking-`connect` 基盤 + `SO_RCVTIMEO`/`SO_SNDTIMEO` と、
+    クライアント既定 / リクエスト単位上書きの `timeout(ns)` — 本注記が欠けていると言っていた 2 つ — は
+    **実装済み**(G3-1 の先送りはクライアント側で完全に解決)。上記のサーバ側エスカレーションは引き続き
+    独自の v1 後の堅牢化項目として残る。
   - **サブケース — HEAD / 304 のフレーミング(スライス 1/2 から継承)。** `HEAD` レスポンスや
     `304 Not Modified` は、正当に `Content-Length` ヘッダを持つが**ボディを持たない**。v1 の読み取り
     ループは純粋に `Content-Length` でフレーミングする(リクエストメソッドやステータスで特別扱いしない)
@@ -887,7 +888,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
   `Error.Code`、プロトコル違反は `Error.Invalid`。(メッセージレスな `Error` enum はより広い別課題として残る
   が、DC-1 の「HTTPS 未対応」負債は解消 — HTTPS は *対応済み*。)
 
-## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, IMPLEMENTED 2026-07-24)
 
 上記 G3-1 の先送りを解決する。動機は `align-llm` の LLM API 呼び出し(`POST /v1/chat/completions`)であり、
 コネクションをハングまたはブラックホール化しうるエンドポイントが相手である。タイムアウトが無いと、1 リクエストが
@@ -947,12 +948,47 @@ errno)、`Error.Denied`(TLS 検証失敗)、4xx/5xx ステータスを運ぶ通�
 および `timeout` に対する sema の `HttpClient`/`HttpRequest` メソッドディスパッチ。有効タイムアウトの解決
 (リクエスト上書き、無ければクライアント既定)は `http_client_perform` で行う。
 
+### 実装済みの姿(2026-07-24)
+
+- **言語。** 新しい HIR/MIR/codegen バリアント `HttpRequestTimeout { req, ns }` /
+  `HttpClientTimeout { client, ns }`(`Ty::Unit`、i64 引数、束縛ローカルレシーバ —
+  `r.body`/`c.timeout_ns` と同じ形)を、あらゆる sema パス(EffectScan — **Pure**、フィールド格納;
+  `region_of`→Static;`slice_is_local`;EscapeCheck walk/visit;MoveCheck — 借用のみ、何も消費しない;
+  `borrow_sources`;finalize)へ通し、`lower_http` 経由で `align_rt_http_timeout` /
+  `align_rt_http_client_timeout` へ下ろす。負の `ns` はセッタで abort、非 i64 引数は型エラー。
+- **有効タイムアウト。** `http_client_perform` が `req.timeout_ns > 0 ? req : client` を解決
+  (クライアント既定は `get_many` の共有ワーカが安全に読めるよう `AtomicI64`)し、1 つの `ns` を
+  `http_connect_fd`/`http_tls_connect`(→ `align_rt_tcp_connect(…, ns, …)`、connect + ハンドシェイク)と
+  `http_arm_conn_timeout(fd, ns)`(`SO_RCVTIMEO` + `SO_SNDTIMEO` 両方)へ通す。後者は **毎リクエスト** —
+  新規 AND 再利用プール conn — で交換前に arm する。**再 arm/クリア:** `SO_*TIMEO` はプール済み fd に
+  残るため、再利用 conn は常に再 arm し、`ns == 0` はゼロ `timeval` =「永久ブロック」へ**クリア**する
+  (タイムアウト付きリクエストがプールした conn が、後続の無タイムアウトリクエストへ古いデッドラインを
+  持ち込まない)。新規 conn で `ns == 0` の場合は arm 自体をスキップ(`setsockopt` 無し — タイムアウト前と
+  バイト一致)。
+- **失効 → `AL_TIMEOUT`。** 平文 `plain_read`/`http_send_all` はブロッキング fd の
+  `EAGAIN`/`EWOULDBLOCK` を `io_read_write_status` で写す(ブロッキングソケットはデッドラインが arm された
+  ときのみ `EAGAIN` を返すので、`ns == 0` では写像はバイト一致)。**TLS** が微妙な部分:`SO_*TIMEO` の失効は
+  下層の `recv`/`send` を `EAGAIN` にし、OpenSSL はそれを `SSL_ERROR_SYSCALL` **または**
+  `SSL_ERROR_WANT_READ`/`WANT_WRITE`(バージョン依存)として表面化する。`tls_read`/`tls_write_all` は
+  `SSL_get_error` の**前に** `errno` を捕捉し、デッドラインが arm されているとき(`has_deadline`)に
+  `err ∈ {SYSCALL, WANT_READ, WANT_WRITE}` **かつ** `errno ∈ {EAGAIN, EWOULDBLOCK}` を `AL_TIMEOUT` に
+  写す(それ以外は `WANT_*` はリトライ、`SYSCALL` は errno を写す — 従来通りで、`ns == 0` はバイト一致・
+  スピンなし)。ハンドシェイク(`SSL_connect`)も同じ arm された fd 上で走り、同一条件を `AL_TIMEOUT` に写す。
+
 ### Test / gate
 
 **コネクションを accept するが決して応答しない**エンドポイントへのリクエストが、無期限にブロックする代わりに設定
 上限内で `Err(Timeout)` を返す(Request-2 の受け入れゲート)。ブラックホール化された(決して accept しない)アドレスへの
 connect が上限内で `Err(Timeout)` を返す。`ns == 0` は現在のブロッキング挙動を保つ。通常の高速リクエストは影響
-を受けない。
+を受けない。**出荷したテスト:** `align_runtime` ユニット — セッタ格納 + リクエストがクライアントを上書き、
+accept 後無応答 → `AL_TIMEOUT`(read 経路、`SO_RCVTIMEO` + 平文写像のエンドツーエンド)、フルバックログの
+ループバックブラックホール → `AL_TIMEOUT`(connect 経路、Linux)、高速応答は無影響 — さらに
+`crates/align_driver/tests/http_timeout.rs` の Align 表面経由 E2E(`cl.timeout` / `r.timeout` →
+サイレントサーバで `Err(Error.Timeout)`、リクエスト単位上書き、高速時は無効、および unbound レシーバ / 非 i64
+のコンパイルゲート)。TLS のタイムアウト経路は共有 `SO_*TIMEO` 機構と平文 E2E でカバーされる(正の TLS
+ラウンドトリップはドライバハーネスから駆動できない — `#[cfg(test)]` の信頼フックがそこには無い、スライス 5 の
+記録どおり);TLS トランスポートが唯一異なる `tls_read`/`tls_write_all` の `has_deadline` 写像は上に記述した。
+既存の http/TLS/pool/get_many/stream テストはすべて不変で通る(有効 0 のバイト一致不変条件)。
 
 ## Pitfalls
 

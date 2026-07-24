@@ -1229,6 +1229,12 @@ pub enum ExprKind {
     /// `r.body(data)` — set the request `req`'s body to a copy of `data` (a byte view — `str` /
     /// `slice<u8>`), mutating in place. The `ty` is [`crate::Ty::Unit`]. `req` is a bound local. Pure.
     HttpBody { req: Box<Expr>, data: Box<Expr> },
+    /// `r.timeout(ns)` — set the request `req`'s per-request I/O timeout (`ns` nanoseconds), mutating
+    /// in place. The `ty` is [`crate::Ty::Unit`]. `ns == 0` = inherit the client default; a positive
+    /// `ns` overrides the client default; a negative `ns` **aborts** at runtime (the `command.timeout_ns`
+    /// precedent). `req` is a bound local; `ns` is a Copy `i64`. Pure — this stores a field on the
+    /// handle (the deadline is applied at perform time, no I/O here). The build-dual of [`HttpBody`].
+    HttpRequestTimeout { req: Box<Expr>, ns: Box<Expr> },
     /// `http.parse(data)` — parse a complete HTTP/1.1 response buffer `data` (a byte view) into an
     /// owned [`crate::Ty::HttpResponse`], yielding `Result<response, Error>` (the `ty`). A malformed
     /// status line / non-numeric status / header without `:` / chunked encoding / bad or oversized
@@ -1251,6 +1257,12 @@ pub enum ExprKind {
     /// Slice 2 carries no pooled state. **Impure**? No — allocating the handle performs no I/O; the
     /// *requests* (`get`/`post`/`request`) are Impure. No operands.
     HttpClient,
+    /// `cl.timeout(ns)` — set the client `client`'s default I/O timeout (`ns` nanoseconds) applied to
+    /// every request on it, mutating in place. The `ty` is [`crate::Ty::Unit`]. `ns == 0` = no timeout
+    /// (the default — current blocking behavior); a negative `ns` **aborts** at runtime. `client` is a
+    /// bound local (borrowed, not consumed); `ns` is a Copy `i64`. Pure — stores a field, applied per
+    /// request at perform time. A request's own `timeout > 0` overrides this default.
+    HttpClientTimeout { client: Box<Expr>, ns: Box<Expr> },
     /// `cl.get(url)` — perform a `GET url` over a fresh connection, yielding `Result<response, Error>`
     /// (the `ty`). `cl` is a bound [`crate::Ty::HttpClient`] local (borrowed, not consumed); `url` is a
     /// borrowed `str`. **Impure** (network I/O). A 4xx/5xx status is `Ok(response)` (http.md P2); a
