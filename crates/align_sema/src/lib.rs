@@ -4511,6 +4511,13 @@ impl EffectScan<'_> {
                 self.expr(command);
                 self.expr(ns);
             }
+            // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` do a `setsockopt` syscall — Impure,
+            // like `c.timeout_ns(ns)` on a command (the conn is borrowed, the ns is Copy).
+            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                self.impure_direct = true;
+                self.expr(conn);
+                self.expr(ns);
+            }
             ExprKind::CommandEnv { command, name, value } => {
                 self.impure_direct = true;
                 self.expr(command);
@@ -6126,6 +6133,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            // `c.read_timeout_ns` / `c.write_timeout_ns` produce `()` (a socket-option side effect) —
+            // nothing borrows, so `Static` (like `c.cwd`/`c.timeout_ns`).
+            | ExprKind::TcpReadTimeout { .. }
+            | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. }
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
@@ -6425,6 +6436,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            // `c.read_timeout_ns`/`c.write_timeout_ns` produce `()`, never a slice — not local-backed.
+            | ExprKind::TcpReadTimeout { .. }
+            | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. }
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
@@ -7180,6 +7194,12 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(command, depth);
                 self.walk(ns, depth);
             }
+            // `c.read_timeout_ns` / `c.write_timeout_ns` borrow the conn in place (no escape) and take a
+            // Copy `i64` — just recurse to check an escape *inside* the operands (like `CommandTimeout`).
+            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                self.walk(conn, depth);
+                self.walk(ns, depth);
+            }
             ExprKind::CommandEnv { command, name, value } => {
                 self.walk(command, depth);
                 self.walk(name, depth);
@@ -7856,6 +7876,12 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::CommandTimeout { command, ns } => {
                 self.visit(command);
+                self.visit(ns);
+            }
+            // `c.read_timeout_ns` / `c.write_timeout_ns` — recurse into the operands (the conn is
+            // borrowed in place, the ns is Copy; no escape), like `CommandTimeout`.
+            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                self.visit(conn);
                 self.visit(ns);
             }
             ExprKind::CommandEnv { command, name, value } => {
@@ -8773,6 +8799,8 @@ impl<'a> MoveCheck<'a> {
             // `out.code` (`i64`) borrow nothing; `out.stdout()`/`out.stderr()` (which DO borrow `out`)
             // are in the `storage_roots` group above.
             | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandTimeout { .. }
+            // `c.read_timeout_ns` / `c.write_timeout_ns` yield `()` (a socket-option side effect) — no borrow.
+            | ExprKind::TcpReadTimeout { .. } | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
             | ExprKind::RunOutputCode { .. } | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
@@ -9745,6 +9773,12 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::CommandTimeout { command, ns } => {
                 self.expr(command, moved, false, false);
+                self.expr(ns, moved, false, false);
+            }
+            // `c.read_timeout_ns` / `c.write_timeout_ns` BORROW the conn (in-place socket-option set,
+            // never consumed — like `c.timeout_ns` / `c.reader()`); every operand is a read (no move).
+            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                self.expr(conn, moved, false, false);
                 self.expr(ns, moved, false, false);
             }
             ExprKind::CommandEnv { command, name, value } => {
@@ -13787,12 +13821,24 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // `std.net` stream borrows on a `tcp_conn`: `c.reader()` / `c.writer()` hand back an M9
-        // reader/writer over the conn's socket fd (`owns_fd:false`), region-bound to `c`. Dispatched
-        // on the receiver type so the names stay free on other values.
+        // reader/writer over the conn's socket fd (`owns_fd:false`), region-bound to `c`; and the
+        // in-place deadline setters `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` (each `()`).
+        // Dispatched on the receiver type so the names stay free on other values.
         if matches!(method, "reader" | "writer") {
             let recv_expr = self.check_expr(recv, None);
             if recv_expr.ty == Ty::TcpConn {
                 return self.check_conn_stream(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `tcp_conn` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        if matches!(method, "read_timeout_ns" | "write_timeout_ns") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::TcpConn {
+                return self.check_conn_timeout(recv_expr, method, args, span);
             }
             if recv_expr.ty != Ty::Error {
                 self.diags
@@ -20191,6 +20237,56 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` on a `tcp_conn` ([`Ty::TcpConn`]), the
+    /// receiver already evaluated. Arm (or clear, `ns == 0`) an `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline on
+    /// the conn's socket in place; the result is `()`. The conn is **borrowed** (not consumed, like
+    /// `c.reader()`); `ns` is required to be exactly `i64` (mirroring `c.timeout_ns` on a command). A
+    /// negative `ns` aborts at runtime. The bound-receiver gate mirrors `check_conn_stream`.
+    fn check_conn_timeout(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate (mirrors `check_conn_stream`): the conn must be a bound local — an
+        // unbound owned-conn temporary is not `Drop`ped yet, so setting an option on its fd (about to
+        // leak) is meaningless. Bind the conn first.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the connection to a local first, then set a timeout (`c := tcp.connect(...)?` then `c.read_timeout_ns(ns)`) — a temporary owned connection handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'.{method}()' takes 1 argument (the timeout in nanoseconds, i64), got {}", args.len()), span);
+            return err;
+        }
+        let ns = self.check_expr(&args[0], None);
+        if ns.ty == Ty::Error {
+            return err;
+        }
+        // Require *exactly* `i64` (binding a bare int literal's inference var), mirroring
+        // `c.timeout_ns(ns)`: a narrower operand would mismatch the runtime `align_rt_tcp_*_timeout(c,
+        // i64)`. `ns == 0` clears the deadline (block forever); a negative `ns` aborts at runtime.
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(ns.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(ns.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(
+                    format!("'.{method}()' expects a timeout in nanoseconds (i64), got {}", ty_name(other)),
+                    args[0].span,
+                );
+                return err;
+            }
+        }
+        let kind = if method == "read_timeout_ns" {
+            ExprKind::TcpReadTimeout { conn: Box::new(recv_expr), ns: Box::new(ns) }
+        } else {
+            ExprKind::TcpWriteTimeout { conn: Box::new(recv_expr), ns: Box::new(ns) }
+        };
+        Expr { kind, ty: Ty::Unit, span }
+    }
+
     /// `l.accept()` on a `tcp_listener` ([`Ty::TcpListener`]), the receiver already evaluated. Blocks
     /// for an inbound connection and returns a new **owned** `tcp_conn` (`Result<tcp_conn, Error>`) —
     /// the accepted conn is freshly owned (never a borrow of the listener), so its result is not
@@ -21808,6 +21904,10 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::CommandTimeout { command, ns } => {
                 self.finalize_expr(command);
+                self.finalize_expr(ns);
+            }
+            ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
+                self.finalize_expr(conn);
                 self.finalize_expr(ns);
             }
             ExprKind::CommandEnv { command, name, value } => {

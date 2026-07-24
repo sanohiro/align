@@ -159,7 +159,15 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 **Note**: v1 はブロッキングプール上のブロッキングソケットである。Non-blocking/epoll/io_uring は、同じ
 シグネチャの背後に置く後日の Linux バックエンドであって、意味論上の変更ではない。
 
-## I/O timeouts (align-llm Request 2 — DESIGNED 2026-07-24, not yet implemented)
+## I/O timeouts (align-llm Request 2 — net レール実装済み 2026-07-24;http サーフェスは保留)
+
+> **ステータス:** 以下の net レールは実装済み — `align_rt_tcp_connect` に `timeout_ns` パラメータが加わり
+> (ノンブロッキング connect + `poll(POLLOUT)` デッドライン;`timeout_ns == 0` は従来どおりのブロッキング
+> connect)、`c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)`(`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`)は
+> その場でデッドラインを設定し、その満了を reader/writer のバイト経路が `Err(Error.Timeout)` として表面化する。
+> raw な `tcp.connect(host, port)` サーフェスはタイムアウト無しのままでリテラル `0` を渡す。`std.http` の
+> `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は後続 PR で、同じ
+> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。
 
 `std.http` のリクエスト単位タイムアウト(http.md「I/O timeouts」)は net 基盤（レール）に載るので、基盤はここで
 設計する;net は raw-socket 呼び出し側向けにこれを直接も公開する。動機は `align-llm` の LLM API 呼び出し

@@ -740,13 +740,23 @@ pub enum Rvalue {
     /// owned `tcp_conn` handle (a bare pointer) into `out`. Yields an `i32` status (0 = ok, else the
     /// shared errno/status table; a bad port or bad host is `AL_INVALID`). Mirrors [`Rvalue::ReaderOpen`]
     /// (a handle payload written into an out slot), with a second `port` operand.
-    TcpConnect { host: Operand, port: Operand, out: Slot },
+    /// The `timeout_ns` operand bounds each candidate's `connect`: `0` (the constant the raw
+    /// `tcp.connect` surface lowers, since Align has no optional args) preserves the exact blocking
+    /// connect; a positive value bounds the handshake with a deadline and can yield `AL_TIMEOUT`.
+    TcpConnect { host: Operand, port: Operand, timeout_ns: Operand, out: Slot },
     /// `c.reader()` — borrow an M9 `reader` over the `tcp_conn` operand's socket fd (`owns_fd:false`).
     /// Yields the reader handle pointer (like [`Rvalue::ReaderStdin`], but over the conn's fd).
     ConnReader(Operand),
     /// `c.writer()` — borrow an M9 (unbuffered) `writer` over the `tcp_conn` operand's socket fd
     /// (`owns_fd:false`). Yields the writer handle pointer.
     ConnWriter(Operand),
+    /// `c.read_timeout_ns(ns)` — arm (`ns > 0`) or clear (`ns == 0`) an `SO_RCVTIMEO` receive deadline
+    /// on the `tcp_conn`'s socket fd, in place. No value (`Ty::Unit`). A negative `ns` aborts at
+    /// runtime. The conn operand is borrowed (not consumed), the `ns` operand is a Copy `i64`. Impure.
+    TcpReadTimeout { conn: Operand, ns: Operand },
+    /// `c.write_timeout_ns(ns)` — arm/clear an `SO_SNDTIMEO` send deadline on the `tcp_conn`'s socket
+    /// fd, in place. No value (`Ty::Unit`). Same operand/abort contract as [`Rvalue::TcpReadTimeout`].
+    TcpWriteTimeout { conn: Operand, ns: Operand },
     /// `tcp.listen(host, port)` — resolve `host` (`AI_PASSIVE`) and bind+listen on `port`, writing the
     /// owned `tcp_listener` handle (a bare pointer) into `out`. Yields an `i32` status (0 = ok, else
     /// the shared errno/status table; a bad port/host is `AL_INVALID`). Mirrors [`Rvalue::TcpConnect`]
@@ -3076,6 +3086,22 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ConnWriter(c)));
             Operand::Value(v)
+        }
+        // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` — set an SO_RCVTIMEO/SO_SNDTIMEO deadline
+        // on the conn's fd in place; no value (like `c.cwd(dir)`).
+        hir::ExprKind::TcpReadTimeout { conn, ns } => {
+            let c = lower_expr(b, conn);
+            let n = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::TcpReadTimeout { conn: c, ns: n }));
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::TcpWriteTimeout { conn, ns } => {
+            let c = lower_expr(b, conn);
+            let n = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::TcpWriteTimeout { conn: c, ns: n }));
+            Operand::Const(Const::Unit)
         }
         hir::ExprKind::TcpListen { host, port } => lower_tcp_listen(b, host, port, e.ty),
         hir::ExprKind::TcpAccept { listener } => lower_tcp_accept(b, listener, e.ty),
@@ -8347,8 +8373,12 @@ fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result
     let out = b.new_slot(Ty::TcpConn);
     let h = lower_expr(b, host);
     let p = lower_expr(b, port);
+    // The raw `tcp.connect(host, port)` surface has no timeout argument (Align has no optional args),
+    // so it always lowers a literal `0` — the exact blocking connect. `std.http` (a later PR) builds
+    // this Rvalue with its own effective-timeout operand instead.
+    let timeout_ns = Operand::Const(Const::Int(0, i64_ty()));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::TcpConnect { host: h, port: p, out }));
+    b.push(Stmt::Let(code, Rvalue::TcpConnect { host: h, port: p, timeout_ns, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));

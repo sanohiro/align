@@ -600,11 +600,131 @@ const SO_KEEPALIVE: i32 = 9; // Linux
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const SO_KEEPALIVE: i32 = 0x0008; // macOS/BSD
 
+// `getsockopt(SO_ERROR)` reads the pending socket error after a non-blocking `connect` completes (the
+// connect-timeout substrate, net.md "I/O timeouts"); `SO_RCVTIMEO`/`SO_SNDTIMEO` arm a per-socket
+// read/write deadline (`c.read_timeout_ns`/`c.write_timeout_ns`). All three are `SOL_SOCKET` options
+// whose numeric values differ between Linux and macOS/BSD (like `SO_KEEPALIVE`), so cfg them.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SO_ERROR: i32 = 4; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_ERROR: i32 = 0x1007; // macOS/BSD
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SO_RCVTIMEO: i32 = 20; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_RCVTIMEO: i32 = 0x1006; // macOS/BSD
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SO_SNDTIMEO: i32 = 21; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_SNDTIMEO: i32 = 0x1005; // macOS/BSD
+
+// `EINPROGRESS` — a non-blocking `connect` returns this errno to mean "handshake started, poll for
+// completion". Differs between Linux and macOS/BSD. Used only by [`connect_with_deadline`].
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const EINPROGRESS: i32 = 115; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const EINPROGRESS: i32 = 36; // macOS/BSD
+
+/// `struct timeval` — the `SO_RCVTIMEO`/`SO_SNDTIMEO` option value. `tv_sec` is `time_t` (a `long` on
+/// both 64-bit Linux and macOS/BSD); `tv_usec` is `suseconds_t` — a `long` on Linux but an `int` on
+/// macOS/BSD, so cfg that field to keep the C layout exact.
+#[repr(C)]
+struct Timeval {
+    tv_sec: core::ffi::c_long,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    tv_usec: core::ffi::c_long,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    tv_usec: core::ffi::c_int,
+}
+
 /// A `tcp_conn` (`std.net`) — a Move handle owning one connected TCP socket fd; `Drop`
 /// ([`align_rt_tcp_conn_free`]) closes it. `c.reader()`/`c.writer()` hand back **borrowed** M9
 /// `Reader`/`Writer` over the same fd (`owns_fd: false`), so only this handle closes the fd.
 pub struct TcpConn {
     fd: i32,
+}
+
+/// Establish a non-blocking `connect` to `addr` bounded by an ns deadline (the connect-timeout
+/// substrate, net.md "I/O timeouts"). Sets the socket `O_NONBLOCK`, issues `connect` (expecting
+/// `EINPROGRESS`), `poll`s `POLLOUT` until the deadline, then reads `SO_ERROR` to learn the outcome.
+/// On success restores blocking mode (so the resulting fd behaves exactly like a normal blocking
+/// connection) and returns `Ok(())`. Returns `Err(AL_TIMEOUT)` when the deadline expires before the
+/// handshake completes, or `Err(<mapped errno>)` for a `connect`/`poll`/`SO_ERROR` failure. Does NOT
+/// close `fd` — the caller closes it on `Err` (and tries the next candidate address). `timeout_ns`
+/// must be `> 0` (the caller's `== 0` case takes the plain blocking path instead). A `timeout_ns` so
+/// large the deadline `Instant` would overflow falls back to an unbounded `poll(-1)` rather than
+/// panicking.
+///
+/// # Safety
+/// `fd` must be a valid open socket; `addr`/`addrlen` a valid `sockaddr` (as `getaddrinfo` filled).
+unsafe fn connect_with_deadline(fd: i32, addr: *const u8, addrlen: u32, timeout_ns: i64) -> Result<(), i32> {
+    // Deadline = now + timeout_ns. `checked_add` yields `None` on overflow (a multi-century `ns`);
+    // that degrades to an unbounded `poll` below rather than panicking (net.md: "a huge ns falling
+    // back to no-bound is fine, never panic"). `timeout_ns > 0` is the caller's contract, so the
+    // `as u64` cast is exact.
+    let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_nanos(timeout_ns as u64));
+    // Arm non-blocking so `connect` returns immediately (`EINPROGRESS`) and the `poll` owns the wait.
+    unsafe { set_nonblocking(fd) };
+    let rc = unsafe { connect(fd, addr, addrlen) };
+    if rc == 0 {
+        // Rare: an immediate connect (e.g. a loopback peer already listening). Restore blocking.
+        unsafe { clear_nonblocking(fd) };
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    // `EINPROGRESS` (or, defensively, an `EAGAIN`/`EWOULDBLOCK` some stacks report) = handshake
+    // underway; poll for completion. Any other errno is an immediate hard failure for this address.
+    let in_progress = e.raw_os_error() == Some(EINPROGRESS) || e.kind() == std::io::ErrorKind::WouldBlock;
+    if !in_progress {
+        return Err(io_error_to_status(&e));
+    }
+    // Wait for the socket to become writable (connect complete) or the deadline to pass.
+    loop {
+        let timeout_ms = match deadline {
+            Some(d) => match poll_timeout_ms(d.saturating_duration_since(std::time::Instant::now())) {
+                Some(ms) => ms,
+                None => return Err(AL_TIMEOUT), // deadline already reached
+            },
+            None => -1, // overflowed deadline: unbounded wait (never panics)
+        };
+        let mut pfd = PollFd { fd, events: POLLOUT, revents: 0 };
+        let prc = unsafe { poll(&mut pfd as *mut PollFd, 1, timeout_ms) };
+        if prc < 0 {
+            let pe = std::io::Error::last_os_error();
+            if pe.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: re-poll (deadline recomputed at the top)
+            }
+            return Err(io_error_to_status(&pe));
+        }
+        if prc == 0 {
+            // `poll` timed out — with a deadline set, the clamp-to-1ms wait is always >= the true
+            // remaining, so a `0` return means the instant has passed (mirrors `drain_two_pipes`).
+            return Err(AL_TIMEOUT);
+        }
+        break; // POLLOUT (or POLLERR/POLLHUP) — read SO_ERROR to learn the actual outcome.
+    }
+    // Read the pending connect error. A writable socket with `SO_ERROR == 0` connected cleanly; a
+    // nonzero value is the connect errno (`ECONNREFUSED`, `EHOSTUNREACH`, ...). This is the same
+    // status the blocking `connect` would have returned, so callers see identical `Error.Code`s.
+    let mut soerr: i32 = 0;
+    let mut optlen: u32 = core::mem::size_of::<i32>() as u32;
+    let g = unsafe {
+        getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            &mut soerr as *mut i32 as *mut core::ffi::c_void,
+            &mut optlen,
+        )
+    };
+    if g != 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    if soerr != 0 {
+        return Err(io_error_to_status(&std::io::Error::from_raw_os_error(soerr)));
+    }
+    // Connected. Restore blocking mode so the M9 reader/writer byte path sees a normal blocking fd.
+    unsafe { clear_nonblocking(fd) };
+    Ok(())
 }
 
 /// `tcp.connect(host, port)` — resolve `host` via `getaddrinfo` (AF_UNSPEC — both IPv4 and IPv6,
@@ -617,15 +737,21 @@ pub struct TcpConn {
 /// when every candidate address failed. Leaves `*out = null` on failure. `freeaddrinfo` runs on
 /// every path (no leak).
 ///
-/// v1 makes no `EINTR` retry on `connect` (an interrupted attempt fails that address and moves on
-/// to the next candidate) and sets no connect timeout (a hung/black-holed peer blocks indefinitely)
-/// — both acceptable for v1, documented here rather than silently assumed.
+/// `timeout_ns` bounds each candidate's `connect`: `0` (the default the raw `tcp.connect` surface
+/// passes — Align has no optional args) preserves the exact blocking `connect` (a hung/black-holed
+/// peer blocks indefinitely, the pre-timeout behavior); a **positive** value bounds the handshake
+/// with a `poll` deadline via [`connect_with_deadline`], returning `AL_TIMEOUT` (`Error.Timeout`) if
+/// no address connects in time. A **negative** `timeout_ns` is treated as `0` (no bound). `std.http`
+/// threads its effective request timeout through this same parameter.
+///
+/// v1 makes no `EINTR` retry on the blocking `connect` (an interrupted attempt fails that address and
+/// moves on to the next candidate); the deadline path does retry `EINTR` on `poll`.
 ///
 /// # Safety
 /// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
 /// `*mut TcpConn` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpConn) -> i32 {
+pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, port: i64, timeout_ns: i64, out: *mut *mut TcpConn) -> i32 {
     if out.is_null() {
         return AL_INVALID;
     }
@@ -674,28 +800,42 @@ pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, po
             cur = ai.ai_next;
             continue;
         }
-        let rc = unsafe { connect(fd, ai.ai_addr, ai.ai_addrlen) };
-        if rc == 0 {
-            // Connected. Enable TCP keepalive (best-effort — ignore the result: an unset keepalive
-            // does not make the connection unusable).
-            let on: i32 = 1;
-            unsafe {
-                setsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_KEEPALIVE,
-                    &on as *const i32 as *const core::ffi::c_void,
-                    core::mem::size_of::<i32>() as u32,
-                );
+        // Establish the connection. A positive `timeout_ns` bounds the handshake with a `poll`
+        // deadline; `timeout_ns <= 0` takes the EXACT original blocking `connect` path (byte-identical
+        // to before the timeout parameter existed). Either way, a failure records the mapped status,
+        // closes this fd, and moves on to the next candidate address.
+        if timeout_ns > 0 {
+            if let Err(status) = unsafe { connect_with_deadline(fd, ai.ai_addr, ai.ai_addrlen, timeout_ns) } {
+                last_status = status;
+                unsafe { close(fd) };
+                cur = ai.ai_next;
+                continue;
             }
-            unsafe { freeaddrinfo(res) };
-            unsafe { *out = Box::into_raw(Box::new(TcpConn { fd })) };
-            return 0;
+        } else {
+            let rc = unsafe { connect(fd, ai.ai_addr, ai.ai_addrlen) };
+            if rc != 0 {
+                // Failed — record the errno and close this fd before trying the next address.
+                last_status = io_error_to_status(&std::io::Error::last_os_error());
+                unsafe { close(fd) };
+                cur = ai.ai_next;
+                continue;
+            }
         }
-        // Failed — record the errno and close this fd before trying the next address.
-        last_status = io_error_to_status(&std::io::Error::last_os_error());
-        unsafe { close(fd) };
-        cur = ai.ai_next;
+        // Connected (either path). Enable TCP keepalive (best-effort — ignore the result: an unset
+        // keepalive does not make the connection unusable).
+        let on: i32 = 1;
+        unsafe {
+            setsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                &on as *const i32 as *const core::ffi::c_void,
+                core::mem::size_of::<i32>() as u32,
+            );
+        }
+        unsafe { freeaddrinfo(res) };
+        unsafe { *out = Box::into_raw(Box::new(TcpConn { fd })) };
+        return 0;
     }
     unsafe { freeaddrinfo(res) };
     last_status
@@ -743,6 +883,78 @@ pub unsafe extern "C" fn align_rt_tcp_conn_writer(c: *mut TcpConn) -> *mut Write
     }
     let fd = unsafe { (*c).fd };
     Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered: false, buf: Vec::new() }))
+}
+
+/// Build the `struct timeval` for an `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline from a nanosecond count.
+/// `ns == 0` yields a zero `timeval` — the kernel reads that as "no timeout" (block forever), which
+/// is the intended "clear the deadline" semantics. For `ns > 0`, split into whole seconds and the
+/// microsecond remainder; a **sub-microsecond** positive `ns` (which would round to a zero `timeval`
+/// and thus silently mean "block forever") is clamped up to `1 µs` so a positive deadline is never
+/// accidentally infinite. `ns >= 0` is the caller's contract (a negative `ns` aborts before here).
+fn timeval_from_ns(ns: i64) -> Timeval {
+    if ns == 0 {
+        return Timeval { tv_sec: 0, tv_usec: 0 };
+    }
+    let secs = ns / 1_000_000_000;
+    let usecs = (ns % 1_000_000_000) / 1_000;
+    // A positive `ns` under 1 µs rounds both fields to 0 — bump the microseconds to 1 so the option
+    // is a real (tiny) deadline, not the "block forever" zero `timeval`.
+    let usecs = if secs == 0 && usecs == 0 { 1 } else { usecs };
+    Timeval { tv_sec: secs as core::ffi::c_long, tv_usec: usecs as _ }
+}
+
+/// Shared body of the two `tcp_conn` timeout setters: arm (`ns > 0`) or clear (`ns == 0`) the given
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline on the conn's fd. A null handle or a **negative** `ns`
+/// **aborts** (a programmer error / compiler-invariant break, mirroring `command.timeout_ns`). The
+/// `setsockopt` result is best-effort — a valid, connected socket does not reject `SO_*TIMEO`.
+///
+/// # Safety
+/// `c` must be null or a valid `TcpConn` pointer.
+unsafe fn tcp_set_timeout(c: *mut TcpConn, ns: i64, optname: i32, what: &str) {
+    if c.is_null() {
+        panic_abort(what);
+    }
+    if ns < 0 {
+        panic_abort(what);
+    }
+    let fd = unsafe { (*c).fd };
+    let tv = timeval_from_ns(ns);
+    unsafe {
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            optname,
+            &tv as *const Timeval as *const core::ffi::c_void,
+            core::mem::size_of::<Timeval>() as u32,
+        );
+    }
+}
+
+/// `c.read_timeout_ns(ns)` (`std.net`) — arm a receive deadline on the conn's socket via
+/// `setsockopt(SO_RCVTIMEO)`. After this, a `c.reader()` read that finds no data within `ns`
+/// nanoseconds returns `Err(Error.Timeout)` (the blocking `read` reports `EAGAIN`, which the M9
+/// reader maps to `AL_TIMEOUT` — see the read byte path). `ns == 0` clears the deadline (block
+/// forever — the default). A **negative** `ns` aborts (a programmer error, like `command.timeout_ns`).
+/// Null conn → abort (a compiler-invariant break, never reachable from a bound local). No value.
+///
+/// # Safety
+/// `c` must be null or a valid `TcpConn` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_read_timeout(c: *mut TcpConn, ns: i64) {
+    unsafe { tcp_set_timeout(c, ns, SO_RCVTIMEO, "conn.read_timeout_ns: null connection handle or negative timeout") };
+}
+
+/// `c.write_timeout_ns(ns)` (`std.net`) — arm a send deadline on the conn's socket via
+/// `setsockopt(SO_SNDTIMEO)`. After this, a `c.writer()` write that cannot make progress within `ns`
+/// nanoseconds returns `Err(Error.Timeout)` (the blocking `write` reports `EAGAIN`, mapped to
+/// `AL_TIMEOUT`). `ns == 0` clears the deadline (block forever). A **negative** `ns` aborts. Null conn
+/// → abort. No value.
+///
+/// # Safety
+/// `c` must be null or a valid `TcpConn` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_write_timeout(c: *mut TcpConn, ns: i64) {
+    unsafe { tcp_set_timeout(c, ns, SO_SNDTIMEO, "conn.write_timeout_ns: null connection handle or negative timeout") };
 }
 
 // --- tcp.listen / accept (std.net Slice 3) ----------------------------------------------------
@@ -6828,6 +7040,34 @@ fn io_error_to_status(e: &std::io::Error) -> i32 {
     }
 }
 
+/// The read/write byte-path status mapping (`std.io` `reader`/`writer`): identical to
+/// [`io_error_to_status`] EXCEPT a blocking-fd `EAGAIN`/`EWOULDBLOCK` maps to `AL_TIMEOUT`
+/// (`Error.Timeout`) instead of `Error.Code(EAGAIN)`.
+///
+/// Why this is correct: every M9 `reader`/`writer` fd is **blocking** (a file, `io.stdin`, or a
+/// `tcp_conn`'s socket). A blocking fd's `read`/`write` returns `EAGAIN`/`EWOULDBLOCK` **only** when a
+/// socket receive/send timeout (`SO_RCVTIMEO`/`SO_SNDTIMEO`, armed by `c.read_timeout_ns` /
+/// `c.write_timeout_ns`) has fired — a file never yields `EAGAIN`, and a blocking socket without a
+/// timeout waits forever. So on these fds an `EAGAIN` is unambiguously a deadline expiry, and mapping
+/// it to `Error.Timeout` is the right surface. Every non-`EAGAIN` errno is untouched (mapped exactly
+/// as [`io_error_to_status`] does), so no other error path changes.
+///
+/// **One honest exception: inherited `O_NONBLOCK` on stdio.** The runtime creates every socket/file fd
+/// blocking (and `connect_with_deadline` restores blocking before a `tcp_conn` is handed out), but
+/// `io.stdin`/`io.stdout`/`io.stderr` wrap the *inherited* fds 0/1/2, whose blocking mode this process
+/// does not control. `O_NONBLOCK` lives on the shared open-file-description and can leak in from a
+/// pipeline peer (the classic shell/Node "write to stdout: Resource temporarily unavailable"). In that
+/// rare case a no-data `stdin` read / full-pipe `stdout` write returns `EAGAIN` and now surfaces as
+/// `Error.Timeout` rather than `Error.Code(EAGAIN)`. This only relabels one error as another — an
+/// `EAGAIN` on a fd the caller believes is blocking was never a success and was already mishandled
+/// (returned, not retried) before this change; it is not a crash / hang / data-loss regression.
+fn io_read_write_status(e: &std::io::Error) -> i32 {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return AL_TIMEOUT;
+    }
+    io_error_to_status(e)
+}
+
 /// 64 KiB — large enough to amortize the syscall over many small writes, small enough to stay in
 /// cache and bound a buffered writer's memory to O(buffer).
 const BUF_WRITER_CAP: usize = 64 * 1024;
@@ -6846,9 +7086,11 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> i32 {
                 continue; // interrupted before writing: retry
             }
             // A genuine error, or a 0-byte write (treat as failure rather than spin). A 0-byte
-            // write leaves errno unset, so `io_error_to_status` yields `Code(0)` — a distinct
-            // non-success status.
-            return io_error_to_status(&e);
+            // write leaves errno unset, so the mapping yields `Code(0)` — a distinct non-success
+            // status. A blocking-fd `EAGAIN` means an armed `SO_SNDTIMEO` (`c.write_timeout_ns`)
+            // fired → `Error.Timeout` (a 0-byte write's stale/zero errno is not `EAGAIN`, so it is
+            // unaffected).
+            return io_read_write_status(&e);
         }
     }
     0
@@ -7360,7 +7602,8 @@ impl Reader {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error_to_status(&e));
+            // A blocking-fd `EAGAIN` here means an armed `SO_RCVTIMEO` fired → `Error.Timeout`.
+            return Err(io_read_write_status(&e));
         }
     }
 }
@@ -7455,7 +7698,9 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
             continue;
         }
         b.len = 0;
-        return -(io_error_to_status(&e) as i64);
+        // A blocking-fd `EAGAIN` here means an armed `SO_RCVTIMEO` (`c.read_timeout_ns`) fired →
+        // `Error.Timeout`; any other errno maps as usual.
+        return -(io_read_write_status(&e) as i64);
     }
 }
 
@@ -10565,6 +10810,20 @@ unsafe fn set_nonblocking(fd: i32) {
     }
 }
 
+/// Clear `O_NONBLOCK` on `fd` (restore blocking mode). The connect-timeout substrate sets the socket
+/// non-blocking to bound the `connect` with a `poll` deadline, then restores blocking here so the
+/// resulting `tcp_conn` behaves exactly like a normally-connected one (the M9 reader/writer byte path
+/// expects a blocking fd). Best-effort — a fresh, just-connected socket does not fail `F_SETFL`.
+///
+/// # Safety
+/// `fd` must be a valid open descriptor.
+unsafe fn clear_nonblocking(fd: i32) {
+    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+    if flags >= 0 {
+        unsafe { fcntl(fd, F_SETFL, flags & !O_NONBLOCK) };
+    }
+}
+
 /// Convert a remaining `Duration` until a deadline into the `poll` timeout argument (milliseconds).
 /// Returns `None` when the deadline has already passed (the caller must treat that as a timeout);
 /// otherwise `Some(ms)` clamped to `>= 1` (never a busy-spin `0`, which would be `poll`-returns-
@@ -11579,6 +11838,10 @@ unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn connect(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
     fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const core::ffi::c_void, optlen: u32) -> i32;
+    // `getsockopt` — read a socket option. Used by the connect-timeout substrate to read `SO_ERROR`
+    // (the pending connect error) after a non-blocking `connect` becomes writable. `optlen` is
+    // in/out (`socklen_t*` = `*mut u32`). Identical prototype on Linux and macOS/BSD.
+    fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut core::ffi::c_void, optlen: *mut u32) -> i32;
     // `send` — a socket write that can suppress `SIGPIPE` via `MSG_NOSIGNAL` (Linux). Writing to a
     // peer that has closed its read half would otherwise raise `SIGPIPE` and kill the whole process —
     // the common case when the http pool reuses a keepalive conn the server has since dropped. On
@@ -15405,7 +15668,9 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8]) -> HttpExchange 
 /// Callers must eventually pool or `close` the returned fd.
 unsafe fn http_connect_fd(host: &str, port: i64) -> Result<i32, i32> {
     let mut conn: *mut TcpConn = core::ptr::null_mut();
-    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, &mut conn) };
+    // `timeout_ns = 0` = no connect deadline (the pre-timeout blocking behavior). The `std.http`
+    // request-timeout PR will thread the client/request deadline through here.
+    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, 0, &mut conn) };
     if rc != 0 {
         return Err(rc);
     }
@@ -15840,6 +16105,9 @@ struct PollFd {
 // `poll(2)` event bits — `POLLIN` (readable), plus the two output-only conditions a parked
 // connection can report. All three have the same values on Linux and macOS/BSD.
 const POLLIN: i16 = 0x0001;
+// `POLLOUT` (writable) — the condition a non-blocking `connect` signals on completion (the
+// connect-timeout substrate polls for it). Same value on Linux and macOS/BSD.
+const POLLOUT: i16 = 0x0004;
 const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
@@ -22767,7 +23035,7 @@ mod tests {
 
         let (hp, hl) = view_of("127.0.0.1");
         let mut conn: *mut TcpConn = std::ptr::null_mut();
-        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, &mut conn) };
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, 0, &mut conn) };
         assert_eq!(rc, 0, "connect to the local listener succeeds");
         assert!(!conn.is_null(), "a successful connect writes a non-null handle");
 
@@ -22797,12 +23065,12 @@ mod tests {
     fn tcp_connect_bad_port_and_null_out() {
         let (hp, hl) = view_of("127.0.0.1");
         // A null `out` slot is rejected as Error.Invalid, never a crash.
-        assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, 80, std::ptr::null_mut()) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, 80, 0, std::ptr::null_mut()) }, AL_INVALID);
         // Out-of-range ports (0, negative, > 65535) are Error.Invalid, never an abort and never a
         // wrap into a valid port; `out` is left null.
         for bad in [0i64, -1, 65536, 70000] {
             let mut conn: *mut TcpConn = std::ptr::null_mut();
-            assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, bad, &mut conn) }, AL_INVALID, "port {bad} is invalid");
+            assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, bad, 0, &mut conn) }, AL_INVALID, "port {bad} is invalid");
             assert!(conn.is_null(), "a rejected port leaves out null");
         }
     }
@@ -22816,9 +23084,82 @@ mod tests {
         drop(listener);
         let (hp, hl) = view_of("127.0.0.1");
         let mut conn: *mut TcpConn = std::ptr::null_mut();
-        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, &mut conn) };
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, 0, &mut conn) };
         assert_ne!(rc, 0, "connecting to a closed port is an Err");
         assert!(conn.is_null(), "a failed connect leaves out null");
+    }
+
+    #[test]
+    fn tcp_connect_timeout_blackhole() {
+        // A TEST-NET-1 address (RFC 5737, 192.0.2.0/24 — reserved, never routed): a `connect` to it
+        // hangs until the OS default (~2 min) on a normal host, so a 300ms deadline must return
+        // `AL_TIMEOUT` well before that. If the sandbox has no network and rejects the address
+        // immediately, the deadline can't be exercised — we then only assert the call returned
+        // promptly (never hung) with a non-success status. Either outcome runs `connect_with_deadline`
+        // and proves the call is bounded.
+        let (hp, hl) = view_of("192.0.2.1");
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let start = std::time::Instant::now();
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, 80, 300_000_000, &mut conn) };
+        let elapsed = start.elapsed();
+        assert!(conn.is_null(), "a failed/timed-out connect leaves out null");
+        assert_ne!(rc, 0, "an unreachable address never succeeds");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the deadline bounds the connect — it never hangs to the OS default (elapsed {elapsed:?})"
+        );
+        if rc == AL_TIMEOUT {
+            // The deadline fired: it must not have returned meaningfully before ~300ms.
+            assert!(
+                elapsed >= std::time::Duration::from_millis(150),
+                "a deadline timeout fires no earlier than the deadline (elapsed {elapsed:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_read_timeout_fires_on_silent_peer() {
+        // A listener that accepts then holds the connection open, sending nothing. A read armed with a
+        // ~200ms `SO_RCVTIMEO` must return `Error.Timeout` (the reader maps the blocking-fd `EAGAIN` to
+        // `AL_TIMEOUT`), not block until the peer eventually goes away.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port() as i64;
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_millis(1500)); // stay silent, then hang up
+            drop(sock);
+        });
+
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, 0, &mut conn) };
+        assert_eq!(rc, 0, "connect to the local listener succeeds (timeout_ns = 0, blocking)");
+        assert!(!conn.is_null());
+
+        // Arm a 200ms receive deadline, then read from the silent peer.
+        unsafe { align_rt_tcp_read_timeout(conn, 200_000_000) };
+        let r = unsafe { align_rt_tcp_conn_reader(conn) };
+        let b = align_rt_buffer_new(16);
+        let start = std::time::Instant::now();
+        let n = unsafe { align_rt_io_reader_read(r, b) };
+        let elapsed = start.elapsed();
+        assert_eq!(n, -(AL_TIMEOUT as i64), "a read past the receive deadline is Error.Timeout");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(120),
+            "the read waited about the deadline (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the read returned at the deadline, not on peer hang-up (elapsed {elapsed:?})"
+        );
+
+        // `ns == 0` clears the deadline (block-forever default) without error — a no-op on the setter.
+        unsafe { align_rt_tcp_read_timeout(conn, 0) };
+
+        unsafe { align_rt_io_reader_free(r) };
+        unsafe { align_rt_tcp_conn_free(conn) };
+        unsafe { align_rt_buffer_free(b) };
+        server.join().expect("silent server");
     }
 
     #[test]

@@ -1441,9 +1441,24 @@ fn build_module<'c>(
         module.add_function("align_rt_dns_resolve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
     );
     funcs.insert(
-        // tcp.connect (host_ptr, host_len, port: i64, out: **TcpConn) -> i32 status (owned conn).
+        // tcp.connect (host_ptr, host_len, port: i64, timeout_ns: i64, out: **TcpConn) -> i32 status
+        // (owned conn). `timeout_ns == 0` = the blocking connect; positive = a deadline-bounded connect.
         "tcp_connect".to_string(),
-        module.add_function("align_rt_tcp_connect", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
+        module.add_function(
+            "align_rt_tcp_connect",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // c.read_timeout_ns(ns: i64) (c: *TcpConn) -> void; setsockopt(SO_RCVTIMEO) on the conn's fd.
+        "tcp_read_timeout".to_string(),
+        module.add_function("align_rt_tcp_read_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // c.write_timeout_ns(ns: i64) (c: *TcpConn) -> void; setsockopt(SO_SNDTIMEO) on the conn's fd.
+        "tcp_write_timeout".to_string(),
+        module.add_function("align_rt_tcp_write_timeout", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
     funcs.insert(
         // drop(c) (c: *TcpConn) -> void; close its fd.
@@ -7138,15 +7153,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("dns_resolve returns i32")
             }
             // tcp.connect — write the owned tcp_conn handle pointer into `out`, return i32 status.
-            Rvalue::TcpConnect { host, port, out } => {
+            Rvalue::TcpConnect { host, port, timeout_ns, out } => {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
                 let (h_ptr, h_len) = self.split_str(host)?;
                 let port_v = self.operand(port)?.into();
+                let timeout_v = self.operand(timeout_ns)?.into();
                 self.builder
-                    .build_call(self.funcs["tcp_connect"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tconn")
+                    .build_call(self.funcs["tcp_connect"], &[h_ptr.into(), h_len.into(), port_v, timeout_v, out_ptr.into()], "tconn")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_connect returns i32")
+            }
+            // c.read_timeout_ns(ns) / c.write_timeout_ns(ns) — set an SO_*TIMEO deadline on the conn's
+            // fd in place; no value (like `c.timeout_ns(ns)` on a command).
+            Rvalue::TcpReadTimeout { conn, ns } => {
+                let c = self.operand(conn)?.into_pointer_value();
+                let n = self.operand(ns)?;
+                self.builder
+                    .build_call(self.funcs["tcp_read_timeout"], &[c.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::TcpWriteTimeout { conn, ns } => {
+                let c = self.operand(conn)?.into_pointer_value();
+                let n = self.operand(ns)?;
+                self.builder
+                    .build_call(self.funcs["tcp_write_timeout"], &[c.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
             }
             // c.reader() / c.writer() — borrow an M9 reader/writer over the conn's fd (owns_fd:false).
             Rvalue::ConnReader(c) => {
