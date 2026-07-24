@@ -86,6 +86,84 @@
 
 ---
 
+**Q14.** Over an empty slice, what do `any` and `all` answer?
+
+**A14.** `any` is `false`; `all` is `true`. There is no witness that passes, and no counterexample that fails.
+
+---
+
+**Q15.** Why is `all` of nothing `true`? It sounds strange.
+
+**A15.** Ask the question it computes: “Did I find an element that breaks the rule?” In an empty input, no. This identity lets `all` compose without a special empty case, just as `sum` begins at `0` and a product begins at `1`.
+
+---
+
+**Q16.** Sum the squares of `[1, 2, 3, 4]`.
+
+**A16.**
+
+```align
+[1, 2, 3, 4].map(fn x { x * x }).sum()
+```
+
+`30`. First say what each becomes; then say how the many become one.
+
+---
+
+**Q17.** Count the even squares. Must we square first?
+
+**A17.** No. A number and its square have the same evenness:
+
+```align
+[1, 2, 3, 4].where(fn x { x % 2 == 0 }).count()
+```
+
+`2`. Do not compute a value the final question does not need.
+
+---
+
+**Q18.** Find both the sum and count in one fold.
+
+**A18.**
+
+```align
+pair := [2, 4, 6].reduce((0, 0), fn acc, x {
+    (acc.0 + x, acc.1 + 1)
+})
+```
+
+`pair` is `(12, 3)`. An accumulator may be a tuple: the answer-so-far can have more than one pocket.
+
+---
+
+**Q19.** Then the integer average?
+
+**A19.** `pair.0 / pair.1`, which is `4`. The reduction collected the facts; the final expression interprets them. For possibly empty input, decide the empty case before dividing.
+
+---
+
+**Q20.** Running totals of `[3, -5, 4, 2]`?
+
+**A20.** `[3, -2, 2, 4]` from:
+
+```align
+[3, -5, 4, 2].scan(0, fn acc, x { acc + x }).to_array()
+```
+
+---
+
+**Q21.** What was the highest running total?
+
+**A21.**
+
+```align
+[3, -5, 4, 2].scan(0, fn acc, x { acc + x }).max()
+```
+
+`4`. A stage may expose intermediate answers so a later reducer can ask about their history.
+
+---
+
 > **The Fourth Commandment**
 >
 > *Seed first, then fold. And when a named reducer says it plainer — `sum`, `count`, `min`, `max`, `any`, `all` — say it plainly.*

@@ -11,8 +11,8 @@ anchors). Authored by the main loop (Fable).
 `std` got per-module implementable design specs (`../std-design/`) *before* implementation.
 `core` grew the other way: it shipped milestone by milestone (M0–M10), its normative surface is
 scattered across `draft.md` (§5 Option/Result, §7 array/slice, §8 data processing, §9 SIMD, §12
-string, §13 template, §14 JSON, §18.1 catalog), and §18.1 is a thin name catalog that in places
-runs **ahead** of the implementation (e.g. `split`, `json.scan`). These docs close that gap: one
+string, §13 template, §14 JSON, §18.1 catalog), and §18.1 is a thin name catalog that can run
+**ahead** of the implementation (for example, `split`; `json.scan` has since shipped). These docs close that gap: one
 file per core area, recording the **implemented, test-pinned surface** at std-design depth, plus
 an explicit *spec'd-but-not-implemented* section so drift is visible instead of ambient.
 

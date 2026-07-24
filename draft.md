@@ -518,6 +518,11 @@ this equals Unicode scalar order). It is deterministic and locale-free; dictiona
 collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is anything
 `Ord`: a number, a `char`, or a string. Aggregates have no order, exactly as they have no `==`.
 
+> **Current implementation boundary:** the operator and builtin-bound paths are complete for
+> borrowed `str`, but direct comparison of owned `string` values is not implemented yet. Pass
+> each owned string to a `str`-typed helper (the ordinary `string` → `str` borrow coercion) when a
+> comparison is needed. This is an implementation gap, not a change to the language rule above.
+
 ### Optional
 
 ```align
@@ -642,6 +647,9 @@ and `str`/`string` — byte-lexicographic, § Equality and Ordering); `Eq` grant
 `char`, `bool`, `str`/`string`). A type argument that does not
 satisfy a parameter's bound is a compile error at the call. There are **no user-defined
 trait-style bounds** — deliberately, for AI-friendliness and *one way*.
+
+The current compiler's concrete `Eq`/`Ord` bound satisfaction follows the implementation boundary
+above: `str` is accepted and owned `string` is rejected until its direct comparison lowering lands.
 
 A type parameter may also appear **nested** in an `Option<T>` / `Result<T, E>`, in a parameter or
 return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T` or
@@ -1994,13 +2002,15 @@ scalar / `str` / nested struct): decode maps a missing key or JSON `null` to
 `None`, a type mismatch to `Err`, and a present value to `Some`; encode **omits**
 a `None` field entirely (never `"k": null`), so `decode(encode(x))` round-trips.
 A non-`Option` field still errors when its key is missing — optionality is
-declared in the type, never inferred. (An Option payload must be non-owned in v1,
-and `Option<struct>` encode is a pending follow-up.) A field may also be an owned
+declared in the type, never inferred. An Option payload must be non-owned in v1;
+`Option<struct>` decode and encode are implemented for non-Move payload structs.
+A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
-The array element struct must be non-owned in v1 (`array<string>` deferred), and a
-`soa<Struct>` stays primitive/`str` columns.
+The array element struct may itself be Move; its elements are deep-dropped. A
+bare `array<string>` field remains deferred, and a `soa<Struct>` stays
+primitive/`str` columns.
 
 ### Union (Sum-Type) Mapping
 
@@ -2040,7 +2050,7 @@ arena {
   text := d.get("choices").at(0).get("message").get("content").as_str()
   n := d.get("choices").len()             // 0 on a non-array/object
   k := d.key(0)                           // Option<str> — objects as data (ordered)
-  parts := d.get("items").elems()         // array<json.doc>: pipelines over a level
+  parts := d.get("items").elems()         // slice<json.doc>: one materialized level
 }
 ```
 

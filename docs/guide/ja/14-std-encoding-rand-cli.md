@@ -2,7 +2,7 @@
 
 > 🌐 [English](../14-std-encoding-rand-cli.md) · **日本語**
 
-`std` ライブラリの機能紹介の第2波として、境界でのバイト列変換と文字列検索、乱数生成、そしてコマンドライン引数の解析について解説します。[13](13-std-os.md) 章と同様に、インポート、エラー、所有権はコード上に明示されます。
+`std` ライブラリの機能紹介の第2波として、境界でのバイト列変換（エンコーディング）、テキスト検索、乱数生成、そしてコマンドライン引数の解析について解説します。[13](13-std-os.md) 章で説明したのと同じ「3つの設計ルール」がここでも機能しています。すなわち、「明示的なインポートの要求」、「`Result` と一元化されたエラーテーブル」、そして「リソースを所有する箇所での Move セマンティクス」です。
 
 ## `std.encoding`
 
@@ -28,7 +28,7 @@ pub fn main() -> Result<(), Error> {
 
 ## `std.regex`
 
-パターンは一度だけコンパイルし、Move ハンドルをローカル変数へ束縛して再利用します。
+パターンを一度コンパイルし、その Move ハンドルをローカル変数へ束縛して再利用します。
 
 ```align
 import std.regex
@@ -36,22 +36,17 @@ import std.regex
 pub fn main() -> Result<(), Error> {
     re := regex.compile("[A-Za-z_][A-Za-z0-9_]*")?
     print(re.is_match("answer = 42"))
-
     match re.find("answer = 42") {
         Some(m) => print("answer = 42"[m.start..m.end]),
-        None    => print("no identifier"),
+        None    => print("識別子なし"),
     }
     return Ok(())
 }
 ```
 
-`find` と `find_at` は `Option<regex_match>` を返します。`start` と `end` は半開区間を
-表す UTF-8 バイト位置で、必ず文字境界にあるため、そのまま検査付き文字列スライスへ渡せます。
-パターンの構文エラーや資源上限超過は `Error.Invalid`、一致しない場合は単に `None` です。
-`find_at` に不正な境界を渡すと、プログラマの誤りとしてアボートします。オートマトン方式の
-エンジンは、検索時間を予測可能に保つため、先読み・後読みと後方参照を意図的にサポートしません。
-正規表現専用リテラルも隠れたキャッシュもなく、所有される `regex` 値そのものが再利用可能な
-コンパイル済みプランです。
+`regex.compile(pattern: str) -> Result<regex, Error>` は所有権を持つコンパイル済みハンドルを返します。`is_match` は `bool`、`find` と `find_at` は `Option<regex_match>` を返します。`regex_match` は Copy 値であり、`start` と `end` は文字境界上の、終端を含まない UTF-8 バイトオフセットなので、チェック付き文字列スライスへそのまま渡せます。不正なパターン構文やリソース上限による拒否は `Error.Invalid`、マッチしなかった場合は通常の `None` です。文字列の範囲外、または文字境界ではないオフセットを `find_at` に渡すと、プログラミングエラーとして abort します。
+
+エンジンは意図的に look-around と backreference を提供しません。正規表現リテラルも暗黙のグローバルキャッシュもありません。`regex` 値そのものがコンパイル済みプランであり、その所有と再利用はソース上で常に見える形になります。
 
 ## `std.rand`
 

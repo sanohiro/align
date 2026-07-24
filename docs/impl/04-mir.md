@@ -1,6 +1,9 @@
-# MIR: Intermediate Representation, Desugaring, and Optimization (draft)
+# MIR: Intermediate Representation, Desugaring, and Optimization
 
-Design sketch for `align_mir`. MIR is the **backend-agnostic core** (`00-overview.md`). Align's semantics—desugaring, loop fusion, SIMD-ization, arena/region encoding—are all settled here, and `MIR → LLVM` (`05-backend-llvm.md`) is restricted to pure lowering.
+Implementation model for `align_mir`. MIR is the **backend-agnostic core** (`00-overview.md`).
+Align's semantics—desugaring, fused pipelines, explicit ownership operations, tasks, and
+target-independent vector operations—are represented here, while `MIR → LLVM`
+(`05-backend-llvm.md`) is restricted to lowering them.
 
 Role boundaries:
 
@@ -15,7 +18,9 @@ MIR (optimized)  → to codegen
 
 Design principle: **nothing hidden** (`draft.md` §3.2). allocation / error path / parallel unit (chunk) remain as **explicit nodes** in MIR, read by both lint (`draft.md` §16) and codegen.
 
-This document is a **draft**. Open items are at the end + inline `// OPEN:`.
+The pseudocode below explains the model; it is not a second definition of the Rust enum. The
+authoritative concrete node inventory is `crates/align_mir/src/lib.rs`, and `alignc emit-mir`
+shows what a program actually lowered to. Historical optimization proposals are labelled as such.
 
 ---
 
@@ -24,27 +29,29 @@ This document is a **draft**. Open items are at the end + inline `// OPEN:`.
 A CFG (a set of basic blocks) per function. Each block is a sequence of statements + a trailing terminator. Close to SSA form (each value defined once; reassignment yields a new value), but assignment to a `mut` place is an explicit store.
 
 ```text
-Function { params, ret, regions, blocks[] }
-Block    { stmts[], term }
+Function { name, params, ret, slots, blocks[] }
+Block    { params, stmts[], term }
 
 stmt =
-  Let(v, rvalue)               // v = rvalue (pure computation)
-  Store(place, operand)        // write to a mut place
-  Alloc(v, kind, layout)       // ★explicit allocation node (kind: Arena(id) | Heap | Stack)
-  Drop(place)                  // release point for an owned value (from the move check)
-  Call(v?, callee, args, eff)  // eff: Pure/Impure. used for parallel/I/O analysis
+  Let(v, rvalue)                       // v = computation / call / allocation
+  Store(slot, operand)                 // assignment to storage
+  StoreField / StoreIndex / PtrStore   // explicit aggregate or buffer writes
+  ArenaEnd / TgWait / TgEnd            // explicit lifetime and join points
+  Drop / DropValue / DropElem…         // explicit ownership release
 
 term =
   Goto(bb)
   Branch(cond, bb_then, bb_else)
-  Switch(operand, [(val,bb)...], default)   // from match
-  TryEdge(ok_bb, err_bb)       // ★the ?'s ok/failure split (err_bb is cold)
   Return(operand?)
-  Loop(header, body, exit)     // structured loop (unit of fusion analysis)
-  ParLoop(chunk, body, reduce?)// ★parallel loop (par_map/reduce). unit is chunk
+  Unreachable
 ```
 
-`★` marks the explicit nodes that make "nothing hidden" work. Their kind is preserved after optimization, referenced by codegen and lint.
+Calls, arena/heap allocation, enum inspection, collection operations, vector operations,
+`ParMapParallel`, and task creation are concrete `Rvalue` variants. A source `match`, `?`, or loop
+therefore becomes ordinary blocks and `Branch`/`Goto`; there is no separate `Switch`, `TryEdge`,
+`Loop`, or `ParLoop` terminator in the current representation. This keeps control flow uniform
+while preserving allocations, drops, task boundaries, and parallel materialization as explicit
+operations for codegen and inspection.
 
 Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **does not recompute** types (anti-rewrite).
 
@@ -55,14 +62,17 @@ Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **
 HIR sugar is expanded into the CFG here—the things the frontend/typecheck did not expand (`02`/`03`).
 
 ### 2.1 `?` (Result propagation)
-Expand `expr?` into extracting the ok value + an early-return on failure, marking the failure edge **cold** (`draft.md` §10).
+Expand `expr?` into testing the tag, extracting the ok value, and returning early on failure.
+The following names are explanatory pseudocode; the concrete MIR uses result-inspection rvalues
+plus `Branch`.
 
 ```align
 data := fs.read_file(path)?;
 ```
 ```text
 t0 = call fs.read_file(path)        : Result(String, E)
-TryEdge(ok, err)                    // err is cold
+is_ok = ResultIsOk(t0)
+Branch(is_ok, ok, err)
 ok:  data = t0.ok_value
 err: r = make Err(convert(t0.err))  // E -> the function's E'
      Return(r)
@@ -77,7 +87,7 @@ user := find_user(id) else return Error.NotFound;
 port := get_env("PORT") else { 8080 };
 ```
 ```text
-Switch(tag(lhs), some=>bind, none=>rhs_block)
+Branch(has_value(lhs), bind_block, rhs_block)
 ```
 
 ### 2.3 Field selector `.ident`
@@ -103,7 +113,9 @@ msg = b.to_string()
 `html`/`json` insert context-specific escaping (`write_html_escaped` etc.) on the value parts. If the total length of the static parts is known, the builder's initial capacity is preallocated (1 `Alloc`).
 
 ### 2.6 match
-Lowered to a `Switch` terminator + variant decomposition (`Field`/payload extraction). Exhaustiveness is already guaranteed by typecheck (`03`).
+Lowered to tag tests and a chain/tree of ordinary `Branch` terminators, with
+`EnumPayload` extraction in the selected arm. Exhaustiveness is already guaranteed by typecheck
+(`03`).
 
 ---
 
@@ -230,22 +242,24 @@ Because the `Alloc` node carries a region, lints like "allocation inside a loop"
 
 ---
 
-## 6. Parallel nodes (par_map / task_group)
+## 6. Parallel nodes (`par_map` / `task_group`)
 
-Data parallelism stays as `ParLoop`; I/O concurrency stays as a Call.
+The implemented data-parallel operation is a dedicated materializer:
 
 ```text
-par_map(f)   ParLoop(chunk=default/specified, body=the fused body of f, reduce=none)
-parallel reduce  ParLoop(.., reduce=associative accumulator)   // combine partial sums
-chunks(n)    set the ParLoop's chunk size to n
-task_group   spawn=async Call, wait=join point. ? applies to each spawn result
+non-capturing source.par_map(f)  → Rvalue::ParMapParallel { src, func, elem_in, elem_out }
+capturing par_map                → sequential pipeline fallback, preserving capture semantics
+source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
+task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
 ```
 
-The body of `ParLoop` already requires `Effect=Pure` (`03 §8`). Because the parallel unit is explicit in MIR, codegen can hand it straight to the runtime's (`06`) parallel API. `// OPEN:` how to guarantee/express the associativity of reduce (monoid specification vs. restricting to known reductions).
+`par_map` requires a Pure callable (`03 §8`); the dedicated node lets codegen call the runtime's
+parallel-map API with an explicit element thunk. Parallel reduction is not part of the current
+surface, so MIR does not claim a `ParLoop(reduce=…)` node or an associativity contract.
 
 ---
 
-## 7. Optimization passes (proposed order)
+## 7. Optimization model (historical proposed order)
 
 ```text
 1. inline      small functions / selector closure expansion (set up the prerequisites for fusion)
@@ -257,7 +271,10 @@ The body of `ParLoop` already requires `Effect=Pure` (`03 §8`). Because the par
 7. simplify    cleanup of unreachable (cold) code, common subexpressions
 ```
 
-Each pass is MIR→MIR. lint diagnostics reuse the analysis results of 2/3/5/6 (no separate implementation). `// OPEN:` finalizing the pass order and whether fixpoint iteration is needed.
+This list is the design decomposition, not a claim that the compiler currently has seven separately
+scheduled MIR-to-MIR pass objects. When a transformation is implemented during lowering, its
+observable contract is still the same: no hidden intermediate collection, guarded effects, and an
+explicit ownership/parallel operation in the emitted MIR.
 
 ---
 
@@ -267,15 +284,14 @@ Each pass is MIR→MIR. lint diagnostics reuse the analysis results of 2/3/5/6 (
 
 ---
 
-## 9. Open items (to be settled)
+## 9. Remaining design refinements
 
 ```text
 - precise rules for fusion boundaries (how far to do partial fusion of scan / group_by)
 - SIMD width is permanently a backend concern (§4): MIR stays width-agnostic and carries only vectorizable properties; the open part is what property set the backend needs to pick fixed-width+remainder vs. scalable predication
-- expressing associativity for par reduce (monoid specification vs. restricting to known reductions)
 - finalizing the optimization pass order and whether iteration (fixpoint) is needed
 - how far to push MIR toward SSA / handling of mut places
-- whether monomorphization happens before or after MIR construction (linked with 03 §9)
 ```
 
-Once settled, reflect into `draft.md` (the relevant feature) and this document.
+Monomorphization is already settled: it happens before MIR construction (`03 §9`). A parallel
+reduction is a possible future feature, not an unimplemented branch of the current MIR.

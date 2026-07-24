@@ -123,6 +123,69 @@ s: soa<User> := json.decode(data)?
 
 ---
 
+**Q16.** `rows.to_soa()` は無料ですか？
+
+**A16.** いいえ。column を確保し、すべての row を transpose します。利益はそのあとです。複数の hot な column scan が、一度の目に見える変換を返済します。一度だけ小さな whole-row 処理をするために横倒しにすれば、得る以上に払います。
+
+---
+
+**Q17.** では「入り口で」とは、本当はどういう意味？
+
+**A17.** 繰り返す仕事が始まる前に、layout を一度選ぶということです。JSON が入り口なら `soa<T>` へ decode して row-shaped な中間を作らない。AoS がすでにあるなら、これからの field-wise pass が transpose を正当化するときだけ変換します。
+
+---
+
+**Q18.** AoS と SoA のどちら？ 100万 particle の `x`、`y`、`velocity` だけを毎 frame 更新し、name と metadata は触れません。
+
+**A18.** SoA。hot loop は冷たい field を cache に運ばず、少数の hot column だけを流すべきです。
+
+---
+
+**Q19.** 12個の config record を、ほぼ常に一つずつ丸ごと load、validate、print します。
+
+**A19.** AoS。小さな whole-row work は transpose の返済先を持ちません。
+
+---
+
+**Q20.** Order に `price`、`quantity`、`active` があります。active な order の総額は？
+
+**A20.**
+
+```align
+orders
+    .where(.active)
+    .map(fn o { o.price * o.quantity })
+    .sum()
+```
+
+`soa<Order>` なら、名指した3 column だけを読みます。
+
+---
+
+**Q21.** なぜ `orders.price.sum() * orders.quantity.sum()` ではない？
+
+**A21.** multiply は sum より前に、row ごとに行うからです。最初の price は最初の quantity と対応します。columnar layout は storage を変えますが、関係は変えません。
+
+---
+
+**Q22.** row 100 から199だけを分析するには？
+
+**A22.** reduce の前に column を slice します。
+
+```align
+orders.price[100..200].sum()
+```
+
+半開区間には100個の price が入ります。
+
+---
+
+**Q23.** index を見つけたあと、customer 一人の record 全体が必要です。row gather は SoA の失敗？
+
+**A23.** いいえ。`orders[i]` で gather します。layout は支配的な仕事のために選ぶもので、宗教ではありません。時々の row gather は、繰り返す column scan を安くするために払う価格です。
+
+---
+
 > **第九の戒律**
 >
 > *行ではなく列を走査せよ。データは入り口で一度だけ横倒しにせよ。そうすればコンピュータが喜んで効率的に動いてくれる。*

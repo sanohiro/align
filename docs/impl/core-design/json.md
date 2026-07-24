@@ -8,8 +8,9 @@ anchors). Authored by the main loop (Fable).
 
 ## Overview
 
-Typed records across the text boundary (draft §14). Two functions — encode and decode — with the
-target type carried by **inference, never a written type argument** (settled: Align has no
+JSON across typed and schema-unknown boundaries (draft §14). The surface has four operations:
+typed `encode` / `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
+types are carried by **inference, never a written type argument** (settled: Align has no
 expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
 capability-header rule applies to core.json exactly like std modules).
 
@@ -66,9 +67,8 @@ field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggreg
 `Drop` frees null there (single-free). The union's variants are expanded into the enclosing struct's
 `json_union_schema_sig` so a variant change invalidates the decode/encode cache. **Boundary:** because a
 Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
-`Message` decode target binds with `?`; and `Chat { messages: array<Message> }` where `Message` is Move
-is an `array<Move-struct>` field, rejected until J3b's owned-element deep free (a non-Move-`Message`
-`array<Message>` — a union with only str/scalar/object variants — still round-trips).
+`Message` decode target binds with `?`. The following J3b slice supplies owned-element deep free, so
+`Chat { messages: array<Message> }` also round-trips when `Message` is Move.
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
 `array<Struct>` — the `messages: array<Message>` / `choices: array<Choice>` shape; the full OpenAI
@@ -92,7 +92,6 @@ chat gateway closes end-to-end** (`Chat` round-trips byte-identically). **Still 
 caught at 0b-2). **Constraint:** a Move struct (owns an array/Move-enum) can't be a `Result`/`Option`
 Ok payload across a function boundary — decode + use in-scope; `json.encode` of a bare
 `array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
-Deferred: `array<scalar>` field decode.
 
 **`array<scalar>` fields (JSON completeness T1b).** A struct field may be an owned `array<i64>` /
 `array<f64>` / `array<bool>` — the align-LLM data shapes (embeddings, token ids). A JSON descriptor
@@ -136,8 +135,8 @@ Runtime: the field descriptor carries kind 4 with a `JsonSubTable` pointer (the 
 descriptors + PHF + store size), and `parse_object` / `write_field_indexed` recurse — so BOTH the slow
 path and the Mison speculative path handle nesting (a nested field is one record-level colon whose
 value the record-splitter leaves at a deeper bracket depth). Nested `str` fields stay zero-copy views
-into the input, so the whole value is region-tied to it recursively (`struct_has_str` recurses). Still
-deferred here: `Option<T>` fields (Slice B), `array<T>` fields (Slice C), enum-payload targets.
+into the input, so the whole value is region-tied to it recursively (`struct_has_str` recurses).
+The later Option, array-field, and union slices described above compose with this recursive path.
 
 ## Type & ownership classification
 
@@ -156,9 +155,10 @@ Pure (parsing is computation; no I/O — pair it with `std.fs`/`std.io` for the 
 
 Everything malformed is `Err(Error)` — never a panic, never a silently-wrong value: syntax
 errors, missing fields, type mismatches, **out-of-range integers** (sign-carrying field tag,
-#295; `u64` fields accept the full `u64` range through one write dispatcher, #311). Duplicate
-keys on the speculative path resolve consistently (last-wins parity with the slow path, #306 —
-zero new state, cost confined to records with undeclared colons).
+#295; `u64` fields accept the full `u64` range through one write dispatcher, #311). A declared
+field must appear exactly once: a duplicate declared key is an `Err` on both the strict and
+speculative paths, including at a position the learned pattern considered unqueried. Undeclared
+keys are skipped.
 
 ## Regions
 
@@ -166,10 +166,11 @@ zero new state, cost confined to records with undeclared colons).
 owned arrays escape freely. Escaping a decoded view past its input is caught at the escape
 point (clone out to keep).
 
-## Designed but not implemented (the JSON-completeness design, settled 2026-07-18)
+## Completeness status and remaining boundaries
 
 The full design lives in `open-questions.md` → "JSON completeness — DESIGN SETTLED" (the
-implementation source of truth; spec text in draft §14 + §18.1). Remaining slices J1–J6:
+implementation record; spec text in draft §14 + §18.1). The ledger below records what shipped and
+the few boundaries that remain:
 
 - **Unions (J1–J2):** a JSON `oneOf` maps to a sum type discriminated by pairwise-distinct
   **shape classes** (Str/Number/Bool/Object/Array; compile-checked; O(1) first-byte dispatch;
@@ -195,8 +196,8 @@ implementation source of truth; spec text in draft §14 + §18.1). Remaining sli
   `as_bool` (→ `Option`; `as_str` is a zero-copy input view, escaped strings unescape into the arena).
   A number's **form** selects the accessor (`42.0` / `1e3` are integer-valued but non-integer form →
   `as_i64` `None`, `as_f64` `Some`), matching simdjson's on-demand model. `get` on a **duplicate** key
-  returns the **first** occurrence (lazy-view; deliberately distinct from `decode`'s last-wins —
-  duplicate keys are pathological in both). **Slice 2 SHIPPED:** `d.len()` (member/element count, 0 on a
+  returns the **first** occurrence (lazy-view semantics; deliberately distinct from typed `decode`,
+  which rejects a duplicate declared key). **Slice 2 SHIPPED:** `d.len()` (member/element count, 0 on a
   non-container) + `d.key(i) -> Option<str>` (the i-th object key in document order — objects-as-ordered
   data). Together with `at(i)`, these drive iteration over a doc array by recursion (no `loop` needed).
   The types `json.doc` and `json.kind` are now **nameable** (a `fn f(d: json.doc)` helper / a

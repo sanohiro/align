@@ -11,7 +11,8 @@ explicitly vendored, never ambiently resolvable.
 
 ## Status
 
-**DESIGN v2 (2026-07-20, owner-directed; attribution corrected same day).** The owner's brief,
+**SHIPPED (W1–W7 complete, 2026-07-22).** This document is the current package contract and keeps
+the design rationale that led to the implementation. The owner's brief,
 restored after a lost conversation record and now pinned here so it cannot be lost again: **the
 deliverable is an Align-idiomatic, data-oriented, blazing-fast zero-copy REST framework — speed is
 the headline, and bloat is rejected** (a small surface; nothing speculative). **References are
@@ -25,8 +26,8 @@ framework X does it". **The router is a first-class requirement**: the first con
 (OpenAI-compatible, fixed paths) would not need one, but a REST framework does — so it gets a
 deliberately Align-idiomatic design (below), not an afterthought. The gateway / LLM apps are
 merely the framework's first consumers ("what we build with it happens to be LLM-related") — they
-do not shape this design. Plan of record: `../15-pkg-web-plan.md`. Hard compiler prerequisite:
-**F1 field-eligibility widening** (see Prerequisites).
+do not shape this design. Historical plan of record: `../15-pkg-web-plan.md`. The former hard
+compiler prerequisite, **F1 field-eligibility widening**, is shipped (see Foundations).
 
 ## Minimalism (owner constraint)
 
@@ -238,21 +239,17 @@ oracle to the documented left-to-right intent.) Duplicate (method, path) rows an
 param names remain build-time aborts.
 `web.param(c, "name")` = linear scan of the ≤ n_params name views (n is tiny; no map).
 
-## Prerequisites (compiler / std — the 土台)
+## Foundations (compiler / std — shipped)
 
-- **F1 — field-eligibility widening (the one hard language slice).** `web.Ctx` and `Route` need
-  struct fields beyond today's whitelist (probed 2026-07-20: `fn` in a field errors "struct fields
-  must be a primitive scalar, str, or a plain struct"): ① a **fn value** field (Copy pointer —
-  the `Route.handler`; effect bits flow via FnTy, #465), ② a **Move handle** field
-  (`http_request_ctx` inside `Ctx` — makes `Ctx` a Move struct; drop/move machinery for Move
-  fields already exists via the J3a Move-enum-field work), ③ a **`slice<str>`** field (the param
-  slots — view slices, region-tracked like `str` fields). Each reuses existing classification
-  machinery; the slice widens `is_field_ok` + the layout/drop/region sweeps. Capturing escaping
-  closures stay OUT (unchanged deferral).
-- **F0 — pkg-foundation rules** (`internal` + pkg-layering import checks + spec text): enables
-  `pkg.web.internal.*` modules (the radix tree lives there) — parallelizable with F1.
-- **std.http floor items (consumer arrived):** `ctx.query` + percent-decode (protocol → std);
-  SSE event framing (WHATWG) when the first streaming consumer lands (the LLM app — W6+).
+- **F1 — field-eligibility widening.** Shipped for the shapes `web.Ctx` and `Route` require:
+  ① a **fn value** field (Copy pointer — `Route.handler`; effects flow through `FnTy`), ② a
+  **Move handle** field (`http_request_ctx` inside `Ctx`), and ③ a region-tracked
+  **`slice<str>`** field for parameter slots. Capturing escaping closures remain outside this
+  capability; pkg.web does not depend on them.
+- **F0 — pkg-foundation rules.** `internal`, pkg-layer import checks, and the package specification
+  shipped, enabling `pkg.web.internal.*` for the radix implementation.
+- **std.http floor.** Query access/percent decoding and WHATWG SSE framing shipped with the
+  consumer-facing HTTP work.
 
 ## Move/effect classification
 
@@ -700,13 +697,14 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 
 ## Slices (F3 of the plan)
 
-- **W1 — router core.** Pattern parse + validation; the **radix tree** (static/param/wildcard
+- **W1 — router core. DONE.** Pattern parse + validation; the **radix tree** (static/param/wildcard
   nodes, priority order, conflict detection) + matcher as pure functions over path segments;
   param slot capture. Unit-tested against a linear-scan oracle (differential). Needs F1①.
-- **W2 — Ctx + serve + dispatch.** `web.Ctx` (needs F1②③); the accept loop over std.http;
+- **W2 — Ctx + serve + dispatch. DONE.** `web.Ctx`; the accept loop over std.http;
   automatic 404/405/400/500; `group`. Integration tests via the in-process server pattern
   (`crates/align_driver/tests/m11_http.rs`).
-- **W3 — accessors + responders.** param/query/header/body/body_str; json/status_json/text/status.
+- **W3 — accessors + responders. DONE.** param/query/header/body/body_str;
+  json/status_json/text/status.
 - **W4 — hardening.** First slice SHIPPED 2026-07-21: **startup table validation**
   (`router.validate`, pure diagnosis; `serve` prints to stderr + `process.abort()` before binding
   — the error policy's "startup abort, not Err"): known uppercase method or `""`, leading-`/`
@@ -771,7 +769,7 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 - **P6 — 405 needs the per-path method set** from the tree (Allow header) — design it into the
   node layout in W1, not bolted on in W4.
 
-## Test anchors (planned)
+## Test anchors
 
 Workspace `apps/web/` (the framework author workspace: `pkg/web/` + example/test entries beside
 it); driver integration tests `apps_web_*` (W2/W4 matrices); `bench/web_router` / `bench/web_e2e`

@@ -6,11 +6,15 @@
 
 This is not a reference and not a textbook — [the guide](../guide/README.md) is the textbook. This is a **drill book**: a long conversation of small questions and small answers, each one a half-step past the last. It teaches your hands the parts of Align that are unlike other languages — pipelines, `match`, Move, arenas, and turning data sideways into columns — until the idioms come out on their own.
 
+It does not tour every syntax form or library module. It has succeeded when a problem you have not seen before makes you ask the Align questions on your own: What is the shape of the data? Is this a flow, a choice, or a control circle? Who owns it, how long does it live, which columns will the machine touch, and where is the cost written? The aim is not to leave you acquainted with Align. It is to make you an **aligner**.
+
 ## How to use it
 
 Read a question. **Answer it out loud before reading the answer.** If you were right, keep going; if you were wrong, back up a few questions — the answer was built there. When a program appears, you may run it (`alignc run`), but try to be the compiler first: most questions can be answered with nothing but the previous page.
 
 Some answers are one word. Some questions look identical to the one before — the difference is the lesson. And when a rule has earned it, it is carved into a **Commandment**.
+
+After the first trip through the book, take one program you liked and read it again without running it. Predict its answer. Trace the data. Point to where every value dies. Count the passes, allocations, and copies. [The final chapter](15-read-it-four-ways.md) teaches this second reading. Recognition makes a page feel familiar; recall makes the language yours.
 
 ## The chapters
 
@@ -25,7 +29,9 @@ Some answers are one word. Some questions look identical to the one before — t
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: data as columns
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`, `agg`, `dict_encode`
 11. [Do It Until](11-do-it-until.md) — the `loop` expression, when a pipeline can't say it
-12. [Four at a Time](12-four-at-a-time.md) — explicit SIMD, vectors, and masks
-13. [The Big Crunch](13-the-big-crunch.md) — mmap, zero-copy pipelines, and putting it all together
+12. [Do It Apart](12-do-it-apart.md) — Pure work, `par_map`, and structured tasks
+13. [Four at a Time](13-four-at-a-time.md) — explicit SIMD, vectors, and masks
+14. [The Big Crunch](14-the-big-crunch.md) — mmap, zero-copy pipelines, and putting it all together
+15. [Read It Four Ways](15-read-it-four-ways.md) — answer, flow, lifetime, and work
 
 Everything here runs with today's `alignc`. Bon appétit.

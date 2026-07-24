@@ -27,7 +27,7 @@ s[i].field = v                                   // one-cell write (StoreColumn;
 s[i] = value                                     // whole-element scatter (gather+scatter)
 s.where(.flag)                                   // column-predicate filter stage
 
-s.group_by(.k).sum(.v)           -> (keys, sums)     // i64 key on soa, or str key on array<Struct>
+s.group_by(.k).sum(.v)           -> (keys, sums)     // i64 or str key on soa; str key on array<Struct>
 s.group_by(.k).min(.v) / .max(.v) / .count()         // count takes NO field
 xs.group_by(.name).agg(sum(.a), max(.b), count())    // fused multi-aggregate, ONE pass
 xs.dict_encode(.name)            -> encoded          // intern str key column; reuse across group_bys

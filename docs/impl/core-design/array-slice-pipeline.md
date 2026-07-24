@@ -92,7 +92,9 @@ input-vs-output scope; sources are allowed to alias one another and are never de
 ## Spec'd but not implemented
 
 - Slicing/indexing **Move-element** collections ("slicing a collection of the Move type … not
-  supported yet"); arrays of Move structs (per-element drop pending).
+  supported yet"). Fixed arrays of Move structs and owned struct-array fields already have
+  recursive element drop; the remaining issue is the read operation's borrow-vs-transfer rule,
+  not missing destruction for the collection itself.
 - Dynamic `array<Struct>` element-field writes with a **non-primitive leaf** (str/owned/nested-
   Move) — `StoreElemFieldPtr` is primitive-leaf-only (#316).
 - Nested element write `arr[i].a.x = v` works; nested **soa** columns and element write via

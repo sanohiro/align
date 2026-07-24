@@ -118,6 +118,94 @@ The impossible states — ready *and* failed, a size with no page — cannot be 
 
 ---
 
+**Q14.** Another one-of-many:
+
+```align
+Reading { Good(i64), Missing, Bad(i64) }
+```
+
+Write “use the good value; use zero for everything else.”
+
+**A14.**
+
+```align
+fn value_or_zero(r: Reading) -> i64 = match r {
+    Good(n) => n,
+    Missing => 0,
+    Bad(_)  => 0,
+}
+```
+
+The two zeroes have different meanings even when they share an answer.
+
+---
+
+**Q15.** May we shorten the last two arms to `_ => 0`?
+
+**A15.** Yes, and today the result is the same. But the explicit arms will force a decision if `Reading` later gains `Stale(i64)`. A wildcard buys brevity by giving up that future question.
+
+---
+
+**Q16.** Sum every good value in an array of readings.
+
+**A16.**
+
+```align
+readings.map(value_or_zero).sum()
+```
+
+A sum type handles one element; a pipeline handles the many. The tools compose because each keeps its own job.
+
+---
+
+**Q17.** Count the bad readings instead.
+
+**A17.**
+
+```align
+readings.where(fn r {
+    match r {
+        Good(_) => false,
+        Missing => false,
+        Bad(_)  => true,
+    }
+}).count()
+```
+
+The `match` produces the predicate's `bool`.
+
+---
+
+**Q18.** Could `match` in Q17 return `1` or `0`, followed by `sum`?
+
+**A18.** Yes:
+
+```align
+readings.map(fn r {
+    match r {
+        Good(_) => 0,
+        Missing => 0,
+        Bad(_)  => 1,
+    }
+}).sum()
+```
+
+Same answer. Prefer `where(...).count()` when the thought is “which elements?”; prefer `map(...).sum()` when each variant contributes a quantity.
+
+---
+
+**Q19.** Add `Stale(i64)` to `Reading`. Which earlier code raises its hand?
+
+**A19.** Every exhaustive `match`: `value_or_zero`, the predicate in Q17, and the contribution in Q18. That is not breakage to fear; it is a list of decisions the new variant requires.
+
+---
+
+**Q20.** What question should we ask before inventing a sum type?
+
+**A20.** “What impossible combination am I trying to make unwriteable?” If the answer is “a reading cannot be Good and Missing at once,” the variants are doing real modeling work. If the states can coexist, they may be fields instead.
+
+---
+
 > **The Sixth Commandment**
 >
 > *When a thing is one of many, say the many. Then `match`, and let the compiler keep the list.*

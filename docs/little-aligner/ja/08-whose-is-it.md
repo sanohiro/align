@@ -116,6 +116,85 @@ print(shout("align"))
 
 ---
 
+**Q15.** 一つの array、二つの slice です。
+
+```align
+xs := [10, 20, 30]
+a := xs[0..2]
+b := a
+```
+
+array はいくつありますか？
+
+**A15.** 一つです。`a` と `b` は、同じ2要素を見る Copy view です。view の copy は pointer と length だけを copy し、見ている要素は copy しません。
+
+---
+
+**Q16.** どちらの view も `xs` より長生きできますか？
+
+**A16.** いいえ。view が安いのは何も所有しないからで、安全なのは compiler が借り元を覚えるからです。Move は「誰が解放するか」に、view は「誰の寿命の内側にいるか」に答えます。
+
+---
+
+**Q17.** owner を追ってください。
+
+```align
+a := "red".clone()
+b := a
+c := b.clone()
+```
+
+まだ使える名前は？
+
+**A17.** `b` と `c`。move が `a` を殺し、clone が `b` を殺さずに2つ目の buffer を作りました。
+
+---
+
+**Q18.** ここで `d := b`。string を所有する名前は？
+
+**A18.** `c` と `d`。元の buffer は `b` から `d` へ移り、clone された buffer は `c` に残ります。一つの owned buffer へ2本の矢印を描いてはいけません。
+
+---
+
+**Q19.** 関数が `string` を値で受け取ります。`d` を渡すと？
+
+**A19.** ownership が関数へ移ります。関数が string を返さない限り、caller の `d` は死に、callee が buffer を drop します。関数境界でも Move は止まりません。
+
+---
+
+**Q20.** 関数は text を読むだけです。よりよい parameter は？
+
+**A20.** `str` です。
+
+```align
+fn count_bytes(s: str) -> i64 = s.len()
+```
+
+owner を保ったまま view を渡します。ownership parameter は「これを渡す」、view parameter は「これを見せる」と言います。
+
+---
+
+**Q21.** temporary string を10個作り、一つを返します。copy はどこに現れるべき？
+
+**A21.**
+
+```align
+arena {
+    chosen := build_choice(...)
+    return chosen.clone()
+}
+```
+
+生き残るかもしれないという理由で10個すべてを heap-own せず、phase をまとめ、境界を越える一つだけを copy します。
+
+---
+
+**Q22.** 最初に役立つ問いは「stack か heap か」、それとも「どれだけ生きるか」？
+
+**A22.** 「どれだけ生きるか」です。borrowed view、scope の値、phase の arena、長寿命の owner。storage は lifetime の判断のあとに決まります。
+
+---
+
 > **第八の戒律**
 >
 > *所有者は一度に1人。短命なものは arena の中で管理せよ。そしてどうしても2つ要るなら — `.clone()`、皆に見える場所で。*

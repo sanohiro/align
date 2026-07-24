@@ -87,4 +87,4 @@ These are the performance model speaking at the source line, not style rules. Fi
 
 ## What's deliberately missing
 
-There is no Align language-package registry/resolver, project manifest, general test runner, or debugger integration yet. Homebrew and apt can distribute the compiler itself; source dependencies remain the future `pkg` layer outside core and std. The current contract is deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.
+There is no Align package registry/resolver, fetch command, project manifest, general test runner, or debugger integration yet. Source packages work today by vendoring their source under `pkg/`; imports and the filesystem remain the dependency graph, with no manifest or lockfile. Homebrew and apt distribute the compiler and runtime, not those source packages. Chapter [23](23-packages.md) covers the current package model. The toolchain contract remains deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.

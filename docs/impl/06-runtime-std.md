@@ -1,6 +1,7 @@
-# Runtime and core/std Bootstrap (draft)
+# Runtime and core/std Bootstrap
 
-Design sketch for the ABI of `align_runtime` and for how to bring up core/std. Here we define the implementation of the `align_rt_*` that `05-backend-llvm.md` calls, closing the source→executable design.
+Implementation overview of the `align_runtime` ABI and the core/std bootstrap boundary. This closes
+the source→executable design used by `05-backend-llvm.md`.
 
 Policy:
 
@@ -11,13 +12,16 @@ core is close to the language  write it in Align itself as much as possible. dro
 std is the OS boundary       std is a thin wrapper over OS syscalls. built on core
 ```
 
-This document is a **draft**. Open items are at the end + inline `// OPEN:`.
+Historical bootstrap proposals are retained where useful; current per-module surfaces live in
+`core-design/` and `std-design/`. Remaining policy questions are listed in §11.
 
 ---
 
 ## 1. Runtime structure
 
-`align_runtime` is a thin native library (implemented in Rust, leaning toward `no_std`, exposing a C ABI). The driver links it with the object (`01`/`05`).
+`align_runtime` is a thin native Rust library exposing a C ABI. It uses the Rust standard library
+where the shipped runtime needs OS integration, allocation, synchronization, or the persistent
+worker pool. The driver links it with the object (`01`/`05`).
 
 ```text
 align_runtime
@@ -105,41 +109,36 @@ Normal code does not manually free (`draft.md` §6.5). The release point comes f
 
 ## 5. Data parallelism (par)
 
-The target that MIR's `ParLoop` (`04 §6`) lowers to (`05 §7`).
+The target that MIR's `ParMapParallel` (`04 §6`) lowers to (`05 §7`).
 
 ```text
-void align_rt_par_for(
-  void* items, i64 len, i64 elem_size,
-  i64 chunk,                       // 0 means the runtime default
-  void (*body)(void* chunk_ptr, i64 chunk_len, void* ctx),
-  void* ctx)
+void* align_rt_par_map(
+  void* in_buf, i64 count,
+  i64 in_stride, i64 out_stride,
+  void (*thunk)(void* in_elem, void* out_elem))
 ```
 
-- Split the input into chunks and hand them to worker threads. The parallel unit is the chunk (`draft.md` §11).
-- `body` is the function carved out of the body fused in MIR (`05 §7`). `Effect=Pure` is guaranteed (`03 §8`), so no races occur.
-
-Parallel reduce:
-
-```text
-void align_rt_par_reduce(
-  ..., void (*body)(.., void* partial),     // the per-chunk partial result into partial
-  void (*combine)(void* acc, void* partial),// combine partial results (associative)
-  void* acc)
-```
-
-Combine partial results tree-wise/serially. Reuse the process-resident `ParPool`; `// OPEN:` ordering
-guarantee of the combine (floating-point reproducibility).
+- Allocate one owned output buffer, split its disjoint element ranges across the process-resident
+  `ParPool`, and return the buffer pointer. Small inputs run on the caller to avoid pool overhead.
+- The thunk is a generated element adapter around a non-capturing Pure function (`03 §8`), so
+  output ranges do not race. Capturing/staged cases never call this ABI.
+- Parallel reduction is not part of the present runtime contract.
 
 ---
 
 ## 6. I/O concurrency (task_group)
 
 ```text
-Task*  align_rt_task_spawn(Result (*fn)(void* ctx), void* ctx)
-Result align_rt_task_wait_all(TaskGroup*)
+TaskGroup* align_rt_tg_begin()
+void*      align_rt_tg_alloc(TaskGroup*, i64 size, i64 align)
+void       align_rt_tg_register(TaskGroup*, tramp, thunk, env, result_slot, error_slot)
+void*      align_rt_tg_wait(TaskGroup*)   // first error slot, or null
+void       align_rt_tg_end(TaskGroup*)
 ```
 
-I/O-wait concurrency (`draft.md` §11). `?` applies to each spawn result, and the first failure propagates at the `wait` join point. There is no async/await (`non-goals.md`), so start from a naive implementation that puts blocking I/O on threads/a pool in the runtime.
+I/O-wait concurrency (`draft.md` §11). Spawn snapshots captures into the task-group region; `wait`
+joins registered tasks using the persistent shared pool and reports the first failure. There is no
+async/await (`non-goals.md`).
 
 ---
 
@@ -221,11 +220,10 @@ self-hosting work.
 
 ```text
 - static linking / scope of libc dependence / whether direct syscalls are allowed (common with 05 §10)
-- floating-point reproducibility of parallel reduce
 - whether to provide a panic catch boundary (current: immediate abort)
-- Error type display and exit-code correspondence (M2 error type design)
 - the boundary for writing core in Align (how far to drop to intrinsics)
-- API for arena nesting / explicit allocator (linked with 03/04)
+- optional named/explicit allocator API (ordinary nested arena ordering is implemented)
 ```
 
-Once settled, reflect into `draft.md` (the relevant feature) and this document.
+Generic parallel reduction is a future surface, not an unfinished runtime promise. Builtin `Error`
+display and `main` exit-code correspondence are settled in `core-design/option-result.md`.

@@ -7,7 +7,7 @@ Align は AOT コンパイル方式のデータ指向プログラミング言語
 ## プラットフォーム
 
 現在サポートしているプラットフォームは以下の通りです：
-- **Linux x86-64**
+- **Linux x86-64 / ARM64**
 - **macOS Apple Silicon (aarch64)**
 - *※ Windows には対応していません。*
 
@@ -85,10 +85,11 @@ fn main() -> i32 {
 ## レイアウト
 
 - `draft.md` —— 言語仕様の正典
-- `docs/guide/` —— 実践的なチュートリアル、全23章(`00`〜`22`、英語 + 日本語)
+- `docs/guide/` —— 実践的なチュートリアル、全24章(`00`〜`23`、英語 + 日本語)
 - `docs/little-aligner/` —— *The Little Schemer* スタイルの Q&A ドリル・ワークブック(英語 + 日本語)
 - `docs/` —— 設計の根拠、経緯、非目標、未解決の論点
 - `docs/impl/` —— コンパイラ実装計画 + 標準ライブラリのモジュール設計仕様
+- `apps/` —— `pkg.web`、`pkg.jwt` などの first-party パッケージ用ワークスペース
 - `editors/` —— Vim / Emacs / VS Code 対応(シンタックスハイライト、スニペット)
 - `crates/` —— `alignc` コンパイラのワークスペース
 

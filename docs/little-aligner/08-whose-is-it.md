@@ -116,6 +116,85 @@ print(shout("align"))
 
 ---
 
+**Q15.** One array, two slices:
+
+```align
+xs := [10, 20, 30]
+a := xs[0..2]
+b := a
+```
+
+How many arrays now exist?
+
+**A15.** One. `a` and `b` are Copy views of the same two elements. Copying a view copies only its pointer and length, never the elements it sees.
+
+---
+
+**Q16.** May either view outlive `xs`?
+
+**A16.** No. A view is cheap because it owns nothing, and safe because the compiler remembers what it borrows. Move answers *who will free this?* A view answers *whose lifetime am I inside?* You need both answers to read memory correctly.
+
+---
+
+**Q17.** Follow the owner:
+
+```align
+a := "red".clone()
+b := a
+c := b.clone()
+```
+
+Which names may still be used?
+
+**A17.** `b` and `c`. The move killed `a`; the clone made a second buffer without killing `b`.
+
+---
+
+**Q18.** Now `d := b`. Which names own strings?
+
+**A18.** `c` and `d`. The original buffer moved from `b` to `d`; the cloned buffer stayed with `c`. Draw arrows if you must, but never draw two arrows to one owned buffer.
+
+---
+
+**Q19.** A function takes `string` by value. What happens when we call it with `d`?
+
+**A19.** Ownership moves into the function. Unless the function returns the string, `d` is dead to the caller and the callee drops the buffer. Function boundaries do not suspend Move.
+
+---
+
+**Q20.** The function only needs to read the text. Better parameter?
+
+**A20.** `str`. Pass a view and keep the owner:
+
+```align
+fn count_bytes(s: str) -> i64 = s.len()
+```
+
+Ownership parameters say “give this to me.” View parameters say “let me look.”
+
+---
+
+**Q21.** We build ten temporary strings and return one. Where should the copy appear?
+
+**A21.** At the survivor:
+
+```align
+arena {
+    chosen := build_choice(...)
+    return chosen.clone()
+}
+```
+
+Do not heap-own all ten in case one survives. Group the phase; copy the one value that crosses its boundary.
+
+---
+
+**Q22.** Which is the useful first question: “stack or heap?” or “how long does it live?”
+
+**A22.** “How long does it live?” Storage follows lifetime: borrowed view, scope value, phase arena, or longer-lived owner. Starting with heap versus stack skips the ownership decision that matters.
+
+---
+
 > **The Eighth Commandment**
 >
 > *One owner at a time. Group the short-lived under an arena. And when you must have two — `.clone()`, where all can see.*

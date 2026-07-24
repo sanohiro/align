@@ -1,12 +1,18 @@
 # Cache-first compilation and output-code optimization
 
-Status: **RECORDED 2026-07-12; artifact-collision C0 implemented 2026-07-13.** Private object/run/size
-staging plus atomic executable publication closes §3; deterministic diagnostics, reproducibility,
-and CAS work remain open. This is the durable source for the
-cache-first audit requested after the LLVM 22 / macOS portability wave. It records confirmed
-correctness defects, the required artifact-cache architecture, and new measure-first CPU-cache
-candidates that are not already in the roadmap. Audit baseline: commit `ad7e4c8b57ad`, arm64 macOS,
-LLVM 22.1.8, rustc 1.96.1.
+Status: **CACHE ARCHITECTURE SHIPPED.** Private staging/atomic publication, per-unit summaries,
+content-addressed object storage, default-on reuse, parallel codegen of misses, and separate
+ThinLTO phase caches have landed. This is the durable source for the original 2026-07-12
+cache-first audit and the decisions that followed it; unchecked measurement and reproducibility
+items below remain proposals, not descriptions of a missing CAS. Audit baseline: commit
+`ad7e4c8b57ad`, arm64 macOS, LLVM 22.1.8, rustc 1.96.1.
+
+> **Known cold/cache parity defect (2026-07-23):** codegen can still visit an unreachable function
+> that the unit hash has already pruned. If that dead function hits a lowering failure, a cold build
+> can fail while a cache hit succeeds. Until the unit-validation and unit-hashing reachability
+> boundaries are identical, correctness comparisons and compiler audits must use
+> `ALIGNC_CACHE=off`. This is a build-result consistency defect, even where the eventual live object
+> bytes would agree.
 
 The status labels in this document are deliberate:
 
@@ -723,16 +729,18 @@ not adopt the transform.
 **Completion:** no shared partial path exists; the race mutation is caught; identical cold builds
 are byte-identical on the supported object formats.
 
-### Slice C1 — whole-program object CAS
+### Slice C1 — object CAS (shipped at the per-unit boundary)
 
-- Define cache schema and exact object key.
-- Cache the current one-Program object before M15 changes the unit boundary.
-- Hash the real runtime archive into link identity; replace the incomplete mtime freshness premise
-  with a content/configuration manifest.
-- Emit structured hit/miss reasons.
+- [x] Define the cache schema and exact codegen keys.
+- [x] Store immutable objects in CAS; the planned temporary whole-program layer was superseded by
+  the more useful per-unit boundary as M15 landed.
+- [x] Replace runtime-archive mtime freshness with a content digest and carry the relevant build
+  configuration in identity.
+- [x] Emit structured per-unit hit/miss reasons.
 
-**Completion:** no-op and source-revert builds hit; comment-only changes can hit codegen; every key
-mutation in the validation matrix causes the intended miss; cache-hit and cold outputs match.
+**Completion status:** reuse, source-revert, key-separation, and observability gates shipped. The
+known cold/cache success-parity defect called out at the top is a remaining correctness issue and
+must not be hidden by calling the original CAS work open.
 
 ### Slice C2 — M15 unit summaries and incremental invalidation
 

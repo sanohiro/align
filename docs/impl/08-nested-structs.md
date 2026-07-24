@@ -2,10 +2,11 @@
 
 > **Current status.** The core plan shipped: plain-data nesting, whole inner-struct values,
 > string-owning nested fields with Drop, nested array element access/update, Move-struct arrays,
-> and cross-module field types are implemented. The sections below preserve the original walls and
-> slice rationale as an implementation record. Remaining limits are called out in their individual
-> bullets: partial moves through nested paths, owned collection fields, nested SoA columns, and a
-> few owned-field/element mutation forms.
+> owned collection fields used by the JSON model, and cross-module field types are implemented.
+> The sections below preserve the original walls and slice rationale as a chronological
+> implementation record: a `deferred` bullet inside an early slice may be closed by a later
+> `DONE` follow-up. Current limits include partial moves through nested paths, nested SoA columns,
+> Move-element extraction, and some non-primitive dynamic element-field writes.
 
 This was the last broad language-modeling gap when the plan was written. At that time a struct
 field had to be a primitive scalar or `str`, and field access was depth-1 (`local.field`). The plan
@@ -105,7 +106,9 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
 - **tests**: construct + drop; nested recursive drop; return / pass / assign by value (no double-free,
   verified under `MALLOC_CHECK_=3`); the unsupported-container rejections above; partial owned-field
   move-out rejected.
-- **deferred**: owned **collection** (`array<T>`) fields.
+- **deferred at this slice:** owned **collection** (`array<T>`) fields. Later JSON/ownership slices
+  added the supported scalar/struct array-field shapes and recursive drop; see
+  `core-design/json.md`.
 
 #### Follow-up (landed) — moving an owned `string` field out of a struct (partial move)
 A depth-1 owned `string` field can now be **moved** out (`n := u.name`, `f(u.name)` by value,
@@ -156,11 +159,13 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   emits a `Drop` of the slot before the store. The slot holds a live buffer or null (a prior move /
   the entry `DropFlagInit`), so the drop frees once or no-ops `free(null)`. `s = f(s)` / `s = s`
   (RHS consumes the old value → ownership transferred) emit no reassign drop — no double-free.
-- **deferred**: reassigning an owned **field** (`u.name = …`) / **element** (`a[i] = …`) still leaks
+- **deferred at this point in the sequence:** reassigning an owned **field** (`u.name = …`) /
+  **element** (`a[i] = …`) still leaks
   the overwritten value (`AssignField`/`AssignIndex` don't yet drop-old). The degenerate self-assign
   `s = s` keeps leaking (the move machinery nulls the slot before the store). Separately, a local
   whose region is demoted by a self-borrowing reassign (`s = dup(s)` with `dup(v: str)`) drops out of
-  the drop set entirely — a pre-existing conservative-region limitation, not this fix.
+  the drop set entirely — a pre-existing conservative-region limitation, not this fix. The owned
+  field/element replacement cases are closed later in Slice 4b.
 
 ### Slice 4 — arrays / soa × nesting
 `arr[i].a.x` (struct-array element nested field) and a soa column over a nested field.

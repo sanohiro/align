@@ -65,7 +65,7 @@ What is the `?` doing?
 fs.write_file("log.txt", "hi")
 ```
 
-**A9.** The compiler says no — *unhandled Result*, a hard error. Handle it (`?`, `match`, or bind it and decide). In Align you may fail, but you may not fail *silently*.
+**A9.** The compiler says no — *unhandled Result*, a hard error. Handle it (`?`, `match`, `else`, or bind it and decide). In Align you may fail, but you may not fail *silently*.
 
 ---
 
@@ -89,7 +89,73 @@ v := inner(n).map_err(to_error)?
 
 **Q12.** `else` on a `Result` — may we?
 
-**A12.** No; `else` is Option's. A `Result` carries a reason, and reasons are for reading — `match` it, or pass it on with `?`. (Want a fallback anyway? Say it in two honest lines with a `match`.)
+**A12.** Yes: `value := result else fallback`. It visibly discards the `Err` payload and uses the fallback. Do that only when the reason truly does not matter; use `match` when it does, or pass the failure on with `?`.
+
+---
+
+**Q13.** Three calls to `safe_head`:
+
+```align
+a := safe_head([7, 8]) else 0
+b := safe_head([]) else 0
+c := safe_head([]) else -1
+```
+
+What are they?
+
+**A13.** `a` is `7`, `b` is `0`, `c` is `-1`. The producer reported only absence; each caller supplied its own meaning.
+
+---
+
+**Q14.** A missing optional nickname and a missing required input file: same type?
+
+**A14.** No. Nickname → `Option<str>`; no nickname may be ordinary. Required file → `Result<string, Error>`; the reason may matter and the operation failed.
+
+---
+
+**Q15.** Trace the happy path:
+
+```align
+fn load_score(path: str) -> Result<i64, Error> {
+    text := fs.read_file(path)?
+    score := parse_score(text).map_err(to_error)?
+    return Ok(score)
+}
+```
+
+**A15.** `read_file` yields `Ok(text)`, `parse_score` yields `Ok(score)`, and the function wraps that score in `Ok` for its caller.
+
+---
+
+**Q16.** The file is missing. Does `parse_score` run?
+
+**A16.** No. The first `?` returns the file's `Err` from `load_score` immediately. Later work is not half-done; it is not begun.
+
+---
+
+**Q17.** The file exists but contains bad text. Which error leaves the function?
+
+**A17.** `parse_score`'s error, after `map_err(to_error)` visibly converts it to the function's `Error` type. The second `?` then passes that converted error upward.
+
+---
+
+**Q18.** We decide a malformed score should count as zero, but a missing file should still fail. Where does `else 0` go?
+
+**A18.**
+
+```align
+text := fs.read_file(path)?
+score := parse_score(text) else 0
+return Ok(score)
+```
+
+Policy sits at the boundary it changes. File errors keep their story; parse errors are deliberately discarded.
+
+---
+
+**Q19.** Why not write `fs.read_file(path) else ""` too?
+
+**A19.** You may only if “unreadable file means empty input” is truly the application's policy. `else` is not a shorter `?`; it answers a different question. Choose by meaning, never by punctuation count.
 
 ---
 

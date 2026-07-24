@@ -92,6 +92,87 @@ items.where(.active).price.map(fn p { p * 108 / 100 }).sum()
 
 ---
 
+**Q13.** 小さな table です。
+
+```align
+Reading { value: i64, valid: bool }
+
+readings := [
+    Reading { value: 5,  valid: true },
+    Reading { value: 40, valid: false },
+    Reading { value: 12, valid: true },
+]
+```
+
+`readings.where(.valid).value.to_array()` は？
+
+**A13.** `[5, 12]`。まず行を残し、次に残った field を射影します。
+
+---
+
+**Q14.** `readings.value.where(fn x { x > 10 }).to_array()` は？
+
+**A14.** `[40, 12]`。この問いは `valid` を見ていません。field を射影すると、ほかの field は忘れられます。`.value` のあとは数だけが流れます。
+
+---
+
+**Q15.** valid で、かつ10より大きい reading だけを残してください。
+
+**A15.**
+
+```align
+readings
+    .where(.valid)
+    .where(fn r { r.value > 10 })
+    .value
+    .to_array()
+```
+
+答えは `[12]`。まだ射影していないので、2つ目の predicate も `Reading` を受け取ります。
+
+---
+
+**Q16.** 2つ目の `where` より先に `.value` を射影できますか？
+
+**A16.** valid な行を選んだあとなら可能です。
+
+```align
+readings.where(.valid).value.where(fn x { x > 10 }).to_array()
+```
+
+答えは同じです。今度の predicate は `i64` を受け取ります。考えをいちばん明瞭に言える順序を選びます。
+
+---
+
+**Q17.** 残った値を2倍して合計してください。
+
+**A17.**
+
+```align
+readings
+    .where(.valid)
+    .value
+    .where(fn x { x > 10 })
+    .map(fn x { x * 2 })
+    .sum()
+```
+
+`24`。
+
+---
+
+**Q18.** Q17 は中間 array をいくつ作りましたか？
+
+**A18.** 0です。3つの reading が入り、1つだけが multiply に届き、1つの数が accumulator に届きます。想像上の collection ではなく、要素を追ってください。
+
+---
+
+**Q19.** Q17 を syntax なしで言ってください。
+
+**A19.** 「reading を取り、valid なものを残し、その value を取り、10より大きい value を残し、2倍し、足す」。文と chain が一致しなければ、どちらかが間違っています。
+
+---
+
 > **第三の戒律**
 >
 > *絞るには `where`、指し示すには `.field`、そしてデータをその答えへと流れさせよ。*

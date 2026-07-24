@@ -70,7 +70,7 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 
 ## 仕様先行(未実装)
 
-- **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。Move struct の配列（要素ごとの drop が保留中）。
+- **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、読み出しを借用とするか所有権移動とするかという規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。
 - ネストした要素書き込み `arr[i].a.x = v` は動作する。しかし、ネストした **soa** 列や、テスト済みの形式を超える chained projection 経由での要素書き込みは未対応 — `08-nested-structs.md` の deferred リストを参照。
 - `soa` 列は汎用パス（generic path）経由では範囲スライスできない（列のウィンドウは実装済みの `s.field[a..b]` を経由する。未対応なのは汎用的な `check_slice_range` のアームのみである）。

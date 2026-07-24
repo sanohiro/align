@@ -38,3 +38,7 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 - [20 — Beyond arenas: pools and lifetimes](20-beyond-arenas.md)
 - [21 — State machines](21-state-machines.md)
 - [22 — Building a system: ECS](22-building-a-system.md)
+
+## Part V — Packages
+
+- [23 — Packages: vendored source, pkg.web, and pkg.jwt](23-packages.md)

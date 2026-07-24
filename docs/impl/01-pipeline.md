@@ -21,12 +21,10 @@ Typed HIR                   high-level IR with types on every expression
   │  align_sema (3) move checking / arena escape checking
   ▼
 Checked HIR                 safety-verified. If it passes here it is safe
-  │  align_mir  lowering (desugaring) + analysis
+  │  align_mir  lowering (desugaring) + target-independent transforms
   ▼
-MIR                         backend-agnostic core. SIMD/fusion/arena fixed
-  │  align_mir  optimization passes
-  ▼
-MIR (optimized)
+MIR                         backend-agnostic core. ownership, fused pipelines,
+                            vector operations, tasks, and par-map materialization fixed
   │  align_codegen_llvm
   ▼
 LLVM IR → object
@@ -75,10 +73,14 @@ executable
   - `map`/`where`/`sum` chains → fusion into a single loop.
   - `arena {}` → arena allocator allocate / bulk-free calls.
   - explicit `to_soa` / SoA and grouped operations → column layout and aggregation nodes (§14).
-- allocation / error path / parallel unit (chunk) are held as **explicit nodes** in MIR (nothing hidden).
+- allocation/drop, task-group operations, and parallel-map materialization are held as
+  **explicit nodes** in MIR (nothing hidden). Control flow, including error paths and loops, uses
+  ordinary blocks and branches.
 
-### MIR Optimization (`align_mir`)
-- pipeline fusion, branchless mask/select lowering, explicit SIMD shapes, and constant/string pooling.
+### MIR Optimization model (`align_mir`)
+- pipeline fusion, guarded mask/select lowering, explicit SIMD shapes, and constant/string pooling
+  are target-independent. Some are performed while constructing MIR rather than by a separately
+  scheduled MIR-to-MIR pass; `emit-mir` is the concrete truth.
 - Structural performance lints run in sema; LLVM optimization remarks are exposed separately by `alignc explain-opt`.
 
 ### Codegen (`align_codegen_llvm`)

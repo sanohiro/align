@@ -107,8 +107,8 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
 - `where(...).par_map(...)` is sequential;
 - unsupported aggregate source shapes are sequential.
 
-The parallel case is a single `Rvalue::ParMapParallel`, not the fused `ParLoop` described by
-`04-mir.md` ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That opaque node carries a
+The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
+([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That opaque node carries a
 source, function name, and input/output element types, but no explicit range body, captures, or
 cost summary.
 
@@ -629,10 +629,10 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 
 ### MIR and reduction
 
-`04-mir.md` describes `par_map` as a real `ParLoop`; current MIR uses opaque
-`ParMapParallel`. The same section sketches parallel reduction, while no complete source-visible
-associativity/floating-order rule exists. Restore the explicit kernel body for maps, but do not let
-that editorial cleanup silently declare generic parallel reduction settled.
+Current MIR deliberately uses opaque `ParMapParallel`; `04-mir.md` now distinguishes that
+implemented node from a possible future range IR. No complete source-visible
+associativity/floating-order rule exists, so an eventual explicit kernel body must not silently
+declare generic parallel reduction settled.
 
 ---
 

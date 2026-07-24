@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/17-the-align-way.md)
 
-The idioms, collected. Each of these was earned somewhere in the previous sixteen chapters; here they are as the checklist an experienced Align programmer runs on autopilot.
+The idioms, collected. Each of these was earned somewhere in the previous chapters; here they are as the checklist an experienced Align programmer runs on autopilot.
 
 ## Describe transformations, don't iterate
 
@@ -14,7 +14,7 @@ total := xs.map(f).where(p).sum()
 
 ## Handle errors with `?`, not branches
 
-Failable functions return `Result`; call them with `?`; convert error types visibly with `map_err`; `match` at the point of final consumption. Let `main() -> Result<(), Error>` do the exit-code plumbing. Absence is `Option` + `else` — a different thing from failure, and the signature says which one you mean.
+Failable functions return `Result`; call them with `?`; convert error types visibly with `map_err`; `match` at the point of final consumption when the reason matters. If the reason truly does not matter, `result else fallback` discards the error visibly and supplies a fallback. Let `main() -> Result<(), Error>` do the exit-code plumbing. Absence is still `Option`, a different thing from failure, and the signature says which one you mean.
 
 ## Choose the lifetime, then stop thinking about memory
 
