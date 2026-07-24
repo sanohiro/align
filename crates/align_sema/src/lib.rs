@@ -15638,6 +15638,20 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         let out_ty = match elem {
+            // `to_array` allocates a dynamic AoS buffer. Its heap/arena allocation currently has
+            // only the LLVM ABI alignment, so collecting an `align(N)` struct would silently lose
+            // the declared storage alignment. Keep this consistent with explicit `array<S>` until
+            // dynamic over-aligned allocation is implemented.
+            Ty::Struct(id) if self.structs[id as usize].align.is_some() => {
+                self.diags.error(
+                    format!(
+                        "'to_array' cannot collect `align(N)` struct '{}' yet (dynamic array allocation does not preserve its over-alignment)",
+                        self.structs[id as usize].name
+                    ),
+                    span,
+                );
+                return err;
+            }
             Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums) => Ty::DynStructArray(id, Layout::Aos),
             Ty::Struct(id) => {
                 self.diags.error(
