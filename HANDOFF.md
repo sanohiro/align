@@ -8,8 +8,16 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-25, **align-llm Request 3 (core.json `array<str>` struct fields) SHIPPED (#635)
-— all three align-llm requests now done.** #635: `json.decode` admits a struct field of type
+_Last updated: 2026-07-25, **v0.4.0 RELEASED — the align-llm request batch (R1/R2/R3) is tagged and
+published.** `Cargo.toml` bumped to 0.4.0, `RELEASE_NOTES_0.4.0.md` written (headline: std.process
+capture + std.net/http I/O timeouts + the new core `Error.Timeout` variant + core.json `array<str>`),
+committed `chore(release): Align v0.4.0` (88ee798) and the `v0.4.0` tag pushed — which triggers
+`.github/workflows/release.yml` (the public build/publish; ~3 min, same path as v0.3.0). **The release
+process is now documented in `CLAUDE.md` → "align-llm request register + release cadence"** (where the
+requests live, that a response is required back in `../align-llm/docs/align-requests.md`, and that a
+completed request batch ends in a version bump + RELEASE_NOTES + tag-push). Before the release,
+**align-llm Request 3 (core.json `array<str>` struct fields) SHIPPED (#635) — all three align-llm
+requests done.** #635: `json.decode` admits a struct field of type
 `array<str>` (the C0 eval-task `argv` shape). A `str` element is a zero-copy `{ptr,len}` view into the
 input (the top-level `str`-field rule) — the owned spine borrows the input, so the decoded struct is
 already input-region-bound; `.clone()` copies past it, an escaped element `Err`s (the pre-existing
