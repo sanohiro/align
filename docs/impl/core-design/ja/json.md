@@ -87,21 +87,30 @@ mid-array パース失敗時に `buf[0..count]` の既 materialize 要素を解�
 decode + 使用する。bare `array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
 （decode→encode パススルーは動作）。
 
-**`array<scalar>` フィールド（JSON 完全対応 T1b）。** 構造体フィールドは所有の `array<i64>` /
-`array<f64>` / `array<bool>` であってよい — align-LLM のデータシェイプ（embeddings、token ids）。JSON
-descriptor **kind 7**: フィールド自身の `{ptr,len}` スロットは幅 16（下位バイト）、要素スカラーの kind
-（0=int / 1=bool / 2=float、bits 20-23）・width（bits 24-27）・sign（bit 16）をタグ上位ビットに詰めるので
-1 つのタグが両方を運ぶ。decode: `decode_scalar_array_value` が共有の per-scalar `write_value` で JSON 配列を
-所有バッファにパース（scalar *フィールド*と同じ範囲/符号/float 幅チェックが要素ごとに適用）。encode:
-`ScalarArrayField` テンプレートピース → `json_encode_scalar_array` がバッファをループして `[e0,e1,…]` を出力
-（動的長 → runtime ループ）。drop: 所有バッファを flat free（scalar は何も所有しない）— 成功時は
-`drop_struct_fields` の `DynArray` アーム、decode エラーパスは `drop_decoded_owned` kind-7（`sub_owns_buffers`
-に kind 7 を追加したので `array<Move-struct>` 要素内の scalar-array フィールドも deep-free される）。J3b と
-合成する（`Table { rows: array<Row>, meta: array<i64> }`、`Row { vals: array<f64> }`）。要素型は decode
-スキーマ指紋（`json_schema_sig` → 要素対応の MIR `ty_name`）に焼き込まれるので `array<i64>`→`array<f64>` の
-変更でキャッシュが無効化される。**延期:** `array<str>`（借用ビュー要素 — region 追跡の follow-up）と
-`array<char>`（JSON 形式なし）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline と bare
-`array<scalar>` の `json.encode` は制限（decode + `.len()` + フィールドとしての encode は動作）。
+**`array<scalar>` フィールド（JSON 完全対応 T1b + `array<str>`, align-llm Request 3）。** 構造体フィールドは
+所有の `array<i64>` / `array<f64>` / `array<bool>`（align-LLM のデータシェイプ — embeddings、token ids）
+**または `array<str>`**（argv リスト、`stop`/`tags`、tool 名リスト）であってよい。JSON descriptor **kind 7**:
+フィールド自身の `{ptr,len}` スロットは幅 16（下位バイト）、要素スカラーの kind（0=int / 1=bool / 2=float /
+**3=str**、bits 20-23）・width（bits **24-28** — 5 ビット。`str` 要素の `{ptr,len}` は幅 16 で元の 4 ビットに
+収まらないため）・sign（bit 16）をタグ上位ビットに詰めるので、1 つのタグが両方を運ぶ。decode:
+`decode_scalar_array_value` が共有の per-scalar `write_value` で JSON 配列を所有バッファにパースするので、scalar
+*フィールド*と同じ範囲/符号/float 幅チェックが要素ごとに適用される。**`str` 要素（kind 3, 幅 16）は入力への
+zero-copy な `{ptr,len}` ビューとして書き込まれる**（top-level `str` フィールドと同じルール）ので、所有スパインの
+各エントリは入力を借用する — decode された構造体全体は `region_of(JsonDecode) = region_of(input)` により既に
+入力 region に束縛されているため、新たな仕組みは不要。`.clone()` は入力を越えてコピーする。JSON エスケープを含む
+要素（`\`）は escaped `str` フィールドと同じ既存の zero-copy 制限（`Err` に decode）。encode: `ScalarArrayField`
+テンプレートピース → `json_encode_scalar_array` がバッファをループして `[e0,e1,…]` を出力（`str` 要素は quote +
+`write_json_str_body` エスケープでレンダリング）。drop: 所有スパインを flat free（scalar / `str`-view 要素は何も
+所有しない — ビューは誰も free せず入力を借用する）— 成功時は `drop_struct_fields` の `DynArray` アーム、decode
+エラーパスは `drop_decoded_owned` kind-7（要素非依存の flat-free）。`sub_owns_buffers` に kind 7 があるので
+`array<Move-struct>` 要素内の scalar/str-array フィールドも cleanup される。J3b と合成する
+（`Table { rows: array<Row>, meta: array<i64> }`、`Row { vals: array<f64> }`）。要素型は decode スキーマ指紋
+（`json_schema_sig` → 要素対応の MIR `ty_name`）に焼き込まれるので `array<i64>`→`array<f64>` の変更でキャッシュが
+無効化される。**なお延期:** `array<char>`（JSON 形式なし）と、**top-level** の `array<str> := json.decode`
+（構造体 FIELD は囲む構造体の入力 region 束縛に乗るが、top-level 配列の結果はその region を自身で運ぶ必要がある —
+scalar の top-level 配列は意図的に `Static`/返却可能なので、top-level の `array<str>` は別途 region を運ぶ slice に
+なる）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline と bare `array<scalar>` の `json.encode` は
+制限（decode + `.len()` + フィールドとしての encode は動作）。
 
 **`Option<T>` フィールド（REST-gateway runway, Slice B）。** 構造体フィールドは `Option<T>`（payload は
 scalar / `str` / ネスト構造体）であってよい。**null ポリシー:** decode はキー欠落→`None`、JSON `null`→

@@ -946,6 +946,41 @@ fn json_decode_struct_array_scalar_only() {
 }
 
 #[test]
+fn json_decode_struct_str_array_field_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // align-llm Request 3: a struct field of type `array<str>` decodes a JSON string array into an
+    // owned spine of zero-copy `{ptr,len}` VIEWS into the input (the top-level `str`-field rule), and
+    // `json.encode` renders it back in declaration order. The C0 eval-task shape: an `argv` list.
+    // Indexing reads the elements; the whole decoded struct is input-region-bound (used within the
+    // input literal's Static scope here). Elements with JSON escapes are a pre-existing zero-copy `str`
+    // limitation (a `\`-bearing string decodes to `Err` for a plain `str` field too), so — like the
+    // top-level `str` rule — the elements here are plain (unescaped), which the align-llm argv/tag
+    // use cases are.
+    let src = "import core.json\nSpec { id: str, argv: array<str>, code: i64 }\nfn main() -> Result<(), Error> {\n  r: Spec := json.decode(\"{\\\"id\\\":\\\"t1\\\",\\\"argv\\\":[\\\"git\\\",\\\"status\\\",\\\"--porcelain\\\"],\\\"code\\\":7}\")?\n  print(r.argv.len())\n  print(r.argv[0])\n  print(r.argv[2])\n  print(json.encode(r))\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-str-array-field", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\ngit\n--porcelain\n{\"id\":\"t1\",\"argv\":[\"git\",\"status\",\"--porcelain\"],\"code\":7}\n"
+    );
+}
+
+#[test]
+fn json_decode_struct_str_array_field_empty() {
+    if !backend_available() {
+        return;
+    }
+    // An empty JSON array `[]` decodes to an empty owned `array<str>` (len 0, no allocation of
+    // element views), and re-encodes as `[]`.
+    let src = "import core.json\nE { xs: array<str> }\nfn main() -> Result<(), Error> {\n  a: E := json.decode(\"{\\\"xs\\\":[]}\")?\n  print(a.xs.len())\n  print(json.encode(a))\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-str-array-empty", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n{\"xs\":[]}\n");
+}
+
+#[test]
 fn json_decode_empty_struct_array_is_safe() {
     if !backend_available() {
         return;

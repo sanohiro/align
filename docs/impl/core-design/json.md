@@ -93,22 +93,33 @@ caught at 0b-2). **Constraint:** a Move struct (owns an array/Move-enum) can't b
 Ok payload across a function boundary — decode + use in-scope; `json.encode` of a bare
 `array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
 
-**`array<scalar>` fields (JSON completeness T1b).** A struct field may be an owned `array<i64>` /
-`array<f64>` / `array<bool>` — the align-LLM data shapes (embeddings, token ids). A JSON descriptor
+**`array<scalar>` fields (JSON completeness T1b + `array<str>`, align-llm Request 3).** A struct field
+may be an owned `array<i64>` / `array<f64>` / `array<bool>` (the align-LLM data shapes — embeddings,
+token ids) **or `array<str>`** (argv lists, `stop`/`tags`, tool-name lists). A JSON descriptor
 **kind 7**: the field's own `{ptr,len}` slot is width 16 (low byte); the ELEMENT scalar's kind (0=int /
-1=bool / 2=float, bits 20-23), width (bits 24-27) and sign (bit 16) pack into the tag's upper bits, so
-one tag carries both. Decode: `decode_scalar_array_value` parses the JSON array into an owned buffer via
-the shared per-scalar `write_value`, so the same range / sign / float-width checks a scalar *field* gets
-apply per element. Encode: a `ScalarArrayField` template piece → `json_encode_scalar_array` loops the
-buffer emitting `[e0,e1,…]` (dynamic length → runtime loop). Drop: the owned buffer flat-frees (scalars
-own nothing) — `drop_struct_fields`'s `DynArray` arm on success, `drop_decoded_owned` kind-7 on the
-decode error path (`sub_owns_buffers` gained kind 7 so a scalar-array field inside an `array<Move-struct>`
-element is deep-freed). Composes with J3b (`Table { rows: array<Row>, meta: array<i64> }` where
-`Row { vals: array<f64> }`). The element type is baked into the decode schema fingerprint
+1=bool / 2=float / **3=str**, bits 20-23), width (bits **24-28** — 5 bits, because a `str` element's
+`{ptr,len}` is width 16, which does not fit the original 4) and sign (bit 16) pack into the tag's upper
+bits, so one tag carries both. Decode: `decode_scalar_array_value` parses the JSON array into an owned
+buffer via the shared per-scalar `write_value`, so the same range / sign / float-width checks a scalar
+*field* gets apply per element. **A `str` element (kind 3, width 16) is written as a zero-copy `{ptr,len}`
+VIEW into the input** (the top-level `str`-field rule), so the owned spine's entries borrow the input —
+the whole decoded struct is already input-region-bound via `region_of(JsonDecode) = region_of(input)`,
+so nothing new is needed. `.clone()` copies past the input; a JSON-escaped element (`\`) is the same
+pre-existing zero-copy limitation as an escaped `str` field (decodes to `Err`). Encode: a
+`ScalarArrayField` template piece → `json_encode_scalar_array` loops the buffer emitting `[e0,e1,…]`
+(a `str` element renders quoted + `write_json_str_body`-escaped). Drop: the owned SPINE flat-frees
+(scalar / `str`-view elements own nothing — the views are freed by no one, they borrow the input) —
+`drop_struct_fields`'s `DynArray` arm on success, `drop_decoded_owned` kind-7 (element-agnostic
+flat-free) on the decode error path (`sub_owns_buffers` has kind 7 so a scalar/str-array field inside an
+`array<Move-struct>` element is cleaned up). Composes with J3b (`Table { rows: array<Row>, meta: array<i64> }`
+where `Row { vals: array<f64> }`). The element type is baked into the decode schema fingerprint
 (`json_schema_sig` → the element-aware MIR `ty_name`), so an `array<i64>`→`array<f64>` change invalidates
-the cache. **Deferred:** `array<str>` (a borrowed-view element — region-tracking follow-up) and
-`array<char>` (no JSON form). v1 limits: `.sum()`/pipelines over an owned scalar-array field and
-`json.encode` of a bare `array<scalar>` stay restricted (decode + `.len()` + encode-as-field work).
+the cache. **Still deferred:** `array<char>` (no JSON form); a **top-level** `array<str> := json.decode`
+(a struct FIELD rides the enclosing struct's input-region binding, but a top-level array result would
+have to carry that region itself — the scalar top-level array is deliberately `Static`/returnable, so
+`array<str>` at top level is a separate region-carrying slice). v1 limits: `.sum()`/pipelines over an
+owned scalar-array field and `json.encode` of a bare `array<scalar>` stay restricted (decode + `.len()`
++ encode-as-field work).
 
 **`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
 scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →
