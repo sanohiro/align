@@ -111,14 +111,14 @@ fn main() -> Result<(), Error> {
     task_group {
         a := spawn(fn { fetch(3) })
         b := spawn(fn { fetch(-1) })
-        wait()?                         // joins ALL tasks, then propagates the first error
+        wait()?                         // joins ALL tasks, then propagates the lowest-index error
         print(a.get() + b.get())        // not reached
     }
     return Ok(())
 }
 ```
 
-`wait()?` は、タスクグループにおけるエラーの境界として機能します。まずすべてのタスクの完了を待機し（一部のタスクだけが放置されることはありません）、その上で、タスクの中で最初に発生したエラーが通常の `Err` として伝播します。並列処理におけるエラーハンドリングも、逐次処理と全く同じ `?` 演算子1つで完結します。
+`wait()?` は、タスクグループにおけるエラーの境界として機能します。まずすべてのタスクの完了を待機し（一部のタスクだけが放置されることはありません）、その上で、spawn インデックスが最も低いタスクのエラーが通常の `Err` として伝播します。並列処理におけるエラーハンドリングも、逐次処理と全く同じ `?` 演算子1つで完結します。
 
 ## どちらを、いつ
 

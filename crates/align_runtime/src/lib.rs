@@ -11801,7 +11801,7 @@ struct TgTask {
     /// The task's result slot (a region allocation sized for `R`).
     slot: *mut u8,
     /// The task's error slot (a region allocation sized for `Error`), or null for a non-fallible
-    /// task. `wait()?` reads the first errored task's `err_slot`.
+    /// task. `wait()?` reads the lowest-spawn-index errored task's `err_slot`.
     err_slot: *mut u8,
 }
 

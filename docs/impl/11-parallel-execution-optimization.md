@@ -659,15 +659,16 @@ the natural unit better than the compiler.
 
 ## 10. Documentation drift to settle
 
-### Task error selection
+### Task error selection — SETTLED
 
-- `draft.md` and the settled design entry say `wait()?` propagates the “first” error.
-- an older implementation plan says any failing task is acceptable;
-- current runtime and tests select the failing task with the **lowest spawn index**.
+- `wait()?` propagates the failing task with the **lowest spawn index**.
+- An older implementation plan said any failing task was acceptable; that historical wording is no
+  longer the contract.
+- The current runtime and tests select the same lowest-index task.
 
-Recommended settlement: define “first” as lowest spawn index. It is deterministic, matches the
-implementation, and batching can preserve it with a local/atomic minimum. Completion-order error
-selection would make reruns nondeterministic for negligible normal-path benefit.
+This definition is deterministic, matches the implementation, and batching preserves it with an
+atomic minimum. Completion-order error selection would make reruns nondeterministic for negligible
+normal-path benefit.
 
 ### Pool implementation
 
