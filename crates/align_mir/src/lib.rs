@@ -3948,7 +3948,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
             // run in parallel via the runtime; otherwise (prior stages, struct-array source, or a
-            // capturing lambda — the parallel thunk takes no capture context) fall back to the
+            // capturing lambda — the parallel range kernel takes no capture context) fall back to the
             // sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),

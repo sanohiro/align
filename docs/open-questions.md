@@ -993,9 +993,9 @@ call ABI** (`recursive_fib` 1.00× — note fib is *non*-tail-recursive, so this
 stack-frame convention matches Rust, not just TCO loops), and **struct AoS *and* SoA scanning**
 (`sum_coords` 1.00× — stride/offset correctness, SoA transpose adds no scan regression). All parity →
 the core codegen/ABI is solid cross-arch; nothing to fix. group_by (1.4–4.2× vs std) and JSON
-(~14–17% off serde) re-confirmed. The match double-free is acknowledged **Resolved** (PR #175). The
-sole remaining open item it re-flags is the **par_map OS-thread-spawn** gap above (3rd time) — still
-the one perf lever in this set, std/runtime layer.
+(~14–17% off serde) re-confirmed. The match double-free is acknowledged **Resolved** (PR #175). At
+the time, the sole remaining item it re-flagged was the `par_map` OS-thread-spawn gap; the persistent
+pool and later whole-range kernel fixes are recorded above.
 
 ### First-party arm64 benchmark — Apple Silicon, in-repo harness (2026-06-30)
 The authoritative `bench/` numbers had been x86 (linux); arm64 was only external (Gemini, below) +
@@ -2437,7 +2437,8 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   without touching the (possibly-freed) region. Tests: `tg_wait_runs_all_tasks_pool_backed`,
   `tg_wait_returns_first_errored_slot_by_index`, `tg_wait_nested_task_groups_do_not_deadlock` (the
   last would hang on a deadlock) in `align_runtime`, plus the existing `align_driver` `task_group`
-  suite. (The `par_map` "still behind rayon" note above is unrelated and stands.)
+  suite. (`par_map` throughput remains a separate measurement stream; the former per-element
+  indirection diagnosis was removed by the 2026-07-25 whole-range kernel.)
 - **Status: fixed.** **Allocator-family runtime declarations lacked return/function attributes** in
   codegen's declarations. Each attribute was verified against the function's *actual* Rust body
   (over-declaration is a miscompile, so this split matters):

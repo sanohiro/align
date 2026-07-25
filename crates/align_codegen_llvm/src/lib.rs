@@ -3798,7 +3798,7 @@ fn mark_internal<'c>(f: FunctionValue<'c>) {
     f.set_linkage(Linkage::Internal);
 }
 
-/// `private`: a compiler-generated helper (fn-value / closure / spawn-trampoline / par_map thunk).
+/// `private`: a compiler-generated helper (fn-value / closure / spawn-trampoline / par_map kernel).
 /// Stronger than `internal` — the symbol name itself is dropped. These are only ever reached
 /// through a function pointer (handed to the runtime or an indirect call), never by symbol name, so
 /// dropping the name is safe and maximizes what the optimizer may fold away.

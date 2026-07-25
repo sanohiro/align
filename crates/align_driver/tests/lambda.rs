@@ -224,7 +224,7 @@ fn lambda_captures_in_par_map_falls_back_to_sequential() {
     if !backend_available() {
         return;
     }
-    // A capturing par_map lambda is correct via the sequential path (the parallel thunk takes no
+    // A capturing par_map lambda is correct via the sequential path (the parallel range kernel takes no
     // capture context): (1+100)+(2+100)+(3+100) = 306.
     let src = "fn main() -> Result<(), Error> {\n  b := 100\n  print([1, 2, 3].par_map(fn x { x + b }).sum())\n  return Ok(())\n}\n";
     let out = build_and_run("lam-capture-parmap", src);
