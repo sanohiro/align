@@ -715,10 +715,9 @@ fn path_str(path: &[u32]) -> String {
     path.iter().map(|i| format!(".{i}")).collect::<String>()
 }
 
-/// Constant-array elements rendered value-exactly. `impl_hash` hashes the printed
-/// MIR, so this rendering is load-bearing for cache identity: two tables with
-/// different values must never print identically. Floats use `{:?}` (shortest
-/// round-trip, distinguishes 1.0 from 1.5 and -0.0 from 0.0).
+/// Constant-array elements rendered value-exactly so the human-readable MIR does not hide a
+/// semantic difference. The codegen cache hashes the complete structural [`Program`] instead.
+/// Floats use `{:?}` (shortest round-trip, distinguishes 1.0 from 1.5 and -0.0 from 0.0).
 fn const_elems_str(elems: &[crate::ConstElem]) -> String {
     let parts: Vec<String> = elems
         .iter()

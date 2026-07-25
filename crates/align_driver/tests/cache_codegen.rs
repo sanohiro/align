@@ -253,12 +253,12 @@ fn gate2_type_table_only_edit_cannot_hit() {
 
 // ---- Gate 2b: a json.decode target-struct field RENAME invalidates the cache -------------------
 
-/// A `json.decode` target struct's field name/type feeds only the codegen descriptor table, not the
-/// surrounding MIR — a field RENAME at the same slot (or a NESTED struct's field change) leaves every
-/// other MIR statement byte-identical. Without the schema fingerprint baked into the decode rvalue
-/// (`json_schema_sig`), the unit's `impl_hash` would be unchanged and the warm cache would serve a
-/// STALE object still decoding the OLD key (the #514/#517 stale-cache class, reproduced end-to-end).
-/// This gate pins that the rename misses on the unit's own MIR digest — both flat and nested.
+/// A `json.decode` target struct's field name/type feeds the codegen descriptor table rather than
+/// the surrounding statement sequence. A field RENAME at the same slot (or a NESTED struct's field
+/// change) therefore exercises the complete structural codegen-input fingerprint, including its
+/// type tables. The explicit `json_schema_sig` remains part of the decode rvalue, but cache safety no
+/// longer relies on the human MIR printer exposing every descriptor input. This gate pins that the
+/// rename misses on the unit's own MIR digest — both flat and nested.
 #[test]
 fn gate2b_json_decode_field_rename_invalidates() {
     if !backend() {
@@ -308,11 +308,10 @@ fn gate2b_json_decode_field_rename_invalidates() {
 
 // ---- Gate 2c: a union's array<Struct> ELEMENT field rename invalidates the cache ----------------
 
-/// A shape-directed union's `array<Struct>` payload (J2b) reaches its element struct's fields only
-/// through the codegen descriptor, exactly like a nested-struct field — so an element field RENAME
-/// leaves every other MIR statement byte-identical. `json_union_schema_sig_into` must expand the
-/// element struct's schema (not just print its id via `ty_name`), else the warm cache serves a STALE
-/// object decoding the OLD element key (the #514/#517 class). This gate pins the miss.
+/// A shape-directed union's `array<Struct>` payload (J2b) reaches its element struct's fields through
+/// the codegen descriptor, exactly like a nested-struct field — so an element field RENAME leaves
+/// every other MIR statement byte-identical. This gate pins that the complete structural MIR
+/// fingerprint includes that descriptor input and the warm cache misses.
 #[test]
 fn gate2c_json_union_array_element_rename_invalidates() {
     if !backend() {
@@ -346,11 +345,10 @@ fn gate2c_json_union_array_element_rename_invalidates() {
 
 // ---- Gate 2d: an array<scalar> field's ELEMENT type change invalidates the cache ---------------
 
-/// An `array<scalar>` field (T1b, kind-7 descriptor) feeds its element kind/width/sign only through the
-/// codegen descriptor tag, not the surrounding MIR — changing the element type (`array<i64>` →
-/// `array<f64>`) at the same slot leaves every other MIR statement byte-identical. The schema
-/// fingerprint (`json_schema_sig` → `ty_name`) must render the element type so the change flips the
-/// unit's MIR digest; else the warm cache serves a STALE object decoding the OLD element width/kind.
+/// An `array<scalar>` field (T1b, kind-7 descriptor) feeds its element kind/width/sign through the
+/// codegen descriptor tag rather than the surrounding statement sequence. Changing the element type
+/// (`array<i64>` → `array<f64>`) at the same slot therefore pins that the complete structural MIR
+/// fingerprint includes the descriptor input and the warm cache misses.
 #[test]
 fn gate2d_json_scalar_array_element_type_change_invalidates() {
     if !backend() {
@@ -375,11 +373,10 @@ fn gate2d_json_scalar_array_element_type_change_invalidates() {
 
 // ---- Gate 2e: an Option<struct> payload field RENAME invalidates the cache ---------------------
 
-/// An `Option<struct>` field's payload struct reaches its fields only through the codegen descriptor
-/// (decode) / the `OptionStructField` encode piece (T1b) — never the surrounding MIR — so a payload
-/// field RENAME at the same slot leaves every other MIR statement byte-identical. `json_schema_sig`
-/// must recurse into an `Option<struct>` payload (not fold it to a bare `Option` via `ty_name`), else
-/// the warm cache serves a stale object decoding/encoding the OLD payload key (the #514/#517 class).
+/// An `Option<struct>` field's payload struct reaches its fields through the codegen descriptor
+/// (decode) / the `OptionStructField` encode piece (T1b), rather than the surrounding statement
+/// sequence. A payload field RENAME at the same slot therefore pins that the complete structural MIR
+/// fingerprint includes the descriptor input and the warm cache misses.
 #[test]
 fn gate2e_json_option_struct_payload_rename_invalidates() {
     if !backend() {

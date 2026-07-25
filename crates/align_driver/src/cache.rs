@@ -117,7 +117,7 @@ pub struct CodegenKey {
     /// #3 (cont.) located vs normal MIR namespace — an `explain-opt`-shaped located entry can never be
     /// shared with a normal build. Always `false` on the cached build paths (located is uncached).
     pub located: bool,
-    /// #4 the unit's `impl_hash` (stable, location-free MIR fingerprint).
+    /// #4 the unit's `impl_hash` (complete structural MIR codegen-input fingerprint).
     pub impl_hash: Hash128,
     /// #4 (cont.) the unit's transitive dependency interface hashes, sorted by unit name. A private
     /// body edit in a dep leaves these byte-identical; a public-surface (or generic-body) change flips

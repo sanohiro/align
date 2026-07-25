@@ -5861,7 +5861,7 @@ enum NeedleLower {
 /// Must be called after `setup_source` and before the loop header is emitted.
 fn hoist_str_finder_plans(b: &mut Builder, stages: &[hir::Stage]) -> Vec<Option<NeedleLower>> {
     // Read the toggle at MIR lowering (never in codegen): the object cache key fingerprints the
-    // lowered MIR text, so reading it here makes the two shapes cache-distinct, and
+    // structural MIR program, so reading it here makes the two shapes cache-distinct, and
     // `CacheContext::from_env` additionally forces the cache off whenever this var is set.
     let hoist = std::env::var("ALIGN_NEEDLE_HOIST").ok().as_deref() != Some("off");
     stages
@@ -7665,7 +7665,7 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // unset. Refinements are gated by key order: only a total-order key can take any new path.
     //
     // Cache safety: this env read MUST stay at MIR-lowering level (here), never in codegen — the
-    // per-unit `impl_hash` fingerprints the lowered MIR text, so reading it here makes the object-cache
+    // per-unit `impl_hash` fingerprints the structural MIR program, so reading it here makes the object-cache
     // key differ between the two shapes. `CacheContext::from_env` additionally forces the object cache
     // off whenever this var is set (fail-closed). Do not move this read into `align_codegen_llvm`.
     let adaptive = std::env::var("ALIGN_SORT_ADAPTIVE").ok().as_deref() != Some("off");

@@ -39,8 +39,8 @@ struct LoadedUnit {
     path: String,
     ast: align_ast::File,
     is_entry: bool,
-    /// The module's full source text — retained for the M15 interface summary (generic template
-    /// bodies + const values are recorded as source slices, and `impl_hash` is over these bytes).
+    /// The module's full source text — retained for the M15 interface summary because generic
+    /// template bodies and const values are recorded as source slices.
     src: String,
     /// The module's source file path on disk (the entry file's given `name`, or a resolved
     /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own

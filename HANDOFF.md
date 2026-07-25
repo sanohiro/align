@@ -131,7 +131,7 @@ Language semantics and surface       draft.md
 Current decisions and open items     docs/open-questions.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
-Cache architecture and parity gap    docs/impl/10-cache-first-optimization.md
+Cache architecture and parity resolution    docs/impl/10-cache-first-optimization.md
 Closure/memory/I/O/SIMD audit        docs/impl/12-pipeline-closure-memory-io-simd-audit.md
 Allocation and short-input audit     docs/impl/13-string-array-allocation-short-input-audit.md
 Source-correctness fixes             docs/impl/source-correctness-fixes-2026-07-13.md
