@@ -1703,6 +1703,8 @@ impl ParPool {
 /// can check whether it has been created yet without forcing creation itself.
 static PAR_POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
 
+const PAR_MIN_CHUNK: usize = 65_536;
+
 #[cfg(feature = "par-map-probe")]
 static PAR_MAP_FORCE_CALLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1716,17 +1718,30 @@ pub extern "C" fn align_rt_test_par_map_force_caller(force: i32) {
     PAR_MAP_FORCE_CALLER.store(force != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Benchmark-only threshold getter for keeping `bench/par_map`'s probe synchronized with the
+/// runtime constant. It is present only in the opt-in `par-map-probe` build.
+#[cfg(feature = "par-map-probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_par_map_min_chunk() -> i64 {
+    i64::try_from(PAR_MIN_CHUNK).expect("par_map threshold fits in i64")
+}
+
+fn par_worker_count() -> usize {
+    #[cfg(not(test))]
+    let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+    #[cfg(test)]
+    let n = std::env::var("ALIGN_TEST_PAR_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1));
+    n
+}
+
 /// The global pool (lazily created). Returns its worker count too (= the parallelism degree).
 fn par_pool() -> (&'static ParPool, usize) {
     *PAR_POOL.get_or_init(|| {
-        #[cfg(not(test))]
-        let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
-        #[cfg(test)]
-        let n = std::env::var("ALIGN_TEST_PAR_WORKERS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1));
+        let n = par_worker_count();
         let p: &'static ParPool = Box::leak(Box::new(ParPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             available: std::sync::Condvar::new(),
@@ -1875,7 +1890,6 @@ pub unsafe extern "C" fn align_rt_par_map(
     // floor/initial grain target, so tiny maps (where the pool round-trip would dwarf the work)
     // fall to the caller path. The threshold is deliberately conservative for cheap/vectorizable
     // bodies; retune only from the checked-in threshold probe and cross-host measurements.
-    const PAR_MIN_CHUNK: usize = 65536;
     // Run every element on the calling thread, no pool involved.
     let run_all_on_caller = || {
         let end = i64::try_from(count).expect("par_map count was validated from i64");
@@ -1897,10 +1911,18 @@ pub unsafe extern "C" fn align_rt_par_map(
         return out_buf;
     }
 
+    // A single available worker cannot execute a helper range concurrently, so avoid creating a
+    // detached pool that the caller-only fallback would never use. The test build can force this
+    // case with ALIGN_TEST_PAR_WORKERS=1; production uses the host's available parallelism.
+    if par_worker_count() <= 1 {
+        run_all_on_caller();
+        return out_buf;
+    }
+
     let (pool, workers) = par_pool();
     let Some((nchunks, per)) = par_map_plan(count, workers, PAR_MIN_CHUNK) else {
-        // Reached only when `workers == 1` (or another degenerate worker count) still produces one
-        // range above the floor; the pool is already initialized by this point regardless.
+        // Retain a defensive caller fallback if a future planner admits another degenerate worker
+        // configuration after the pre-init one-worker guard above.
         run_all_on_caller();
         return out_buf;
     };
@@ -23102,6 +23124,58 @@ mod tests {
                 assert_eq!(v, (i as i64) * 2, "count={count} index={i}");
             }
             unsafe { align_rt_free(output) };
+        }
+    }
+
+    #[test]
+    fn par_map_one_worker_skips_pool_initialization() {
+        const CHILD: &str = "ALIGN_ONE_WORKER_PAR_MAP_CHILD";
+        const WORKERS: &str = "ALIGN_TEST_PAR_WORKERS";
+        if std::env::var_os(CHILD).is_some() {
+            const COUNT: i64 = 65_537;
+            assert!(!align_rt_test_par_pool_initialized());
+            let input: Vec<i64> = (0..COUNT).collect();
+            let output = unsafe {
+                align_rt_par_map(
+                    core::ptr::null(),
+                    input.as_ptr() as *const u8,
+                    COUNT,
+                    size_of::<i64>() as i64,
+                    size_of::<i64>() as i64,
+                    par_map_double,
+                )
+            };
+            let values = unsafe { std::slice::from_raw_parts(output as *const i64, COUNT as usize) };
+            assert_eq!(values.first(), Some(&0));
+            assert_eq!(values.last(), Some(&(2 * (COUNT - 1))));
+            unsafe { align_rt_free(output) };
+            assert!(
+                !align_rt_test_par_pool_initialized(),
+                "one-worker par_map must stay caller-only without initializing the pool"
+            );
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::par_map_one_worker_skips_pool_initialization", "--nocapture"])
+            .env(CHILD, "1")
+            .env(WORKERS, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "one-worker par_map child failed with {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("one-worker par_map child did not finish before the watchdog deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

@@ -985,9 +985,10 @@ A second Gemini bench (group_by / par_map / json-decode on arm64). Verified agai
   indirect call from the element loop; optimized-IR gates prove that a cheap `i64` body inlines and
   vectorizes. The post-specialization probe moved the caller-only floor from 32768 to 65536 elements
   on native Apple Silicon: entering the pool at the old 32769 boundary was still a loss for cheap and
-  heavy bodies, while the heavier body approached parity with the caller-only materializing kernel
-  around 82–98K. The fused sequential comparison is separate and later on that run. The checked-in
-  probe reports balanced median ratios and must be rerun on a target host before another retune. The shared pool
+  heavy bodies, while the heavier body crossed below the caller-only materializing kernel between
+  65,537 and 73,728 on the checked-in run. The fused sequential comparison is separate and later,
+  crossing below 1 at 131,072 on that run. The checked-in probe reports balanced median ratios and
+  must be rerun on a target host before another retune. The shared pool
   can later back parallel `reduce`/`task_group` too; remeasure the full `rayon` crossover separately
   rather than preserving the obsolete per-element-thunk diagnosis.
 

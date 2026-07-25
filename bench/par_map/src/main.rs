@@ -23,6 +23,8 @@ extern "C" {
     fn smap(s: Slice) -> i64;
     /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
     fn align_rt_test_par_map_force_caller(force: i32);
+    /// Benchmark-only threshold getter, present in the opt-in `par-map-probe` runtime build.
+    fn align_rt_test_par_map_min_chunk() -> i64;
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -92,6 +94,11 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[index]
 }
 
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    percentile(&samples, 0.5)
+}
+
 fn run_standard() {
     let rounds = 50;
     let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
@@ -127,19 +134,32 @@ fn run_standard() {
             "align sequential vs par_map"
         );
 
-        let (mut am, mut sm, mut rm) = (f64::MAX, f64::MAX, f64::MAX);
-        let mut align_seq = f64::MAX;
-        for _ in 0..rounds {
-            let t = Instant::now();
-            std::hint::black_box(unsafe {
-                pmap(Slice {
-                    ptr: sl.ptr,
-                    len: sl.len,
-                })
-            });
-            am = am.min(t.elapsed().as_secs_f64() * 1e3);
-
-            if profile {
+        let mut align_samples = Vec::with_capacity(rounds);
+        let mut seq_samples = Vec::with_capacity(rounds);
+        let mut rayon_samples = Vec::with_capacity(rounds);
+        let mut align_seq_samples = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let align = || {
+                let t = Instant::now();
+                std::hint::black_box(unsafe {
+                    pmap(Slice {
+                        ptr: sl.ptr,
+                        len: sl.len,
+                    })
+                });
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let seq = || {
+                let t = Instant::now();
+                std::hint::black_box(rust_seq(&data));
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let rayon = || {
+                let t = Instant::now();
+                std::hint::black_box(rust_rayon(&data));
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let align_seq = || {
                 let t = Instant::now();
                 std::hint::black_box(unsafe {
                     smap(Slice {
@@ -147,17 +167,27 @@ fn run_standard() {
                         len: sl.len,
                     })
                 });
-                align_seq = align_seq.min(t.elapsed().as_secs_f64() * 1e3);
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            if round % 2 == 0 {
+                align_samples.push(align());
+                seq_samples.push(seq());
+                rayon_samples.push(rayon());
+                if profile {
+                    align_seq_samples.push(align_seq());
+                }
+            } else {
+                rayon_samples.push(rayon());
+                seq_samples.push(seq());
+                align_samples.push(align());
+                if profile {
+                    align_seq_samples.push(align_seq());
+                }
             }
-
-            let t = Instant::now();
-            std::hint::black_box(rust_seq(&data));
-            sm = sm.min(t.elapsed().as_secs_f64() * 1e3);
-
-            let t = Instant::now();
-            std::hint::black_box(rust_rayon(&data));
-            rm = rm.min(t.elapsed().as_secs_f64() * 1e3);
         }
+        let am = median(align_samples);
+        let sm = median(seq_samples);
+        let rm = median(rayon_samples);
         println!(
             "{:>9}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x",
             n,
@@ -168,6 +198,7 @@ fn run_standard() {
             rm / am
         );
         if profile {
+            let align_seq = median(align_seq_samples);
             println!(
                 "profile n={n}: align-seq {:8.3} ms; pmap is {:5.2}x align-seq",
                 align_seq,
@@ -178,9 +209,16 @@ fn run_standard() {
 }
 
 fn run_threshold() {
-    // This mirrors the runtime constant intentionally. The probe is the evidence used before a
-    // future change to the runtime threshold; it must not silently become a second tuning knob.
-    const PAR_MIN_CHUNK: usize = 65_536;
+    // Keep the expected value explicit for the checked-in measurement table, but read the actual
+    // runtime value too so a future retune cannot silently leave the probe out of sync.
+    const EXPECTED_PAR_MIN_CHUNK: usize = 65_536;
+    let runtime_min = usize::try_from(unsafe { align_rt_test_par_map_min_chunk() })
+        .expect("runtime par_map threshold must be non-negative");
+    assert_eq!(
+        runtime_min, EXPECTED_PAR_MIN_CHUNK,
+        "update the checked-in threshold probe after changing the runtime threshold"
+    );
+    let par_min_chunk = runtime_min;
     const ROUNDS: usize = 31;
     let counts = [
         16_384usize,
@@ -212,7 +250,7 @@ fn run_threshold() {
 
     // Initialize the persistent pool once, so the table measures the steady-state choice at the
     // boundary. Cold-start behavior is pinned separately by the runtime integration test.
-    let warm = gen(PAR_MIN_CHUNK * 2);
+    let warm = gen(par_min_chunk * 2);
     let warm_slice = Slice {
         ptr: warm.as_ptr(),
         len: warm.len() as i64,
@@ -220,7 +258,7 @@ fn run_threshold() {
     std::hint::black_box(call(pmap, warm_slice));
 
     println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples)");
-    println!("n <= {PAR_MIN_CHUNK}: caller-only; n > {PAR_MIN_CHUNK}: pool eligible");
+    println!("n <= {par_min_chunk}: caller-only; n > {par_min_chunk}: pool eligible");
     println!(
         "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}",
         "n", "case", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
