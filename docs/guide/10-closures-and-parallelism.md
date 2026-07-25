@@ -78,7 +78,7 @@ fn main() -> Result<(), Error> {
 
 `par_map(f)` is `map` across a persistent worker-thread pool, materializing an owned `array<R>`. Semantically identical to `map` — purity guarantees it — so you can switch between them freely as data sizes change.
 
-And you should: **`par_map` earns its keep only when `f` is expensive.** Every element crosses an indirect call, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. (A capturing closure currently falls back to sequential execution — implementation in progress.)
+And you should: **`par_map` earns its keep only when `f` is expensive.** The range kernel still has setup and scheduling overhead, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. Direct-source `par_map` with Copy-capturing closures uses the same range kernel with an immutable call-scoped context; staged or unsupported forms remain sequential, and Move captures are rejected.
 
 ## `task_group` — task parallelism
 

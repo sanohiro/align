@@ -247,17 +247,18 @@ Because the `Alloc` node carries a region, lints like "allocation inside a loop"
 The implemented data-parallel operation is a dedicated materializer:
 
 ```text
-non-capturing source.par_map(f)  → Rvalue::ParMapParallel { src, func, elem_in, elem_out }
-capturing par_map                → sequential pipeline fallback, preserving capture semantics
+direct source.par_map(f)        → Rvalue::ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out }
+staged / unsupported par_map    → sequential pipeline fallback, preserving capture semantics
 source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
 ```
 
 `par_map` requires a Pure callable (`03 §8`); the dedicated node lets codegen call the runtime's
-parallel-map API with a generated whole-range kernel. The kernel contains the typed counted loop
-and a direct call to the known body; the runtime schedules disjoint `[start,end)` ranges. Parallel
-reduction is not part of the current surface, so MIR does not claim a `ParLoop(reduce=…)` node or an
-associativity contract.
+parallel-map API with a generated whole-range kernel. Direct-source Copy captures are lowered once
+into a call-scoped immutable context; the kernel loads them and passes them as direct trailing
+arguments. The kernel contains the typed counted loop and a direct call to the known body; the
+runtime schedules disjoint `[start,end)` ranges. Parallel reduction is not part of the current
+surface, so MIR does not claim a `ParLoop(reduce=…)` node or an associativity contract.
 
 ---
 

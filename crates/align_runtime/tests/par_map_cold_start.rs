@@ -12,7 +12,7 @@
 //! large workload before the deliberate "sanity: a big workload still initializes the pool" check
 //! at the end.
 
-extern "C" fn double(input: *const u8, output: *mut u8, start: i64, end: i64) {
+extern "C" fn double(_context: *const u8, input: *const u8, output: *mut u8, start: i64, end: i64) {
     let start = usize::try_from(start).unwrap();
     let end = usize::try_from(end).unwrap();
     for i in start..end {
@@ -39,6 +39,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
     let input: Vec<i64> = (0..COUNT).collect();
     let output = unsafe {
         align_runtime::align_rt_par_map(
+            std::ptr::null(),
             input.as_ptr() as *const u8,
             COUNT,
             std::mem::size_of::<i64>() as i64,
@@ -81,6 +82,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
     let big_input: Vec<i64> = (0..BIG).collect();
     let big_output = unsafe {
         align_runtime::align_rt_par_map(
+            std::ptr::null(),
             big_input.as_ptr() as *const u8,
             BIG,
             std::mem::size_of::<i64>() as i64,

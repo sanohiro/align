@@ -220,21 +220,21 @@ fn lambda_captures_in_partition_and_any_all() {
 }
 
 #[test]
-fn lambda_captures_in_par_map_falls_back_to_sequential() {
+fn lambda_captures_in_par_map_uses_parallel_context() {
     if !backend_available() {
         return;
     }
-    // A capturing par_map lambda is correct via the sequential path (the parallel range kernel takes no
-    // capture context): (1+100)+(2+100)+(3+100) = 306.
+    // A capturing par_map lambda carries its Copy capture through the generated range-kernel context:
+    // (1+100)+(2+100)+(3+100) = 306.
     let src = "fn main() -> Result<(), Error> {\n  b := 100\n  print([1, 2, 3].par_map(fn x { x + b }).sum())\n  return Ok(())\n}\n";
     let out = build_and_run("lam-capture-parmap", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "306\n");
-    // With a capture, par_map does NOT take the parallel runtime path.
+    // The direct source still takes the parallel MIR path, with the capture listed in its context.
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(!text.contains("par_map["), "a capturing par_map must fall back to sequential:\n{text}");
+    assert!(text.contains("par_map[") && text.contains("captures=["), "a capturing par_map must carry its context:\n{text}");
 }
 
 #[test]

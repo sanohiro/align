@@ -46,7 +46,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType};
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, IntValue};
+use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue};
 
 pub fn is_available() -> bool {
     true
@@ -1022,12 +1022,12 @@ fn build_module<'c>(
             None,
         ),
     );
-    // `par_map`: (in_buf, count, in_stride, out_stride, range_kernel) -> out_buf. Allocates the
-    // output, applies the generated kernel to disjoint ranges across threads, returns the owned
-    // buffer.
+    // `par_map`: (capture_ctx, in_buf, count, in_stride, out_stride, range_kernel) -> out_buf.
+    // Allocates the output, applies the generated kernel to disjoint ranges across threads, and
+    // returns the owned buffer. The call-scoped capture context is never retained by the runtime.
     let par_map = module.add_function(
         "align_rt_par_map",
-        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
+        ptr.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
         None,
     );
     // Only `noalias` on the return: the output buffer is a fresh allocation disjoint from the inputs.
@@ -4789,15 +4789,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))
     }
 
-    /// Get (building it once) the `void(in_base, out_base, start, end)` range kernel for `func`.
-    /// The kernel owns the counted element loop: typed GEP → load → direct call → store. The runtime
-    /// calls it once per claimed range, so the hot element loop contains no indirect callback.
+    /// Get (building it once) the `void(context, in_base, out_base, start, end)` range kernel for
+    /// `func`. The kernel owns the counted element loop: typed GEP → load → direct call → store.
+    /// The runtime calls it once per claimed range, so the hot element loop contains no indirect
+    /// callback. Copy captures are loaded once from the immutable call-scoped context.
     /// Building it temporarily repositions the shared builder, then restores it.
     fn par_map_range_kernel(
         &self,
         func: &str,
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
+        capture_tys: &[Ty],
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let name = format!("{func}$parkernel");
         if let Some(f) = self.module.get_function(&name) {
@@ -4808,19 +4810,33 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .get(func)
             .copied()
             .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
+        let expected_params = capture_tys
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.err(format!("par_map function `{func}` capture count overflows")))?;
+        let actual_params = target.get_type().get_param_types().len();
+        if actual_params != expected_params {
+            return Err(self.err(format!(
+                "par_map function `{func}` has {actual_params} parameters, expected {expected_params}"
+            )));
+        }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
+        let capture_fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+        let capture_struct = self.ctx.struct_type(&capture_fields, false);
         let kernel = self.module.add_function(
             &name,
             self.ctx
                 .void_type()
-                .fn_type(&[ptr_t.into(), ptr_t.into(), i64t.into(), i64t.into()], false),
+                .fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into(), i64t.into(), i64t.into()], false),
             None,
         );
         mark_nounwind(self.ctx, kernel);
         mark_private_helper(kernel);
-        // The synchronous runtime never retains either base pointer. Input is read-only; output is
-        // the runtime's fresh allocation and is written only through this disjoint range kernel.
+        // The synchronous runtime never retains the context or either base pointer. Input and the
+        // context are read-only; output is the runtime's fresh allocation and is written only
+        // through this disjoint range kernel. Input/context are not noalias: a Copy capture may
+        // contain a view into the input storage.
         add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(0), "readonly");
         add_valued_enum_attr(
             self.ctx,
@@ -4829,12 +4845,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
             "captures",
             CAPTURES_NONE,
         );
-        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(1), "noalias");
-        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(1), "writeonly");
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(1), "readonly");
         add_valued_enum_attr(
             self.ctx,
             kernel,
             inkwell::attributes::AttributeLoc::Param(1),
+            "captures",
+            CAPTURES_NONE,
+        );
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(2), "noalias");
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(2), "writeonly");
+        add_valued_enum_attr(
+            self.ctx,
+            kernel,
+            inkwell::attributes::AttributeLoc::Param(2),
             "captures",
             CAPTURES_NONE,
         );
@@ -4852,10 +4876,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let body = self.ctx.append_basic_block(kernel, "body");
         let done = self.ctx.append_basic_block(kernel, "done");
         self.builder.position_at_end(entry);
-        let in_base = kernel.get_nth_param(0).unwrap().into_pointer_value();
-        let out_base = kernel.get_nth_param(1).unwrap().into_pointer_value();
-        let start = kernel.get_nth_param(2).unwrap().into_int_value();
-        let end = kernel.get_nth_param(3).unwrap().into_int_value();
+        let context = kernel.get_nth_param(0).unwrap().into_pointer_value();
+        let in_base = kernel.get_nth_param(1).unwrap().into_pointer_value();
+        let out_base = kernel.get_nth_param(2).unwrap().into_pointer_value();
+        let start = kernel.get_nth_param(3).unwrap().into_int_value();
+        let end = kernel.get_nth_param(4).unwrap().into_int_value();
+        let capture_values = if capture_tys.is_empty() {
+            Vec::new()
+        } else {
+            capture_tys
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    let field = self
+                        .builder
+                        .build_struct_gep(capture_struct, context, i as u32, "parcap")
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_load(self.llvm_type(*ty), field, "parcapv")
+                        .map_err(|e| self.err(e))
+                })
+                .collect::<Result<Vec<_>, CodegenError>>()?
+        };
         self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
 
         // head: i = phi [start, entry], [i+1, body]; enter while i < end.
@@ -4877,9 +4919,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
         };
         let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
+        let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + capture_values.len());
+        call_args.push(x.into());
+        call_args.extend(capture_values.iter().map(|value| BasicMetadataValueEnum::from(*value)));
         let r = self
             .builder
-            .build_call(target, &[x.into()], "r")
+            .build_call(target, &call_args, "r")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -6625,9 +6670,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("align_rt_chunks returns a {ptr,len}")
             }
-            Rvalue::ParMapParallel { src, func, elem_in, elem_out } => {
-                // Heap-allocate the output buffer, then run `func` over the input in parallel via
-                // a per-`func` range kernel; the result is the owned `{ out_buf, count }` array.
+            Rvalue::ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out } => {
+                // Build a call-scoped immutable context for Copy captures, then run `func` over the
+                // input in parallel via a per-`func` range kernel; the result is the owned
+                // `{ out_buf, count }` array. The runtime call is synchronous, so the entry alloca
+                // remains live until every worker has stopped reading it.
+                if captures.len() != capture_tys.len() {
+                    return Err(self.err(format!(
+                        "par_map capture operand/type count mismatch: {} operands, {} types",
+                        captures.len(),
+                        capture_tys.len()
+                    )));
+                }
                 let agg = self.operand(src)?.into_struct_value();
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
                 let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
@@ -6636,14 +6690,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty)?;
+                let context = if capture_tys.is_empty() {
+                    self.ctx.ptr_type(AddressSpace::default()).const_null()
+                } else {
+                    let fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+                    let context_ty = self.ctx.struct_type(&fields, false);
+                    let context = self.alloca_at_entry(context_ty.into(), "par_map_context")?;
+                    for (i, op) in captures.iter().enumerate() {
+                        let value = self.operand(op)?;
+                        let field = self
+                            .builder
+                            .build_struct_gep(context_ty, context, i as u32, "parcap")
+                            .map_err(|e| self.err(e))?;
+                        self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                    }
+                    context
+                };
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys)?;
                 // The runtime allocates the output (overflow-guarded), runs the kernel across
                 // threads, and returns the owned buffer.
                 let out_buf = self
                     .builder
                     .build_call(
                         self.funcs["par_map"],
-                        &[in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
+                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
                         "obuf",
                     )
                     .map_err(|e| self.err(e))?

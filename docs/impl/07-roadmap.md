@@ -563,8 +563,9 @@ are compiler-known builtins, monomorphic per element type.
   named function cannot do (`map(fn x { x * factor })`). Capture is copy-values only (an owned/Move
   capture is rejected); it works in **every** stage and reducer — `map`/`where` (in `StageKind`)
   and `reduce`/`scan`/`partition`/`any`/`all`/`par_map` (a `captures` field on each node, threaded
-  to the per-element call). A *capturing* `par_map` falls back to the sequential path (the parallel
-  runtime thunk takes no capture context). All three flow analyses (`MoveCheck`/`EscapeCheck`/
+  to the per-element call). A direct-source `par_map` with Copy captures uses the generated range
+  kernel through an immutable call-scoped context; staged or unsupported forms remain sequential,
+  and Move captures are rejected. All three flow analyses (`MoveCheck`/`EscapeCheck`/
   `EffectScan`) walk stage and node captures. First-class function values remain a follow-up.
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
@@ -1005,7 +1006,8 @@ already lives in `docs/open-questions.md`.
 - [done] **thread-parallel execution of `par_map`** — the perf widening of the sequential
   skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
   `Rvalue::ParMapParallel`: codegen emits a per-function
-  `void(in_base, out_base, start, end)` kernel whose typed counted loop directly calls `f`, and the
+  `void(capture_ctx, in_base, out_base, start, end)` kernel whose typed counted loop directly calls
+  `f` after loading Copy captures from the immutable call-scoped context, and the
   runtime `align_rt_par_map` schedules disjoint output ranges on a process-lifetime `ParPool`;
   helpers and the caller drain one shared range cursor and join a total-range completion barrier.
   The original per-element indirect thunk was removed 2026-07-25; a cheap arithmetic kernel now
@@ -1014,7 +1016,8 @@ already lives in `docs/open-questions.md`.
   with a fail-closed higher-order unknown-target gate; #465 later moved concrete callable effects
   into `FnTy` and removed address-taking call edges. The saturated `task_group -> par_map`
   forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A *staged*
-  `par_map` (`where(p).par_map(f)`) and a capturing `par_map` still use the sequential collect loop.
+  `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop; Move captures remain
+  rejected by ownership checks.
   Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
   function values + indirect call (①), a lambda as a first-class value with typed parameters (②a),

@@ -248,23 +248,23 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 
 ## 7. Parallelism (`ParMapParallel` → runtime)
 
-MIR's dedicated non-capturing `ParMapParallel` materializer (`04 §6`) goes to the runtime's
+MIR's dedicated direct-source `ParMapParallel` materializer (`04 §6`) goes to the runtime's
 parallel-map API.
 
 ```text
-ParMapParallel { src, func, elem_in, elem_out }
-  → synthesize one typed range kernel (start..<end)
-  → align_rt_par_map(in_buf, count, in_stride, out_stride, kernel)
+ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out }
+  → synthesize one typed range kernel (context, start..<end)
+  → align_rt_par_map(capture_ctx, in_buf, count, in_stride, out_stride, kernel)
   → owned array<elem_out>
 
 task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
 ```
 
-The range kernel loops over typed input/output GEPs, calls the named Pure Align function directly,
-and stores each output. LLVM can inline and vectorize that loop; the runtime invokes the function
-pointer once per coarse range, not once per element. Capturing or staged `par_map` forms use the
-sequential pipeline fallback before codegen. There is no generic parallel-reduce lowering in the
-current surface. The ABI is in `06`.
+The range kernel loops over typed input/output GEPs, loads Copy captures once from the immutable
+call-scoped context, calls the Pure Align function directly, and stores each output. LLVM can inline
+and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
+element. Staged `par_map` forms use the sequential pipeline fallback before codegen. There is no
+generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---
 
