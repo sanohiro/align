@@ -64,8 +64,8 @@ field makes the enclosing struct **Move**: `struct_is_move`/`ty_owns_buffer_rec`
 runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the union's owned
 payload on the decode error path. `match m.content { … }` moves the owned payload out and zeroes the
 field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggregate), so the struct's
-`Drop` frees null there (single-free). The union's variants are expanded into the enclosing struct's
-`json_union_schema_sig` so a variant change invalidates the decode/encode cache. **Boundary:** because a
+`Drop` frees null there (single-free). The union's variants are part of the structural MIR type
+tables, so a variant change invalidates the decode/encode cache. **Boundary:** because a
 Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
 `Message` decode target binds with `?`. The following J3b slice supplies owned-element deep free, so
 `Chat { messages: array<Message> }` also round-trips when `Message` is Move.
@@ -112,9 +112,9 @@ pre-existing zero-copy limitation as an escaped `str` field (decodes to `Err`). 
 `drop_struct_fields`'s `DynArray` arm on success, `drop_decoded_owned` kind-7 (element-agnostic
 flat-free) on the decode error path (`sub_owns_buffers` has kind 7 so a scalar/str-array field inside an
 `array<Move-struct>` element is cleaned up). Composes with J3b (`Table { rows: array<Row>, meta: array<i64> }`
-where `Row { vals: array<f64> }`). The element type is baked into the decode schema fingerprint
-(`json_schema_sig` → the element-aware MIR `ty_name`), so an `array<i64>`→`array<f64>` change invalidates
-the cache. **Still deferred:** `array<char>` (no JSON form); a **top-level** `array<str> := json.decode`
+where `Row { vals: array<f64> }`). The structural MIR fingerprint includes the element type, so an
+`array<i64>`→`array<f64>` change invalidates the cache. **Still deferred:** `array<char>` (no JSON
+form); a **top-level** `array<str> := json.decode`
 (a struct FIELD rides the enclosing struct's input-region binding, but a top-level array result would
 have to carry that region itself — the scalar top-level array is deliberately `Static`/returnable, so
 `array<str>` at top level is a separate region-carrying slice). v1 limits: `.sum()`/pipelines over an
@@ -136,9 +136,8 @@ descriptor-driven encoder (a new `OptionStructField` template piece → `align_r
 single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
 scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
 own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and stays non-Move.
-The `OptionStructField` piece bakes the payload's `json_schema_sig` for cache invalidation; the same
-recursion was added to `json_schema_sig` for the DECODE side too (an `Option<struct>` payload field
-change had folded to a bare `"Option"` — a stale-cache gap, now fixed).
+The structural MIR fingerprint includes the payload struct definition, so an `Option<struct>` payload
+field change invalidates both decode and encode objects without a manually threaded schema string.
 
 **Nested-struct fields (REST-gateway runway, Slice A).** A struct field may itself be a `Struct`;
 `decode` recurses into the nested object and `encode` renders it back, so a nested record round-trips.
@@ -263,21 +262,19 @@ validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<
 - P4 — the soa decode's performance contract (≈serde parity at 1M rows, `bench/json_soa`) is a
   regression tripwire: re-run the bench before landing parser changes.
 - P5 — **the decode target's field schema must feed the codegen cache key.** A decode target
-  struct's field names/types feed only the codegen descriptor table, not the surrounding MIR — a
-  field RENAME at the same slot (or a NESTED struct's field change) leaves every other MIR statement
-  byte-identical, so without a schema fingerprint the unit's `impl_hash` would be unchanged and the
-  warm cache would serve a STALE object still decoding the OLD key (reproduced end-to-end; the
-  #514/#517 stale-cache class). The `JsonDecode*` MIR rvalues bake a recursive `json_schema_sig`
-  (names + types + `layout(C)`/`align`, nested expanded) that is printed into the MIR — pinned by
-  `cache_codegen.rs` gate 2b. Any new schema-carrying decode surface must do the same.
+  struct's field names/types feed the codegen descriptor table rather than its surrounding statement
+  sequence. The per-unit key therefore fingerprints the complete structural MIR Program, including
+  struct/enum tables, `layout(C)`, and alignment. `cache_codegen.rs` gates 2/2b pin flat, nested, and
+  type-table-only changes. New schema-carrying surfaces must place every backend input in the
+  structural Program; do not add cache-only strings to the human MIR printer.
 
 ## Test anchors
 
 `m5.rs` (decode matrix: struct/arrays/str-fields/order/unknown-keys/malformed/range #295 #311;
 encode escaping; duplicate-key #306; **nested** decode+encode round-trip
 `json_decode_encode_nested_struct_roundtrip` + Mison-path `json_decode_nested_struct_array_mison`),
-`soa.rs:317` (json→soa filtered aggregate), `cache_codegen.rs` gate 2b (schema-fingerprint cache
-invalidation, flat + nested), runtime `json_decode_nested_struct_single` / `..._array_mison`
+`soa.rs:317` (json→soa filtered aggregate), `cache_codegen.rs` gates 2/2b (structural codegen-input
+cache invalidation, flat + nested), runtime `json_decode_nested_struct_single` / `..._array_mison`
 (descriptor-level slow + Mison recursion), examples `json.align`, `json_decode.align`,
 `json_nested.align`, `soa_json_str.align`; benches `bench/json_decode`, `bench/json_soa` (+ their
 READMEs for the measured model).

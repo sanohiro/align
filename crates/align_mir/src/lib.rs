@@ -545,12 +545,9 @@ pub enum Rvalue {
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
     ///
-    /// `schema` is a stable textual fingerprint of the (recursive) decode schema — every field's
-    /// name and type, nested structs expanded, plus each level's `layout(C)`/`align`. It is printed
-    /// into the MIR so the unit's `impl_hash` (hence the codegen cache key) invalidates on any schema
-    /// change the surrounding MIR would otherwise hide — a field RENAME (same slot/type) or a NESTED
-    /// struct's field change, neither of which alters this function's other MIR (the stale-cache bug
-    /// class of #514/#517). See [`json_schema_sig`].
+    /// `schema` is a legacy human-readable summary of the recursive decode schema. Codegen consumes
+    /// `Program::structs` directly, and the object cache fingerprints that complete structural
+    /// program; cache correctness does not depend on this redundant string. See [`json_schema_sig`].
     JsonDecode { struct_id: u32, schema: String, input: Operand, out: Slot },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
@@ -564,26 +561,26 @@ pub enum Rvalue {
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
     /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser. `schema` is the
-    /// recursive schema fingerprint (see [`JsonDecode`]) baked in for cache invalidation.
+    /// redundant human-readable summary described on [`JsonDecode`].
     JsonDecodeStructArray { struct_id: u32, schema: String, input: Operand, out: Slot },
     /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
     /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
     /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
     /// status (0 = ok). `arena` is the enclosing arena handle the runtime bump-allocates the column
     /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`. `schema`
-    /// is the recursive schema fingerprint (see [`JsonDecode`]) baked in for cache invalidation.
+    /// is the redundant human-readable summary described on [`JsonDecode`].
     JsonDecodeSoa { struct_id: u32, schema: String, input: Operand, out: Slot, arena: Operand },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value, select the variant by its shape class (Str/Number/Bool/Object; O(1) first-byte
     /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
     /// (0 = ok). codegen builds the [`JsonUnion`] descriptor (per-variant payload arms + the shape
-    /// class → arm table). `schema` is the union's fingerprint (variant names + payload types, struct
-    /// payloads expanded — see [`json_union_schema_sig`]) baked in for cache invalidation.
+    /// class → arm table). `schema` is a redundant human-readable union summary (variant names +
+    /// payload types, struct payloads expanded — see [`json_union_schema_sig`]).
     JsonDecodeUnion { enum_id: u32, schema: String, input: Operand, out: Slot },
     /// `json.doc(input)` (J4): parse the `str` `input` into an arena-backed tape, writing the root
     /// `{tape,node}` handle into the `out` slot. Yields an `i32` status (0 = ok). `arena` is the
-    /// enclosing arena handle the runtime bump-allocates the tape from. Schema-unknown, so — unlike the
-    /// typed `JsonDecode*` — it carries NO schema fingerprint (the tape is generic; nothing to stale).
+    /// enclosing arena handle the runtime bump-allocates the tape from. Schema-unknown, so it carries
+    /// no human-readable schema summary (the tape is generic).
     JsonDoc { input: Operand, arena: Operand, out: Slot },
     /// `d.kind()` on a `json.doc`: the runtime returns the `json.kind` tag directly as an `i32`
     /// (codegen wraps it into the tag-only enum aggregate). Total.
@@ -620,8 +617,9 @@ pub enum Rvalue {
     /// One streaming step of a `json.scanner<Row>` fused terminal (J5): decode the next JSON object at
     /// `*cursor` in the scanner's input into the `row` slot, advancing `*cursor` past it. Returns an
     /// `i32` status: `0` = a row was decoded, `1` = the stream is exhausted (top-level `]` / EOF),
-    /// `2` = a malformed row (the terminal yields `Err`). Reuses the decode descriptor of `struct_id`
-    /// (emitted at codegen, keyed on `schema` for cache invalidation like the typed decodes).
+    /// `2` = a malformed row (the terminal yields `Err`). Reuses the decode descriptor of
+    /// `struct_id`; cache identity comes from the complete structural Program, while `schema` is
+    /// only the legacy human-readable summary used by typed decodes.
     JsonScanNext { scanner: Operand, struct_id: u32, schema: String, cursor: Slot, row: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
@@ -1132,9 +1130,8 @@ pub enum TemplatePiece {
     /// `json.encode` of an `Option<struct>` field (JSON completeness T1b): when `opt` is `Some`, append
     /// `"name":{…},` (the payload struct rendered by the runtime descriptor-driven encoder); when
     /// `None`, append nothing. `struct_id` is the payload struct (codegen emits its descriptor table);
-    /// `schema` is its recursive field fingerprint baked in for cache invalidation (a payload field
-    /// change feeds only the codegen descriptor, so — like the decode rvalues — it must reach the MIR
-    /// digest, else a warm cache serves a stale-key encode). Paired with [`PopComma`].
+    /// `schema` is a redundant human-readable field summary; the complete structural Program carries
+    /// the cache identity. Paired with [`PopComma`].
     OptionStructField { opt: Operand, name: String, struct_id: u32, schema: String },
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
@@ -1145,13 +1142,13 @@ pub enum TemplatePiece {
     StructArrayField { array: Operand, struct_id: u32 },
     /// `json.encode` of an `array<scalar>` field (JSON completeness T1b): emit the owned scalar buffer
     /// (`{ptr,len}`) as `[e0,e1,…]` via the runtime encoder. `elem` is the element scalar
-    /// (int/float/bool); codegen packs its kind/width/sign into the runtime call's element tag. `elem`
-    /// prints in the MIR (Debug), so an element-type change invalidates the object cache.
+    /// (int/float/bool); codegen packs its kind/width/sign into the runtime call's element tag. The
+    /// structural Program fingerprint includes `elem`.
     ScalarArrayField { array: Operand, elem: align_sema::Scalar },
     /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
     /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
     /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits;
-    /// `schema` is the union fingerprint baked in for cache invalidation (see [`json_union_schema_sig`]).
+    /// `schema` is a redundant human-readable union summary (see [`json_union_schema_sig`]).
     UnionValue { value: Operand, enum_id: u32, schema: String },
 }
 
@@ -6222,8 +6219,8 @@ fn lower_json_scan_reduce(
         Ty::Result(sc, _) => align_sema::scalar_to_ty(sc),
         _ => unreachable!("a json.scan terminal is Result-typed"),
     };
-    // Fingerprint the row schema into the MIR (cache invalidation, pitfall P5) — a field rename/type
-    // change must re-trigger codegen even though the surrounding MIR is byte-identical.
+    // Retain the legacy human-readable row-schema summary. Cache identity independently includes
+    // the complete structural Program and its type tables.
     let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
 
     let scanner = lower_expr(b, source);
@@ -8245,13 +8242,11 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
 /// branch into `Ok(<struct>)` on status 0 or `Err(<code>)` otherwise, yielding the Result.
-/// A stable textual fingerprint of the recursive `json.decode` schema for struct `struct_id`: each
-/// field's name and type, nested structs expanded in place, plus every level's `layout(C)`/`align`
-/// (both change physical offsets). Baked into the decode MIR rvalue and printed, so the unit's
-/// `impl_hash` — hence the codegen cache key — invalidates on any schema change the surrounding MIR
-/// would otherwise hide (a field RENAME at the same slot, or a NESTED struct's field change; the
-/// stale-cache bug class of #514/#517). The struct graph is acyclic (`struct_acyclic`), so the
-/// recursion terminates; a `visiting` guard is defense in depth against a mis-built graph.
+/// A legacy human-readable summary of the recursive `json.decode` schema for struct `struct_id`:
+/// each field's name and type, nested structs expanded in place, plus every level's
+/// `layout(C)`/`align`. The complete structural Program now provides cache identity, so this string
+/// is redundant and must not be treated as a correctness boundary. The struct graph is acyclic
+/// (`struct_acyclic`); a `visiting` guard is defense in depth against a mis-built graph.
 fn json_schema_sig(structs: &[hir::StructDef], enums: &[hir::EnumDef], struct_id: u32) -> String {
     let mut s = String::new();
     json_schema_sig_into(structs, enums, struct_id, &mut Vec::new(), &mut s);
@@ -8280,15 +8275,11 @@ fn json_schema_sig_into(structs: &[hir::StructDef], enums: &[hir::EnumDef], stru
         out.push(':');
         match f.ty {
             Ty::Struct(nid) => json_schema_sig_into(structs, enums, nid, visiting, out),
-            // A union (`enum`) field (J1b-2b): expand its variant payloads so a change to the union's
-            // shape invalidates the enclosing struct's decode/encode cache (the #514/#517 class). Pass
-            // the shared `visiting` so a struct→union→struct cycle terminates (sema rejects it anyway).
+            // Expand union payloads for the legacy human-readable summary. Pass the shared
+            // `visiting` so a struct→union→struct cycle terminates (sema rejects it anyway).
             Ty::Enum(eid) => json_union_schema_sig_into(enums, structs, eid, visiting, out),
-            // An `Option<struct>` field's payload struct reaches decode/encode only through the codegen
-            // descriptor / the `OptionStructField` piece — never other MIR — so a payload field change
-            // must be expanded here (else a warm cache serves a stale-key object; the #514/#517 class).
-            // `ty_name` alone would fold it to a bare "Option". Render the payload width for an
-            // `Option<scalar>` too (`Option<i64>` vs `Option<f64>` differ).
+            // Expand Option payloads for the legacy human-readable summary; `ty_name` alone folds
+            // them to a bare "Option".
             Ty::Option(align_sema::Scalar::Struct(pid)) => {
                 out.push_str("Option<");
                 json_schema_sig_into(structs, enums, pid, visiting, out);
@@ -8302,12 +8293,10 @@ fn json_schema_sig_into(structs: &[hir::StructDef], enums: &[hir::EnumDef], stru
     visiting.pop();
 }
 
-/// A stable fingerprint of a shape-directed union's decode/encode schema (JSON completeness J1b):
+/// A legacy human-readable summary of a shape-directed union's decode/encode schema (J1b):
 /// `U{variant:payload,…}` in **variant (tag) order**, with a struct (object) payload expanded via
-/// [`json_schema_sig_into`] so a nested field change invalidates the cache. Baked into the
-/// `JsonDecodeUnion` rvalue / `UnionValue` template piece so the unit's `impl_hash` (hence the
-/// codegen cache key) tracks any change to a variant name, order, or payload type — none of which
-/// alters this function's other MIR (the stale-cache bug class of #514/#517).
+/// [`json_schema_sig_into`]. The complete structural Program now provides cache identity, so this
+/// string is redundant and must not be extended as a cache-correctness mechanism.
 fn json_union_schema_sig(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32) -> String {
     let mut s = String::new();
     json_union_schema_sig_into(enums, structs, enum_id, &mut Vec::new(), &mut s);
@@ -10926,9 +10915,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Vec(_, n) => format!("vec{n}"),
         Ty::Mask(_, n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
-        // Render the element scalar — the `json_schema_sig` for an `array<scalar>` decode field (T1b)
-        // bakes this into the unit's MIR digest, so `array<i64>` and `array<f64>` MUST differ (else a
-        // warm cache serves a stale wrong-element-width decode object — the #514/#517 class).
+        // Keep the legacy human-readable schema summary element-aware.
         Ty::DynArray(s) => format!("array<{}>", ty_name(align_sema::scalar_to_ty(s))),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
