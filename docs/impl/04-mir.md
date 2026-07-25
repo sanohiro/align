@@ -248,6 +248,8 @@ The implemented data-parallel operation is a dedicated materializer:
 
 ```text
 direct source.par_map(f)        → Rvalue::ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out }
+direct stage-free integer par_map(f).sum()
+                                → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out }
 staged / unsupported par_map    → sequential pipeline fallback, preserving capture semantics
 source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
@@ -257,8 +259,12 @@ task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult;
 parallel-map API with a generated whole-range kernel. Direct-source Copy captures are lowered once
 into a call-scoped immutable context; the kernel loads them and passes them as direct trailing
 arguments. The kernel contains the typed counted loop and a direct call to the known body; the
-runtime schedules disjoint `[start,end)` ranges. Parallel reduction is not part of the current
-surface, so MIR does not claim a `ParLoop(reduce=…)` node or an associativity contract.
+runtime schedules disjoint `[start,end)` ranges. The specialized `ParMapReduce` node covers only a
+direct, stage-free integer `par_map(f).sum()`; its generated kernel folds each range with plain
+wrapping integer addition and publishes one partial result per range, so no transformed array is
+materialized. Staged pipelines, `chunks` producers, floating-point sums, and arbitrary reducers
+remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
+parallelize ordinary reductions.
 
 ---
 

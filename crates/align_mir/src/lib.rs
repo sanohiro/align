@@ -476,6 +476,19 @@ pub enum Rvalue {
         elem_in: Ty,
         elem_out: Ty,
     },
+    /// `par_map(f).sum()` over a direct, stage-free scalar source whose result is an integer:
+    /// apply the Pure `func` in parallel and combine one wrapping partial sum per claimed range,
+    /// without materializing the transformed array. `elem_in` is the function parameter type and
+    /// `elem_out` is the integer result/fold type. The generated range kernel writes one partial
+    /// value to the per-range output slot supplied by the runtime.
+    ParMapReduce {
+        src: Operand,
+        func: String,
+        captures: Vec<Operand>,
+        capture_tys: Vec<Ty>,
+        elem_in: Ty,
+        elem_out: Ty,
+    },
     /// The `len` of a slice operand.
     SliceLen(Operand),
     /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
@@ -3861,6 +3874,21 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ArraySum { source, stages } => {
+            // An explicitly parallel, directly-consumed integer map can fold its result in the
+            // range kernel. This removes the full transformed array and the serial reread while
+            // preserving the existing `par_map` Pure boundary and wrapping integer semantics.
+            // Keep staged maps and `chunks(...).par_map(...)` on their existing paths: the former
+            // is not yet a whole-range pipeline, and the latter's explicit producer materialization
+            // is a separate optimization slice.
+            if stages.is_empty()
+                && let hir::ExprKind::ArrayParMap { source: map_source, stages: map_stages, func, captures, elem } = &source.kind
+                && map_stages.is_empty()
+                && matches!(elem, Ty::Int(_))
+                && !matches!(map_source.ty, Ty::DynSliceArray(_))
+                && let Some(elem_in) = direct_par_map_elem_in(map_source.ty)
+            {
+                return lower_array_par_map_reduce(b, map_source, func, captures, elem_in, *elem);
+            }
             // A `json.scanner<Row>` source streams rows (no materialized array); the terminal is
             // `Result<T, Error>` (e.ty), so the scan lowering seeds/reduces on the Ok scalar (J5).
             if let Ty::JsonScanner(sid) = source.ty {
@@ -5918,6 +5946,56 @@ fn lower_where_str_contains_pred(b: &mut Builder, nl: &NeedleLower, elem: Operan
             pred
         }
     }
+}
+
+/// Return the function parameter type for the direct range-kernel `par_map` shapes. The reduction
+/// fusion intentionally excludes `array<slice<T>>` (`chunks`) because its producer/materialization
+/// elision has a separate cost and ownership contract.
+fn direct_par_map_elem_in(ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => Some(align_sema::scalar_to_ty(s)),
+        _ => None,
+    }
+}
+
+/// Lower the directly consumed integer `par_map(...).sum()` shape. The source is consumed by the
+/// runtime read, but only a source that owns a fresh heap buffer is dropped here; named arrays and
+/// slices remain borrowed exactly as they do on the ordinary parallel map path.
+fn lower_array_par_map_reduce(
+    b: &mut Builder,
+    source: &hir::Expr,
+    func: &str,
+    captures: &[hir::Expr],
+    elem_in: Ty,
+    elem_out: Ty,
+) -> Operand {
+    let src = match source.ty {
+        Ty::Slice(_) | Ty::DynArray(_) => lower_expr(b, source),
+        Ty::Array(_, _) => {
+            let (slot, n) = array_source_slot(b, source);
+            let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
+            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
+            Operand::Value(sv)
+        }
+        other => unreachable!("direct par_map reduction source has unsupported type {other:?}"),
+    };
+    let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
+    let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
+    let free_src = pipeline_source_needs_drop(source, b.arenas.is_empty());
+    let v = b.fresh_value(elem_out);
+    b.push(Stmt::Let(v, Rvalue::ParMapReduce {
+        src: src.clone(),
+        func: func.to_string(),
+        captures: capture_ops,
+        capture_tys,
+        elem_in,
+        elem_out,
+    }));
+    if free_src {
+        // The reduction has consumed the source bytes before returning its scalar result.
+        b.push(Stmt::DropValue(src));
+    }
+    Operand::Value(v)
 }
 
 fn lower_array_reduce(

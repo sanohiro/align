@@ -371,6 +371,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 format!("par_map[{}]({}: {} -> {}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
+        Rvalue::ParMapReduce { src, func, captures, elem_in, elem_out, .. } => {
+            let caps = captures.iter().map(operand_str).collect::<Vec<_>>().join(", ");
+            if caps.is_empty() {
+                format!("par_map_reduce[{}]({}: {} -> {})", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+            } else {
+                format!("par_map_reduce[{}]({}: {} -> {}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+            }
+        }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SlicePtr(op) => format!("slice_ptr({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),

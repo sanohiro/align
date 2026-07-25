@@ -1035,6 +1035,17 @@ fn build_module<'c>(
     // range kernel, so we don't assert anything about what that does).
     add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
     funcs.insert("par_map".to_string(), par_map);
+    // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, range_kernel)
+    // -> wrapping integer sum. The runtime keeps only one partial result per claimed range, so no
+    // full transformed output buffer is materialized.
+    funcs.insert(
+        "par_map_reduce".to_string(),
+        module.add_function(
+            "align_rt_par_map_reduce",
+            i64t.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
+            None,
+        ),
+    );
     funcs.insert(
         "print_str".to_string(),
         module.add_function(
@@ -4800,8 +4811,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
         capture_tys: &[Ty],
+        reduce: bool,
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
-        let name = format!("{func}$parkernel");
+        let name = if reduce { format!("{func}$parreducekernel") } else { format!("{func}$parkernel") };
         if let Some(f) = self.module.get_function(&name) {
             return Ok(f.as_global_value().as_pointer_value());
         }
@@ -4810,6 +4822,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .get(func)
             .copied()
             .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
+        let reduce_ty = if reduce {
+            Some(match out_ty {
+                BasicTypeEnum::IntType(ty) => ty,
+                _ => return Err(self.err(format!("par_map reduction function `{func}` must return an integer"))),
+            })
+        } else {
+            None
+        };
         let expected_params = capture_tys
             .len()
             .checked_add(1)
@@ -4905,6 +4925,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let phi = self.builder.build_phi(i64t, "i").map_err(|e| self.err(e))?;
         phi.add_incoming(&[(&start, entry)]);
         let i = phi.as_basic_value().into_int_value();
+        let acc_phi = if let Some(reduce_ty) = reduce_ty {
+            let acc = self.builder.build_phi(reduce_ty, "acc").map_err(|e| self.err(e))?;
+            let zero = reduce_ty.const_zero();
+            acc.add_incoming(&[(&zero, entry)]);
+            Some(acc)
+        } else {
+            None
+        };
         let more = self
             .builder
             .build_int_compare(inkwell::IntPredicate::ULT, i, end, "more")
@@ -4914,9 +4942,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.position_at_end(body);
         let in_p = unsafe {
             self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
-        };
-        let out_p = unsafe {
-            self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
         };
         let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
         let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + capture_values.len());
@@ -4929,12 +4954,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| self.err("par_map function must return a value"))?;
-        self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+        if let Some(acc_phi) = &acc_phi {
+            let r = match r {
+                BasicValueEnum::IntValue(v) => v,
+                _ => return Err(self.err("par_map reduction function must return an integer")),
+            };
+            let next_acc = self
+                .builder
+                .build_int_add(acc_phi.as_basic_value().into_int_value(), r, "acc.next")
+                .map_err(|e| self.err(e))?;
+            acc_phi.add_incoming(&[(&next_acc, body)]);
+        } else {
+            let out_p = unsafe {
+                self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
+            };
+            self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+        }
         let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
         phi.add_incoming(&[(&next, body)]);
         self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
 
         self.builder.position_at_end(done);
+        if let Some(acc_phi) = &acc_phi {
+            self.builder
+                .build_store(out_base, acc_phi.as_basic_value())
+                .map_err(|e| self.err(e))?;
+        }
         self.builder.build_return(None).map_err(|e| self.err(e))?;
         match saved {
             Some(s) => self.builder.position_at_end(s),
@@ -6706,7 +6751,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys)?;
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, false)?;
                 // The runtime allocates the output (overflow-guarded), runs the kernel across
                 // threads, and returns the owned buffer.
                 let out_buf = self
@@ -6733,6 +6778,70 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()
+            }
+            Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out } => {
+                // The reduction kernel writes one wrapping integer partial per claimed range;
+                // the runtime combines those partials and returns the result bits in i64. The
+                // final truncation restores the source integer width without adding signed
+                // overflow flags.
+                if captures.len() != capture_tys.len() {
+                    return Err(self.err(format!(
+                        "par_map reduction capture operand/type count mismatch: {} operands, {} types",
+                        captures.len(),
+                        capture_tys.len()
+                    )));
+                }
+                let agg = self.operand(src)?.into_struct_value();
+                let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
+                let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
+                let in_ty = self.llvm_type(*elem_in);
+                let out_ty = self.llvm_type(*elem_out);
+                let out_int = match out_ty {
+                    BasicTypeEnum::IntType(ty) => ty,
+                    _ => return Err(self.err("par_map reduction result must be an integer")),
+                };
+                let i64t = self.ctx.i64_type();
+                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
+                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let context = if capture_tys.is_empty() {
+                    self.ctx.ptr_type(AddressSpace::default()).const_null()
+                } else {
+                    let fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+                    let context_ty = self.ctx.struct_type(&fields, false);
+                    let context = self.alloca_at_entry(context_ty.into(), "par_map_reduce_context")?;
+                    for (i, op) in captures.iter().enumerate() {
+                        let value = self.operand(op)?;
+                        let field = self
+                            .builder
+                            .build_struct_gep(context_ty, context, i as u32, "parcap")
+                            .map_err(|e| self.err(e))?;
+                        self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                    }
+                    context
+                };
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, true)?;
+                let raw = self
+                    .builder
+                    .build_call(
+                        self.funcs["par_map_reduce"],
+                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
+                        "parsum",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("align_rt_par_map_reduce returned no value"))?;
+                let BasicValueEnum::IntValue(raw) = raw else {
+                    return Err(self.err("align_rt_par_map_reduce returned a non-integer value"));
+                };
+                if out_int.get_bit_width() == 64 {
+                    raw.into()
+                } else {
+                    self.builder
+                        .build_int_truncate(raw, out_int, "parsum_narrow")
+                        .map_err(|e| self.err(e))?
+                        .into()
+                }
             }
             Rvalue::StrLit(s) => {
                 let (ptr, len) = self.str_global(s);

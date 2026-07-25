@@ -1812,6 +1812,11 @@ struct ParMapWork {
     context_addr: usize,
     in_addr: usize,
     out_addr: usize,
+    /// Zero means the kernel receives the global output base and indexes it by the global element
+    /// index. A non-zero value means each claimed range receives a distinct output slot at
+    /// `out_addr + range * range_output_stride`; this is the partial-result shape used by the
+    /// fused integer reduction.
+    range_output_stride: usize,
     kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
     barrier: std::sync::Mutex<ParMapBarrier>,
     complete: std::sync::Condvar,
@@ -1833,10 +1838,20 @@ fn drain_par_map(work: &ParMapWork) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let start = i64::try_from(start).expect("par_map range start came from an i64 count");
             let end = i64::try_from(end).expect("par_map range end came from an i64 count");
+            let out_addr = if work.range_output_stride == 0 {
+                work.out_addr
+            } else {
+                let offset = range
+                    .checked_mul(work.range_output_stride)
+                    .expect("par_map range output offset overflow");
+                work.out_addr
+                    .checked_add(offset)
+                    .expect("par_map range output address overflow")
+            };
             (work.kernel)(
                 work.context_addr as *const u8,
                 work.in_addr as *const u8,
-                work.out_addr as *mut u8,
+                out_addr as *mut u8,
                 start,
                 end,
             );
@@ -1862,6 +1877,76 @@ fn par_map_plan(count: usize, workers: usize, min_chunk: usize) -> Option<(usize
     let target_per = count.div_ceil(workers).max(min_chunk);
     let ranges = count.div_ceil(target_per);
     (ranges > 1).then(|| (ranges, count.div_ceil(ranges)))
+}
+
+/// Decide whether this call uses one caller-owned range or the worker pool. The threshold check is
+/// deliberately first: tiny maps must not initialize the process-lifetime pool. The returned plan
+/// is reused by both materializing `par_map` and fused integer reduction so the two paths have the
+/// same range/caller behavior.
+fn par_map_execution_plan(count: usize) -> Option<(usize, usize)> {
+    if count <= PAR_MIN_CHUNK {
+        return None;
+    }
+    #[cfg(feature = "par-map-probe")]
+    if PAR_MAP_FORCE_CALLER.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let workers = par_worker_count();
+    if workers <= 1 {
+        return None;
+    }
+    par_map_plan(count, workers, PAR_MIN_CHUNK)
+}
+
+/// Run one generated range kernel over the caller-only or pooled plan. `range_output_stride == 0`
+/// preserves the materializing `par_map` ABI (the kernel indexes one global output array); a
+/// non-zero stride gives each range a separate output slot, allowing a reduction kernel to publish
+/// one partial without an element-sized output buffer.
+fn run_par_map_ranges(
+    context: *const u8,
+    in_buf: *const u8,
+    out_buf: *mut u8,
+    count: usize,
+    kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
+    range_output_stride: usize,
+    plan: Option<(usize, usize)>,
+) -> usize {
+    let end = i64::try_from(count).expect("par_map count was validated from i64");
+    let Some((nchunks, per)) = plan else {
+        kernel(context, in_buf, out_buf, 0, end);
+        return 1;
+    };
+    let (pool, _) = par_pool();
+    // Helpers and the caller share one claim loop. The caller therefore drains all of its own
+    // ranges even when every pool worker is blocked in another nested structured operation.
+    let work = std::sync::Arc::new(ParMapWork {
+        next_range: std::sync::atomic::AtomicUsize::new(0),
+        ranges: nchunks,
+        per,
+        count,
+        context_addr: context as usize,
+        in_addr: in_buf as usize,
+        out_addr: out_buf as usize,
+        range_output_stride,
+        kernel,
+        barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
+        complete: std::sync::Condvar::new(),
+    });
+    for _ in 0..nchunks - 1 {
+        let work = work.clone();
+        pool.submit(Box::new(move || drain_par_map(&work)));
+    }
+    drain_par_map(&work);
+
+    let mut state = work.barrier.lock().unwrap();
+    while state.remaining > 0 {
+        state = work.complete.wait(state).unwrap();
+    }
+    if let Some((_, panic)) = state.panic.take() {
+        drop(state);
+        std::panic::resume_unwind(panic);
+    }
+    nchunks
 }
 
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and invoke
@@ -1905,78 +1990,80 @@ pub unsafe extern "C" fn align_rt_par_map(
         .unwrap_or_else(|| panic_abort("par_map input size overflow"));
 
     let out_buf = align_rt_alloc(bytes);
-    // Don't parallelize trivially-small work: `PAR_MIN_CHUNK` is the conservative single-range
-    // floor/initial grain target, so tiny maps (where the pool round-trip would dwarf the work)
-    // fall to the caller path. The threshold is deliberately conservative for cheap/vectorizable
-    // bodies; retune only from the checked-in threshold probe and cross-host measurements.
-    // Run every element on the calling thread, no pool involved.
-    let run_all_on_caller = || {
-        let end = i64::try_from(count).expect("par_map count was validated from i64");
-        kernel(context, in_buf, out_buf, 0, end);
-    };
-    // Threshold check hoisted above `par_pool()`: `count <= PAR_MIN_CHUNK` guarantees a single
-    // range regardless of the worker count, so this skips touching the global worker pool entirely
-    // — a tiny `par_map` (e.g. 8 elements) must not pay the pool's cold-start cost (~69µs measured,
-    // vs ~125ns warm) just to immediately fall back to the caller-only path anyway (Codex audit
-    // item 5).
-    if count <= PAR_MIN_CHUNK {
-        run_all_on_caller();
-        return out_buf;
-    }
-
-    #[cfg(feature = "par-map-probe")]
-    if PAR_MAP_FORCE_CALLER.load(std::sync::atomic::Ordering::Relaxed) {
-        run_all_on_caller();
-        return out_buf;
-    }
-
-    // A single available worker cannot execute a helper range concurrently, so avoid creating a
-    // detached pool that the caller-only fallback would never use. The test build can force this
-    // case with ALIGN_TEST_PAR_WORKERS=1; production uses the host's available parallelism.
-    if par_worker_count() <= 1 {
-        run_all_on_caller();
-        return out_buf;
-    }
-
-    let (pool, workers) = par_pool();
-    let Some((nchunks, per)) = par_map_plan(count, workers, PAR_MIN_CHUNK) else {
-        // Retain a defensive caller fallback if a future planner admits another degenerate worker
-        // configuration after the pre-init one-worker guard above.
-        run_all_on_caller();
-        return out_buf;
-    };
-    // The plan balances the ranges after choosing their count, so a threshold-adjacent call does
-    // not hand one worker a full range and another worker a one-element tail.
-
-    // Helpers and the caller share one claim loop. The caller therefore drains all of its own
-    // ranges even when every pool worker is blocked in another nested structured operation.
-    let work = std::sync::Arc::new(ParMapWork {
-        next_range: std::sync::atomic::AtomicUsize::new(0),
-        ranges: nchunks,
-        per,
-        count,
-        context_addr: context as usize,
-        in_addr: in_buf as usize,
-        out_addr: out_buf as usize,
-        kernel,
-        barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
-        complete: std::sync::Condvar::new(),
-    });
-    for _ in 0..nchunks - 1 {
-        let work = work.clone();
-        pool.submit(Box::new(move || drain_par_map(&work)));
-    }
-    drain_par_map(&work);
-
-    let mut state = work.barrier.lock().unwrap();
-    while state.remaining > 0 {
-        state = work.complete.wait(state).unwrap();
-    }
-    if let Some((_, panic)) = state.panic.take() {
-        drop(state);
-        std::panic::resume_unwind(panic);
-    }
+    let plan = par_map_execution_plan(count);
+    run_par_map_ranges(context, in_buf, out_buf, count, kernel, 0, plan);
     out_buf
+}
+
+/// `par_map(...).sum()`: run a generated integer-reduction range kernel and combine one wrapping
+/// partial per range. `result_stride` is the native byte width of the integer result (1, 2, 4, or
+/// 8); the returned i64 carries the exact result bits, and codegen narrows it back to the language
+/// integer type. No `count * result_stride` output buffer is allocated.
+///
+/// # Safety
+/// `in_buf` must point to `count` elements of `in_stride` bytes for the call's duration; `kernel`
+/// must read only the supplied input range and store one `result_stride`-wide integer at its output
+/// pointer. The runtime passes each range a distinct output slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_par_map_reduce(
+    context: *const u8,
+    in_buf: *const u8,
+    count: i64,
+    in_stride: i64,
+    result_stride: i64,
+    kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
+) -> i64 {
+    if count <= 0 {
+        return 0;
+    }
+    let count = safe_len(count).unwrap_or_else(|_| panic_abort("par_map reduction count overflow"));
+    let Ok(in_stride) = safe_len(in_stride) else {
+        panic_abort("par_map reduction input stride invalid")
+    };
+    let Ok(result_stride) = safe_len(result_stride) else {
+        panic_abort("par_map reduction result stride invalid")
+    };
+    if !matches!(result_stride, 1 | 2 | 4 | 8) {
+        panic_abort("par_map reduction result stride unsupported");
+    }
+    let _in_bytes = count
+        .checked_mul(in_stride)
+        .and_then(|b| isize::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("par_map reduction input size overflow"));
+
+    let plan = par_map_execution_plan(count);
+    let ranges = plan.map_or(1, |(nchunks, _)| nchunks);
+    // A u64 slot for every range keeps the range output address naturally aligned even when the
+    // language result is i8/i16. The kernel stores only the result-width prefix; the vector is
+    // zero-initialized so reading that prefix is deterministic after every successful range.
+    let mut partials = vec![0_u64; ranges];
+    let actual_ranges = run_par_map_ranges(
+        context,
+        in_buf,
+        partials.as_mut_ptr().cast::<u8>(),
+        count,
+        kernel,
+        core::mem::size_of::<u64>(),
+        plan,
+    );
+    debug_assert_eq!(actual_ranges, ranges);
+
+    let base = partials.as_ptr().cast::<u8>();
+    let mut total = 0_u64;
+    for range in 0..actual_ranges {
+        let slot = unsafe { base.add(range * core::mem::size_of::<u64>()) };
+        let value = unsafe {
+            match result_stride {
+                1 => slot.cast::<u8>().read_unaligned() as u64,
+                2 => slot.cast::<u16>().read_unaligned() as u64,
+                4 => slot.cast::<u32>().read_unaligned() as u64,
+                8 => slot.cast::<u64>().read_unaligned(),
+                _ => unreachable!("validated par_map reduction result stride"),
+            }
+        };
+        total = total.wrapping_add(value);
+    }
+    total as i64
 }
 
 /// A growable byte buffer allocated by the same C malloc/realloc/free family as Align owned
@@ -23111,6 +23198,24 @@ mod tests {
         }
     }
 
+    extern "C" fn par_map_reduce_sum(
+        _context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let start = usize::try_from(start).unwrap();
+        let end = usize::try_from(end).unwrap();
+        let mut total = 0_i64;
+        for i in start..end {
+            unsafe {
+                total = total.wrapping_add(*input.cast::<i64>().add(i));
+            }
+        }
+        unsafe { output.cast::<i64>().write(total) };
+    }
+
     #[test]
     fn par_map_plan_balances_threshold_adjacent_ranges() {
         const MIN: usize = 65_536;
@@ -23143,6 +23248,28 @@ mod tests {
                 assert_eq!(v, (i as i64) * 2, "count={count} index={i}");
             }
             unsafe { align_rt_free(output) };
+        }
+    }
+
+    #[test]
+    fn par_map_reduce_correct_across_threshold_boundary() {
+        // The reduction kernel receives a distinct 8-byte output slot for each claimed range.
+        // Counts around the pool threshold exercise both the caller-only and pooled scheduler
+        // shapes; the modulo-i64 result must match a serial wrapping fold in either case.
+        for &count in &[1_i64, 65_536, 65_537, 131_073] {
+            let input: Vec<i64> = (0..count).collect();
+            let got = unsafe {
+                align_rt_par_map_reduce(
+                    core::ptr::null(),
+                    input.as_ptr() as *const u8,
+                    count,
+                    size_of::<i64>() as i64,
+                    size_of::<i64>() as i64,
+                    par_map_reduce_sum,
+                )
+            };
+            let want = input.iter().copied().fold(0_i64, i64::wrapping_add);
+            assert_eq!(got, want, "count={count}");
         }
     }
 

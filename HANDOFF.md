@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #644.
-The current change separates the bounded PR gate from the retained full regression corpus._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #646.
+The current change fuses direct integer `par_map(...).sum()` into a reduction range kernel._
 
 ## Start here
 
@@ -56,6 +56,7 @@ facts must live in this repository.
 #642  whole-range par_map kernels with direct vectorizable element loops
 #643  Copy-capturing par_map range contexts + integration-test hardening
 #644  par_map range-threshold retune from measured crossover data
+#646  separate bounded and full test suites
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -110,12 +111,12 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-The capture-context and threshold slices are shipped in #643 and #644. The
-current change implements the integration-test execution policy. After it lands,
-the next recommended slice is wrapping-integer `par_map(...).sum()` fusion so the parallel operation can avoid
-writing and rereading its full intermediate array. Length-preserving staged
-parallel lowering and the wider `task_group` low-lock work remain later
-measure-first follow-ups.
+The capture-context, threshold, and test-policy slices are shipped in #643, #644,
+and #646. The current change implements wrapping-integer `par_map(...).sum()`
+fusion so the parallel operation can avoid writing and rereading its full
+intermediate array. After it lands, the next recommended slice is the low-lock
+`task_group` completion path and batched queue publication. Length-preserving
+staged parallel lowering remains a later measure-first follow-up.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -129,8 +130,8 @@ Consumer-gated deferrals that remain intentional:
 - The first pkg.web consumer application remains a separate, owner-scheduled
   task.
 
-The integration-test execution-policy review is implemented in the current
-change. `scripts/test-pr.sh` is the bounded ordinary gate: workspace build,
+The integration-test execution-policy review is implemented on `main` in #646.
+`scripts/test-pr.sh` is the bounded ordinary gate: workspace build,
 deterministic non-runtime library tests, and the M0 compile/link/run smoke.
 CI no longer runs the full workspace corpus or the pkg.web performance gate on
 each PR. Deep driver regressions, differential fuzz, runtime network/filesystem,

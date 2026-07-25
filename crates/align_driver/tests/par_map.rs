@@ -103,21 +103,73 @@ fn par_map_over_struct_field() {
 }
 
 #[test]
-fn par_map_chained_into_reduction_frees_intermediate() {
+fn par_map_chained_into_reduction_fuses_intermediate() {
     if !backend_available() {
         return;
     }
-    // `arr.par_map(f).sum()` — the par_map result is a fresh owned array consumed by `sum`; it
-    // must be freed (`drop_value`), not leaked. 2 + 4 + 6 = 12.
+    // A directly consumed integer `par_map(f).sum()` uses one partial per range instead of a full
+    // transformed array followed by a serial reread. 2 + 4 + 6 = 12.
     let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  print([1, 2, 3].par_map(dbl).sum())\n  return Ok(())\n}\n";
     let out = build_and_run("pm-chain", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
-    // The consumed intermediate buffer is freed (no leak).
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(text.contains("drop_value"), "the par_map intermediate must be freed:\n{text}");
+    assert!(text.contains("par_map_reduce[dbl]"), "the direct chain must use the fused reduction:\n{text}");
+    assert!(!text.contains("par_map[dbl]"), "the fused chain must not materialize the map result:\n{text}");
+}
+
+#[test]
+fn par_map_reduction_preserves_integer_wrap() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn keep_i8(x: i8) -> i8 = x\nfn keep_u8(x: u8) -> u8 = x\nfn main() -> Result<(), Error> {\n  print([127, 1].par_map(keep_i8).sum())\n  print([200, 100].par_map(keep_u8).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-reduce-wrap", src);
+    assert_eq!(out.status.code(), Some(0));
+    // 128 in i8 is -128; 300 in u8 is 44. Both folds are modulo the result width.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-128\n44\n");
+}
+
+#[test]
+fn par_map_reduction_captures_copy_context() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  k := 10\n  print([1, 2, 3].par_map(fn x { x + k }).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-reduce-capture", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn par_map_reduction_empty_input_returns_zero() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  xs := b.build()\n  print(xs.par_map(dbl).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-reduce-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+#[test]
+fn par_map_reduction_range_kernel_writes_partials() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i64) -> i64 = x * 2\npub fn run(xs: slice<i64>) -> i64 = xs.par_map(dbl).sum()\nfn main() -> i32 = 0\n";
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parreducekernel")))
+        .unwrap_or_else(|| panic!("no par_map reduction range kernel in IR:\n{ir}"));
+    let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
+    assert!(kernel.contains("phi i64"), "the reduction kernel needs a counted loop and an accumulator:\n{kernel}");
+    assert!(kernel.contains("call i64 @dbl(i64"), "the reduction kernel must call the body directly:\n{kernel}");
+    assert!(kernel.contains("add i64"), "the reduction kernel must use plain wrapping integer addition:\n{kernel}");
+    assert!(kernel.contains("store i64"), "the reduction kernel must publish one partial:\n{kernel}");
 }
 
 #[test]

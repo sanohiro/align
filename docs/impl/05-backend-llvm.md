@@ -246,7 +246,7 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 
 ---
 
-## 7. Parallelism (`ParMapParallel` → runtime)
+## 7. Parallelism (`ParMapParallel` / `ParMapReduce` → runtime)
 
 MIR's dedicated direct-source `ParMapParallel` materializer (`04 §6`) goes to the runtime's
 parallel-map API.
@@ -258,12 +258,20 @@ ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out }
   → owned array<elem_out>
 
 task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
+
+ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out }
+  → synthesize one typed reducing range kernel (context, start..<end)
+  → align_rt_par_map_reduce(capture_ctx, in_buf, count, in_stride, result_stride, kernel)
+  → integer result bits, narrowed to elem_out
 ```
 
 The range kernel loops over typed input/output GEPs, loads Copy captures once from the immutable
 call-scoped context, calls the Pure Align function directly, and stores each output. LLVM can inline
 and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
-element. Staged `par_map` forms use the sequential pipeline fallback before codegen. There is no
+element. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses plain wrapping
+addition, and stores one partial at the range output pointer; the runtime combines the partials and
+returns the result bits. Staged `par_map` forms use the sequential pipeline fallback before codegen,
+and the fused node excludes `chunks`, floating-point sums, and arbitrary reducers. There is no
 generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---
