@@ -550,12 +550,18 @@ completion decrement and perform an Acquire join/fence before reading them; a Re
 minimum is sound only when that completion latch supplies the happens-before edge. Never return
 before all result-slot writes are visible and all tasks have joined.
 
-### 8.2 Batch pool submission
+### 8.2 Batch pool submission — SHIPPED 2026-07-26
 
 Add `submit_many`/runner-batch publication so one operation locks the global queue once, extends it,
-and wakes the needed number of workers. Today both producer and consumer take the queue mutex once
-per job. Queue batching is a smaller, safer first step than immediately replacing the queue with a
-custom lock-free deque.
+and wakes the needed number of workers. Before this slice, both producer and consumer took the
+queue mutex once per job. Queue batching is a smaller, safer first step than immediately replacing
+the queue with a custom lock-free deque.
+
+The runtime now implements this shape in `ParPool::submit_many`. Both `par_map` range helpers and
+`task_group` runner helpers publish their jobs through one queue critical section, then notify one
+parked worker per queued job. The FIFO queue, job order, caller participation, and task claim
+semantics are unchanged; only producer-side lock traffic is removed. The low-lock task claim and
+completion latch remain a separate follow-up.
 
 A dedicated bulk fork-join descriptor or bounded MPMC ring may be justified later, but only after
 queue lock telemetry. The operation count is at most roughly the worker count once range kernels
@@ -756,7 +762,7 @@ no indirect call inside the hot loop. Staged and unsupported aggregate forms rem
 
 ### Slice P2 — low-lock task execution
 
-- Batch queue publication.
+- [x] Batch queue publication (2026-07-26).
 - Add adaptive contiguous claims.
 - Replace per-task barrier mutex/wake with runner-local accumulation and final-transition latch.
 - Measure false sharing before padding.

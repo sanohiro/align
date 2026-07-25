@@ -1048,8 +1048,9 @@ and `par_map` helpers plus callers drain one shared range cursor under a child-p
 whole-range specialization plan concrete; the direct whole-range kernel shipped 2026-07-25,
 removing the per-element indirect callback and restoring vectorization for cheap arithmetic bodies.
 The direct-source Copy capture context shipped in #643. The direct integer transform-reduce slice
-is implemented in the current change; staged-pipeline, low-lock latch/batching, work-aware grain,
-and split execution-domain candidates remain. It proposes no new source syntax.
+is implemented in #647. Queue publication batching is implemented in the current change; staged
+pipeline lowering, low-lock task claim/completion, work-aware grain, and split execution-domain
+candidates remain. It proposes no new source syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**
 `12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive
