@@ -23098,6 +23098,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn par_pool_submit_many_preserves_fifo_and_empty_input() {
+        let pool: &'static ParPool = Box::leak(Box::new(ParPool {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            available: std::sync::Condvar::new(),
+        }));
+        pool.submit_many(std::iter::empty());
+        assert!(pool.queue.lock().unwrap().is_empty());
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        pool.submit_many((0..4).map(|id| {
+            let observed = observed.clone();
+            Box::new(move || observed.lock().unwrap().push(id)) as ParJob
+        }));
+
+        let mut queue = pool.queue.lock().unwrap();
+        while let Some(job) = queue.pop_front() {
+            job();
+        }
+        assert_eq!(*observed.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
     // --- `task_group` `tg_wait` (pool-backed, caller-participating work-claiming) ---
 
     /// A test trampoline: read `i64` from `env`, write `2*env` into `slot`, succeed. Matches the
