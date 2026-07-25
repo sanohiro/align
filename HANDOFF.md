@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-25. `main` includes the shipped wave through #638.
-The Unit-call lowering and call-ownership fix is under review in #639._
+_Last updated: 2026-07-25. `main` includes the shipped wave through #639.
+The cold/cache build-result parity fix is the current work._
 
 ## Start here
 
@@ -50,9 +50,10 @@ facts must live in this repository.
 #636  portable env_clear for macOS/BSD
 #637  unified Claude/Codex guidance + compact handoff
 #638  Copy-struct array materialization
+#639  Unit-call values + aggregate call-ownership hardening
 ```
 
-PR #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
+#639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
 lowering. Its final review also hardened call ownership: temporary aggregate
 arguments keep per-member cleanup until the call is reached, and arena-owned
 Move values cannot transfer to a callee. Bound aggregates require one uniform
@@ -79,10 +80,12 @@ was rerun after #636.
 
 ## Next work
 
-Finish review, CI, and merge for #639. Then select the next task from an owner
-request, a real consumer, or the current **Open** section of
-`docs/open-questions.md`; do not resurrect a superseded `NEXT` item from the
-archived journal.
+Finish the cold/cache build-result parity fix: the per-unit implementation hash
+must cover the exact structural MIR program consumed by codegen, including type
+tables and linkage metadata, so a cache hit cannot skip a failure caused by an
+omitted backend input. Then select the next task from an owner request, a real
+consumer, or the current **Open** section of `docs/open-questions.md`; do not
+resurrect a superseded `NEXT` item from the archived journal.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -95,18 +98,6 @@ Consumer-gated deferrals that remain intentional:
   see `docs/impl/core-design/json.md`.
 - The first pkg.web consumer application remains a separate, owner-scheduled
   task.
-
-## Known unscheduled correctness follow-ups
-
-These were found by prior hardening work and remain useful starting points, but
-none is currently selected:
-
-1. **Cold/cache build-result parity.** Codegen can visit an unreachable function
-   already pruned from the unit hash, allowing a cold failure that a cache hit
-   masks. The durable record is
-   `docs/impl/10-cache-first-optimization.md`. Until its reachability boundaries
-   converge, compiler audits and main-vs-branch correctness comparisons must
-   use `ALIGNC_CACHE=off`.
 
 ## Build and test notes
 
@@ -129,8 +120,7 @@ Operational rules:
 - Do not edit runtime sources while a workspace test run is in progress; that
   can produce a stale-archive cascade in driver tests.
 - Do not pipe test output through a command that hides the original exit code.
-- Use `ALIGNC_CACHE=off` for cold-build correctness and reproducibility
-  comparisons.
+- Use `ALIGNC_CACHE=off` when a test specifically requires a cold build.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
 
@@ -141,7 +131,7 @@ Language semantics and surface       draft.md
 Current decisions and open items     docs/open-questions.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
-Cache architecture and parity gap    docs/impl/10-cache-first-optimization.md
+Cache architecture and parity resolution    docs/impl/10-cache-first-optimization.md
 Closure/memory/I/O/SIMD audit        docs/impl/12-pipeline-closure-memory-io-simd-audit.md
 Allocation and short-input audit     docs/impl/13-string-array-allocation-short-input-audit.md
 Source-correctness fixes             docs/impl/source-correctness-fixes-2026-07-13.md

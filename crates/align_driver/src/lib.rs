@@ -39,8 +39,8 @@ struct LoadedUnit {
     path: String,
     ast: align_ast::File,
     is_entry: bool,
-    /// The module's full source text — retained for the M15 interface summary (generic template
-    /// bodies + const values are recorded as source slices, and `impl_hash` is over these bytes).
+    /// The module's full source text — retained for the M15 interface summary because generic
+    /// template bodies and const values are recorded as source slices.
     src: String,
     /// The module's source file path on disk (the entry file's given `name`, or a resolved
     /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own
@@ -423,11 +423,12 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 interface_only: false,
             }];
             // Per-unit MIR (S2): the unit's own fns + in-consumer monomorphs, with the
-            // separate-compilation visibility bits set (`pub` fns external, imported callees carried
-            // as external declares). The summary is byte-identical whether lowered per-unit or
-            // whole-program (its `impl_hash` hashes MIR *fns*, its capabilities partition MIR fns —
-            // neither sees the exportable bit or the declare list), so `check_per_unit`'s summaries
-            // are unchanged by this while `build_per_unit` reuses the same MIR for codegen.
+            // separate-compilation visibility bits set (`pub` fns external, public declarations from
+            // interface-only dependencies carried as external declares). The per-unit `impl_hash`
+            // below fingerprints this exact codegen input, including its type tables, declarations,
+            // linkage, and alignment. The legacy
+            // whole-program summary producer still partitions function MIR for its multi-unit
+            // inspection surface; only per-unit summaries feed the object cache.
             let mir = if located {
                 lower_to_mir_per_unit_located(&program, source_map)
             } else {
@@ -441,7 +442,12 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 &sources,
                 &external_effects,
             );
-            if let Some(s) = built.pop() {
+            if let Some(mut s) = built.pop() {
+                // Cache soundness boundary: hash the exact structural MIR program that a miss hands
+                // to codegen. Hashing only stable-printed function bodies omitted type tables and
+                // linkage metadata, so a changed dead function could fail cold while an old key hit
+                // skipped codegen. A hit under this hash implies the full backend input is equal.
+                s.impl_hash = align_interface::codegen_impl_hash(&mir);
                 summaries.insert(u.path.clone(), s.clone());
                 mirs.insert(u.path.clone(), (s, mir, u.is_entry));
             }
@@ -477,8 +483,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
 }
 
 /// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
-/// external declares for imported `pub` callees), its interface summary, and its transitive
-/// dependency interface-hash set (the S3 cache-key input). Produced bottom-up by [`build_per_unit`].
+/// external declares for non-generic `pub` functions from interface-only dependencies), its
+/// interface summary, and its transitive dependency interface-hash set (the S3 cache-key input).
+/// Produced bottom-up by [`build_per_unit`].
 pub struct PerUnitArtifact {
     pub unit: String,
     pub is_entry: bool,
@@ -603,9 +610,10 @@ pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
 }
 
 /// M15 S2 per-unit lowering: lower ONE unit's checked HIR to MIR under the separate-compilation
-/// visibility model — a non-entry `pub` function gets `external` linkage, and imported `pub` callees
-/// become external declares (`align_mir::lower_program_per_unit`). The whole-program [`lower_to_mir`]
-/// keeps every function `internal` and drops declares, so the default object stays byte-identical.
+/// visibility model — a non-entry `pub` function gets `external` linkage, and non-generic `pub`
+/// declarations from interface-only dependencies become external declares
+/// (`align_mir::lower_program_per_unit`). The whole-program [`lower_to_mir`] keeps every function
+/// `internal` and drops declares, so the default object stays byte-identical.
 pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
     align_mir::lower_program_per_unit(hir)
 }

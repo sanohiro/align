@@ -760,11 +760,12 @@ fn build_module<'c>(
         let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types, exports);
         funcs.insert(f.name.clone(), fv);
     }
-    // M15 S2 (per-unit): imported `pub` functions this unit calls but does not define. Each is an
-    // external, bodyless `declare` under the same Align ABI a defining unit emits (`declare_imported_fn`
-    // mirrors `declare_fn`'s signature computation), keyed by the mangled `module$name` so a
-    // `Rvalue::Call` resolves. The linker binds it to the owning unit's exported definition. Empty in
-    // the whole-program path (every callee body is in `program.fns`), so this loop is a no-op there.
+    // M15 S2 (per-unit): non-generic `pub` functions declared by interface-only dependencies. Each is
+    // an external, bodyless `declare` under the same Align ABI a defining unit emits
+    // (`declare_imported_fn` mirrors `declare_fn`'s signature computation), keyed by the mangled
+    // `module$name` so any `Rvalue::Call` resolves. The linker binds it to the owning unit's exported
+    // definition. Empty in the whole-program path (every callee body is in `program.fns`), so this
+    // loop is a no-op there.
     for imp in &program.imported_fns {
         // A name collision with a locally-defined function would be a driver bug (a unit must not both
         // define and import the same symbol); prefer the local definition and skip the declare.
@@ -3741,8 +3742,9 @@ fn declare_fn<'c>(
     fv
 }
 
-/// M15 S2: declare an imported `pub` function (a cross-unit call target defined in another unit's
-/// object) as an external, bodyless LLVM `declare`. The signature is computed exactly as
+/// M15 S2: declare a non-generic `pub` function from an interface-only dependency (a potential
+/// cross-unit call target defined in another unit's object) as an external, bodyless LLVM `declare`.
+/// The signature is computed exactly as
 /// [`declare_fn`] does for a definition (structs / struct-arrays / tuples / enums pass and return by
 /// value as their aggregate type; scalars/views via `abi_type`), so the call type matches the
 /// owning unit's definition and the linker binds them. Linkage stays external (an undefined symbol
@@ -6898,8 +6900,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("builder_into_string returns a {ptr,len}")
             }
             Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
-            // `schema` is a cache-invalidation fingerprint printed into the MIR; codegen rebuilds the
-            // descriptor table directly from `struct_id`, so it does not read `schema` here.
+            // `schema` is a redundant legacy summary. Codegen rebuilds the descriptor table directly
+            // from `struct_id`, and cache identity includes the complete structural MIR Program.
             Rvalue::JsonDecode { struct_id, input, out, .. } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,

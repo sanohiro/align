@@ -80,10 +80,6 @@ rules:
 
 - Direct owned-`string` comparison is specified but not lowered; compare through `str`-typed helper
   parameters for now (`draft.md` §5).
-- A codegen cache hit can mask a failure in a pruned unreachable function. Compiler audits and
-  cold-vs-hit correctness comparisons must use `ALIGNC_CACHE=off`
-  (`10-cache-first-optimization.md`).
-
 ## Document Index
 
 ```text

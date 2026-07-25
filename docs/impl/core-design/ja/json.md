@@ -59,8 +59,8 @@ tag-switched な `drop_enum` で生きているバリアントを解放する。
 **kind-6** アーム（`→ drop_decoded_union`）が加わり、decode エラーパスで union の所有 payload を解放する。
 `match m.content { … }` は所有 payload をムーブアウトしフィールドをゼロ化する（`NullStructField` が型対応
 = `{tag,payloads}` 集約全体をゼロ化）ので、struct の `Drop` はそこで null を解放する（単一解放）。
-union のバリアントは外側 struct の `json_union_schema_sig` に展開されるので、バリアント変更で
-decode/encode キャッシュが無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
+union のバリアントは構造化 MIR の型テーブルに含まれるので、バリアント変更で decode/encode キャッシュが
+無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
 payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。続く J3b
 スライスが所有要素の deep free を提供するため、`Message` が Move の場合も
 `Chat { messages: array<Message> }` までラウンドトリップする。
@@ -104,9 +104,9 @@ zero-copy な `{ptr,len}` ビューとして書き込まれる**（top-level `st
 所有しない — ビューは誰も free せず入力を借用する）— 成功時は `drop_struct_fields` の `DynArray` アーム、decode
 エラーパスは `drop_decoded_owned` kind-7（要素非依存の flat-free）。`sub_owns_buffers` に kind 7 があるので
 `array<Move-struct>` 要素内の scalar/str-array フィールドも cleanup される。J3b と合成する
-（`Table { rows: array<Row>, meta: array<i64> }`、`Row { vals: array<f64> }`）。要素型は decode スキーマ指紋
-（`json_schema_sig` → 要素対応の MIR `ty_name`）に焼き込まれるので `array<i64>`→`array<f64>` の変更でキャッシュが
-無効化される。**なお延期:** `array<char>`（JSON 形式なし）と、**top-level** の `array<str> := json.decode`
+（`Table { rows: array<Row>, meta: array<i64> }`、`Row { vals: array<f64> }`）。構造化 MIR の指紋には
+要素型も含まれるため、`array<i64>`→`array<f64>` の変更でキャッシュが無効化される。**なお延期:**
+`array<char>`（JSON 形式なし）と、**top-level** の `array<str> := json.decode`
 （構造体 FIELD は囲む構造体の入力 region 束縛に乗るが、top-level 配列の結果はその region を自身で運ぶ必要がある —
 scalar の top-level 配列は意図的に `Static`/返却可能なので、top-level の `array<str>` は別途 region を運ぶ slice に
 なる）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline と bare `array<scalar>` の `json.encode` は
@@ -125,9 +125,9 @@ encode は `Option` を含むオブジェクトを trailing-comma 方式に切�
 `align_rt_json_encode_object`、descriptor テーブルで単一 struct を出力）でネストオブジェクトを描画し、
 `None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と
 ネストした `Option<str>` を持つ payload はその `None` も省略）。payload struct は encodable であることを
-検証（`decode_struct_fields_ok`）し、非 Move を維持。`OptionStructField` ピースは payload の
-`json_schema_sig` をキャッシュ無効化のために焼き込む。同じ再帰を DECODE 側の `json_schema_sig` にも追加した
-（`Option<struct>` payload フィールド変更が素の `"Option"` に畳まれていた stale-cache ギャップを修正）。
+検証（`decode_struct_fields_ok`）し、非 Move を維持。構造化 MIR の指紋には payload struct の定義も
+含まれるため、手動でスキーマ文字列を受け渡さなくても `Option<struct>` payload のフィールド変更で
+decode/encode の両オブジェクトが無効化される。
 
 **ネストされた構造体フィールド（REST-gateway runway, Slice A）。** 構造体のフィールドはそれ自身が
 `Struct` であってよい。`decode` はネストされたオブジェクトへ再帰し、`encode` はそれを再構築するため、
@@ -232,8 +232,8 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 - P2 — 投機的（Mison PHF）パスとスローパスは、**外部から観測可能な挙動が完全に同一（observably identical）** に保たれなければならない（重複キーの扱い、エスケープ文字、数値の境界値など）。パーサーに変更を加えた場合は、必ず両方のパスに対して再度ファジング（`fuzz_differential` 方式のオラクルテストまたは m5 コーパス）を実行する必要がある。
 - P3 — `encode` のエスケープ用テーブルは string builder のパスに組み込まれている。新しくエスケープが必要なフィールド型を追加する場合は、その場限りのエスケープ処理をインラインで書くのではなく、このテーブルの機能を拡張すること。
 - P4 — soa デコードのパフォーマンス目標（100万行の処理において `serde` と同等レベル、`bench/json_soa`）は、パフォーマンス低下（リグレッション）を検知するための罠（tripwire）である。パーサーの変更をマージする前に、必ずこのベンチマークを再実行すること。
-- P5 — **デコードターゲットのフィールドスキーマは codegen のキャッシュキーに反映されなければならない。** デコードターゲット構造体のフィールド名/型は codegen のディスクリプタテーブルにのみ効き、周囲の MIR には現れない — 同一スロットでのフィールド名変更（RENAME）や、ネスト構造体のフィールド変更は、それ以外の MIR 文をバイト単位で不変にする。したがってスキーマフィンガープリントがなければユニットの `impl_hash` は変化せず、暖まったキャッシュが古いキーでデコードする **陳腐化した（STALE）** オブジェクトを提供してしまう（end-to-end で再現、#514/#517 の陳腐キャッシュクラス）。`JsonDecode*` MIR rvalue は再帰的な `json_schema_sig`（フィールド名 + 型 + `layout(C)`/`align`、ネスト展開）を埋め込み MIR に印字する — `cache_codegen.rs` の gate 2b で固定。スキーマを持つ新しいデコード面を追加する場合も同様にすること。
+- P5 — **デコードターゲットのフィールドスキーマは codegen のキャッシュキーに反映されなければならない。** デコードターゲット構造体のフィールド名/型は周囲の文列ではなく codegen のディスクリプタテーブルに効く。そのため per-unit キーは、struct/enum テーブル、`layout(C)`、alignment を含む構造化 MIR Program 全体を指紋化する。`cache_codegen.rs` の gate 2/2b が flat、nested、型テーブルだけの変更を固定する。新しいスキーマ面も全 backend 入力を構造化 Program に置き、人向け MIR printer にキャッシュ専用文字列を追加してはならない。
 
 ## Test anchors
 
-`m5.rs`（デコードのマトリクステスト: 構造体/配列/str フィールド/順序/未知のキー/不正なデータ/数値の範囲 #295 #311、エンコード時のエスケープ、重複キー #306、**ネスト** の decode+encode ラウンドトリップ `json_decode_encode_nested_struct_roundtrip` と Mison パス `json_decode_nested_struct_array_mison`）、`soa.rs:317`（json から soa へのフィルタ済み集約）、`cache_codegen.rs` gate 2b（スキーマフィンガープリントによるキャッシュ無効化、flat + nested）、ランタイム `json_decode_nested_struct_single` / `..._array_mison`（ディスクリプタレベルのスロー + Mison 再帰）。例として `json.align`、`json_decode.align`、`json_nested.align`、`soa_json_str.align`。ベンチマークとして `bench/json_decode`、`bench/json_soa`（計測モデルの詳細はそれぞれの README を参照）。
+`m5.rs`（デコードのマトリクステスト: 構造体/配列/str フィールド/順序/未知のキー/不正なデータ/数値の範囲 #295 #311、エンコード時のエスケープ、重複キー #306、**ネスト** の decode+encode ラウンドトリップ `json_decode_encode_nested_struct_roundtrip` と Mison パス `json_decode_nested_struct_array_mison`）、`soa.rs:317`（json から soa へのフィルタ済み集約）、`cache_codegen.rs` gate 2/2b（構造化 codegen 入力によるキャッシュ無効化、flat + nested）、ランタイム `json_decode_nested_struct_single` / `..._array_mison`（ディスクリプタレベルのスロー + Mison 再帰）。例として `json.align`、`json_decode.align`、`json_nested.align`、`soa_json_str.align`。ベンチマークとして `bench/json_decode`、`bench/json_soa`（計測モデルの詳細はそれぞれの README を参照）。

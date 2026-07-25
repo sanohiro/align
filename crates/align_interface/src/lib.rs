@@ -10,16 +10,16 @@
 //! * `interface_hash` — over the canonical **interface surface** (signatures + type defs + consts +
 //!   effect bits + generic template bodies). Consumers depend on THIS hash only, so a private-body
 //!   edit that does not change the surface leaves it unchanged (the headline incrementality win).
-//! * `impl_hash` — over the unit's own implementation. Changes on any body edit; consumers do not
-//!   depend on it.
+//! * `impl_hash` — over the unit's own implementation. The per-unit producer fingerprints the
+//!   complete structural MIR program consumed by codegen (functions, type tables, declarations,
+//!   linkage, and alignment); consumers do not depend on it.
 //!
 //! ## Honest S1a compromises (recorded)
 //!
-//! * **`impl_hash` source.** MIR is whole-program today, not per-unit separable, so `impl_hash` is
-//!   taken over the unit's **source bytes** (a change to any body changes the source → the hash;
-//!   never under-invalidates — a comment/whitespace edit over-invalidates the unit's own object, but
-//!   no consumer, which is sound). S2 replaces this with the unit's own canonical location-free MIR
-//!   (`docs/impl/10` §6.2). Marked `TODO(m15-s2)` at the call site.
+//! * **Whole-program summary compatibility.** The legacy multi-module producer partitions function
+//!   MIR by owning unit because its one program is not a codegen unit. The shipped per-unit producer
+//!   replaces its selected unit's hash with [`codegen_impl_hash`], over the exact MIR program passed
+//!   to codegen. The object cache only consumes the latter.
 //! * **Effect of a generic `pub` fn.** The whole-program purity analysis runs over the *monomorphized*
 //!   concrete functions, so a generic template has no concrete effect entry. Its body ships in the
 //!   interface (C++-template-like) and the consumer recomputes the effect on instantiation, so the
@@ -176,7 +176,8 @@ pub struct InterfaceSummary {
     /// Hash of the canonical interface surface (signatures + type defs + consts + effect bits +
     /// generic template bodies). Consumers depend on this ONLY.
     pub interface_hash: Hash128,
-    /// Hash of the unit's implementation (S1a: its source bytes; S2: its own MIR).
+    /// Hash of the unit's implementation. Per-unit compilation hashes the complete structural MIR
+    /// codegen input; the legacy whole-program summary producer partitions function MIR by unit.
     pub impl_hash: Hash128,
 }
 
@@ -252,6 +253,17 @@ pub fn build_summaries(
     sources: &HashMap<String, String>,
 ) -> Vec<InterfaceSummary> {
     build_summaries_with_effects(modules, program, mir, sources, &HashMap::new())
+}
+
+/// Fingerprint the complete MIR program passed to one object-codegen invocation.
+///
+/// The human-readable MIR printer intentionally omits backend inputs such as struct/enum/tuple
+/// tables, declarations, linkage, and slot alignment. Hashing only that view allowed a cache hit to
+/// skip a cold-path codegen failure after one of those omitted inputs changed. The structural
+/// rendering covers the complete [`align_mir::Program`]; the cache key separately namespaces the
+/// compiler build and schema, so this representation need not be stable across compiler versions.
+pub fn codegen_impl_hash(mir: &align_mir::Program) -> Hash128 {
+    Hash128::of(align_mir::print::codegen_input_to_string(mir).as_bytes())
 }
 
 /// Like [`build_summaries`], but folds `external_effects` (M15 S1b: the effect bits of imported
@@ -390,15 +402,10 @@ pub fn build_summaries_with_effects(
             impl_hash: Hash128 { lo: 0, hi: 0 },
         };
         summary.interface_hash = Hash128::of(&codec::encode_interface_surface(&summary));
-        // impl_hash (M15 S2): the fingerprint of the unit's OWN implementation — its MIR functions
-        // (its bodies + the monomorphs/thunks that carry its base name), stable-printed and
-        // location-free (the MIR text printer ignores `stmt_lines`). Replaces the S1a source-byte
-        // stand-in: hashing the compiled shape means a whitespace/comment-only edit that lowers to
-        // identical MIR no longer over-invalidates the object, while any real body change flips it.
-        // A unit whose MIR the whole-program producer did not separate falls back to source bytes.
-        // Honest intermediate (recorded): the printed form carries this compile's struct/enum/tuple
-        // ids; deterministic within the per-unit build path (the only path S3 caches), which is what
-        // the incremental key requires. See `partition_impl_hashes`.
+        // Legacy whole-program summary hash: attribute stable-printed function MIR to each source
+        // unit. The per-unit driver replaces this value with `codegen_impl_hash` over the exact
+        // structural MIR program that feeds object codegen; only that stronger value reaches S3.
+        // A unit whose whole-program MIR cannot be separated falls back to source bytes.
         summary.impl_hash =
             impl_hash_by_unit.get(&m.path).copied().unwrap_or_else(|| Hash128::of(src.as_bytes()));
         summaries.push(summary);
@@ -461,14 +468,15 @@ fn partition_capabilities(
     caps_by_unit
 }
 
-/// The per-unit `impl_hash` (M15 S2): partition `mir.fns` into the unit that owns each function (same
-/// longest-base-match rule as [`partition_capabilities`] — a monomorph / lifted thunk / C-`main`
-/// wrapper shares its base's unit; an unowned function falls to the entry unit), then hash each
+/// The legacy whole-program `impl_hash` partition: split `mir.fns` into the unit that owns each
+/// function (same longest-base-match rule as [`partition_capabilities`] — a monomorph / lifted thunk
+/// / C-`main` wrapper shares its base's unit; an unowned function falls to the entry unit), then hash each
 /// unit's functions' stable, location-free MIR text (names sorted so the encoding is
 /// declaration-order-independent). A body edit changes that unit's printed MIR and so its
 /// `impl_hash`; a pure comment/whitespace edit that lowers identically does not. Consumers never key
-/// on `impl_hash` (only on `interface_hash`), so this fingerprint drives exactly one thing: whether
-/// the unit's own object must be re-emitted.
+/// on `impl_hash` (only on `interface_hash`). Before the object cache is consulted, per-unit
+/// compilation replaces this compatibility and inspection value with [`codegen_impl_hash`] over the
+/// complete codegen input.
 fn partition_impl_hashes(
     modules: &[align_sema::Module],
     mir: &align_mir::Program,

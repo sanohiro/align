@@ -7,7 +7,8 @@
 //!  1. Headline incremental win — A→B→C(+D): edit C's PRIVATE body → C prelink misses; only units
 //!     whose import list / import-source digests changed miss backend; a unit that imports nothing
 //!     from C hits BOTH phases.
-//!  2. pub-signature change → transitive dependents miss prelink (interface hash) AND backend.
+//!  2. pub-signature change → transitive dependents miss prelink (structural MIR / interface hash)
+//!     AND backend.
 //!  3. Import-sensitive precision — a private-body edit in an IMPORTED-FROM unit misses the importer's
 //!     backend even though the importer's own prelink hits.
 //!  4. Toggle isolation — `--thin-lto` on/off never mix objects (structurally disjoint key namespaces).
@@ -90,12 +91,13 @@ fn gate2_pub_signature_change_invalidates_dependents_both_phases() {
     // c itself: prelink + backend miss (its own impl changed).
     assert!(!hot.prelink("c").hit && !hot.backend("c").hit);
 
-    // b keys on c's interface hash → b prelink misses on the DEP interface, and its backend misses too.
+    // b's codegen input gains c's new public declaration, and its dependency interface changes.
+    // MirDigest has the documented first-difference priority, and the backend misses too.
     assert!(!hot.prelink("b").hit);
     assert_eq!(
         hot.prelink("b").miss_reason,
-        Some(FirstDiff::DepInterfaceHashes),
-        "a pub-signature change in c misses b's prelink on the dep interface hash"
+        Some(FirstDiff::MirDigest),
+        "a pub-signature change in c changes b's imported declarations before the dep interface diff"
     );
     assert!(!hot.backend("b").hit, "b's backend misses too (c's prelink digest changed)");
 

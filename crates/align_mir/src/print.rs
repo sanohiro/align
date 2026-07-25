@@ -14,6 +14,23 @@ pub fn program_to_string(p: &Program) -> String {
     out
 }
 
+/// A deterministic structural rendering of every MIR field that can affect object emission.
+///
+/// [`program_to_string`] is intentionally a human-facing function-body view: it omits type tables,
+/// declarations, linkage, slot alignment, and other backend inputs. That makes it useful for
+/// `emit-mir`, but unsound as the complete object-cache fingerprint. This rendering instead uses
+/// the derived structural `Debug` form of [`Program`], so adding a field to the MIR automatically
+/// adds it to the fingerprint input rather than requiring another hand-maintained printer arm.
+///
+/// Stability is required only within one compiler build: cache keys separately include the compiler
+/// build id and frontend schema version. MIR contains no unordered maps, pointers, or process-local
+/// ids, so this form is deterministic across processes for one build. Located MIR deliberately
+/// includes `stmt_lines`, because debug locations are codegen input; normal cached builds lower
+/// unlocated MIR and therefore keep comment/whitespace-only edits invisible.
+pub fn codegen_input_to_string(p: &Program) -> String {
+    format!("{p:?}")
+}
+
 /// The same stable, location-free text [`program_to_string`] prints for one function, without
 /// needing to wrap it in a [`Program`] (and so without cloning it into one) — types are printed by
 /// id, never resolved through the program's type tables, so a single [`Function`] prints identically
@@ -56,10 +73,8 @@ fn block_to_string(out: &mut String, b: &Block) {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
             }
             Stmt::StoreConstArray { slot, elems, elem } => {
-                // The element VALUES must be printed: `impl_hash` (the incremental
-                // object-cache body fingerprint) hashes this text, so omitting them
-                // makes value-only edits of a pooled table cache-invisible — a
-                // stale-object miscompile.
+                // Keep the human-readable view value-exact. Cache identity uses the complete
+                // structural Program, independently of this printer.
                 let _ = writeln!(
                     out,
                     "    _{slot} <- const_array[{}] : {} = {}",
@@ -360,7 +375,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::StrLit(s) => format!("{s:?}"),
         Rvalue::ConstArray { elems, elem } => {
-            // Values included for the same impl_hash reason as Stmt::StoreConstArray.
+            // Keep the human-readable view value-exact, as for Stmt::StoreConstArray.
             format!("const_array[{}] : {} = {}", elems.len(), ty_name(*elem), const_elems_str(elems))
         }
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
@@ -698,10 +713,9 @@ fn path_str(path: &[u32]) -> String {
     path.iter().map(|i| format!(".{i}")).collect::<String>()
 }
 
-/// Constant-array elements rendered value-exactly. `impl_hash` hashes the printed
-/// MIR, so this rendering is load-bearing for cache identity: two tables with
-/// different values must never print identically. Floats use `{:?}` (shortest
-/// round-trip, distinguishes 1.0 from 1.5 and -0.0 from 0.0).
+/// Constant-array elements rendered value-exactly so the human-readable MIR does not hide a
+/// semantic difference. The codegen cache hashes the complete structural [`Program`] instead.
+/// Floats use `{:?}` (shortest round-trip, distinguishes 1.0 from 1.5 and -0.0 from 0.0).
 fn const_elems_str(elems: &[crate::ConstElem]) -> String {
     let parts: Vec<String> = elems
         .iter()

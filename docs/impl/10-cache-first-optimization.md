@@ -7,12 +7,13 @@ cache-first audit and the decisions that followed it; unchecked measurement and 
 items below remain proposals, not descriptions of a missing CAS. Audit baseline: commit
 `ad7e4c8b57ad`, arm64 macOS, LLVM 22.1.8, rustc 1.96.1.
 
-> **Known cold/cache parity defect (2026-07-23):** codegen can still visit an unreachable function
-> that the unit hash has already pruned. If that dead function hits a lowering failure, a cold build
-> can fail while a cache hit succeeds. Until the unit-validation and unit-hashing reachability
-> boundaries are identical, correctness comparisons and compiler audits must use
-> `ALIGNC_CACHE=off`. This is a build-result consistency defect, even where the eventual live object
-> bytes would agree.
+> **Cold/cache parity defect resolved (2026-07-25):** the per-unit `impl_hash` now fingerprints the
+> exact structural MIR program handed to codegen: functions, type tables, declarations, linkage,
+> slot alignment, and source locations when present. The old function-text hash omitted backend
+> inputs; changing an unreachable function's struct shape could therefore retain an old key and let
+> a cache hit skip a cold codegen failure. A changed backend input now always misses, so cache state
+> cannot change build success. `ALIGNC_CACHE=off` remains useful to request a deliberately cold run,
+> but is no longer a correctness-audit workaround.
 
 The status labels in this document are deliberate:
 
@@ -738,9 +739,9 @@ are byte-identical on the supported object formats.
   configuration in identity.
 - [x] Emit structured per-unit hit/miss reasons.
 
-**Completion status:** reuse, source-revert, key-separation, and observability gates shipped. The
-known cold/cache success-parity defect called out at the top is a remaining correctness issue and
-must not be hidden by calling the original CAS work open.
+**Completion status:** reuse, source-revert, key-separation, observability, and cold/cache
+success-parity gates shipped. The object key covers the complete structural per-unit MIR consumed by
+codegen; function-only MIR remains a human inspection format, not a cache identity.
 
 ### Slice C2 — M15 unit summaries and incremental invalidation
 

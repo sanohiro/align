@@ -345,3 +345,32 @@ fn gate_f_impl_hash_flips_on_body_not_on_comment() {
         "a comment-only edit lowers to identical MIR — impl_hash must not move (the MIR-based win)"
     );
 }
+
+#[test]
+fn gate_f_impl_hash_covers_codegen_type_tables() {
+    // The function-only MIR printer names both structs only as `struct#0`, so these programs have
+    // identical printed function bodies. LLVM codegen still reads the field type from
+    // `Program::structs`; the per-unit cache digest must therefore differ. Keeping `inspect`
+    // unreachable from `main` pins the cold-vs-hit failure class that originally exposed the gap.
+    let lib_i64 =
+        "module lib\nHidden { value: i64 }\nfn inspect(x: Hidden) -> i64 = 0\npub fn answer() -> i64 = 42\n";
+    let lib_char =
+        "module lib\nHidden { value: char }\nfn inspect(x: Hidden) -> i64 = 0\npub fn answer() -> i64 = 42\n";
+    let main = "import lib\nfn main() {\n  print(lib.answer())\n}\n";
+
+    let ints = build_per_unit_multi("gf-types-i64", &[("lib.align", lib_i64), ("main.align", main)], "main.align");
+    let chars =
+        build_per_unit_multi("gf-types-char", &[("lib.align", lib_char), ("main.align", main)], "main.align");
+    let int_unit = ints.unit("lib");
+    let char_unit = chars.unit("lib");
+
+    assert_eq!(
+        align_mir::print::program_to_string(&int_unit.mir),
+        align_mir::print::program_to_string(&char_unit.mir),
+        "control: the human/function-only MIR view must miss the type-table-only edit"
+    );
+    assert_ne!(
+        int_unit.summary.impl_hash, char_unit.summary.impl_hash,
+        "the object-cache digest must include the codegen-consumed struct table"
+    );
+}

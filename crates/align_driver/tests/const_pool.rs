@@ -240,9 +240,9 @@ fn pooled_table_rodata_is_never_freed() {
 }
 
 /// The review's reproduced stale-cache miscompile, pinned: a VALUE-ONLY edit of a pooled table
-/// must change the printed MIR (impl_hash's input) and therefore miss the incremental object
-/// cache. Two subprocess builds against one warm cache root: edit `999` -> `111`, and the rerun
-/// must print the new value — never the stale cached object's.
+/// must change the structural MIR codegen input and therefore miss the incremental object cache.
+/// Two subprocess builds against one warm cache root: edit `999` -> `111`, and the rerun must print
+/// the new value — never the stale cached object's.
 #[test]
 fn value_only_edit_of_pooled_table_misses_the_cache() {
     let _g = pool_guard();
@@ -273,13 +273,13 @@ fn value_only_edit_of_pooled_table_misses_the_cache() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The impl_hash input itself: value-differing tables must never print identical MIR. Covers both
+/// Human-readable MIR fidelity: value-differing tables must never print identical MIR. Covers both
 /// the pooled local (Stmt::StoreConstArray) and the #514 aggregate constant (Rvalue::ConstArray).
 #[test]
 fn const_array_values_are_part_of_printed_mir() {
     let a = mir_text_of("pool_print_a", &program_with_last(999));
     let b = mir_text_of("pool_print_b", &program_with_last(111));
-    assert_ne!(a, b, "value-only table edits must change the printed MIR (impl_hash input)");
+    assert_ne!(a, b, "value-only table edits must change the printed MIR");
     assert!(a.contains("999") && b.contains("111"), "elements are printed value-exactly");
 
     // A dynamic index keeps the Rvalue::ConstArray in MIR (a constant index folds it away).

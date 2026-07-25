@@ -81,19 +81,20 @@ pub struct Program {
     /// interned by scalar signature; concrete values/locals receive distinct entries so their
     /// inferred effects do not contaminate unrelated functions with the same ABI.
     pub fn_types: Vec<FnTy>,
-    /// M15 S2 (per-unit compilation): imported `pub` functions this unit *calls* but whose bodies
-    /// live in another unit's object. Each is a bodyless declaration (its already-mangled
-    /// `module$name` symbol + the signature resolved into this unit's type universe); codegen emits
-    /// an external LLVM `declare` for each so a cross-unit `Rvalue::Call` resolves. **Empty in the
-    /// whole-program build path** (every callee's body is in `fns`), so the default object stays
-    /// byte-identical — populated only when checking a unit against interface-only dependencies.
+    /// M15 S2 (per-unit compilation): non-generic `pub` functions declared by interface-only
+    /// dependencies, whose bodies live in another unit's object. Each is a bodyless declaration
+    /// (its already-mangled `module$name` symbol + the signature resolved into this unit's type
+    /// universe); codegen emits an external LLVM `declare` for each so a cross-unit `Rvalue::Call`
+    /// resolves. **Empty in the whole-program build path** (every callee's body is in `fns`), so the
+    /// default object stays byte-identical — populated only when checking a unit against
+    /// interface-only dependencies.
     pub imported_fns: Vec<ImportedFn>,
 }
 
-/// A cross-unit `pub` function call target (M15 S2): the callee's mangled symbol plus its
-/// signature, with no body. Codegen turns each into an external LLVM `declare` under the same
-/// Align ABI a defining unit would emit for the function, so the linker resolves the call against
-/// the unit that owns the definition. See [`Program::imported_fns`].
+/// A cross-unit `pub` function declaration (M15 S2): its mangled symbol plus its signature, with no
+/// body. Codegen turns each into an external LLVM `declare` under the same Align ABI a defining unit
+/// would emit for the function, so the linker resolves the call against the unit that owns the
+/// definition. See [`Program::imported_fns`].
 #[derive(Clone, Debug)]
 pub struct ImportedFn {
     /// The already-mangled `module$name` symbol (collision-free across units).

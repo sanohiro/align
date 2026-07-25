@@ -5,7 +5,8 @@
 //! except the cross-process `impl_hash`-stability gate, which drives two fresh `alignc` subprocesses.
 //!
 //! The matrix: (1) no-op rebuild all-hit; (2) private dep-body edit → that unit MirDigest-miss, every
-//! dependent hit + correct exe; (3) transitive A→B→C invalidation; (4) comment-only edit hit;
+//! dependent hit + correct exe; (2b) a codegen-only type-table edit misses even when function MIR
+//! is unchanged; (3) transitive A→B→C invalidation; (4) comment-only edit hit;
 //! (5) edit-then-exact-revert hit (old CAS entry); (6) corrupted blob → corruption event + rebuild +
 //! correct binary; (7) cold vs hit byte-identity (object + executable); (8) profile / `--export`
 //! change miss with the right `FirstDiff`; (9) rt-lto on/off distinct keys; (10) cross-process
@@ -221,14 +222,43 @@ fn gate2_private_body_edit_misses_only_edited_unit() {
     }
 }
 
+/// A per-unit object key must cover the complete codegen input, not only the human-readable
+/// function MIR. Both versions below print identical function MIR (`Hidden` is `struct#0` in each),
+/// but LLVM reads a different field type from `Program::structs`. `inspect` is unreachable from
+/// `main`, matching the failure class where a warm hit used to skip codegen of a changed dead
+/// function. The changed program must miss, so any cold codegen result (success or failure) is also
+/// the warm result.
+#[test]
+fn gate2_type_table_only_edit_cannot_hit() {
+    if !backend() {
+        return;
+    }
+    let v1 = "Hidden { value: i64 }\nfn inspect(x: Hidden) -> i64 = 0\nfn main() -> i32 = 0\n";
+    let v2 = "Hidden { value: char }\nfn inspect(x: Hidden) -> i64 = 0\nfn main() -> i32 = 0\n";
+    let proj = Project::new("type-table-digest", &[("main.align", v1)], "main.align");
+    let cache = proj.cache();
+
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit);
+
+    proj.write("main.align", v2);
+    let changed = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!changed.outcome("main").hit, "a codegen-consumed type-table edit must miss");
+    assert_eq!(
+        changed.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the complete structural MIR fingerprint is the first changed key component"
+    );
+}
+
 // ---- Gate 2b: a json.decode target-struct field RENAME invalidates the cache -------------------
 
-/// A `json.decode` target struct's field name/type feeds only the codegen descriptor table, not the
-/// surrounding MIR — a field RENAME at the same slot (or a NESTED struct's field change) leaves every
-/// other MIR statement byte-identical. Without the schema fingerprint baked into the decode rvalue
-/// (`json_schema_sig`), the unit's `impl_hash` would be unchanged and the warm cache would serve a
-/// STALE object still decoding the OLD key (the #514/#517 stale-cache class, reproduced end-to-end).
-/// This gate pins that the rename misses on the unit's own MIR digest — both flat and nested.
+/// A `json.decode` target struct's field name/type feeds the codegen descriptor table rather than
+/// the surrounding statement sequence. A field RENAME at the same slot (or a NESTED struct's field
+/// change) therefore exercises the complete structural codegen-input fingerprint, including its
+/// type tables. The explicit `json_schema_sig` remains part of the decode rvalue, but cache safety no
+/// longer relies on the human MIR printer exposing every descriptor input. This gate pins that the
+/// rename misses on the unit's own MIR digest — both flat and nested.
 #[test]
 fn gate2b_json_decode_field_rename_invalidates() {
     if !backend() {
@@ -250,7 +280,7 @@ fn gate2b_json_decode_field_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the rename flips the baked json schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the renamed field"
     );
     if cc_available() {
         // v2 declares `zzz` but the input still carries key "k" → strict decode fails (missing
@@ -272,17 +302,16 @@ fn gate2b_json_decode_field_rename_invalidates() {
     assert_eq!(
         hotn.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the nested field feeds the recursive schema fingerprint → the parent unit's MIR digest"
+        "the structural MIR fingerprint includes nested type tables"
     );
 }
 
 // ---- Gate 2c: a union's array<Struct> ELEMENT field rename invalidates the cache ----------------
 
-/// A shape-directed union's `array<Struct>` payload (J2b) reaches its element struct's fields only
-/// through the codegen descriptor, exactly like a nested-struct field — so an element field RENAME
-/// leaves every other MIR statement byte-identical. `json_union_schema_sig_into` must expand the
-/// element struct's schema (not just print its id via `ty_name`), else the warm cache serves a STALE
-/// object decoding the OLD element key (the #514/#517 class). This gate pins the miss.
+/// A shape-directed union's `array<Struct>` payload (J2b) reaches its element struct's fields through
+/// the codegen descriptor, exactly like a nested-struct field — so an element field RENAME leaves
+/// every other MIR statement byte-identical. This gate pins that the complete structural MIR
+/// fingerprint includes that descriptor input and the warm cache misses.
 #[test]
 fn gate2c_json_union_array_element_rename_invalidates() {
     if !backend() {
@@ -305,7 +334,7 @@ fn gate2c_json_union_array_element_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the element field feeds the union's recursive schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the union payload's element type table"
     );
     if cc_available() {
         // v2 requires key "txt" but the input carries "text" → strict decode fails, `?` propagates,
@@ -316,11 +345,10 @@ fn gate2c_json_union_array_element_rename_invalidates() {
 
 // ---- Gate 2d: an array<scalar> field's ELEMENT type change invalidates the cache ---------------
 
-/// An `array<scalar>` field (T1b, kind-7 descriptor) feeds its element kind/width/sign only through the
-/// codegen descriptor tag, not the surrounding MIR — changing the element type (`array<i64>` →
-/// `array<f64>`) at the same slot leaves every other MIR statement byte-identical. The schema
-/// fingerprint (`json_schema_sig` → `ty_name`) must render the element type so the change flips the
-/// unit's MIR digest; else the warm cache serves a STALE object decoding the OLD element width/kind.
+/// An `array<scalar>` field (T1b, kind-7 descriptor) feeds its element kind/width/sign through the
+/// codegen descriptor tag rather than the surrounding statement sequence. Changing the element type
+/// (`array<i64>` → `array<f64>`) at the same slot therefore pins that the complete structural MIR
+/// fingerprint includes the descriptor input and the warm cache misses.
 #[test]
 fn gate2d_json_scalar_array_element_type_change_invalidates() {
     if !backend() {
@@ -339,26 +367,25 @@ fn gate2d_json_scalar_array_element_type_change_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the element type feeds the baked json schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the scalar-array element type"
     );
 }
 
 // ---- Gate 2e: an Option<struct> payload field RENAME invalidates the cache ---------------------
 
-/// An `Option<struct>` field's payload struct reaches its fields only through the codegen descriptor
-/// (decode) / the `OptionStructField` encode piece (T1b) — never the surrounding MIR — so a payload
-/// field RENAME at the same slot leaves every other MIR statement byte-identical. `json_schema_sig`
-/// must recurse into an `Option<struct>` payload (not fold it to a bare `Option` via `ty_name`), else
-/// the warm cache serves a stale object decoding/encoding the OLD payload key (the #514/#517 class).
+/// An `Option<struct>` field's payload struct reaches its fields through the codegen descriptor
+/// (decode) / the `OptionStructField` encode piece (T1b), rather than the surrounding statement
+/// sequence. A payload field RENAME at the same slot therefore pins that the complete structural MIR
+/// fingerprint includes the descriptor input and the warm cache misses.
 #[test]
 fn gate2e_json_option_struct_payload_rename_invalidates() {
     if !backend() {
         return;
     }
     // v1 payload `Inner { v, tag }`; v2 renames `tag` → `txt`. The JSON literal keeps key "tag"; every
-    // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins the load-bearing
-    // `json_schema_sig` recursion into `Option<struct>` — the pre-existing decode gap this slice fixes,
-    // independent of the `OptionStructField` encode piece's own baked schema.
+    // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins that the complete
+    // structural Program covers an Option payload's descriptor inputs independently of the redundant
+    // legacy schema string.
     let v1 = "import core.json\nInner { v: i64, tag: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let v2 = "import core.json\nInner { v: i64, txt: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let proj = Project::new("json-opt-struct-rename", &[("main.align", v1)], "main.align");
@@ -371,7 +398,7 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the payload field feeds the recursive schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the Option payload's type table"
     );
 }
 
@@ -423,8 +450,9 @@ fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
         return;
     }
     // A `pub` aggregate constant's value (its initializer source) is part of the exported interface
-    // hash, so editing one element must miss the defining unit AND every dependent that reads it —
-    // the real cross-unit cache proof (not just an interface-hash inequality).
+    // hash, so editing one element must miss every dependent that materializes it. The defining
+    // unit has no codegen representation for the const and therefore stays hot under the exact
+    // structural MIR digest — the real cross-unit cache proof (not just a hash inequality).
     let cfg_v1 = "module cfg\npub WEIGHTS := [2, 3, 5]\n";
     let cfg_v2 = "module cfg\npub WEIGHTS := [2, 3, 6]\n"; // one element edited
     let main = "import cfg\nfn main() {\n  print(cfg.WEIGHTS.sum())\n}\n";
@@ -440,7 +468,7 @@ fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
     // Edit one element of the pub aggregate constant.
     proj.write("cfg.align", cfg_v2);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
-    assert!(!hot.outcome("cfg").hit, "the edited defining unit must miss");
+    assert!(hot.outcome("cfg").hit, "the defining unit's exact codegen input is unchanged");
     assert!(
         !hot.outcome("main").hit,
         "a dependent keying on cfg's interface hash must miss when a pub constant's value changes"
