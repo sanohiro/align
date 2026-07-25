@@ -113,16 +113,17 @@ The target that MIR's `ParMapParallel` (`04 §6`) lowers to (`05 §7`).
 
 ```text
 void* align_rt_par_map(
-  void* in_buf, i64 count,
+  void* capture_ctx, void* in_buf, i64 count,
   i64 in_stride, i64 out_stride,
-  void (*kernel)(void* in_buf, void* out_buf, i64 start, i64 end))
+  void (*kernel)(void* capture_ctx, void* in_buf, void* out_buf, i64 start, i64 end))
 ```
 
 - Allocate one owned output buffer, split its disjoint element ranges across the process-resident
   `ParPool`, and return the buffer pointer. Small inputs run on the caller to avoid pool overhead.
-- The kernel is a generated typed loop around a non-capturing Pure function (`03 §8`), so output
-  ranges do not race. It receives the complete bases plus one disjoint `[start,end)` range and calls
-  the known body directly per element. Capturing/staged cases never call this ABI yet.
+- The kernel is a generated typed loop around a Pure function (`03 §8`), so output ranges do not
+  race. It receives a call-scoped immutable capture context, the complete bases, and one disjoint
+  `[start,end)` range; it loads captures once and calls the known body directly per element. Staged
+  cases still use the sequential collect path.
 - Parallel reduction is not part of the present runtime contract.
 
 ---

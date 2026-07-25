@@ -466,7 +466,16 @@ pub enum Rvalue {
     /// to each element in parallel (runtime `align_rt_par_map` + a generated whole-range kernel),
     /// materializing an owned `array<elem_out>` `{ out_buf, count }`. `elem_in` is the source element
     /// type (the `func` parameter — a scalar, or a `slice<T>` chunk); `elem_out` is `func`'s return.
-    ParMapParallel { src: Operand, func: String, elem_in: Ty, elem_out: Ty },
+    /// `captures` are Copy values passed through a call-scoped immutable context record. The runtime
+    /// never retains that record; the generated kernel loads it and forwards the values to `func`.
+    ParMapParallel {
+        src: Operand,
+        func: String,
+        captures: Vec<Operand>,
+        capture_tys: Vec<Ty>,
+        elem_in: Ty,
+        elem_out: Ty,
+    },
     /// The `len` of a slice operand.
     SliceLen(Operand),
     /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
@@ -3946,16 +3955,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
-            // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
-            // run in parallel via the runtime; otherwise (prior stages, struct-array source, or a
-            // capturing lambda — the parallel range kernel takes no capture context) fall back to the
-            // sequential collect loop.
+            // With no prior stages and a `{ptr,len}` (or fixed scalar-array) source, run in parallel
+            // via the runtime. Copy captures are lowered once into the call-scoped context record;
+            // prior stages and unsupported aggregate sources retain the sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
                 Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 _ => None,
             };
-            if stages.is_empty() && captures.is_empty()
+            if stages.is_empty()
                 && let Some(elem_in) = elem_in {
                     let src = match source.ty {
                         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
@@ -3966,11 +3974,20 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             Operand::Value(sv)
                         }
                     };
+                    let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
+                    let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
                     // Free the source buffer if it is an owned temporary the runtime just consumed.
                     // A call returning `slice<T>` is a borrow and must never be classified as one.
                     let free_src = pipeline_source_needs_drop(source, b.arenas.is_empty());
                     let v = b.fresh_value(e.ty);
-                    b.push(Stmt::Let(v, Rvalue::ParMapParallel { src: src.clone(), func: func.clone(), elem_in, elem_out: *elem }));
+                    b.push(Stmt::Let(v, Rvalue::ParMapParallel {
+                        src: src.clone(),
+                        func: func.clone(),
+                        captures: capture_ops,
+                        capture_tys,
+                        elem_in,
+                        elem_out: *elem,
+                    }));
                     if free_src {
                         b.push(Stmt::DropValue(src));
                     }

@@ -14,13 +14,23 @@ use common::*;
 
 /// The number of "expression nests too deeply" diagnostics produced by checking `src`.
 fn too_deep_count(name: &str, src: &str) -> usize {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    checked
-        .diags
-        .iter()
-        .filter(|d| d.message.contains("expression nests too deeply"))
-        .count()
+    let name = name.to_owned();
+    let src = src.to_owned();
+    std::thread::Builder::new()
+        .name(format!("expr-depth-{name}"))
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let mut sm = SourceMap::new();
+            let checked = check(&mut sm, &name, &src);
+            checked
+                .diags
+                .iter()
+                .filter(|d| d.message.contains("expression nests too deeply"))
+                .count()
+        })
+        .expect("spawn expression-depth check")
+        .join()
+        .expect("expression-depth check thread")
 }
 
 #[test]

@@ -1762,9 +1762,10 @@ struct ParMapWork {
     ranges: usize,
     per: usize,
     count: usize,
+    context_addr: usize,
     in_addr: usize,
     out_addr: usize,
-    kernel: extern "C" fn(*const u8, *mut u8, i64, i64),
+    kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
     barrier: std::sync::Mutex<ParMapBarrier>,
     complete: std::sync::Condvar,
 }
@@ -1781,11 +1782,17 @@ fn drain_par_map(work: &ParMapWork) {
             break;
         }
         let start = range * work.per;
-        let end = (start + work.per).min(work.count);
+        let end = start.saturating_add(work.per).min(work.count);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let start = i64::try_from(start).expect("par_map range start came from an i64 count");
             let end = i64::try_from(end).expect("par_map range end came from an i64 count");
-            (work.kernel)(work.in_addr as *const u8, work.out_addr as *mut u8, start, end);
+            (work.kernel)(
+                work.context_addr as *const u8,
+                work.in_addr as *const u8,
+                work.out_addr as *mut u8,
+                start,
+                end,
+            );
         }));
 
         let mut state = work.barrier.lock().unwrap();
@@ -1801,10 +1808,11 @@ fn drain_par_map(work: &ParMapWork) {
 }
 
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and invoke
-/// `kernel(in_buf, out, start, end)` once per contiguous, **disjoint** output range across the
-/// available threads. The generated kernel owns the typed element loop and directly calls the
-/// user's Pure function. No synchronization is needed: the language guarantees the kernel shares
-/// no mutable state and the ranges never overlap
+/// `kernel(context, in_buf, out, start, end)` once per contiguous, **disjoint** output range across
+/// the available threads. The generated kernel owns the typed element loop and directly calls the
+/// user's Pure function. `context` is a synchronous, immutable capture record and is never retained
+/// by the runtime. No synchronization is needed: the language guarantees the kernel shares no mutable
+/// state and the ranges never overlap
 /// (`draft.md` §11). Returns the owned output buffer (freed by the generated `Drop`). `count <= 0`
 /// → null. The buffer size uses `checked_mul` (a huge `count` would otherwise under-allocate and
 /// then heap-overflow the write loop).
@@ -1814,11 +1822,12 @@ fn drain_par_map(work: &ParMapWork) {
 /// write only indices in the supplied half-open range.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map(
+    context: *const u8,
     in_buf: *const u8,
     count: i64,
     in_stride: i64,
     out_stride: i64,
-    kernel: extern "C" fn(*const u8, *mut u8, i64, i64),
+    kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
 ) -> *mut u8 {
     if count <= 0 {
         return core::ptr::null_mut();
@@ -1846,7 +1855,7 @@ pub unsafe extern "C" fn align_rt_par_map(
     // Run every element on the calling thread, no pool involved.
     let run_all_on_caller = || {
         let end = i64::try_from(count).expect("par_map count was validated from i64");
-        kernel(in_buf, out_buf, 0, end);
+        kernel(context, in_buf, out_buf, 0, end);
     };
     // Threshold check hoisted above `par_pool()`: `count <= PAR_MIN_CHUNK` guarantees a single
     // chunk regardless of the worker count (below, `per` would end up `>= PAR_MIN_CHUNK >= count`),
@@ -1876,6 +1885,7 @@ pub unsafe extern "C" fn align_rt_par_map(
         ranges: nchunks,
         per,
         count,
+        context_addr: context as usize,
         in_addr: in_buf as usize,
         out_addr: out_buf as usize,
         kernel,
@@ -11964,10 +11974,9 @@ unsafe extern "C" {
     fn accept4(sockfd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i32;
     // `fcntl` — the non-Linux `FD_CLOEXEC` fallback (platforms without an atomic CLOEXEC-at-creation
     // variant) AND the `O_NONBLOCK` `F_GETFL`/`F_SETFL` toggle used on every platform by the
-    // `command.run()` capture drain (`set_nonblocking`). Variadic in C (`int fcntl(int, int, ...)`); the
-    // `F_*FD`/`F_*FL` cmds each take one `i32` arg, which passes correctly through this fixed-arity
-    // declaration on the SysV/AAPCS ABIs.
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    // `command.run()` capture drain (`set_nonblocking`). Variadic in C; keep the declaration
+    // variadic so the call uses the platform's actual ABI for the optional third argument.
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
 /// `fcntl` file-status-flag commands (`F_GETFL`/`F_SETFL`) + the `O_NONBLOCK`/`O_CLOEXEC` bits used by
@@ -23005,7 +23014,7 @@ mod tests {
         unsafe { align_rt_tg_end(tg) };
     }
 
-    extern "C" fn par_map_double(input: *const u8, output: *mut u8, start: i64, end: i64) {
+    extern "C" fn par_map_double(_context: *const u8, input: *const u8, output: *mut u8, start: i64, end: i64) {
         let start = usize::try_from(start).unwrap();
         let end = usize::try_from(end).unwrap();
         for i in start..end {
@@ -23026,6 +23035,7 @@ mod tests {
             let input: Vec<i64> = (0..count).collect();
             let output = unsafe {
                 align_rt_par_map(
+                    core::ptr::null(),
                     input.as_ptr() as *const u8,
                     count,
                     size_of::<i64>() as i64,
@@ -23054,6 +23064,7 @@ mod tests {
         let input: Vec<i64> = (0..COUNT).map(|i| base + i).collect();
         let output = unsafe {
             align_rt_par_map(
+                core::ptr::null(),
                 input.as_ptr() as *const u8,
                 COUNT,
                 size_of::<i64>() as i64,
@@ -23658,11 +23669,10 @@ mod tests {
     }
 
     // `fcntl(F_GETFD)` — read the file-descriptor flags to prove `FD_CLOEXEC` is set. The test
-    // declares its own `fcntl` (the runtime's is private to the parent module). The signature matches
-    // the runtime's fixed-arity declaration exactly — two `extern` declarations of one symbol must
-    // agree (`clashing_extern_declarations`). `F_GETFD` ignores the third argument.
+    // declares its own variadic `fcntl` (the runtime's is private to the parent module); both
+    // declarations must agree (`clashing_extern_declarations`). `F_GETFD` ignores the third argument.
     unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
     const T_F_GETFD: i32 = 1;
     const T_FD_CLOEXEC: i32 = 1;

@@ -36,8 +36,9 @@ Do the work in this order:
 3. ~~Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
    per-element indirect thunk disappears.~~ **SHIPPED 2026-07-25.** The runtime now invokes one
    generated typed kernel per claimed range; its direct-call loop inlines and vectorizes.
-4. Extend that kernel with a read-only capture context, removing the current sequential fallback
-   for capturing `par_map`.
+4. ~~Extend that kernel with a read-only capture context, removing the current sequential fallback
+   for capturing `par_map`.~~ **SHIPPED 2026-07-25.** Direct-source Copy captures now use the same
+   range kernel; staged and unsupported aggregate cases remain sequential.
 5. Replace `task_group`'s per-task mutex/wake path with batched claims and a low-lock completion
    latch; batch queue submission too.
 6. Fuse integer `par_map(...).sum()` so the parallel operation never writes and rereads its full
@@ -96,22 +97,23 @@ The implementation lowers to the parallel runtime only when all of these are tru
 
 ```text
 no prior pipeline stages
-no captures
+Copy captures only (passed through a call-scoped immutable context)
 scalar / slice / chunks-compatible source
 ```
 
 Otherwise it appends a normal `map` stage and executes the sequential collect loop
 ([MIR lowering](../../crates/align_mir/src/lib.rs#L2874-L2921)). In particular:
 
-- a capturing `par_map` is sequential;
+- a capturing `par_map` with Copy captures uses the range kernel and immutable context;
+- Move captures remain rejected by the existing ownership checks;
 - `map(...).par_map(...)` is sequential even though it preserves length;
 - `where(...).par_map(...)` is sequential;
 - unsupported aggregate source shapes are sequential.
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That opaque node carries a
-source, function name, and input/output element types, but no explicit range body, captures, or
-cost summary.
+source, function name, Copy capture operands/types, and input/output element types, but no explicit
+range body or cost summary.
 
 ### 3.2 Whole-range kernel — SHIPPED 2026-07-25
 
@@ -127,7 +129,7 @@ map body from one another.
 That boundary is now:
 
 ```text
-void range_kernel(ptr input, ptr output, i64 start, i64 end)
+void range_kernel(ptr capture_ctx, ptr input, ptr output, i64 start, i64 end)
 ```
 
 Codegen emits the typed `start..<end` loop in the private kernel (typed GEP → load → direct call →
@@ -377,15 +379,15 @@ directly known `par_map` body. Vectorization remarks and generated assembly are 
 Runtime bitcode/LTO may help other runtime calls, but it is not required to expose a loop that the
 compiler itself can emit.
 
-The existing dedicated `ParMapParallel` materializer supplies the source, known body, and
-input/output layout needed for this first direct-source kernel. Before staged or capturing cases
-widen into it, MIR must also carry their fused stages/capture operands and the relevant
-ordering/ownership facts; no generic parallel reduction is implied.
+The existing dedicated `ParMapParallel` materializer supplies the source, known body, Copy capture
+operands/types, and input/output layout needed for this direct-source kernel. Before staged cases
+widen into it, MIR must also carry their fused stages and the relevant ordering/ownership facts; no
+generic parallel reduction is implied.
 
-### 7.2 Parallel capture context — prior goal, concrete ABI now pinned
+### 7.2 Parallel capture context — SHIPPED 2026-07-25
 
-The source semantics already say a non-escaping pipeline lambda uses captures as parameters. Extend
-the range kernel with one immutable context pointer:
+The source semantics already say a non-escaping pipeline lambda uses captures as parameters. The
+range kernel now carries one immutable context pointer:
 
 1. codegen builds a typed call-scoped record from captured Copy values;
 2. the synchronous runtime call receives its address and never retains or dereferences it after a
@@ -398,7 +400,7 @@ This is not a heap closure environment and needs no new syntax. It fulfills the 
 captures-as-parameters design for the parallel lowering instead of falling back to sequential.
 Copy captures may themselves contain borrowed/view aggregates, so retain the ordinary region and
 liveness checks and do not infer that input and context are mutually `noalias`. Owned/Move captures
-remain rejected until their existing ownership question is solved.
+remain rejected by the existing ownership checks.
 
 The late-runner proof from the work-first scheduler is load-bearing: a queued runner that starts
 after the synchronous call has drained must inspect only scheduler-owned state, observe no range to
@@ -720,11 +722,11 @@ with zero idle pool workers.
 
 - [x] Generate one typed loop body per range; erase per-element indirection (2026-07-25).
 - [x] Pin the direct-call IR shape and cheap-body vectorization (2026-07-25).
-- Pass immutable capture context and parallelize current capturing cases.
-- Pin ordered/drop behavior for capturing cases.
+- [x] Pass immutable capture context and parallelize current direct-source Copy-capturing cases (2026-07-25).
+- [x] Pin ordered/drop behavior for capturing cases (2026-07-25).
 
-**Current:** direct scalar/slice/chunk maps use the range path with no indirect call inside the hot
-loop. **Completion:** capturing scalar maps use that same path through an immutable context.
+**Current:** direct scalar/slice/chunk maps, including Copy-capturing forms, use the range path with
+no indirect call inside the hot loop. Staged and unsupported aggregate forms remain sequential.
 
 ### Slice P2 — low-lock task execution
 

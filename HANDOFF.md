@@ -98,12 +98,12 @@ was rerun after #636. #637-#642 passed their focused and PR CI gates.
 
 ## Next work
 
-Work paused at the owner's request after #642. Resume with the next recorded
-parallel slice in `docs/impl/11-parallel-execution-optimization.md`: extend the
-range kernel with a read-only capture context so capturing `par_map` no longer
-falls back to the sequential collect loop. Then remeasure the conservative
-range threshold before changing it. The wider `task_group` low-lock work remains
-a later measure-first follow-up.
+Work paused at the owner's request after #642. The next recorded parallel slice
+extends the range kernel with a read-only capture context so direct-source Copy-
+capturing `par_map` no longer falls back to the sequential collect loop; that
+slice is implemented in the current change. After it lands, remeasure the
+conservative range threshold before changing it. The wider `task_group` low-lock
+work remains a later measure-first follow-up.
 
 Consumer-gated deferrals that remain intentional:
 

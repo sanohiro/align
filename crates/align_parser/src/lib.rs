@@ -103,6 +103,133 @@ fn cap_expr_depths(file: &mut File, diags: &mut Diagnostics) {
     }
 }
 
+/// Work item used by [`discard_expr_tree`]. Every AST container is boxed so the work-list enum
+/// itself stays small; this path is only used when rejecting an over-deep input.
+enum DiscardExprTask {
+    Kind(Box<ExprKind>),
+    Expr(Box<Expr>),
+    Block(Box<Block>),
+    Stmt(Box<Stmt>),
+    Field(Box<FieldInit>),
+    Arm(Box<MatchArm>),
+    Template(Box<TemplatePart>),
+}
+
+/// Drop an expression subtree without recursively dropping its nested `Box<Expr>` chain.
+/// Replacing an over-deep expression with `Unit` would otherwise ask Rust to drop the detached
+/// tree recursively, which can overflow the native stack before the compiler reports its intended
+/// diagnostic.
+fn discard_expr_tree(root: DiscardExprTask) {
+    let mut pending = vec![root];
+    while let Some(task) = pending.pop() {
+        match task {
+            DiscardExprTask::Kind(kind) => match *kind {
+                ExprKind::Unit
+                | ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Char(_)
+                | ExprKind::Str(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Path(_)
+                | ExprKind::FieldShorthand(_) => {}
+                ExprKind::Unary { expr, .. }
+                | ExprKind::Cast { expr, .. }
+                | ExprKind::Try(expr)
+                | ExprKind::FieldAccess { recv: expr, .. }
+                | ExprKind::TupleIndex { recv: expr, .. } => pending.push(DiscardExprTask::Expr(expr)),
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    pending.push(DiscardExprTask::Expr(lhs));
+                    pending.push(DiscardExprTask::Expr(rhs));
+                }
+                ExprKind::Call { callee, args } => {
+                    pending.push(DiscardExprTask::Expr(callee));
+                    pending.extend(args.into_iter().map(|arg| DiscardExprTask::Expr(Box::new(arg))));
+                }
+                ExprKind::If { cond, then, els } => {
+                    pending.push(DiscardExprTask::Expr(cond));
+                    pending.push(DiscardExprTask::Block(Box::new(then)));
+                    if let Some(els) = els {
+                        pending.push(DiscardExprTask::Expr(els));
+                    }
+                }
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::Unsafe(block)
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Loop(block) => pending.push(DiscardExprTask::Block(Box::new(block))),
+                ExprKind::StructLit { fields, .. } => {
+                    pending.extend(fields.into_iter().map(|field| DiscardExprTask::Field(Box::new(field))));
+                }
+                ExprKind::ElseUnwrap { opt, fallback } => {
+                    pending.push(DiscardExprTask::Expr(opt));
+                    pending.push(DiscardExprTask::Expr(fallback));
+                }
+                ExprKind::ArrayLit(exprs) | ExprKind::Tuple(exprs) => {
+                    pending.extend(exprs.into_iter().map(|expr| DiscardExprTask::Expr(Box::new(expr))));
+                }
+                ExprKind::Index { recv, index } => {
+                    pending.push(DiscardExprTask::Expr(recv));
+                    pending.push(DiscardExprTask::Expr(index));
+                }
+                ExprKind::SliceRange { recv, start, end } => {
+                    pending.push(DiscardExprTask::Expr(recv));
+                    if let Some(start) = start {
+                        pending.push(DiscardExprTask::Expr(start));
+                    }
+                    if let Some(end) = end {
+                        pending.push(DiscardExprTask::Expr(end));
+                    }
+                }
+                ExprKind::Lambda { body, .. } => pending.push(DiscardExprTask::Block(Box::new(body))),
+                ExprKind::Match { scrutinee, arms } => {
+                    pending.push(DiscardExprTask::Expr(scrutinee));
+                    pending.extend(arms.into_iter().map(|arm| DiscardExprTask::Arm(Box::new(arm))));
+                }
+                ExprKind::Template(parts) => {
+                    pending.extend(parts.into_iter().map(|part| DiscardExprTask::Template(Box::new(part))));
+                }
+            },
+            DiscardExprTask::Expr(expr) => {
+                let Expr { kind, .. } = *expr;
+                pending.push(DiscardExprTask::Kind(Box::new(kind)));
+            }
+            DiscardExprTask::Block(block) => {
+                let Block { stmts, tail, .. } = *block;
+                if let Some(tail) = tail {
+                    pending.push(DiscardExprTask::Expr(tail));
+                }
+                pending.extend(stmts.into_iter().map(|stmt| DiscardExprTask::Stmt(Box::new(stmt))));
+            }
+            DiscardExprTask::Stmt(stmt) => match *stmt {
+                Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                    pending.push(DiscardExprTask::Expr(Box::new(init)));
+                }
+                Stmt::Assign { place, value } => {
+                    pending.push(DiscardExprTask::Expr(Box::new(place)));
+                    pending.push(DiscardExprTask::Expr(Box::new(value)));
+                }
+                Stmt::Return(Some(expr)) | Stmt::Break { value: Some(expr), .. } | Stmt::Expr(expr) => {
+                    pending.push(DiscardExprTask::Expr(Box::new(expr)));
+                }
+                Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
+            },
+            DiscardExprTask::Field(field) => {
+                let FieldInit { value, .. } = *field;
+                pending.push(DiscardExprTask::Expr(Box::new(value)));
+            }
+            DiscardExprTask::Arm(arm) => {
+                let MatchArm { body, .. } = *arm;
+                pending.push(DiscardExprTask::Expr(body));
+            }
+            DiscardExprTask::Template(part) => {
+                if let TemplatePart::Hole(expr) = *part {
+                    pending.push(DiscardExprTask::Expr(Box::new(expr)));
+                }
+            }
+        }
+    }
+}
+
 /// An expression node with no sub-expression children — descending never recurses through it.
 fn is_leaf_expr(k: &ExprKind) -> bool {
     matches!(
@@ -128,7 +255,8 @@ fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
         // which yields exactly one clean diagnostic per over-deep chain (not one per sibling leaf).
         if !is_leaf_expr(&e.kind) {
             diags.error("expression nests too deeply", e.span);
-            e.kind = ExprKind::Unit;
+            let discarded = std::mem::replace(&mut e.kind, ExprKind::Unit);
+            discard_expr_tree(DiscardExprTask::Kind(Box::new(discarded)));
         }
         return;
     }
@@ -219,8 +347,16 @@ fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
 fn cap_block_depth(b: &mut Block, depth: u32, diags: &mut Diagnostics) {
     if depth > MAX_EXPR_DEPTH {
         diags.error("expression nests too deeply", b.span);
-        b.stmts.clear();
-        b.tail = None;
+        let span = b.span;
+        let discarded = std::mem::replace(
+            b,
+            Block {
+                stmts: Vec::new(),
+                tail: None,
+                span,
+            },
+        );
+        discard_expr_tree(DiscardExprTask::Block(Box::new(discarded)));
         return;
     }
     let d = depth + 1;

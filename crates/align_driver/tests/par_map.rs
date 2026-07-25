@@ -1,7 +1,8 @@
 //! `par_map(f)` — apply a Pure function to each element, materializing an owned `array<R>`
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
-//! capturing or staged forms retain the sequential fallback.
+//! capturing forms use the same range kernel through an immutable call-scoped context; staged forms
+//! retain the sequential fallback.
 
 
 mod common;
@@ -17,6 +18,43 @@ fn par_map_pure_function() {
     let out = build_and_run("pm-pure", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+}
+
+#[test]
+fn par_map_capturing_lambda_uses_parallel_range_kernel() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  k := 10\n  ys := [1, 2, 3].par_map(fn x { x + k })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-capture", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+        .unwrap_or_else(|| panic!("no capturing par_map range kernel in IR:\n{ir}"));
+    let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
+    assert!(
+        kernel.lines().next().is_some_and(|line| {
+            line.matches("ptr readonly captures(none)").count() >= 2
+                && line.contains("ptr noalias writeonly captures(none)")
+        }),
+        "capture, input, and output pointer contracts must be present:\n{kernel}"
+    );
+    assert!(kernel.contains("load i64"), "the kernel must load the captured value from its context:\n{kernel}");
+    assert!(
+        kernel.contains("call i64 @\"main$lambda") && kernel.contains(", i64 %parcapv"),
+        "the direct body call must receive the capture value:\n{kernel}"
+    );
+
+    // Cross the runtime's range threshold too: the context must remain live while pool workers
+    // execute the generated kernel, not only on the caller-only small-input path.
+    let large_src = "fn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 32769 { break }\n  }\n  xs := b.build()\n  k := 10\n  ys := xs.par_map(fn x { x + k })\n  print(ys[0])\n  print(ys[32768])\n  return Ok(())\n}\n";
+    let large = build_and_run("pm-capture-large", large_src);
+    assert_eq!(large.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&large.stdout), "10\n32778\n");
 }
 
 #[test]

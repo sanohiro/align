@@ -50,6 +50,18 @@ fn exchange(port: u16, req: &[u8]) -> String {
     }
 }
 
+/// Connect to a freshly spawned server, allowing its generated executable to finish startup.
+fn connect_retry(port: u16) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(sock) => return sock,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("server never came up: {e}"),
+        }
+    }
+}
+
 /// The application: a route table built with the per-method constructors, one handler per route,
 /// and `web.serve` owning everything else. `boom` and `fail_as` return `Err` without building a
 /// response — the cases the framework must answer, log, and survive.
@@ -166,7 +178,6 @@ fn start(name: &str) -> Server {
 }
 
 fn start_app(name: &str, app: &str) -> Server {
-    let port = free_loopback_port();
     let built = build_exe_multi(
         name,
         &[
@@ -178,20 +189,34 @@ fn start_app(name: &str, app: &str) -> Server {
         ],
         "main.align",
     );
-    let mut child = std::process::Command::new(&built.exe)
-        .args(["--port", &port.to_string()])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-    // A server that dies at startup (bind failure, arg parse) would otherwise show up only as a
-    // 30-second connect timeout, so surface it as itself.
-    std::thread::sleep(Duration::from_millis(300));
-    if let Ok(Some(st)) = child.try_wait() {
-        let mut stderr = String::new();
-        child.stderr.take().expect("stderr piped").read_to_string(&mut stderr).expect("read stderr");
-        panic!("server exited at startup: {st:?}; stderr: {stderr}");
+    // The probe-and-bind sequence has an unavoidable race with other test processes: another
+    // process can claim the probed port after `free_loopback_port` releases it. Retry only the
+    // bind-specific startup failure, while surfacing every other startup failure immediately.
+    for attempt in 0..8 {
+        let port = free_loopback_port();
+        let mut child = std::process::Command::new(&built.exe)
+            .args(["--port", &port.to_string()])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server");
+        // A server that dies at startup (bind failure, arg parse) would otherwise show up only as a
+        // 30-second connect timeout, so surface it as itself.
+        std::thread::sleep(Duration::from_millis(300));
+        if let Ok(Some(st)) = child.try_wait() {
+            let mut stderr = String::new();
+            child.stderr.take().expect("stderr piped").read_to_string(&mut stderr).expect("read stderr");
+            // Linux reports EADDRINUSE as 98 and macOS as 48; keep the text fallback for another
+            // host whose runtime formats the native bind error instead of exposing errno directly.
+            let bind_failed = matches!(st.code(), Some(48 | 98))
+                || stderr.to_ascii_lowercase().contains("address already in use");
+            if bind_failed && attempt < 7 {
+                continue;
+            }
+            panic!("server exited at startup: {st:?}; stderr: {stderr}");
+        }
+        return Server { child, port, _built: built };
     }
-    Server { child, port, _built: built }
+    unreachable!("startup retry loop returns or panics")
 }
 
 const MIDDLEWARE_APP: &str = "module main\n\
@@ -376,7 +401,7 @@ fn malformed_requests_do_not_kill_the_serve_loop() {
         ),
     ];
     for (name, raw) in cases {
-        let mut bad = TcpStream::connect(("127.0.0.1", srv.port)).expect("connect malformed client");
+        let mut bad = connect_retry(srv.port);
         bad.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
         bad.write_all(raw).unwrap_or_else(|e| panic!("write {name}: {e}"));
         let mut got = Vec::new();
