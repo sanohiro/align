@@ -14,17 +14,24 @@ struct Slice {
 
 extern "C" {
     /// `pub fn pmap_cheap(s: slice<i64>) -> i64` — cheap vectorizable body.
+    #[cfg(feature = "probe")]
     fn pmap_cheap(s: Slice) -> i64;
     /// `pub fn smap_cheap(s: slice<i64>) -> i64` — sequential cheap body.
+    #[cfg(feature = "probe")]
     fn smap_cheap(s: Slice) -> i64;
     /// `pub fn pmap(s: slice<i64>) -> i64` — `s.par_map(work).sum()`.
     fn pmap(s: Slice) -> i64;
     /// `pub fn smap(s: slice<i64>) -> i64` — sequential `s.map(work).sum()`.
     fn smap(s: Slice) -> i64;
     /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
     fn align_rt_test_par_map_force_caller(force: i32);
     /// Benchmark-only threshold getter, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
     fn align_rt_test_par_map_min_chunk() -> i64;
+    /// Benchmark-only worker-count getter, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
+    fn align_rt_test_par_map_workers() -> i64;
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -59,8 +66,10 @@ fn gen(n: usize) -> Vec<i64> {
     v
 }
 
+#[cfg(feature = "probe")]
 type Kernel = unsafe extern "C" fn(Slice) -> i64;
 
+#[cfg(feature = "probe")]
 #[derive(Clone, Copy)]
 struct ThresholdCase {
     name: &'static str,
@@ -68,12 +77,14 @@ struct ThresholdCase {
     seq: Kernel,
 }
 
+#[cfg(feature = "probe")]
 fn call(kernel: Kernel, slice: Slice) -> i64 {
     // The benchmark exports are checked Align functions with the same C ABI; the harness owns the
     // backing Vec for the full duration of every call.
     unsafe { kernel(slice) }
 }
 
+#[cfg(feature = "probe")]
 fn elapsed_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
     let start = Instant::now();
     for _ in 0..reps {
@@ -82,6 +93,7 @@ fn elapsed_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
     start.elapsed().as_secs_f64() * 1e3
 }
 
+#[cfg(feature = "probe")]
 fn elapsed_caller_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
     unsafe { align_rt_test_par_map_force_caller(1) };
     let elapsed = elapsed_ms(kernel, slice, reps);
@@ -208,6 +220,7 @@ fn run_standard() {
     }
 }
 
+#[cfg(feature = "probe")]
 fn run_threshold() {
     // Keep the expected value explicit for the checked-in measurement table, but read the actual
     // runtime value too so a future retune cannot silently leave the probe out of sync.
@@ -218,6 +231,12 @@ fn run_threshold() {
         runtime_min, EXPECTED_PAR_MIN_CHUNK,
         "update the checked-in threshold probe after changing the runtime threshold"
     );
+    let runtime_workers = usize::try_from(unsafe { align_rt_test_par_map_workers() })
+        .expect("runtime par_map worker count must be positive");
+    if runtime_workers <= 1 {
+        println!("par_map threshold probe skipped: runtime reports {runtime_workers} worker; the pool path is intentionally disabled on a one-worker host");
+        return;
+    }
     let par_min_chunk = runtime_min;
     const ROUNDS: usize = 31;
     let counts = [
@@ -257,7 +276,7 @@ fn run_threshold() {
     };
     std::hint::black_box(call(pmap, warm_slice));
 
-    println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples)");
+    println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples, {runtime_workers} workers)");
     println!("n <= {par_min_chunk}: caller-only; n > {par_min_chunk}: pool eligible");
     println!(
         "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}",
@@ -276,23 +295,28 @@ fn run_threshold() {
         for case in cases {
             let expected = call(case.seq, slice);
             assert_eq!(call(case.par, slice), expected, "{} n={n}", case.name);
-            // Alternate pool→caller→seq and seq→caller→pool so adjacent timings see both positions
-            // in the cycle. The median of ratios keeps correlated frequency drift in the pair.
+            // Cycle through all six permutations so pool, caller, and sequential each occupy every
+            // timing slot. The median of ratios keeps correlated frequency drift in the pair.
             let mut pool_seq_ratios = Vec::with_capacity(ROUNDS);
             let mut pool_caller_ratios = Vec::with_capacity(ROUNDS);
             for round in 0..ROUNDS {
-                let (pool_ms, caller_ms, seq_ms) = if round % 2 == 0 {
-                    (
-                        elapsed_ms(case.par, slice, reps),
-                        elapsed_caller_ms(case.par, slice, reps),
-                        elapsed_ms(case.seq, slice, reps),
-                    )
-                } else {
-                    let seq_ms = elapsed_ms(case.seq, slice, reps);
-                    let caller_ms = elapsed_caller_ms(case.par, slice, reps);
-                    let pool_ms = elapsed_ms(case.par, slice, reps);
-                    (pool_ms, caller_ms, seq_ms)
+                let order = match round % 6 {
+                    0 => [0, 1, 2],
+                    1 => [2, 1, 0],
+                    2 => [1, 0, 2],
+                    3 => [2, 0, 1],
+                    4 => [1, 2, 0],
+                    _ => [0, 2, 1],
                 };
+                let mut elapsed = [0.0; 3];
+                for arm in order {
+                    elapsed[arm] = match arm {
+                        0 => elapsed_ms(case.par, slice, reps),
+                        1 => elapsed_caller_ms(case.par, slice, reps),
+                        _ => elapsed_ms(case.seq, slice, reps),
+                    };
+                }
+                let [pool_ms, caller_ms, seq_ms] = elapsed;
                 pool_seq_ratios.push(pool_ms / seq_ms);
                 pool_caller_ratios.push(pool_ms / caller_ms);
             }
@@ -312,8 +336,16 @@ fn run_threshold() {
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("threshold") {
-        run_threshold();
-    } else {
-        run_standard();
+        #[cfg(feature = "probe")]
+        {
+            run_threshold();
+            return;
+        }
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("threshold mode requires the probe feature");
+            std::process::exit(2);
+        }
     }
+    run_standard();
 }

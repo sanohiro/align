@@ -128,6 +128,19 @@ Consumer-gated deferrals that remain intentional:
 - The first pkg.web consumer application remains a separate, owner-scheduled
   task.
 
+After the current `par_map` threshold PR, review the integration-test execution
+policy. Do not make the full workspace suite or expensive differential-fuzz,
+network/filesystem, and performance suites mandatory on every PR. The default
+PR gate must stay bounded and deterministic and run tests directly related to
+the changed surface; retain the expensive suites as explicit, targeted checks
+or roughly monthly scheduled runs. The review must inspect the suite itself:
+remove redundant or low-value cases, move unit-level checks out of integration
+tests, and stop the suite from growing by accumulation without a clear
+correctness or regression role. Keep a focused regression test for a specific
+optimization when it protects that optimization, but do not accumulate those
+spot checks into an every-PR integration-test wall; merge or remove overlapping
+checks during the review.
+
 ## Build and test notes
 
 On this Apple Silicon machine, use:

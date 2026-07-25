@@ -151,7 +151,8 @@ every worker locks it again to pop a job.
 `align_rt_par_map` now:
 
 1. allocates the complete output;
-2. for counts above the single-range floor, initializes the pool;
+2. for counts above the single-range floor on a host with multiple available workers, initializes
+   the pool; a one-worker host remains caller-only;
 3. partitions into at most `workers` contiguous, balanced chunks, using `PAR_MIN_CHUNK = 65536`
    **elements** as the caller-only floor and initial grain target;
 4. creates one shared range cursor and total-range completion barrier;
@@ -162,15 +163,16 @@ The tiny-call fast path moves step 2 after the single-chunk decision. It does no
 progress, per-element IR, or warm steady-state contention.
 
 The post-specialization threshold probe (`bench/par_map/run.sh threshold`) was rerun on native Apple
-Silicon after #643. It alternates paired pooled/caller-only/sequential timings, reports the median of
-31 `pool/seq` and `pool/caller` ratios, and covers both a cheap vectorizable body and a heavier body
-around the boundary. At the old 32768 boundary, entering the pool at 32769 was still a loss against
-the fused sequential control; moving the caller-only floor to 65536 keeps that medium-size region
-on the caller. The balanced range plan avoids a one-element helper at the first pool-eligible size,
-and the heavy-body pool/caller crossover falls between 65,537 and 73,728 on this representative
-run; the fused sequential comparison is separate and later, with pool/seq falling below 1 at
-131,072. The value is deliberately body-agnostic and host-sensitive; rerun the probe before any
-future retune.
+Silicon after #643. It uses the opt-in probe runtime, skips one-worker hosts because the pool path is
+intentionally disabled there, and alternates all six paired pooled/caller-only/sequential orders so
+each arm occupies every timing slot. It reports the median of 31 `pool/seq` and `pool/caller` ratios
+and covers both a cheap vectorizable body and a heavier body around the boundary. At the old 32768
+boundary, entering the pool at 32769 was still a loss against the fused sequential control; moving
+the caller-only floor to 65536 keeps that medium-size region on the caller. The balanced range plan
+avoids a one-element helper at the first pool-eligible size, and the heavy-body pool/caller crossover
+falls between 65,537 and 73,728 on this representative run; the fused sequential comparison is
+separate and later, with pool/seq falling below 1 at 131,072. The value is deliberately body-agnostic
+and host-sensitive; rerun the probe before any future retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task
 at a time with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is drained.

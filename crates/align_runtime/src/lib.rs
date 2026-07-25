@@ -1702,6 +1702,9 @@ impl ParPool {
 /// The global pool's storage, hoisted out of `par_pool()` so [`align_rt_test_par_pool_initialized`]
 /// can check whether it has been created yet without forcing creation itself.
 static PAR_POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
+// `ParPool` is process-lifetime state, so the host worker count is too. Cache the platform query
+// instead of paying for `available_parallelism()` on every pooled `par_map` call.
+static PAR_WORKER_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 const PAR_MIN_CHUNK: usize = 65_536;
 
@@ -1727,15 +1730,31 @@ pub extern "C" fn align_rt_test_par_map_min_chunk() -> i64 {
 }
 
 fn par_worker_count() -> usize {
-    #[cfg(not(test))]
-    let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
-    #[cfg(test)]
-    let n = std::env::var("ALIGN_TEST_PAR_WORKERS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1));
-    n
+    *PAR_WORKER_COUNT.get_or_init(|| {
+        #[cfg(not(test))]
+        {
+            std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1)
+        }
+        #[cfg(test)]
+        {
+            std::env::var("ALIGN_TEST_PAR_WORKERS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|&value| value > 0)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1)
+                })
+        }
+    })
+}
+
+/// Benchmark-only worker-count getter for making one-worker threshold probes report that the
+/// runtime intentionally stays caller-only. It is present only in the opt-in `par-map-probe`
+/// build.
+#[cfg(feature = "par-map-probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_par_map_workers() -> i64 {
+    i64::try_from(par_worker_count()).expect("par_map worker count fits in i64")
 }
 
 /// The global pool (lazily created). Returns its worker count too (= the parallelism degree).

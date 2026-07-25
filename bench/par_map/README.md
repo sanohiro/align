@@ -16,11 +16,11 @@ Rust controls therefore execute the same data and the same wrapping-int body.
 Native Apple Silicon, 2026-07-25, after the whole-range kernel and `PAR_MIN_CHUNK = 65536`:
 
 ```
-        n    align ms      seq ms    rayon ms     vs seq   vs rayon
-     1000       0.002       0.002       0.018      0.86x      7.55x
-    10000       0.028       0.019       0.115      0.69x      4.17x
-   100000       0.128       0.139       0.148      1.09x      1.16x
-  1000000       0.372       0.661       0.245      1.78x      0.66x
+     n    align ms      seq ms    rayon ms     vs seq   vs rayon
+     1000       0.001       0.001       0.026      0.74x     26.89x
+    10000       0.010       0.007       0.039      0.70x      4.08x
+   100000       0.091       0.103       0.120      1.12x      1.32x
+  1000000       0.391       0.653       0.267      1.67x      0.68x
 ```
 
 The exact ratio is host- and body-sensitive. The whole-range kernel removes the per-element
@@ -35,32 +35,34 @@ explicit parallel form.
 body elements per timing, alternates pool/caller-only/sequential order, and reports the median of 31
 paired `pool/seq` and `pool/caller` ratios plus the `pool/seq` p10..p90 spread. The caller-only control
 uses the same materializing `par_map` kernel with the scheduler disabled by the benchmark-only
-`par-map-probe` runtime feature. It probes both a cheap vectorizable body and the heavier headline
-body around the caller-only/pool boundary. Cold-start behavior remains pinned by
+`par-map-probe` runtime feature; standard headline runs use the default runtime without probe
+instrumentation. It probes both a cheap vectorizable body and the heavier headline body around the
+caller-only/pool boundary. On a one-worker host it reports that the probe is skipped because the
+runtime intentionally stays caller-only. Cold-start behavior remains pinned by
 `crates/align_runtime/tests/par_map_cold_start.rs`.
 
 Native Apple Silicon, one representative run after balancing ranges at `PAR_MIN_CHUNK = 65536`:
 
 ```
         n      case     median pool/seq  median pool/caller  pool/seq p10..p90
-    32768     cheap               1.305                1.000  1.303..1.312
-    32768     heavy               1.167                1.000  1.166..1.169
-    32769     cheap               1.310                1.000  1.304..1.316
-    32769     heavy               1.164                1.000  1.163..1.174
-    65535     cheap               1.261                1.000  1.238..1.265
-    65535     heavy               1.149                1.000  1.146..1.153
-    65536     cheap               1.261                1.000  1.252..1.264
-    65536     heavy               1.147                1.000  1.137..1.150
-    65537     cheap               1.427                1.121  1.398..1.460
-    65537     heavy               1.178                1.019  1.140..1.218
-    73728     cheap               1.391                1.102  1.365..1.418
-    73728     heavy               1.149                0.996  1.053..1.190
-    81920     cheap               1.375                1.093  1.299..1.401
-    81920     heavy               1.112                0.978  0.878..1.140
-    98304     cheap               1.343                1.068  1.266..1.414
-    98304     heavy               1.071                0.931  1.062..1.079
-   131072     cheap               1.320                1.063  1.315..1.330
-   131072     heavy               0.876                0.765  0.852..0.894
+    32768     cheap               1.306                0.999  1.295..1.314
+    32768     heavy               1.166                1.000  1.142..1.178
+    32769     cheap               1.309                0.999  1.287..1.332
+    32769     heavy               1.165                1.002  1.139..1.173
+    65535     cheap               1.259                1.000  1.249..1.282
+    65535     heavy               1.147                1.000  1.129..1.168
+    65536     cheap               1.259                1.000  1.256..1.288
+    65536     heavy               1.144                1.000  1.129..1.151
+    65537     cheap               1.376                1.087  1.330..1.442
+    65537     heavy               1.189                1.022  1.118..1.218
+    73728     cheap               1.350                1.073  1.315..1.386
+    73728     heavy               1.058                0.918  0.892..1.113
+    81920     cheap               1.320                1.056  1.288..1.372
+    81920     heavy               1.033                0.906  0.922..1.135
+    98304     cheap               1.291                1.034  1.255..1.345
+    98304     heavy               0.998                0.869  0.962..1.052
+   131072     cheap               1.307                1.054  1.279..1.323
+   131072     heavy               0.868                0.760  0.843..0.898
 ```
 
 The previous 32768 boundary entered the pool immediately at 32769 even though both bodies were

@@ -70,9 +70,8 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
             double,
         )
     };
-    let boundary_values = unsafe {
-        std::slice::from_raw_parts(boundary_output as *const i64, BOUNDARY as usize)
-    };
+    let boundary_values =
+        unsafe { std::slice::from_raw_parts(boundary_output as *const i64, BOUNDARY as usize) };
     assert_eq!(boundary_values.first(), Some(&0));
     assert_eq!(boundary_values.last(), Some(&(2 * (BOUNDARY - 1))));
     unsafe { align_runtime::align_rt_free(boundary_output) };
@@ -88,7 +87,14 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
     unsafe { *(env as *mut i64) = 21 };
     let slot = unsafe { align_runtime::align_rt_tg_alloc(tg, 8, 8) };
     unsafe {
-        align_runtime::align_rt_tg_register(tg, double_tramp, std::ptr::null(), env, slot, std::ptr::null_mut())
+        align_runtime::align_rt_tg_register(
+            tg,
+            double_tramp,
+            std::ptr::null(),
+            env,
+            slot,
+            std::ptr::null_mut(),
+        )
     };
     let err = unsafe { align_runtime::align_rt_tg_wait(tg) };
     assert!(err.is_null());
@@ -99,9 +105,10 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
         "a single-task task_group must not spin up the global worker pool (Codex audit item 5)"
     );
 
-    // Sanity check on the observation mechanism itself: a workload that DOES cross the threshold
-    // must still initialize the pool as before. Must run last in this process -- it deliberately
-    // poisons the "never touched" state checked above.
+    // Sanity check on the observation mechanism itself: on a multi-worker host, a workload that
+    // DOES cross the threshold must initialize the pool as before. A one-worker host intentionally
+    // remains caller-only, so the final assertion follows the runtime's host policy. Must run last
+    // in this process -- it deliberately poisons the "never touched" state on multi-worker hosts.
     const BIG: i64 = 65_537;
     let big_input: Vec<i64> = (0..BIG).collect();
     let big_output = unsafe {
@@ -116,9 +123,18 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
     };
     assert!(!big_output.is_null());
     unsafe { align_runtime::align_rt_free(big_output) };
-    assert!(
-        align_runtime::align_rt_test_par_pool_initialized(),
-        "a workload above PAR_MIN_CHUNK must still spin up the pool (confirms the assertions \
-         above are meaningful, not vacuously true)"
-    );
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    if workers > 1 {
+        assert!(
+            align_runtime::align_rt_test_par_pool_initialized(),
+            "a workload above PAR_MIN_CHUNK must initialize the pool on a multi-worker host"
+        );
+    } else {
+        assert!(
+            !align_runtime::align_rt_test_par_pool_initialized(),
+            "a one-worker host must keep par_map caller-only without initializing the pool"
+        );
+    }
 }

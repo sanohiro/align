@@ -22,10 +22,9 @@ case "$mode" in
   *) echo "usage: run.sh [baseline|v3|native|threshold]" >&2; exit 2 ;;
 esac
 
-( cd ../.. && cargo build -q --release --bin alignc && cargo build -q --release -p align_runtime --features par-map-probe )
+( cd ../.. && cargo build -q --release --bin alignc )
 ALIGNC="../../target/release/alignc"
 RT_DIR="$(cd ../.. && pwd)/target/release"
-[ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic lib in $RT_DIR" >&2; exit 1; }
 
 KOBJ="$PWD/kernel.o"
 trap 'rm -f "$KOBJ"' EXIT
@@ -35,7 +34,11 @@ trap 'rm -f "$KOBJ"' EXIT
 echo "target: $mode (Align=$align_tgt, Rust=$rust_tgt)"
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=$rust_tgt"
 if [ "$mode" = threshold ]; then
-  ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release -- threshold
+  ( cd ../.. && cargo build -q --release -p align_runtime --features par-map-probe )
+  [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic lib in $RT_DIR" >&2; exit 1; }
+  ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release --features probe -- threshold
 else
+  ( cd ../.. && cargo build -q --release -p align_runtime )
+  [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic lib in $RT_DIR" >&2; exit 1; }
   ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release
 fi
