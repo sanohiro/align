@@ -280,7 +280,7 @@ fn gate2b_json_decode_field_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the rename flips the baked json schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the renamed field"
     );
     if cc_available() {
         // v2 declares `zzz` but the input still carries key "k" → strict decode fails (missing
@@ -302,7 +302,7 @@ fn gate2b_json_decode_field_rename_invalidates() {
     assert_eq!(
         hotn.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the nested field feeds the recursive schema fingerprint → the parent unit's MIR digest"
+        "the structural MIR fingerprint includes nested type tables"
     );
 }
 
@@ -334,7 +334,7 @@ fn gate2c_json_union_array_element_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the element field feeds the union's recursive schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the union payload's element type table"
     );
     if cc_available() {
         // v2 requires key "txt" but the input carries "text" → strict decode fails, `?` propagates,
@@ -367,7 +367,7 @@ fn gate2d_json_scalar_array_element_type_change_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the element type feeds the baked json schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the scalar-array element type"
     );
 }
 
@@ -383,9 +383,9 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
         return;
     }
     // v1 payload `Inner { v, tag }`; v2 renames `tag` → `txt`. The JSON literal keeps key "tag"; every
-    // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins the load-bearing
-    // `json_schema_sig` recursion into `Option<struct>` — the pre-existing decode gap this slice fixes,
-    // independent of the `OptionStructField` encode piece's own baked schema.
+    // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins that the complete
+    // structural Program covers an Option payload's descriptor inputs independently of the redundant
+    // legacy schema string.
     let v1 = "import core.json\nInner { v: i64, tag: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let v2 = "import core.json\nInner { v: i64, txt: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let proj = Project::new("json-opt-struct-rename", &[("main.align", v1)], "main.align");
@@ -398,7 +398,7 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
     assert_eq!(
         hot.outcome("main").miss_reason,
         Some(FirstDiff::MirDigest),
-        "the payload field feeds the recursive schema fingerprint → the unit's MIR digest"
+        "the structural MIR fingerprint includes the Option payload's type table"
     );
 }
 

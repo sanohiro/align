@@ -6898,8 +6898,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("builder_into_string returns a {ptr,len}")
             }
             Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
-            // `schema` is a cache-invalidation fingerprint printed into the MIR; codegen rebuilds the
-            // descriptor table directly from `struct_id`, so it does not read `schema` here.
+            // `schema` is a redundant legacy summary. Codegen rebuilds the descriptor table directly
+            // from `struct_id`, and cache identity includes the complete structural MIR Program.
             Rvalue::JsonDecode { struct_id, input, out, .. } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
