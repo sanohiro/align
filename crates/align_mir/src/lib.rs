@@ -76,10 +76,11 @@ pub struct Program {
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<hir::ExternFn>,
-    /// M15 S2 (per-unit compilation): imported `pub` functions called cross-unit but defined in
-    /// another unit's object. Codegen emits an external Align-ABI `declare` for each so a
-    /// `Rvalue::Call` keyed by the mangled `module$name` resolves at link time. **Empty in the
-    /// whole-program path** (byte-identity), populated only by per-unit lowering.
+    /// M15 S2 (per-unit compilation): non-generic `pub` functions declared by interface-only
+    /// dependencies and defined in another unit's object. Codegen emits an external Align-ABI
+    /// `declare` for each so a `Rvalue::Call` keyed by the mangled `module$name` resolves at link
+    /// time. **Empty in the whole-program path** (byte-identity), populated only by per-unit
+    /// lowering.
     pub imported_fns: Vec<hir::ImportedFn>,
     /// External libraries to link (`-l<name>`), passed through from HIR; consumed by the driver.
     pub link_libs: Vec<String>,
@@ -1348,10 +1349,10 @@ pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program 
 /// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
 /// model — a non-entry `pub` user function ([`hir::Fn::exportable`]) gets `external` linkage in the
 /// object (so a dependent unit's object resolves the cross-unit call), and the unit's imported
-/// `pub` callees ([`hir::Program::imported_fns`]) are carried through as bodyless external declares.
-/// The whole-program [`lower_program`] forces every function `internal` and drops any declares, so
-/// the default object stays byte-identical to today; per-unit lowering is the only path that turns
-/// these bits on.
+/// `pub` declarations ([`hir::Program::imported_fns`]) are carried through as bodyless external
+/// declares. The whole-program [`lower_program`] forces every function `internal` and drops any
+/// declares, so the default object stays byte-identical to today; per-unit lowering is the only path
+/// that turns these bits on.
 pub fn lower_program_per_unit(program: &hir::Program) -> Program {
     lower_program_impl(program, None, true)
 }
