@@ -1,6 +1,7 @@
 //! `par_map(f)` — apply a Pure function to each element, materializing an owned `array<R>`
-//! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. The first cut
-//! runs sequentially (real thread-parallel execution is a runtime follow-up).
+//! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
+//! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
+//! capturing or staged forms retain the sequential fallback.
 
 
 mod common;
@@ -144,6 +145,59 @@ fn par_map_takes_parallel_path_and_is_correct() {
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
     assert!(text.contains("par_map["), "a direct par_map should take the parallel path:\n{text}");
+}
+
+#[test]
+fn par_map_range_kernel_owns_the_direct_element_loop() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> i32 {\n  ys := [1, 2, 3].par_map(dbl)\n  return ys[0] as i32\n}\n";
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+        .unwrap_or_else(|| panic!("no par_map range kernel in IR:\n{ir}"));
+    let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
+
+    assert!(
+        kernel.lines().next().is_some_and(|line| {
+            line.contains("ptr readonly captures(none)")
+                && line.contains("ptr noalias writeonly captures(none)")
+                && line.contains("i64")
+        }),
+        "range kernel must pin its read/write pointer contracts:\n{kernel}"
+    );
+    assert!(kernel.contains("phi i64"), "range kernel needs one counted induction variable:\n{kernel}");
+    assert!(kernel.contains("getelementptr inbounds i64"), "range kernel needs typed element GEPs:\n{kernel}");
+    assert!(kernel.contains("call i64 @dbl(i64"), "the element loop must call its known body directly:\n{kernel}");
+    assert!(
+        !kernel.lines().any(|line| line.trim_start().starts_with("call ") && line.contains(" %")),
+        "the element loop must not retain an indirect per-element callback:\n{kernel}"
+    );
+}
+
+#[test]
+fn cheap_par_map_range_kernel_vectorizes_after_specialization() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i64) -> i64 = x * 2\npub fn run(xs: slice<i64>) -> array<i64> = xs.par_map(dbl)\nfn main() -> i32 = 0\n";
+    let ir = emit_llvm_optimized(src, &["run"]);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+        .unwrap_or_else(|| panic!("no optimized par_map range kernel in IR:\n{ir}"));
+    let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
+
+    assert!(
+        kernel.contains("vector.body") && kernel.contains("load <") && kernel.contains("store <"),
+        "a cheap arithmetic range kernel should expose a vectorized loop to LLVM:\n{kernel}"
+    );
+    assert!(
+        !kernel.contains("call i64 @dbl") && !kernel.lines().any(|line| line.trim_start().starts_with("call ") && line.contains(" %")),
+        "the optimized hot loop must inline the body and contain no per-element call:\n{kernel}"
+    );
 }
 
 #[test]

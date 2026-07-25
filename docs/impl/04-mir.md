@@ -254,8 +254,10 @@ task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult;
 ```
 
 `par_map` requires a Pure callable (`03 §8`); the dedicated node lets codegen call the runtime's
-parallel-map API with an explicit element thunk. Parallel reduction is not part of the current
-surface, so MIR does not claim a `ParLoop(reduce=…)` node or an associativity contract.
+parallel-map API with a generated whole-range kernel. The kernel contains the typed counted loop
+and a direct call to the known body; the runtime schedules disjoint `[start,end)` ranges. Parallel
+reduction is not part of the current surface, so MIR does not claim a `ParLoop(reduce=…)` node or an
+associativity contract.
 
 ---
 

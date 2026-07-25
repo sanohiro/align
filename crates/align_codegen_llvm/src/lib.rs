@@ -1022,8 +1022,9 @@ fn build_module<'c>(
             None,
         ),
     );
-    // `par_map`: (in_buf, count, in_stride, out_stride, thunk) -> out_buf. Allocates the output,
-    // applies the per-function thunk to each element across threads, returns the owned buffer.
+    // `par_map`: (in_buf, count, in_stride, out_stride, range_kernel) -> out_buf. Allocates the
+    // output, applies the generated kernel to disjoint ranges across threads, returns the owned
+    // buffer.
     let par_map = module.add_function(
         "align_rt_par_map",
         ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
@@ -1031,7 +1032,7 @@ fn build_module<'c>(
     );
     // Only `noalias` on the return: the output buffer is a fresh allocation disjoint from the inputs.
     // NOT `nounwind` (it may `resume_unwind` a worker panic) and NOT `nofree` (it invokes the user
-    // thunk, so we don't assert anything about what that does).
+    // range kernel, so we don't assert anything about what that does).
     add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
     funcs.insert("par_map".to_string(), par_map);
     funcs.insert(
@@ -4788,54 +4789,116 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))
     }
 
-    /// Get (building it once) the `void(in_ptr, out_ptr)` thunk for `func` — load the input
-    /// element (`in_ty`), call `func`, store its result through `out_ptr` — and return its pointer.
-    /// The runtime `align_rt_par_map` calls this per element. Building it temporarily repositions
-    /// the shared builder, then restores it.
-    fn par_map_thunk(
+    /// Get (building it once) the `void(in_base, out_base, start, end)` range kernel for `func`.
+    /// The kernel owns the counted element loop: typed GEP → load → direct call → store. The runtime
+    /// calls it once per claimed range, so the hot element loop contains no indirect callback.
+    /// Building it temporarily repositions the shared builder, then restores it.
+    fn par_map_range_kernel(
         &self,
         func: &str,
         in_ty: BasicTypeEnum<'c>,
+        out_ty: BasicTypeEnum<'c>,
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
-        let name = format!("{func}$parthunk");
+        let name = format!("{func}$parkernel");
         if let Some(f) = self.module.get_function(&name) {
             return Ok(f.as_global_value().as_pointer_value());
         }
+        let target = self
+            .funcs
+            .get(func)
+            .copied()
+            .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
-        let thunk = self.module.add_function(&name, self.ctx.void_type().fn_type(&[ptr_t.into(), ptr_t.into()], false), None);
-        mark_nounwind(self.ctx, thunk);
-        mark_private_helper(thunk);
+        let i64t = self.ctx.i64_type();
+        let kernel = self.module.add_function(
+            &name,
+            self.ctx
+                .void_type()
+                .fn_type(&[ptr_t.into(), ptr_t.into(), i64t.into(), i64t.into()], false),
+            None,
+        );
+        mark_nounwind(self.ctx, kernel);
+        mark_private_helper(kernel);
+        // The synchronous runtime never retains either base pointer. Input is read-only; output is
+        // the runtime's fresh allocation and is written only through this disjoint range kernel.
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(0), "readonly");
+        add_valued_enum_attr(
+            self.ctx,
+            kernel,
+            inkwell::attributes::AttributeLoc::Param(0),
+            "captures",
+            CAPTURES_NONE,
+        );
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(1), "noalias");
+        add_enum_attr(self.ctx, kernel, inkwell::attributes::AttributeLoc::Param(1), "writeonly");
+        add_valued_enum_attr(
+            self.ctx,
+            kernel,
+            inkwell::attributes::AttributeLoc::Param(1),
+            "captures",
+            CAPTURES_NONE,
+        );
         let saved = self.builder.get_insert_block();
-        // This thunk has no DISubprogram; emitting into it while the outer function's debug location
+        // This kernel has no DISubprogram; emitting into it while the outer function's debug location
         // is active would attach a wrong-scope `!dbg` (a verifier error). Clear it while building
-        // the thunk, then restore the outer function's fallback location afterward (a no-op without
-        // debug info). The thunk needs no locations — the verifier's rule applies only to functions
-        // that carry debug info.
+        // the kernel, then restore the outer function's fallback location afterward (a no-op
+        // without debug info). The kernel needs no locations — the verifier's rule applies only to
+        // functions that carry debug info.
         if self.dibuilder.is_some() {
             self.builder.unset_current_debug_location();
         }
-        let entry = self.ctx.append_basic_block(thunk, "entry");
+        let entry = self.ctx.append_basic_block(kernel, "entry");
+        let head = self.ctx.append_basic_block(kernel, "head");
+        let body = self.ctx.append_basic_block(kernel, "body");
+        let done = self.ctx.append_basic_block(kernel, "done");
         self.builder.position_at_end(entry);
-        let in_p = thunk.get_nth_param(0).unwrap().into_pointer_value();
-        let out_p = thunk.get_nth_param(1).unwrap().into_pointer_value();
+        let in_base = kernel.get_nth_param(0).unwrap().into_pointer_value();
+        let out_base = kernel.get_nth_param(1).unwrap().into_pointer_value();
+        let start = kernel.get_nth_param(2).unwrap().into_int_value();
+        let end = kernel.get_nth_param(3).unwrap().into_int_value();
+        self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+
+        // head: i = phi [start, entry], [i+1, body]; enter while i < end.
+        self.builder.position_at_end(head);
+        let phi = self.builder.build_phi(i64t, "i").map_err(|e| self.err(e))?;
+        phi.add_incoming(&[(&start, entry)]);
+        let i = phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULT, i, end, "more")
+            .map_err(|e| self.err(e))?;
+        self.builder.build_conditional_branch(more, body, done).map_err(|e| self.err(e))?;
+
+        self.builder.position_at_end(body);
+        let in_p = unsafe {
+            self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
+        };
+        let out_p = unsafe {
+            self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
+        };
         let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
         let r = self
             .builder
-            .build_call(self.funcs[func], &[x.into()], "r")
+            .build_call(target, &[x.into()], "r")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| self.err("par_map function must return a value"))?;
         self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+        let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
+        phi.add_incoming(&[(&next, body)]);
+        self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+
+        self.builder.position_at_end(done);
         self.builder.build_return(None).map_err(|e| self.err(e))?;
         match saved {
             Some(s) => self.builder.position_at_end(s),
-            // No prior block: clear the position so later codegen doesn't append into the thunk.
+            // No prior block: clear the position so later codegen doesn't append into the kernel.
             None => self.builder.clear_insertion_position(),
         }
         // Restore an active debug location for the outer function's subsequent instructions.
         self.set_line(self.fn_line, 0);
-        Ok(thunk.as_global_value().as_pointer_value())
+        Ok(kernel.as_global_value().as_pointer_value())
     }
 
     /// Set the builder's current debug location (opt-in). A no-op without debug info. `line == 0`
@@ -6564,7 +6627,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::ParMapParallel { src, func, elem_in, elem_out } => {
                 // Heap-allocate the output buffer, then run `func` over the input in parallel via
-                // a per-`func` thunk; the result is the owned `{ out_buf, count }` array.
+                // a per-`func` range kernel; the result is the owned `{ out_buf, count }` array.
                 let agg = self.operand(src)?.into_struct_value();
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
                 let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
@@ -6573,14 +6636,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
-                let thunk = self.par_map_thunk(func, in_ty)?;
-                // The runtime allocates the output (overflow-guarded), runs the thunk across
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty)?;
+                // The runtime allocates the output (overflow-guarded), runs the kernel across
                 // threads, and returns the owned buffer.
                 let out_buf = self
                     .builder
                     .build_call(
                         self.funcs["par_map"],
-                        &[in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), thunk.into()],
+                        &[in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
                         "obuf",
                     )
                     .map_err(|e| self.err(e))?

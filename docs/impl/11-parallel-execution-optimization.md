@@ -33,8 +33,9 @@ Do the work in this order:
    #465 (2026-07-15)**, including conservative unknown higher-order targets.
 2. ~~Make `par_map` work-first and caller-draining.~~ **FIXED 2026-07-13** with a shared range
    cursor, caller drain loop, total-range completion barrier, and watchdog gate.
-3. Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
-   per-element indirect thunk disappears.
+3. ~~Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
+   per-element indirect thunk disappears.~~ **SHIPPED 2026-07-25.** The runtime now invokes one
+   generated typed kernel per claimed range; its direct-call loop inlines and vectorizes.
 4. Extend that kernel with a read-only capture context, removing the current sequential fallback
    for capturing `par_map`.
 5. Replace `task_group`'s per-task mutex/wake path with batched claims and a low-lock completion
@@ -112,20 +113,29 @@ The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.m
 source, function name, and input/output element types, but no explicit range body, captures, or
 cost summary.
 
-### 3.2 Generated IR crosses an indirect call once per element
+### 3.2 Whole-range kernel — SHIPPED 2026-07-25
 
-Codegen emits a private helper of shape:
+The audit baseline emitted a private helper of shape:
 
 ```text
 void element_thunk(ptr input_element, ptr output_element)
 ```
 
-The helper loads one element, calls the Align function, and stores one result
-([thunk generation](../../crates/align_codegen_llvm/src/lib.rs#L3320-L3365)). The runtime owns the
-counted loop and calls that function pointer for every element
-([runtime loop](../../crates/align_runtime/src/lib.rs#L1457-L1467)). Consequently LLVM cannot see
-the runtime loop and the map body in one optimization unit. Even when the user function inlines
-into the helper, the hot loop still contains one indirect call per element.
+The runtime owned the counted loop and called that pointer for every element, hiding the loop and
+map body from one another.
+
+That boundary is now:
+
+```text
+void range_kernel(ptr input, ptr output, i64 start, i64 end)
+```
+
+Codegen emits the typed `start..<end` loop in the private kernel (typed GEP → load → direct call →
+store), with `readonly captures(none)` on input and `noalias writeonly captures(none)` on the fresh
+output. The runtime schedules the same disjoint ranges and invokes the pointer once per range. A raw
+IR gate proves the element call is direct and an optimized-IR gate proves a cheap `i64` body inlines
+and vectorizes. Ordered output, the pool, caller-draining progress, barrier, and panic propagation
+are unchanged.
 
 The output is freshly allocated and the runtime return is already marked `noalias`, but that fact
 does not compensate for hiding the counted loop behind the runtime ABI.
@@ -308,7 +318,7 @@ forward-progress requirement for all multi-worker calls.
 | Item | Status before this audit |
 |---|---|
 | Cheap-`par_map` cost lint, backed by the 0.24-0.81x result | **ALREADY PLANNED** |
-| Whole-chunk specialization / defunctionalisation to remove the per-element thunk | **ALREADY PLANNED** |
+| Whole-range specialization / defunctionalisation to remove the per-element thunk | **SHIPPED 2026-07-25** |
 | Capturing `par_map` parallelization | **ALREADY INDICATED** as “implementation in progress”; this audit pins the context ABI |
 | Pool initialization after the tiny/single-chunk decision; `task_group n == 1` fast path | **ALREADY PLANNED** |
 | Persistent `ParPool` for `task_group` and caller-draining nested `task_group` | **IMPLEMENTED** |
@@ -334,7 +344,7 @@ progress, and measurement requirements concrete instead of claiming the ideas as
 
 ## 7. Generated-IR direction
 
-### 7.1 Whole-range kernel — already planned, now made concrete
+### 7.1 Whole-range kernel — SHIPPED 2026-07-25
 
 Replace the per-element callback ABI:
 
@@ -348,8 +358,8 @@ with one generated kernel call per claimed range:
 void range(ptr context, ptr input, ptr output, i64 start, i64 end)
 ```
 
-The generated `range` function contains the counted loop, typed GEPs, the fused map body, and
-direct calls. Strides and element layouts are compile-time constants. LLVM can then:
+The generated `range` function contains the counted loop, typed GEPs, and a direct call to the known
+map body. Strides and element layouts are compile-time constants. LLVM can then:
 
 - inline the user function or lifted non-escaping lambda into the loop;
 - vectorize/unroll the loop and hoist loop-invariant captures;
@@ -367,10 +377,10 @@ directly known `par_map` body. Vectorization remarks and generated assembly are 
 Runtime bitcode/LTO may help other runtime calls, but it is not required to expose a loop that the
 compiler itself can emit.
 
-The MIR should grow an explicit parallel-kernel node/body rather than preserving the current opaque
-`ParMapParallel` call forever. It needs, at minimum, the fused body, capture operands, source/result
-layout, grain/cost summary, ordering, and ownership/drop information. That restores the intended
-`ParLoop` boundary without pretending the not-yet-implemented parallel reduction is settled.
+The existing dedicated `ParMapParallel` materializer supplies the source, known body, and
+input/output layout needed for this first direct-source kernel. Before staged or capturing cases
+widen into it, MIR must also carry their fused stages/capture operands and the relevant
+ordering/ownership facts; no generic parallel reduction is implied.
 
 ### 7.2 Parallel capture context — prior goal, concrete ABI now pinned
 
@@ -629,10 +639,10 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 
 ### MIR and reduction
 
-Current MIR deliberately uses opaque `ParMapParallel`; `04-mir.md` now distinguishes that
-implemented node from a possible future range IR. No complete source-visible
-associativity/floating-order rule exists, so an eventual explicit kernel body must not silently
-declare generic parallel reduction settled.
+MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
+range loop instead of an element thunk. Captures, prior stages, and a cost summary are not present
+yet, so those cases remain sequential. No complete source-visible associativity/floating-order rule
+exists, and this map-only kernel does not silently declare generic parallel reduction settled.
 
 ---
 
@@ -657,8 +667,7 @@ declare generic parallel reduction settled.
 ### Generated IR and throughput
 
 - Emitted whole-range kernel contains no indirect call inside the element loop for a direct body.
-- Cheap arithmetic positive case vectorizes after specialization; a deliberately opaque body is
-  the negative control.
+- Cheap arithmetic positive case vectorizes after specialization. Both are regression-pinned.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
 - Sweep input/output element bytes, body cost, element count around the threshold, and range count.
@@ -709,13 +718,13 @@ with zero idle pool workers.
 
 ### Slice P1 — range IR and captures
 
-- Introduce the explicit parallel range-kernel MIR shape.
-- Generate one typed loop body per range; erase per-element indirection.
+- [x] Generate one typed loop body per range; erase per-element indirection (2026-07-25).
+- [x] Pin the direct-call IR shape and cheap-body vectorization (2026-07-25).
 - Pass immutable capture context and parallelize current capturing cases.
-- Pin IR/vectorization and ordered/drop behavior.
+- Pin ordered/drop behavior for capturing cases.
 
-**Completion:** direct and capturing scalar maps use the same parallel range path; no indirect call
-is inside a directly known hot loop.
+**Current:** direct scalar/slice/chunk maps use the range path with no indirect call inside the hot
+loop. **Completion:** capturing scalar maps use that same path through an immutable context.
 
 ### Slice P2 — low-lock task execution
 

@@ -268,7 +268,7 @@ operations plus builtin `sum`/`count`/`min`/`max` retain the mask/identity-selec
 Record: `draft.md` §8, `docs/language-spec.md`, `impl/12-pipeline-closure-memory-io-simd-audit.md` §3
 
 ### Lambdas / closures — IMPLEMENTED (map/where/all reducers + capture)
-**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site (a loop-invariant argument the backend hoists), so there is no closure environment / allocation. Capture is wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a capturing `par_map` falls back to the sequential path (the parallel thunk has no capture context). All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
+**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site (a loop-invariant argument the backend hoists), so there is no closure environment / allocation. Capture is wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a capturing `par_map` falls back to the sequential path because the generated parallel range kernel has no capture context yet. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
 Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
 ### First-class closures + `task_group` — SETTLED + IMPLEMENTED (fully-escaping fn values deferred)
@@ -980,11 +980,12 @@ A second Gemini bench (group_by / par_map / json-decode on arm64). Verified agai
   detached workers parked on a `Mutex<VecDeque<Job>>` + `Condvar`; `par_map` submits chunks + a
   fork-join barrier, running one chunk on the caller) + a `PAR_MIN_CHUNK` floor so trivially-small
   maps stay sequential. `bench/par_map/`: 100k went **~7× slower → ≈parity** with sequential.
-  **Remaining (recorded): par_map is now ≈sequential parity but still behind `rayon` (0.4–0.6×) for
-  cheap work** — the ceiling is the **per-element indirect `thunk` call** (no inlining/vectorization,
-  where seq/rayon inline + vectorize). par_map wins on *heavy non-vectorizable* per-element work; the
-  cheap-map fix is **inlining the thunk** (same class as the builder per-write overhead — cross-object
-  LTO or a specialized monomorphic emit). The shared pool can later back parallel `reduce`/`task_group` too.
+  **Whole-range specialization SHIPPED 2026-07-25:** codegen now emits one typed range kernel with
+  a direct body call, and the runtime invokes it once per claimed range. Raw-IR gates exclude an
+  indirect call from the element loop; optimized-IR gates prove that a cheap `i64` body inlines and
+  vectorizes. The shared pool can later back parallel `reduce`/`task_group` too. Retune the
+  conservative range threshold and remeasure the full `rayon` crossover separately rather than
+  preserving the obsolete per-element-thunk diagnosis.
 
 **Part 3 / consolidated (2026-06-27): basics confirmed at PARITY on arm64 — no new bugs.** A third
 Gemini pass added the fundamentals: **arithmetic + branches** (`math_logic` 0.99×), **recursion /
@@ -2793,9 +2794,10 @@ observable I/O inside an accepted Pure `par_map`; and `task_group -> par_map` de
 pool saturation because `par_map` waited after one caller chunk instead of draining its ranges.
 Both P0s are fixed 2026-07-13: closure edges plus unknown-target fail-closed propagation close the
 effect path, while a shared cursor, caller drain loop, total-range barrier, and forced-worker
-watchdog close the progress path. Next implement the already-recorded whole-chunk
-specialization. The guide already calls capturing-`par_map` parallelization “implementation in
-progress”; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
+watchdog close the progress path. The already-recorded whole-range specialization shipped
+2026-07-25: the runtime invokes one generated typed kernel per claimed range, the element body is a
+direct call, and cheap arithmetic vectorizes after inlining. Capturing-`par_map` parallelization is
+the next implementation slice; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read), length-preserving staged
 parallel lowering, task claim/completion + queue batching, packed task records, and body/byte-aware
 grain. Applying the already-recorded blocking-worker direction to generic `task_group` stays a
