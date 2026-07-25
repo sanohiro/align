@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-25. `main` includes the shipped wave through #640.
-Removing obsolete JSON schema summaries from MIR is the current work._
+_Last updated: 2026-07-25. `main` includes the shipped wave through #642.
+Work is intentionally paused after the whole-range `par_map` kernel specialization._
 
 ## Start here
 
@@ -52,6 +52,8 @@ facts must live in this repository.
 #638  Copy-struct array materialization
 #639  Unit-call values + aggregate call-ownership hardening
 #640  cold/cache build-result parity via complete structural MIR identity
+#641  remove redundant JSON schema summaries from MIR
+#642  whole-range par_map kernels with direct vectorizable element loops
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -79,20 +81,29 @@ per-unit MIR program consumed by codegen. Type tables, declarations, linkage,
 alignment, and located metadata now participate automatically, so a warm cache
 hit cannot skip a cold codegen failure caused by an omitted backend input.
 
+#641 then removed the recursive JSON schema strings that had existed only to
+perturb the former incomplete implementation hash. JSON MIR nodes now retain
+their target ids; the structural program hash owns cache identity.
+
+#642 replaced the per-element indirect `par_map` callback with one generated
+typed kernel per claimed range. The element loop and direct Pure body call now
+share an LLVM function, allowing cheap arithmetic bodies to inline and
+vectorize while preserving the existing worker-pool scheduler and ordered
+output.
+
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
 and the macOS release-build CI path. A local `cargo build --release --workspace`
-was rerun after #636.
+was rerun after #636. #637-#642 passed their focused and PR CI gates.
 
 ## Next work
 
-Remove the obsolete recursive JSON schema strings from MIR. #640 made the
-per-unit implementation hash cover the exact structural MIR program consumed by
-codegen, including its type tables, so the copied summaries no longer carry
-cache identity. JSON MIR nodes should retain only their target ids. Then select
-the next task from an owner request, a real consumer, or the current **Open**
-section of `docs/open-questions.md`; do not resurrect a superseded `NEXT` item
-from the archived journal.
+Work paused at the owner's request after #642. Resume with the next recorded
+parallel slice in `docs/impl/11-parallel-execution-optimization.md`: extend the
+range kernel with a read-only capture context so capturing `par_map` no longer
+falls back to the sequential collect loop. Then remeasure the conservative
+range threshold before changing it. The wider `task_group` low-lock work remains
+a later measure-first follow-up.
 
 Consumer-gated deferrals that remain intentional:
 

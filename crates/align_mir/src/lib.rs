@@ -463,9 +463,9 @@ pub enum Rvalue {
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
     Chunks { src: Operand, n: Operand, elem: Ty },
     /// `par_map(f)` over a `{ptr,len}` source `src` with no prior stages — apply the Pure `func`
-    /// to each element in parallel (runtime `align_rt_par_map` + a per-`func` thunk), materializing
-    /// an owned `array<elem_out>` `{ out_buf, count }`. `elem_in` is the source element type (the
-    /// `func` parameter — a scalar, or a `slice<T>` chunk); `elem_out` is `func`'s return.
+    /// to each element in parallel (runtime `align_rt_par_map` + a generated whole-range kernel),
+    /// materializing an owned `array<elem_out>` `{ out_buf, count }`. `elem_in` is the source element
+    /// type (the `func` parameter — a scalar, or a `slice<T>` chunk); `elem_out` is `func`'s return.
     ParMapParallel { src: Operand, func: String, elem_in: Ty, elem_out: Ty },
     /// The `len` of a slice operand.
     SliceLen(Operand),
@@ -3948,7 +3948,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
             // run in parallel via the runtime; otherwise (prior stages, struct-array source, or a
-            // capturing lambda — the parallel thunk takes no capture context) fall back to the
+            // capturing lambda — the parallel range kernel takes no capture context) fall back to the
             // sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),

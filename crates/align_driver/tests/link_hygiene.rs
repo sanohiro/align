@@ -85,7 +85,7 @@ fn global_line<'a>(ir: &'a str, sym: &str) -> &'a str {
 
 /// A representative program touching most emitted symbol classes at once: an `extern "C"` decl, a
 /// non-exported helper, a `Result`-returning `main` (→ `align_main` + a generated C `main`), lifted
-/// pipeline/`par_map`/closure lambdas, a string constant, and thus a `$parthunk` + a `$clos` thunk.
+/// pipeline/`par_map`/closure lambdas, a string constant, and thus a `$parkernel` + a `$clos` thunk.
 const REPRESENTATIVE: &str = concat!(
     "extern \"C\" fn cabs(x: i32) -> i32\n",
     "\n",
@@ -122,7 +122,7 @@ fn representative_program_linkage_map() {
     assert_internal(&ir, "main$lambda2");
 
     // Compiler-generated helper thunks, reached only via a function pointer → private.
-    assert_private(&ir, "main$lambda1$parthunk");
+    assert_private(&ir, "main$lambda1$parkernel");
     assert_private(&ir, "main$lambda2$clos");
 
     // The `extern "C"` symbol is an undefined declaration resolved by the linker → external, and it

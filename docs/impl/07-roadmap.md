@@ -1004,10 +1004,12 @@ already lives in `docs/open-questions.md`.
   Lowers via the existing collect loop (sequential). (`examples/chunk_parallel.align`.)
 - [done] **thread-parallel execution of `par_map`** — the perf widening of the sequential
   skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
-  `Rvalue::ParMapParallel`: codegen emits a per-function `void(in, out)` thunk (load element → call
-  `f` → store result) and the runtime `align_rt_par_map` splits `[0, count)` into disjoint output
-  ranges on a process-lifetime `ParPool`; helpers and the caller drain one shared range cursor and
-  join a total-range completion barrier. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
+  `Rvalue::ParMapParallel`: codegen emits a per-function
+  `void(in_base, out_base, start, end)` kernel whose typed counted loop directly calls `f`, and the
+  runtime `align_rt_par_map` schedules disjoint output ranges on a process-lifetime `ParPool`;
+  helpers and the caller drain one shared range cursor and join a total-range completion barrier.
+  The original per-element indirect thunk was removed 2026-07-25; a cheap arithmetic kernel now
+  vectorizes after inlining. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
   2026-07-12 audit found a P0 lifted-capturing-closure effect edge; **fixed 2026-07-13**, together
   with a fail-closed higher-order unknown-target gate; #465 later moved concrete callable effects
   into `FnTy` and removed address-taking call edges. The saturated `task_group -> par_map`
@@ -1040,9 +1042,11 @@ capturing closure could be laundered through a function value into `par_map`, an
 `task_group -> par_map` re-entry deadlocked because only `task_group` drained work on its caller.
 Both are fixed and regression-pinned as of 2026-07-13: effects fail closed at the Pure boundary,
 and `par_map` helpers plus callers drain one shared range cursor under a child-process watchdog. The record makes the existing
-whole-chunk specialization plan concrete, and gates new capture-context, integer
-transform-reduce, staged-pipeline, low-lock latch/batching, work-aware grain, and split execution
-domain candidates. It proposes no new source syntax.
+whole-range specialization plan concrete; the direct whole-range kernel shipped 2026-07-25,
+removing the per-element indirect callback and restoring vectorization for cheap arithmetic bodies.
+The record gates the remaining capture-context, integer transform-reduce, staged-pipeline, low-lock
+latch/batching, work-aware grain, and split execution-domain candidates. It proposes no new source
+syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**
 `12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive
@@ -2013,7 +2017,7 @@ regression net that validates the upgrade.
   (`align_driver/tests/link_hygiene.rs`, 6 tests, mutation-checked) pins the linkage map — the C
   entry `main` (incl. the Result-main wrapper) is the SOLE external definition; `align_main` +
   all program fns + lifted lambdas = internal; the four thunk classes (`$fnval`/`$clos`/
-  `tramp$R`/`$parthunk`) = private; runtime/`extern "C"` declares stay external (undefined);
+  `tramp$R`/`$parkernel`) = private; runtime/`extern "C"` declares stay external (undefined);
   `@str`/`@jfields`/`@jphf` = private unnamed_addr constant (safe — string `==` is content
   compare via `align_rt_str_eq`, never address identity). Size smoke: `pipe.o` −33%, no
   regressions; O0 machine code unchanged (linkage is metadata). Key fact recorded at the
@@ -2142,8 +2146,10 @@ regression net that validates the upgrade.
   whole-program reality**: since Slice 1 every fn is internal, LLVM inlines hard at O2, and for
   the survivors (recursion, par thunks) **LLVM's FunctionAttrs already infers**
   `memory(none)`/`nocapture readonly`/`nonnull` etc. with zero codegen help (IR-verified:
-  `fib` got `nofree nosync nounwind memory(none)` + fastcc; the `$parthunk` params got
-  `nocapture readonly/writeonly` — all inferred). Aggregates are already passed as first-class
+  `fib` got `nofree nosync nounwind memory(none)` + fastcc; the former `$parthunk` params got
+  `nocapture readonly/writeonly` — all inferred). The whole-range `$parkernel` that replaced it on
+  2026-07-25 pins the modern `readonly`/`writeonly` + `captures(none)` contracts explicitly.
+  Aggregates are already passed as first-class
   by-value LLVM values that SROA/mem2reg scalarize immediately — hand-flattening measured a
   no-op. The k7 finding (fn-level `noalias` not the map_into unlock) generalizes. **What ships
   as Slice 5:**

@@ -253,16 +253,18 @@ parallel-map API.
 
 ```text
 ParMapParallel { src, func, elem_in, elem_out }
-  → synthesize one element thunk
-  → align_rt_par_map(in_buf, count, in_stride, out_stride, thunk)
+  → synthesize one typed range kernel (start..<end)
+  → align_rt_par_map(in_buf, count, in_stride, out_stride, kernel)
   → owned array<elem_out>
 
 task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
 ```
 
-The thunk loads one input element, calls the named Pure Align function, and stores one output
-element. Capturing or staged `par_map` forms use the sequential pipeline fallback before codegen.
-There is no generic parallel-reduce lowering in the current surface. The ABI is in `06`.
+The range kernel loops over typed input/output GEPs, calls the named Pure Align function directly,
+and stores each output. LLVM can inline and vectorize that loop; the runtime invokes the function
+pointer once per coarse range, not once per element. Capturing or staged `par_map` forms use the
+sequential pipeline fallback before codegen. There is no generic parallel-reduce lowering in the
+current surface. The ABI is in `06`.
 
 ---
 

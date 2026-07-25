@@ -12,8 +12,14 @@
 //! large workload before the deliberate "sanity: a big workload still initializes the pool" check
 //! at the end.
 
-extern "C" fn double(input: *const u8, output: *mut u8) {
-    unsafe { *(output as *mut i64) = *(input as *const i64) * 2 };
+extern "C" fn double(input: *const u8, output: *mut u8, start: i64, end: i64) {
+    let start = usize::try_from(start).unwrap();
+    let end = usize::try_from(end).unwrap();
+    for i in start..end {
+        unsafe {
+            *output.cast::<i64>().add(i) = *input.cast::<i64>().add(i) * 2;
+        }
+    }
 }
 
 extern "C" fn double_tramp(_thunk: *const u8, env: *mut u8, slot: *mut u8, _err: *mut u8) -> i32 {

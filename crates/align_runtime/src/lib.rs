@@ -1764,9 +1764,7 @@ struct ParMapWork {
     count: usize,
     in_addr: usize,
     out_addr: usize,
-    in_stride: usize,
-    out_stride: usize,
-    thunk: extern "C" fn(*const u8, *mut u8),
+    kernel: extern "C" fn(*const u8, *mut u8, i64, i64),
     barrier: std::sync::Mutex<ParMapBarrier>,
     complete: std::sync::Condvar,
 }
@@ -1785,11 +1783,9 @@ fn drain_par_map(work: &ParMapWork) {
         let start = range * work.per;
         let end = (start + work.per).min(work.count);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for i in start..end {
-                let ip = work.in_addr.checked_add(i.checked_mul(work.in_stride).unwrap()).unwrap() as *const u8;
-                let op = work.out_addr.checked_add(i.checked_mul(work.out_stride).unwrap()).unwrap() as *mut u8;
-                (work.thunk)(ip, op);
-            }
+            let start = i64::try_from(start).expect("par_map range start came from an i64 count");
+            let end = i64::try_from(end).expect("par_map range end came from an i64 count");
+            (work.kernel)(work.in_addr as *const u8, work.out_addr as *mut u8, start, end);
         }));
 
         let mut state = work.barrier.lock().unwrap();
@@ -1804,25 +1800,25 @@ fn drain_par_map(work: &ParMapWork) {
     }
 }
 
-/// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and apply
-/// `thunk` to each of `count` input elements — reading element `i` from `in_buf + i*in_stride`,
-/// writing its result to `out + i*out_stride` — splitting the work into contiguous, **disjoint**
-/// output ranges across the available threads. No synchronization is needed: the language
-/// guarantees `thunk` (a Pure function) shares no mutable state and the ranges never overlap
+/// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and invoke
+/// `kernel(in_buf, out, start, end)` once per contiguous, **disjoint** output range across the
+/// available threads. The generated kernel owns the typed element loop and directly calls the
+/// user's Pure function. No synchronization is needed: the language guarantees the kernel shares
+/// no mutable state and the ranges never overlap
 /// (`draft.md` §11). Returns the owned output buffer (freed by the generated `Drop`). `count <= 0`
 /// → null. The buffer size uses `checked_mul` (a huge `count` would otherwise under-allocate and
 /// then heap-overflow the write loop).
 ///
 /// # Safety
-/// `in_buf` must point to `count` elements of `in_stride` bytes for the call; `thunk` reads one
-/// input element and writes one output element.
+/// `in_buf` must point to `count` elements of `in_stride` bytes for the call; `kernel` must read and
+/// write only indices in the supplied half-open range.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map(
     in_buf: *const u8,
     count: i64,
     in_stride: i64,
     out_stride: i64,
-    thunk: extern "C" fn(*const u8, *mut u8),
+    kernel: extern "C" fn(*const u8, *mut u8, i64, i64),
 ) -> *mut u8 {
     if count <= 0 {
         return core::ptr::null_mut();
@@ -1832,6 +1828,7 @@ pub unsafe extern "C" fn align_rt_par_map(
     let Ok(out_stride) = safe_len(out_stride) else { return core::ptr::null_mut() };
     let bytes = count
         .checked_mul(out_stride)
+        .filter(|&b| isize::try_from(b).is_ok())
         .and_then(|b| i64::try_from(b).ok())
         .unwrap_or_else(|| panic_abort("par_map output size overflow"));
     
@@ -1843,16 +1840,13 @@ pub unsafe extern "C" fn align_rt_par_map(
 
     let out_buf = align_rt_alloc(bytes);
     // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
-    // tiny maps (where the pool round-trip would dwarf the work) fall to the single-chunk caller
-    // path. Keep chunks coarse because each element still crosses the indirect thunk boundary.
+    // tiny maps (where the pool round-trip would dwarf the work) fall to the single-range caller
+    // path. Keep the existing conservative threshold; retuning it is a separate measurement gate.
     const PAR_MIN_CHUNK: usize = 32768;
     // Run every element on the calling thread, no pool involved.
     let run_all_on_caller = || {
-        for i in 0..count {
-            let ip = (in_buf as usize).checked_add(i.checked_mul(in_stride).unwrap()).unwrap() as *const u8;
-            let op = (out_buf as usize).checked_add(i.checked_mul(out_stride).unwrap()).unwrap() as *mut u8;
-            thunk(ip, op);
-        }
+        let end = i64::try_from(count).expect("par_map count was validated from i64");
+        kernel(in_buf, out_buf, 0, end);
     };
     // Threshold check hoisted above `par_pool()`: `count <= PAR_MIN_CHUNK` guarantees a single
     // chunk regardless of the worker count (below, `per` would end up `>= PAR_MIN_CHUNK >= count`),
@@ -1884,9 +1878,7 @@ pub unsafe extern "C" fn align_rt_par_map(
         count,
         in_addr: in_buf as usize,
         out_addr: out_buf as usize,
-        in_stride,
-        out_stride,
-        thunk,
+        kernel,
         barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
         complete: std::sync::Condvar::new(),
     });
@@ -23013,8 +23005,14 @@ mod tests {
         unsafe { align_rt_tg_end(tg) };
     }
 
-    extern "C" fn par_map_double(input: *const u8, output: *mut u8) {
-        unsafe { *(output as *mut i64) = *(input as *const i64) * 2 };
+    extern "C" fn par_map_double(input: *const u8, output: *mut u8, start: i64, end: i64) {
+        let start = usize::try_from(start).unwrap();
+        let end = usize::try_from(end).unwrap();
+        for i in start..end {
+            unsafe {
+                *output.cast::<i64>().add(i) = *input.cast::<i64>().add(i) * 2;
+            }
+        }
     }
 
     #[test]
