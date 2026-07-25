@@ -167,7 +167,8 @@ Silicon after #643. It alternates paired pooled/caller-only/sequential timings, 
 around the boundary. At the old 32768 boundary, entering the pool at 32769 was still a loss against
 the fused sequential control; moving the caller-only floor to 65536 keeps that medium-size region
 on the caller. The balanced range plan avoids a one-element helper at the first pool-eligible size,
-and the heavy-body crossover against sequential is near 82–98K on this host. The value is deliberately
+and the heavy-body crossover against the caller-only materializing kernel is near 82–98K on this
+host; the fused sequential comparison is a separate, later crossover. The value is deliberately
 body-agnostic and host-sensitive; rerun the probe before any future retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task

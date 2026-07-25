@@ -67,9 +67,10 @@ The previous 32768 boundary entered the pool immediately at 32769 even though bo
 still slower than sequential in this probe. Raising it to 65536 keeps that medium-size region on
 the caller. The balanced range plan avoids a one-element helper at 65537; the pool is only about
 1.09x the same caller-only materializing kernel for the cheap body, while the fused sequential
-control remains faster. The heavy-body crossover against sequential is near 82–98K on this host.
-This is a conservative, body-agnostic fallback, not a universal optimum; rerun the probe on a
-target host before changing it again.
+control remains faster. The heavy-body crossover against the caller-only materializing kernel is
+near 82–98K on this host; the fused sequential comparison is a separate, later crossover. This is
+a conservative, body-agnostic fallback, not a universal optimum; rerun the probe on a target host
+before changing it again.
 
 The benchmark's old spawn and per-element-thunk results remain historical evidence in
 `docs/open-questions.md`; they are not descriptions of the current generated kernel.
