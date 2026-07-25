@@ -3071,10 +3071,11 @@ until S2b flips them): `build_per_unit` walks the DAG bottom-up producing one `P
 links the N objects. Visibility model wired end-to-end: a non-entry `pub` user fn gets `external`
 linkage (`hir::Fn.exportable` → `mir::Function.exportable`, set only by `lower_program_per_unit`;
 whole-program `lower_program` forces every fn internal for byte-identity), the entry unit's fns stay
-internal (nothing imports the entry — this is also what makes N=1 byte-identical), and imported `pub`
-callees become external Align-ABI declares (`hir::Program.imported_fns` → `mir::Program.imported_fns`
-→ codegen `declare_imported_fn`, mirroring `declare_fn`'s signature/ABI so the linker binds the call;
-generics stay consumer-side monomorphs, never cross-unit declares). Capability sets union
+internal (nothing imports the entry — this is also what makes N=1 byte-identical), and every
+non-generic `pub` declaration from an interface-only dependency becomes an external Align-ABI
+declare (`hir::Program.imported_fns` → `mir::Program.imported_fns` → codegen
+`declare_imported_fn`, mirroring `declare_fn`'s signature/ABI so the linker binds any call; generics
+stay consumer-side monomorphs, never cross-unit declares). Capability sets union
 deterministically across units at final link. Per-unit `--rt-lto` merges the baked bitcode into each
 unit's raw module (the guarded-skip/shed logic is already per-module). `impl_hash` upgraded off the
 S1a source-byte stand-in to the unit's own MIR functions, stable-printed + location-free

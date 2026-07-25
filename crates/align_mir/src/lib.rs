@@ -1360,9 +1360,10 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// M15 S2b per-unit lowering **with source locations** — the located ([`lower_program_located`])
 /// and per-unit ([`lower_program_per_unit`]) variants combined: each MIR statement records the
 /// (line, col) it came from (populating `Block::stmt_lines`) *and* the separate-compilation
-/// visibility bits are honored (non-entry `pub` fns external, imported callees as declares). Used by
-/// `alignc explain-opt`, which now compiles each unit in isolation and needs both the debug locations
-/// (for remark attribution) and the per-unit boundary (so a cross-unit call stays an opaque call).
+/// visibility bits are honored (non-entry `pub` fns external, public declarations from
+/// interface-only dependencies carried as external declares). Used by `alignc explain-opt`, which
+/// now compiles each unit in isolation and needs both the debug locations (for remark attribution)
+/// and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
     lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))), true)
 }
