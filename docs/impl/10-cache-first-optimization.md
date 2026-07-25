@@ -568,6 +568,10 @@ The parallel-runtime shape, newly confirmed nested-pool deadlock, and wider gene
 recorded in [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md). This
 subsection remains the cache-locality gate; document 11 is the parallel correctness source.
 
+Queue publication batching shipped on 2026-07-26: `par_map` and `task_group` now enqueue helper
+jobs through one `ParPool` queue critical section. The per-task claim and completion work below
+remains the separate measure-first probe.
+
 `align_rt_tg_wait` performs one shared atomic `fetch_add` per task and, after every task, locks one
 shared `TgBarrier`, updates it, and calls `notify_all`
 ([implementation](../../crates/align_runtime/src/lib.rs#L7318-L7395)). For many tiny tasks, the

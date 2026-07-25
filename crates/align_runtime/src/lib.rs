@@ -1693,9 +1693,26 @@ struct ParPool {
 }
 
 impl ParPool {
-    fn submit(&'static self, job: ParJob) {
-        self.queue.lock().unwrap().push_back(job);
-        self.available.notify_one();
+    /// Publish a group of jobs under one queue lock, then wake one parked worker per job.
+    ///
+    /// The queue remains the deliberately simple FIFO used by both `par_map` and `task_group`.
+    /// Batching only removes repeated producer-side lock/unlock pairs; it does not change job
+    /// ordering, caller participation, or the worker loop's claim semantics.
+    fn submit_many<I>(&'static self, jobs: I)
+    where
+        I: IntoIterator<Item = ParJob>,
+    {
+        let mut count = 0usize;
+        {
+            let mut queue = self.queue.lock().unwrap();
+            for job in jobs {
+                queue.push_back(job);
+                count += 1;
+            }
+        }
+        for _ in 0..count {
+            self.available.notify_one();
+        }
     }
 }
 
@@ -1932,10 +1949,10 @@ fn run_par_map_ranges(
         barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
         complete: std::sync::Condvar::new(),
     });
-    for _ in 0..nchunks - 1 {
+    pool.submit_many((0..nchunks - 1).map(|_| {
         let work = work.clone();
-        pool.submit(Box::new(move || drain_par_map(&work)));
-    }
+        Box::new(move || drain_par_map(&work)) as ParJob
+    }));
     drain_par_map(&work);
 
     let mut state = work.barrier.lock().unwrap();
@@ -11966,9 +11983,7 @@ pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
         // is itself a runner), then run the claim loop on the caller. See the deadlock analysis
         // above: even if every submitted helper is starved by busy workers, the caller drains the
         // group.
-        for _ in 0..workers.min(n - 1) {
-            pool.submit(Box::new(run_all.clone()));
-        }
+        pool.submit_many((0..workers.min(n - 1)).map(|_| Box::new(run_all.clone()) as ParJob));
     }
     run_all();
 
@@ -23055,6 +23070,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn par_pool_submit_many_executes_all_jobs() {
+        let (pool, _) = par_pool();
+        let total = 32usize;
+        let state = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        pool.submit_many((0..total).map(|_| {
+            let state = state.clone();
+            Box::new(move || {
+                let (lock, ready) = &*state;
+                let mut done = lock.lock().unwrap();
+                *done += 1;
+                ready.notify_one();
+            }) as ParJob
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (lock, ready) = &*state;
+        let mut done = lock.lock().unwrap();
+        while *done < total {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "submit_many did not run all queued jobs");
+            let (next, _) = ready.wait_timeout(done, deadline - now).unwrap();
+            done = next;
+        }
+    }
+
+    #[test]
+    fn par_pool_submit_many_preserves_fifo_and_empty_input() {
+        let pool: &'static ParPool = Box::leak(Box::new(ParPool {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            available: std::sync::Condvar::new(),
+        }));
+        pool.submit_many(std::iter::empty());
+        assert!(pool.queue.lock().unwrap().is_empty());
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        pool.submit_many((0..4).map(|id| {
+            let observed = observed.clone();
+            Box::new(move || observed.lock().unwrap().push(id)) as ParJob
+        }));
+
+        let mut queue = pool.queue.lock().unwrap();
+        while let Some(job) = queue.pop_front() {
+            job();
+        }
+        assert_eq!(*observed.lock().unwrap(), vec![0, 1, 2, 3]);
     }
 
     // --- `task_group` `tg_wait` (pool-backed, caller-participating work-claiming) ---

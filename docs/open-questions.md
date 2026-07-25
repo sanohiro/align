@@ -2806,10 +2806,11 @@ watchdog close the progress path. The already-recorded whole-range specializatio
 direct call, and cheap arithmetic vectorizes after inlining. Direct-source Copy-capturing `par_map`
 also uses the range kernel through a synchronous immutable context; staged and unsupported aggregate
 forms remain sequential. The current change implements direct wrapping-integer
-`par_map(...).sum()` fusion (remove the full intermediate write/read); length-preserving staged
-parallel lowering, task claim/completion + queue batching, packed task records, and body/byte-aware
-grain remain. Applying the already-recorded blocking-worker direction to generic `task_group` stays
-a later mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
+`par_map(...).sum()` fusion (remove the full intermediate write/read) in #647. The current change
+batches helper-job publication through one pool critical section. Length-preserving staged parallel
+lowering, low-lock task claim/completion, packed task records, and body/byte-aware grain remain.
+Applying the already-recorded blocking-worker direction to generic `task_group` stays a later
+mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of
 those unsettled descriptions authorizes implicit parallelization of ordinary `reduce`.
 
