@@ -122,9 +122,14 @@ Use the checks appropriate to the change:
 
 ```text
 cargo build --workspace
-cargo test --workspace
+scripts/test-pr.sh
 cargo clippy --workspace --all-targets
 ```
+
+Run the narrow regression target that owns the changed behavior. The full,
+expensive corpus is explicit via `scripts/test-full.sh`; it is not the ordinary
+PR gate. See `docs/impl/16-test-policy.md` for the test categories and growth
+rules.
 
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.

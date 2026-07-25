@@ -6,6 +6,16 @@
 use align_driver::{check, lower_to_mir};
 use align_span::SourceMap;
 
+struct TempArtifacts([std::path::PathBuf; 2]);
+
+impl Drop for TempArtifacts {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 const M0: &str = "fn main() -> i32 {\n  x := 1\n  return x\n}\n";
 
 #[test]
@@ -40,10 +50,21 @@ fn m0_compiles_and_runs_with_exit_code() {
     let mir = lower_to_mir(&checked.hir);
 
     let dir = std::env::temp_dir();
-    let obj = dir.join("align-test-m0.o");
-    let exe = dir.join("align-test-m0");
-    align_driver::emit_object_file(&mir, &obj, align_driver::BuildTarget::Baseline, align_driver::Profile::Release, &[], false).expect("codegen");
-    align_driver::link_executable(&obj, &exe, &mir.link_libs, align_driver::Profile::Release).expect("link");
+    let stem = dir.join(format!("align-test-m0-{}", std::process::id()));
+    let obj = stem.with_extension("o");
+    let exe = stem;
+    let _artifacts = TempArtifacts([obj.clone(), exe.clone()]);
+    align_driver::emit_object_file(
+        &mir,
+        &obj,
+        align_driver::BuildTarget::Baseline,
+        align_driver::Profile::Release,
+        &[],
+        false,
+    )
+    .expect("codegen");
+    align_driver::link_executable(&obj, &exe, &mir.link_libs, align_driver::Profile::Release)
+        .expect("link");
 
     let status = std::process::Command::new(&exe).status().expect("run");
     assert_eq!(status.code(), Some(1), "main returns x:=1, so exit code 1");
