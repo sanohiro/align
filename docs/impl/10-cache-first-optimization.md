@@ -12,8 +12,9 @@ items below remain proposals, not descriptions of a missing CAS. Audit baseline:
 > slot alignment, and source locations when present. The old function-text hash omitted backend
 > inputs; changing an unreachable function's struct shape could therefore retain an old key and let
 > a cache hit skip a cold codegen failure. A changed backend input now always misses, so cache state
-> cannot change build success. `ALIGNC_CACHE=off` remains useful to request a deliberately cold run,
-> but is no longer a correctness-audit workaround.
+> cannot change build success. JSON decode, encode, and scan MIR nodes consequently carry target ids
+> only; the former copied schema summaries are gone. `ALIGNC_CACHE=off` remains useful to request a
+> deliberately cold run, but is no longer a correctness-audit workaround.
 
 The status labels in this document are deliberate:
 

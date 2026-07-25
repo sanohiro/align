@@ -545,11 +545,7 @@ pub enum Rvalue {
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
-    ///
-    /// `schema` is a legacy human-readable summary of the recursive decode schema. Codegen consumes
-    /// `Program::structs` directly, and the object cache fingerprints that complete structural
-    /// program; cache correctness does not depend on this redundant string. See [`json_schema_sig`].
-    JsonDecode { struct_id: u32, schema: String, input: Operand, out: Slot },
+    JsonDecode { struct_id: u32, input: Operand, out: Slot },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
@@ -561,27 +557,24 @@ pub enum Rvalue {
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): parse a JSON array of objects
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
-    /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser. `schema` is the
-    /// redundant human-readable summary described on [`JsonDecode`].
-    JsonDecodeStructArray { struct_id: u32, schema: String, input: Operand, out: Slot },
+    /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
+    JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot },
     /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
     /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
     /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
     /// status (0 = ok). `arena` is the enclosing arena handle the runtime bump-allocates the column
-    /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`. `schema`
-    /// is the redundant human-readable summary described on [`JsonDecode`].
-    JsonDecodeSoa { struct_id: u32, schema: String, input: Operand, out: Slot, arena: Operand },
+    /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`.
+    JsonDecodeSoa { struct_id: u32, input: Operand, out: Slot, arena: Operand },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value, select the variant by its shape class (Str/Number/Bool/Object; O(1) first-byte
     /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
     /// (0 = ok). codegen builds the [`JsonUnion`] descriptor (per-variant payload arms + the shape
-    /// class → arm table). `schema` is a redundant human-readable union summary (variant names +
-    /// payload types, struct payloads expanded — see [`json_union_schema_sig`]).
-    JsonDecodeUnion { enum_id: u32, schema: String, input: Operand, out: Slot },
+    /// class → arm table).
+    JsonDecodeUnion { enum_id: u32, input: Operand, out: Slot },
     /// `json.doc(input)` (J4): parse the `str` `input` into an arena-backed tape, writing the root
     /// `{tape,node}` handle into the `out` slot. Yields an `i32` status (0 = ok). `arena` is the
-    /// enclosing arena handle the runtime bump-allocates the tape from. Schema-unknown, so it carries
-    /// no human-readable schema summary (the tape is generic).
+    /// enclosing arena handle the runtime bump-allocates the tape from. The tape is schema-unknown
+    /// and generic.
     JsonDoc { input: Operand, arena: Operand, out: Slot },
     /// `d.kind()` on a `json.doc`: the runtime returns the `json.kind` tag directly as an `i32`
     /// (codegen wraps it into the tag-only enum aggregate). Total.
@@ -619,9 +612,8 @@ pub enum Rvalue {
     /// `*cursor` in the scanner's input into the `row` slot, advancing `*cursor` past it. Returns an
     /// `i32` status: `0` = a row was decoded, `1` = the stream is exhausted (top-level `]` / EOF),
     /// `2` = a malformed row (the terminal yields `Err`). Reuses the decode descriptor of
-    /// `struct_id`; cache identity comes from the complete structural Program, while `schema` is
-    /// only the legacy human-readable summary used by typed decodes.
-    JsonScanNext { scanner: Operand, struct_id: u32, schema: String, cursor: Slot, row: Slot },
+    /// `struct_id`.
+    JsonScanNext { scanner: Operand, struct_id: u32, cursor: Slot, row: Slot },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -1130,10 +1122,9 @@ pub enum TemplatePiece {
     OptionField { opt: Operand, name: String },
     /// `json.encode` of an `Option<struct>` field (JSON completeness T1b): when `opt` is `Some`, append
     /// `"name":{…},` (the payload struct rendered by the runtime descriptor-driven encoder); when
-    /// `None`, append nothing. `struct_id` is the payload struct (codegen emits its descriptor table);
-    /// `schema` is a redundant human-readable field summary; the complete structural Program carries
-    /// the cache identity. Paired with [`PopComma`].
-    OptionStructField { opt: Operand, name: String, struct_id: u32, schema: String },
+    /// `None`, append nothing. `struct_id` is the payload struct (codegen emits its descriptor table).
+    /// Paired with [`PopComma`].
+    OptionStructField { opt: Operand, name: String, struct_id: u32 },
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
     PopComma,
@@ -1148,9 +1139,8 @@ pub enum TemplatePiece {
     ScalarArrayField { array: Operand, elem: align_sema::Scalar },
     /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
     /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
-    /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits;
-    /// `schema` is a redundant human-readable union summary (see [`json_union_schema_sig`]).
-    UnionValue { value: Operand, enum_id: u32, schema: String },
+    /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits.
+    UnionValue { value: Operand, enum_id: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -2919,8 +2909,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                     hir::TemplatePart::OptionStructField { access, name, struct_id } => {
                         let op = lower_expr(b, access);
-                        let schema = json_schema_sig(&b.structs, &b.enums, *struct_id);
-                        pieces.push(TemplatePiece::OptionStructField { opt: op, name: name.clone(), struct_id: *struct_id, schema });
+                        pieces.push(TemplatePiece::OptionStructField { opt: op, name: name.clone(), struct_id: *struct_id });
                     }
                     hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
                     hir::TemplatePart::StructArrayField { access, struct_id } => {
@@ -2933,8 +2922,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                     hir::TemplatePart::UnionValue { access, enum_id } => {
                         let op = lower_expr(b, access);
-                        let schema = json_union_schema_sig(&b.enums, &b.structs, *enum_id);
-                        pieces.push(TemplatePiece::UnionValue { value: op, enum_id: *enum_id, schema });
+                        pieces.push(TemplatePiece::UnionValue { value: op, enum_id: *enum_id });
                     }
                 }
                 if b.is_terminated() {
@@ -6221,10 +6209,6 @@ fn lower_json_scan_reduce(
         Ty::Result(sc, _) => align_sema::scalar_to_ty(sc),
         _ => unreachable!("a json.scan terminal is Result-typed"),
     };
-    // Retain the legacy human-readable row-schema summary. Cache identity independently includes
-    // the complete structural Program and its type tables.
-    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
-
     let scanner = lower_expr(b, source);
     let cursor = b.new_slot(i64_ty());
     b.push(Stmt::Store(cursor, Operand::Const(Const::Int(0, i64_ty()))));
@@ -6261,7 +6245,7 @@ fn lower_json_scan_reduce(
     // header: status = next(scanner, cursor -> row); 0 → body, 1 → ok_exit, 2 → err_exit.
     b.cur = header;
     let status = b.fresh_value(status_ty());
-    b.push(Stmt::Let(status, Rvalue::JsonScanNext { scanner: scanner.clone(), struct_id, schema: schema.clone(), cursor, row }));
+    b.push(Stmt::Let(status, Rvalue::JsonScanNext { scanner: scanner.clone(), struct_id, cursor, row }));
     let is_row = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_row, Rvalue::Bin(BinOp::Eq, Operand::Value(status), Operand::Const(Const::Int(0, status_ty())))));
     let after_row = b.new_block();
@@ -6885,14 +6869,13 @@ fn transpose_to_soa(
 /// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
 fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let soa_ty = Ty::Soa(struct_id);
-    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(soa_ty);
     let inp = lower_expr(b, input);
     // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
     // so the runtime needs the innermost arena handle.
     let arena = *b.arenas.last().expect("json.decode → soa outside an arena (sema-checked)");
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, schema, input: inp, out, arena: Operand::Value(arena) }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, input: inp, out, arena: Operand::Value(arena) }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -8244,110 +8227,15 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
 /// branch into `Ok(<struct>)` on status 0 or `Err(<code>)` otherwise, yielding the Result.
-/// A legacy human-readable summary of the recursive `json.decode` schema for struct `struct_id`:
-/// each field's name and type, nested structs expanded in place, plus every level's
-/// `layout(C)`/`align`. The complete structural Program now provides cache identity, so this string
-/// is redundant and must not be treated as a correctness boundary. The struct graph is acyclic
-/// (`struct_acyclic`); a `visiting` guard is defense in depth against a mis-built graph.
-fn json_schema_sig(structs: &[hir::StructDef], enums: &[hir::EnumDef], struct_id: u32) -> String {
-    let mut s = String::new();
-    json_schema_sig_into(structs, enums, struct_id, &mut Vec::new(), &mut s);
-    s
-}
-
-fn json_schema_sig_into(structs: &[hir::StructDef], enums: &[hir::EnumDef], struct_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
-    if visiting.contains(&struct_id) {
-        out.push_str("<cycle>");
-        return;
-    }
-    visiting.push(struct_id);
-    let sd = &structs[struct_id as usize];
-    out.push('{');
-    if sd.c_repr {
-        out.push('C');
-    }
-    if let Some(a) = sd.align {
-        out.push_str(&format!("a{a}"));
-    }
-    for (i, f) in sd.fields.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&f.name);
-        out.push(':');
-        match f.ty {
-            Ty::Struct(nid) => json_schema_sig_into(structs, enums, nid, visiting, out),
-            // Expand union payloads for the legacy human-readable summary. Pass the shared
-            // `visiting` so a struct→union→struct cycle terminates (sema rejects it anyway).
-            Ty::Enum(eid) => json_union_schema_sig_into(enums, structs, eid, visiting, out),
-            // Expand Option payloads for the legacy human-readable summary; `ty_name` alone folds
-            // them to a bare "Option".
-            Ty::Option(align_sema::Scalar::Struct(pid)) => {
-                out.push_str("Option<");
-                json_schema_sig_into(structs, enums, pid, visiting, out);
-                out.push('>');
-            }
-            Ty::Option(s) => out.push_str(&format!("Option<{}>", ty_name(align_sema::scalar_to_ty(s)))),
-            other => out.push_str(&ty_name(other)),
-        }
-    }
-    out.push('}');
-    visiting.pop();
-}
-
-/// A legacy human-readable summary of a shape-directed union's decode/encode schema (J1b):
-/// `U{variant:payload,…}` in **variant (tag) order**, with a struct (object) payload expanded via
-/// [`json_schema_sig_into`]. The complete structural Program now provides cache identity, so this
-/// string is redundant and must not be extended as a cache-correctness mechanism.
-fn json_union_schema_sig(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32) -> String {
-    let mut s = String::new();
-    json_union_schema_sig_into(enums, structs, enum_id, &mut Vec::new(), &mut s);
-    s
-}
-
-/// The cycle-safe worker: `visiting` is the shared struct-id DFS path, threaded through object-payload
-/// expansion so a union whose object payload (transitively) contains the same struct terminates
-/// (`<cycle>`) instead of recursing forever. Such a type is rejected by sema's enum-aware
-/// `struct_acyclic`, so this is defense-in-depth, matching [`json_schema_sig_into`].
-fn json_union_schema_sig_into(enums: &[hir::EnumDef], structs: &[hir::StructDef], enum_id: u32, visiting: &mut Vec<u32>, out: &mut String) {
-    out.push_str("U{");
-    if let Some(ed) = enums.get(enum_id as usize) {
-        for (i, v) in ed.variants.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&v.name);
-            out.push(':');
-            // A union variant carries exactly one payload (sema-checked); expand a struct payload
-            // through the shared `visiting` set so a cycle terminates.
-            match v.payload.first() {
-                Some(align_sema::Scalar::Struct(nid)) => json_schema_sig_into(structs, enums, *nid, visiting, out),
-                // An owned `array<Struct>` payload (J2b): expand the ELEMENT struct's schema (prefixed
-                // `[]`) so a change to the element's fields invalidates the union's decode/encode cache
-                // (#514/#517 class) — `ty_name` alone prints only the struct id, missing a field
-                // rename / type change that the descriptor (hence the decoded bytes) depends on.
-                Some(align_sema::Scalar::DynStructArray(nid)) => {
-                    out.push_str("[]");
-                    json_schema_sig_into(structs, enums, *nid, visiting, out);
-                }
-                Some(sc) => out.push_str(&ty_name(align_sema::scalar_to_ty(*sc))),
-                None => out.push_str("()"),
-            }
-        }
-    }
-    out.push('}');
-}
-
 /// `json.decode(input)` into a shape-directed union (`enum`) target → decode one value into an out
 /// enum slot via the runtime (status `i32`), then branch into `Ok(<enum>)` / `Err(<code>)`. Mirrors
 /// [`lower_json_decode`]; the decoded enum's `str` payloads are zero-copy views into the input.
 fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let ety = Ty::Enum(enum_id);
-    let schema = json_union_schema_sig(&b.enums, &b.structs, enum_id);
     let out = b.new_slot(ety);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, schema, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -8382,11 +8270,10 @@ fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, res
 
 fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let sty = Ty::Struct(struct_id);
-    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(sty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, schema, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -10312,11 +10199,10 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 /// `Drop`-frees it), while its elements' `str` fields remain views into the input.
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
-    let schema = json_schema_sig(&b.structs, &b.enums, struct_id);
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, schema, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -10917,7 +10803,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Vec(_, n) => format!("vec{n}"),
         Ty::Mask(_, n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
-        // Keep the legacy human-readable schema summary element-aware.
+        // Keep the human-readable MIR type name element-aware.
         Ty::DynArray(s) => format!("array<{}>", ty_name(align_sema::scalar_to_ty(s))),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
@@ -11000,6 +10886,23 @@ mod tests {
         let p = lower("fn f(n: i64) -> i64 {\n  if n < 2 { return n }\n  return n\n}\n");
         let f = &p.fns[0];
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Branch(..))));
+    }
+
+    #[test]
+    fn json_mir_uses_target_ids_without_copied_schema_strings() {
+        let p = lower(
+            "import core.json\nS { secret_field: i64 }\nfn main() -> Result<(), Error> {\n  s: S := json.decode(\"{}\")?\n  print(s.secret_field)\n  return Ok(())\n}\n",
+        );
+        let human = print::program_to_string(&p);
+        assert!(human.contains("json_decode(struct#0,"), "decode MIR must retain the target id:\n{human}");
+        assert!(
+            !human.contains("secret_field"),
+            "the human function view must not duplicate the target schema:\n{human}"
+        );
+        assert!(
+            format!("{p:?}").contains("secret_field"),
+            "the structural Program must retain the codegen-consumed type table"
+        );
     }
 
     #[test]

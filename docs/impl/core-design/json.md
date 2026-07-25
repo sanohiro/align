@@ -137,7 +137,8 @@ single struct by its descriptor table), `None` omits the field (the same trailin
 scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
 own `None`s). The payload struct is validated encodable (`decode_struct_fields_ok`) and stays non-Move.
 The structural MIR fingerprint includes the payload struct definition, so an `Option<struct>` payload
-field change invalidates both decode and encode objects without a manually threaded schema string.
+field change invalidates both decode and encode objects. JSON MIR nodes carry only target ids; no
+manually threaded schema string exists.
 
 **Nested-struct fields (REST-gateway runway, Slice A).** A struct field may itself be a `Struct`;
 `decode` recurses into the nested object and `encode` renders it back, so a nested record round-trips.
@@ -265,8 +266,9 @@ validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<
   struct's field names/types feed the codegen descriptor table rather than its surrounding statement
   sequence. The per-unit key therefore fingerprints the complete structural MIR Program, including
   struct/enum tables, `layout(C)`, and alignment. `cache_codegen.rs` gates 2/2b pin flat, nested, and
-  type-table-only changes. New schema-carrying surfaces must place every backend input in the
-  structural Program; do not add cache-only strings to the human MIR printer.
+  type-table-only changes. JSON MIR nodes carry target ids rather than copied schema strings. New
+  schema-carrying surfaces must place every backend input in the structural Program; do not add
+  cache-only strings to the human MIR printer.
 
 ## Test anchors
 
