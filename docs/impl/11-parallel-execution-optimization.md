@@ -680,9 +680,11 @@ exists, and this map-only kernel does not silently declare generic parallel redu
 - Cheap arithmetic positive case vectorizes after specialization. Both are regression-pinned.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
-- [x] Remeasure the post-specialization threshold with input/output element bytes, body cost, and
-  element count around the boundary (`bench/par_map/run.sh threshold`, 2026-07-25 native Apple
-  Silicon); retain cold-start and cross-host checks before the next retune.
+- [x] Remeasure the post-specialization threshold across body costs and element counts around the
+  boundary (`bench/par_map/run.sh threshold`, 2026-07-25 native Apple Silicon); retain cold-start,
+  element-width, aggregate-size, and cross-host checks before the next retune.
+- [ ] Sweep input/output element widths and aggregate sizes before treating the floor as a general
+  cost model rather than this host's measured `i64` probe result.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 

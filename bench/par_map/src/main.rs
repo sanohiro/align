@@ -176,6 +176,7 @@ fn run_threshold() {
     let counts = [
         16_384usize,
         32_768,
+        32_769,
         49_152,
         65_535,
         65_536,
@@ -238,10 +239,9 @@ fn run_threshold() {
                         elapsed_ms(case.seq, slice, reps),
                     )
                 } else {
-                    (
-                        elapsed_ms(case.seq, slice, reps),
-                        elapsed_ms(case.par, slice, reps),
-                    )
+                    let seq_ms = elapsed_ms(case.seq, slice, reps);
+                    let par_ms = elapsed_ms(case.par, slice, reps);
+                    (par_ms, seq_ms)
                 };
                 ratios.push(par_ms / seq_ms);
             }

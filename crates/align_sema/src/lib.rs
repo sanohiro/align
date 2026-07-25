@@ -16366,7 +16366,9 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `source.….par_map(f)` — apply the Pure function `f` to each surviving element and
     /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
-    /// whole call graph) and return a primitive scalar. The first cut runs sequentially.
+    /// whole call graph) and return a primitive scalar. Lowering selects the parallel range kernel
+    /// for direct scalar/slice/chunks sources with Copy captures; staged and unsupported aggregate
+    /// forms remain sequential, while Move captures are rejected by ownership checks.
     fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [fn_arg] = args else {

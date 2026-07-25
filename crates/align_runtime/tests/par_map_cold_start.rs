@@ -57,6 +57,30 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
         "a tiny par_map must not spin up the global worker pool (Codex audit item 5)"
     );
 
+    // The exact boundary must take the same caller-only path, not merely a much smaller input.
+    const BOUNDARY: i64 = 65_536;
+    let boundary_input: Vec<i64> = (0..BOUNDARY).collect();
+    let boundary_output = unsafe {
+        align_runtime::align_rt_par_map(
+            std::ptr::null(),
+            boundary_input.as_ptr() as *const u8,
+            BOUNDARY,
+            std::mem::size_of::<i64>() as i64,
+            std::mem::size_of::<i64>() as i64,
+            double,
+        )
+    };
+    let boundary_values = unsafe {
+        std::slice::from_raw_parts(boundary_output as *const i64, BOUNDARY as usize)
+    };
+    assert_eq!(boundary_values.first(), Some(&0));
+    assert_eq!(boundary_values.last(), Some(&(2 * (BOUNDARY - 1))));
+    unsafe { align_runtime::align_rt_free(boundary_output) };
+    assert!(
+        !align_runtime::align_rt_test_par_pool_initialized(),
+        "a par_map at PAR_MIN_CHUNK must not spin up the global worker pool"
+    );
+
     // A single-task `task_group` (`n == 1`) must likewise never touch the pool: `workers.min(n-1)`
     // is always 0 for `n == 1`, so no helper would ever be submitted even if the pool existed.
     let tg = align_runtime::align_rt_tg_begin();

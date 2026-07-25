@@ -2,7 +2,8 @@
 // `array<R>` (draft.md §11) — the data-parallel map. The function must be **Pure** (no I/O or
 // other observable side effect); an impure function is a compile error. Direct scalar, slice, and
 // chunks sources, including Copy-capturing closures, are eligible for the generated whole-range
-// kernel; staged, Move-capturing, and unsupported aggregate forms retain the sequential fallback.
+// kernel; staged and unsupported aggregate forms retain the sequential fallback, while Move
+// captures are rejected by the ownership checks.
 Emp { base: i32, bonus: i32 }
 
 fn net(e: Emp) -> i32 = e.base + e.bonus
