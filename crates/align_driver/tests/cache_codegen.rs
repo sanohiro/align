@@ -5,7 +5,8 @@
 //! except the cross-process `impl_hash`-stability gate, which drives two fresh `alignc` subprocesses.
 //!
 //! The matrix: (1) no-op rebuild all-hit; (2) private dep-body edit → that unit MirDigest-miss, every
-//! dependent hit + correct exe; (3) transitive A→B→C invalidation; (4) comment-only edit hit;
+//! dependent hit + correct exe; (2b) a codegen-only type-table edit misses even when function MIR
+//! is unchanged; (3) transitive A→B→C invalidation; (4) comment-only edit hit;
 //! (5) edit-then-exact-revert hit (old CAS entry); (6) corrupted blob → corruption event + rebuild +
 //! correct binary; (7) cold vs hit byte-identity (object + executable); (8) profile / `--export`
 //! change miss with the right `FirstDiff`; (9) rt-lto on/off distinct keys; (10) cross-process
@@ -221,6 +222,35 @@ fn gate2_private_body_edit_misses_only_edited_unit() {
     }
 }
 
+/// A per-unit object key must cover the complete codegen input, not only the human-readable
+/// function MIR. Both versions below print identical function MIR (`Hidden` is `struct#0` in each),
+/// but LLVM reads a different field type from `Program::structs`. `inspect` is unreachable from
+/// `main`, matching the failure class where a warm hit used to skip codegen of a changed dead
+/// function. The changed program must miss, so any cold codegen result (success or failure) is also
+/// the warm result.
+#[test]
+fn gate2_type_table_only_edit_cannot_hit() {
+    if !backend() {
+        return;
+    }
+    let v1 = "Hidden { value: i64 }\nfn inspect(x: Hidden) -> i64 = 0\nfn main() -> i32 = 0\n";
+    let v2 = "Hidden { value: char }\nfn inspect(x: Hidden) -> i64 = 0\nfn main() -> i32 = 0\n";
+    let proj = Project::new("type-table-digest", &[("main.align", v1)], "main.align");
+    let cache = proj.cache();
+
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!cold.outcome("main").hit);
+
+    proj.write("main.align", v2);
+    let changed = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!changed.outcome("main").hit, "a codegen-consumed type-table edit must miss");
+    assert_eq!(
+        changed.outcome("main").miss_reason,
+        Some(FirstDiff::MirDigest),
+        "the complete structural MIR fingerprint is the first changed key component"
+    );
+}
+
 // ---- Gate 2b: a json.decode target-struct field RENAME invalidates the cache -------------------
 
 /// A `json.decode` target struct's field name/type feeds only the codegen descriptor table, not the
@@ -423,8 +453,9 @@ fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
         return;
     }
     // A `pub` aggregate constant's value (its initializer source) is part of the exported interface
-    // hash, so editing one element must miss the defining unit AND every dependent that reads it —
-    // the real cross-unit cache proof (not just an interface-hash inequality).
+    // hash, so editing one element must miss every dependent that materializes it. The defining
+    // unit has no codegen representation for the const and therefore stays hot under the exact
+    // structural MIR digest — the real cross-unit cache proof (not just a hash inequality).
     let cfg_v1 = "module cfg\npub WEIGHTS := [2, 3, 5]\n";
     let cfg_v2 = "module cfg\npub WEIGHTS := [2, 3, 6]\n"; // one element edited
     let main = "import cfg\nfn main() {\n  print(cfg.WEIGHTS.sum())\n}\n";
@@ -440,7 +471,7 @@ fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
     // Edit one element of the pub aggregate constant.
     proj.write("cfg.align", cfg_v2);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
-    assert!(!hot.outcome("cfg").hit, "the edited defining unit must miss");
+    assert!(hot.outcome("cfg").hit, "the defining unit's exact codegen input is unchanged");
     assert!(
         !hot.outcome("main").hit,
         "a dependent keying on cfg's interface hash must miss when a pub constant's value changes"

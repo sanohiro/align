@@ -424,10 +424,10 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             }];
             // Per-unit MIR (S2): the unit's own fns + in-consumer monomorphs, with the
             // separate-compilation visibility bits set (`pub` fns external, imported callees carried
-            // as external declares). The summary is byte-identical whether lowered per-unit or
-            // whole-program (its `impl_hash` hashes MIR *fns*, its capabilities partition MIR fns —
-            // neither sees the exportable bit or the declare list), so `check_per_unit`'s summaries
-            // are unchanged by this while `build_per_unit` reuses the same MIR for codegen.
+            // as external declares). The per-unit `impl_hash` below fingerprints this exact codegen
+            // input, including its type tables, declarations, linkage, and alignment. The legacy
+            // whole-program summary producer still partitions function MIR for its multi-unit
+            // inspection surface; only per-unit summaries feed the object cache.
             let mir = if located {
                 lower_to_mir_per_unit_located(&program, source_map)
             } else {
@@ -441,7 +441,12 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 &sources,
                 &external_effects,
             );
-            if let Some(s) = built.pop() {
+            if let Some(mut s) = built.pop() {
+                // Cache soundness boundary: hash the exact structural MIR program that a miss hands
+                // to codegen. Hashing only stable-printed function bodies omitted type tables and
+                // linkage metadata, so a changed dead function could fail cold while an old key hit
+                // skipped codegen. A hit under this hash implies the full backend input is equal.
+                s.impl_hash = align_interface::codegen_impl_hash(&mir);
                 summaries.insert(u.path.clone(), s.clone());
                 mirs.insert(u.path.clone(), (s, mir, u.is_entry));
             }

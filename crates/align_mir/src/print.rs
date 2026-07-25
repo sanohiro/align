@@ -14,6 +14,23 @@ pub fn program_to_string(p: &Program) -> String {
     out
 }
 
+/// A deterministic structural rendering of every MIR field that can affect object emission.
+///
+/// [`program_to_string`] is intentionally a human-facing function-body view: it omits type tables,
+/// declarations, linkage, slot alignment, and other backend inputs. That makes it useful for
+/// `emit-mir`, but unsound as the complete object-cache fingerprint. This rendering instead uses
+/// the derived structural `Debug` form of [`Program`], so adding a field to the MIR automatically
+/// adds it to the fingerprint input rather than requiring another hand-maintained printer arm.
+///
+/// Stability is required only within one compiler build: cache keys separately include the compiler
+/// build id and frontend schema version. MIR contains no unordered maps, pointers, or process-local
+/// ids, so this form is deterministic across processes for one build. Located MIR deliberately
+/// includes `stmt_lines`, because debug locations are codegen input; normal cached builds lower
+/// unlocated MIR and therefore keep comment/whitespace-only edits invisible.
+pub fn codegen_input_to_string(p: &Program) -> String {
+    format!("{p:?}")
+}
+
 /// The same stable, location-free text [`program_to_string`] prints for one function, without
 /// needing to wrap it in a [`Program`] (and so without cloning it into one) — types are printed by
 /// id, never resolved through the program's type tables, so a single [`Function`] prints identically
