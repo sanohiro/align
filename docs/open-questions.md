@@ -282,7 +282,7 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 Record: `draft.md` §11 (Task Group), `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
 **Implementation plan (2026-06-23, revised), after closures ①–③ shipped.** `task_group` **does need the region-owned env** the settled design specified — a **fresh environment per `spawn`, allocated in the `task_group` region** (an arena-like bump region tied to the scope, freed at scope end). The ②b-2 frame-local env is a *single hoisted alloca slot per closure site*, so it cannot back a spawned closure: a `spawn` in a loop (or after reassigning a captured variable) reuses that one slot, and a **deferred** task (④a) would then read the final value, while a **concurrent** task (④b) would race the next iteration's overwrite. A fresh per-`spawn` allocation in the region gives each task a stable, private snapshot of its captures. (So `spawn` is the escape that triggers the region env — exactly "escape decides the representation". The frame-local env stays correct only for a closure that is *called within the frame*, never spawned.) Surface (all scalar `R` for now, matching the closure slices):
-- `task_group { … }` — a block scope like `arena {}`; opens the task region + context; `wait()` (or scope end) joins, then the region is freed.
+- `task_group { … }` — a structured block scope like `arena {}` in lifetime only; opens the task region + context; `wait()` (or scope end) joins, then the region is freed. The region is reserved for spawned environments and result slots, so ordinary owned values retain normal cleanup and arena-only operations still require an explicit nested `arena {}`.
 - `spawn(fn { … })` — a builtin valid inside the scope (like an arena allocation refers to its arena). Takes a `fn() -> R` value (captures by value, **snapshotted into a fresh region env**; may be impure); returns `Task<R>`. `Ty::Task(Scalar)`.
 - `wait()` — joins all spawned tasks; later `wait()?` is the single error boundary (tasks returning `Result`, first-`Err` propagation).
 - `t.get()` — reads the task's result `R` after the join. **`get()` before `wait()` is a compile-time error** (a flow check, like use-after-move — the result is not yet computed); it is not a runtime trap or an on-demand trigger. Symmetrically, `spawn`/`wait`/`get` are valid only inside a `task_group` scope.
@@ -1049,11 +1049,12 @@ test migration completed on 2026-07-15.
   frame-bounded views remains rejected. The settled One-way rule later chose `builder` instead of an
   owned-concat surface; on 2026-07-15 sema made the rejection uniform and the obsolete MIR
   concatenation lowering was removed. The named-reducer sub-gap is therefore closed by the same
-  hard error, while builder-reduce remains valid. `tests/lambda.rs` pins all three former contexts.
+  hard error. Builder-reduce was initially retained, but is now rejected until Move accumulator
+  transfer and scanner error-path cleanup are explicit; use a visible loop with `builder` meanwhile.
 - **Gap B — `acc + x` string reduce would use O(N²) arena space; MOOT under the hard error.** Arena has no
   per-object free, so all N intermediate strings live until block exit (Rust frees each `acc`
   immediately → O(1)). The uniform compile-time rejection makes this shape unrepresentable;
-  `builder` accumulation is the single supported path, so no separate lint remains.
+  explicit `builder` accumulation is the single supported path, so no separate lint remains.
 - **Gap C — `builder(capacity)` — DONE 2026-06-27 as a feature, but MEASURED *not* to be the lever.**
   Added the surface (`builder()` / `builder(capacity)`, an `i64`) + `align_rt_builder_new(arena, cap)`
   → `Vec::with_capacity`. **But `bench/string_builder/` shows `+cap` ≈ `build` (2.77 vs 2.77 ms) — the
@@ -1957,6 +1958,24 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
 **Decision: one inferred region lattice + owned heap collections with per-binding drop; views are region-tied and escape is checked; a value that must outlive its source is cloned explicitly (the compiler never inserts a copy on escape).** The phase that unified the old point solutions and lifted the M3/M4/M5 ownership deferrals. Concretely settled and shipped:
 - **One region lattice** `Static ⊐ Frame ⊐ Arena(k)` (regions stay *inferred* — no lifetime syntax). Every view producer (`slice`, `str` borrow, struct field, a `json.decode`-d struct or `array<Struct>`, a call re-borrowing an argument) carries a region; `EscapeCheck` forbids a view outliving its source. Replaces the three unrelated mechanisms (arena depth for `box`/`str`, slice "local-backed", struct `str` region-0).
 - **Owned (Move) heap collections + drop**: free-standing owned `string` / `array<T>` / `array<Struct>` (AoS) / `builder`, freed by per-binding MIR `Drop` (null-on-move drop flags) outside an arena, or arena bulk-free inside one. Owned payloads inside `Option`/`Result` are dropped / moved-out as a unit.
+- **Call ownership transfer**: a by-value Move argument becomes callee-owned and is therefore
+  limited to free-standing owned storage. Arena-owned values stay in their caller-visible arena and
+  cross calls only as non-owning slices/views. Temporary aggregate arguments retain per-member
+  cleanup provenance until all arguments succeed, so a later early exit neither leaks heap members
+  nor individually frees arena members. Synthesized calls obey the same rule: `Result.map_err`
+  checks its Move error payload and forwards the selected result ownership bit, while fused
+  pipeline functions reject Move source and result elements until explicit move-out/null and
+  per-iteration cleanup exist. `reduce` and materializing `scan` require a Copy accumulator until
+  per-iteration transfer and scanner error cleanup are explicit. `map_err` also retains a fresh
+  receiver during mapper evaluation and joins mapper-capture borrows into the result region. A Move
+  value leaving a value-carrying `task_group` forwards its tail local's cleanup bit and clears that
+  inner source before an outer return or call takes ownership.
+- **Uniform aggregate ownership mode**: one owning aggregate slot carries one runtime cleanup bit,
+  so its owned members are all free-standing or all arena-owned. Mixed tuples, structs, sum values,
+  and owned arrays are rejected, and owned field/element assignments preserve the existing mode;
+  borrowed members remain governed separately by Region. A one-owner aggregate can forward a
+  path-dependent runtime mode, but mutation requires a definite mode; Move-struct construction
+  retains completed field owners through direct struct and fixed-array `let` paths too.
 - **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
 - **`json.decode`**: `str` and `array<Struct>` decode are zero-copy views region-tied to the input (a struct's `str` fields borrow it); `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied). Together → **`draft.md` §19 runs end-to-end except the `fs`/`io` std boundary**.
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar; **struct array → whole struct by value**, a Copy load region-tied to the array via `region_of`) and `arr[index].field` (a struct-array element's field), both bounds-checked. Since-implemented on separate tracks: tuples / multi-value returns → `partition`; `array<slice<T>>` → `chunks` (`Ty::DynSliceArray`); `out` params + the no-alias check. Still open: `array<Struct>.clone()`, and emitting LLVM `noalias` (below).

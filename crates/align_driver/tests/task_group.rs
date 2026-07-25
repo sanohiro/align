@@ -55,6 +55,19 @@ fn tasks_run_deferred_at_wait() {
 }
 
 #[test]
+fn scope_end_implicitly_joins_tasks() {
+    if !backend_available() {
+        return;
+    }
+    // Structured concurrency joins every task when the group scope ends, even without an explicit
+    // `wait()`. The captured view must remain live until the deferred task has observed it.
+    let src = "fn main() -> Result<(), Error> {\n  owned := \"captured\".clone()\n  view: str := owned\n  task_group {\n    t := spawn(fn { print(view) })\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-implicit-join", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "captured\n");
+}
+
+#[test]
 fn many_parallel_tasks() {
     if !backend_available() {
         return;
@@ -72,12 +85,91 @@ fn early_return_joins_tasks() {
     if !backend_available() {
         return;
     }
-    // An early `return` out of a `task_group` still joins its tasks (structured concurrency):
-    // the spawned side effect runs during the exit cleanup.
-    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    spawn(fn { print(9) })\n    return Ok(())\n  }\n}\n";
+    // An early `return` joins before dropping frame-owned capture storage: the spawned task must
+    // observe the live string view, then the owner may be released.
+    let src = "fn main() -> Result<(), Error> {\n  owned := \"captured\".clone()\n  view: str := owned\n  task_group {\n    spawn(fn { print(view) })\n    return Ok(())\n  }\n}\n";
     let out = build_and_run("tg-early-return", src);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "captured\n");
+}
+
+#[test]
+fn owned_tail_moves_out_exactly_once() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn make() -> string {
+  return task_group {
+    s := \"hello\".clone()
+    s
+  }
+}
+fn take(s: string) -> i64 = s.len()
+fn call() -> i64 = take(task_group {
+  s := \"world\".clone()
+  s
+})
+fn borrow() -> i64 = task_group {
+  s := \"viewed\".clone()
+  s
+}.len()
+fn chunk_count(xs: slice<i64>) -> i64 = task_group {
+  chunks := xs.chunks(2)
+  chunks
+}.len()
+fn wrapped() -> i64 {
+  pair := (task_group {
+    s := \"wrapped\".clone()
+    s
+  }, 2)
+  return pair.0.len() + pair.1
+}
+fn early() -> i32 {
+  use(task_group {
+    s := \"kept\".clone()
+    s
+  }, { return 0 })
+  return 1
+}
+fn use(s: string, x: ()) {}
+fn main() -> i32 {
+  a := make()
+  xs := [1, 2, 3, 4]
+  if early() != 0 { return 1 }
+  return (a.len() + call() + borrow() + chunk_count(xs) + wrapped()) as i32
+}
+";
+    let out = build_and_run("tg-owned-tail-move", src);
+    assert_eq!(out.status.code(), Some(27));
+}
+
+#[test]
+fn general_allocations_inside_task_group_keep_their_normal_ownership() {
+    assert!(check_errs(
+        "tg-is-not-arena",
+        "fn main() -> i32 {\n  task_group {\n    p := heap.new(7)\n    print(p.get())\n  }\n  return 0\n}\n"
+    ));
+
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn main() -> i32 {
+  task_group {
+    xs := [1, 2, 3].to_array()
+    print(xs.len())
+    arena {
+      p := heap.new(7)
+      print(p.get())
+    }
+  }
+  return 0
+}
+";
+    let out = build_and_run("tg-normal-allocations", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n7\n");
 }
 
 #[test]

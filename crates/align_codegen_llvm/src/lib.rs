@@ -10439,20 +10439,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// value up in a table, and neither lookup is guaranteed by the type system alone.
     ///
     /// - `Operand::Value(id)` is only in [`Self::values`] if the statement that defined `id`
-    ///   produced a basic value. A `()`-returning call defines a `ValueId` whose LLVM call yields
-    ///   **void**, so nothing is recorded — reading it used to index a `HashMap` and abort the
-    ///   compiler.
+    ///   produced a basic value. A `()`-returning call defines a bookkeeping `ValueId` whose LLVM
+    ///   call yields **void**, so nothing is recorded. MIR lowering canonicalizes every source-level
+    ///   use of that result to `Const::Unit`; a stale or malformed MIR reference must still diagnose
+    ///   rather than index a `HashMap` and abort the compiler.
     /// - `Operand::Arg(i)` indexes the LLVM parameter list, which a MIR/ABI mismatch can outrun.
     ///
-    /// The `Arg` case is a compiler bug when it fires. The `()` case is **not** hypothetical and is
-    /// **not** fully gated by sema: `print(u())` / `template "{u()}"` are sema-rejected, but
-    /// `x := u()`, `fn v() { return u() }`, `g(u())` with `g(a: ())`, `x := { u() }` and
-    /// `x := arena { u() }` all pass `alignc check` and reach here — a MIR **lowering** hole, not an
-    /// intended rejection (the same programs written with `if` / `match` / `loop { break u() }`
-    /// compile fine). They abort the compiler without this accessor. So this error is currently
-    /// user-reachable and carries no source span; fixing the lowering is a recorded follow-up.
-    /// Either way, a compiler bug on user input must surface as a diagnosable error, never a panic
-    /// (the Gate-3 rule).
+    /// Both missing-value and argument-index cases are compiler bugs. They must surface as
+    /// diagnosable errors, never panics (the Gate-3 rule).
     fn operand(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
         Ok(match op {
             Operand::Const(Const::Int(v, ty)) => {
@@ -10715,14 +10709,11 @@ mod tests {
         }
     }
 
-    /// A `()`-valued operand. A `()`-returning call defines a `ValueId` whose LLVM call yields
-    /// **void**, so no LLVM value is recorded for it — and reading it used to index a `HashMap`
-    /// directly and abort. Real source reaches this: `x := u()` / `fn v() { return u() }` /
-    /// `g(u())` / `x := { u() }` / `x := arena { u() }` all check ok and abort the compiler on
-    /// `main` (`print(u())` / `template "{u()}"` are the two spellings sema *does* reject). Until
-    /// the lowering hole is closed the read must at least degrade to a `CodegenError`.
+    /// A malformed MIR `ValueId` use of a `()`-returning call. Source lowering emits the void call
+    /// for its effects but returns `Const::Unit` to every value context, so this shape is now only a
+    /// defensive codegen invariant test. It must remain a `CodegenError`, never a map-index panic.
     #[test]
-    fn a_unit_valued_operand_is_an_error_not_a_panic() {
+    fn a_malformed_unit_value_id_is_an_error_not_a_panic() {
         let unit_fn = Function {
             name: "u".to_string(),
             params: vec![],

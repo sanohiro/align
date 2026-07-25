@@ -297,11 +297,11 @@ fn str_concat_in_lambda_own_arena_is_still_rejected() {
 }
 
 #[test]
-fn builder_reduce_still_ok() {
-    // The correct string-accumulation pattern (the one the error points to) keeps working: the
-    // lambda only appends to the builder (no per-call allocation/leak).
+fn builder_reduce_is_rejected_until_move_cleanup_is_explicit() {
+    // A builder is a Move accumulator. Reduce cannot transfer it safely across every iteration and
+    // scanner error path yet, so it fails closed like other Move accumulators.
     let src = "pub fn run(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x { b.write_int(x); b })\n  return b.to_string().len()\n}\nfn main() -> i32 = 0\n";
-    assert!(!check_errs("builder-reduce-ok", src));
+    assert!(check_errs("builder-reduce-move-error", src));
 }
 
 #[test]

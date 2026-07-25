@@ -154,6 +154,35 @@ fn main() -> i32 {
 }
 
 #[test]
+fn fixed_array_construction_stops_after_early_return() {
+    if !backend_available() {
+        return;
+    }
+    // Scalar and Copy-struct arrays both stop at a returning element/field. Later side effects must
+    // not be appended to the already-terminated MIR block.
+    let src = "\
+Point { x: i64, y: i64 }
+fn side() -> i64 { print(9); return 9 }
+fn scalar() -> i32 {
+  xs := [{ return 0; 0 }, side()]
+  return 1
+}
+fn records() -> i32 {
+  ps := [Point { x: { return 0; 0 }, y: side() }, Point { x: side(), y: side() }]
+  return 1
+}
+fn main() -> i32 {
+  if scalar() != 0 { return 1 }
+  if records() != 0 { return 2 }
+  return 0
+}
+";
+    let out = build_and_run("fixed-array-early-return", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "later element side effects must not run");
+}
+
+#[test]
 fn element_owned_field_reassign_drops_old() {
     if !backend_available() {
         return;

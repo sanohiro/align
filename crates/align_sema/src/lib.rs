@@ -975,14 +975,9 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
-        || payload_is_move(ty)
-        || ty_tuple_is_move(ty, tuples)
-        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
-        // A Move enum (owns an `array<Struct>` payload, J2) captured by value into a closure would be
-        // copy-captured and double-dropped — reject it like any other owned capture.
-        || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
+    // Capture uses the same ownership classification as calls and pipelines. Keeping one predicate
+    // prevents a newly supported aggregate shape from becoming Copy only at a closure boundary.
+    ty_is_move(ty, structs, tuples, enums)
 }
 
 /// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, a nested
@@ -1236,6 +1231,8 @@ fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs, enums))
+        // A fixed array of Move structs owns every element recursively.
+        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums))
         // A Move sum type (owns an `array<Struct>` payload, J2).
         || matches!(ty, Ty::Enum(id) if enum_is_move(id, enums))
 }
@@ -3780,6 +3777,8 @@ pub fn check_program_with_effects(
                 drop_individual_exprs: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 task_group_regions: Vec::new(),
+                allocation_regions: Vec::new(),
+                allocation_region_by_expr: std::collections::HashMap::new(),
                 flow: EscapeFlowCfg::new(),
                 flow_current: 0,
                 loop_exit_blocks: Vec::new(),
@@ -5071,11 +5070,18 @@ impl Region {
 
 /// Path-sensitive escape provenance at one control-flow point. Both components form finite
 /// may-lattices: a local's joined region is the shortest region it may carry, and slice provenance
-/// is present when any reaching path may still borrow function-local storage.
+/// is present when any reaching path may still borrow function-local storage. Owned provenance
+/// keeps both the must-individual and may-individual facts so a heap/arena join stays distinct from
+/// definite arena ownership.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct EscapeState {
     region: std::collections::HashMap<LocalId, Region>,
     local_backed_slice: std::collections::HashSet<LocalId>,
+    /// True only when every reaching path holds individually owned storage.
+    individual: std::collections::HashMap<LocalId, bool>,
+    /// True when at least one reaching path may hold individually owned storage. Together with
+    /// `individual`, this distinguishes definite arena ownership from a heap/arena path join.
+    individual_may: std::collections::HashMap<LocalId, bool>,
 }
 
 impl EscapeState {
@@ -5091,6 +5097,20 @@ impl EscapeState {
         joined
             .local_backed_slice
             .extend(other.local_backed_slice.iter().copied());
+        for (&local, &individual) in &other.individual {
+            joined
+                .individual
+                .entry(local)
+                .and_modify(|current| *current &= individual)
+                .or_insert(individual);
+        }
+        for (&local, &individual) in &other.individual_may {
+            joined
+                .individual_may
+                .entry(local)
+                .and_modify(|current| *current |= individual)
+                .or_insert(individual);
+        }
         joined
     }
 }
@@ -5139,6 +5159,9 @@ enum EscapeFlowOp<'a> {
         group: Region,
         depth: u32,
     },
+    /// A by-value call transfers a Move value to the callee. Arena-owned storage cannot cross
+    /// that function boundary because the callee has no caller-region provenance.
+    CallTransfer(&'a Expr, u32),
     ReturnEscape(&'a Expr, u32),
 }
 
@@ -5210,6 +5233,12 @@ struct EscapeCheck<'a> {
     /// the group's `wait`, so every capture must outlive the innermost group even when `spawn`
     /// appears inside a shorter-lived nested arena.
     task_group_regions: Vec<Region>,
+    /// Actual `arena {}` regions active during syntax lowering. A `task_group` has its own task
+    /// storage but is not a general allocator, so it deliberately does not enter this stack.
+    allocation_regions: Vec<Region>,
+    /// Actual arena allocation region at each expression, keyed by HIR-node identity before the
+    /// CFG is solved. Absence means the expression allocates free-standing heap/frame storage.
+    allocation_region_by_expr: std::collections::HashMap<usize, Region>,
     /// Compact checked-HIR CFG built before solving escape state.
     flow: EscapeFlowCfg<'a>,
     /// Block currently receiving lowered escape operations.
@@ -5220,6 +5249,17 @@ struct EscapeCheck<'a> {
 
 impl<'a> EscapeCheck<'a> {
     fn check(&mut self) {
+        for &param in &self.f.params {
+            if self.f.locals.get(param as usize).is_some_and(|local| {
+                is_owned_droppable(local.ty, self.structs, self.enums)
+                    || ty_tuple_is_move(local.ty, self.tuples)
+            }) {
+                // A by-value Move parameter has already crossed the call boundary and is owned by
+                // this frame. The caller-side transfer check guarantees it is free-standing.
+                self.state.individual.insert(param, true);
+                self.state.individual_may.insert(param, true);
+            }
+        }
         self.lower_block(&self.f.body, 0);
         // The body's trailing value is the function's return value (single-expression
         // bodies and fall-through blocks), so apply the same escape check there.
@@ -5241,7 +5281,7 @@ impl<'a> EscapeCheck<'a> {
     /// diagnostics to a sink so loop iterations cannot duplicate user-facing errors.
     fn solve_flow(&mut self) {
         let mut inputs = vec![None; self.flow.blocks.len()];
-        inputs[0] = Some(EscapeState::default());
+        inputs[0] = Some(self.state.clone());
         let mut worklist = std::collections::VecDeque::from([0usize]);
         let mut sink = Diagnostics::new();
         std::mem::swap(self.diags, &mut sink);
@@ -5283,6 +5323,13 @@ impl<'a> EscapeCheck<'a> {
         match op {
             EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
             EscapeFlowOp::DropProvenance(expr, depth) => {
+                if self.aggregate_contains_mixed_ownership(expr, depth) {
+                    self.diags.error(
+                        "an owned aggregate cannot mix free-standing and arena-owned members; use one allocation mode for every owned member"
+                            .to_string(),
+                        expr.span,
+                    );
+                }
                 self.drop_is_individual(expr, depth);
             }
             EscapeFlowOp::MatchBindings {
@@ -5325,11 +5372,115 @@ impl<'a> EscapeCheck<'a> {
                 group,
                 depth,
             } => self.check_spawn_capture(closure, group, depth),
+            EscapeFlowOp::CallTransfer(value, depth) => {
+                if self.call_transfer_contains_arena_owned(value, depth) {
+                    self.diags.error(
+                        "an arena-owned value cannot be moved into a function call; pass a slice/view or use a free-standing owned value"
+                            .to_string(),
+                        value.span,
+                    );
+                }
+            }
             EscapeFlowOp::ReturnEscape(value, depth) => {
                 self.check_return_escape(value, depth)
             }
         }
         *state = self.state.clone();
+    }
+
+    /// Whether a by-value call argument contains storage the callee must not individually drop.
+    /// Borrow regions are deliberately ignored here: an owned call result can be heap-owned while
+    /// still carrying a short borrow from an argument. Fresh aggregates recurse so a single
+    /// aggregate region/cleanup bit cannot hide mixed heap and arena members; bound locals use the
+    /// path-sensitive ownership fact joined in [`EscapeState`].
+    fn call_transfer_contains_arena_owned(&mut self, e: &Expr, depth: u32) -> bool {
+        if !needs_drop_flag(e.ty, self.structs, self.tuples, self.enums)
+            || matches!(e.ty, Ty::DynSliceArray(_))
+        {
+            return false;
+        }
+        match &e.kind {
+            ExprKind::Local(local) => !self.state.individual.get(local).copied().unwrap_or_else(|| {
+                !matches!(self.region_of(e, depth), Region::Arena(_))
+            }),
+            ExprKind::Tuple { elems, .. } => elems
+                .iter()
+                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
+            ExprKind::EnumValue { payload, .. } => payload
+                .iter()
+                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .any(|value| self.call_transfer_contains_arena_owned(value, depth)),
+            ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner)
+            | ExprKind::TaskGet(inner) => self.call_transfer_contains_arena_owned(inner, depth),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth)),
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth + 1)),
+            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
+                block
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| self.call_transfer_contains_arena_owned(value, depth))
+            }),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .any(|arm| self.call_transfer_contains_arena_owned(&arm.body, depth)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.call_transfer_contains_arena_owned(opt, depth)
+                    || self.call_transfer_contains_arena_owned(fallback, depth)
+            }
+            // A function result cannot borrow arena-owned storage across its own return boundary.
+            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => false,
+            _ => !self.drop_is_individual(e, depth),
+        }
+    }
+
+    /// A resource-owning slot has one runtime cleanup bit, so every directly owned member of one
+    /// aggregate must share an allocation mode. Nested aggregates diagnose themselves when their
+    /// own provenance op is replayed.
+    fn aggregate_contains_mixed_ownership(&mut self, e: &Expr, depth: u32) -> bool {
+        let parts: Option<&[Expr]> = match &e.kind {
+            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => Some(elems),
+            ExprKind::EnumValue { payload, .. } => Some(payload),
+            ExprKind::StructLit { fields, .. } => Some(fields),
+            _ => None,
+        };
+        let Some(parts) = parts else { return false };
+        let mut owned_parts = 0;
+        let mut expected: Option<(bool, bool)> = None;
+        for part in parts {
+            if !needs_drop_flag(part.ty, self.structs, self.tuples, self.enums) {
+                continue;
+            }
+            owned_parts += 1;
+            let mode = (
+                self.drop_is_individual(part, depth),
+                self.drop_may_be_individual(part, depth),
+            );
+            // A path-dependent member is representable when it is the aggregate's only owner: the
+            // aggregate can carry that member's runtime bit. With multiple owned members, however,
+            // this analysis cannot prove their runtime modes are correlated, so fail closed.
+            if mode.0 != mode.1 && owned_parts > 1 {
+                return true;
+            }
+            if let Some(previous) = expected {
+                if previous != mode || previous.0 != previous.1 {
+                    return true;
+                }
+            } else {
+                expected = Some(mode);
+            }
+        }
+        false
     }
 
     /// Escape check for a returned value `e` (an explicit `return` or a body's trailing value):
@@ -5540,6 +5691,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner)
             | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
+            // `map_err` passes the Ok payload through and a callee-produced Move error is always
+            // free-standing. The source therefore determines whether every owning runtime variant
+            // is individual; MIR carries the selected variant's exact bit.
+            ExprKind::ResultMapErr { result, .. } => self.drop_is_individual(result, depth),
             ExprKind::Block(block) | ExprKind::Unsafe(block) => block
                 .value
                 .as_ref()
@@ -5568,9 +5723,22 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
             }
-            // A Move struct's Drop releases its owned fields; borrowed fields may shorten the
-            // struct's escape Region but do not change those fields' allocation provenance.
-            ExprKind::StructLit { .. } if matches!(e.ty, Ty::Struct(_)) => true,
+            // One aggregate slot has one cleanup bit. Determine it only from directly owned
+            // members: borrowed members may shorten Region but do not affect allocation mode. The
+            // separate mixed-mode diagnostic rejects the case where this conjunction would lose
+            // a free-standing member.
+            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_is_individual(part, depth)),
+            ExprKind::EnumValue { payload, .. } => payload
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_is_individual(part, depth)),
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_is_individual(part, depth)),
             _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
             }
         };
@@ -5581,6 +5749,76 @@ impl<'a> EscapeCheck<'a> {
             .and_modify(|known| *known &= individual)
             .or_insert(individual);
         individual
+    }
+
+    /// Whether an owned expression may be individually allocated on any reaching path. Paired
+    /// with [`Self::drop_is_individual`], this forms a three-state ownership lattice:
+    /// `(true,true)` is definitely individual, `(false,false)` definitely arena, and
+    /// `(false,true)` path-dependent. Mutating an aggregate requires a definite mode.
+    fn drop_may_be_individual(&mut self, e: &Expr, depth: u32) -> bool {
+        if matches!(e.ty, Ty::DynSliceArray(_)) {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Local(local) => self
+                .state
+                .individual_may
+                .get(local)
+                .copied()
+                .unwrap_or_else(|| !matches!(self.region_of(e, depth), Region::Arena(_))),
+            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
+            ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner)
+            | ExprKind::TaskGet(inner) => self.drop_may_be_individual(inner, depth),
+            ExprKind::ResultMapErr { result, .. } => {
+                self.drop_may_be_individual(result, depth)
+                    || matches!(e.ty, Ty::Result(_, err) if needs_drop_flag(
+                        scalar_to_ty(err),
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                    ))
+            }
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_ref()
+                .is_none_or(|value| self.drop_may_be_individual(value, depth)),
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
+                .value
+                .as_ref()
+                .is_none_or(|value| self.drop_may_be_individual(value, depth + 1)),
+            ExprKind::If { then, els, .. } => {
+                then.value
+                    .as_ref()
+                    .is_none_or(|value| self.drop_may_be_individual(value, depth))
+                    || els
+                        .value
+                        .as_ref()
+                        .is_none_or(|value| self.drop_may_be_individual(value, depth))
+            }
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .any(|arm| self.drop_may_be_individual(&arm.body, depth)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.drop_may_be_individual(opt, depth)
+                    || self.drop_may_be_individual(fallback, depth)
+            }
+            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_may_be_individual(part, depth)),
+            ExprKind::EnumValue { payload, .. } => payload
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_may_be_individual(part, depth)),
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .all(|part| self.drop_may_be_individual(part, depth)),
+            _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
+        }
     }
 
     /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
@@ -5696,41 +5934,64 @@ impl<'a> EscapeCheck<'a> {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
             // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
             // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => Region::arena(depth),
-            ExprKind::Template(_) => if depth == 0 { Region::Frame } else { Region::arena(depth) },
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => self.allocation_region(e),
+            ExprKind::Template(_) => self
+                .allocation_region_by_expr
+                .get(&Self::expr_key(e))
+                .copied()
+                .unwrap_or(Region::Frame),
             // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
             // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
             // / `fs.remove` return owned / non-region values and stay explicitly `Static` below.
-            ExprKind::FsReadFileView { .. } => Region::arena(depth),
+            ExprKind::FsReadFileView { .. } => self.allocation_region(e),
             // `fs.read_bytes_view(p)` returns a `bytes` (`slice<u8>`) view of the same mmap, so it is
             // arena-bound exactly like `read_file_view`'s `str` view. Unlike a `str`, a `slice<u8>` is
             // not `tracks_region` (its element is numeric), so `region_bearing` is what routes the
             // escape check here — this arm gives the view its Arena region.
-            ExprKind::FsReadBytesView { .. } => Region::arena(depth),
+            ExprKind::FsReadBytesView { .. } => self.allocation_region(e),
             // A spawned task's handle is a box in the enclosing `task_group` region.
             ExprKind::Spawn { .. } => Region::arena(depth),
-            // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
-            // its accumulator there too — when that accumulator is region-tracked (a template-built
-            // `str`, a struct), the result lives in the enclosing arena and must not escape
-            // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
-            // at this depth can have, so it conservatively covers an accumulator that instead just
-            // forwards `init` or borrows a source element (both outlive `arena(depth)`).
-            // These allocating producers bump-allocate in the enclosing arena; the returned value
-            // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
+            // `.to_array()` and these other producers use the explicit enclosing arena when one
+            // exists and otherwise create free-standing owned storage. `reduce` follows the same
+            // rule for a region-tracked accumulator. A task_group's private runtime region never
+            // changes their general allocation provenance.
             // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
             // also borrows its source/input, so it needs the shorter of the two regions.)
             ExprKind::ArrayToArray { source, stages, .. } => {
-                let from_source = Region::arena(depth).shorter(self.region_of(source, depth));
+                let from_source =
+                    self.allocation_region(e).shorter(self.region_of(source, depth));
                 stage_capture_exprs(stages)
                     .fold(from_source, |acc, capture| acc.shorter(self.region_of(capture, depth)))
             }
+            ExprKind::ArrayReduce {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            }
+            | ExprKind::ArrayScan {
+                source,
+                stages,
+                captures,
+                init,
+                ..
+            } => {
+                let from_values = self
+                    .allocation_region(e)
+                    .shorter(self.region_of(source, depth))
+                    .shorter(self.region_of(init, depth));
+                stage_capture_exprs(stages)
+                    .chain(captures)
+                    .fold(from_values, |acc, capture| {
+                        acc.shorter(self.region_of(capture, depth))
+                    })
+            }
             ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
-            | ExprKind::ArrayScan { .. }
             | ExprKind::ArraySort { .. }
-            | ExprKind::ArraySortBy { .. }
-            | ExprKind::ArrayReduce { .. } => Region::arena(depth),
+            | ExprKind::ArraySortBy { .. } => self.allocation_region(e),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
@@ -5751,13 +6012,15 @@ impl<'a> EscapeCheck<'a> {
             // (A primitive-only soa borrows nothing and stays purely arena-regioned via the group
             // arm above, so it is self-contained and free to escape the input.)
             ExprKind::JsonDecodeSoa { input, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(input, depth).shorter(Region::arena(depth))
+                self.region_of(input, depth).shorter(self.allocation_region(e))
             }
-            ExprKind::JsonDecodeSoa { .. } => Region::arena(depth),
+            ExprKind::JsonDecodeSoa { .. } => self.allocation_region(e),
             // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
-            ExprKind::JsonDoc { input } => self.region_of(input, depth).shorter(Region::arena(depth)),
+            ExprKind::JsonDoc { input } => self
+                .region_of(input, depth)
+                .shorter(self.allocation_region(e)),
             // `json.scan(input)` (J5): the scanner is a `{ptr,len}` view of the input (no arena tape),
             // and the rows it streams borrow the input. So it is region-tied to the input alone — it
             // cannot outlive it (a scanner escaping its input view is caught, like a `str`).
@@ -5770,16 +6033,18 @@ impl<'a> EscapeCheck<'a> {
             // `d.elems()` bump-allocates the handle buffer in the enclosing arena, and each element
             // handle views the same tape (the doc's region). So the slice is region-tied to BOTH — the
             // arena and the doc — i.e. the shorter of the two (like `json.decode → soa` / `to_array`).
-            ExprKind::JsonDocElems { doc } => self.region_of(doc, depth).shorter(Region::arena(depth)),
+            ExprKind::JsonDocElems { doc } => self
+                .region_of(doc, depth)
+                .shorter(self.allocation_region(e)),
             // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
             // `str` column copies the source elements' `str` views into the column, so a str-bearing
             // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
             // source (the shorter of the two). A primitive-only `to_soa` borrows nothing → the group
             // arm below binds it purely to the arena (self-contained, like `to_array`'s buffer).
             ExprKind::ArrayToSoa { source, struct_id } if self.struct_has_str(*struct_id) => {
-                self.region_of(source, depth).shorter(Region::arena(depth))
+                self.region_of(source, depth).shorter(self.allocation_region(e))
             }
-            ExprKind::ArrayToSoa { .. } => Region::arena(depth),
+            ExprKind::ArrayToSoa { .. } => self.allocation_region(e),
             // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
@@ -5854,9 +6119,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
-            // `map_err` passes the `Ok` payload through unchanged, so its region is the source's
-            // (a region-tied Ok payload must not escape via the converted result).
-            ExprKind::ResultMapErr { result, .. } => self.region_of(result, depth),
+            // `map_err` passes the `Ok` payload through unchanged, while its mapped error may
+            // borrow the mapper closure's environment. The result can outlive neither source.
+            ExprKind::ResultMapErr { result, f } => self
+                .region_of(result, depth)
+                .shorter(self.region_of(f, depth)),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
@@ -6216,6 +6483,20 @@ impl<'a> EscapeCheck<'a> {
         b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(Region::Static)
     }
 
+    /// General allocation region for `e`. Task-group storage is intentionally absent: only spawned
+    /// environments/result slots use that runtime region; ordinary values allocate in an explicit
+    /// enclosing arena or use free-standing storage.
+    fn allocation_region(&self, e: &Expr) -> Region {
+        self.allocation_region_by_expr
+            .get(&Self::expr_key(e))
+            .copied()
+            .unwrap_or(Region::Static)
+    }
+
+    fn expr_key(e: &Expr) -> usize {
+        e as *const Expr as usize
+    }
+
     /// The region of the **backing storage** a `chunks` source borrows — deliberately distinct from
     /// the source's *element/value* region ([`Self::region_of`]). A fixed stack `array<T>` / AoS
     /// `array<Struct>` bound as a `Let`-local owns a **frame slot**, scoped to the arena it was
@@ -6262,7 +6543,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) => self.slice_is_local(inner),
-            ExprKind::ResultMapErr { result, .. } => self.slice_is_local(result),
+            ExprKind::ResultMapErr { result, f } => {
+                self.slice_is_local(result) || self.slice_is_local(f)
+            }
             ExprKind::Tuple { elems, .. } => elems.iter().any(|el| self.slice_is_local(el)),
             ExprKind::TupleIndex { recv, .. } => self.slice_is_local(recv),
             ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.slice_is_local(recv),
@@ -6289,6 +6572,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
                 b.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
+            // A closure may return a captured local-backed slice. Its callable value carries those
+            // captures into an indirect call or `map_err`, so preserve that provenance.
+            ExprKind::Closure { captures, .. } => {
+                captures.iter().any(|capture| self.slice_is_local(capture))
+            }
             // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
             // the body, not reachable from this node. Each `break` value is escape-checked directly
             // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
@@ -6311,7 +6599,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::IntArith { .. }
             | ExprKind::MathOp { .. }
             | ExprKind::FnValue(..)
-            | ExprKind::Closure { .. }
             | ExprKind::EnumValue { .. }
             | ExprKind::Spawn { .. }
             | ExprKind::TaskGet(..)
@@ -6578,7 +6865,10 @@ impl<'a> EscapeCheck<'a> {
                     || ty_tuple_is_move(init.ty, self.tuples)
                 {
                     let individual = self.drop_is_individual(init, depth);
+                    let may_individual = self.drop_may_be_individual(init, depth);
                     self.drop_individual.insert(*local, individual);
+                    self.state.individual.insert(*local, individual);
+                    self.state.individual_may.insert(*local, may_individual);
                 }
                 if self.region_bearing(init.ty) {
                     let mut r = self.region_of(init, depth);
@@ -6613,6 +6903,27 @@ impl<'a> EscapeCheck<'a> {
             Stmt::AssignIndex { base, index: _, value }
             | Stmt::AssignElemField { base, index: _, value, .. }
             | Stmt::AssignElem { base, index: _, value, .. } => {
+                if needs_drop_flag(value.ty, self.structs, self.tuples, self.enums) {
+                    let old_individual = self.state.individual.get(base).copied().unwrap_or(true);
+                    let old_may_individual = self
+                        .state
+                        .individual_may
+                        .get(base)
+                        .copied()
+                        .unwrap_or(old_individual);
+                    let new_individual = self.drop_is_individual(value, depth);
+                    let new_may_individual = self.drop_may_be_individual(value, depth);
+                    if old_individual != old_may_individual
+                        || new_individual != new_may_individual
+                        || old_individual != new_individual
+                    {
+                        self.diags.error(
+                            "an owned aggregate cannot change allocation mode through an element assignment; use the aggregate's existing allocation mode"
+                                .to_string(),
+                            value.span,
+                        );
+                    }
+                }
                 if self.region_bearing(value.ty) {
                     let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
@@ -6630,7 +6941,11 @@ impl<'a> EscapeCheck<'a> {
                 if is_owned_droppable(value.ty, self.structs, self.enums)
                     || ty_tuple_is_move(value.ty, self.tuples)
                 {
-                    drop_new.set(self.drop_is_individual(value, depth));
+                    let individual = self.drop_is_individual(value, depth);
+                    let may_individual = self.drop_may_be_individual(value, depth);
+                    drop_new.set(individual);
+                    self.state.individual.insert(*local, individual);
+                    self.state.individual_may.insert(*local, may_individual);
                 }
                 // Assignment is a strong update on this path. Branch/loop joins below restore the
                 // conservative may-property when another reaching path still holds a local borrow.
@@ -6666,6 +6981,27 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::AssignField { root, value, .. } => {
+                if needs_drop_flag(value.ty, self.structs, self.tuples, self.enums) {
+                    let old_individual = self.state.individual.get(root).copied().unwrap_or(true);
+                    let old_may_individual = self
+                        .state
+                        .individual_may
+                        .get(root)
+                        .copied()
+                        .unwrap_or(old_individual);
+                    let new_individual = self.drop_is_individual(value, depth);
+                    let new_may_individual = self.drop_may_be_individual(value, depth);
+                    if old_individual != old_may_individual
+                        || new_individual != new_may_individual
+                        || old_individual != new_individual
+                    {
+                        self.diags.error(
+                            "an owned aggregate cannot change allocation mode through a field assignment; use the aggregate's existing allocation mode"
+                                .to_string(),
+                            value.span,
+                        );
+                    }
+                }
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
                 if self.region_bearing(value.ty) {
@@ -6693,6 +7029,7 @@ impl<'a> EscapeCheck<'a> {
             // region, so the tuple's region is exact; per-element regions are a later refinement.)
             Stmt::LetTuple { locals, init, .. } => {
                 let individual = self.drop_is_individual(init, depth);
+                let may_individual = self.drop_may_be_individual(init, depth);
                 for local in locals.iter().flatten() {
                     if self
                         .f
@@ -6704,6 +7041,8 @@ impl<'a> EscapeCheck<'a> {
                         })
                     {
                         self.drop_individual.insert(*local, individual);
+                        self.state.individual.insert(*local, individual);
+                        self.state.individual_may.insert(*local, may_individual);
                     }
                 }
                 if self.region_bearing(init.ty) {
@@ -6745,6 +7084,7 @@ impl<'a> EscapeCheck<'a> {
             .region_bearing(scrutinee.ty)
             .then(|| self.region_of(scrutinee, depth));
         let individual = self.drop_is_individual(scrutinee, depth);
+        let may_individual = self.drop_may_be_individual(scrutinee, depth);
         let local_slice =
             self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
         for binding in bindings {
@@ -6759,6 +7099,8 @@ impl<'a> EscapeCheck<'a> {
                 })
             {
                 self.drop_individual.insert(*binding, individual);
+                self.state.individual.insert(*binding, individual);
+                self.state.individual_may.insert(*binding, may_individual);
             }
             if let Some(region) = region {
                 self.state.region.insert(*binding, region);
@@ -6835,6 +7177,9 @@ impl<'a> EscapeCheck<'a> {
     /// Lower every checked-HIR value position into the compact escape CFG. This match is exhaustive:
     /// adding syntax requires either explicit control-flow edges or explicit operand recursion.
     fn walk(&mut self, e: &'a Expr, depth: u32) {
+        if let Some(region) = self.allocation_regions.last().copied() {
+            self.allocation_region_by_expr.insert(Self::expr_key(e), region);
+        }
         // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
         // enclosing locals); walk them so a captured value escaping its region is caught.
         if let Some(stages) = pipeline_stages(&e.kind) {
@@ -6859,7 +7204,9 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
             ExprKind::Arena(b) => {
                 let inner = depth + 1;
+                self.allocation_regions.push(Region::arena(inner));
                 self.lower_block(b, inner);
+                self.allocation_regions.pop();
                 if let Some(v) = &b.value {
                     self.push_flow_op(EscapeFlowOp::ArenaExit {
                         value: v,
@@ -6948,6 +7295,15 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ResultMapErr { result, f } => {
                 self.walk(result, depth);
                 self.walk(f, depth);
+                // `map_err` synthesizes a real call with the `Err` payload as a by-value
+                // argument. A Move error therefore obeys the same ownership-transfer rule as an
+                // explicit call. Result slots carry one cleanup-provenance bit, so a non-
+                // individual result must fail closed even when its runtime variant may be `Ok`.
+                if let Ty::Result(_, err) = result.ty
+                    && needs_drop_flag(scalar_to_ty(err), self.structs, self.tuples, self.enums)
+                {
+                    self.push_flow_op(EscapeFlowOp::CallTransfer(result, depth));
+                }
             }
             ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
@@ -6979,9 +7335,13 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(lhs, depth);
                 self.walk(rhs, depth);
             }
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { func, args, .. } => {
+                let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
                 for a in args {
                     self.walk(a, depth);
+                    if !borrows_args {
+                        self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
+                    }
                 }
             }
             // A fn value is a `Static` pointer (no region); an indirect call recurses its parts.
@@ -6998,6 +7358,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(callee, depth);
                 for a in args {
                     self.walk(a, depth);
+                    self.push_flow_op(EscapeFlowOp::CallTransfer(a, depth));
                 }
             }
             ExprKind::StructLit { fields, .. } => {
@@ -8276,15 +8637,14 @@ struct MoveCheck<'a> {
     /// getting a hidden owned `string` freed on each loop edge ([`owns_hidden_string`]), so no
     /// per-iteration root is recorded and an arena-scoped accumulator stays legal.
     ///
-    /// **This counts `arena` ONLY — deliberately unlike the two identically-named region counters
-    /// in this file** (`Checker::arena_depth` and the escape walk's `depth`), which also count
-    /// `task_group { … }`. They are right for their own job: a `task_group`'s values live in a
-    /// region, so the escape check must see one. This one must mirror MIR's `Builder::arenas`
-    /// exactly, and MIR keeps task groups on a *separate* stack — `b.arenas` is untouched by
-    /// `task_group`, so a `template` inside one still gets its hidden owner and still dies on the
-    /// enclosing loop's edge. Counting `task_group` here would make this pass believe otherwise and
-    /// silently re-open the use-after-free (only the region rule would still catch that shape, and
-    /// only because a `task_group` value cannot escape its block at all). Pinned by
+    /// **This counts `arena` ONLY**, like `Checker::arena_depth` and unlike the escape walk's
+    /// combined `depth`. The escape walk must count a `task_group` because task handles live in its
+    /// private region; this counter must mirror MIR's `Builder::arenas` exactly. MIR keeps task
+    /// groups on a separate stack — `b.arenas` is untouched by `task_group`, so a `template` inside
+    /// one still gets its hidden owner and still dies on the enclosing loop's edge. Counting
+    /// `task_group` here would make this pass believe otherwise and silently re-open the
+    /// use-after-free (only the region rule would still catch that shape, and only because a
+    /// `task_group` value cannot escape its block at all). Pinned by
     /// `borrow_liveness.rs::a_template_returned_out_of_a_task_group_in_a_loop_is_rejected`.
     arena_depth: u32,
 }
@@ -8700,7 +9060,9 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner)
             | ExprKind::TaskGet(inner) => self.borrow_sources(inner),
-            ExprKind::ResultMapErr { result, .. } => self.borrow_sources(result),
+            ExprKind::ResultMapErr { result, f } => {
+                union(vec![result.as_ref(), f.as_ref()])
+            }
             ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
                 let mut roots = BorrowRoots::new();
                 for elem in elems {
@@ -10100,12 +10462,12 @@ impl<'a> MoveCheck<'a> {
 
 /// One enclosing `loop` while type-checking a function body. A `break` bound to this loop unifies
 /// its value type into `break_ty` (seeded from the loop's expected type), exactly like `match` arms
-/// running-unify their bodies. `arena_depth` records the `arena`/`task_group` nesting at loop entry
-/// so a `break` inside a region nested within the loop can be rejected (deferred — see `check_break`).
+/// running-unify their bodies. `region_depth` records the combined `arena`/`task_group` nesting at
+/// loop entry so a `break` inside a nested region can be rejected (deferred — see `check_break`).
 struct LoopCtx {
     break_ty: Option<Ty>,
     saw_break: bool,
-    arena_depth: u32,
+    region_depth: u32,
 }
 
 struct Checker<'a, 't> {
@@ -11427,16 +11789,14 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::TaskGroup(b) => {
                 let diverges = ast_block_diverges(b);
-                // A `task_group` opens a region (like `arena {}`): spawned task handles are boxes
-                // in it, region-tied to the scope (so a `Task` can't escape).
+                // A `task_group` opens a task-only region: spawned environments/results live in it,
+                // but ordinary arena-requiring operations still need an explicit `arena {}`.
                 self.task_group_depth += 1;
-                self.arena_depth += 1;
                 self.wait_state.push(false);
                 self.task_group_fallible.push(false);
                 let block = self.check_block(b, if diverges { None } else { expected });
                 self.task_group_fallible.pop();
                 self.wait_state.pop();
-                self.arena_depth -= 1;
                 self.task_group_depth -= 1;
                 let ty = if diverges {
                     expected.unwrap_or(Ty::Unit)
@@ -14832,6 +15192,23 @@ impl<'a, 't> Checker<'a, 't> {
         Some((mangled, ret, Vec::new()))
     }
 
+    /// Fused pipeline call sites repeatedly pass their input to a user function by value. Until
+    /// MIR has an explicit move-out/null operation for an element or accumulator slot, admitting a
+    /// Move value would let the callee drop storage that the source pipeline still owns.
+    fn reject_move_pipeline_call_arg(&mut self, ty: Ty, label: &str, role: &str, span: Span) -> bool {
+        let ty = self.resolve(ty);
+        if !ty_is_move(ty, self.structs, self.tuples, self.enums) {
+            return false;
+        }
+        self.diags.error(
+            format!(
+                "'{label}' cannot pass a Move {role} by value to its function yet; use a Copy or borrowed value"
+            ),
+            span,
+        );
+        true
+    }
+
     /// The `idx`-th parameter type of a *named* function argument, to seed an inline-literal source's
     /// element type. A lambda has no signature to peek (its parameters are inferred), so it yields
     /// `None` (the literal then defaults like any unconstrained value).
@@ -15079,7 +15456,18 @@ impl<'a, 't> Checker<'a, 't> {
                         self.diags.error("a whole-struct `map`/`where` over `soa<T>` is not supported (it would gather every column); project a field first (`s.field.…`) or filter a field (`where(.field)`)".to_string(), span);
                         return None;
                     }
+                    if self.reject_move_pipeline_call_arg(elem, "map", "element", span) {
+                        return None;
+                    }
                     let (func, ret, captures) = self.resolve_stage_fn(&sf, elem, false)?;
+                    if ty_is_move(ret, self.structs, self.tuples, self.enums) {
+                        self.diags.error(
+                            "'map' cannot produce a Move element until pipeline iteration cleanup is implemented"
+                                .to_string(),
+                            span,
+                        );
+                        return None;
+                    }
                     stages.push(Stage { kind: StageKind::Map { func, captures }, out_ty: ret });
                     elem = ret;
                     mapped = true;
@@ -15092,6 +15480,9 @@ impl<'a, 't> Checker<'a, 't> {
                     // source).
                     if matches!(source.ty, Ty::Soa(_)) && matches!(elem, Ty::Struct(_)) {
                         self.diags.error("a whole-struct `map`/`where` over `soa<T>` is not supported (it would gather every column); filter a field with `where(.field)`".to_string(), span);
+                        return None;
+                    }
+                    if self.reject_move_pipeline_call_arg(elem, "where", "element", span) {
                         return None;
                     }
                     // doc-13 §6.6 / §11 P3 — repeated-needle plan hoisting. Recognise
@@ -15895,6 +16286,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if self.reject_move_pipeline_call_arg(elem, "partition", "element", span) {
+            return err;
+        }
         // The predicate has type `(elem) -> bool` (named or lambda).
         let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), "partition", span) else {
             return err;
@@ -15986,6 +16380,9 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        if self.reject_move_pipeline_call_arg(elem, "par_map", "element", span) {
+            return err;
+        }
         // `f: (elem) -> R` (named or lambda); `R` is inferred.
         let Some((func, r, captures)) = self.resolve_fn(fn_arg, &[elem], None, "par_map", span) else {
             return err;
@@ -16036,6 +16433,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if self.reject_move_pipeline_call_arg(elem, name, "element", span) {
+            return err;
+        }
         // Predicate must be `(elem) -> bool` (named or lambda).
         let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), name, span) else {
             return err;
@@ -16082,6 +16482,17 @@ impl<'a, 't> Checker<'a, 't> {
         // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
         // so it doesn't cascade into the lambda body / signature check (matching `scan`).
         if acc_ty == Ty::Error {
+            return err;
+        }
+        // MIR does not yet carry per-iteration ownership for the accumulator: a bound init source
+        // is not cleared, arena storage could cross the implicit call boundary, and a scanner error
+        // path could abandon the live value. Fail closed until all three paths transfer exactly.
+        if self.reject_move_pipeline_call_arg(acc_ty, "reduce", "accumulator", span) {
+            return err;
+        }
+        // The source element is only loaded, so a Move element would leave its source slot owning
+        // the same storage after the implicit reducer call.
+        if self.reject_move_pipeline_call_arg(elem, "reduce", "element", span) {
             return err;
         }
         // `f: (acc, elem) -> acc` (named or lambda).
@@ -16149,6 +16560,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if self.reject_move_pipeline_call_arg(elem, "scan", "element", span) {
+            return err;
+        }
         // The accumulator (output element) must be a *primitive* scalar to materialize into
         // `array<A>`. `ty_to_scalar` accepts `Ty::Struct` (a valid Option/Result payload), but
         // the buffer/PtrStore path has no struct-element support, so reject structs explicitly.
@@ -16166,6 +16580,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if self.reject_move_pipeline_call_arg(acc_ty, "scan", "accumulator", span) {
+            return err;
+        }
         // `f: (acc, elem) -> acc` (named or lambda).
         let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "scan", span) else {
             return err;
@@ -16233,6 +16650,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if self.reject_move_pipeline_call_arg(elem, "sort_by_key", "element", span) {
+            return err;
+        }
         // The key function `f: (elem) -> K`; `K` must be an orderable scalar.
         let Some((key_func, key_ty, captures)) = self.resolve_fn(fn_arg, &[elem], None, "sort_by_key", span) else {
             return err;
@@ -21484,7 +21904,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// whose arms all diverge — it satisfies any expected type, and the code after it is unreachable.
     /// The body's trailing value is discarded each iteration (checked with no expected type).
     fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
-        self.loops.push(LoopCtx { break_ty: expected, saw_break: false, arena_depth: self.arena_depth });
+        self.loops.push(LoopCtx {
+            break_ty: expected,
+            saw_break: false,
+            region_depth: self.arena_depth + self.task_group_depth,
+        });
         // The body is a per-iteration statement sequence: its tail value is discarded, so no
         // expected type is threaded to it. `break` statements inside drive the loop's value.
         // Bracket the body check with the `self.locals` length: every local declared inside the body
@@ -21524,8 +21948,8 @@ impl<'a, 't> Checker<'a, 't> {
         // Deferred: a `break` inside an `arena {}` / `task_group {}` that is itself inside the loop
         // would have to unwind (bulk-free) those regions on the jump to the loop exit — the scoped
         // region-cleanup-on-break wiring is a separate slice. Reject cleanly for now.
-        let loop_arena_depth = self.loops.last().unwrap().arena_depth;
-        if self.arena_depth > loop_arena_depth {
+        let loop_region_depth = self.loops.last().unwrap().region_depth;
+        if self.arena_depth + self.task_group_depth > loop_region_depth {
             self.diags.error(
                 "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet; move the `break` out of the region (restructure so the region ends before the `break`)".to_string(),
                 span,
@@ -24530,6 +24954,18 @@ mod tests {
     }
 
     #[test]
+    fn reduce_move_accumulators_are_rejected_until_cleanup_is_explicit() {
+        for src in [
+            "fn keep(acc: string, x: i64) -> string = acc\nfn main() -> i32 {\n  s := \"x\".clone()\n  out := [1, 2].reduce(s, keep)\n  return out.len() as i32\n}\n",
+            "fn replace(acc: array<i64>, x: i64) -> array<i64> = [x].to_array()\nfn main() -> i32 {\n  arena {\n    xs := [1].to_array()\n    out := [2].reduce(xs, replace)\n    return out.len() as i32\n  }\n}\n",
+            "fn main() -> i32 {\n  b := [1, 2].reduce(builder(), fn b, x { b.write_int(x); b })\n  return b.to_string().len() as i32\n}\n",
+        ] {
+            let (_p, d) = check(src);
+            assert!(d.has_errors(), "a Move reduce accumulator must be rejected");
+        }
+    }
+
+    #[test]
     fn str_clone_produces_returnable_owned_string() {
         // `str.clone()` yields a heap-owned `string` (region `Static`), so it can be returned out
         // of the arena its source was built in — the explicit escape hatch (MMv2 slice 7).
@@ -24928,6 +25364,239 @@ mod tests {
         // block's value (bound outside the arena) must be rejected.
         let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  bad := arena {\n    [1, 2, 3].map(double).to_array()\n  }\n  return 0\n}\n");
         assert!(d.has_errors(), "an arena-allocated owned array must not escape its arena");
+    }
+
+    #[test]
+    fn arena_owned_move_arguments_are_rejected() {
+        let direct =
+            "fn take(xs: array<i64>) -> i64 = xs.sum()\nfn main() -> i32 {\n  arena {\n    xs := [1, 2, 3].to_array()\n    return take(xs) as i32\n  }\n}\n";
+        let (_p, d) = check(direct);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "a direct call must not transfer arena-owned storage to a callee"
+        );
+
+        let indirect =
+            "fn take(xs: array<i64>) -> i64 = xs.sum()\nfn main() -> i32 {\n  f := take\n  arena {\n    xs := [1, 2, 3].to_array()\n    return f(xs) as i32\n  }\n}\n";
+        let (_p, d) = check(indirect);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "an indirect call must not transfer arena-owned storage to a callee"
+        );
+
+        let aggregate =
+            "fn make() -> array<i64> = [1].to_array()\nfn take(t: (array<i64>, array<i64>)) -> i64 = t.0.sum() + t.1.sum()\nfn main() -> i32 {\n  arena {\n    heap := make()\n    local := [2].to_array()\n    return take((heap, local)) as i32\n  }\n}\n";
+        let (_p, d) = check(aggregate);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "an aggregate containing arena-owned storage must not cross the call boundary"
+        );
+
+        let joined =
+            "fn make() -> array<i64> = [1].to_array()\nfn take(xs: array<i64>) -> i64 = xs.sum()\nfn run(c: bool) -> i32 {\n  arena {\n    mut xs := make()\n    if c {\n      xs = [2].to_array()\n    }\n    return take(xs) as i32\n  }\n}\nfn main() -> i32 = run(false)\n";
+        let (_p, d) = check(joined);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "a path-joined local that may be arena-owned must not transfer to a callee"
+        );
+    }
+
+    #[test]
+    fn free_standing_owned_move_arguments_are_allowed() {
+        let array =
+            "fn take(xs: array<i64>) -> i64 = xs.sum()\nfn main() -> i32 {\n  xs := [1, 2, 3].to_array()\n  return take(xs) as i32\n}\n";
+        let (_p, d) = check(array);
+        assert!(!d.has_errors(), "a free-standing owned array may transfer to a callee");
+
+        let heap_string =
+            "fn take(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  arena {\n    s := \"hello\".clone()\n    return take(s) as i32\n  }\n}\n";
+        let (_p, d) = check(heap_string);
+        assert!(
+            !d.has_errors(),
+            "a heap-owned string remains free-standing even when created inside an arena"
+        );
+
+        let borrowed_result =
+            "fn copy(xs: slice<i64>) -> array<i64> = xs.to_array()\nfn take(xs: array<i64>) -> i64 = xs.sum()\nfn main() -> i32 {\n  arena {\n    local := [1, 2, 3].to_array()\n    heap := copy(local)\n    return take(heap) as i32\n  }\n}\n";
+        let (_p, d) = check(borrowed_result);
+        assert!(
+            !d.has_errors(),
+            "a free-standing call result remains transferable when its borrow region is arena-shortened"
+        );
+    }
+
+    #[test]
+    fn map_err_obeys_move_call_transfer_rules() {
+        let arena_owned =
+            "fn discard(xs: array<i64>) -> i64 = xs.len()\nfn main() -> i32 {\n  arena {\n    r: Result<(), array<i64>> := Err([1, 2].to_array())\n    mapped := r.map_err(discard)\n    return 0\n  }\n}\n";
+        let (_p, d) = check(arena_owned);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "map_err must not transfer an arena-owned Move error to its mapper"
+        );
+
+        let free_standing =
+            "fn make() -> array<i64> = [1, 2].to_array()\nfn discard(xs: array<i64>) -> i64 = xs.len()\nfn main() -> i32 {\n  r: Result<(), array<i64>> := Err(make())\n  mapped := r.map_err(discard)\n  return 0\n}\n";
+        let (_p, d) = check(free_standing);
+        assert!(!d.has_errors(), "map_err may transfer a free-standing Move error");
+
+        let captured_str =
+            "E { Bad }\nfn leak() -> Result<i64, str> {\n  owned := \"x\".clone()\n  view: str := owned\n  r: Result<i64, E> := Err(E.Bad)\n  return r.map_err(fn _: E { view })\n}\n";
+        let (_p, d) = check(captured_str);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot return a view that borrows local storage")),
+            "map_err must not return a mapper result borrowed from a frame-local closure capture"
+        );
+    }
+
+    #[test]
+    fn pipeline_functions_reject_move_values_by_value() {
+        let map =
+            "P { xs: array<i64> }\nfn take(p: P) -> i64 = p.xs.len()\nfn main() -> i32 {\n  rows := [P { xs: [1, 2].to_array() }]\n  return rows.map(take).sum() as i32\n}\n";
+        let (_p, d) = check(map);
+        assert!(
+            d.iter().any(|e| e.message.contains("'map' cannot pass a Move element by value")),
+            "map must not copy a Move element into a callee"
+        );
+
+        let where_ =
+            "P { xs: array<i64> }\nfn keep(p: P) -> bool = p.xs.len() > 0\nfn main() -> i32 {\n  rows := [P { xs: [1, 2].to_array() }]\n  return rows.where(keep).count() as i32\n}\n";
+        let (_p, d) = check(where_);
+        assert!(
+            d.iter().any(|e| e.message.contains("'where' cannot pass a Move element by value")),
+            "where must not copy a Move element into a callee"
+        );
+
+        let reduce =
+            "P { xs: array<i64> }\nfn add(acc: i64, p: P) -> i64 = acc + p.xs.len()\nfn main() -> i32 {\n  rows := [P { xs: [1, 2].to_array() }]\n  return rows.reduce(0, add) as i32\n}\n";
+        let (_p, d) = check(reduce);
+        assert!(
+            d.iter().any(|e| e.message.contains("'reduce' cannot pass a Move element by value")),
+            "reduce must not copy a Move element into a callee"
+        );
+
+        let fixed_array_accumulator =
+            "P { xs: array<i64> }\nfn main() -> i32 {\n  rows := [P { xs: [1].to_array() }]\n  folded := [1, 2].reduce(rows, fn acc, x { acc })\n  return folded.len() as i32\n}\n";
+        let (_p, d) = check(fixed_array_accumulator);
+        assert!(
+            d.iter().any(|e| e.message.contains("'reduce' cannot pass a Move accumulator by value")),
+            "reduce must reject an inferred fixed Move-struct array accumulator"
+        );
+
+        let map_result =
+            "fn make(x: i64) -> array<i64> = [x].to_array()\nfn main() -> i32 {\n  return [1, 2].map(make).count() as i32\n}\n";
+        let (_p, d) = check(map_result);
+        assert!(
+            d.iter().any(|e| e.message.contains("'map' cannot produce a Move element")),
+            "map must not leak a Move result on every pipeline iteration"
+        );
+    }
+
+    #[test]
+    fn fixed_move_struct_array_cannot_be_captured_by_value() {
+        let src =
+            "P { xs: array<i64> }\nfn main() -> i32 {\n  rows := [P { xs: [1].to_array() }]\n  f := fn { rows.len() }\n  return f() as i32\n}\n";
+        let (_p, d) = check(src);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot capture the owned value 'rows'")),
+            "a fixed Move-struct array capture would copy and double-drop its elements"
+        );
+    }
+
+    #[test]
+    fn task_group_is_not_a_general_allocation_arena() {
+        let heap_new =
+            "fn main() -> i32 {\n  task_group {\n    p := heap.new(7)\n    print(p.get())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(heap_new);
+        assert!(
+            d.iter().any(|e| e.message.contains("heap.new must be used inside an `arena {}`")),
+            "task_group storage is reserved for spawned environments/results"
+        );
+
+        let free_standing =
+            "fn main() -> i32 {\n  task_group {\n    xs := [1, 2].to_array()\n    print(xs.len())\n  }\n  return 0\n}\n";
+        let (p, d) = check(free_standing);
+        assert!(!d.has_errors(), "ordinary owned values remain valid inside a task_group");
+        let main = p.fns.iter().find(|f| f.name == "main").expect("main HIR");
+        let xs = main.locals.iter().find(|l| l.name == "xs").expect("xs local");
+        assert!(
+            main.drop_individual_locals.contains(&xs.id),
+            "to_array without an explicit arena must keep its individual cleanup inside task_group"
+        );
+
+        let explicit =
+            "fn main() -> i32 {\n  task_group {\n    arena {\n      p := heap.new(7)\n      print(p.get())\n    }\n  }\n  return 0\n}\n";
+        let (_p, d) = check(explicit);
+        assert!(!d.has_errors(), "an explicit arena inside task_group still provides general region allocation");
+    }
+
+    #[test]
+    fn reduce_and_scan_results_preserve_borrowed_pipeline_regions() {
+        let reduce =
+            "fn pick(acc: str, x: str) -> str = x\nfn leak() -> str {\n  return task_group {\n    owned := \"x\".clone()\n    view: str := owned\n    views := [view]\n    views.reduce(\"\", pick)\n  }\n}\nfn main() -> i32 = 0\n";
+        let (_p, d) = check(reduce);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot escape as the block's value")),
+            "reduce must not let a source-borrowing result escape its task_group"
+        );
+
+        let scan =
+            "fn pick(acc: str, x: str) -> str = x\nfn leak() -> array<str> {\n  return task_group {\n    owned := \"x\".clone()\n    view: str := owned\n    views := [view]\n    views.scan(\"\", pick)\n  }\n}\nfn main() -> i32 = 0\n";
+        let (_p, d) = check(scan);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot escape as the block's value")),
+            "scan must not let source-borrowing elements escape their task_group"
+        );
+    }
+
+    #[test]
+    fn owned_aggregates_require_one_allocation_mode() {
+        let tuple =
+            "fn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    heap := make()\n    local := [2].to_array()\n    t := (heap, local)\n    print(t.0.len())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(tuple);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot mix free-standing and arena-owned")),
+            "a tuple with mixed owned allocation modes must be rejected"
+        );
+
+        let strukt =
+            "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    heap := make()\n    local := [2].to_array()\n    p := Pair { left: heap, right: local }\n    print(p.left.len())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(strukt);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot mix free-standing and arena-owned")),
+            "a struct with mixed owned allocation modes must be rejected"
+        );
+
+        let uniform =
+            "fn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  heap := (make(), make())\n  print(heap.0.len())\n  arena {\n    local := ([1].to_array(), [2].to_array())\n    print(local.1.len())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(uniform);
+        assert!(!d.has_errors(), "uniform heap and uniform arena aggregates must remain legal");
+
+        let arena_struct_call =
+            "Pair { left: array<i64>, right: array<i64> }\nfn take(p: Pair) -> i64 = p.left.len() + p.right.len()\nfn main() -> i32 {\n  arena {\n    p := Pair { left: [1].to_array(), right: [2].to_array() }\n    return take(p) as i32\n  }\n}\n";
+        let (_p, d) = check(arena_struct_call);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot be moved into a function call")),
+            "a bound uniformly arena-owned struct must retain arena provenance"
+        );
+
+        let field_reassign =
+            "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    mut p := Pair { left: make(), right: make() }\n    p.right = [2].to_array()\n    print(p.left.len())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(field_reassign);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
+            "field assignment must not introduce mixed aggregate ownership"
+        );
+
+        let joined_field =
+            "Wrap { xs: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn run(c: bool) -> i32 {\n  arena {\n    mut w := Wrap { xs: make() }\n    if c {\n      w = Wrap { xs: [2].to_array() }\n    }\n    w.xs = [3].to_array()\n    return 0\n  }\n}\nfn main() -> i32 = run(false)\n";
+        let (_p, d) = check(joined_field);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
+            "a heap/arena path-dependent aggregate must reject field mutation"
+        );
     }
 
     #[test]

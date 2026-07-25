@@ -736,6 +736,29 @@ it is not recomputed from the joined region.
 The table is exhaustive for value-carrying control syntax. Adding another form requires choosing
 both columns and adding the corresponding regression cells.
 
+A by-value function argument is an ownership transfer for a Move type. Only a free-standing owned
+value may cross that boundary: the callee owns and drops it. An arena-owned value remains tied to
+the caller's arena and cannot be passed by value; pass a non-owning slice/view instead. This rule
+applies recursively to tuples, structs, and sum-type payloads. A call evaluates all arguments before
+transferring them, so an early exit while evaluating a later argument leaves every earlier owned
+member under caller cleanup. Synthesized calls obey the same boundary: `Result.map_err` cannot pass
+an arena-owned Move error to its mapper. Pipeline functions cannot receive a Move source element
+by value or produce a Move element until the pipeline has explicit per-iteration cleanup; project
+or produce a Copy or borrowed value instead. `reduce` and materializing `scan` require a Copy
+accumulator until per-iteration transfer and every error cleanup path are explicit. `map_err`
+forwards the selected `Ok`/`Err` allocation bit with its rebuilt result, retains a fresh receiver
+while the mapper expression is evaluated, and includes mapper-capture borrows in the result region.
+A Move value leaving a value-carrying scope such as `task_group` transfers the trailing local's
+ownership bit and clears that inner source before the outer return or call takes ownership.
+
+One aggregate value uses one path-local cleanup bit. Its owned members must therefore use one
+allocation mode: all free-standing or all arena-owned. Mixing the two in one tuple, struct, sum
+value, or owned array is a compile error; keep them separate or construct every owned member in the
+same mode. Replacing an owned field or element must preserve the aggregate's mode. Borrowed fields
+do not affect this rule. A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
+but its owned fields or elements cannot be mutated until the mode is definite. Direct Move-struct
+and fixed-array bindings retain every completed field owner until initialization succeeds.
+
 ### 6.4 Arena
 
 ```align
@@ -1232,7 +1255,13 @@ total := users.reduce(0, fn acc, u {
 ### Task Group
 
 I/O concurrency uses `task_group` — a **structured** scope (like `arena {}`): the tasks it
-spawns cannot outlive it, and the scope joins them at its end.
+spawns cannot outlive it, and the scope joins them at its end. An early exit also joins first,
+before releasing any frame-owned or enclosing-arena storage captured by a task.
+
+The similarity to `arena` is the visible lifetime boundary, not general allocation permission.
+The task-group region stores only spawned closure environments and task result slots. Ordinary
+owned values created in the block keep their normal individual ownership; operations that require
+arena allocation, including `heap.new`, still require an explicit nested `arena {}`.
 
 ```align
 task_group {

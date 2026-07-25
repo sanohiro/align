@@ -211,6 +211,30 @@ individual-vs-arena bit. Value-carrying `block` / `if` / `match` / `else` / `?` 
 the value and select both on the same CFG edge. This keeps the one region lattice conservative for
 safety while making cleanup exact, without visible lifetime or ownership-mode syntax.
 
+**A Move call argument crosses an ownership boundary.** The callee has no caller-arena provenance,
+so only a free-standing owned value can be transferred by value and dropped there. An arena-owned
+value stays in its visible arena; code that only needs access passes a slice/view. Rejecting that
+transfer keeps allocation and cleanup visible and avoids a hidden per-member ownership ABI.
+Argument evaluation still belongs to the caller until the call is emitted, which requires
+component-wise cleanup provenance for temporary aggregates when a later argument exits early.
+The rule also covers synthesized calls. `Result.map_err` checks its Move error payload, while fused
+pipeline functions reject Move source and result elements until MIR has explicit element
+move-out/null and per-iteration cleanup. `map_err` carries the selected branch's runtime ownership
+bit through its rebuilt result, retains a fresh receiver during mapper evaluation, and joins mapper
+capture provenance into the result region. A materializing `scan` also rejects a Move accumulator
+because it retains every intermediate value; `reduce` rejects one until its per-iteration transfer
+and scanner error cleanup are explicit. Value-carrying scopes preserve the same exact transfer: a
+Move value leaving a `task_group` forwards its tail local's runtime cleanup bit and clears the inner
+source.
+
+**One aggregate, one allocation mode.** A bound aggregate has one path-local cleanup bit, so all of
+its owned members are free-standing or all are arena-owned. A mixed aggregate is rejected instead
+of leaking heap members or individually freeing arena storage. Borrowed members remain governed by
+the region lattice and do not affect this allocation choice. Owned field and element assignments
+must preserve the aggregate's mode. A one-owner aggregate can carry a path-dependent runtime mode,
+but mutation is rejected when the joined mode is not definite. Move-struct construction retains
+completed field owners until the complete value exists, including direct `let` initialization.
+
 **Explicit `.clone()` over a hidden copy-on-escape.** A zero-copy decoded view that needs to
 outlive its input is cloned *explicitly*; the compiler never inserts the copy silently. The
 cache-friendly fast path — borrow the input bytes, process, discard — is identical either
@@ -261,7 +285,9 @@ analysis (the same one that governs views and arenas) chooses: a non-escaping la
 pipeline `map`/`where`/`reduce`/`par_map`) is inlined with captures-as-parameters — zero
 allocation, SIMD/GPU-friendly; an escaping lambda gets an environment. That environment is not a
 new hidden cost class: it is **owned by the enclosing region** — the `task_group {}` / `arena {}`
-scope it escapes into — and freed with that region, exactly like every other region allocation. So
+scope it escapes into — and freed with that region, exactly like every other region allocation.
+The task-group region is reserved for spawned environments and result slots; it does not silently
+turn unrelated allocations in the block into arena allocations. So
 it stays inside the one region-based allocation model, and the *visible* act of escaping (and the
 *visible* enclosing scope) is the allocation boundary — consistent with **Nothing hidden** (no
 silent free-floating `malloc`). This is the load-bearing design point: it lets first-class function

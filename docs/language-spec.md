@@ -227,6 +227,25 @@ heap ownership from arena ownership. Moves clear the source; scope exit drops on
 individually owned value. A `mut` binding may therefore change allocation region when every assigned
 value outlives its scope, without leaking heap storage or individually freeing arena storage.
 
+A Move argument passed by value transfers ownership to the callee, which becomes responsible for
+its drop. Only free-standing owned values may cross a call boundary. Arena-owned values must stay
+in the caller's arena and be passed through a non-owning slice/view. The restriction is recursive
+for owned aggregates. Argument evaluation remains caller-owned until the call is reached, so an
+early exit while evaluating a later argument cleans up every earlier owned component. Synthesized
+calls follow the same rule: `Result.map_err` cannot pass an arena-owned Move error to its mapper,
+and a pipeline function cannot receive or produce a Move element without per-iteration cleanup.
+Project or produce a Copy or borrowed value instead. `reduce` and materializing `scan` require a
+Copy accumulator until per-iteration transfer and error cleanup are explicit. A mapped result
+preserves the selected `Ok`/`Err` allocation bit and cannot outlive either its source or mapper
+captures. A Move value leaving a `task_group` carries the trailing local's ownership bit and clears
+that inner source before an outer return or call takes ownership.
+
+An aggregate has one path-local cleanup bit, so its owned members must all be free-standing or all
+be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owned array is rejected.
+Replacing an owned field or element must preserve the existing mode. Borrowed members do not
+participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
+runtime mode, but mutation requires a definite mode.
+
 ### Error handling
 
 ```text
@@ -397,6 +416,11 @@ task_group
 ```
 
 No async/await in v1.
+Leaving a `task_group`, including by early return or error propagation, joins its tasks before
+captured frame-owned locals or enclosing-arena storage are released.
+Its private runtime region stores spawned environments and result slots only. It is not a general
+allocation arena: ordinary owned values keep individual ownership, and arena-only operations still
+require an explicit `arena {}`.
 
 ### Safety
 
