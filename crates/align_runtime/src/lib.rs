@@ -1850,8 +1850,9 @@ pub unsafe extern "C" fn align_rt_par_map(
     let out_buf = align_rt_alloc(bytes);
     // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
     // tiny maps (where the pool round-trip would dwarf the work) fall to the single-range caller
-    // path. Keep the existing conservative threshold; retuning it is a separate measurement gate.
-    const PAR_MIN_CHUNK: usize = 32768;
+    // path. The threshold is deliberately conservative for cheap/vectorizable bodies; retune only
+    // from the checked-in threshold probe and cross-host measurements.
+    const PAR_MIN_CHUNK: usize = 65536;
     // Run every element on the calling thread, no pool involved.
     let run_all_on_caller = || {
         let end = i64::try_from(count).expect("par_map count was validated from i64");
@@ -23026,12 +23027,12 @@ mod tests {
 
     #[test]
     fn par_map_correct_across_threshold_boundary() {
-        // Codex audit item 5: `PAR_MIN_CHUNK` (32_768) is the caller-only/pool-split boundary. A
+        // Codex audit item 5: `PAR_MIN_CHUNK` (65_536) is the caller-only/pool-split boundary. A
         // count at or below it must run the tiny-map fast path added above `par_pool()`; one above
         // it crosses into the pool-backed path. Both must produce identical, correct output --
         // this only checks correctness (see the `par_map_cold_start` integration test for the
         // pool-untouched pin, which needs a fresh process to observe reliably).
-        for &count in &[1i64, 7, 32_767, 32_768, 32_769, 65_537] {
+        for &count in &[1i64, 7, 65_535, 65_536, 65_537, 131_073] {
             let input: Vec<i64> = (0..count).collect();
             let output = unsafe {
                 align_rt_par_map(
@@ -23059,7 +23060,7 @@ mod tests {
         slot: *mut u8,
         _err: *mut u8,
     ) -> i32 {
-        const COUNT: i64 = 32_769;
+        const COUNT: i64 = 65_537;
         let base = unsafe { *(env as *const i64) };
         let input: Vec<i64> = (0..COUNT).map(|i| base + i).collect();
         let output = unsafe {
@@ -23082,7 +23083,7 @@ mod tests {
     }
 
     fn run_saturated_nested_par_map() {
-        const COUNT: i64 = 32_769;
+        const COUNT: i64 = 65_537;
         let (_, workers) = par_pool();
         let tasks = workers + 1;
         let tg = align_rt_tg_begin();

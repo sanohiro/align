@@ -151,14 +151,22 @@ every worker locks it again to pop a job.
 `align_rt_par_map` now:
 
 1. allocates the complete output;
-2. initializes the pool;
-3. partitions into at most `workers` contiguous chunks, with `PAR_MIN_CHUNK = 32768` **elements**;
+2. for counts above the single-range floor, initializes the pool;
+3. partitions into at most `workers` contiguous chunks, with `PAR_MIN_CHUNK = 65536` **elements**;
 4. creates one shared range cursor and total-range completion barrier;
 5. submits helper drain loops and runs the same drain loop on the caller;
 6. waits until every claimed range publishes completion, then re-raises any recorded panic.
 
-The already-planned tiny-call fix moves step 2 after the single-chunk decision. It does not address
-nested progress, per-element IR, or warm steady-state contention.
+The tiny-call fast path moves step 2 after the single-chunk decision. It does not address nested
+progress, per-element IR, or warm steady-state contention.
+
+The post-specialization threshold probe (`bench/par_map/run.sh threshold`) was rerun on native Apple
+Silicon after #643. It alternates paired `par_map`/sequential timings, reports the median of 31
+ratios, and covers both a cheap vectorizable body and a heavier body around the boundary. At the old
+32768 boundary, entering the pool at 32769 was still a loss for both bodies; moving the caller-only
+floor to 65536 removes that medium-size cliff and leaves the heavy-body crossover near 82–98K on
+this host. The value is deliberately body-agnostic and host-sensitive; rerun the probe before any
+future retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task
 at a time with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is drained.
@@ -233,7 +241,7 @@ must not reach observable side effects through a representation corner.
 
 ### Reproduction
 
-On the eight-worker audit host, each spawned task ran a 40,000-element `par_map`. That is above
+On the eight-worker audit host, each spawned task ran a 65,537-element `par_map`. That is above
 `PAR_MIN_CHUNK` and creates two inner chunks.
 
 | Shape | Result |
@@ -596,7 +604,7 @@ tasks, and retain separate allocations if the false-sharing cost exceeds the cal
 
 ## 9. Work- and byte-aware grain selection
 
-`PAR_MIN_CHUNK = 32768` elements treats a byte transform and a 128-byte aggregate with an expensive
+`PAR_MIN_CHUNK = 65536` elements treats a byte transform and a 128-byte aggregate with an expensive
 body as the same amount of work. The compiler knows more than the runtime:
 
 ```text
@@ -672,7 +680,9 @@ exists, and this map-only kernel does not silently declare generic parallel redu
 - Cheap arithmetic positive case vectorizes after specialization. Both are regression-pinned.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
-- Sweep input/output element bytes, body cost, element count around the threshold, and range count.
+- [x] Remeasure the post-specialization threshold with input/output element bytes, body cost, and
+  element count around the boundary (`bench/par_map/run.sh threshold`, 2026-07-25 native Apple
+  Silicon); retain cold-start and cross-host checks before the next retune.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 

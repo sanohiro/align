@@ -1,6 +1,11 @@
-// Benchmark kernel: par_map a moderately heavy per-element function over a slice, then sum. The
-// runtime now uses a persistent worker pool (no per-call OS-thread spawn), so this should beat
-// sequential Rust when there is real per-element work (and not regress on small inputs).
+// Benchmark kernels: compare a cheap vectorizable body and a moderately heavy body. The runtime
+// uses a persistent worker pool and one generated kernel per claimed range, so the threshold probe
+// can measure scheduler overhead after the whole-range specialization rather than the old
+// per-element callback path.
+fn cheap(x: i64) -> i64 {
+  return x * 3 + 1
+}
+
 fn work(x: i64) -> i64 {
   mut a := x
   a = a * 2654435761 + 12345
@@ -8,5 +13,7 @@ fn work(x: i64) -> i64 {
   a = a * 40503 - 99
   return a
 }
+pub fn pmap_cheap(s: slice<i64>) -> i64 = s.par_map(cheap).sum()
+pub fn smap_cheap(s: slice<i64>) -> i64 = s.map(cheap).sum()
 pub fn pmap(s: slice<i64>) -> i64 = s.par_map(work).sum()
 pub fn smap(s: slice<i64>) -> i64 = s.map(work).sum()

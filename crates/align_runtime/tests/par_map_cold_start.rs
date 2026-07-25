@@ -34,7 +34,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
         "the pool must not be touched before this fresh process does any parallel work"
     );
 
-    // A tiny `par_map` (far below `PAR_MIN_CHUNK` = 32_768) must run entirely on the caller.
+    // A tiny `par_map` (far below `PAR_MIN_CHUNK` = 65_536) must run entirely on the caller.
     const COUNT: i64 = 8;
     let input: Vec<i64> = (0..COUNT).collect();
     let output = unsafe {
