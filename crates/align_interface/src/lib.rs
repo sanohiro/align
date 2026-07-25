@@ -474,8 +474,9 @@ fn partition_capabilities(
 /// unit's functions' stable, location-free MIR text (names sorted so the encoding is
 /// declaration-order-independent). A body edit changes that unit's printed MIR and so its
 /// `impl_hash`; a pure comment/whitespace edit that lowers identically does not. Consumers never key
-/// on `impl_hash` (only on `interface_hash`), so this fingerprint drives exactly one thing: whether
-/// the unit's own object must be re-emitted.
+/// on `impl_hash` (only on `interface_hash`). Before the object cache is consulted, per-unit
+/// compilation replaces this compatibility and inspection value with [`codegen_impl_hash`] over the
+/// complete codegen input.
 fn partition_impl_hashes(
     modules: &[align_sema::Module],
     mir: &align_mir::Program,
