@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-25. `main` includes the shipped wave through #643.
-The current change retunes the post-specialization `par_map` range threshold from measured data._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #644.
+The current change separates the bounded PR gate from the retained full regression corpus._
 
 ## Start here
 
@@ -55,6 +55,7 @@ facts must live in this repository.
 #641  remove redundant JSON schema summaries from MIR
 #642  whole-range par_map kernels with direct vectorizable element loops
 #643  Copy-capturing par_map range contexts + integration-test hardening
+#644  par_map range-threshold retune from measured crossover data
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -97,7 +98,7 @@ so they use the same range kernel; staged and unsupported aggregate forms remain
 sequential. It also hardened malformed-expression cleanup, the macOS `fcntl` ABI,
 and the web integration-test startup retry.
 
-The threshold probe then moved the caller-only `PAR_MIN_CHUNK` floor from 32768
+The #644 threshold probe moved the caller-only `PAR_MIN_CHUNK` floor from 32768
 to 65536 on native Apple Silicon. It uses alternating paired timings and median
 ratios for cheap and heavy bodies; the value remains host- and body-sensitive, so
 rerun `bench/par_map/run.sh threshold` before another retune.
@@ -105,13 +106,13 @@ rerun `bench/par_map/run.sh threshold` before another retune.
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
 and the macOS release-build CI path. A local `cargo build --release --workspace`
-was rerun after #636. #637-#643 passed their focused and PR CI gates.
+was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-The capture-context slice is shipped in #643, and the current change implements
-the measure-first threshold retune. After it lands, the next recommended slice is
-wrapping-integer `par_map(...).sum()` fusion so the parallel operation can avoid
+The capture-context and threshold slices are shipped in #643 and #644. The
+current change implements the integration-test execution policy. After it lands,
+the next recommended slice is wrapping-integer `par_map(...).sum()` fusion so the parallel operation can avoid
 writing and rereading its full intermediate array. Length-preserving staged
 parallel lowering and the wider `task_group` low-lock work remain later
 measure-first follow-ups.
@@ -128,18 +129,15 @@ Consumer-gated deferrals that remain intentional:
 - The first pkg.web consumer application remains a separate, owner-scheduled
   task.
 
-After the current `par_map` threshold PR, review the integration-test execution
-policy. Do not make the full workspace suite or expensive differential-fuzz,
-network/filesystem, and performance suites mandatory on every PR. The default
-PR gate must stay bounded and deterministic and run tests directly related to
-the changed surface; retain the expensive suites as explicit, targeted checks
-or roughly monthly scheduled runs. The review must inspect the suite itself:
-remove redundant or low-value cases, move unit-level checks out of integration
-tests, and stop the suite from growing by accumulation without a clear
-correctness or regression role. Keep a focused regression test for a specific
-optimization when it protects that optimization, but do not accumulate those
-spot checks into an every-PR integration-test wall; merge or remove overlapping
-checks during the review.
+The integration-test execution-policy review is implemented in the current
+change. `scripts/test-pr.sh` is the bounded ordinary gate: workspace build,
+deterministic non-runtime library tests, and the M0 compile/link/run smoke.
+CI no longer runs the full workspace corpus or the pkg.web performance gate on
+each PR. Deep driver regressions, differential fuzz, runtime network/filesystem,
+and performance suites remain explicit change-specific checks;
+`scripts/test-full.sh` retains the full corpus for unusually broad work and
+versioned-release preparation. `docs/impl/16-test-policy.md` records the audit,
+commands, and suite-growth rule.
 
 ## Build and test notes
 
@@ -151,9 +149,12 @@ export LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config
 export LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib
 
 cargo build --workspace
-cargo test --workspace
+scripts/test-pr.sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Run `scripts/test-full.sh` only when the change scope or release preparation
+requires the retained full regression corpus.
 
 Operational rules:
 
@@ -174,6 +175,7 @@ Current decisions and open items     docs/open-questions.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
 Cache architecture and parity resolution    docs/impl/10-cache-first-optimization.md
+Test execution policy                docs/impl/16-test-policy.md
 Closure/memory/I/O/SIMD audit        docs/impl/12-pipeline-closure-memory-io-simd-audit.md
 Allocation and short-input audit     docs/impl/13-string-array-allocation-short-input-audit.md
 Source-correctness fixes             docs/impl/source-correctness-fixes-2026-07-13.md
