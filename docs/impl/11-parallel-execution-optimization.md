@@ -144,7 +144,7 @@ are unchanged.
 The output is freshly allocated and the runtime return is already marked `noalias`, but that fact
 does not compensate for hiding the counted loop behind the runtime ABI.
 
-### 3.3 The shared pool and barriers
+### 3.3 The shared pool and completion
 
 `ParPool` is one process-lifetime `Mutex<VecDeque<Box<dyn FnOnce()>>>` plus a `Condvar`
 ([pool](../../crates/align_runtime/src/lib.rs#L1376-L1418)). Every submit locks the global queue;
@@ -176,12 +176,12 @@ falls between 65,537 and 73,728 on this representative run; the fused sequential
 separate and later, with pool/seq falling below 1 at 131,072. The value is deliberately body-agnostic
 and host-sensitive; rerun the probe before any future retune.
 
-`align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task
-at a time with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is drained.
-After **every task**, the runner locks a shared `TgBarrier`, increments `done`, selects the
-lowest-index error/panic, and calls `notify_all`
-([wait loop](../../crates/align_runtime/src/lib.rs#L7319-L7395)). Only the caller waits on that
-condvar.
+`align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim a small
+contiguous batch with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is
+drained. After each claimed batch, the runner publishes one completion decrement through
+`TgCompletion`, records the lowest error index atomically, and records only the panic payload under
+a mutex. The final decrement wakes the caller through a `notify_one` guarded by the parker mutex
+([wait loop](../../crates/align_runtime/src/lib.rs)).
 
 Codegen separately allocates each spawned task's capture environment, result slot, and optional
 error slot, then registers one descriptor
@@ -520,7 +520,7 @@ parallel final reduction remains the separate, already-recorded language-semanti
 
 ## 8. Low-lock runtime direction
 
-### 8.1 Batch `task_group` claims and completion
+### 8.1 Batch `task_group` claims and completion — SHIPPED 2026-07-26
 
 Document 10 already records this as a CPU-cache probe; this section pins the parallel-runtime
 shape. For a large group, let each runner claim a small contiguous block:
@@ -550,6 +550,16 @@ completion decrement and perform an Acquire join/fence before reading them; a Re
 minimum is sound only when that completion latch supplies the happens-before edge. Never return
 before all result-slot writes are visible and all tasks have joined.
 
+The runtime now uses a four-way oversubscribed contiguous claim size, with grain 1 when the task
+count does not exceed the worker count. `TgCompletion` tracks remaining tasks with one Release
+decrement per claimed batch and an Acquire join, records the lowest error index atomically, keeps
+only panic payload selection behind a mutex, and protects the final `notify_one` with the parker
+mutex. The caller
+still drains the shared cursor, nested groups still make progress under pool saturation, and late
+helpers still exit before touching exhausted task descriptors. This removes the per-task barrier
+mutex and `notify_all`; body-aware grain, false-sharing measurement, and blocking-pool policy remain
+separate follow-ups.
+
 ### 8.2 Batch pool submission — SHIPPED 2026-07-26
 
 Add `submit_many`/runner-batch publication so one operation locks the global queue once, extends it,
@@ -561,7 +571,7 @@ The runtime now implements this shape in `ParPool::submit_many`. Both `par_map` 
 `task_group` runner helpers publish their jobs through one queue critical section, then notify one
 parked worker per queued job. The FIFO queue, job order, caller participation, and task claim
 semantics are unchanged; only producer-side lock traffic is removed. The low-lock task claim and
-completion latch remain a separate follow-up.
+completion latch are now shipped in the adjacent 8.1 slice.
 
 A dedicated bulk fork-join descriptor or bounded MPMC ring may be justified later, but only after
 queue lock telemetry. The operation count is at most roughly the worker count once range kernels
@@ -763,8 +773,8 @@ no indirect call inside the hot loop. Staged and unsupported aggregate forms rem
 ### Slice P2 — low-lock task execution
 
 - [x] Batch queue publication (2026-07-26).
-- Add adaptive contiguous claims.
-- Replace per-task barrier mutex/wake with runner-local accumulation and final-transition latch.
+- [x] Add adaptive contiguous claims (2026-07-26).
+- [x] Replace per-task barrier mutex/wake with an atomic completion latch (2026-07-26).
 - Measure false sharing before padding.
 - Probe one-allocation packed task records after block claiming is stable.
 

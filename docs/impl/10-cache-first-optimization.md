@@ -569,17 +569,19 @@ recorded in [`11-parallel-execution-optimization.md`](11-parallel-execution-opti
 subsection remains the cache-locality gate; document 11 is the parallel correctness source.
 
 Queue publication batching shipped on 2026-07-26: `par_map` and `task_group` now enqueue helper
-jobs through one `ParPool` queue critical section. The per-task claim and completion work below
-remains the separate measure-first probe.
+jobs through one `ParPool` queue critical section. Low-lock task-group claiming and completion
+shipped in the current change: runners claim contiguous batches, normal completion uses atomics,
+and only panic payload selection plus the final wake path use mutexes. Body-aware grain, false
+sharing, and blocking-pool policy remain separate measure-first probes.
 
-`align_rt_tg_wait` performs one shared atomic `fetch_add` per task and, after every task, locks one
-shared `TgBarrier`, updates it, and calls `notify_all`
-([implementation](../../crates/align_runtime/src/lib.rs#L7318-L7395)). For many tiny tasks, the
-task body can be cheaper than the cache-coherence and mutex traffic.
+`align_rt_tg_wait` now claims contiguous batches from one shared atomic cursor and publishes each
+claimed batch through an atomic completion latch
+([implementation](../../crates/align_runtime/src/lib.rs)). For many tiny tasks, the task body can
+be cheaper than the cache-coherence and mutex traffic.
 
-Probe runners claiming a small contiguous batch of indices at once and accumulating completion
-locally. Merge one local result per batch/runner; lock only for a real error/panic or the final
-completion transition. Preserve all existing semantics:
+The current shape claims a small contiguous batch at once and publishes one completion decrement
+per batch; only panic selection and the final completion transition use mutexes. Preserve all
+existing semantics:
 
 - caller participation and nested-group deadlock freedom;
 - every task claimed exactly once;

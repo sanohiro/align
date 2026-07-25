@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #647.
-The current change batches helper-job publication through the shared `ParPool` queue._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #649.
+The current change implements low-lock `task_group` claims and completion._
 
 ## Start here
 
@@ -58,6 +58,8 @@ facts must live in this repository.
 #644  par_map range-threshold retune from measured crossover data
 #646  separate bounded and full test suites
 #647  direct integer par_map reduction fusion and ABI documentation
+#648  batched parallel pool job publication
+#649  focused test selection policy
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -112,11 +114,11 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
-The capture-context, threshold, test-policy, and direct integer transform-reduce
-slices are shipped in #643, #644, #646, and #647. The current change implements
-batched helper-job publication through the shared `ParPool` queue. After it lands,
-the next recommended slice is the low-lock `task_group` claim/completion path.
-Length-preserving staged parallel lowering remains a later measure-first follow-up.
+The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
+and focused-verification slices are shipped in #643, #644, #646, #647, #648, and #649. The current
+change implements low-lock `task_group` claim/completion. After it lands, the next recommended
+slice is length-preserving staged parallel lowering; packed task records, body-aware grain, and
+false-sharing measurement remain later measure-first follow-ups.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -130,7 +132,8 @@ Consumer-gated deferrals that remain intentional:
 - The first pkg.web consumer application remains a separate, owner-scheduled
   task.
 
-The integration-test execution-policy review is implemented on `main` in #646.
+The integration-test execution-policy review is implemented on `main` in #646 and its
+focused-test-selection clarification shipped in #649.
 `scripts/test-pr.sh` is the bounded ordinary gate: workspace build,
 deterministic non-runtime library tests, and the M0 compile/link/run smoke.
 CI no longer runs the full workspace corpus or the pkg.web performance gate on

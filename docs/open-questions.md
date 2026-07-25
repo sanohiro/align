@@ -2426,9 +2426,10 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
   `ParPool` that `par_map` already built for exactly this cost. `tg_wait` now routes tasks through
   `ParPool` with a **caller-participating work-claiming** loop: the tasks live in a shared claim-once
-  list (`TgTasks`, `Send + Sync` by construction — each index is claimed exactly once via an atomic
-  cursor, each `env`/`slot`/`err_slot` is a private disjoint region allocation) with a join barrier
-  (`TgBarrier`: done-count + first-panic + first-errored-slot by lowest index). `wait()` dispatches
+  list (`TgTasks`, `Send + Sync` by construction — each contiguous batch is claimed exactly once via
+  an atomic cursor, each `env`/`slot`/`err_slot` is a private disjoint region allocation) with a
+  low-lock completion latch (`TgCompletion`: one Release decrement per batch, lowest error index by
+  atomic minimum, lowest panic by mutex, and a guarded final wake). `wait()` dispatches
   `min(workers, n-1)` runners onto the pool **and runs the same claim loop on the calling thread**,
   then blocks until every task is done (so the join still precedes the region free at `tg_end`). The
   panic-collecting behaviour is preserved (a worker panic is re-raised on the caller — defensive: a
@@ -2805,10 +2806,12 @@ watchdog close the progress path. The already-recorded whole-range specializatio
 2026-07-25: the runtime invokes one generated typed kernel per claimed range, the element body is a
 direct call, and cheap arithmetic vectorizes after inlining. Direct-source Copy-capturing `par_map`
 also uses the range kernel through a synchronous immutable context; staged and unsupported aggregate
-forms remain sequential. The current change implements direct wrapping-integer
-`par_map(...).sum()` fusion (remove the full intermediate write/read) in #647. The current change
-batches helper-job publication through one pool critical section. Length-preserving staged parallel
-lowering, low-lock task claim/completion, packed task records, and body/byte-aware grain remain.
+forms remain sequential. Direct wrapping-integer `par_map(...).sum()` fusion (remove the full
+intermediate write/read) shipped in #647, and helper-job publication batching shipped in #648. The
+current change implements low-lock task-group claim/completion: contiguous claims, one atomic
+completion decrement per batch, atomic error selection, panic capture under a mutex, and a guarded
+final wake. Length-preserving staged parallel lowering, packed task records, and body/byte-aware
+grain remain.
 Applying the already-recorded blocking-worker direction to generic `task_group` stays a later
 mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of
