@@ -428,19 +428,21 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::FloatHole(o) => format!("float({})", operand_str(o)),
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
-                    crate::TemplatePiece::OptionStructField { opt, name, struct_id, schema } => {
-                        format!("opt_struct_field({name:?}, struct#{struct_id} {schema}, {})", operand_str(opt))
+                    crate::TemplatePiece::OptionStructField { opt, name, struct_id } => {
+                        format!("opt_struct_field({name:?}, struct#{struct_id}, {})", operand_str(opt))
                     }
                     crate::TemplatePiece::PopComma => "pop_comma".to_string(),
                     crate::TemplatePiece::StructArrayField { array, struct_id } => format!("struct_array_field(struct#{struct_id}, {})", operand_str(array)),
                     crate::TemplatePiece::ScalarArrayField { array, elem } => format!("scalar_array_field({}, {})", crate::ty_name(align_sema::scalar_to_ty(*elem)), operand_str(array)),
-                    crate::TemplatePiece::UnionValue { value, enum_id, schema } => format!("union_value(enum#{enum_id} {schema}, {})", operand_str(value)),
+                    crate::TemplatePiece::UnionValue { value, enum_id } => {
+                        format!("union_value(enum#{enum_id}, {})", operand_str(value))
+                    }
                 })
                 .collect();
             format!("template[{}]", ps.join(", "))
         }
-        Rvalue::JsonDecode { struct_id, schema, input, out } => {
-            format!("json_decode(struct#{struct_id} {schema}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonDecode { struct_id, input, out } => {
+            format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDecodeArray { elem, input, out } => {
             format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
@@ -448,14 +450,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeScalar { scalar, input, out } => {
             format!("json_decode_scalar({} : {}, -> _{out})", operand_str(input), crate::ty_name(*scalar))
         }
-        Rvalue::JsonDecodeStructArray { struct_id, schema, input, out } => {
-            format!("json_decode_struct_array(struct#{struct_id} {schema}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
+            format!("json_decode_struct_array(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
-        Rvalue::JsonDecodeSoa { struct_id, schema, input, out, arena } => {
-            format!("json_decode_soa(struct#{struct_id} {schema}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
+        Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
+            format!("json_decode_soa(struct#{struct_id}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
         }
-        Rvalue::JsonDecodeUnion { enum_id, schema, input, out } => {
-            format!("json_decode_union(enum#{enum_id} {schema}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonDecodeUnion { enum_id, input, out } => {
+            format!("json_decode_union(enum#{enum_id}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDoc { input, arena, out } => {
             format!("json_doc({}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
@@ -471,8 +473,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDocKey { doc, index, out } => format!("json_doc_key({}, {}, -> _{out})", operand_str(doc), operand_str(index)),
         Rvalue::JsonDocElems { doc, arena, out } => format!("json_doc_elems({}, arena={}, -> _{out})", operand_str(doc), operand_str(arena)),
         Rvalue::JsonScanNew { input } => format!("json_scan_new({})", operand_str(input)),
-        Rvalue::JsonScanNext { scanner, struct_id, schema, cursor, row } => {
-            format!("json_scan_next({}, struct#{struct_id}, schema={schema:?}, cursor=_{cursor}, -> row _{row})", operand_str(scanner))
+        Rvalue::JsonScanNext { scanner, struct_id, cursor, row } => {
+            format!("json_scan_next({}, struct#{struct_id}, cursor=_{cursor}, -> row _{row})", operand_str(scanner))
         }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))

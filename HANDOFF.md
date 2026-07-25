@@ -5,8 +5,8 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-25. `main` includes the shipped wave through #639.
-The cold/cache build-result parity fix is the current work._
+_Last updated: 2026-07-25. `main` includes the shipped wave through #640.
+Removing obsolete JSON schema summaries from MIR is the current work._
 
 ## Start here
 
@@ -51,6 +51,7 @@ facts must live in this repository.
 #637  unified Claude/Codex guidance + compact handoff
 #638  Copy-struct array materialization
 #639  Unit-call values + aggregate call-ownership hardening
+#640  cold/cache build-result parity via complete structural MIR identity
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -73,6 +74,11 @@ allocation still requires an explicit nested `arena {}`.
 Both `reduce` and materializing `scan` require a Copy accumulator until MIR has
 explicit per-iteration transfer and error-path cleanup for Move values.
 
+#640 replaced the function-only implementation hash with the complete structural
+per-unit MIR program consumed by codegen. Type tables, declarations, linkage,
+alignment, and located metadata now participate automatically, so a warm cache
+hit cannot skip a cold codegen failure caused by an omitted backend input.
+
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
 and the macOS release-build CI path. A local `cargo build --release --workspace`
@@ -80,12 +86,13 @@ was rerun after #636.
 
 ## Next work
 
-Finish the cold/cache build-result parity fix: the per-unit implementation hash
-must cover the exact structural MIR program consumed by codegen, including type
-tables and linkage metadata, so a cache hit cannot skip a failure caused by an
-omitted backend input. Then select the next task from an owner request, a real
-consumer, or the current **Open** section of `docs/open-questions.md`; do not
-resurrect a superseded `NEXT` item from the archived journal.
+Remove the obsolete recursive JSON schema strings from MIR. #640 made the
+per-unit implementation hash cover the exact structural MIR program consumed by
+codegen, including its type tables, so the copied summaries no longer carry
+cache identity. JSON MIR nodes should retain only their target ids. Then select
+the next task from an owner request, a real consumer, or the current **Open**
+section of `docs/open-questions.md`; do not resurrect a superseded `NEXT` item
+from the archived journal.
 
 Consumer-gated deferrals that remain intentional:
 

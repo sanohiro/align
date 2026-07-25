@@ -6900,14 +6900,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("builder_into_string returns a {ptr,len}")
             }
             Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
-            // `schema` is a redundant legacy summary. Codegen rebuilds the descriptor table directly
-            // from `struct_id`, and cache identity includes the complete structural MIR Program.
-            Rvalue::JsonDecode { struct_id, input, out, .. } => self.gen_json_decode(*struct_id, input, *out)?,
+            Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
-            Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
-            Rvalue::JsonDecodeSoa { struct_id, input, out, arena, .. } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
-            Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => self.gen_json_decode_union(*enum_id, input, *out)?,
+            Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
+                self.gen_json_decode_struct_array(*struct_id, input, *out)?
+            }
+            Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
+                self.gen_json_decode_soa(*struct_id, input, *out, arena)?
+            }
+            Rvalue::JsonDecodeUnion { enum_id, input, out } => self.gen_json_decode_union(*enum_id, input, *out)?,
             // json.doc (J4). `get`/`at` are void (the runtime writes the child handle into `out`).
             Rvalue::JsonDoc { input, arena, out } => self.gen_json_doc(input, arena, *out)?,
             Rvalue::JsonDocKind { doc } => self.gen_json_doc_kind(doc, result_ty)?,
@@ -6937,7 +6939,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonScanNew { input } => self.operand(input)?,
             // One streaming step: decode the next object at `*cursor` into the `row` slot, return the
             // i32 status (0 = row / 1 = done / 2 = malformed).
-            Rvalue::JsonScanNext { scanner, struct_id, cursor, row, .. } => self.gen_json_scan_next(*struct_id, scanner, *cursor, *row)?,
+            Rvalue::JsonScanNext { scanner, struct_id, cursor, row } => {
+                self.gen_json_scan_next(*struct_id, scanner, *cursor, *row)?
+            }
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
@@ -10016,7 +10020,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // the payload struct via the runtime descriptor-driven encoder (the same schema decode
                 // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
                 // to an entry alloca so the encoder can read it by field offset.
-                align_mir::TemplatePiece::OptionStructField { opt, name, struct_id, .. } => {
+                align_mir::TemplatePiece::OptionStructField { opt, name, struct_id } => {
                     let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "ostag").map_err(|e| self.err(e))?.into_int_value();
                     let payload = self.builder.build_extract_value(agg, 1, "ospay").map_err(|e| self.err(e))?;
@@ -10101,7 +10105,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `json.encode` of a shape-directed union: materialize the enum value in memory (the
                 // runtime encoder reads the tag + live payload at byte offsets), then emit its bare
                 // payload via the descriptor-driven union encoder.
-                align_mir::TemplatePiece::UnionValue { value, enum_id, .. } => {
+                align_mir::TemplatePiece::UnionValue { value, enum_id } => {
                     let ety = self.enum_types[*enum_id as usize];
                     let v = self.operand(value)?;
                     // Hoist the scratch slot to the entry block so an `encode` inside a loop does not

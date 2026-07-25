@@ -126,8 +126,8 @@ encode は `Option` を含むオブジェクトを trailing-comma 方式に切�
 `None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と
 ネストした `Option<str>` を持つ payload はその `None` も省略）。payload struct は encodable であることを
 検証（`decode_struct_fields_ok`）し、非 Move を維持。構造化 MIR の指紋には payload struct の定義も
-含まれるため、手動でスキーマ文字列を受け渡さなくても `Option<struct>` payload のフィールド変更で
-decode/encode の両オブジェクトが無効化される。
+含まれるため、`Option<struct>` payload のフィールド変更で decode/encode の両オブジェクトが無効化される。
+JSON の MIR ノードは target id だけを持ち、手動で受け渡すスキーマ文字列は存在しない。
 
 **ネストされた構造体フィールド（REST-gateway runway, Slice A）。** 構造体のフィールドはそれ自身が
 `Struct` であってよい。`decode` はネストされたオブジェクトへ再帰し、`encode` はそれを再構築するため、
@@ -232,7 +232,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 - P2 — 投機的（Mison PHF）パスとスローパスは、**外部から観測可能な挙動が完全に同一（observably identical）** に保たれなければならない（重複キーの扱い、エスケープ文字、数値の境界値など）。パーサーに変更を加えた場合は、必ず両方のパスに対して再度ファジング（`fuzz_differential` 方式のオラクルテストまたは m5 コーパス）を実行する必要がある。
 - P3 — `encode` のエスケープ用テーブルは string builder のパスに組み込まれている。新しくエスケープが必要なフィールド型を追加する場合は、その場限りのエスケープ処理をインラインで書くのではなく、このテーブルの機能を拡張すること。
 - P4 — soa デコードのパフォーマンス目標（100万行の処理において `serde` と同等レベル、`bench/json_soa`）は、パフォーマンス低下（リグレッション）を検知するための罠（tripwire）である。パーサーの変更をマージする前に、必ずこのベンチマークを再実行すること。
-- P5 — **デコードターゲットのフィールドスキーマは codegen のキャッシュキーに反映されなければならない。** デコードターゲット構造体のフィールド名/型は周囲の文列ではなく codegen のディスクリプタテーブルに効く。そのため per-unit キーは、struct/enum テーブル、`layout(C)`、alignment を含む構造化 MIR Program 全体を指紋化する。`cache_codegen.rs` の gate 2/2b が flat、nested、型テーブルだけの変更を固定する。新しいスキーマ面も全 backend 入力を構造化 Program に置き、人向け MIR printer にキャッシュ専用文字列を追加してはならない。
+- P5 — **デコードターゲットのフィールドスキーマは codegen のキャッシュキーに反映されなければならない。** デコードターゲット構造体のフィールド名/型は周囲の文列ではなく codegen のディスクリプタテーブルに効く。そのため per-unit キーは、struct/enum テーブル、`layout(C)`、alignment を含む構造化 MIR Program 全体を指紋化する。`cache_codegen.rs` の gate 2/2b が flat、nested、型テーブルだけの変更を固定する。JSON の MIR ノードはコピーしたスキーマ文字列ではなく target id を持つ。新しいスキーマ面も全 backend 入力を構造化 Program に置き、人向け MIR printer にキャッシュ専用文字列を追加してはならない。
 
 ## Test anchors
 

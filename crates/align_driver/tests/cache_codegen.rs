@@ -256,9 +256,9 @@ fn gate2_type_table_only_edit_cannot_hit() {
 /// A `json.decode` target struct's field name/type feeds the codegen descriptor table rather than
 /// the surrounding statement sequence. A field RENAME at the same slot (or a NESTED struct's field
 /// change) therefore exercises the complete structural codegen-input fingerprint, including its
-/// type tables. The explicit `json_schema_sig` remains part of the decode rvalue, but cache safety no
-/// longer relies on the human MIR printer exposing every descriptor input. This gate pins that the
-/// rename misses on the unit's own MIR digest — both flat and nested.
+/// type tables. Decode rvalues carry only the target id; cache safety does not rely on the human MIR
+/// printer exposing every descriptor input. This gate pins that the rename misses on the unit's own
+/// MIR digest — both flat and nested.
 #[test]
 fn gate2b_json_decode_field_rename_invalidates() {
     if !backend() {
@@ -384,8 +384,8 @@ fn gate2e_json_option_struct_payload_rename_invalidates() {
     }
     // v1 payload `Inner { v, tag }`; v2 renames `tag` → `txt`. The JSON literal keeps key "tag"; every
     // other line is byte-identical. **Decode-only** (no `json.encode`) so this pins that the complete
-    // structural Program covers an Option payload's descriptor inputs independently of the redundant
-    // legacy schema string.
+    // structural Program covers an Option payload's descriptor inputs without a cache-only schema
+    // string.
     let v1 = "import core.json\nInner { v: i64, tag: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let v2 = "import core.json\nInner { v: i64, txt: str }\nOuter { a: i64, b: Option<Inner> }\nfn main() -> Result<(), Error> {\n  arena {\n    p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"h\\\"}}\")?\n    print(p.a)\n  }\n  return Ok(())\n}\n";
     let proj = Project::new("json-opt-struct-rename", &[("main.align", v1)], "main.align");

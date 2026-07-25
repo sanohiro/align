@@ -3942,11 +3942,10 @@ close the rest — no "this JSON shape works, that one doesn't" gap).**
   encodes uniformly — no partial support. `struct_has_str` recurses so a nested-`str` struct is
   region-tied to the input recursively. **Also fixed a pre-existing stale-cache miscompile this
   slice would have extended (the #514/#517 class):** a decode target struct's field name/type feeds
-  only the codegen descriptor, not the surrounding MIR, so a field RENAME at the same slot (or a
-  nested struct's field change) left `impl_hash` unchanged → the warm object cache served a stale
-  object decoding the OLD key (reproduced end-to-end). The `JsonDecode*` MIR rvalues now bake a
-  recursive `json_schema_sig` (names + types + `layout(C)`/`align`, nested expanded) printed into
-  the MIR; pinned by `cache_codegen.rs` gate 2b (flat + nested). Tests: `m5.rs`
+  the codegen descriptor rather than the surrounding statement sequence. The object cache now
+  fingerprints the complete structural MIR Program, including nested type tables, `layout(C)`, and
+  alignment; decode rvalues carry only the target id, with no cache-only schema string.
+  `cache_codegen.rs` gate 2b pins flat + nested changes. Tests: `m5.rs`
   (`json_decode_encode_nested_struct_roundtrip`, `json_decode_nested_struct_array_mison`), runtime
   descriptor-level (`json_decode_nested_struct_single`/`..._array_mison`), example
   `examples/json_nested.align`. (The broader `layout(C)`-toggle / field-reorder offset-cache concern
@@ -4151,13 +4150,15 @@ every variant one payload, each mapping to a shape class (Str/Number/Bool/Object
 (`decode_union_value`/`align_rt_json_decode_union`); encode writes the live payload bare
 (`json_encode_value` factored out of `json_encode_object`, `align_rt_json_encode_union`). New
 `Rvalue::JsonDecodeUnion` + `TemplatePiece::UnionValue` swept through every exhaustive HIR/MIR pass
-(region_of gives input-region for a str-bearing union, Static for scalar-only); `json_union_schema_sig`
-baked into the MIR for cache invalidation. Tests: `m5.rs` J1b section. **J1b-2b — SHIPPED: union as a
+(region_of gives input-region for a str-bearing union, Static for scalar-only); their enum ids select
+the structural type table that the object cache fingerprints. Tests: `m5.rs` J1b section.
+**J1b-2b — SHIPPED: union as a
 struct field** (`Message { content: Content }`) — a JSON descriptor **kind 6** whose `sub` is the
 `JsonUnion` (reused decode+encode); `field_width`/`write_value` (all decode paths) + `json_encode_value`
 grew a kind-6 arm; sema `decode_struct_fields_ok`/`json_object_parts` grew enum-field arms (both check
-union-decodability so `emit_json_union` never sees a bad enum); `json_schema_sig_into` expands a union
-field (cycle-safe). Composes with nested / `Option` / `array<Struct>` fields — the full
+union-decodability so `emit_json_union` never sees a bad enum); the structural MIR fingerprint
+includes the union type table directly. Composes with nested / `Option` / `array<Struct>` fields —
+the full
 `Chat { messages: array<Message> }` shape round-trips. Tests: `m5.rs` J1b-2b (field decode/encode,
 object-payload + Option coexist, array<Message>, non-union-enum-field rejected). **J2a — SHIPPED: enum
 owned `array<T>` payloads + tag-switched drop (the language prerequisite for the multimodal union).**
@@ -4190,9 +4191,9 @@ C (`json_payload_tag_sub` → `emit_json_union` arm; runtime `json_shape_class('
 `decode_union_value`/`write_value`/`field_width`, `encode_union_at`/`json_encode_value`), so the change
 is minimal: sema `union_shape_class` `Scalar::DynStructArray => Some(4)`; `check_union_decodable`'s
 class table `[_;4]` → `[_; JSON_SHAPE_CLASSES]` (an Array arm would else panic OOB) + recurse into the
-array **element** struct (decodable check); MIR `json_union_schema_sig_into` expands the element
-struct's schema (`[]{…}`) so an element-field rename invalidates the cache (#514/#517 class, pinned by
-`cache_codegen` gate 2c); runtime `drop_decoded_union` frees the materialized AoS on the
+array **element** struct (decodable check); the structural MIR fingerprint includes that element
+struct's fields, so a rename invalidates the cache (#514/#517 class, pinned by `cache_codegen` gate
+2c); runtime `drop_decoded_union` frees the materialized AoS on the
 trailing-garbage error path (the one new leak surface — the Align side has no bound value to drop on an
 `Err`; pinned by an `alloc-count` new==free gate). v1 boundary: `array<scalar>` union payloads
 (`Scalar::DynArray`) stay rejected ("no shape class") — no descriptor arm yet, deferred to J3. Tests:
@@ -4248,9 +4249,9 @@ per-scalar `write_value` (same range/sign/float-width checks per element); encod
 runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar_array`). Composes with J3b
 (a scalar-array field inside an `array<Move-struct>` element). Drop: the owned buffer flat-frees
 (`drop_struct_fields`'s `DynArray` arm on success; `drop_decoded_owned` kind-7 on the decode error path;
-`sub_owns_buffers` gained kind 7). Also fixed a pre-existing #514/#517 stale-cache bug: MIR `ty_name`
-rendered a bare `"array"` for `DynArray`, so a `array<i64>`→`array<f64>` element change didn't invalidate
-the decode cache (now renders the element). `array<str>` (borrowed element) / `array<char>` deferred. v1
+`sub_owns_buffers` gained kind 7). The structural MIR fingerprint includes the element scalar, so an
+`array<i64>`→`array<f64>` change invalidates the cache; the human MIR type name remains element-aware
+for inspection. `array<str>` (borrowed element) / `array<char>` deferred. v1
 limits: `.sum()`/pipelines over an owned scalar-array field and `json.encode` of a bare `array<scalar>`
 stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
 int / float / bool). Parses the WHOLE input as one JSON number / bool; the value is `Copy` (copied out,
@@ -4261,10 +4262,9 @@ top-level `array<scalar>` target already existed — MMv2 slice 8c.) **T1b (part
 `Some` → the nested object via the runtime descriptor-driven encoder (a new `OptionStructField` template
 piece + `align_rt_json_encode_object` FFI); `None` → the field omitted (trailing-comma + `PopComma`).
 Composes recursively; the payload struct must be non-Move (`Option<Move-struct>` stays rejected —
-Slice-B). Also fixed a pre-existing #514/#517 stale-cache bug: `json_schema_sig` folded an `Option<struct>`
-field to a bare `"Option"`, so a decode-only payload field rename didn't invalidate the cache — now
-recurses into the payload (and renders `Option<scalar>` width). Tests: `m5.rs` T1b, `cache_codegen`
-gate2e. **T1b is now COMPLETE** — `array<Option<T>>` is DEFERRED as a language-type gap (an owned array
+Slice-B). The structural MIR fingerprint includes the Option payload's type table, so a decode-only
+payload field rename invalidates the cache without a recursively threaded schema string. Tests:
+`m5.rs` T1b, `cache_codegen` gate2e. **T1b is now COMPLETE** — `array<Option<T>>` is DEFERRED as a language-type gap (an owned array
 of a composite element needs a dedicated `Ty`/`Scalar`, not a JSON matrix-fill; see the T1b entry above).
 **J4 `json.doc` — SLICE 1 SHIPPED** (the schema-unknown lazy document view MVP): a Copy `{tape,node}`
 handle (`Ty::JsonDoc` / `Scalar::JsonDoc`, region-tied to min(input, arena)); `json.doc(s)?` parses
@@ -4274,8 +4274,8 @@ ONCE into an arena-backed tape (`Result<json.doc, Error>` — malformed = `Err`,
 Missing`, matched by bare variant name); and the four leaf accessors `as_str`/`as_i64`/`as_f64`/
 `as_bool` → `Option` (`as_str` is a zero-copy input view, escaped strings unescape into the arena — the
 one allocating accessor). Runtime = a `simdjson`-style flat node array (per-node sibling-skip offsets;
-recursive validate-and-emit build) in `align_rt_json_doc_*`. Schema-UNKNOWN, so no `json_schema_sig`
-cache key (the tape is generic — nothing to stale). Threaded through every exhaustive HIR/MIR pass
+recursive validate-and-emit build) in `align_rt_json_doc_*`. Schema-UNKNOWN, so the tape carries no
+typed target id (it is generic — nothing to stale). Threaded through every exhaustive HIR/MIR pass
 (region_of = min(input, arena) for the doc / receiver-region for `get`/`at`/`as_str` / `Static` for
 `kind`/`as_i64/f64/bool`; `tracks_region` + `ty_may_borrow` + `borrow_sources` = the input roots).
 Tests: `m5.rs` (navigate + kind-match + leaf accessors, malformed→Err, arena gate, view-escape
