@@ -19,6 +19,9 @@ crate-type = ["lib", "staticlib", "cdylib"]
 # `bench/adaptive_sort` probe to prove the `len <= 32` sort short-size scratch matrix allocates only
 # the materialize buffer(s). Not a runtime capability — a measurement aid.
 alloc-count = []
+# Measurement aid for `bench/par_map`: expose a caller-only switch so the threshold probe can
+# compare the pooled kernel with the same materializing `par_map` kernel without the scheduler.
+par-map-probe = []
 
 [dependencies]
 align_hash = { path = "../align_hash" }

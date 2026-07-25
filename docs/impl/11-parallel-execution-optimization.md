@@ -151,14 +151,28 @@ every worker locks it again to pop a job.
 `align_rt_par_map` now:
 
 1. allocates the complete output;
-2. initializes the pool;
-3. partitions into at most `workers` contiguous chunks, with `PAR_MIN_CHUNK = 32768` **elements**;
+2. for counts above the single-range floor on a host with multiple available workers, initializes
+   the pool; a one-worker host remains caller-only;
+3. partitions into at most `workers` contiguous, balanced chunks, using `PAR_MIN_CHUNK = 65536`
+   **elements** as the caller-only floor and initial grain target;
 4. creates one shared range cursor and total-range completion barrier;
 5. submits helper drain loops and runs the same drain loop on the caller;
 6. waits until every claimed range publishes completion, then re-raises any recorded panic.
 
-The already-planned tiny-call fix moves step 2 after the single-chunk decision. It does not address
-nested progress, per-element IR, or warm steady-state contention.
+The tiny-call fast path moves step 2 after the single-chunk decision. It does not address nested
+progress, per-element IR, or warm steady-state contention.
+
+The post-specialization threshold probe (`bench/par_map/run.sh threshold`) was rerun on native Apple
+Silicon after #643. It uses the opt-in probe runtime, skips one-worker hosts because the pool path is
+intentionally disabled there, and alternates all six paired pooled/caller-only/sequential orders so
+each arm occupies every timing slot. It reports the median of 31 `pool/seq` and `pool/caller` ratios
+and covers both a cheap vectorizable body and a heavier body around the boundary. At the old 32768
+boundary, entering the pool at 32769 was still a loss against the fused sequential control; moving
+the caller-only floor to 65536 keeps that medium-size region on the caller. The balanced range plan
+avoids a one-element helper at the first pool-eligible size, and the heavy-body pool/caller crossover
+falls between 65,537 and 73,728 on this representative run; the fused sequential comparison is
+separate and later, with pool/seq falling below 1 at 131,072. The value is deliberately body-agnostic
+and host-sensitive; rerun the probe before any future retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task
 at a time with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is drained.
@@ -233,7 +247,7 @@ must not reach observable side effects through a representation corner.
 
 ### Reproduction
 
-On the eight-worker audit host, each spawned task ran a 40,000-element `par_map`. That is above
+On the eight-worker audit host, each spawned task ran a 65,537-element `par_map`. That is above
 `PAR_MIN_CHUNK` and creates two inner chunks.
 
 | Shape | Result |
@@ -596,7 +610,7 @@ tasks, and retain separate allocations if the false-sharing cost exceeds the cal
 
 ## 9. Work- and byte-aware grain selection
 
-`PAR_MIN_CHUNK = 32768` elements treats a byte transform and a 128-byte aggregate with an expensive
+`PAR_MIN_CHUNK = 65536` elements treats a byte transform and a 128-byte aggregate with an expensive
 body as the same amount of work. The compiler knows more than the runtime:
 
 ```text
@@ -642,9 +656,10 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 ### MIR and reduction
 
 MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
-range loop instead of an element thunk. Captures, prior stages, and a cost summary are not present
-yet, so those cases remain sequential. No complete source-visible associativity/floating-order rule
-exists, and this map-only kernel does not silently declare generic parallel reduction settled.
+range loop instead of an element thunk. Copy captures use the call-scoped context described above;
+prior stages and a cost summary are not present yet, so those cases remain sequential. No complete
+source-visible associativity/floating-order rule exists, and this map-only kernel does not silently
+declare generic parallel reduction settled.
 
 ---
 
@@ -672,7 +687,11 @@ exists, and this map-only kernel does not silently declare generic parallel redu
 - Cheap arithmetic positive case vectorizes after specialization. Both are regression-pinned.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
-- Sweep input/output element bytes, body cost, element count around the threshold, and range count.
+- [x] Remeasure the post-specialization threshold across body costs and element counts around the
+  boundary (`bench/par_map/run.sh threshold`, 2026-07-25 native Apple Silicon); retain cold-start,
+  element-width, aggregate-size, and cross-host checks before the next retune.
+- [ ] Sweep input/output element widths and aggregate sizes before treating the floor as a general
+  cost model rather than this host's measured `i64` probe result.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 

@@ -120,11 +120,11 @@ bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
   is a general builder-chain batcher for shapes beyond `str,int,str`. This is the string-accumulation
   tool the `str + str`-in-a-lambda error points to.
 - **Data-parallel map (`bench/par_map/`): the persistent worker pool removed the spawn regression
-  (100k went ~7× slower → same order as sequential).** Old `par_map` spawned OS threads per call; now
-  it submits chunks to a process-lifetime pool. Chunk tuning helps, but profile mode shows cheap
-  arithmetic still loses to Align's own sequential/vectorized `map().sum()` because every element
-  crosses an indirect `thunk` call. Use `par_map` for heavier/non-vectorizable work; cheap maps need
-  sequential fallback or thunk specialization.
+  (100k went ~7× slower → same order as sequential).** The current whole-range kernel emits one
+  typed loop per claimed range, so direct bodies can inline and vectorize; the remaining cost is
+  range scheduling and the intermediate output. The threshold probe keeps the body-agnostic
+  caller-only floor at 65,536 elements on the current host. Cheap maps can still lose to the
+  sequential fused loop; measure before choosing explicit parallelism.
 - **Adaptive stable sort (`bench/adaptive_sort/`): SHIPPED — ordered-input wins (already-sorted 3.6×,
   tail-swap/1%-swap 1.14–1.17×) with merge-heavy negatives within ≈2%.** Getting there was a
   measurement lesson. On WSL2 (no CPU-frequency control) a naive block-sequential AB comparison of two

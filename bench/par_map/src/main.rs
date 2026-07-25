@@ -1,7 +1,6 @@
 //! par_map duel: Align `s.par_map(work).sum()` (persistent worker pool) vs Rust sequential and Rust
-//! `rayon` (work-stealing pool). `work` is a moderately heavy per-element function so parallelism
-//! can actually pay off. We vary N down to small sizes — the old per-call OS-thread spawn made
-//! small `par_map` far slower than sequential; the pool should fix that.
+//! `rayon` (work-stealing pool). `bench/par_map/run.sh threshold` separately probes the
+//! caller-only/pool boundary with a balanced median ratio after warming the pool.
 
 use rayon::prelude::*;
 use std::time::Instant;
@@ -14,10 +13,25 @@ struct Slice {
 }
 
 extern "C" {
+    /// `pub fn pmap_cheap(s: slice<i64>) -> i64` — cheap vectorizable body.
+    #[cfg(feature = "probe")]
+    fn pmap_cheap(s: Slice) -> i64;
+    /// `pub fn smap_cheap(s: slice<i64>) -> i64` — sequential cheap body.
+    #[cfg(feature = "probe")]
+    fn smap_cheap(s: Slice) -> i64;
     /// `pub fn pmap(s: slice<i64>) -> i64` — `s.par_map(work).sum()`.
     fn pmap(s: Slice) -> i64;
     /// `pub fn smap(s: slice<i64>) -> i64` — sequential `s.map(work).sum()`.
     fn smap(s: Slice) -> i64;
+    /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
+    fn align_rt_test_par_map_force_caller(force: i32);
+    /// Benchmark-only threshold getter, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
+    fn align_rt_test_par_map_min_chunk() -> i64;
+    /// Benchmark-only worker-count getter, present in the opt-in `par-map-probe` runtime build.
+    #[cfg(feature = "probe")]
+    fn align_rt_test_par_map_workers() -> i64;
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -35,57 +49,168 @@ fn rust_seq(s: &[i64]) -> i64 {
 }
 
 fn rust_rayon(s: &[i64]) -> i64 {
-    s.par_iter().map(|&x| work(x)).reduce(|| 0i64, i64::wrapping_add)
+    s.par_iter()
+        .map(|&x| work(x))
+        .reduce(|| 0i64, i64::wrapping_add)
 }
 
 fn gen(n: usize) -> Vec<i64> {
     let mut v = vec![0i64; n];
     let mut s: u64 = 0x9E3779B97F4A7C15;
     for d in v.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *d = (s >> 33) as i64;
     }
     v
 }
 
-fn main() {
+#[cfg(feature = "probe")]
+type Kernel = unsafe extern "C" fn(Slice) -> i64;
+
+#[cfg(feature = "probe")]
+#[derive(Clone, Copy)]
+struct ThresholdCase {
+    name: &'static str,
+    par: Kernel,
+    seq: Kernel,
+}
+
+#[cfg(feature = "probe")]
+fn call(kernel: Kernel, slice: Slice) -> i64 {
+    // The benchmark exports are checked Align functions with the same C ABI; the harness owns the
+    // backing Vec for the full duration of every call.
+    unsafe { kernel(slice) }
+}
+
+#[cfg(feature = "probe")]
+fn elapsed_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
+    let start = Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(call(kernel, slice));
+    }
+    start.elapsed().as_secs_f64() * 1e3
+}
+
+#[cfg(feature = "probe")]
+fn elapsed_caller_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
+    unsafe { align_rt_test_par_map_force_caller(1) };
+    let elapsed = elapsed_ms(kernel, slice, reps);
+    unsafe { align_rt_test_par_map_force_caller(0) };
+    elapsed
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[index]
+}
+
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    percentile(&samples, 0.5)
+}
+
+fn run_standard() {
     let rounds = 50;
     let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("par_map(work).sum() — Align (pool) vs Rust sequential / rayon");
-    println!("{:>9}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}", "n", "align ms", "seq ms", "rayon ms", "vs seq", "vs rayon");
+    println!(
+        "{:>9}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}",
+        "n", "align ms", "seq ms", "rayon ms", "vs seq", "vs rayon"
+    );
     for &n in &[1_000usize, 10_000, 100_000, 1_000_000] {
         let data = gen(n);
-        let sl = Slice { ptr: data.as_ptr(), len: n as i64 };
+        let sl = Slice {
+            ptr: data.as_ptr(),
+            len: n as i64,
+        };
 
         // Correctness: Align (pool, parallel) must equal the sequential fold (no races / lost work).
-        let a0 = unsafe { pmap(Slice { ptr: sl.ptr, len: sl.len }) };
+        let a0 = unsafe {
+            pmap(Slice {
+                ptr: sl.ptr,
+                len: sl.len,
+            })
+        };
         assert_eq!(a0, rust_seq(&data), "align vs sequential");
         assert_eq!(a0, rust_rayon(&data), "align vs rayon");
-        assert_eq!(unsafe { smap(Slice { ptr: sl.ptr, len: sl.len }) }, a0, "align sequential vs par_map");
+        assert_eq!(
+            unsafe {
+                smap(Slice {
+                    ptr: sl.ptr,
+                    len: sl.len,
+                })
+            },
+            a0,
+            "align sequential vs par_map"
+        );
 
-        let (mut am, mut sm, mut rm) = (f64::MAX, f64::MAX, f64::MAX);
-        let mut align_seq = f64::MAX;
-        for _ in 0..rounds {
-            let t = Instant::now();
-            std::hint::black_box(unsafe { pmap(Slice { ptr: sl.ptr, len: sl.len }) });
-            am = am.min(t.elapsed().as_secs_f64() * 1e3);
-
-            if profile {
+        let mut align_samples = Vec::with_capacity(rounds);
+        let mut seq_samples = Vec::with_capacity(rounds);
+        let mut rayon_samples = Vec::with_capacity(rounds);
+        let mut align_seq_samples = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let align = || {
                 let t = Instant::now();
-                std::hint::black_box(unsafe { smap(Slice { ptr: sl.ptr, len: sl.len }) });
-                align_seq = align_seq.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(unsafe {
+                    pmap(Slice {
+                        ptr: sl.ptr,
+                        len: sl.len,
+                    })
+                });
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let seq = || {
+                let t = Instant::now();
+                std::hint::black_box(rust_seq(&data));
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let rayon = || {
+                let t = Instant::now();
+                std::hint::black_box(rust_rayon(&data));
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            let align_seq = || {
+                let t = Instant::now();
+                std::hint::black_box(unsafe {
+                    smap(Slice {
+                        ptr: sl.ptr,
+                        len: sl.len,
+                    })
+                });
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            if round % 2 == 0 {
+                align_samples.push(align());
+                seq_samples.push(seq());
+                rayon_samples.push(rayon());
+                if profile {
+                    align_seq_samples.push(align_seq());
+                }
+            } else {
+                rayon_samples.push(rayon());
+                seq_samples.push(seq());
+                align_samples.push(align());
+                if profile {
+                    align_seq_samples.push(align_seq());
+                }
             }
-
-            let t = Instant::now();
-            std::hint::black_box(rust_seq(&data));
-            sm = sm.min(t.elapsed().as_secs_f64() * 1e3);
-
-            let t = Instant::now();
-            std::hint::black_box(rust_rayon(&data));
-            rm = rm.min(t.elapsed().as_secs_f64() * 1e3);
         }
-        println!("{:>9}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x", n, am, sm, rm, sm / am, rm / am);
+        let am = median(align_samples);
+        let sm = median(seq_samples);
+        let rm = median(rayon_samples);
+        println!(
+            "{:>9}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x",
+            n,
+            am,
+            sm,
+            rm,
+            sm / am,
+            rm / am
+        );
         if profile {
+            let align_seq = median(align_seq_samples);
             println!(
                 "profile n={n}: align-seq {:8.3} ms; pmap is {:5.2}x align-seq",
                 align_seq,
@@ -93,4 +218,134 @@ fn main() {
             );
         }
     }
+}
+
+#[cfg(feature = "probe")]
+fn run_threshold() {
+    // Keep the expected value explicit for the checked-in measurement table, but read the actual
+    // runtime value too so a future retune cannot silently leave the probe out of sync.
+    const EXPECTED_PAR_MIN_CHUNK: usize = 65_536;
+    let runtime_min = usize::try_from(unsafe { align_rt_test_par_map_min_chunk() })
+        .expect("runtime par_map threshold must be non-negative");
+    assert_eq!(
+        runtime_min, EXPECTED_PAR_MIN_CHUNK,
+        "update the checked-in threshold probe after changing the runtime threshold"
+    );
+    let runtime_workers = usize::try_from(unsafe { align_rt_test_par_map_workers() })
+        .expect("runtime par_map worker count must be positive");
+    if runtime_workers <= 1 {
+        println!("par_map threshold probe skipped: runtime reports {runtime_workers} worker; the pool path is intentionally disabled on a one-worker host");
+        return;
+    }
+    let par_min_chunk = runtime_min;
+    const ROUNDS: usize = 31;
+    let counts = [
+        16_384usize,
+        32_768,
+        32_769,
+        49_152,
+        65_535,
+        65_536,
+        65_537,
+        73_728,
+        81_920,
+        98_304,
+        131_072,
+        196_608,
+        262_144,
+    ];
+    let cases = [
+        ThresholdCase {
+            name: "cheap",
+            par: pmap_cheap,
+            seq: smap_cheap,
+        },
+        ThresholdCase {
+            name: "heavy",
+            par: pmap,
+            seq: smap,
+        },
+    ];
+
+    // Initialize the persistent pool once, so the table measures the steady-state choice at the
+    // boundary. Cold-start behavior is pinned separately by the runtime integration test.
+    let warm = gen(par_min_chunk * 2);
+    let warm_slice = Slice {
+        ptr: warm.as_ptr(),
+        len: warm.len() as i64,
+    };
+    std::hint::black_box(call(pmap, warm_slice));
+
+    println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples, {runtime_workers} workers)");
+    println!("n <= {par_min_chunk}: caller-only; n > {par_min_chunk}: pool eligible");
+    println!(
+        "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}",
+        "n", "case", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
+    );
+    for &n in &counts {
+        let data = gen(n);
+        let slice = Slice {
+            ptr: data.as_ptr(),
+            len: n as i64,
+        };
+        // Batch small maps so each timing contains roughly one million body elements. Repeating
+        // the same call preserves the per-call scheduler cost while making the clock resolution
+        // and transient worker wakeups a small part of each sample.
+        let reps = (1_048_576usize / n).max(1);
+        for case in cases {
+            let expected = call(case.seq, slice);
+            assert_eq!(call(case.par, slice), expected, "{} n={n}", case.name);
+            // Cycle through all six permutations so pool, caller, and sequential each occupy every
+            // timing slot. The median of ratios keeps correlated frequency drift in the pair.
+            let mut pool_seq_ratios = Vec::with_capacity(ROUNDS);
+            let mut pool_caller_ratios = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                let order = match round % 6 {
+                    0 => [0, 1, 2],
+                    1 => [2, 1, 0],
+                    2 => [1, 0, 2],
+                    3 => [2, 0, 1],
+                    4 => [1, 2, 0],
+                    _ => [0, 2, 1],
+                };
+                let mut elapsed = [0.0; 3];
+                for arm in order {
+                    elapsed[arm] = match arm {
+                        0 => elapsed_ms(case.par, slice, reps),
+                        1 => elapsed_caller_ms(case.par, slice, reps),
+                        _ => elapsed_ms(case.seq, slice, reps),
+                    };
+                }
+                let [pool_ms, caller_ms, seq_ms] = elapsed;
+                pool_seq_ratios.push(pool_ms / seq_ms);
+                pool_caller_ratios.push(pool_ms / caller_ms);
+            }
+            pool_seq_ratios.sort_by(f64::total_cmp);
+            pool_caller_ratios.sort_by(f64::total_cmp);
+            let pool_seq_median = percentile(&pool_seq_ratios, 0.5);
+            let pool_caller_median = percentile(&pool_caller_ratios, 0.5);
+            let p10 = percentile(&pool_seq_ratios, 0.1);
+            let p90 = percentile(&pool_seq_ratios, 0.9);
+            println!(
+                "{n:>9}  {:>8}  {pool_seq_median:>18.3}  {pool_caller_median:>18.3}  {p10:.3}..{p90:.3}",
+                case.name,
+            );
+        }
+    }
+}
+
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("threshold") {
+        #[cfg(feature = "probe")]
+        {
+            run_threshold();
+            return;
+        }
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("threshold mode requires the probe feature");
+            std::process::exit(2);
+        }
+    }
+    run_standard();
 }

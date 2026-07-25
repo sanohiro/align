@@ -1,8 +1,8 @@
 //! `par_map(f)` — apply a Pure function to each element, materializing an owned `array<R>`
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
-//! capturing forms use the same range kernel through an immutable call-scoped context; staged forms
-//! retain the sequential fallback.
+//! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
+//! staged forms retain the sequential fallback and Move captures are rejected by ownership checks.
 
 
 mod common;
@@ -49,12 +49,15 @@ fn par_map_capturing_lambda_uses_parallel_range_kernel() {
         "the direct body call must receive the capture value:\n{kernel}"
     );
 
-    // Cross the runtime's range threshold too: the context must remain live while pool workers
-    // execute the generated kernel, not only on the caller-only small-input path.
-    let large_src = "fn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 32769 { break }\n  }\n  xs := b.build()\n  k := 10\n  ys := xs.par_map(fn x { x + k })\n  print(ys[0])\n  print(ys[32768])\n  return Ok(())\n}\n";
+    // Cross the runtime's range threshold too: the context must remain valid when the runtime
+    // takes the pool-eligible path, not only on the caller-only small-input path. The IR
+    // assertions above pin the generated range kernel; this run pins context correctness for
+    // both paths. A one-worker host legitimately executes the single range on the caller; the
+    // runtime's forced-multi-worker nested-par_map test covers helper-worker scheduling.
+    let large_src = "fn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  k := 10\n  ys := xs.par_map(fn x { x + k })\n  print(ys[0])\n  print(ys[65536])\n  return Ok(())\n}\n";
     let large = build_and_run("pm-capture-large", large_src);
     assert_eq!(large.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&large.stdout), "10\n32778\n");
+    assert_eq!(String::from_utf8_lossy(&large.stdout), "10\n65546\n");
 }
 
 #[test]

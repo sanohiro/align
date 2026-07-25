@@ -983,9 +983,14 @@ A second Gemini bench (group_by / par_map / json-decode on arm64). Verified agai
   **Whole-range specialization SHIPPED 2026-07-25:** codegen now emits one typed range kernel with
   a direct body call, and the runtime invokes it once per claimed range. Raw-IR gates exclude an
   indirect call from the element loop; optimized-IR gates prove that a cheap `i64` body inlines and
-  vectorizes. The shared pool can later back parallel `reduce`/`task_group` too. Retune the
-  conservative range threshold and remeasure the full `rayon` crossover separately rather than
-  preserving the obsolete per-element-thunk diagnosis.
+  vectorizes. The post-specialization probe moved the caller-only floor from 32768 to 65536 elements
+  on native Apple Silicon: entering the pool at the old 32769 boundary was still a loss for cheap and
+  heavy bodies, while the heavier body crossed below the caller-only materializing kernel between
+  65,537 and 73,728 on the checked-in run. The fused sequential comparison is separate and later,
+  crossing below 1 at 131,072 on that run. The checked-in probe reports balanced median ratios and
+  must be rerun on a target host before another retune. The shared pool
+  can later back parallel `reduce`/`task_group` too; remeasure the full `rayon` crossover separately
+  rather than preserving the obsolete per-element-thunk diagnosis.
 
 **Part 3 / consolidated (2026-06-27): basics confirmed at PARITY on arm64 — no new bugs.** A third
 Gemini pass added the fundamentals: **arithmetic + branches** (`math_logic` 0.99×), **recursion /
@@ -1847,12 +1852,13 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     hidden, reaches the LLVM ceiling. **Per "ideal form or defer", builder batching is deferred behind
     the LTO infra slice**; the earlier "`write_many` is the lever" note is superseded by this.
   - **`par_map` cost-threshold lint (P0 diagnostic).** `work/par_map_chunk_probe.rs` (verified):
-    cheap per-element `par_map` *loses* to sequential (**0.24–0.81× vs seq inline**; Rayon-style
-    scheduling only wins at ~1M+ elems / heavier bodies). Function indirection alone is a **~9–10×**
-    penalty for trivial bodies (seq inline vs seq indirect). So the rail is: lint a cheap `par_map`
-    toward sequential/vectorized, and (P1) specialize the chunk body in MIR/codegen so the per-element
-    thunk disappears. Reinforces the "make the fast shape the normal rail, warn when it falls off"
-    direction (and the Profile-guided perf-lints bullet above). **Reference pointer (recorded
+    cheap `par_map` *lost* to sequential (**0.24–0.81× vs seq inline**; Rayon-style scheduling only
+    won at ~1M+ elems / heavier bodies) on the pre-#642 per-element-thunk implementation. Whole-range
+    specialization shipped on 2026-07-25 and removes that indirection; the current threshold probe is
+    `bench/par_map/run.sh threshold`. Keep the lint candidate, but remeasure it against the generated
+    range kernel before adopting a diagnostic. Reinforces the "make the fast shape the normal rail,
+    warn when it falls off" direction (and the Profile-guided perf-lints bullet above). **Reference
+    pointer (recorded
     2026-07-04, external design-note review adoption):** Futhark's defunctionalisation (Hovgaard
     et al., 2018) — compile higher-order functions to static data + inlined dispatch so pipelines
     stay vectorizable; prior art for the thunk-erasing specialization (Align's non-escaping lambdas
@@ -2797,8 +2803,9 @@ Both P0s are fixed 2026-07-13: closure edges plus unknown-target fail-closed pro
 effect path, while a shared cursor, caller drain loop, total-range barrier, and forced-worker
 watchdog close the progress path. The already-recorded whole-range specialization shipped
 2026-07-25: the runtime invokes one generated typed kernel per claimed range, the element body is a
-direct call, and cheap arithmetic vectorizes after inlining. Capturing-`par_map` parallelization is
-the next implementation slice; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
+direct call, and cheap arithmetic vectorizes after inlining. Direct-source Copy-capturing `par_map`
+also uses the range kernel through a synchronous immutable context; staged and unsupported aggregate
+forms remain sequential. The next implementation slice is wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read), length-preserving staged
 parallel lowering, task claim/completion + queue batching, packed task records, and body/byte-aware
 grain. Applying the already-recorded blocking-worker direction to generic `task_group` stays a
@@ -2970,9 +2977,9 @@ every valid finding addressed. Disposition:
      across the threshold boundary (`par_map_correct_across_threshold_boundary`) plus a
      process-isolated integration test (`tests/par_map_cold_start.rs`) that checks a new test-only
      introspection hook (`align_rt_test_par_pool_initialized`, not part of the FFI surface) stays
-     `false` through both the tiny `par_map` and the single-task `task_group`, then confirms it
-     flips `true` once a workload actually crosses the threshold (so the assertions above are not
-     vacuous).
+     `false` through both the tiny `par_map` and the single-task `task_group`, then confirms on a
+     multi-worker host that a workload above the threshold flips it to `true`; a one-worker host
+     intentionally remains caller-only (so the assertions above are not vacuous).
   6. **zero-size arena alloc** can take a fresh 64 KiB zeroed chunk (`CHUNK = 64*1024`,
      `align_runtime` ~7095). Adopt: size-0 fast path returning a canonical dangling pointer,
      allocation-counter test. Distinct from the REJECTED arena pool+re-zero — do not conflate.

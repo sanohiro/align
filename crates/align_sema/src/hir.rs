@@ -636,9 +636,10 @@ pub enum ExprKind {
     ArrayPartition { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, elem: crate::Ty },
     /// `source.….par_map(f)` — apply the **Pure** function `func` to each (post-stage) element
     /// and materialize the results into an owned `array<R>` (`elem` = `R`). Semantically a
-    /// data-parallel map. A direct scalar/slice/chunks source with no captures lowers to the
-    /// parallel range kernel; staged, capturing, and unsupported aggregate sources retain the
-    /// sequential collect loop. `func` is required to be Pure (checked in the parallelism pass over
+    /// data-parallel map. A direct scalar/slice/chunks source with Copy captures lowers to the
+    /// parallel range kernel through its immutable call-scoped context; staged and unsupported
+    /// aggregate sources retain the sequential collect loop. Move captures are rejected by the
+    /// ownership checks. `func` is required to be Pure (checked in the parallelism pass over
     /// the full call graph).
     ArrayParMap { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, elem: crate::Ty },
     /// `arr.chunks(n)` — split `source` (an array/slice of primitive `elem`) into sub-slices of

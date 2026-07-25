@@ -862,7 +862,8 @@ documented closure surface.
 ### 5.5 REQUIRED — effects belong on function types
 
 Name-based call graphs work for direct calls but cannot soundly summarize an unknown function value.
-Before capturing `par_map` is made truly parallel, carry the inferred effect on `fn` types and require
+Capturing `par_map` now uses the same direct range kernel for direct-source Copy captures. Preserve the
+inferred effect on `fn` types and require
 Pure at every explicit parallel boundary. Use the same fact as optimization legality for sequential
 fusion, subject to the normative settlement in section 3.2. A closure's effect includes its lifted
 body and the effect requirements of every higher-order parameter it invokes. Unknown/FFI function
