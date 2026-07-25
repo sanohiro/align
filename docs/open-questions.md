@@ -2975,11 +2975,11 @@ every valid finding addressed. Disposition:
      always 0 for `n == 1`, so a single-task group never needed the pool either — confirmed by
      reading the code, not just the report). Regression-pinned by a same-process correctness sweep
      across the threshold boundary (`par_map_correct_across_threshold_boundary`) plus a
-     process-isolated integration test (`tests/par_map_cold_start.rs`) that checks a new test-only
-     introspection hook (`align_rt_test_par_pool_initialized`, not part of the FFI surface) stays
-     `false` through both the tiny `par_map` and the single-task `task_group`, then confirms it
-     flips `true` once a workload actually crosses the threshold (so the assertions above are not
-     vacuous).
+  process-isolated integration test (`tests/par_map_cold_start.rs`) that checks a new test-only
+  introspection hook (`align_rt_test_par_pool_initialized`, not part of the FFI surface) stays
+  `false` through both the tiny `par_map` and the single-task `task_group`, then confirms on a
+  multi-worker host that a workload above the threshold flips it to `true`; a one-worker host
+  intentionally remains caller-only (so the assertions above are not vacuous).
   6. **zero-size arena alloc** can take a fresh 64 KiB zeroed chunk (`CHUNK = 64*1024`,
      `align_runtime` ~7095). Adopt: size-0 fast path returning a canonical dangling pointer,
      allocation-counter test. Distinct from the REJECTED arena pool+re-zero — do not conflate.
