@@ -116,6 +116,12 @@ void* align_rt_par_map(
   void* capture_ctx, void* in_buf, i64 count,
   i64 in_stride, i64 out_stride,
   void (*kernel)(void* capture_ctx, void* in_buf, void* out_buf, i64 start, i64 end))
+
+i64 align_rt_par_map_reduce(
+  void* capture_ctx, void* in_buf, i64 count,
+  i64 in_stride, i64 result_stride,
+  void (*kernel)(void* capture_ctx, void* in_buf, void* partial,
+                 i64 start, i64 end))
 ```
 
 - Allocate one owned output buffer, split its disjoint element ranges across the process-resident
@@ -124,7 +130,14 @@ void* align_rt_par_map(
   race. It receives a call-scoped immutable capture context, the complete bases, and one disjoint
   `[start,end)` range; it loads captures once and calls the known body directly per element. Staged
   cases still use the sequential collect path.
-- Parallel reduction is not part of the present runtime contract.
+- `align_rt_par_map_reduce` is the specialized direct, stage-free integer
+  `par_map(f).sum()` path. It allocates one 8-byte-aligned partial slot per claimed range rather
+  than an element-sized output array, invokes the same caller-draining range scheduler, and combines
+  the `result_stride`-wide wrapping integer partials in range order. `result_stride` is 1, 2, 4, or
+  8 bytes. The kernel must store exactly one integer partial at its supplied `partial` pointer;
+  worker panics are joined and resumed before partials are read. This is not a generic parallel
+  reduction contract: staged pipelines, `chunks` producers, floating-point sums, and arbitrary
+  reducers remain outside this entry point.
 
 ---
 
