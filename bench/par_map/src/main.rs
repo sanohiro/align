@@ -21,6 +21,8 @@ extern "C" {
     fn pmap(s: Slice) -> i64;
     /// `pub fn smap(s: slice<i64>) -> i64` — sequential `s.map(work).sum()`.
     fn smap(s: Slice) -> i64;
+    /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
+    fn align_rt_test_par_map_force_caller(force: i32);
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -76,6 +78,13 @@ fn elapsed_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
         std::hint::black_box(call(kernel, slice));
     }
     start.elapsed().as_secs_f64() * 1e3
+}
+
+fn elapsed_caller_ms(kernel: Kernel, slice: Slice, reps: usize) -> f64 {
+    unsafe { align_rt_test_par_map_force_caller(1) };
+    let elapsed = elapsed_ms(kernel, slice, reps);
+    unsafe { align_rt_test_par_map_force_caller(0) };
+    elapsed
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -213,8 +222,8 @@ fn run_threshold() {
     println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples)");
     println!("n <= {PAR_MIN_CHUNK}: caller-only; n > {PAR_MIN_CHUNK}: pool eligible");
     println!(
-        "{:>9}  {:>8}  {:>18}  {:>18}",
-        "n", "case", "median par/seq", "p10..p90"
+        "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}",
+        "n", "case", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
     );
     for &n in &counts {
         let data = gen(n);
@@ -229,29 +238,35 @@ fn run_threshold() {
         for case in cases {
             let expected = call(case.seq, slice);
             assert_eq!(call(case.par, slice), expected, "{} n={n}", case.name);
-            // Alternate par→seq and seq→par so the two adjacent timings see both positions in the
-            // cycle. The median of ratios keeps correlated frequency drift in the pair.
-            let mut ratios = Vec::with_capacity(ROUNDS);
+            // Alternate pool→caller→seq and seq→caller→pool so adjacent timings see both positions
+            // in the cycle. The median of ratios keeps correlated frequency drift in the pair.
+            let mut pool_seq_ratios = Vec::with_capacity(ROUNDS);
+            let mut pool_caller_ratios = Vec::with_capacity(ROUNDS);
             for round in 0..ROUNDS {
-                let (par_ms, seq_ms) = if round % 2 == 0 {
+                let (pool_ms, caller_ms, seq_ms) = if round % 2 == 0 {
                     (
                         elapsed_ms(case.par, slice, reps),
+                        elapsed_caller_ms(case.par, slice, reps),
                         elapsed_ms(case.seq, slice, reps),
                     )
                 } else {
                     let seq_ms = elapsed_ms(case.seq, slice, reps);
-                    let par_ms = elapsed_ms(case.par, slice, reps);
-                    (par_ms, seq_ms)
+                    let caller_ms = elapsed_caller_ms(case.par, slice, reps);
+                    let pool_ms = elapsed_ms(case.par, slice, reps);
+                    (pool_ms, caller_ms, seq_ms)
                 };
-                ratios.push(par_ms / seq_ms);
+                pool_seq_ratios.push(pool_ms / seq_ms);
+                pool_caller_ratios.push(pool_ms / caller_ms);
             }
-            ratios.sort_by(f64::total_cmp);
-            let median = percentile(&ratios, 0.5);
-            let p10 = percentile(&ratios, 0.1);
-            let p90 = percentile(&ratios, 0.9);
+            pool_seq_ratios.sort_by(f64::total_cmp);
+            pool_caller_ratios.sort_by(f64::total_cmp);
+            let pool_seq_median = percentile(&pool_seq_ratios, 0.5);
+            let pool_caller_median = percentile(&pool_caller_ratios, 0.5);
+            let p10 = percentile(&pool_seq_ratios, 0.1);
+            let p90 = percentile(&pool_seq_ratios, 0.9);
             println!(
-                "{n:>9}  {:>8}  {median:>18.3}  {p10:.3}..{p90:.3}",
-                case.name
+                "{n:>9}  {:>8}  {pool_seq_median:>18.3}  {pool_caller_median:>18.3}  {p10:.3}..{p90:.3}",
+                case.name,
             );
         }
     }

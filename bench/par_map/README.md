@@ -4,7 +4,7 @@ Measures `s.par_map(work).sum()` against Rust sequential and `rayon` (work-steal
 The Align runtime uses a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native]   # headline comparison; default native
+bench/par_map/run.sh [baseline|v3|native|threshold]   # headline comparison or threshold probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 ```
 
@@ -32,37 +32,44 @@ explicit parallel form.
 ## Threshold probe
 
 `run.sh threshold` warms the process-lifetime pool, repeats each size to cover roughly one million
-body elements per timing, alternates `par_map`/sequential order, and reports the median of 31 paired
-`par/seq` ratios plus its p10..p90 spread. It probes both a cheap vectorizable body and the heavier
-headline body around the caller-only/pool boundary. Cold-start behavior remains pinned by
+body elements per timing, alternates pool/caller-only/sequential order, and reports the median of 31
+paired `pool/seq` and `pool/caller` ratios plus the `pool/seq` p10..p90 spread. The caller-only control
+uses the same materializing `par_map` kernel with the scheduler disabled by the benchmark-only
+`par-map-probe` runtime feature. It probes both a cheap vectorizable body and the heavier headline
+body around the caller-only/pool boundary. Cold-start behavior remains pinned by
 `crates/align_runtime/tests/par_map_cold_start.rs`.
 
-Native Apple Silicon, one representative run after moving the boundary to 65536:
+Native Apple Silicon, one representative run after balancing ranges at `PAR_MIN_CHUNK = 65536`:
 
 ```
-        n      case     median par/seq      p10..p90
-    32768     cheap               1.305    1.303..1.312
-    32768     heavy               1.167    1.167..1.170
-    32769     cheap               1.309    1.304..1.315
-    32769     heavy               1.164    1.163..1.166
-    65535     cheap               1.262    1.260..1.264
-    65535     heavy               1.148    1.140..1.150
-    65536     cheap               1.261    1.259..1.278
-    65536     heavy               1.149    1.146..1.155
-    65537     cheap               1.391    1.380..1.430
-    65537     heavy               1.216    1.209..1.226
-    81920     cheap               1.259    1.234..1.283
-    81920     heavy               1.008    1.004..1.011
-    98304     cheap               1.270    1.233..1.309
-    98304     heavy               0.961    0.948..0.971
-   131072     cheap               1.326    1.323..1.333
-   131072     heavy               0.878    0.870..0.887
+        n      case     median pool/seq  median pool/caller  pool/seq p10..p90
+    32768     cheap               1.308                1.000  1.300..1.317
+    32768     heavy               1.174                1.000  1.172..1.178
+    32769     cheap               1.312                1.000  1.309..1.315
+    32769     heavy               1.173                1.000  1.168..1.175
+    65535     cheap               1.262                1.000  1.260..1.264
+    65535     heavy               1.156                1.000  1.154..1.159
+    65536     cheap               1.261                1.000  1.259..1.285
+    65536     heavy               1.156                1.000  1.152..1.158
+    65537     cheap               1.383                1.091  1.369..1.423
+    65537     heavy               1.162                1.012  1.113..1.204
+    73728     cheap               1.353                1.074  1.312..1.374
+    73728     heavy               1.082                0.939  0.935..1.136
+    81920     cheap               1.334                1.060  1.307..1.378
+    81920     heavy               1.125                0.982  1.119..1.133
+    98304     cheap               1.294                1.038  1.267..1.398
+    98304     heavy               1.062                0.927  1.055..1.073
+   131072     cheap               1.326                1.068  1.323..1.336
+   131072     heavy               0.880                0.772  0.872..0.889
 ```
 
 The previous 32768 boundary entered the pool immediately at 32769 even though both bodies were
 still slower than sequential in this probe. Raising it to 65536 keeps that medium-size region on
-the caller and moves the heavy-body crossover toward 82–98K. This is a conservative, body-agnostic
-fallback, not a universal optimum; rerun the probe on a target host before changing it again.
+the caller. The balanced range plan avoids a one-element helper at 65537; the pool is only about
+1.09x the same caller-only materializing kernel for the cheap body, while the fused sequential
+control remains faster. The heavy-body crossover against sequential is near 82–98K on this host.
+This is a conservative, body-agnostic fallback, not a universal optimum; rerun the probe on a
+target host before changing it again.
 
 The benchmark's old spawn and per-element-thunk results remain historical evidence in
 `docs/open-questions.md`; they are not descriptions of the current generated kernel.

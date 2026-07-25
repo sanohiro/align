@@ -16,7 +16,7 @@ case "$mode" in
   *) echo "usage: run.sh [baseline|v3|native|threshold]" >&2; exit 2 ;;
 esac
 
-( cd ../.. && cargo build -q --release --bin alignc && cargo build -q --release -p align_runtime )
+( cd ../.. && cargo build -q --release --bin alignc && cargo build -q --release -p align_runtime --features par-map-probe )
 ALIGNC="../../target/release/alignc"
 RT_DIR="$(cd ../.. && pwd)/target/release"
 [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic lib in $RT_DIR" >&2; exit 1; }

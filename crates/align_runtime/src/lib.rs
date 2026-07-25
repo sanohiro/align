@@ -1703,6 +1703,19 @@ impl ParPool {
 /// can check whether it has been created yet without forcing creation itself.
 static PAR_POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
 
+#[cfg(feature = "par-map-probe")]
+static PAR_MAP_FORCE_CALLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Benchmark-only switch for comparing the pooled `par_map` kernel with its caller-only path.
+///
+/// This symbol is present only in the opt-in `par-map-probe` build used by `bench/par_map`; it is
+/// not part of the runtime ABI consumed by Align programs.
+#[cfg(feature = "par-map-probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_par_map_force_caller(force: i32) {
+    PAR_MAP_FORCE_CALLER.store(force != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The global pool (lazily created). Returns its worker count too (= the parallelism degree).
 fn par_pool() -> (&'static ParPool, usize) {
     *PAR_POOL.get_or_init(|| {
@@ -1807,6 +1820,16 @@ fn drain_par_map(work: &ParMapWork) {
     }
 }
 
+/// Plan a balanced range layout after the threshold has decided that pool work is eligible.
+/// `target_per` retains the conservative grain heuristic, while the final `per` redistributes the
+/// selected number of ranges evenly. Without the second step, `PAR_MIN_CHUNK + 1` would create one
+/// full range and a one-element tail on a multi-worker host.
+fn par_map_plan(count: usize, workers: usize, min_chunk: usize) -> Option<(usize, usize)> {
+    let target_per = count.div_ceil(workers).max(min_chunk);
+    let ranges = count.div_ceil(target_per);
+    (ranges > 1).then(|| (ranges, count.div_ceil(ranges)))
+}
+
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and invoke
 /// `kernel(context, in_buf, out, start, end)` once per contiguous, **disjoint** output range across
 /// the available threads. The generated kernel owns the typed element loop and directly calls the
@@ -1848,10 +1871,10 @@ pub unsafe extern "C" fn align_rt_par_map(
         .unwrap_or_else(|| panic_abort("par_map input size overflow"));
 
     let out_buf = align_rt_alloc(bytes);
-    // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
-    // tiny maps (where the pool round-trip would dwarf the work) fall to the single-range caller
-    // path. The threshold is deliberately conservative for cheap/vectorizable bodies; retune only
-    // from the checked-in threshold probe and cross-host measurements.
+    // Don't parallelize trivially-small work: `PAR_MIN_CHUNK` is the conservative single-range
+    // floor/initial grain target, so tiny maps (where the pool round-trip would dwarf the work)
+    // fall to the caller path. The threshold is deliberately conservative for cheap/vectorizable
+    // bodies; retune only from the checked-in threshold probe and cross-host measurements.
     const PAR_MIN_CHUNK: usize = 65536;
     // Run every element on the calling thread, no pool involved.
     let run_all_on_caller = || {
@@ -1859,25 +1882,30 @@ pub unsafe extern "C" fn align_rt_par_map(
         kernel(context, in_buf, out_buf, 0, end);
     };
     // Threshold check hoisted above `par_pool()`: `count <= PAR_MIN_CHUNK` guarantees a single
-    // chunk regardless of the worker count (below, `per` would end up `>= PAR_MIN_CHUNK >= count`),
-    // so this skips touching the global worker pool entirely — a tiny `par_map` (e.g. 8 elements)
-    // must not pay the pool's cold-start cost (~69µs measured, vs ~125ns warm) just to immediately
-    // fall back to the caller-only path anyway (Codex audit item 5).
+    // range regardless of the worker count, so this skips touching the global worker pool entirely
+    // — a tiny `par_map` (e.g. 8 elements) must not pay the pool's cold-start cost (~69µs measured,
+    // vs ~125ns warm) just to immediately fall back to the caller-only path anyway (Codex audit
+    // item 5).
     if count <= PAR_MIN_CHUNK {
         run_all_on_caller();
         return out_buf;
     }
 
-    let (pool, workers) = par_pool();
-    let per = count.div_ceil(workers).max(PAR_MIN_CHUNK);
-    let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
-    // Single-chunk fast path: run on the caller, no pool round-trip. Reached only when `workers ==
-    // 1` (or another degenerate worker count) still pushes `per` up to `count` even though `count
-    // > PAR_MIN_CHUNK` above; the pool is already initialized by this point regardless.
-    if nchunks <= 1 {
+    #[cfg(feature = "par-map-probe")]
+    if PAR_MAP_FORCE_CALLER.load(std::sync::atomic::Ordering::Relaxed) {
         run_all_on_caller();
         return out_buf;
     }
+
+    let (pool, workers) = par_pool();
+    let Some((nchunks, per)) = par_map_plan(count, workers, PAR_MIN_CHUNK) else {
+        // Reached only when `workers == 1` (or another degenerate worker count) still produces one
+        // range above the floor; the pool is already initialized by this point regardless.
+        run_all_on_caller();
+        return out_buf;
+    };
+    // The plan balances the ranges after choosing their count, so a threshold-adjacent call does
+    // not hand one worker a full range and another worker a one-element tail.
 
     // Helpers and the caller share one claim loop. The caller therefore drains all of its own
     // ranges even when every pool worker is blocked in another nested structured operation.
@@ -23025,6 +23053,31 @@ mod tests {
         }
     }
 
+    extern "C" fn par_map_add_context(
+        context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let context_value = unsafe { *(context.cast::<i64>()) };
+        let start = usize::try_from(start).unwrap();
+        let end = usize::try_from(end).unwrap();
+        for i in start..end {
+            unsafe {
+                *output.cast::<i64>().add(i) = *input.cast::<i64>().add(i) + context_value;
+            }
+        }
+    }
+
+    #[test]
+    fn par_map_plan_balances_threshold_adjacent_ranges() {
+        const MIN: usize = 65_536;
+        assert_eq!(super::par_map_plan(MIN, 8, MIN), None);
+        assert_eq!(super::par_map_plan(MIN + 1, 8, MIN), Some((2, 32_769)));
+        assert_eq!(super::par_map_plan(2 * MIN + 1, 8, MIN), Some((3, 43_691)));
+    }
+
     #[test]
     fn par_map_correct_across_threshold_boundary() {
         // Codex audit item 5: `PAR_MIN_CHUNK` (65_536) is the caller-only/pool-split boundary. A
@@ -23065,12 +23118,12 @@ mod tests {
         let input: Vec<i64> = (0..COUNT).map(|i| base + i).collect();
         let output = unsafe {
             align_rt_par_map(
-                core::ptr::null(),
+                (&base as *const i64).cast::<u8>(),
                 input.as_ptr() as *const u8,
                 COUNT,
                 size_of::<i64>() as i64,
                 size_of::<i64>() as i64,
-                par_map_double,
+                par_map_add_context,
             )
         };
         let values = unsafe { std::slice::from_raw_parts(output as *const i64, COUNT as usize) };
@@ -23105,7 +23158,7 @@ mod tests {
             slots.push(slot);
         }
         assert!(unsafe { align_rt_tg_wait(tg) }.is_null());
-        let base_sum = COUNT * (COUNT - 1);
+        let base_sum = COUNT * (COUNT - 1) / 2;
         for (base, slot) in slots.into_iter().enumerate() {
             assert_eq!(unsafe { *(slot as *const i64) }, base_sum + 2 * base as i64 * COUNT);
         }

@@ -1047,9 +1047,9 @@ Both are fixed and regression-pinned as of 2026-07-13: effects fail closed at th
 and `par_map` helpers plus callers drain one shared range cursor under a child-process watchdog. The record makes the existing
 whole-range specialization plan concrete; the direct whole-range kernel shipped 2026-07-25,
 removing the per-element indirect callback and restoring vectorization for cheap arithmetic bodies.
-The record gates the remaining capture-context, integer transform-reduce, staged-pipeline, low-lock
-latch/batching, work-aware grain, and split execution-domain candidates. It proposes no new source
-syntax.
+The direct-source Copy capture context shipped in #643; the record gates the remaining integer
+transform-reduce, staged-pipeline, low-lock latch/batching, work-aware grain, and split execution-
+domain candidates. It proposes no new source syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**
 `12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive

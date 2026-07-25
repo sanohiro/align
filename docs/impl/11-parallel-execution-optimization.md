@@ -152,7 +152,8 @@ every worker locks it again to pop a job.
 
 1. allocates the complete output;
 2. for counts above the single-range floor, initializes the pool;
-3. partitions into at most `workers` contiguous chunks, with `PAR_MIN_CHUNK = 65536` **elements**;
+3. partitions into at most `workers` contiguous, balanced chunks, using `PAR_MIN_CHUNK = 65536`
+   **elements** as the caller-only floor and initial grain target;
 4. creates one shared range cursor and total-range completion barrier;
 5. submits helper drain loops and runs the same drain loop on the caller;
 6. waits until every claimed range publishes completion, then re-raises any recorded panic.
@@ -161,12 +162,13 @@ The tiny-call fast path moves step 2 after the single-chunk decision. It does no
 progress, per-element IR, or warm steady-state contention.
 
 The post-specialization threshold probe (`bench/par_map/run.sh threshold`) was rerun on native Apple
-Silicon after #643. It alternates paired `par_map`/sequential timings, reports the median of 31
-ratios, and covers both a cheap vectorizable body and a heavier body around the boundary. At the old
-32768 boundary, entering the pool at 32769 was still a loss for both bodies; moving the caller-only
-floor to 65536 removes that medium-size cliff and leaves the heavy-body crossover near 82–98K on
-this host. The value is deliberately body-agnostic and host-sensitive; rerun the probe before any
-future retune.
+Silicon after #643. It alternates paired pooled/caller-only/sequential timings, reports the median of
+31 `pool/seq` and `pool/caller` ratios, and covers both a cheap vectorizable body and a heavier body
+around the boundary. At the old 32768 boundary, entering the pool at 32769 was still a loss against
+the fused sequential control; moving the caller-only floor to 65536 keeps that medium-size region
+on the caller. The balanced range plan avoids a one-element helper at the first pool-eligible size,
+and the heavy-body crossover against sequential is near 82–98K on this host. The value is deliberately
+body-agnostic and host-sensitive; rerun the probe before any future retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim one task
 at a time with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is drained.
@@ -650,9 +652,10 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 ### MIR and reduction
 
 MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
-range loop instead of an element thunk. Captures, prior stages, and a cost summary are not present
-yet, so those cases remain sequential. No complete source-visible associativity/floating-order rule
-exists, and this map-only kernel does not silently declare generic parallel reduction settled.
+range loop instead of an element thunk. Copy captures use the call-scoped context described above;
+prior stages and a cost summary are not present yet, so those cases remain sequential. No complete
+source-visible associativity/floating-order rule exists, and this map-only kernel does not silently
+declare generic parallel reduction settled.
 
 ---
 
