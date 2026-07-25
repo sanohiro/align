@@ -82,17 +82,21 @@ when the change crosses another boundary:
 
 1. Identify the owner: documentation, one private implementation helper, a
    public FFI/ABI surface, compiler lowering, or a resource boundary.
-2. Run the focused owner target first. For a private runtime helper, use a
-   filtered library test such as `cargo test -p align_runtime --lib par_map`
-   rather than the entire runtime library test binary.
+2. For code changes, run the focused owner target first. For a private runtime
+   helper, use a filtered library test such as
+   `cargo test -p align_runtime --lib par_map` rather than the entire runtime
+   library test binary. For documentation-only changes, run `git diff --check`
+   and the relevant consistency or render check when one exists; do not invent
+   a code-test target for prose.
 3. Run the ordinary PR gate required for the change. Rust code changes use
-   `scripts/test-pr.sh`; documentation-only changes need only their relevant
-   consistency or render check.
+   `scripts/test-pr.sh` as the bounded test gate, with the standard workspace
+   build and applicable Clippy checks still required. Documentation-only changes
+   need only their relevant consistency or render check.
 4. Add a broader target only when the changed behavior is not exercised by the
    owner target, crosses crate/ABI/linker boundaries, changes scheduling or
    resource semantics, or is unusually broad.
-5. Use `scripts/test-full.sh` only for an unusually broad change, a release
-   candidate, or an explicit full-regression request.
+5. Use `scripts/test-full.sh` only for an unusually broad change, preparation
+   for a versioned release, or an explicit full-regression request.
 
 Do not run a whole crate or the full workspace by reflex after a narrow change.
 Do not repeat a target already covered by `scripts/test-pr.sh` unless the
