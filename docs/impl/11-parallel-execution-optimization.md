@@ -41,8 +41,10 @@ Do the work in this order:
    range kernel; staged and unsupported aggregate cases remain sequential.
 5. Replace `task_group`'s per-task mutex/wake path with batched claims and a low-lock completion
    latch; batch queue submission too.
-6. Fuse integer `par_map(...).sum()` so the parallel operation never writes and rereads its full
-   intermediate array; this is the strongest new CPU-cache candidate.
+6. ~~Fuse integer `par_map(...).sum()` so the parallel operation never writes and rereads its full
+   intermediate array.~~ **SHIPPED 2026-07-26.** Direct, stage-free scalar maps now use a reduction
+   range kernel with one wrapping partial per claimed range; staged and `chunks` forms remain on
+   their existing paths.
 7. Parallelize length-preserving staged pipelines first. Gate `where` separately because stable
    compaction needs counts and prefix offsets. Before widening, require every fused prior stage to
    be Pure; the current checker validates only the terminal `par_map` function.
@@ -454,7 +456,7 @@ Do not use one global atomic output cursor: it introduces a hot cache line and l
 Selectivity, predicate cost, scratch bytes, extra reads, and memory bandwidth determine the winner;
 keep the current sequential path until a crossover is measured.
 
-### 7.4 Transform-reduce fusion — new highest-value cache candidate
+### 7.4 Transform-reduce fusion — SHIPPED 2026-07-26
 
 The current shape:
 
@@ -462,17 +464,17 @@ The current shape:
 total := xs.par_map(f).sum()
 ```
 
-allocates and writes `N * sizeof(R)` bytes, joins, then reads the same bytes in a second serial
-loop. The map's parallelism is already explicit, so a specialized range kernel can compute an
-integer partial sum while computing each transformed value **without materializing the values**.
-After join, combine the small indexed partial array.
+The old shape allocated and wrote `N * sizeof(R)` bytes, joined, then read the same bytes in a
+second serial loop. A specialized reduction range kernel now computes an integer partial sum while
+calling `f`, without materializing the transformed values. After join, the runtime combines the
+small indexed partial array.
 
-Start with wrapping integer `sum`. Align defines integer overflow as two's-complement wrap, so
-addition is associative modulo the integer width and regrouping across worker/range counts is
-bit-exact. Integer `min`/`max` may follow once their empty-input contract and emitted shape are
-pinned. Exclude floating sum, arbitrary reducers, and reducers whose errors/ordering are observable.
-Apply the rewrite only when the `par_map` array is a directly consumed temporary with no other use
-or alias. Generated partial additions must remain plain wrapping IR operations — never `nsw`/`nuw`.
+The shipped slice covers wrapping `i8`–`i64` and `u8`–`u64` `sum`. Align defines integer overflow
+as two's-complement wrap, so addition is associative modulo the integer width and regrouping across
+worker/range counts is bit-exact. The MIR rewrite applies only when the `par_map` is directly
+consumed, has no prior stages, and its scalar source is not the `chunks` producer. Floating sum,
+arbitrary reducers, and staged/`chunks` shapes remain excluded. Generated partial additions are
+plain wrapping IR operations — never `nsw`/`nuw`.
 
 This is distinct from silently parallelizing ordinary reduction:
 
@@ -482,15 +484,20 @@ xs.par_map(f).sum()   already exposes parallel execution; the compiler removes i
 ```
 
 The range kernel still executes every `f` exactly once, preserving traps/abort behavior of a Pure
-body. It writes only one isolated partial per range instead of every transformed element. Inspect
-and resume any joined panic before reading partial slots that may be uninitialized. Gate on:
+body. It writes only one aligned partial slot per range instead of every transformed element. The
+runtime joins all ranges and resumes the lowest-index worker panic before reading partials. The
+implementation is pinned by:
 
 - output allocation count goes from one to zero;
 - result-buffer writes plus the second read disappear from IR and hardware-byte accounting;
 - empty input returns the existing zero identity; signed/unsigned wraparound and every worker/range
   count are bit-identical;
-- peak RSS, memory bandwidth, LLC misses, and wall time improve on a memory-bound positive case;
-- heavy compute bodies and the non-fused `par_map` control regress no more than the global gate.
+- output allocation removal in MIR/LLVM (the runtime retains only `O(ranges)` partial slots);
+- empty input, signed/unsigned wraparound, and threshold-adjacent caller/pool execution;
+- direct range-kernel IR with a typed loop, direct body call, and plain integer addition.
+
+Peak-RSS, memory-bandwidth, LLC-miss, and heavy-body crossover measurements remain a follow-up
+before any grain or partial-slot layout retune.
 
 Use cache-separated per-runner/range partials only after checking the target/cache-line tradeoff;
 there are only `O(ranges)` of them, so isolation is much cheaper than padding every task result.
@@ -760,7 +767,8 @@ nested progress remain pinned.
 
 ### Slice P3 — widening and cost model
 
-- Fuse wrapping-integer `par_map(...).sum()` and eliminate its full intermediate array.
+- ~~Fuse wrapping-integer `par_map(...).sum()` and eliminate its full intermediate array.~~
+  **SHIPPED 2026-07-26;** staged and `chunks` producer materialization remain later slices.
 - Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
   length-preserving staged pipelines.
 - Add body/byte-aware grain.
