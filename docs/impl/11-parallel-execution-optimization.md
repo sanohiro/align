@@ -785,8 +785,12 @@ declare generic parallel reduction settled.
 - [x] Add the first conservative body/byte-aware floor and pin its width/weight arithmetic; keep the
   common `i64` floor unchanged after the aggressive boundary experiment regressed pool/caller by
   about 7%.
-- [ ] Sweep input/output element widths and aggregate sizes before treating the floor as a general
-  cost model rather than this host's measured `i64` probe result.
+- [x] Sweep scalar input/output element widths and fused/materializing output strides before
+  treating the floor as a general cost model (`bench/par_map/run.sh width`, 2026-07-26 native
+  Apple Silicon); the measured floors scale from `65,536` (`i64`/`i64`) to `524,288` (`i8`/`i8`)
+  and retain the conservative common boundary.
+- [ ] Sweep aggregate struct sizes and other hosts before treating the scalar result as a general
+  cost model.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 

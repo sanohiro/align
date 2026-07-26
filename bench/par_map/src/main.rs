@@ -12,6 +12,22 @@ struct Slice {
     len: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(feature = "probe")]
+struct SliceI8 {
+    ptr: *const i8,
+    len: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(feature = "probe")]
+struct SliceI32 {
+    ptr: *const i32,
+    len: i64,
+}
+
 extern "C" {
     /// `pub fn pmap_cheap(s: slice<i64>) -> i64` — cheap vectorizable body.
     #[cfg(feature = "probe")]
@@ -25,6 +41,35 @@ extern "C" {
     fn smap(s: Slice) -> i64;
     /// `pub fn pfilter(s: slice<i64>) -> i64` — stable count/prefix/scatter filter followed by a cheap map.
     fn pfilter(s: Slice) -> i64;
+    /// Width-probe exports, linked only for the benchmark's opt-in `probe` feature.
+    #[cfg(feature = "probe")]
+    fn pwidth_i8(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_i8(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_i32(s: SliceI32) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_i32(s: SliceI32) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_i64(s: Slice) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_i64(s: Slice) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_i8_to_i64(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_i8_to_i64(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_i64_to_i8(s: Slice) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_i64_to_i8(s: Slice) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_materialize_i8_to_i64(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_materialize_i8_to_i64(s: SliceI8) -> i64;
+    #[cfg(feature = "probe")]
+    fn pwidth_materialize_i64_to_i8(s: Slice) -> i64;
+    #[cfg(feature = "probe")]
+    fn swidth_materialize_i64_to_i8(s: Slice) -> i64;
     /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_force_caller(force: i32);
@@ -34,7 +79,11 @@ extern "C" {
     /// Benchmark-only per-body threshold getter, present in the opt-in `par-map-probe` runtime
     /// build. It keeps the byte/work model in one place instead of copying it into the harness.
     #[cfg(feature = "probe")]
-    fn align_rt_test_par_map_min_chunk_for(in_stride: i64, out_stride: i64, work_weight: i64) -> i64;
+    fn align_rt_test_par_map_min_chunk_for(
+        in_stride: i64,
+        out_stride: i64,
+        work_weight: i64,
+    ) -> i64;
     /// Benchmark-only worker-count getter, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_workers() -> i64;
@@ -91,6 +140,115 @@ struct ThresholdCase {
     par: Kernel,
     seq: Kernel,
     work_weight: i64,
+}
+
+#[cfg(feature = "probe")]
+type WidthKernel = unsafe fn(*const u8, i64) -> i64;
+
+#[cfg(feature = "probe")]
+#[derive(Clone, Copy)]
+enum WidthSource {
+    I8,
+    I32,
+    I64,
+}
+
+#[cfg(feature = "probe")]
+#[derive(Clone, Copy)]
+struct WidthCase {
+    name: &'static str,
+    source: WidthSource,
+    par: WidthKernel,
+    seq: WidthKernel,
+    in_stride: i64,
+    out_stride: i64,
+    work_weight: i64,
+}
+
+#[cfg(feature = "probe")]
+macro_rules! width_wrapper {
+    ($wrapper:ident, $kernel:ident, $slice:ident) => {
+        unsafe fn $wrapper(ptr: *const u8, len: i64) -> i64 {
+            unsafe {
+                $kernel($slice {
+                    ptr: ptr.cast(),
+                    len,
+                })
+            }
+        }
+    };
+}
+
+#[cfg(feature = "probe")]
+width_wrapper!(call_pwidth_i8, pwidth_i8, SliceI8);
+#[cfg(feature = "probe")]
+width_wrapper!(call_swidth_i8, swidth_i8, SliceI8);
+#[cfg(feature = "probe")]
+width_wrapper!(call_pwidth_i32, pwidth_i32, SliceI32);
+#[cfg(feature = "probe")]
+width_wrapper!(call_swidth_i32, swidth_i32, SliceI32);
+#[cfg(feature = "probe")]
+width_wrapper!(call_pwidth_i64, pwidth_i64, Slice);
+#[cfg(feature = "probe")]
+width_wrapper!(call_swidth_i64, swidth_i64, Slice);
+#[cfg(feature = "probe")]
+width_wrapper!(call_pwidth_i8_to_i64, pwidth_i8_to_i64, SliceI8);
+#[cfg(feature = "probe")]
+width_wrapper!(call_swidth_i8_to_i64, swidth_i8_to_i64, SliceI8);
+#[cfg(feature = "probe")]
+width_wrapper!(call_pwidth_i64_to_i8, pwidth_i64_to_i8, Slice);
+#[cfg(feature = "probe")]
+width_wrapper!(call_swidth_i64_to_i8, swidth_i64_to_i8, Slice);
+#[cfg(feature = "probe")]
+width_wrapper!(
+    call_pwidth_materialize_i8_to_i64,
+    pwidth_materialize_i8_to_i64,
+    SliceI8
+);
+#[cfg(feature = "probe")]
+width_wrapper!(
+    call_swidth_materialize_i8_to_i64,
+    swidth_materialize_i8_to_i64,
+    SliceI8
+);
+#[cfg(feature = "probe")]
+width_wrapper!(
+    call_pwidth_materialize_i64_to_i8,
+    pwidth_materialize_i64_to_i8,
+    Slice
+);
+#[cfg(feature = "probe")]
+width_wrapper!(
+    call_swidth_materialize_i64_to_i8,
+    swidth_materialize_i64_to_i8,
+    Slice
+);
+
+#[cfg(feature = "probe")]
+struct WidthData {
+    i8s: Vec<i8>,
+    i32s: Vec<i32>,
+    i64s: Vec<i64>,
+}
+
+#[cfg(feature = "probe")]
+impl WidthData {
+    fn new(n: usize) -> Self {
+        let base = gen(n);
+        Self {
+            i8s: base.iter().map(|&x| x as i8).collect(),
+            i32s: base.iter().map(|&x| x as i32).collect(),
+            i64s: base,
+        }
+    }
+
+    fn view(&self, source: WidthSource) -> (*const u8, i64) {
+        match source {
+            WidthSource::I8 => (self.i8s.as_ptr().cast(), self.i8s.len() as i64),
+            WidthSource::I32 => (self.i32s.as_ptr().cast(), self.i32s.len() as i64),
+            WidthSource::I64 => (self.i64s.as_ptr().cast(), self.i64s.len() as i64),
+        }
+    }
 }
 
 #[cfg(feature = "probe")]
@@ -359,6 +517,183 @@ fn run_threshold() {
     }
 }
 
+#[cfg(feature = "probe")]
+fn elapsed_width_ms(kernel: WidthKernel, ptr: *const u8, len: i64, reps: usize) -> f64 {
+    let start = Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(unsafe { kernel(ptr, len) });
+    }
+    start.elapsed().as_secs_f64() * 1e3
+}
+
+#[cfg(feature = "probe")]
+fn elapsed_width_caller_ms(kernel: WidthKernel, ptr: *const u8, len: i64, reps: usize) -> f64 {
+    unsafe { align_rt_test_par_map_force_caller(1) };
+    let elapsed = elapsed_width_ms(kernel, ptr, len, reps);
+    unsafe { align_rt_test_par_map_force_caller(0) };
+    elapsed
+}
+
+#[cfg(feature = "probe")]
+fn run_width() {
+    let runtime_workers = usize::try_from(unsafe { align_rt_test_par_map_workers() })
+        .expect("runtime par_map worker count must be positive");
+    if runtime_workers <= 1 {
+        println!(
+            "par_map width probe skipped: runtime reports {runtime_workers} worker; the pool path is intentionally disabled on a one-worker host"
+        );
+        return;
+    }
+
+    const ROUNDS: usize = 7;
+    const TARGET_ELEMENTS: usize = 262_144;
+    let cases = [
+        WidthCase {
+            name: "reduce i8 -> i8",
+            source: WidthSource::I8,
+            par: call_pwidth_i8,
+            seq: call_swidth_i8,
+            in_stride: 1,
+            out_stride: 1,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "reduce i32 -> i32",
+            source: WidthSource::I32,
+            par: call_pwidth_i32,
+            seq: call_swidth_i32,
+            in_stride: 4,
+            out_stride: 4,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "reduce i64 -> i64",
+            source: WidthSource::I64,
+            par: call_pwidth_i64,
+            seq: call_swidth_i64,
+            in_stride: 8,
+            out_stride: 8,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "reduce i8 -> i64",
+            source: WidthSource::I8,
+            par: call_pwidth_i8_to_i64,
+            seq: call_swidth_i8_to_i64,
+            in_stride: 1,
+            out_stride: 8,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "reduce i64 -> i8",
+            source: WidthSource::I64,
+            par: call_pwidth_i64_to_i8,
+            seq: call_swidth_i64_to_i8,
+            in_stride: 8,
+            out_stride: 1,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "materialize i8 -> i64",
+            source: WidthSource::I8,
+            par: call_pwidth_materialize_i8_to_i64,
+            seq: call_swidth_materialize_i8_to_i64,
+            in_stride: 1,
+            out_stride: 8,
+            work_weight: 1,
+        },
+        WidthCase {
+            name: "materialize i64 -> i8",
+            source: WidthSource::I64,
+            par: call_pwidth_materialize_i64_to_i8,
+            seq: call_swidth_materialize_i64_to_i8,
+            in_stride: 8,
+            out_stride: 1,
+            work_weight: 1,
+        },
+    ];
+
+    // Start the persistent pool once. Every case then compares warm pool and caller-only choices
+    // for the same generated kernel and data shape.
+    let warm = WidthData::new(65_536 * 2);
+    let (warm_ptr, warm_len) = warm.view(WidthSource::I64);
+    std::hint::black_box(unsafe { call_pwidth_i64(warm_ptr, warm_len) });
+
+    println!(
+        "par_map width probe ({ROUNDS} balanced samples, {runtime_workers} workers; target {TARGET_ELEMENTS} elements per timing)"
+    );
+    println!(
+        "The runtime floor is reported for each input/output stride; counts are floor-δ, floor, floor+1, and floor+δ."
+    );
+    println!(
+        "{:>23}  {:>9}  {:>12}  {:>18}  {:>19}  {:>18}",
+        "case", "n", "floor", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
+    );
+
+    for case in cases {
+        let floor = usize::try_from(unsafe {
+            align_rt_test_par_map_min_chunk_for(case.in_stride, case.out_stride, case.work_weight)
+        })
+        .expect("runtime par_map threshold must be non-negative");
+        let delta = (floor / 8).max(1);
+        let counts = [
+            floor.saturating_sub(delta).max(1),
+            floor,
+            floor.saturating_add(1),
+            floor.saturating_add(delta),
+        ];
+
+        for &n in &counts {
+            let data = WidthData::new(n);
+            let (ptr, len) = data.view(case.source);
+            let expected = unsafe { (case.seq)(ptr, len) };
+            assert_eq!(
+                unsafe { (case.par)(ptr, len) },
+                expected,
+                "{} n={n}",
+                case.name
+            );
+            let reps = (TARGET_ELEMENTS / n).max(1);
+
+            // Six permutations put pool, caller-only, and sequential controls in every timing
+            // position. The paired median is less sensitive to frequency drift than raw samples.
+            let mut pool_seq_ratios = Vec::with_capacity(ROUNDS);
+            let mut pool_caller_ratios = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                let order = match round % 6 {
+                    0 => [0, 1, 2],
+                    1 => [2, 1, 0],
+                    2 => [1, 0, 2],
+                    3 => [2, 0, 1],
+                    4 => [1, 2, 0],
+                    _ => [0, 2, 1],
+                };
+                let mut elapsed = [0.0; 3];
+                for arm in order {
+                    elapsed[arm] = match arm {
+                        0 => elapsed_width_ms(case.par, ptr, len, reps),
+                        1 => elapsed_width_caller_ms(case.par, ptr, len, reps),
+                        _ => elapsed_width_ms(case.seq, ptr, len, reps),
+                    };
+                }
+                let [pool_ms, caller_ms, seq_ms] = elapsed;
+                pool_seq_ratios.push(pool_ms / seq_ms);
+                pool_caller_ratios.push(pool_ms / caller_ms);
+            }
+            pool_seq_ratios.sort_by(f64::total_cmp);
+            pool_caller_ratios.sort_by(f64::total_cmp);
+            let pool_seq_median = percentile(&pool_seq_ratios, 0.5);
+            let pool_caller_median = percentile(&pool_caller_ratios, 0.5);
+            let p10 = percentile(&pool_seq_ratios, 0.1);
+            let p90 = percentile(&pool_seq_ratios, 0.9);
+            println!(
+                "{:>23}  {n:>9}  {floor:>12}  {pool_seq_median:>18.3}  {pool_caller_median:>19.3}  {p10:.3}..{p90:.3}",
+                case.name,
+            );
+        }
+    }
+}
+
 fn run_filter() {
     const ROUNDS: usize = 15;
     println!(
@@ -426,6 +761,18 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("filter") {
         run_filter();
         return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("width") {
+        #[cfg(feature = "probe")]
+        {
+            run_width();
+            return;
+        }
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("width mode requires the probe feature");
+            std::process::exit(2);
+        }
     }
     run_standard();
 }
