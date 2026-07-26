@@ -579,8 +579,8 @@ only panic payload selection behind a mutex, and protects the final `notify_one`
 mutex. The caller
 still drains the shared cursor, nested groups still make progress under pool saturation, and late
 helpers still exit before touching exhausted task descriptors. This removes the per-task barrier
-mutex and `notify_all`; body-aware grain, false-sharing measurement, and blocking-pool policy remain
-separate follow-ups.
+mutex and `notify_all`; body-aware grain and blocking-pool policy remain separate follow-ups. The
+task-group record probe also included a padded control, which did not justify cache-line padding.
 
 ### 8.2 Batch pool submission — SHIPPED 2026-07-26
 
@@ -646,10 +646,31 @@ again for the result, again for the error, copies the capture environment, then 
 `tg_register`. Codegen knows every size and alignment. It can lay out one typed
 `{ captures, result, error }` record, allocate once, and register descriptor offsets/pointers.
 
-This removes runtime calls and improves descriptor/env locality, but it is not automatically a
+This removes runtime calls and can change descriptor/env locality, but it is not automatically a
 cache win: densely packed records can put result words written by different runners on one line.
-Sequence it after block claiming, compare one-record vs current allocation on tiny and I/O-heavy
-tasks, and retain separate allocations if the false-sharing cost exceeds the call/locality win.
+The current split control uses the same bump arena, so small split allocations may already be
+physically adjacent; the checked-in probe therefore does not isolate an additional locality win.
+Sequence it after block claiming, compare one-record vs current allocation on tiny, CPU-heavy, and
+blocking controls, and retain separate allocations if the false-sharing cost exceeds the
+call/locality win. A real filesystem/network workload is a separate resource-policy benchmark.
+
+**Measure-first result (2026-07-26):** `bench/task_group/run.sh` now drives the same registration
+ABI with split, packed-tight, and cache-line-separated padded records. The recorded command was
+`LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib TRIALS=30 REPS=7 bench/task_group/run.sh`
+on native Apple Silicon; the harness reported eight runtime workers. The high-trial run covers the
+one-task caller-only path, worker-derived scheduler/batch boundaries, zero-round, CPU-heavy, and
+bounded blocking controls, plus a real error-slot smoke. Zero-task groups are rejected because
+they contain no record to measure. The error-slot rows use fallible-shaped storage with successful
+task bodies; the separate smoke exercises the actual error return. Since the split control uses the
+same bump arena, packed-tight is primarily allocation-call/record-shape evidence, not an isolated
+locality measurement. The padded control measures total padding/alignment and cache-footprint cost;
+it does not isolate false sharing. The probe drains late pool helpers between repetitions outside the
+clock and is scoped to successful captured CPU/blocking tasks for performance;
+it does not claim filesystem/network behavior. Each row is a median screening statistic from one
+process invocation. The written ship gate requires a repeatable at least 10% packed-tight win on
+both tiny and large groups without a material padded-record penalty across multiple fresh
+invocations; it is not met.
+Production codegen and the runtime ABI therefore retain the current split allocation shape.
 
 ---
 
@@ -828,8 +849,10 @@ unsupported aggregate forms remain sequential.
 - [x] Batch queue publication (2026-07-26).
 - [x] Add adaptive contiguous claims (2026-07-26).
 - [x] Replace per-task barrier mutex/wake with an atomic completion latch (2026-07-26).
-- Measure false sharing before padding.
-- Probe one-allocation packed task records after block claiming is stable.
+- [x] Measure padding/cache-footprint cost before padding (2026-07-26; the padded control did not
+  justify padding and did not isolate false sharing).
+- [x] Probe one-allocation packed task records after block claiming is stable (2026-07-26;
+  the cross-size ship gate was not met, so production remains split).
 
 **Completion:** normal completion has no per-task mutex acquisition; deterministic errors and
 nested progress remain pinned.

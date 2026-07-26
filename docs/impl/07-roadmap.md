@@ -1054,8 +1054,9 @@ removing the per-element indirect callback and restoring vectorization for cheap
 The direct-source Copy capture context shipped in #643. The direct integer transform-reduce slice
 shipped in #647, queue publication batching shipped in #648, and low-lock task-group claim/completion
 shipped in #650. The first primitive-scalar length-preserving staged `map` lowering is shipped. The
-callable primitive-scalar stable `where` compaction is the current change; packed task records,
-false-sharing measurement, and split execution-domain candidates remain.
+callable primitive-scalar stable `where` compaction is shipped. The measure-first task-group record
+probe now covers packed-tight and cache-line-padded controls; its cross-size ship gate was not met,
+so production task records remain split. Split execution-domain candidates remain.
 It proposes no new source syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**

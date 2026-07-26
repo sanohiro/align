@@ -1690,6 +1690,14 @@ type ParJob = Box<dyn FnOnce() + Send + 'static>;
 struct ParPool {
     queue: std::sync::Mutex<std::collections::VecDeque<ParJob>>,
     available: std::sync::Condvar,
+    #[cfg(feature = "task-group-probe")]
+    pending: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "task-group-probe")]
+    idle_lock: std::sync::Mutex<()>,
+    #[cfg(feature = "task-group-probe")]
+    idle: std::sync::Condvar,
+    #[cfg(feature = "task-group-probe")]
+    panicked: std::sync::atomic::AtomicBool,
 }
 
 impl ParPool {
@@ -1709,10 +1717,49 @@ impl ParPool {
                 queue.push_back(job);
                 count += 1;
             }
+            #[cfg(feature = "task-group-probe")]
+            if count != 0 {
+                self.pending
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         for _ in 0..count {
             self.available.notify_one();
         }
+    }
+
+    #[cfg(feature = "task-group-probe")]
+    fn job_finished(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.pending.fetch_sub(1, Ordering::Release) == 1 {
+            let _idle_guard = self.idle_lock.lock().unwrap();
+            self.idle.notify_all();
+        }
+    }
+
+    #[cfg(feature = "task-group-probe")]
+    fn wait_idle(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let mut idle_guard = self.idle_lock.lock().unwrap();
+        while self.pending.load(Ordering::Acquire) != 0 {
+            idle_guard = self.idle.wait(idle_guard).unwrap();
+        }
+        !self.panicked.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "task-group-probe")]
+    fn run_job(&self, job: ParJob) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        if result.is_err() {
+            // Pool jobs are detached, so there is no caller to which this panic can be resumed.
+            // Keep the measurement-only worker alive so queued jobs still drain; `wait_idle`
+            // reports the failure once the queue is empty instead of hanging behind a dead worker.
+            self.panicked
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.job_finished();
     }
 }
 
@@ -1797,19 +1844,32 @@ fn par_pool() -> (&'static ParPool, usize) {
         let p: &'static ParPool = Box::leak(Box::new(ParPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             available: std::sync::Condvar::new(),
+            #[cfg(feature = "task-group-probe")]
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "task-group-probe")]
+            idle_lock: std::sync::Mutex::new(()),
+            #[cfg(feature = "task-group-probe")]
+            idle: std::sync::Condvar::new(),
+            #[cfg(feature = "task-group-probe")]
+            panicked: std::sync::atomic::AtomicBool::new(false),
         }));
         for _ in 0..n {
-            std::thread::spawn(move || loop {
-                let job = {
-                    let mut q = p.queue.lock().unwrap();
-                    loop {
-                        match q.pop_front() {
-                            Some(j) => break j,
-                            None => q = p.available.wait(q).unwrap(),
+            std::thread::spawn(move || {
+                loop {
+                    let job = {
+                        let mut q = p.queue.lock().unwrap();
+                        loop {
+                            match q.pop_front() {
+                                Some(j) => break j,
+                                None => q = p.available.wait(q).unwrap(),
+                            }
                         }
-                    }
-                };
-                job(); // run outside the lock so other workers can keep pulling
+                    };
+                    #[cfg(feature = "task-group-probe")]
+                    p.run_job(job);
+                    #[cfg(not(feature = "task-group-probe"))]
+                    job(); // run outside the lock so other workers can keep pulling
+                }
             });
         }
         (p, n)
@@ -1825,6 +1885,19 @@ fn par_pool() -> (&'static ParPool, usize) {
 #[doc(hidden)]
 pub fn align_rt_test_par_pool_initialized() -> bool {
     PAR_POOL.get().is_some()
+}
+
+/// Measurement-only barrier for `bench/task_group`. It waits for every queued/running pool job
+/// without forcing pool creation and returns false if a detached pool job panicked; normal runtime
+/// builds do not expose this function or track the pending-job count.
+#[cfg(feature = "task-group-probe")]
+#[doc(hidden)]
+pub fn align_rt_test_par_pool_wait_idle() -> bool {
+    if let Some((pool, _)) = PAR_POOL.get() {
+        pool.wait_idle()
+    } else {
+        true
+    }
 }
 
 type ParPanic = Box<dyn std::any::Any + Send + 'static>;
@@ -23369,11 +23442,106 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "task-group-probe")]
+    #[test]
+    fn par_pool_wait_idle_waits_for_running_job() {
+        let pool: &'static ParPool = Box::leak(Box::new(ParPool {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            available: std::sync::Condvar::new(),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            idle_lock: std::sync::Mutex::new(()),
+            idle: std::sync::Condvar::new(),
+            panicked: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        pool.submit_many(std::iter::once(Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }) as ParJob));
+
+        let worker = std::thread::spawn(move || {
+            let job = pool.queue.lock().unwrap().pop_front().unwrap();
+            job();
+            pool.job_finished();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the queued job started");
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            pool.wait_idle();
+            done_tx.send(()).unwrap();
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the idle waiter started");
+        assert!(
+            done_rx.try_recv().is_err(),
+            "wait_idle returned while the job was still running"
+        );
+
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait_idle returned after the job finished");
+        worker.join().unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[cfg(feature = "task-group-probe")]
+    #[test]
+    fn par_pool_wait_idle_drains_after_panicking_job() {
+        let pool: &'static ParPool = Box::leak(Box::new(ParPool {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            available: std::sync::Condvar::new(),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            idle_lock: std::sync::Mutex::new(()),
+            idle: std::sync::Condvar::new(),
+            panicked: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_job = completed.clone();
+        pool.submit_many([
+            Box::new(|| -> () { panic!("intentional measurement-job panic") }) as ParJob,
+            Box::new(move || {
+                completed_job.store(true, std::sync::atomic::Ordering::Release);
+            }) as ParJob,
+        ]);
+
+        let worker_completed = completed.clone();
+        let worker = std::thread::spawn(move || loop {
+            let job = pool.queue.lock().unwrap().pop_front().unwrap();
+            pool.run_job(job);
+            if worker_completed.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+        });
+
+        assert!(
+            !pool.wait_idle(),
+            "wait_idle must report a worker panic after draining queued jobs"
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        worker.join().unwrap();
+    }
+
     #[test]
     fn par_pool_submit_many_preserves_fifo_and_empty_input() {
         let pool: &'static ParPool = Box::leak(Box::new(ParPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             available: std::sync::Condvar::new(),
+            #[cfg(feature = "task-group-probe")]
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "task-group-probe")]
+            idle_lock: std::sync::Mutex::new(()),
+            #[cfg(feature = "task-group-probe")]
+            idle: std::sync::Condvar::new(),
+            #[cfg(feature = "task-group-probe")]
+            panicked: std::sync::atomic::AtomicBool::new(false),
         }));
         pool.submit_many(std::iter::empty());
         assert!(pool.queue.lock().unwrap().is_empty());
