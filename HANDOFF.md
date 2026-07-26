@@ -5,9 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #650.
-The current change implements the first primitive-scalar length-preserving staged `par_map` range
-kernel slice._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #651.
+The current change adds the first conservative body/byte-aware `par_map` grain hint; the broader
+width/aggregate sweep remains a measure-first follow-up._
 
 ## Start here
 
@@ -62,6 +62,7 @@ facts must live in this repository.
 #648  batched parallel pool job publication
 #649  focused test selection policy
 #650  low-lock task-group claims and completion
+#651  fuse primitive scalar `par_map` map stages
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -109,6 +110,13 @@ to 65536 on native Apple Silicon. It uses alternating paired timings and median
 ratios for cheap and heavy bodies; the value remains host- and body-sensitive, so
 rerun `bench/par_map/run.sh threshold` before another retune.
 
+#651 carries the first primitive-scalar length-preserving `map` stages into the
+same ordered range kernel. The current grain slice adds a compiler-generated
+1/2/4 body hint and input/output byte-aware floor. An aggressive reduction of the
+common `i64` floor was measured at the boundary and regressed pool/caller by about
+7%, so the shipped first model keeps that floor conservative until width and
+aggregate measurements justify a broader retune.
+
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
 and the macOS release-build CI path. A local `cargo build --release --workspace`
@@ -117,11 +125,10 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 ## Next work
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
-focused-verification, and low-lock task-group slices are shipped in #643, #644, #646, #647, #648,
-#649, and #650. The current change widens only primitive-scalar length-preserving `map` stages before
-`par_map`; filtered compaction, packed task records, body-aware grain, and false-sharing measurement
-remain separate measure-first follow-ups. After this change lands, the next recommended slice is
-body/byte-aware grain if its benchmark gate earns it.
+focused-verification, low-lock task-group, and staged-map slices are shipped in #643, #644, #646,
+#647, #648, #649, #650, and #651. The current change is the conservative body/byte-aware grain
+slice; filtered compaction, packed task records, false-sharing measurement, and a broader
+width/aggregate retune remain separate measure-first follow-ups.
 
 Consumer-gated deferrals that remain intentional:
 

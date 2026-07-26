@@ -115,17 +115,24 @@ The target that MIR's `ParMapParallel` (`04 §6`) lowers to (`05 §7`).
 void* align_rt_par_map(
   void* capture_ctx, void* in_buf, i64 count,
   i64 in_stride, i64 out_stride,
+  i64 work_weight,
   void (*kernel)(void* capture_ctx, void* in_buf, void* out_buf, i64 start, i64 end))
 
 i64 align_rt_par_map_reduce(
   void* capture_ctx, void* in_buf, i64 count,
   i64 in_stride, i64 result_stride,
+  i64 work_weight,
   void (*kernel)(void* capture_ctx, void* in_buf, void* partial,
                  i64 start, i64 end))
 ```
 
 - Allocate one owned output buffer, split its disjoint element ranges across the process-resident
   `ParPool`, and return the buffer pointer. Small inputs run on the caller to avoid pool overhead.
+- `work_weight` is a compiler-generated bounded hint (`1`, `2`, or `4`), not a source-level tuning
+  knob. The runtime combines it with `in_stride + out_stride` (or `in_stride + result_stride` for
+  reduction) to derive a conservative caller-only floor. Invalid values fall back to `1`; the common
+  scalar shapes retain the measured 65,536-element floor, narrower shapes may require more elements,
+  and wider shapes may reach the same byte budget with fewer.
 - The kernel is a generated typed loop around a Pure function (`03 §8`), so output ranges do not
   race. It receives a call-scoped immutable capture context, the complete bases, and one disjoint
   `[start,end)` range; it loads captures once and calls the known body directly per element. A

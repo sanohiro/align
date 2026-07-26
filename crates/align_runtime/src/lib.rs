@@ -1724,6 +1724,11 @@ static PAR_POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::Onc
 static PAR_WORKER_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 const PAR_MIN_CHUNK: usize = 65_536;
+// The baseline floor is the measured i64 map shape: 65,536 elements × (8-byte input + 8-byte
+// output). Narrow elements need more elements to amortize the same scheduler work; wider elements
+// need fewer. The compiler's small body-cost hint divides this byte budget for heavier bodies.
+const PAR_MIN_WORK_BYTES: usize = PAR_MIN_CHUNK * 16;
+const PAR_MAX_WORK_WEIGHT: usize = 4;
 
 #[cfg(feature = "par-map-probe")]
 static PAR_MAP_FORCE_CALLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1743,7 +1748,18 @@ pub extern "C" fn align_rt_test_par_map_force_caller(force: i32) {
 #[cfg(feature = "par-map-probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_test_par_map_min_chunk() -> i64 {
-    i64::try_from(PAR_MIN_CHUNK).expect("par_map threshold fits in i64")
+    i64::try_from(par_map_min_chunk(8, 8, 1)).expect("par_map threshold fits in i64")
+}
+
+/// Benchmark-only threshold getter for a concrete element width and compiler work hint. It is
+/// present only in the opt-in `par-map-probe` build so the benchmark can report per-body floors
+/// without duplicating the runtime cost model.
+#[cfg(feature = "par-map-probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_par_map_min_chunk_for(in_stride: i64, out_stride: i64, work_weight: i64) -> i64 {
+    let in_stride = usize::try_from(in_stride).unwrap_or(0);
+    let out_stride = usize::try_from(out_stride).unwrap_or(0);
+    i64::try_from(par_map_min_chunk(in_stride, out_stride, work_weight)).expect("par_map threshold fits in i64")
 }
 
 fn par_worker_count() -> usize {
@@ -1900,8 +1916,28 @@ fn par_map_plan(count: usize, workers: usize, min_chunk: usize) -> Option<(usize
 /// deliberately first: tiny maps must not initialize the process-lifetime pool. The returned plan
 /// is reused by both materializing `par_map` and fused integer reduction so the two paths have the
 /// same range/caller behavior.
-fn par_map_execution_plan(count: usize) -> Option<(usize, usize)> {
-    if count <= PAR_MIN_CHUNK {
+fn par_map_min_chunk(in_stride: usize, out_stride: usize, work_weight: i64) -> usize {
+    let weight = usize::try_from(work_weight)
+        .ok()
+        .filter(|&weight| weight > 0)
+        .unwrap_or(1)
+        .min(PAR_MAX_WORK_WEIGHT);
+    let bytes_per_element = in_stride.saturating_add(out_stride).max(1);
+    // The threshold probe established 65,536 elements as the safe scheduler floor for the common
+    // <=16-byte scalar shapes (i64 input + i64 output is exactly 16 bytes). Do not let a body hint
+    // turn that shape into extra short ranges; for wider records, byte volume dominates and the
+    // byte floor naturally permits fewer elements.
+    let element_floor = if bytes_per_element <= 16 {
+        PAR_MIN_CHUNK
+    } else {
+        PAR_MIN_CHUNK.div_ceil(bytes_per_element)
+    };
+    (PAR_MIN_WORK_BYTES / weight).div_ceil(bytes_per_element).max(element_floor).max(1)
+}
+
+fn par_map_execution_plan(count: usize, in_stride: usize, out_stride: usize, work_weight: i64) -> Option<(usize, usize)> {
+    let min_chunk = par_map_min_chunk(in_stride, out_stride, work_weight);
+    if count <= min_chunk {
         return None;
     }
     #[cfg(feature = "par-map-probe")]
@@ -1912,7 +1948,7 @@ fn par_map_execution_plan(count: usize) -> Option<(usize, usize)> {
     if workers <= 1 {
         return None;
     }
-    par_map_plan(count, workers, PAR_MIN_CHUNK)
+    par_map_plan(count, workers, min_chunk)
 }
 
 /// Run one generated range kernel over the caller-only or pooled plan. `range_output_stride == 0`
@@ -1969,7 +2005,9 @@ fn run_par_map_ranges(
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and invoke
 /// `kernel(context, in_buf, out, start, end)` once per contiguous, **disjoint** output range across
 /// the available threads. The generated kernel owns the typed element loop and directly calls the
-/// user's Pure function. `context` is a synchronous, immutable capture record and is never retained
+/// user's Pure function. `work_weight` is a compiler-generated 1/2/4 body-cost hint; the runtime
+/// combines it with `in_stride + out_stride` to choose a conservative caller-only floor. Invalid
+/// hints fall back to 1. `context` is a synchronous, immutable capture record and is never retained
 /// by the runtime. No synchronization is needed: the language guarantees the kernel shares no mutable
 /// state and the ranges never overlap
 /// (`draft.md` §11). Returns the owned output buffer (freed by the generated `Drop`). `count <= 0`
@@ -1978,7 +2016,7 @@ fn run_par_map_ranges(
 ///
 /// # Safety
 /// `in_buf` must point to `count` elements of `in_stride` bytes for the call; `kernel` must read and
-/// write only indices in the supplied half-open range.
+/// write only indices in the supplied half-open range. `work_weight` is an internal compiler hint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map(
     context: *const u8,
@@ -1986,6 +2024,7 @@ pub unsafe extern "C" fn align_rt_par_map(
     count: i64,
     in_stride: i64,
     out_stride: i64,
+    work_weight: i64,
     kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
 ) -> *mut u8 {
     if count <= 0 {
@@ -2007,20 +2046,22 @@ pub unsafe extern "C" fn align_rt_par_map(
         .unwrap_or_else(|| panic_abort("par_map input size overflow"));
 
     let out_buf = align_rt_alloc(bytes);
-    let plan = par_map_execution_plan(count);
+    let plan = par_map_execution_plan(count, in_stride, out_stride, work_weight);
     run_par_map_ranges(context, in_buf, out_buf, count, kernel, 0, plan);
     out_buf
 }
 
 /// `par_map(...).sum()`: run a generated integer-reduction range kernel and combine one wrapping
 /// partial per range. `result_stride` is the native byte width of the integer result (1, 2, 4, or
-/// 8); the returned i64 carries the exact result bits, and codegen narrows it back to the language
+/// 8); `work_weight` is the compiler-generated 1/2/4 body-cost hint used with the input/result byte
+/// width. The returned i64 carries the exact result bits, and codegen narrows it back to the language
 /// integer type. No `count * result_stride` output buffer is allocated.
 ///
 /// # Safety
 /// `in_buf` must point to `count` elements of `in_stride` bytes for the call's duration; `kernel`
 /// must read only the supplied input range and store one `result_stride`-wide integer at its output
-/// pointer. The runtime passes each range a distinct output slot.
+/// pointer. The runtime passes each range a distinct output slot. `work_weight` is an internal
+/// compiler hint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map_reduce(
     context: *const u8,
@@ -2028,6 +2069,7 @@ pub unsafe extern "C" fn align_rt_par_map_reduce(
     count: i64,
     in_stride: i64,
     result_stride: i64,
+    work_weight: i64,
     kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
 ) -> i64 {
     if count <= 0 {
@@ -2048,7 +2090,7 @@ pub unsafe extern "C" fn align_rt_par_map_reduce(
         .and_then(|b| isize::try_from(b).ok())
         .unwrap_or_else(|| panic_abort("par_map reduction input size overflow"));
 
-    let plan = par_map_execution_plan(count);
+    let plan = par_map_execution_plan(count, in_stride, result_stride, work_weight);
     let ranges = plan.map_or(1, |(nchunks, _)| nchunks);
     // A u64 slot for every range keeps the range output address naturally aligned even when the
     // language result is i8/i16. The kernel stores only the result-width prefix; the vector is
@@ -23376,6 +23418,25 @@ mod tests {
     }
 
     #[test]
+    fn par_map_min_chunk_accounts_for_bytes_and_body_weight() {
+        // The baseline is the existing i64 shape: 1 MiB of input+output bytes at weight 1.
+        assert_eq!(super::par_map_min_chunk(8, 8, 1), 65_536);
+        // Narrow elements need more elements to reach the same scheduler-amortizing byte budget.
+        assert_eq!(super::par_map_min_chunk(1, 1, 1), 524_288);
+        // A wider element reaches the budget sooner, and a heavier body halves that byte floor.
+        assert_eq!(super::par_map_min_chunk(64, 64, 1), 8_192);
+        assert_eq!(super::par_map_min_chunk(64, 64, 2), 4_096);
+        assert_eq!(super::par_map_min_chunk(8, 8, 2), 65_536);
+        // Invalid compiler hints fail closed to the light-body floor; oversized hints are capped.
+        assert_eq!(super::par_map_min_chunk(8, 8, 0), 65_536);
+        assert_eq!(super::par_map_min_chunk(8, 8, -1), 65_536);
+        assert_eq!(super::par_map_min_chunk(64, 64, 99), 2_048);
+        // Stride addition saturates before the byte calculation; malformed oversized metadata
+        // must not wrap into a zero-sized scheduler floor.
+        assert_eq!(super::par_map_min_chunk(usize::MAX, usize::MAX, 1), 1);
+    }
+
+    #[test]
     fn par_map_correct_across_threshold_boundary() {
         // Codex audit item 5: `PAR_MIN_CHUNK` (65_536) is the caller-only/pool-split boundary. A
         // count at or below it must run the tiny-map fast path added above `par_pool()`; one above
@@ -23391,6 +23452,7 @@ mod tests {
                     count,
                     size_of::<i64>() as i64,
                     size_of::<i64>() as i64,
+                    1,
                     par_map_double,
                 )
             };
@@ -23416,6 +23478,7 @@ mod tests {
                     count,
                     size_of::<i64>() as i64,
                     size_of::<i64>() as i64,
+                    1,
                     par_map_reduce_sum,
                 )
             };
@@ -23439,6 +23502,7 @@ mod tests {
                     COUNT,
                     size_of::<i64>() as i64,
                     size_of::<i64>() as i64,
+                    1,
                     par_map_double,
                 )
             };
@@ -23494,6 +23558,7 @@ mod tests {
                 COUNT,
                 size_of::<i64>() as i64,
                 size_of::<i64>() as i64,
+                1,
                 par_map_add_context,
             )
         };

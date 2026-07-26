@@ -29,6 +29,10 @@ extern "C" {
     /// Benchmark-only threshold getter, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_min_chunk() -> i64;
+    /// Benchmark-only per-body threshold getter, present in the opt-in `par-map-probe` runtime
+    /// build. It keeps the byte/work model in one place instead of copying it into the harness.
+    #[cfg(feature = "probe")]
+    fn align_rt_test_par_map_min_chunk_for(in_stride: i64, out_stride: i64, work_weight: i64) -> i64;
     /// Benchmark-only worker-count getter, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_workers() -> i64;
@@ -75,6 +79,7 @@ struct ThresholdCase {
     name: &'static str,
     par: Kernel,
     seq: Kernel,
+    work_weight: i64,
 }
 
 #[cfg(feature = "probe")]
@@ -237,7 +242,6 @@ fn run_threshold() {
         println!("par_map threshold probe skipped: runtime reports {runtime_workers} worker; the pool path is intentionally disabled on a one-worker host");
         return;
     }
-    let par_min_chunk = runtime_min;
     const ROUNDS: usize = 31;
     let counts = [
         16_384usize,
@@ -259,17 +263,19 @@ fn run_threshold() {
             name: "cheap",
             par: pmap_cheap,
             seq: smap_cheap,
+            work_weight: 1,
         },
         ThresholdCase {
             name: "heavy",
             par: pmap,
             seq: smap,
+            work_weight: 2,
         },
     ];
 
     // Initialize the persistent pool once, so the table measures the steady-state choice at the
     // boundary. Cold-start behavior is pinned separately by the runtime integration test.
-    let warm = gen(par_min_chunk * 2);
+    let warm = gen(runtime_min * 2);
     let warm_slice = Slice {
         ptr: warm.as_ptr(),
         len: warm.len() as i64,
@@ -277,10 +283,14 @@ fn run_threshold() {
     std::hint::black_box(call(pmap, warm_slice));
 
     println!("par_map threshold probe (warm pool, {ROUNDS} balanced ratio samples, {runtime_workers} workers)");
-    println!("n <= {par_min_chunk}: caller-only; n > {par_min_chunk}: pool eligible");
+    println!("cheap floor={} elements; heavy floor={} elements; floors use input/output bytes plus the compiler body hint", unsafe {
+        align_rt_test_par_map_min_chunk_for(8, 8, 1)
+    }, unsafe {
+        align_rt_test_par_map_min_chunk_for(8, 8, 2)
+    });
     println!(
-        "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}",
-        "n", "case", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
+        "{:>9}  {:>8}  {:>18}  {:>18}  {:>18}  {:>12}",
+        "n", "case", "median pool/seq", "median pool/caller", "pool/seq p10..p90", "floor"
     );
     for &n in &counts {
         let data = gen(n);
@@ -293,6 +303,10 @@ fn run_threshold() {
         // and transient worker wakeups a small part of each sample.
         let reps = (1_048_576usize / n).max(1);
         for case in cases {
+            let case_min_chunk = usize::try_from(unsafe {
+                align_rt_test_par_map_min_chunk_for(8, 8, case.work_weight)
+            })
+            .expect("runtime par_map threshold must be non-negative");
             let expected = call(case.seq, slice);
             assert_eq!(call(case.par, slice), expected, "{} n={n}", case.name);
             // Cycle through all six permutations so pool, caller, and sequential each occupy every
@@ -327,7 +341,7 @@ fn run_threshold() {
             let p10 = percentile(&pool_seq_ratios, 0.1);
             let p90 = percentile(&pool_seq_ratios, 0.9);
             println!(
-                "{n:>9}  {:>8}  {pool_seq_median:>18.3}  {pool_caller_median:>18.3}  {p10:.3}..{p90:.3}",
+                "{n:>9}  {:>8}  {pool_seq_median:>18.3}  {pool_caller_median:>18.3}  {p10:.3}..{p90:.3}  {case_min_chunk:>12}",
                 case.name,
             );
         }

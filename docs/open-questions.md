@@ -2810,8 +2810,8 @@ length-preserving `map` stages now enter the same ordered kernel, with every sta
 Pure; filtered and unsupported aggregate forms remain sequential. Direct wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read) shipped in #647, helper-job
 publication batching shipped in #648, and low-lock task-group claim/completion shipped in #650.
-The current change widens only the staged map slice; packed task records, body/byte-aware grain, and
-stable `where` compaction remain.
+The current change adds the conservative body/byte-aware grain hint; packed task records, a broader
+width/aggregate sweep, and stable `where` compaction remain.
 Applying the already-recorded blocking-worker direction to generic `task_group` stays a later
 mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of

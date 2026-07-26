@@ -44,6 +44,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
             COUNT,
             std::mem::size_of::<i64>() as i64,
             std::mem::size_of::<i64>() as i64,
+            1,
             double,
         )
     };
@@ -67,6 +68,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
             BOUNDARY,
             std::mem::size_of::<i64>() as i64,
             std::mem::size_of::<i64>() as i64,
+            1,
             double,
         )
     };
@@ -118,6 +120,7 @@ fn tiny_par_map_and_single_task_group_skip_pool_init() {
             BIG,
             std::mem::size_of::<i64>() as i64,
             std::mem::size_of::<i64>() as i64,
+            1,
             double,
         )
     };
