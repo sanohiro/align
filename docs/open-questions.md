@@ -2812,9 +2812,11 @@ Pure; projection, string, and unsupported aggregate forms remain sequential. Dir
 publication batching shipped in #648, and low-lock task-group claim/completion shipped in #650.
 The current slice adds stable callable primitive-scalar `where` compaction via count/prefix/scatter.
 The task-group record probe now compares split, packed-tight, and cache-line-padded layouts on the
-shipped registration ABI; the cross-size ship gate was not met, so packed task records remain a
-measure-first follow-up rather than a production ABI change. Projection/aggregate filters and a
-broader width/aggregate sweep remain.
+shipped registration ABI; because the split control uses the same bump arena, packed-tight is
+primarily allocation-call/record-shape evidence rather than an isolated locality measurement. The
+cross-size ship gate was not met, so packed task records remain a measure-first follow-up rather
+than a production ABI change. Projection/aggregate filters and a broader width/aggregate sweep
+remain.
 Applying the already-recorded blocking-worker direction to generic `task_group` stays a later
 mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of

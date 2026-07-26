@@ -342,6 +342,10 @@ fn median(values: &mut [f64]) -> f64 {
 }
 
 fn run_case(tasks: usize, rounds: u64, sleep_us: u64, fallible: bool, trials: usize, reps: usize) {
+    assert!(
+        tasks > 0,
+        "task-group record probe requires at least one task"
+    );
     let mut samples = [
         Vec::with_capacity(trials),
         Vec::with_capacity(trials),
@@ -412,13 +416,18 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
         .max(1);
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
     println!("task_group record probe — current split allocation vs one-record layouts");
+    println!("host parallelism / task-group runtime workers: {workers}");
     println!(
         "six-order balanced cycle, median of {trials} trials, {reps} repetitions per timing arm"
     );
     println!("packed-tight keeps fields adjacent; packed-padded puts each result/error on a cache-line boundary");
     println!("tasks  rounds  sleep-us  fallible       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
     for &(tasks, rounds, sleep_us) in &[
+        (1, 0, 0),
         (8, 0, 0),
         (128, 0, 0),
         (4096, 0, 0),

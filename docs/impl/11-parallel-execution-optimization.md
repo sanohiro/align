@@ -646,19 +646,26 @@ again for the result, again for the error, copies the capture environment, then 
 `tg_register`. Codegen knows every size and alignment. It can lay out one typed
 `{ captures, result, error }` record, allocate once, and register descriptor offsets/pointers.
 
-This removes runtime calls and improves descriptor/env locality, but it is not automatically a
+This removes runtime calls and can change descriptor/env locality, but it is not automatically a
 cache win: densely packed records can put result words written by different runners on one line.
+The current split control uses the same bump arena, so small split allocations may already be
+physically adjacent; the checked-in probe therefore does not isolate an additional locality win.
 Sequence it after block claiming, compare one-record vs current allocation on tiny, CPU-heavy, and
 blocking controls, and retain separate allocations if the false-sharing cost exceeds the
 call/locality win. A real filesystem/network workload is a separate resource-policy benchmark.
 
 **Measure-first result (2026-07-26):** `bench/task_group/run.sh` now drives the same registration
-ABI with split, packed-tight, and cache-line-padded records. On native Apple Silicon (8 workers),
-the final high-trial run covers zero-work, CPU-heavy, and bounded blocking controls, plus a real
-error-slot smoke. The probe is scoped to successful captured CPU/blocking tasks for performance;
-it does not claim filesystem/network behavior. The written ship gate requires a repeatable at least
-10% packed-tight win on both tiny and large groups without a material padded-control penalty; it is
-not met. Production codegen and the runtime ABI therefore retain the current split allocation shape.
+ABI with split, packed-tight, and cache-line-padded records. The recorded command was
+`LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib TRIALS=31 REPS=7 bench/task_group/run.sh`
+on native Apple Silicon; the harness reported eight runtime workers. The high-trial run covers the
+one-task caller-only path, zero-work, CPU-heavy, and
+bounded blocking controls, plus a real error-slot smoke. Zero-task groups are rejected because
+they contain no record to measure. Since the split control uses the same bump arena, packed-tight
+is primarily allocation-call/record-shape evidence, not an isolated locality measurement. The
+probe is scoped to successful captured CPU/blocking tasks for performance; it does not claim
+filesystem/network behavior. The written ship gate requires a repeatable at least 10% packed-tight
+win on both tiny and large groups without a material padded-control penalty; it is not met.
+Production codegen and the runtime ABI therefore retain the current split allocation shape.
 
 ---
 
