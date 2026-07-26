@@ -744,6 +744,29 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
     }
 }
 
+/// Whether a staged `par_map` can enter the single range-kernel path. The first widening slice is
+/// deliberately narrow: the source and every length-preserving `map` result must be a primitive
+/// scalar, and no filtering/projection/`chunks` stage may be present. Keep this predicate shared by
+/// effect checking and MIR lowering so a stage is never admitted to the parallel kernel without the
+/// matching Pure boundary check.
+pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage]) -> bool {
+    let elem = match source {
+        Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+        _ => return false,
+    };
+    if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char) || stages.is_empty() {
+        return false;
+    }
+    for stage in stages {
+        if !matches!(stage.kind, hir::StageKind::Map { .. })
+            || !matches!(stage.out_ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
 }
@@ -3971,7 +3994,8 @@ struct EffectSets {
     impure: std::collections::HashSet<String>,
     /// Functions that (transitively) call a function value of statically-unknown effect.
     unknown: std::collections::HashSet<String>,
-    /// Every `par_map` callee to verify Pure, with the call site's span.
+    /// Every `par_map` callee, plus every callable stage that will execute inside a widened
+    /// length-preserving staged range kernel, to verify Pure, with the call site's span.
     parmaps: Vec<(String, Span)>,
 }
 
@@ -4822,6 +4846,17 @@ impl EffectScan<'_> {
                 self.stage_funcs(stages);
                 self.calls.push(func.clone());
                 self.parmaps.push((func.clone(), e.span));
+                // A staged map is only a parallel candidate when MIR/codegen can keep the whole
+                // length-preserving scalar chain inside one range kernel. Its prior callables then
+                // cross the same Pure boundary as the terminal function; filtering, projection,
+                // aggregate sources, and `chunks` remain sequential and keep their old contract.
+                if par_map_staged_parallelizable(source.ty, stages) {
+                    for stage in stages {
+                        if let StageKind::Map { func, .. } = &stage.kind {
+                            self.parmaps.push((func.clone(), e.span));
+                        }
+                    }
+                }
                 self.expr(source);
             }
             // `to_soa` transposes its source array — no stage/reducer functions of its own.
@@ -16367,8 +16402,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// `source.….par_map(f)` — apply the Pure function `f` to each surviving element and
     /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
     /// whole call graph) and return a primitive scalar. Lowering selects the parallel range kernel
-    /// for direct scalar/slice/chunks sources with Copy captures; staged and unsupported aggregate
-    /// forms remain sequential, while Move captures are rejected by ownership checks.
+    /// for direct scalar/slice sources and primitive-scalar length-preserving map stages with Copy
+    /// captures; filtered and unsupported aggregate forms remain sequential, while Move captures
+    /// are rejected by ownership checks.
     fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [fn_arg] = args else {

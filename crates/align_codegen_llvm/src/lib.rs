@@ -24,7 +24,7 @@ pub mod thinlto_spike;
 pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
-use align_mir::{Block, Const, ConstElem, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
+use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{enum_is_move, payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
@@ -4812,16 +4812,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
         out_ty: BasicTypeEnum<'c>,
         capture_tys: &[Ty],
         reduce: bool,
+        stages: &[ParMapStage],
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
-        let name = if reduce { format!("{func}$parreducekernel") } else { format!("{func}$parkernel") };
+        if reduce && !stages.is_empty() {
+            return Err(self.err("par_map reduction kernels cannot contain prior stages"));
+        }
+        let name = if reduce {
+            format!("{func}$parreducekernel")
+        } else if stages.is_empty() {
+            format!("{func}$parkernel")
+        } else {
+            let chain = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join("$");
+            format!("{func}$parmapchain${chain}")
+        };
         if let Some(f) = self.module.get_function(&name) {
             return Ok(f.as_global_value().as_pointer_value());
         }
-        let target = self
-            .funcs
-            .get(func)
-            .copied()
-            .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
         let reduce_ty = if reduce {
             Some(match out_ty {
                 BasicTypeEnum::IntType(ty) => ty,
@@ -4830,8 +4836,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
         } else {
             None
         };
+        let mut terminal_capture_start = 0usize;
+        for stage in stages {
+            if stage.captures.len() != stage.capture_tys.len() {
+                return Err(self.err(format!(
+                    "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
+                    stage.func,
+                    stage.captures.len(),
+                    stage.capture_tys.len()
+                )));
+            }
+            let target = self
+                .funcs
+                .get(&stage.func)
+                .copied()
+                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
+            let expected_params = stage
+                .capture_tys
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| self.err(format!("par_map stage `{}` capture count overflows", stage.func)))?;
+            let actual_params = target.get_type().get_param_types().len();
+            if actual_params != expected_params {
+                return Err(self.err(format!(
+                    "par_map stage function `{}` has {actual_params} parameters, expected {expected_params}",
+                    stage.func
+                )));
+            }
+            terminal_capture_start = terminal_capture_start
+                .checked_add(stage.capture_tys.len())
+                .ok_or_else(|| self.err("par_map staged capture count overflows"))?;
+        }
+        if terminal_capture_start > capture_tys.len() {
+            return Err(self.err("par_map staged capture layout is shorter than its stage records"));
+        }
+        let target = self
+            .funcs
+            .get(func)
+            .copied()
+            .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
         let expected_params = capture_tys
             .len()
+            .checked_sub(terminal_capture_start)
+            .ok_or_else(|| self.err("par_map terminal capture layout is shorter than its stages"))?
             .checked_add(1)
             .ok_or_else(|| self.err(format!("par_map function `{func}` capture count overflows")))?;
         let actual_params = target.get_type().get_param_types().len();
@@ -4944,9 +4991,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
         };
         let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
-        let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + capture_values.len());
-        call_args.push(x.into());
-        call_args.extend(capture_values.iter().map(|value| BasicMetadataValueEnum::from(*value)));
+        let mut current = x;
+        let mut capture_start = 0usize;
+        for stage in stages {
+            let target = self
+                .funcs
+                .get(&stage.func)
+                .copied()
+                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
+            let capture_end = capture_start
+                .checked_add(stage.capture_tys.len())
+                .ok_or_else(|| self.err("par_map staged capture count overflows"))?;
+            let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
+            call_args.push(current.into());
+            call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
+            current = self
+                .builder
+                .build_call(target, &call_args, "stage")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err(format!("par_map stage function `{}` must return a value", stage.func)))?;
+            capture_start = capture_end;
+        }
+        let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
+        call_args.push(current.into());
+        call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
         let r = self
             .builder
             .build_call(target, &call_args, "r")
@@ -6715,17 +6785,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("align_rt_chunks returns a {ptr,len}")
             }
-            Rvalue::ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out } => {
-                // Build a call-scoped immutable context for Copy captures, then run `func` over the
-                // input in parallel via a per-`func` range kernel; the result is the owned
-                // `{ out_buf, count }` array. The runtime call is synchronous, so the entry alloca
-                // remains live until every worker has stopped reading it.
+            Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out } => {
+                // Build one call-scoped immutable context for all prior map and terminal captures,
+                // then run the complete scalar chain in one range kernel. The runtime call is
+                // synchronous, so the entry alloca remains live until every worker has stopped
+                // reading it.
                 if captures.len() != capture_tys.len() {
                     return Err(self.err(format!(
                         "par_map capture operand/type count mismatch: {} operands, {} types",
                         captures.len(),
                         capture_tys.len()
                     )));
+                }
+                let mut all_captures = Vec::new();
+                let mut all_capture_tys = Vec::new();
+                for stage in stages {
+                    if stage.captures.len() != stage.capture_tys.len() {
+                        return Err(self.err(format!(
+                            "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
+                            stage.func,
+                            stage.captures.len(),
+                            stage.capture_tys.len()
+                        )));
+                    }
+                    for (op, ty) in stage.captures.iter().zip(&stage.capture_tys) {
+                        all_captures.push(self.operand(op)?);
+                        all_capture_tys.push(*ty);
+                    }
+                }
+                for (op, ty) in captures.iter().zip(capture_tys) {
+                    all_captures.push(self.operand(op)?);
+                    all_capture_tys.push(*ty);
                 }
                 let agg = self.operand(src)?.into_struct_value();
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
@@ -6735,23 +6825,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
-                let context = if capture_tys.is_empty() {
+                let context = if all_capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
-                    let fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+                    let fields: Vec<BasicTypeEnum<'c>> = all_capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
                     let context_ty = self.ctx.struct_type(&fields, false);
                     let context = self.alloca_at_entry(context_ty.into(), "par_map_context")?;
-                    for (i, op) in captures.iter().enumerate() {
-                        let value = self.operand(op)?;
+                    for (i, value) in all_captures.iter().enumerate() {
                         let field = self
                             .builder
                             .build_struct_gep(context_ty, context, i as u32, "parcap")
                             .map_err(|e| self.err(e))?;
-                        self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                        self.builder.build_store(field, *value).map_err(|e| self.err(e))?;
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, false)?;
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, &all_capture_tys, false, stages)?;
                 // The runtime allocates the output (overflow-guarded), runs the kernel across
                 // threads, and returns the owned buffer.
                 let out_buf = self
@@ -6819,7 +6908,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, true)?;
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, true, &[])?;
                 let raw = self
                     .builder
                     .build_call(

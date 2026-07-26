@@ -5,8 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #649.
-The current change implements low-lock `task_group` claims and completion._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #650.
+The current change implements the first primitive-scalar length-preserving staged `par_map` range
+kernel slice._
 
 ## Start here
 
@@ -60,6 +61,7 @@ facts must live in this repository.
 #647  direct integer par_map reduction fusion and ABI documentation
 #648  batched parallel pool job publication
 #649  focused test selection policy
+#650  low-lock task-group claims and completion
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -98,7 +100,7 @@ vectorize while preserving the existing worker-pool scheduler and ordered
 output.
 
 #643 carried direct-source Copy captures through a synchronous immutable context
-so they use the same range kernel; staged and unsupported aggregate forms remain
+so they use the same range kernel; filtered and unsupported aggregate forms remain
 sequential. It also hardened malformed-expression cleanup, the macOS `fcntl` ABI,
 and the web integration-test startup retry.
 
@@ -115,10 +117,11 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 ## Next work
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
-and focused-verification slices are shipped in #643, #644, #646, #647, #648, and #649. The current
-change implements low-lock `task_group` claim/completion. After it lands, the next recommended
-slice is length-preserving staged parallel lowering; packed task records, body-aware grain, and
-false-sharing measurement remain later measure-first follow-ups.
+focused-verification, and low-lock task-group slices are shipped in #643, #644, #646, #647, #648,
+#649, and #650. The current change widens only primitive-scalar length-preserving `map` stages before
+`par_map`; filtered compaction, packed task records, body-aware grain, and false-sharing measurement
+remain separate measure-first follow-ups. After this change lands, the next recommended slice is
+body/byte-aware grain if its benchmark gate earns it.
 
 Consumer-gated deferrals that remain intentional:
 
