@@ -174,6 +174,35 @@ fn par_map_reduction_range_kernel_writes_partials() {
 }
 
 #[test]
+fn par_map_runtime_call_carries_static_body_work_weight() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"fn cheap(x: i64) -> i64 = x + 1
+fn heavy(x: i64) -> i64 {
+  mut a := x
+  a = a * 2654435761
+  a = a * a + 7
+  a = a * 40503 - 99
+  return a
+}
+pub fn cheap_sum(xs: slice<i64>) -> i64 = xs.par_map(cheap).sum()
+pub fn heavy_sum(xs: slice<i64>) -> i64 = xs.par_map(heavy).sum()
+fn main() -> i32 = 0
+"#;
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-work-weight", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map_reduce[cheap](") && text.contains("work=1"), "cheap map should carry weight 1:\n{text}");
+    assert!(text.contains("par_map_reduce[heavy](") && text.contains("work=2"), "heavier map should carry weight 2:\n{text}");
+
+    let ir = emit_llvm(src);
+    let calls: Vec<&str> = ir.lines().filter(|line| line.contains("@align_rt_par_map_reduce(")).collect();
+    assert!(calls.iter().any(|line| line.contains("i64 1, ptr")), "cheap reduction call must carry weight 1:\n{ir}");
+    assert!(calls.iter().any(|line| line.contains("i64 2, ptr")), "heavy reduction call must carry weight 2:\n{ir}");
+}
+
+#[test]
 fn chunks_par_map_chunk_function() {
     if !backend_available() {
         return;

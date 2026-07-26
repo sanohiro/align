@@ -120,8 +120,8 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That node carries a source, terminal
-function, ordered prior-map records, flattened Copy capture operands/types, and input/output element
-types, but no cost summary.
+function, ordered prior-map records, flattened Copy capture operands/types, input/output element
+types, and a bounded post-lowering body-work hint (`1`, `2`, or `4`).
 
 ### 3.2 Whole-range kernel — SHIPPED 2026-07-25
 
@@ -161,8 +161,9 @@ every worker locks it again to pop a job.
 1. allocates the complete output;
 2. for counts above the single-range floor on a host with multiple available workers, initializes
    the pool; a one-worker host remains caller-only;
-3. partitions into at most `workers` contiguous, balanced chunks, using `PAR_MIN_CHUNK = 65536`
-   **elements** as the caller-only floor and initial grain target;
+3. derives a caller-only floor from the input/output byte width and the bounded MIR body-work hint;
+   the common `i64` shape retains `PAR_MIN_CHUNK = 65536` elements as its measured floor, while
+   narrower shapes need more elements and wider shapes may use fewer;
 4. creates one shared range cursor and total-range completion barrier;
 5. submits helper drain loops and runs the same drain loop on the caller;
 6. waits until every claimed range publishes completion, then re-raises any recorded panic.
@@ -171,16 +172,19 @@ The tiny-call fast path moves step 2 after the single-chunk decision. It does no
 progress, per-element IR, or warm steady-state contention.
 
 The post-specialization threshold probe (`bench/par_map/run.sh threshold`) was rerun on native Apple
-Silicon after #643. It uses the opt-in probe runtime, skips one-worker hosts because the pool path is
+Silicon on 2026-07-26. It uses the opt-in probe runtime, skips one-worker hosts because the pool path is
 intentionally disabled there, and alternates all six paired pooled/caller-only/sequential orders so
 each arm occupies every timing slot. It reports the median of 31 `pool/seq` and `pool/caller` ratios
 and covers both a cheap vectorizable body and a heavier body around the boundary. At the old 32768
 boundary, entering the pool at 32769 was still a loss against the fused sequential control; moving
 the caller-only floor to 65536 keeps that medium-size region on the caller. The balanced range plan
-avoids a one-element helper at the first pool-eligible size, and the heavy-body pool/caller crossover
-falls between 65,537 and 73,728 on this representative run; the fused sequential comparison is
-separate and later, with pool/seq falling below 1 at 131,072. The value is deliberately body-agnostic
-and host-sensitive; rerun the probe before any future retune.
+avoids a one-element helper at the first pool-eligible size; the current pool/caller ratios at 65,537
+are 1.091x for the cheap body and 1.065x for the heavy body. The heavy-body crossover falls between
+73,728 and 98,304 in this representative run, while the fused sequential comparison falls below 1
+at 81,920 for cheap and 98,304 for heavy. A first aggressive experiment lowered the heavy `i64` floor
+at the boundary and made the pool/caller case about 7% slower because it created two short ranges;
+the shipped first slice therefore keeps the common scalar floor conservative while still carrying the
+body hint and byte model. The value remains host-sensitive; rerun the probe before any broader retune.
 
 `align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim a small
 contiguous batch with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is
@@ -638,19 +642,35 @@ tasks, and retain separate allocations if the false-sharing cost exceeds the cal
 
 ## 9. Work- and byte-aware grain selection
 
-`PAR_MIN_CHUNK = 65536` elements treats a byte transform and a 128-byte aggregate with an expensive
-body as the same amount of work. The compiler knows more than the runtime:
+`PAR_MIN_CHUNK = 65536` elements alone treats a byte transform and a 128-byte aggregate with an
+expensive body as the same amount of work. The compiler knows more than the runtime, so the first
+implementation now carries a bounded body hint and the runtime receives concrete strides:
 
 ```text
 estimated work = element_count * MIR body cost
 memory pressure = element_count * (input_bytes + output_bytes + staged bytes)
 ```
 
-Attach a small static cost class/weight to the parallel MIR node. It need not predict nanoseconds;
-it only needs to distinguish trivial arithmetic, memory-dominated copying, opaque calls, and heavy
-non-vectorizable bodies. Combine that with bytes/range and worker count at runtime. Keep the
-already-planned cheap-body lint as user guidance; the runtime threshold is the safe execution
-fallback for a construct whose parallel intent is already visible.
+The current runtime model is deliberately conservative:
+
+```text
+work_weight          = compiler hint in {1, 2, 4}, invalid runtime values use 1
+bytes_per_element    = input_stride + output_stride (or result_stride for reduction)
+byte_floor           = ceil(floor((65536 * 16) / work_weight) / bytes_per_element)
+element_floor        = 65536 when bytes_per_element <= 16, otherwise ceil(65536 / bytes_per_element)
+caller_only_floor    = max(1, byte_floor, element_floor)
+```
+
+The MIR pass classifies local statements, branches, and opaque calls; staged map weights are summed
+and capped at `4`. Unknown imported bodies use `1`. This need not predict nanoseconds: it only
+provides a stable coarse distinction without source annotations. For common scalar shapes the
+measured 65,536-element floor remains a safety bound; narrower shapes can require more elements and
+wider shapes can use fewer. An aggressive body-driven reduction of the common `i64` floor was measured
+and rejected after creating short ranges and slowing the boundary case by about 7%. Keep the
+already-planned cheap-body lint as user guidance; a broader width/aggregate sweep must earn any
+further threshold retune. The current fused range kernel has no materialized intermediate stages, so
+staged bytes are zero in this first byte model; a future materializing producer needs its own measured
+memory-pressure term.
 
 Use several coarse ranges per worker only when load imbalance justifies it. The range-kernel ABI
 makes 4-8x over-decomposition plausible because it pays one indirect call per range, but uniform
@@ -686,8 +706,8 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 
 MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
 range loop instead of an element thunk. Copy captures use the call-scoped context described above;
-primitive-scalar map stages carry ordered records in that same node. Filtered/aggregate stages and a
-cost summary are not present yet, so those cases remain sequential. No complete
+primitive-scalar map stages carry ordered records in that same node. The node now also carries a
+bounded body-work hint; filtered/aggregate stages remain sequential. No complete
 source-visible associativity/floating-order rule exists, and this map-only kernel does not silently
 declare generic parallel reduction settled.
 
@@ -719,8 +739,11 @@ declare generic parallel reduction settled.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
 - [x] Remeasure the post-specialization threshold across body costs and element counts around the
-  boundary (`bench/par_map/run.sh threshold`, 2026-07-25 native Apple Silicon); retain cold-start,
+  boundary (`bench/par_map/run.sh threshold`, 2026-07-26 native Apple Silicon); retain cold-start,
   element-width, aggregate-size, and cross-host checks before the next retune.
+- [x] Add the first conservative body/byte-aware floor and pin its width/weight arithmetic; keep the
+  common `i64` floor unchanged after the aggressive boundary experiment regressed pool/caller by
+  about 7%.
 - [ ] Sweep input/output element widths and aggregate sizes before treating the floor as a general
   cost model rather than this host's measured `i64` probe result.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
@@ -796,7 +819,9 @@ nested progress remain pinned.
   **SHIPPED 2026-07-26;** staged and `chunks` producer materialization remain later slices.
 - ~~Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
   length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (first primitive-scalar map slice).**
-- Add body/byte-aware grain.
+- ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in the current slice
+  2026-07-26;** broader width/aggregate measurement and any more aggressive body-driven retune remain
+  deferred.
 - Probe stable parallel compaction for `where` separately.
 - Probe explicit-parallel producer/ordered-terminal materialization elision.
 

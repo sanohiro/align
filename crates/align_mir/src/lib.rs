@@ -118,6 +118,75 @@ pub struct Function {
     pub exportable: bool,
 }
 
+/// Static work hint attached to an explicit parallel map. The value is deliberately a small
+/// multiplier, not a nanosecond estimate: `1` is a trivial body, `2` is a body with several scalar
+/// operations or a direct Pure call, and `4` is a larger/branchier body. Unknown imported bodies
+/// use `1` so the runtime stays conservative. The runtime combines this hint with the input/output
+/// byte width when choosing its caller-only floor and range grain.
+pub const PAR_MAP_DEFAULT_WORK_WEIGHT: u8 = 1;
+const PAR_MAP_MAX_WORK_WEIGHT: u8 = 4;
+
+fn par_map_function_work_units(f: &Function) -> u16 {
+    let mut units = 0u16;
+    for block in &f.blocks {
+        units = units.saturating_add(block.stmts.len().min(u16::MAX as usize) as u16);
+        if matches!(block.term, Term::Branch(..)) {
+            units = units.saturating_add(4);
+        }
+        for stmt in &block.stmts {
+            if matches!(stmt, Stmt::Let(_, Rvalue::Call(..) | Rvalue::CallIndirect { .. })) {
+                // A call is opaque at this stage; give it more weight than a local arithmetic
+                // instruction without trying to recursively model a separately compiled callee.
+                units = units.saturating_add(4);
+            }
+        }
+    }
+    units
+}
+
+fn par_map_function_work_weight(f: &Function) -> u8 {
+    match par_map_function_work_units(f) {
+        0..=4 => PAR_MAP_DEFAULT_WORK_WEIGHT,
+        5..=20 => 2,
+        _ => PAR_MAP_MAX_WORK_WEIGHT,
+    }
+}
+
+fn combined_par_map_work_weight(names: impl IntoIterator<Item = String>, weights: &std::collections::HashMap<String, u8>) -> u8 {
+    let total = names
+        .into_iter()
+        .map(|name| u16::from(weights.get(&name).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)))
+        .fold(0u16, u16::saturating_add);
+    total.min(u16::from(PAR_MAP_MAX_WORK_WEIGHT)) as u8
+}
+
+/// Fill the runtime scheduling hint after all functions have been lowered. Keeping this as a
+/// post-pass means a staged node can sum the local cost of every source-first stage and terminal,
+/// while a separate-compilation import with no body remains the fail-closed default.
+fn annotate_par_map_work(fns: &mut [Function]) {
+    let weights: std::collections::HashMap<String, u8> = fns
+        .iter()
+        .map(|f| (f.name.clone(), par_map_function_work_weight(f)))
+        .collect();
+    for f in fns {
+        for block in &mut f.blocks {
+            for stmt in &mut block.stmts {
+                let Stmt::Let(_, rv) = stmt else { continue };
+                match rv {
+                    Rvalue::ParMapParallel { func, stages, work_weight, .. } => {
+                        let names = stages.iter().map(|stage| stage.func.clone()).chain(std::iter::once(func.clone()));
+                        *work_weight = combined_par_map_work_weight(names, &weights);
+                    }
+                    Rvalue::ParMapReduce { func, work_weight, .. } => {
+                        *work_weight = weights.get(func).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 impl Function {
     /// The type produced by an operand.
     pub fn operand_ty(&self, op: &Operand) -> Ty {
@@ -479,7 +548,8 @@ pub enum Rvalue {
     /// calls that are fused into the same kernel; it is empty for a direct source. `elem_in` is the
     /// source element type and `elem_out` is `func`'s return. All captures are Copy values passed
     /// through one call-scoped immutable context record. The runtime never retains that record; the
-    /// generated kernel loads and forwards each stage and terminal value.
+    /// generated kernel loads and forwards each stage and terminal value. `work_weight` is a small
+    /// post-lowering cost hint (1/2/4) combined with element byte width by the runtime.
     ParMapParallel {
         src: Operand,
         func: String,
@@ -489,6 +559,7 @@ pub enum Rvalue {
         capture_tys: Vec<Ty>,
         elem_in: Ty,
         elem_out: Ty,
+        work_weight: u8,
     },
     /// `par_map(f).sum()` over a direct, stage-free scalar source whose result is an integer:
     /// apply the Pure `func` in parallel and combine one wrapping partial sum per claimed range,
@@ -502,6 +573,8 @@ pub enum Rvalue {
         capture_tys: Vec<Ty>,
         elem_in: Ty,
         elem_out: Ty,
+        /// Small post-lowering body-cost hint (1/2/4); unknown imported bodies use 1.
+        work_weight: u8,
     },
     /// The `len` of a slice operand.
     SliceLen(Operand),
@@ -1398,7 +1471,7 @@ pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) ->
 // base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
-    let fns: Vec<Function> = program
+    let mut fns: Vec<Function> = program
         .fns
         .iter()
         .map(|f| {
@@ -1411,6 +1484,7 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
             mf
         })
         .collect();
+    annotate_par_map_work(&mut fns);
     // User-declared `extern "C" link("name")` libraries come first (validated in sema); then the
     // libraries the used builtins require. Both feed the driver's single `-l<name>` loop.
     let mut link_libs = program.link_libs.clone();
@@ -4051,6 +4125,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         capture_tys,
                         elem_in,
                         elem_out: *elem,
+                        work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
                     }));
                     if free_src {
                         b.push(Stmt::DropValue(src));
@@ -6026,6 +6101,7 @@ fn lower_array_par_map_reduce(
         capture_tys,
         elem_in,
         elem_out,
+        work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
     }));
     if free_src {
         // The reduction has consumed the source bytes before returning its scalar result.

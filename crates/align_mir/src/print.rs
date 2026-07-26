@@ -363,7 +363,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Chunks { src, n, elem } => {
             format!("chunks({}, {} x {})", operand_str(src), operand_str(n), crate::ty_name(*elem))
         }
-        Rvalue::ParMapParallel { src, func, stages, captures, elem_in, elem_out, .. } => {
+        Rvalue::ParMapParallel { src, func, stages, captures, elem_in, elem_out, work_weight, .. } => {
             let caps = stages
                 .iter()
                 .flat_map(|stage| stage.captures.iter())
@@ -378,17 +378,17 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 format!("{prefix} -> {func}")
             };
             if caps.is_empty() {
-                format!("par_map[{chain}]({}: {} -> {})", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+                format!("par_map[{chain}]({}: {} -> {}; work={work_weight})", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
             } else {
-                format!("par_map[{chain}]({}: {} -> {}; captures=[{}])", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+                format!("par_map[{chain}]({}: {} -> {}; work={work_weight}; captures=[{}])", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
-        Rvalue::ParMapReduce { src, func, captures, elem_in, elem_out, .. } => {
+        Rvalue::ParMapReduce { src, func, captures, elem_in, elem_out, work_weight, .. } => {
             let caps = captures.iter().map(operand_str).collect::<Vec<_>>().join(", ");
             if caps.is_empty() {
-                format!("par_map_reduce[{}]({}: {} -> {})", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight})", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
             } else {
-                format!("par_map_reduce[{}]({}: {} -> {}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),

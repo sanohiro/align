@@ -247,10 +247,10 @@ Because the `Alloc` node carries a region, lints like "allocation inside a loop"
 The implemented data-parallel operation is a dedicated materializer:
 
 ```text
-direct source.par_map(f)        → Rvalue::ParMapParallel { src, func, stages: [], captures, capture_tys, elem_in, elem_out }
-staged scalar map chain         → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out }
+direct source.par_map(f)        → Rvalue::ParMapParallel { src, func, stages: [], captures, capture_tys, elem_in, elem_out, work_weight }
+staged scalar map chain         → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
 direct stage-free integer par_map(f).sum()
-                                → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out }
+                                → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight }
 filtered / unsupported par_map → sequential pipeline fallback, preserving capture semantics
 source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
@@ -266,6 +266,13 @@ wrapping integer addition and publishes one partial result per range, so no tran
 materialized. Filtered/unsupported staged pipelines, `chunks` producers, floating-point sums, and
 arbitrary reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
 parallelize ordinary reductions.
+
+Each parallel node also carries a compiler-generated `work_weight` in `{1, 2, 4}`. The post-lowering
+MIR pass classifies the callable from its local statement count, branches, and opaque calls; staged
+chains add their stage weights and cap the result at `4`. An unavailable imported body defaults to
+`1`, so separate compilation fails closed toward the conservative scheduler floor. This is a coarse
+runtime scheduling hint, not a source annotation or a nanosecond estimate; codegen passes it with
+the input/output byte widths to the runtime.
 
 ---
 

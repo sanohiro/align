@@ -252,16 +252,16 @@ MIR's dedicated direct-source `ParMapParallel` materializer (`04 §6`) goes to t
 parallel-map API.
 
 ```text
-ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out }
+ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
   → synthesize one typed range kernel (context, start..<end)
-  → align_rt_par_map(capture_ctx, in_buf, count, in_stride, out_stride, kernel)
+  → align_rt_par_map(capture_ctx, in_buf, count, in_stride, out_stride, work_weight, kernel)
   → owned array<elem_out>
 
 task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
 
-ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out }
+ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight }
   → synthesize one typed reducing range kernel (context, start..<end)
-  → align_rt_par_map_reduce(capture_ctx, in_buf, count, in_stride, result_stride, kernel)
+  → align_rt_par_map_reduce(capture_ctx, in_buf, count, in_stride, result_stride, work_weight, kernel)
   → integer result bits, narrowed to elem_out
 ```
 
@@ -272,6 +272,9 @@ element. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses p
 addition, and stores one partial at the range output pointer; the runtime combines the partials and
 returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in the same
 ordered range kernel; filtered and unsupported staged forms use the sequential pipeline fallback.
+`work_weight` is a bounded MIR hint (`1`, `2`, or `4`) materialized as an `i64` argument; it is
+combined with the concrete input/output strides by the runtime and does not change the source or
+language ABI.
 The fused node excludes `chunks`, floating-point sums, and arbitrary reducers. There is no
 generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 

@@ -1022,12 +1022,14 @@ fn build_module<'c>(
             None,
         ),
     );
-    // `par_map`: (capture_ctx, in_buf, count, in_stride, out_stride, range_kernel) -> out_buf.
+    // `par_map`: (capture_ctx, in_buf, count, in_stride, out_stride, work_weight, range_kernel)
+    // -> out_buf. `work_weight` is a compiler-generated 1/2/4 hint; the runtime combines it with
+    // the element byte width to choose a conservative caller-only floor.
     // Allocates the output, applies the generated kernel to disjoint ranges across threads, and
     // returns the owned buffer. The call-scoped capture context is never retained by the runtime.
     let par_map = module.add_function(
         "align_rt_par_map",
-        ptr.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
+        ptr.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
         None,
     );
     // Only `noalias` on the return: the output buffer is a fresh allocation disjoint from the inputs.
@@ -1035,14 +1037,14 @@ fn build_module<'c>(
     // range kernel, so we don't assert anything about what that does).
     add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
     funcs.insert("par_map".to_string(), par_map);
-    // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, range_kernel)
-    // -> wrapping integer sum. The runtime keeps only one partial result per claimed range, so no
-    // full transformed output buffer is materialized.
+    // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, work_weight,
+    // range_kernel) -> wrapping integer sum. The runtime keeps only one partial result per claimed
+    // range, so no full transformed output buffer is materialized.
     funcs.insert(
         "par_map_reduce".to_string(),
         module.add_function(
             "align_rt_par_map_reduce",
-            i64t.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
+            i64t.fn_type(&[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
             None,
         ),
     );
@@ -6785,7 +6787,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("align_rt_chunks returns a {ptr,len}")
             }
-            Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out } => {
+            Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight } => {
                 // Build one call-scoped immutable context for all prior map and terminal captures,
                 // then run the complete scalar chain in one range kernel. The runtime call is
                 // synchronous, so the entry alloca remains live until every worker has stopped
@@ -6825,6 +6827,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if all_capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
@@ -6847,7 +6850,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(
                         self.funcs["par_map"],
-                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
+                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
                         "obuf",
                     )
                     .map_err(|e| self.err(e))?
@@ -6868,7 +6871,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
-            Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out } => {
+            Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight } => {
                 // The reduction kernel writes one wrapping integer partial per claimed range;
                 // the runtime combines those partials and returns the result bits in i64. The
                 // final truncation restores the source integer width without adding signed
@@ -6892,6 +6895,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
@@ -6913,7 +6917,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(
                         self.funcs["par_map_reduce"],
-                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), kernel.into()],
+                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
                         "parsum",
                     )
                     .map_err(|e| self.err(e))?
