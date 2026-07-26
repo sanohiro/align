@@ -775,6 +775,23 @@ fn build_module<'c>(
         let fv = declare_imported_fn(ctx, module, imp, &struct_types, &enum_types, &tuple_types);
         funcs.insert(imp.name.clone(), fv);
     }
+    // Keep the semantic signatures alongside the LLVM declarations. The latter intentionally
+    // erase integer signedness, while a fused range kernel must reject a malformed MIR call whose
+    // physical `i64` happens to be compatible with the wrong declared `Ty`.
+    let mut fn_sigs: HashMap<String, ParMapFunctionSignature> = program
+        .fns
+        .iter()
+        .map(|f| {
+            let params = f.params.iter().map(|slot| f.slots[*slot as usize]).collect();
+            (f.name.clone(), ParMapFunctionSignature { params, ret: f.ret })
+        })
+        .collect();
+    for imp in &program.imported_fns {
+        fn_sigs.entry(imp.name.clone()).or_insert_with(|| ParMapFunctionSignature {
+            params: imp.params.clone(),
+            ret: imp.ret,
+        });
+    }
     // A by-value struct in an `extern "C"` signature uses the SysV AMD64 register ABI, which we
     // implement for x86-64 Linux only. On any other target we refuse rather than guess a per-target
     // register rule (that is the one FFI corner a wrong rule *silently miscompiles*) — the user must
@@ -2848,6 +2865,7 @@ fn build_module<'c>(
             module,
             builder: &builder,
             funcs: &funcs,
+            fn_sigs: &fn_sigs,
             extern_abi: &extern_abi,
             structs: &program.structs,
             struct_types: &struct_types,
@@ -3615,7 +3633,8 @@ fn handle_free_fn(ty: Ty) -> Option<&'static str> {
 }
 
 /// The constant data `json.decode` codegen emits for one struct: the field-descriptor table, the
-/// field count + struct store size, and the perfect-hash slot table (`phf_len = 0` → linear scan).
+/// field count + struct ABI allocation size, and the perfect-hash slot table (`phf_len = 0` →
+/// linear scan).
 struct DecodeTable<'c> {
     descs: inkwell::values::PointerValue<'c>,
     n_fields: u64,
@@ -3625,9 +3644,9 @@ struct DecodeTable<'c> {
     phf_seed: u64,
 }
 
-/// The field-descriptor table (+ PHF) `emit_desc_table` emits for one struct, without the store
-/// size. A nested-struct field's `JsonSubTable` global bundles this with the store size; the
-/// top-level `DecodeTable` adds the store size for the decode call.
+/// The field-descriptor table (+ PHF) `emit_desc_table` emits for one struct, without the ABI
+/// allocation size. A nested-struct field's `JsonSubTable` global bundles this with the ABI
+/// allocation size; the top-level `DecodeTable` adds the same size for the decode call.
 struct DescTable<'c> {
     descs: inkwell::values::PointerValue<'c>,
     n_fields: u64,
@@ -4266,6 +4285,10 @@ struct FnGen<'c, 'a> {
     module: &'a Module<'c>,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
+    /// Semantic signatures for every direct callable. LLVM's physical integer types do not retain
+    /// signedness, so the range-kernel boundary checks these `Ty`s as well as the generated LLVM
+    /// function type before emitting a direct call.
+    fn_sigs: &'a HashMap<String, ParMapFunctionSignature>,
     /// The SysV ABI plan for each `extern "C"` symbol — to coerce call arguments (view→data
     /// pointer, `layout(C)` struct→register slots) and reconstruct a by-value struct return.
     extern_abi: &'a HashMap<String, ExternAbi>,
@@ -4315,6 +4338,16 @@ struct FnGen<'c, 'a> {
     /// body instruction so a statement with no recorded line still carries a `DILocation` (LLVM's
     /// verifier requires one on inlinable calls in a function that has debug info).
     fn_line: u32,
+}
+
+/// The semantic signature needed to validate a callable used by a fused `par_map` range kernel.
+/// The ordinary function declarations already carry the matching LLVM ABI, but that ABI cannot
+/// distinguish (for example) `i64` from `u64`; keeping the `Ty` signature beside the declaration
+/// lets malformed MIR fail before LLVM accepts a physically compatible but semantically wrong call.
+#[derive(Clone, Debug)]
+struct ParMapFunctionSignature {
+    params: Vec<Ty>,
+    ret: Ty,
 }
 
 fn is_builder_header_ty(ty: Ty) -> bool {
@@ -4546,6 +4579,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// LLVM's store size omits an aggregate's tail padding, while typed GEP and the runtime's
+    /// element buffer contract advance by the ABI allocation size. Use the latter for every
+    /// dynamically allocated element buffer and for range-kernel strides so padded AoS structs
+    /// cannot overlap or under-allocate their rows.
+    fn element_allocation_size(&self, ty: BasicTypeEnum<'c>) -> u64 {
+        self.target_data.get_abi_size(&ty)
+    }
+
     fn stack_header_slot_for_operand(&self, op: &Operand) -> Option<Slot> {
         match op {
             Operand::Value(v) => self.stack_header_load_values.get(v).copied(),
@@ -4589,6 +4630,319 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// identity map, so their byte layout — the FFI/`raw`/json boundary — is unchanged.
     fn pfield(&self, struct_id: u32, logical: u32) -> u32 {
         self.field_perm[struct_id as usize][logical as usize]
+    }
+
+    /// Validate and resolve a compiler-generated AoS field stage. MIR stores field indices in the
+    /// language's logical order; the LLVM aggregate may reorder non-`layout(C)` fields, so every
+    /// range-kernel projection/filter must pass through the same permutation as ordinary field
+    /// access. Return the physical field index and its semantic type. This is a codegen error
+    /// rather than an indexing panic because malformed MIR must fail closed at the ABI boundary.
+    fn par_map_stage_field_info(&self, stage: &ParMapStage) -> Result<(u32, Ty), CodegenError> {
+        let field = match stage.kind {
+            ParMapStageKind::Project { field } | ParMapStageKind::FilterField { field } => field,
+            _ => return Err(self.err("non-field par_map stage passed to field-info validation")),
+        };
+        let Ty::Struct(struct_id) = stage.elem_in else {
+            return Err(self.err(format!("par_map field stage needs a struct input, got {:?}", stage.elem_in)));
+        };
+        let Some(def) = self.structs.get(struct_id as usize) else {
+            return Err(self.err(format!("par_map field stage references missing struct {struct_id}")));
+        };
+        let Some(field_ty) = def.fields.get(field as usize).map(|f| f.ty) else {
+            return Err(self.err(format!("par_map field stage references missing field {field} of struct {struct_id}")));
+        };
+        match stage.kind {
+            ParMapStageKind::Project { .. } if field_ty != stage.elem_out => {
+                return Err(self.err(format!("par_map projection type mismatch: field is {:?}, stage output is {:?}", field_ty, stage.elem_out)));
+            }
+            ParMapStageKind::FilterField { .. } if field_ty != Ty::Bool || stage.elem_out != stage.elem_in => {
+                return Err(self.err("par_map field filter must read a bool and preserve its struct element"));
+            }
+            _ => {}
+        }
+        let Some(physical) = self.field_perm.get(struct_id as usize).and_then(|perm| perm.get(field as usize)).copied() else {
+            return Err(self.err(format!("par_map field stage has no physical mapping for struct {struct_id} field {field}")));
+        };
+        Ok((physical, field_ty))
+    }
+
+    /// Keep generated staged-kernel names distinct when the same callable chain projects fields
+    /// from different struct types. The visible chain remains readable; the layout suffix prevents
+    /// LLVM from reusing a kernel whose input aggregate type or field permutation belongs to another
+    /// AoS type.
+    fn par_map_field_layout_suffix(stages: &[ParMapStage]) -> String {
+        let ids: Vec<String> = stages
+            .iter()
+            .filter_map(|stage| match stage.kind {
+                ParMapStageKind::Project { .. } | ParMapStageKind::FilterField { .. } => Some(match stage.elem_in {
+                    Ty::Struct(id) => id.to_string(),
+                    _ => "invalid".to_string(),
+                }),
+                ParMapStageKind::Map | ParMapStageKind::Filter => None,
+            })
+            .collect();
+        if ids.is_empty() { String::new() } else { format!("$struct{}", ids.join("_")) }
+    }
+
+    /// Encode the staged portion of a kernel's structural identity with only identifier-safe bytes.
+    /// The readable chain below intentionally keeps source names, but `$` is a legal part of lifted
+    /// names, so joining names with `$` alone is not injective (`a$b` versus `a`, `b`). Include the
+    /// stage kind, length-prefixed callable bytes, element types, field number, and stage capture
+    /// types so the complete kernel key cannot reuse a kernel built for a different chain.
+    fn par_map_stage_structural_key(stages: &[ParMapStage]) -> String {
+        stages
+            .iter()
+            .map(|stage| {
+                let (kind, field) = match stage.kind {
+                    ParMapStageKind::Map => ("m", "-".to_string()),
+                    ParMapStageKind::Filter => ("f", "-".to_string()),
+                    ParMapStageKind::Project { field } => ("p", field.to_string()),
+                    ParMapStageKind::FilterField { field } => ("w", field.to_string()),
+                };
+                let func = stage.func.as_deref().unwrap_or("");
+                let captures = stage
+                    .capture_tys
+                    .iter()
+                    .map(|ty| Self::par_map_type_key(*ty))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{kind}{field}{}{}:{}:{}:{}",
+                    func.len(),
+                    Self::par_map_hex(func),
+                    Self::par_map_type_key(stage.elem_in),
+                    Self::par_map_type_key(stage.elem_out),
+                    captures
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Add the parts that are outside the staged chain to a range-kernel identity. Empty
+    /// materializers and reductions have no stage records at all, and the terminal callable's
+    /// captures are not represented by a stage, so neither may use a name keyed only by `func`.
+    /// Include the declared MIR element types, the LLVM element types, mode, terminal captures, and
+    /// the exact LLVM signatures of every callable. Every free-form component is hex encoded before
+    /// it enters the generated name, keeping the identifier safe and injective.
+    #[allow(clippy::too_many_arguments)] // Each argument is an independent cache/ABI identity dimension.
+    fn par_map_kernel_structural_key(
+        &self,
+        func: &str,
+        in_ty: BasicTypeEnum<'c>,
+        out_ty: BasicTypeEnum<'c>,
+        elem_in: Ty,
+        elem_out: Ty,
+        capture_tys: &[Ty],
+        terminal_capture_start: usize,
+        mode: ParMapKernelMode,
+        stages: &[ParMapStage],
+    ) -> Result<String, CodegenError> {
+        let mode_key = match mode {
+            ParMapKernelMode::Materialize => "materialize",
+            ParMapKernelMode::Reduce => "reduce",
+            ParMapKernelMode::FilterCount => "filter-count",
+            ParMapKernelMode::FilterScatter => "filter-scatter",
+        };
+        let callable_signature = |name: &str| {
+            self.funcs
+                .get(name)
+                .map(|f| f.get_type().print_to_string().to_string())
+                .ok_or_else(|| self.err(format!("par_map function `{name}` is missing from codegen")))
+        };
+        let stage_signatures = stages
+            .iter()
+            .filter_map(|stage| stage.func.as_deref())
+            .map(callable_signature)
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminal_signature = callable_signature(func)?;
+        let terminal_captures = capture_tys
+            .get(terminal_capture_start..)
+            .ok_or_else(|| self.err("par_map terminal capture layout is shorter than its stages"))?
+            .to_vec();
+        Ok(Self::par_map_kernel_identity_key(
+            func,
+            &in_ty.print_to_string().to_string(),
+            &out_ty.print_to_string().to_string(),
+            elem_in,
+            elem_out,
+            &terminal_captures,
+            mode_key,
+            stages,
+            &terminal_signature,
+            &stage_signatures,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keep the testable key function aligned with its ABI dimensions.
+    fn par_map_kernel_identity_key(
+        func: &str,
+        in_llvm: &str,
+        out_llvm: &str,
+        elem_in: Ty,
+        elem_out: Ty,
+        terminal_captures: &[Ty],
+        mode: &str,
+        stages: &[ParMapStage],
+        terminal_signature: &str,
+        stage_signatures: &[String],
+    ) -> String {
+        let terminal_captures = terminal_captures
+            .iter()
+            .map(|ty| Self::par_map_type_key(*ty))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "mode={};elem_in={};elem_out={};in_llvm={};out_llvm={};terminal={}:{};terminal_captures={};stages={};stage_signatures={}",
+            mode,
+            Self::par_map_type_key(elem_in),
+            Self::par_map_type_key(elem_out),
+            Self::par_map_hex(in_llvm),
+            Self::par_map_hex(out_llvm),
+            Self::par_map_hex(func),
+            Self::par_map_hex(terminal_signature),
+            terminal_captures,
+            Self::par_map_stage_structural_key(stages),
+            stage_signatures
+                .iter()
+                .map(|signature| Self::par_map_hex(signature))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+
+    fn par_map_type_key(ty: Ty) -> String {
+        Self::par_map_hex(&format!("{ty:?}"))
+    }
+
+    fn par_map_hex(value: &str) -> String {
+        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Check every type-table id that the range-kernel path may hand to `llvm_type`. Normal MIR
+    /// has already passed sema, but codegen also accepts compiler-generated MIR in tests and in
+    /// future tooling; a bad id must be a lowering error rather than an index panic.
+    fn validate_par_map_type(&self, ty: Ty) -> Result<(), CodegenError> {
+        let valid = match ty {
+            Ty::Struct(id) | Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => {
+                self.struct_types.get(id as usize).is_some()
+            }
+            Ty::Tuple(id) => self.tuple_types.get(id as usize).is_some(),
+            Ty::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            Ty::Option(s) => self.validate_par_map_scalar(s),
+            Ty::Result(ok, err) => self.validate_par_map_scalar(ok) && self.validate_par_map_scalar(err),
+            Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => self.validate_par_map_scalar(s),
+            _ => true,
+        };
+        valid.then_some(()).ok_or_else(|| self.err(format!("par_map type table does not contain {ty:?}")))
+    }
+
+    /// Range kernels load values by value on every iteration and may run the same source slot on
+    /// multiple workers. Only primitive scalars, borrowed `str`, and non-Move Copy structs have a
+    /// safe by-value ABI here. Keep this codegen-side ownership gate beside the table-id validator:
+    /// hand-built/future MIR must not turn an unchecked `{ptr,len}` Move value into a repeated
+    /// load-and-drop or a copied owning capture.
+    fn validate_par_map_kernel_type(&self, ty: Ty) -> Result<(), CodegenError> {
+        self.validate_par_map_type(ty)?;
+        let valid = matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
+            || matches!(ty, Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums));
+        valid
+            .then_some(())
+            .ok_or_else(|| self.err(format!("par_map range kernel values must be primitive, str, or a Copy struct, got {ty:?}")))
+    }
+
+    /// Captures are loaded once from the immutable context record and passed by value to the
+    /// callable; unlike range elements they need not be limited to the element-kernel scalar/AoS
+    /// domain. Match sema's Copy/Move classification, then keep a fail-closed list of value shapes
+    /// for which `llvm_type`/the Align ABI actually has a by-value representation. In particular,
+    /// fixed arrays, slices, and tuples are valid Copy captures even though they are not valid range
+    /// element layouts.
+    fn validate_par_map_capture_type(&self, ty: Ty) -> Result<(), CodegenError> {
+        self.validate_par_map_type(ty)?;
+        if align_sema::ty_capture_is_move(ty, self.structs, self.tuples, self.enums) {
+            return Err(self.err(format!("par_map captures must be Copy values, got owning {ty:?}")));
+        }
+        let supported = matches!(
+            ty,
+            Ty::Int(_)
+                | Ty::Float(_)
+                | Ty::Bool
+                | Ty::Char
+                | Ty::Unit
+                | Ty::Struct(_)
+                | Ty::Tuple(_)
+                | Ty::Array(_, _)
+                | Ty::StructArray(_, _)
+                | Ty::Slice(_)
+                | Ty::Soa(_)
+                | Ty::Str
+                | Ty::Raw
+                | Ty::HttpHeaders
+                | Ty::JsonDoc
+                | Ty::JsonScanner(_)
+                | Ty::Option(_)
+                | Ty::Result(_, _)
+                | Ty::Enum(_)
+                | Ty::Rng
+                | Ty::Fn(_)
+                | Ty::Vec(_, _)
+                | Ty::Mask(_, _)
+                | Ty::ArenaHandle
+        );
+        supported
+            .then_some(())
+            .ok_or_else(|| self.err(format!("par_map capture type has no supported Copy ABI, got {ty:?}")))
+    }
+
+    /// Validate one direct callable at the range-kernel boundary. Comparing only LLVM types is not
+    /// enough: `i64` carries no signedness, so a malformed MIR node could call a `u64` function as
+    /// though it were `i64` and still produce verifier-clean IR. The semantic signature map catches
+    /// that mismatch; the physical function-type comparison then protects the ABI side of the same
+    /// contract before a cached/generated kernel is reused.
+    fn validate_par_map_callable(
+        &self,
+        name: &str,
+        params: &[Ty],
+        ret: Ty,
+        role: &str,
+    ) -> Result<FunctionValue<'c>, CodegenError> {
+        let signature = self
+            .fn_sigs
+            .get(name)
+            .ok_or_else(|| self.err(format!("{role} function `{name}` has no semantic signature")))?;
+        if signature.params != params || signature.ret != ret {
+            return Err(self.err(format!(
+                "{role} function `{name}` semantic signature {:?} -> {:?} does not match declared {:?} -> {:?}",
+                signature.params, signature.ret, params, ret
+            )));
+        }
+        let target = self
+            .funcs
+            .get(name)
+            .copied()
+            .ok_or_else(|| self.err(format!("{role} function `{name}` is missing from codegen")))?;
+        let llvm_params: Vec<BasicMetadataTypeEnum<'c>> = params.iter().map(|ty| self.llvm_type(*ty).into()).collect();
+        let expected = if ret == Ty::Unit {
+            self.ctx.void_type().fn_type(&llvm_params, false)
+        } else {
+            self.llvm_type(ret).fn_type(&llvm_params, false)
+        };
+        let actual_text = target.get_type().print_to_string().to_string();
+        let expected_text = expected.print_to_string().to_string();
+        if actual_text != expected_text {
+            return Err(self.err(format!(
+                "{role} function `{name}` LLVM signature {actual_text} does not match expected {expected_text}"
+            )));
+        }
+        Ok(target)
+    }
+
+    fn validate_par_map_scalar(&self, scalar: Scalar) -> bool {
+        match scalar {
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => self.struct_types.get(id as usize).is_some(),
+            Scalar::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            _ => true,
+        }
     }
 
     /// The byte offset of logical field `logical` within struct `struct_id`, read from the built
@@ -4827,17 +5181,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Get (building it once) the `void(context, in_base, out_base, start, end)` range kernel for
-    /// `func`. The kernel owns the counted element loop: typed GEP → load → direct call → store.
-    /// The runtime calls it once per claimed range, so the hot element loop contains no indirect
-    /// callback. Copy captures are loaded once from the immutable call-scoped context. Filter
-    /// kernels use the same ABI: the count pass stores one survivor count to `out_base`, while the
-    /// scatter pass writes survivors at local offsets from the range's prefix-adjusted `out_base`.
+    /// `func`. The kernel owns the counted element loop: typed GEP → load → staged transforms →
+    /// direct call → store. The runtime calls it once per claimed range, so the hot element loop
+    /// contains no indirect callback. Copy captures are loaded once from the immutable call-scoped
+    /// context. Filter kernels use the same ABI: the count pass stores one survivor count to
+    /// `out_base`, while the scatter pass writes survivors at local offsets from the range's
+    /// prefix-adjusted `out_base`. Field stages extract logical AoS fields through the backend
+    /// layout map.
     /// Building it temporarily repositions the shared builder, then restores it.
+    #[allow(clippy::too_many_arguments)] // The kernel ABI and staged pipeline are separate dimensions.
     fn par_map_range_kernel(
         &self,
         func: &str,
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
+        elem_in: Ty,
+        elem_out: Ty,
         capture_tys: &[Ty],
         mode: ParMapKernelMode,
         stages: &[ParMapStage],
@@ -4849,32 +5208,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if reduce && !stages.is_empty() {
             return Err(self.err("par_map reduction kernels cannot contain prior stages"));
         }
-        if filter && !stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter) {
+        if filter && !stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. })) {
             return Err(self.err("par_map filter kernels require a filter stage"));
         }
-        let name = match mode {
-            ParMapKernelMode::Reduce => format!("{func}$parreducekernel"),
-            ParMapKernelMode::Materialize if stages.is_empty() => format!("{func}$parkernel"),
-            ParMapKernelMode::Materialize => {
-                let chain = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join("$");
-                format!("{func}$parmapchain${chain}")
-            }
-            ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
-                let suffix = if filter_count { "count" } else { "scatter" };
-                let chain = stages
-                    .iter()
-                    .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone(),
-                        ParMapStageKind::Filter => format!("where${}", stage.func),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("$");
-                format!("{func}$parfilter${suffix}${chain}")
-            }
-        };
-        if let Some(f) = self.module.get_function(&name) {
-            return Ok(f.as_global_value().as_pointer_value());
+        if mode == ParMapKernelMode::Materialize
+            && stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }))
+        {
+            return Err(self.err("par_map materialize kernels cannot contain filter stages"));
         }
+        self.validate_par_map_kernel_type(elem_in)?;
+        self.validate_par_map_kernel_type(elem_out)?;
         let reduce_ty = if reduce {
             Some(match out_ty {
                 BasicTypeEnum::IntType(ty) => ty,
@@ -4885,40 +5228,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
         };
         let mut terminal_capture_start = 0usize;
         for stage in stages {
+            self.validate_par_map_kernel_type(stage.elem_in)?;
+            self.validate_par_map_kernel_type(stage.elem_out)?;
+            for ty in &stage.capture_tys {
+                self.validate_par_map_capture_type(*ty)?;
+            }
             if stage.captures.len() != stage.capture_tys.len() {
                 return Err(self.err(format!(
                     "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                    stage.func,
+                    stage.func.as_deref().unwrap_or("<field>"),
                     stage.captures.len(),
                     stage.capture_tys.len()
                 )));
             }
-            let target = self
-                .funcs
-                .get(&stage.func)
-                .copied()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
-            let expected_params = stage
-                .capture_tys
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| self.err(format!("par_map stage `{}` capture count overflows", stage.func)))?;
-            let actual_params = target.get_type().get_param_types().len();
-            if actual_params != expected_params {
-                return Err(self.err(format!(
-                    "par_map stage function `{}` has {actual_params} parameters, expected {expected_params}",
-                    stage.func
-                )));
-            }
-            if stage.kind == ParMapStageKind::Filter {
-                let Some(return_type) = target.get_type().get_return_type() else {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
-                };
-                let BasicTypeEnum::IntType(return_type) = return_type else {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
-                };
-                if return_type.get_bit_width() != 1 {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
+            match stage.kind {
+                ParMapStageKind::Project { .. } | ParMapStageKind::FilterField { .. } => {
+                    if stage.func.is_some() || !stage.captures.is_empty() {
+                        return Err(self.err("par_map field stages cannot carry callable captures"));
+                    }
+                    self.par_map_stage_field_info(stage)?;
+                }
+                ParMapStageKind::Map | ParMapStageKind::Filter => {
+                    let Some(stage_func) = stage.func.as_deref() else {
+                        return Err(self.err("par_map callable stage is missing its function"));
+                    };
+                    let expected_ret = match stage.kind {
+                        ParMapStageKind::Map => stage.elem_out,
+                        ParMapStageKind::Filter => Ty::Bool,
+                        _ => unreachable!("field stages are handled above"),
+                    };
+                    let expected_param_count = stage
+                        .capture_tys
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| self.err(format!("par_map stage `{stage_func}` capture count overflows")))?;
+                    let mut expected_params = Vec::with_capacity(expected_param_count);
+                    expected_params.push(stage.elem_in);
+                    expected_params.extend(stage.capture_tys.iter().copied());
+                    self.validate_par_map_callable(stage_func, &expected_params, expected_ret, "par_map stage")?;
                 }
             }
             terminal_capture_start = terminal_capture_start
@@ -4928,22 +5275,71 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if terminal_capture_start > capture_tys.len() {
             return Err(self.err("par_map staged capture layout is shorter than its stage records"));
         }
-        let target = self
-            .funcs
-            .get(func)
-            .copied()
-            .ok_or_else(|| self.err(format!("par_map function `{func}` is missing from codegen")))?;
-        let expected_params = capture_tys
+        let terminal_capture_tys = capture_tys
+            .get(terminal_capture_start..)
+            .ok_or_else(|| self.err("par_map terminal capture layout is shorter than its stages"))?;
+        let terminal_input = stages.last().map_or(elem_in, |stage| stage.elem_out);
+        let terminal_param_count = terminal_capture_tys
             .len()
-            .checked_sub(terminal_capture_start)
-            .ok_or_else(|| self.err("par_map terminal capture layout is shorter than its stages"))?
             .checked_add(1)
             .ok_or_else(|| self.err(format!("par_map function `{func}` capture count overflows")))?;
-        let actual_params = target.get_type().get_param_types().len();
-        if actual_params != expected_params {
-            return Err(self.err(format!(
-                "par_map function `{func}` has {actual_params} parameters, expected {expected_params}"
-            )));
+        let mut terminal_params = Vec::with_capacity(terminal_param_count);
+        terminal_params.push(terminal_input);
+        terminal_params.extend(terminal_capture_tys.iter().copied());
+        let target = self.validate_par_map_callable(func, &terminal_params, elem_out, "par_map terminal")?;
+        for ty in capture_tys {
+            self.validate_par_map_capture_type(*ty)?;
+        }
+        let structural_key = self.par_map_kernel_structural_key(
+            func,
+            in_ty,
+            out_ty,
+            elem_in,
+            elem_out,
+            capture_tys,
+            terminal_capture_start,
+            mode,
+            stages,
+        )?;
+        let field_layout_suffix = Self::par_map_field_layout_suffix(stages);
+        let name = match mode {
+            ParMapKernelMode::Reduce => format!("{func}$parreducekernel$key${structural_key}"),
+            ParMapKernelMode::Materialize => {
+                let chain = stages
+                    .iter()
+                    .map(|stage| match stage.kind {
+                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
+                        ParMapStageKind::Filter => stage.func.clone().unwrap_or_else(|| "where".to_string()),
+                        ParMapStageKind::Project { field } => format!("field${field}"),
+                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("$");
+                if stages.is_empty() {
+                    format!("{func}$parkernel$key${structural_key}")
+                } else {
+                    format!("{func}$parmapchain${chain}{field_layout_suffix}$key${structural_key}")
+                }
+            }
+            ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
+                let suffix = if filter_count { "count" } else { "scatter" };
+                let chain = stages
+                    .iter()
+                    .map(|stage| match stage.kind {
+                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
+                        ParMapStageKind::Filter => format!("where${}", stage.func.as_deref().unwrap_or("filter")),
+                        ParMapStageKind::Project { field } => format!("field${field}"),
+                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("$");
+                format!("{func}$parfilter${suffix}${chain}{field_layout_suffix}$key${structural_key}")
+            }
+        };
+        // Validate the complete staged shape before consulting the module cache. A malformed MIR
+        // node must not silently reuse an earlier kernel merely because its readable name collides.
+        if let Some(f) = self.module.get_function(&name) {
+            return Ok(f.as_global_value().as_pointer_value());
         }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
@@ -5071,38 +5467,77 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let mut current = x;
         let mut capture_start = 0usize;
         for (stage_idx, stage) in stages.iter().enumerate() {
-            let target = self
-                .funcs
-                .get(&stage.func)
-                .copied()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
             let capture_end = capture_start
                 .checked_add(stage.capture_tys.len())
                 .ok_or_else(|| self.err("par_map staged capture count overflows"))?;
-            let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
-            call_args.push(current.into());
-            call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-            let stage_value = self
-                .builder
-                .build_call(target, &call_args, "stage")
-                .map_err(|e| self.err(e))?
-                .try_as_basic_value()
-                .basic()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` must return a value", stage.func)))?;
             match stage.kind {
-                ParMapStageKind::Map => {
-                    current = stage_value;
+                ParMapStageKind::Map | ParMapStageKind::Filter => {
+                    let Some(stage_func) = stage.func.as_deref() else {
+                        return Err(self.err("par_map callable stage is missing its function"));
+                    };
+                    let target = self
+                        .funcs
+                        .get(stage_func)
+                        .copied()
+                        .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` is missing from codegen")))?;
+                    let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
+                    call_args.push(current.into());
+                    call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
+                    let stage_value = self
+                        .builder
+                        .build_call(target, &call_args, "stage")
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` must return a value")))?;
+                    if stage.kind == ParMapStageKind::Map {
+                        current = stage_value;
+                    } else {
+                        let predicate = match stage_value {
+                            BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => value,
+                            _ => return Err(self.err(format!("par_map filter `{stage_func}` must return bool"))),
+                        };
+                        let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
+                        self.builder
+                            .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
+                            .map_err(|e| self.err(e))?;
+                        self.builder.position_at_end(pass);
+                    }
                 }
-                ParMapStageKind::Filter => {
-                    let predicate = match stage_value {
+                ParMapStageKind::Project { .. } => {
+                    let (physical, _) = self.par_map_stage_field_info(stage)?;
+                    let current_struct = match current {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map projection stage needs an aggregate current value")),
+                    };
+                    current = self
+                        .builder
+                        .build_extract_value(current_struct, physical, "project")
+                        .map_err(|e| self.err(e))?;
+                }
+                ParMapStageKind::FilterField { .. } => {
+                    let (physical, field_ty) = self.par_map_stage_field_info(stage)?;
+                    let current_struct = match current {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map field filter needs an aggregate current value")),
+                    };
+                    let field_value = self
+                        .builder
+                        .build_extract_value(current_struct, physical, "wherefield")
+                        .map_err(|e| self.err(e))?;
+                    if field_ty != Ty::Bool {
+                        return Err(self.err("par_map field filter extracted a non-bool value"));
+                    }
+                    let predicate = match field_value {
                         BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => value,
-                        _ => return Err(self.err(format!("par_map filter `{}` must return bool", stage.func))),
+                        _ => return Err(self.err("par_map field filter extracted a non-bool LLVM value")),
                     };
                     let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
                     self.builder
                         .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
                         .map_err(|e| self.err(e))?;
                     self.builder.position_at_end(pass);
+                    current = current_struct.into();
                 }
             }
             capture_start = capture_end;
@@ -6609,7 +7044,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // not necessarily a power of two, so it cannot double as an allocator alignment).
                 let i64t = self.ctx.i64_type();
                 let elem_ty = self.llvm_type(*elem);
-                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&elem_ty), false);
+                let elem_bytes = i64t.const_int(self.element_allocation_size(elem_ty), false);
                 let elem_align = i64t.const_int(self.target_data.get_abi_alignment(&elem_ty) as u64, false);
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
@@ -6623,7 +7058,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::HeapAllocBuf { count, elem } => {
                 // bytes = count * sizeof(elem); heap-allocate (freed by a later Drop).
                 let i64t = self.ctx.i64_type();
-                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&self.llvm_type(*elem)), false);
+                let elem_bytes = i64t.const_int(self.element_allocation_size(self.llvm_type(*elem)), false);
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
@@ -6942,6 +7377,47 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // then run the complete scalar chain in one range kernel. The runtime call is
                 // synchronous, so the entry alloca remains live until every worker has stopped
                 // reading it.
+                let src_ty = self.checked_operand_ty(src)?;
+                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                    return Err(self.err(format!("par_map source must be a slice or AoS array view, got {src_ty:?}")));
+                }
+                let source_elem_ty = match src_ty {
+                    Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                    _ => return Err(self.err("par_map source shape could not be resolved")),
+                };
+                if source_elem_ty != *elem_in {
+                    return Err(self.err(format!(
+                        "par_map source element type {source_elem_ty:?} does not match declared input {elem_in:?}"
+                    )));
+                }
+                self.validate_par_map_kernel_type(*elem_in)?;
+                self.validate_par_map_kernel_type(*elem_out)?;
+                let Some(output_scalar) = ty_to_scalar(*elem_out).filter(|scalar| matches!(scalar, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) else {
+                    return Err(self.err("par_map range output must be a non-owning primitive scalar"));
+                };
+                let expected_result_ty = Ty::DynArray(output_scalar);
+                if result_ty != expected_result_ty {
+                    return Err(self.err(format!(
+                        "par_map result container {result_ty:?} does not match declared output {expected_result_ty:?}"
+                    )));
+                }
+                let mut stage_input = *elem_in;
+                for stage in stages {
+                    if stage.elem_in != stage_input {
+                        return Err(self.err(format!(
+                            "par_map stage input {:?} does not follow previous output {:?}",
+                            stage.elem_in, stage_input
+                        )));
+                    }
+                    match stage.kind {
+                        ParMapStageKind::Map | ParMapStageKind::Project { .. } => stage_input = stage.elem_out,
+                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } if stage.elem_out == stage.elem_in => {}
+                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } => {
+                            return Err(self.err("par_map filter stage must preserve its element type"));
+                        }
+                    }
+                }
                 if captures.len() != capture_tys.len() {
                     return Err(self.err(format!(
                         "par_map capture operand/type count mismatch: {} operands, {} types",
@@ -6955,28 +7431,48 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     if stage.captures.len() != stage.capture_tys.len() {
                         return Err(self.err(format!(
                             "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                            stage.func,
+                            stage.func.as_deref().unwrap_or("<field>"),
                             stage.captures.len(),
                             stage.capture_tys.len()
                         )));
                     }
+                    self.validate_par_map_kernel_type(stage.elem_in)?;
+                    self.validate_par_map_kernel_type(stage.elem_out)?;
                     for (op, ty) in stage.captures.iter().zip(&stage.capture_tys) {
+                        let actual = self.checked_operand_ty(op)?;
+                        if actual != *ty {
+                            return Err(self.err(format!(
+                                "par_map stage capture has type {actual:?}, declared {ty:?}"
+                            )));
+                        }
+                        self.validate_par_map_capture_type(*ty)?;
                         all_captures.push(self.operand(op)?);
                         all_capture_tys.push(*ty);
                     }
                 }
                 for (op, ty) in captures.iter().zip(capture_tys) {
+                    let actual = self.checked_operand_ty(op)?;
+                    if actual != *ty {
+                        return Err(self.err(format!("par_map capture has type {actual:?}, declared {ty:?}")));
+                    }
+                    self.validate_par_map_capture_type(*ty)?;
                     all_captures.push(self.operand(op)?);
                     all_capture_tys.push(*ty);
                 }
-                let agg = self.operand(src)?.into_struct_value();
+                let agg = match self.operand(src)? {
+                    BasicValueEnum::StructValue(value) => value,
+                    _ => return Err(self.err("par_map source view is not an LLVM aggregate")),
+                };
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
-                let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
+                let count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
+                    BasicValueEnum::IntValue(value) => value,
+                    _ => return Err(self.err("par_map source view length is not an integer")),
+                };
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
                 let i64t = self.ctx.i64_type();
-                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
-                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
+                let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if all_capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
@@ -6993,13 +7489,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let has_filter = stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter);
+                let has_filter = stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }));
                 let sty = slice_struct_type(self.ctx);
                 if has_filter {
                     let count_kernel = self.par_map_range_kernel(
                         func,
                         in_ty,
                         out_ty,
+                        *elem_in,
+                        *elem_out,
                         &all_capture_tys,
                         ParMapKernelMode::FilterCount,
                         stages,
@@ -7008,6 +7506,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         func,
                         in_ty,
                         out_ty,
+                        *elem_in,
+                        *elem_out,
                         &all_capture_tys,
                         ParMapKernelMode::FilterScatter,
                         stages,
@@ -7038,6 +7538,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         func,
                         in_ty,
                         out_ty,
+                        *elem_in,
+                        *elem_out,
                         &all_capture_tys,
                         ParMapKernelMode::Materialize,
                         stages,
@@ -7081,9 +7583,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         capture_tys.len()
                     )));
                 }
-                let agg = self.operand(src)?.into_struct_value();
+                if result_ty != *elem_out {
+                    return Err(self.err(format!(
+                        "par_map reduction result {result_ty:?} does not match declared output {elem_out:?}"
+                    )));
+                }
+                self.validate_par_map_kernel_type(*elem_in)?;
+                self.validate_par_map_kernel_type(*elem_out)?;
+                for (op, ty) in captures.iter().zip(capture_tys) {
+                    let actual = self.checked_operand_ty(op)?;
+                    if actual != *ty {
+                        return Err(self.err(format!("par_map reduction capture has type {actual:?}, declared {ty:?}")));
+                    }
+                    self.validate_par_map_capture_type(*ty)?;
+                }
+                let src_ty = self.checked_operand_ty(src)?;
+                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                    return Err(self.err(format!("par_map reduction source must be a slice or AoS array view, got {src_ty:?}")));
+                }
+                let source_elem_ty = match src_ty {
+                    Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                    _ => return Err(self.err("par_map reduction source shape could not be resolved")),
+                };
+                if source_elem_ty != *elem_in {
+                    return Err(self.err(format!(
+                        "par_map reduction source element type {source_elem_ty:?} does not match declared input {elem_in:?}"
+                    )));
+                }
+                let agg = match self.operand(src)? {
+                    BasicValueEnum::StructValue(value) => value,
+                    _ => return Err(self.err("par_map reduction source view is not an LLVM aggregate")),
+                };
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
-                let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
+                let count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
+                    BasicValueEnum::IntValue(value) => value,
+                    _ => return Err(self.err("par_map reduction source view length is not an integer")),
+                };
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
                 let out_int = match out_ty {
@@ -7091,8 +7627,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     _ => return Err(self.err("par_map reduction result must be an integer")),
                 };
                 let i64t = self.ctx.i64_type();
-                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
-                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
+                let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
@@ -7110,7 +7646,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, ParMapKernelMode::Reduce, &[])?;
+                let kernel = self.par_map_range_kernel(
+                    func,
+                    in_ty,
+                    out_ty,
+                    *elem_in,
+                    *elem_out,
+                    capture_tys,
+                    ParMapKernelMode::Reduce,
+                    &[],
+                )?;
                 let raw = self
                     .builder
                     .build_call(
@@ -9614,7 +10159,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Str => ((3 << 8) | 16, null),
             Ty::Struct(nested_id) => (4 << 8, self.emit_json_subtable(nested_id)?),
             // `array<Struct>` field (kind 5, REST-gateway runway Slice C): width 16 (the field's own
-            // `{ptr,len}` slot); `sub` is the ELEMENT struct's schema (store_size = element stride),
+            // `{ptr,len}` slot); `sub` is the ELEMENT struct's schema (store_size = ABI element stride),
             // which the runtime uses to decode the JSON array into an owned AoS. The nested `str`
             // element fields stay borrowed views into the input.
             Ty::DynStructArray(eid, _) => ((5 << 8) | 16, self.emit_json_subtable(eid)?),
@@ -9741,10 +10286,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Emit the `JsonSubTable` global for a nested-struct field of type `struct_id` (its descriptor
-    /// table, store size, and PHF), returning a pointer to it for the parent field's `sub` slot.
+    /// table, ABI allocation size, and PHF), returning a pointer to it for the parent field's `sub` slot.
     fn emit_json_subtable(&mut self, struct_id: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let inner = self.emit_desc_table(struct_id)?; // recurse — acyclic, so it terminates
-        let store_size = self.target_data.get_store_size(&self.struct_types[struct_id as usize]);
+        let store_size = self.element_allocation_size(self.struct_types[struct_id as usize].into());
         let i64t = self.ctx.i64_type();
         let subtable_ty = self.json_subtable_ty();
         let val = subtable_ty.const_named_struct(&[
@@ -9763,14 +10308,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
-    /// with the struct's store size. The table is a private constant global (safe inside a loop).
+    /// with the struct's ABI allocation size. The table is a private constant global (safe inside a loop).
     fn decode_field_table(&mut self, struct_id: u32) -> Result<DecodeTable<'c>, CodegenError> {
         let sty = self.struct_types[struct_id as usize];
         let t = self.emit_desc_table(struct_id)?;
         Ok(DecodeTable {
             descs: t.descs,
             n_fields: t.n_fields,
-            store_size: self.target_data.get_store_size(&sty),
+            store_size: self.element_allocation_size(sty.into()),
             phf_ptr: t.phf_ptr,
             phf_len: t.phf_len,
             phf_seed: t.phf_seed,
@@ -9853,7 +10398,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         tags_g.set_constant(true);
         mark_private_unnamed_addr(tags_g);
 
-        let store_size = self.target_data.get_store_size(&ety);
+        let store_size = self.element_allocation_size(ety.into());
         let union_ty = self.json_union_ty();
         let val = union_ty.const_named_struct(&[
             arms_g.as_pointer_value().into(),
@@ -10605,7 +11150,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let len = self.builder.build_extract_value(agg, 1, "sal").map_err(|e| self.err(e))?;
                     let t = self.emit_desc_table(*struct_id)?;
                     let n = i64t.const_int(t.n_fields, false);
-                    let esz = i64t.const_int(self.target_data.get_store_size(&self.struct_types[*struct_id as usize]), false);
+                    let esz = i64t.const_int(self.element_allocation_size(self.struct_types[*struct_id as usize].into()), false);
                     self.builder
                         .build_call(
                             self.funcs["json_encode_struct_array"],
@@ -10974,6 +11519,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(v)
     }
 
+    /// Read an operand's MIR type without trusting malformed value or argument ids. The ordinary
+    /// `Function::operand_ty` helper is intentionally fast for already-validated MIR; the
+    /// parallel range ABI is an aggregate boundary, so its source type must fail closed before
+    /// codegen indexes a type table or extracts `{ptr,len}` fields.
+    fn checked_operand_ty(&self, op: &Operand) -> Result<Ty, CodegenError> {
+        match op {
+            Operand::Const(Const::Int(_, ty)) | Operand::Const(Const::Float(_, ty)) => Ok(*ty),
+            Operand::Const(Const::Char(_)) => Ok(Ty::Char),
+            Operand::Const(Const::Bool(_)) => Ok(Ty::Bool),
+            Operand::Const(Const::Unit) => Ok(Ty::Unit),
+            Operand::Value(id) => self
+                .f
+                .value_tys
+                .get(*id as usize)
+                .copied()
+                .ok_or_else(|| self.err(format!("value %{id} has no MIR type"))),
+            Operand::Arg(index) => {
+                let slot = self
+                    .f
+                    .params
+                    .get(*index as usize)
+                    .copied()
+                    .ok_or_else(|| self.err(format!("parameter index {index} has no MIR slot")))?;
+                self.f
+                    .slots
+                    .get(slot as usize)
+                    .copied()
+                    .ok_or_else(|| self.err(format!("parameter index {index} references missing slot {slot}")))
+            }
+        }
+    }
+
     /// Read an operand's LLVM value. **Fallible on purpose:** the two non-constant forms look the
     /// value up in a table, and neither lookup is guaranteed by the type system alone.
     ///
@@ -11281,6 +11858,280 @@ mod tests {
             text.contains("has no LLVM value"),
             "the missing-value read must say so, got: {text}"
         );
+    }
+
+    #[test]
+    fn a_malformed_par_map_region_result_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let return_str = Function {
+            name: "return_str".to_string(),
+            params: vec![0],
+            ret: Ty::Str,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![Ty::Str],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![Stmt::Let(0, Rvalue::StrLit("x".to_string()))],
+                stmt_lines: vec![(0, 0)],
+                term: Term::Return(Some(Operand::Value(0))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "return_str".to_string(),
+                        stages: vec![],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: i64_ty,
+                        elem_out: Ty::Str,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true })), Ty::DynArray(Scalar::Str)],
+            vec![Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![],
+            vec![],
+            vec![return_str],
+        )
+        .expect_err("a range par_map must reject a region-bearing result before LLVM lowering");
+        assert!(
+            err.to_string().contains("non-owning primitive scalar"),
+            "the codegen guard should name the result contract, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_par_map_result_container_is_checked_against_element_output() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![i64_ty],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![Stmt::Let(0, Rvalue::Load(0))],
+                stmt_lines: vec![(0, 0)],
+                term: Term::Return(Some(Operand::Value(0))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        for result_scalar in [Scalar::Str, Scalar::String] {
+            let result_ty = Ty::DynArray(result_scalar);
+            let err = codegen_program(
+                vec![
+                    Stmt::Let(0, Rvalue::Load(0)),
+                    Stmt::Let(
+                        1,
+                        Rvalue::ParMapParallel {
+                            src: Operand::Value(0),
+                            func: "return_i64".to_string(),
+                            stages: vec![],
+                            captures: vec![],
+                            capture_tys: vec![],
+                            elem_in: i64_ty,
+                            elem_out: i64_ty,
+                            work_weight: 1,
+                        },
+                    ),
+                ],
+                vec![source_ty, result_ty],
+                vec![source_ty],
+                vec![],
+                vec![],
+                vec![return_i64.clone()],
+            )
+            .expect_err("a range par_map result container must match its primitive element output");
+            assert!(
+                err.to_string().contains("does not match declared output"),
+                "the codegen guard should name the result/container mismatch, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_par_map_move_kernel_value_is_an_error_not_a_copy() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let string_ty = Ty::String;
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![string_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let source_ty = Ty::Slice(Scalar::String);
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "return_i64".to_string(),
+                        stages: vec![],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: string_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![source_ty, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![source_ty],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("a range kernel must reject an owning source element before loading it");
+        assert!(
+            err.to_string().contains("primitive, str, or a Copy struct"),
+            "the codegen ownership guard should reject Move kernel values, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_par_map_reduce_source_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::ParMapReduce {
+                    src: Operand::Const(Const::Int(0, i64_ty)),
+                    func: "return_i64".to_string(),
+                    captures: vec![],
+                    capture_tys: vec![],
+                    elem_in: i64_ty,
+                    elem_out: i64_ty,
+                    work_weight: 1,
+                },
+            )],
+            vec![i64_ty],
+            vec![],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("a reduction source that is not a slice must fail before aggregate extraction");
+        assert!(err.to_string().contains("reduction source must be a slice"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_par_map_reduce_capture_operand_type_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let f64_ty = Ty::Float(FloatTy { bits: 64 });
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0, 1],
+            ret: i64_ty,
+            slots: vec![i64_ty, i64_ty],
+            slot_align: vec![None, None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapReduce {
+                        src: Operand::Value(0),
+                        func: "return_i64".to_string(),
+                        captures: vec![Operand::Const(Const::Float(0.0, f64_ty))],
+                        capture_tys: vec![i64_ty],
+                        elem_in: i64_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![source_ty, i64_ty],
+            vec![source_ty],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("a reduction capture operand/type mismatch must fail before context lowering");
+        assert!(err.to_string().contains("reduction capture has type"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_par_map_reduce_callable_semantic_signature_is_an_error() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let u64_ty = Ty::Int(IntTy { bits: 64, signed: false });
+        let return_i64 = Function {
+            name: "return_u64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![u64_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapReduce {
+                        src: Operand::Value(0),
+                        func: "return_u64".to_string(),
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: i64_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![source_ty, i64_ty],
+            vec![source_ty],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("signed and unsigned integer callable types must not share a range kernel");
+        assert!(err.to_string().contains("semantic signature"), "got: {err}");
     }
 
     /// The sibling lookup in the same accessor: an argument index past the LLVM parameter list (a
@@ -12343,6 +13194,93 @@ mod tests {
         // 0/1-field structs use the linear scan (already O(1)); no table is emitted.
         assert!(build_phf(&[]).is_none());
         assert!(build_phf(&["only"]).is_none());
+    }
+
+    #[test]
+    fn staged_kernel_structural_key_disambiguates_callable_boundaries() {
+        let stage = |func: &str| ParMapStage {
+            kind: ParMapStageKind::Map,
+            func: Some(func.to_string()),
+            captures: Vec::new(),
+            capture_tys: Vec::new(),
+            elem_in: Ty::Bool,
+            elem_out: Ty::Bool,
+        };
+        // The readable `$`-joined names would collide for one callable named `a$b` and two
+        // callables named `a` then `b`; the structural key must keep those kernels distinct.
+        let embedded = FnGen::par_map_stage_structural_key(&[stage("a$b")]);
+        let separated = FnGen::par_map_stage_structural_key(&[stage("a"), stage("b")]);
+        assert_ne!(embedded, separated);
+    }
+
+    #[test]
+    fn range_kernel_identity_includes_mode_types_and_callable_signatures() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let no_stages = Vec::new();
+        let no_stage_signatures = Vec::new();
+        let base = FnGen::par_map_kernel_identity_key(
+            "f",
+            "i64",
+            "i64",
+            i64_ty,
+            i64_ty,
+            &[i64_ty],
+            "materialize",
+            &no_stages,
+            "i64 (i64)",
+            &no_stage_signatures,
+        );
+        assert!(base.contains("mode=materialize"));
+        assert!(base.contains("terminal_captures="));
+        assert_ne!(
+            base,
+            FnGen::par_map_kernel_identity_key(
+                "f",
+                "i64",
+                "i64",
+                i64_ty,
+                i64_ty,
+                &[i32_ty],
+                "materialize",
+                &no_stages,
+                "i64 (i64)",
+                &no_stage_signatures,
+            ),
+            "terminal capture types must be part of the cache identity"
+        );
+        assert_ne!(
+            base,
+            FnGen::par_map_kernel_identity_key(
+                "f",
+                "i64",
+                "i64",
+                i32_ty,
+                i64_ty,
+                &[],
+                "materialize",
+                &no_stages,
+                "i64 (i32)",
+                &no_stage_signatures,
+            ),
+            "declared element types and callable signatures must be part of the cache identity"
+        );
+        assert_ne!(
+            base,
+            FnGen::par_map_kernel_identity_key(
+                "f",
+                "i64",
+                "i64",
+                i64_ty,
+                i64_ty,
+                &[i64_ty],
+                "reduce",
+                &no_stages,
+                "i64 (i64)",
+                &no_stage_signatures,
+            ),
+            "materialization and reduction kernels must never share a cache identity"
+        );
     }
 
     #[test]

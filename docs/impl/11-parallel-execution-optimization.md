@@ -46,11 +46,11 @@ Do the work in this order:
    intermediate array.~~ **SHIPPED 2026-07-26.** Direct, stage-free scalar maps now use a reduction
    range kernel with one wrapping partial per claimed range; staged reduction and `chunks` forms
    remain on their existing paths.
-7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (map slice);**
-   primitive-scalar `map` stages before `par_map` execute in one ordered range kernel. The callable
-   primitive-scalar `where` slice now uses stable count/prefix/scatter compaction, with every stage
-   and the terminal callable checked Pure; projections, `chunks`, and other aggregate shapes remain
-   sequential.
+7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (map, callable-
+   filter, and AoS field slices);** primitive-scalar `map` stages before `par_map` execute in one
+   ordered range kernel. Callable primitive-scalar `where` and AoS `where(.field)` use stable
+   count/prefix/scatter compaction, with every callable stage and terminal callable checked Pure;
+   SoA, `chunks`, string-search, and other unsupported layouts remain sequential.
 8. Choose grain from bytes and estimated body work, not a fixed element count alone. Evaluate
    separate CPU and blocking-I/O execution domains only after the common work-first fix.
 
@@ -98,16 +98,18 @@ Consequences for the language surface:
 
 ### 3.1 `par_map` is narrower than the design document says
 
-The implementation lowers to the parallel runtime for either a direct scalar/slice/chunks source or
-a direct scalar/slice source followed only by primitive-scalar length-preserving `map` stages. In
-both cases:
+The implementation lowers to the parallel runtime for either a direct scalar/AoS source or a
+direct scalar/AoS source followed by an admitted length-preserving stage chain. In both cases:
 
 ```text
 Copy captures only (passed through a call-scoped immutable context)
-scalar / slice / chunks-compatible source
+scalar / slice / AoS struct source
 ```
 
-For the staged map slice, the source and every stage output must additionally be a primitive scalar.
+For the staged scalar slice, the source and every stage output are primitive scalar, `str`, or Copy
+struct values. An AoS struct source may add compiler-generated field projection and
+`where(.field)` stages; the projection uses the logical-to-physical field map and the field filter
+uses the same stable count/prefix/scatter path as a callable filter.
 
 Otherwise it appends a normal `map` stage and executes the sequential collect loop
 ([MIR lowering](../../crates/align_mir/src/lib.rs#L2874-L2921)). In particular:
@@ -118,7 +120,7 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
   captures;
 - callable primitive-scalar `where(...).par_map(...)` chains use the stable count/prefix/scatter
   range path and preserve source order;
-- projections and unsupported aggregate source shapes are sequential.
+- SoA projections, `str.contains`, `chunks`, and unsupported aggregate layouts are sequential.
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That node carries a source, terminal
@@ -126,8 +128,8 @@ function, ordered prior map/filter records, flattened Copy capture operands/type
 element types, and a bounded post-lowering body-work hint (`1`, `2`, or `4`). A callable filter
 chain emits two generated range kernels; the runtime counts survivors, computes ordered prefix
 offsets, and scatters the chain's terminal results into an exact output buffer. The chain is
-re-evaluated in the second pass because all admitted callables are Pure; field/projection and
-aggregate forms remain sequential.
+re-evaluated in the second pass because all admitted callables are Pure; unsupported aggregate
+forms remain sequential.
 
 ### 3.2 Whole-range kernel — SHIPPED 2026-07-25
 
@@ -438,11 +440,10 @@ The late-runner proof from the work-first scheduler is load-bearing: a queued ru
 after the synchronous call has drained must inspect only scheduler-owned state, observe no range to
 claim, and exit without touching the caller's context.
 
-### 7.3 Length-preserving staged pipelines — map and callable-filter slices shipped 2026-07-26
+### 7.3 Length-preserving staged pipelines — map, callable-filter, and AoS field slices shipped 2026-07-26
 
 Prior primitive-scalar `map` stages preserve length and can be fused directly into the same generated
-range kernel. Field projections are a separate future slice because their layout and ABI gates are
-not covered here:
+range kernel. Callable filters use the stable two-pass path because output length is unknown:
 
 ```text
 source.map(f).map(g).par_map(h)
@@ -450,6 +451,9 @@ source.map(f).map(g).par_map(h)
 
 source.where(p).map(f).par_map(h)
   -> count ranges -> prefix survivor counts -> scatter one ordered output range per claim
+
+source.where(.active).value.par_map(h)
+  -> AoS load -> field filter -> count/prefix survivor counts -> field projection -> scatter
 ```
 
 The map slice covers a direct scalar/slice source followed only by primitive-scalar `map` stages.
@@ -461,9 +465,13 @@ records every callable that enters either kernel at the same Pure boundary as th
 including named and lifted capturing forms. Ordered output and drop behavior match the sequential
 collect loop; empty survivor sets return a null pointer with length zero.
 
-Field projections, `str.contains`, `chunks`, and aggregate element shapes remain on the sequential
-path. Do not widen those forms implicitly: projections and aggregate layouts need their own layout/
-ABI gates. The callable-filter implementation uses the documented two-pass algorithm:
+The AoS aggregate follow-up now covers direct fixed/dynamic `array<Struct>` sources, scalar field
+projection, and `where(.field)` in the same typed range kernel. The generated kernel loads one AoS
+record using its target-data stride, extracts the logical field after applying the backend's
+physical field permutation, and passes the resulting value or whole record to the known terminal
+call. Field filters use the same stable two-pass algorithm and preserve source order. SoA
+projections, `str.contains`, `chunks`, and other unsupported layouts remain sequential; do not
+infer AoS support for them.
 
 `where(...).par_map(...)` is a separate gate because output length is unknown. Two viable stable
 algorithms are:
@@ -741,8 +749,9 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 
 MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
 range loop instead of an element thunk. Copy captures use the call-scoped context described above;
-primitive-scalar map/filter stages carry ordered records in that same node. Filtered materialization
-uses count/prefix/scatter range kernels, while projection and aggregate stages remain sequential.
+primitive-scalar and AoS map/filter/projection stages carry ordered records in that same node.
+Filtered materialization uses count/prefix/scatter range kernels; unsupported aggregate stages remain
+sequential.
 The node now also carries a bounded body-work hint; no complete
 source-visible associativity/floating-order rule exists, and this map-only kernel does not silently
 declare generic parallel reduction settled.
@@ -794,8 +803,11 @@ declare generic parallel reduction settled.
   checksums around each runtime floor (`bench/par_map/run.sh aggregate`, 2026-07-26 native Apple
   Silicon). This direct-ABI probe measures scheduler byte/stride behavior only; it does not claim
   compiler-generated aggregate `par_map` support or justify a production retune by itself.
-- [ ] Sweep compiler-generated aggregate structs, projection/aggregate filters, and other hosts
-  before treating the scalar and runtime-record results as a general cost model.
+- [x] Add compiler-generated AoS aggregate sources, field projection, and `where(.field)` filter
+  coverage to the typed range kernel; the focused driver tests pin fixed/dynamic AoS inputs, struct
+  ABI calls, logical-to-physical field ordering, and stable output order.
+- [ ] Sweep those compiler-generated shapes on other hosts before treating the scalar and
+  runtime-record results as a general cost model.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 
@@ -850,8 +862,8 @@ with zero idle pool workers.
 
 **Current:** direct scalar/slice/chunk maps, including Copy-capturing forms, and primitive-scalar
 length-preserving `map`/callable-`where` stages use the range path with no indirect call inside the
-hot loop. Callable filters use a stable count/prefix/scatter pair; projection, `str.contains`, and
-unsupported aggregate forms remain sequential.
+hot loop. Callable filters use a stable count/prefix/scatter pair; AoS projection and `where(.field)`
+share the typed range path, while `str.contains` and unsupported aggregate forms remain sequential.
 
 ### Slice P2 — low-lock task execution
 
@@ -871,14 +883,16 @@ nested progress remain pinned.
 - ~~Fuse wrapping-integer `par_map(...).sum()` and eliminate its full intermediate array.~~
   **SHIPPED 2026-07-26;** staged and `chunks` producer materialization remain later slices.
 - ~~Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
-  length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (primitive-scalar map and callable
-  filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar `where`; field,
-  string, projection, chunks, and aggregate forms remain sequential.
+  length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (primitive-scalar and AoS map,
+  projection, and filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar
+  `where` and AoS `where(.field)`; SoA, string, and chunks forms remain sequential.
 - ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in #652
-  2026-07-26;** scalar width and runtime aggregate-like stride measurements are recorded; compiler
-  aggregate layouts, other hosts, and any more aggressive body-driven retune remain deferred.
+  2026-07-26;** scalar width and runtime aggregate-like stride measurements are recorded; AoS
+  compiler shapes are now covered by the kernel, while other hosts and any more aggressive
+  body-driven retune remain deferred.
 - ~~Probe stable parallel compaction for callable scalar `where`.~~ **SHIPPED 2026-07-26** with
-  count/prefix/scatter range kernels; projection/string/aggregate filters remain deferred.
+  count/prefix/scatter range kernels; AoS field filters now share that path, while SoA/string forms
+  remain deferred.
   The focused `bench/par_map/run.sh filter` probe measured the 50% scalar case on native Apple
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence

@@ -377,8 +377,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 let prefix = stages
                     .iter()
                     .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone(),
-                        ParMapStageKind::Filter => format!("where {}", stage.func),
+                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "<missing-map>".to_string()),
+                        ParMapStageKind::Filter => format!("where {}", stage.func.as_deref().unwrap_or("<missing-filter>")),
+                        ParMapStageKind::Project { field } => format!("field#{field}"),
+                        ParMapStageKind::FilterField { field } => format!("where field#{field}"),
                     })
                     .collect::<Vec<_>>()
                     .join(" -> ");
