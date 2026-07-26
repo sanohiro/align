@@ -168,8 +168,9 @@ the pre-PR gate before a draft PR is opened:
 3. Run a fresh adversarial preflight review of `git diff main...HEAD` and fix
    valid findings locally.
 4. Run the focused owner tests, `scripts/test-pr.sh`, and applicable Clippy.
-5. Record the reviewer and checks against the final commit with
-   `scripts/pre-pr.sh`. Open the draft only through `scripts/open-pr.sh`; direct
+5. Record the HEAD/base-bound clean review log, reviewer, and checks against the
+   final commit with `scripts/pre-pr.sh`. Open the draft only through
+   `scripts/open-pr.sh`; direct
    `gh pr create` bypasses the local guard and is prohibited for agent-driven
    work. CI rejects an absent or stale HEAD-bound attestation.
 
@@ -184,7 +185,9 @@ before it is merged:
    possible. Do not make one follow-up commit per review comment; separate
    commits are for independent changes or a necessary checkpoint.
 4. Rerun `scripts/pre-pr.sh` after any follow-up and refresh the PR attestation
-   with `scripts/update-pr-preflight.sh`. Wait for CI and only then merge.
+   with `scripts/update-pr-preflight.sh`.
+5. Record both clean post-open reviews against the pushed SHA with
+   `scripts/record-post-review.sh`. Wait for CI and only then merge.
 
 Review execution is bounded. A review process that has not returned a verdict
 within 15 minutes is a tool failure, not permission to wait indefinitely. Stop

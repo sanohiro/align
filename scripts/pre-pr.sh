@@ -4,12 +4,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/pre-pr.sh --reviewer ID [--base REF] [--owner-test LABEL] [-- COMMAND ...]" >&2
+  echo "usage: scripts/pre-pr.sh --reviewer ID --review-log FILE [--base REF] [--owner-test LABEL] [-- COMMAND ...]" >&2
   exit 2
 }
 
 base="origin/main"
 reviewer=""
+review_log=""
 owner_test="none"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,6 +22,11 @@ while [[ $# -gt 0 ]]; do
     --reviewer)
       [[ $# -ge 2 ]] || usage
       reviewer="$2"
+      shift 2
+      ;;
+    --review-log)
+      [[ $# -ge 2 ]] || usage
+      review_log="$2"
       shift 2
       ;;
     --owner-test)
@@ -45,10 +51,28 @@ done
   echo "--reviewer must contain only letters, digits, dot, underscore, or hyphen" >&2
   exit 2
 }
+[[ -f "$review_log" ]] || {
+  echo "--review-log must name the fresh adversarial review result" >&2
+  exit 2
+}
 
 git rev-parse --is-inside-work-tree >/dev/null
 base_sha="$(git rev-parse --verify "${base}^{commit}")"
 head_sha="$(git rev-parse HEAD)"
+marker_count="$(grep -Ec '^ALIGN_REVIEW_VERDICT=(CLEAN|FINDINGS)$' "$review_log" || true)"
+last_nonempty="$(awk 'NF { line = $0 } END { print line }' "$review_log")"
+[[ "$marker_count" -eq 1 && "$last_nonempty" == "ALIGN_REVIEW_VERDICT=CLEAN" ]] || {
+  echo "adversarial preflight review is not clean" >&2
+  exit 1
+}
+grep -Fqx "ALIGN_REVIEW_HEAD=$head_sha" "$review_log" || {
+  echo "adversarial review belongs to another HEAD" >&2
+  exit 1
+}
+grep -Fqx "ALIGN_REVIEW_BASE=$base_sha" "$review_log" || {
+  echo "adversarial review belongs to another base" >&2
+  exit 1
+}
 branch="$(git branch --show-current)"
 [[ -n "$branch" ]] || {
   echo "preflight requires a named branch" >&2
@@ -91,12 +115,11 @@ if [[ "$rust_changed" == true ]]; then
   scripts/test-pr.sh
   cargo clippy --workspace --all-targets --locked -- -D warnings
 fi
-if [[ $# -gt 0 ]]; then
-  "$@"
-elif [[ "$shell_changed" == true ]]; then
-  echo "shell changes require an owner test command after --" >&2
+if [[ $# -eq 0 ]]; then
+  echo "every change requires a focused owner verification command after --" >&2
   exit 1
 fi
+"$@"
 
 if [[ "$(git rev-parse HEAD)" != "$head_sha" ]] || [[ -n "$(git status --porcelain)" ]]; then
   echo "HEAD or the worktree changed during preflight; rerun it on the final commit" >&2

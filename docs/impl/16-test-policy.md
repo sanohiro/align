@@ -77,6 +77,10 @@ starting the full review. Ordinary review automation must not promote `cargo tes
 --workspace` or `scripts/test-full.sh` into the PR path without an explicit
 scope justification.
 
+`scripts/record-post-review.sh` publishes the clean host and independent review
+as a SHA-bound GitHub status after the PR exists. The required status prevents a
+later push from inheriting an earlier review result.
+
 ## Change-specific verification
 
 The author must run the narrow regression targets that own the changed

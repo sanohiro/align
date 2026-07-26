@@ -47,3 +47,11 @@ grep -Eq '^<!-- align-preflight-reviewer:[^[:space:]<>]+ -->$' "$body_file" || {
   echo "preflight adversarial reviewer identity is missing" >&2
   exit 1
 }
+grep -Fqx "<!-- align-post-review-head:$head_sha -->" "$body_file" || {
+  echo "post-open review is missing or stale for HEAD $head_sha" >&2
+  exit 1
+}
+grep -Fqx "<!-- align-post-review-base-sha:$base_sha -->" "$body_file" || {
+  echo "post-open review is missing or stale for base $base_sha" >&2
+  exit 1
+}

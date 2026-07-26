@@ -137,11 +137,12 @@ rerun by the two kernels.
 #658 extends that path to direct and dynamic AoS struct inputs, compiler-generated
 field projection and `where(.field)` stages, and ABI allocation-size validation for
 padded rows and JSON struct-array descriptors. Move aggregates, SoA, string-search,
-chunks, and unsupported layouts remain on their safe existing paths. The PR also
-establishes the operational rule that self-review and an adversarial preflight happen
-before a draft PR, review processes have a bounded watchdog, and related review fixes
-are batched instead of committed one finding at a time; see `CLAUDE.md` and
-`docs/impl/16-test-policy.md`.
+chunks, and unsupported layouts remain on their safe existing paths.
+
+#659 establishes the operational rule that self-review and an adversarial
+preflight happen before a draft PR, review processes have a bounded watchdog,
+and related review fixes are batched instead of committed one finding at a time;
+see `CLAUDE.md` and `docs/impl/16-test-policy.md`.
 
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-separated padded controls over the same registration ABI.
