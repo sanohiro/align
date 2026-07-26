@@ -172,6 +172,20 @@ fn par_map_over_padded_aos_uses_abi_stride() {
 }
 
 #[test]
+fn par_map_round_trips_json_aos_with_abi_stride() {
+    if !backend_available() {
+        return;
+    }
+    // JSON AoS decode/encode and the range kernel must agree on the ABI allocation size. The
+    // natural field order gives this row a tail-padded 16-byte stride (bool + i64), while the
+    // logical descriptor still reports fields in source order.
+    let src = "import core.json\nRow { active: bool, amount: i64 }\nBatch { rows: array<Row> }\nfn amount(row: Row) -> i64 = row.amount\nfn main() -> Result<(), Error> {\n  rows: array<Row> := json.decode(\"[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]\")?\n  batch: Batch := json.decode(\"{\\\"rows\\\":[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]}\")?\n  out := rows.par_map(amount)\n  print(out[0])\n  print(out[1])\n  print(json.encode(batch))\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-json-aos", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n7\n{\"rows\":[{\"active\":true,\"amount\":3},{\"active\":false,\"amount\":7}]}\n");
+}
+
+#[test]
 fn par_map_rejects_move_aos_elements_before_codegen() {
     let src = "User { name: string, age: i32 }\nfn age(u: User) -> i32 = u.age\nfn main() -> i32 {\n  users := [User{name: \"a\".clone(), age: 7}]\n  out := users.par_map(age)\n  return out[0]\n}\n";
     assert!(check_errs("pm-move-struct", src), "par_map must reject a Move struct element by value");
