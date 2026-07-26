@@ -63,6 +63,20 @@ fn par_map_capturing_lambda_uses_parallel_range_kernel() {
 }
 
 #[test]
+fn par_map_copy_array_capture_uses_the_context_abi() {
+    if !backend_available() {
+        return;
+    }
+    // Fixed arrays are Copy captures even though they are not range-element layouts. The capture
+    // context must preserve the whole by-value array rather than applying the narrower element gate.
+    let src = "fn main() -> Result<(), Error> {\n  offsets := [4, 5]\n  ys := [1, 2, 3].par_map(fn x { x + offsets[0] })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-copy-array-capture", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n");
+    assert!(emit_llvm(src).contains("$parkernel"), "a Copy array capture should stay on the range-kernel path");
+}
+
+#[test]
 fn par_map_borrowed_call_source_is_not_freed() {
     if !backend_available() {
         return;
