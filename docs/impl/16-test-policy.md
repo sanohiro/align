@@ -145,7 +145,7 @@ product result, and must be reported separately.
 | Change scope | Minimum verification | Add only when |
 | --- | --- | --- |
 | Documentation or policy | `git diff --check` | add the relevant consistency or render check when one exists |
-| Private helper or local analysis | one filtered owner test; Rust changes also use `scripts/test-pr.sh`, the standard workspace build, and applicable Clippy | the helper crosses a crate, ABI, linker, scheduler, or resource boundary |
+| Private helper or local analysis | one filtered owner test; Rust changes also use the bounded gate `scripts/test-pr.sh` (including its workspace build) and applicable Clippy | the helper crosses a crate, ABI, linker, scheduler, or resource boundary |
 | Compiler, runtime, or FFI code | focused owner test, `scripts/test-pr.sh`, and applicable Clippy | the focused target does not exercise the changed contract or the change is broad |
 | Optimization or concurrency | owner correctness test; a named benchmark/probe for a changed performance path, a `MEASURE-FIRST` audit, or a performance/resource claim; `scripts/test-pr.sh` for code changes | add fresh-process, cross-platform, stress, or repeatability coverage only when that behavior is part of the changed contract or claim |
 | Broad refactor or versioned release | the bounded gate and the affected owner targets | run `scripts/test-full.sh` when the scope or release process warrants it |
