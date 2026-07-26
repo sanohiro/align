@@ -1,0 +1,43 @@
+name: Preflight
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preflight-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  attestation:
+    name: Pre-PR attestation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify pre-PR gate belongs to current HEAD and base
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/pr-body.txt"
+          if git show "$PR_BASE_SHA:scripts/check-pr-preflight.sh" > "$RUNNER_TEMP/check-pr-preflight.sh" 2>/dev/null; then
+            chmod +x "$RUNNER_TEMP/check-pr-preflight.sh"
+          elif [[ "$PR_NUMBER" == "659" ]]; then
+            # Bootstrap for the PR that first introduces the base-controlled checker.
+            cp scripts/check-pr-preflight.sh "$RUNNER_TEMP/check-pr-preflight.sh"
+          else
+            echo "trusted base has no preflight checker" >&2
+            exit 1
+          fi
+          chmod +x "$RUNNER_TEMP/check-pr-preflight.sh"
+          "$RUNNER_TEMP/check-pr-preflight.sh" \
+            "$PR_HEAD_SHA" "$PR_BASE_REF" "$PR_BASE_SHA" "$RUNNER_TEMP/pr-body.txt"

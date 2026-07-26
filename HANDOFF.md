@@ -5,13 +5,14 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #657.
+_Last updated: 2026-07-26. `main` includes the shipped wave through #658.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
 materializing maps without changing production behavior. #657 adds a runtime-only
-aggregate-like stride probe without changing production behavior. Projection,
-string, chunk, and aggregate filters remain sequential._
+aggregate-like stride probe without changing production behavior. #658 widens the
+compiler-generated AoS range path to field projection and `where(.field)` stages;
+SoA, string-search, and chunks remain sequential._
 
 ## Start here
 
@@ -73,6 +74,7 @@ facts must live in this repository.
 #655  relevance/cost test-selection policy
 #656  scalar par_map width and output-stride measure-first probe
 #657  runtime-only aggregate-like par_map stride measure-first probe
+#658  compiler-generated AoS projection/field-filter par_map range stages
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -130,8 +132,17 @@ a broader retune.
 #653 adds callable primitive-scalar `where` stages to the same ordered
 range pipeline. It counts survivors per range, prefixes byte offsets, then scatters
 in source order into an exact-sized owned array. Pure map and predicate stages are
-rerun by the two kernels; projection, string, chunk, aggregate, and other
-unsupported filters retain the sequential path.
+rerun by the two kernels.
+
+#658 extends that path to direct and dynamic AoS struct inputs, compiler-generated
+field projection and `where(.field)` stages, and ABI allocation-size validation for
+padded rows and JSON struct-array descriptors. Move aggregates, SoA, string-search,
+chunks, and unsupported layouts remain on their safe existing paths.
+
+#659 establishes the operational rule that self-review and an adversarial
+preflight happen before a draft PR, review processes have a bounded watchdog,
+and related review fixes are batched instead of committed one finding at a time;
+see `CLAUDE.md` and `docs/impl/16-test-policy.md`.
 
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-separated padded controls over the same registration ABI.
