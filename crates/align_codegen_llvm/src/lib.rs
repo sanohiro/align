@@ -4859,7 +4859,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// element layouts.
     fn validate_par_map_capture_type(&self, ty: Ty) -> Result<(), CodegenError> {
         self.validate_par_map_type(ty)?;
-        if align_sema::ty_is_move(ty, self.structs, self.tuples, self.enums) {
+        if align_sema::ty_capture_is_move(ty, self.structs, self.tuples, self.enums) {
             return Err(self.err(format!("par_map captures must be Copy values, got owning {ty:?}")));
         }
         let supported = matches!(

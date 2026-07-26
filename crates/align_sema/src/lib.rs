@@ -1050,12 +1050,20 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
     Some((op, mode))
 }
 
-/// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
-/// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
-fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    // Capture uses the same ownership classification as calls and pipelines. Keeping one predicate
-    // prevents a newly supported aggregate shape from becoming Copy only at a closure boundary.
+/// Whether `ty` is unsafe to copy into a lifted lambda's capture environment. Most values share the
+/// ordinary Move classification, but a fixed array can itself be a stack value whose scalar element
+/// owns storage (`array<string>`); that shape has a separate element-drop model and must not be
+/// copied as one aggregate even though `ty_is_move` deliberately does not classify the fixed array
+/// slot as a heap-owning value.
+pub fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     ty_is_move(ty, structs, tuples, enums)
+        || matches!(
+            ty,
+            Ty::Array(s, _)
+                if s.is_move()
+                    || matches!(s, Scalar::Struct(id) if struct_is_move(id, structs, enums))
+                    || matches!(s, Scalar::Enum(id) if enum_is_move(id, enums))
+        )
 }
 
 /// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, a nested
@@ -1304,7 +1312,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
         || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
 }
 
-pub fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
+fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
     matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)

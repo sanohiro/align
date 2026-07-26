@@ -210,6 +210,16 @@ fn par_map_rejects_move_aos_elements_before_codegen() {
 }
 
 #[test]
+fn par_map_rejects_owned_fixed_array_capture() {
+    let src = "fn main() -> Result<(), Error> {\n  names := [\"a\".clone(), \"b\".clone()]\n  ys := [1, 2].par_map(fn x { x + names.len() })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-array-string-capture", src), "par_map must reject an owned fixed array capture");
+    assert!(
+        check_diagnostics("pm-array-string-capture", src).contains("cannot capture the owned value 'names'"),
+        "the ownership diagnostic should identify the fixed array capture"
+    );
+}
+
+#[test]
 fn par_map_rejects_region_bearing_result() {
     let src = "fn identity(x: str) -> str = x\nfn main() -> i32 {\n  xs := [\"a\"].par_map(identity)\n  return xs.len() as i32\n}\n";
     assert!(check_errs("pm-region-result", src), "par_map must reject a borrowed str result");
