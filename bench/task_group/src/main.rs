@@ -328,7 +328,10 @@ fn timed(
     let elapsed_seconds = if align_rt_test_par_pool_initialized() {
         let mut elapsed = Duration::ZERO;
         for _ in 0..reps {
-            align_rt_test_par_pool_wait_idle();
+            assert!(
+                align_rt_test_par_pool_wait_idle(),
+                "a measurement pool job panicked"
+            );
             let started = Instant::now();
             checksum = checksum.wrapping_add(black_box(run_once(
                 tasks, rounds, sleep_us, layout, fallible,
