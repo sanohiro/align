@@ -4097,15 +4097,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
-                Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
                 _ => None,
             };
-            let staged_parallel = align_sema::par_map_staged_parallelizable(source.ty, stages, &b.structs, &b.enums);
-            let has_sequential_stage = stages.iter().any(|stage| matches!(stage.kind, hir::StageKind::WhereStrContains { .. }));
-            if (stages.is_empty() || staged_parallel) && !has_sequential_stage && let Some(elem_in) = elem_in {
+            if align_sema::par_map_parallelizable(source.ty, stages, &b.structs, &b.enums)
+                && let Some(elem_in) = elem_in
+            {
                     let src = match source.ty {
-                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
+                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
                         _ => {
                             let (slot, n) = array_source_slot(b, source);
                             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
@@ -4144,7 +4143,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
                     // Free the source buffer if it is an owned temporary the runtime just consumed.
                     // A call returning `slice<T>` is a borrow and must never be classified as one.
-                    let free_src = pipeline_source_needs_drop(source, b.arenas.is_empty());
+                    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
                     let v = b.fresh_value(e.ty);
                     b.push(Stmt::Let(v, Rvalue::ParMapParallel {
                         src: src.clone(),
@@ -5800,8 +5799,15 @@ fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec
 /// classify a call by its return type: `make() -> array<T>` transfers ownership, while
 /// `identity(xs) -> slice<T>` merely returns a borrowed view. Treating both as owned attempts to
 /// `free` stack/borrowed storage after the pipeline finishes.
-fn pipeline_source_needs_drop(source: &hir::Expr, outside_arena: bool) -> bool {
-    let always_heap = matches!(source.kind, hir::ExprKind::ArrayChunks { .. })
+fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bool) -> bool {
+    let parallel_par_map = match &source.kind {
+        hir::ExprKind::ArrayParMap { source: inner, stages, .. } => {
+            align_sema::par_map_parallelizable(inner.ty, stages, &b.structs, &b.enums)
+        }
+        _ => false,
+    };
+    let always_heap = parallel_par_map
+        || matches!(source.kind, hir::ExprKind::ArrayChunks { .. })
         || (matches!(source.kind, hir::ExprKind::Call { .. })
             && matches!(source.ty, Ty::DynArray(_) | Ty::DynSliceArray(_)));
     let arena_if_in_arena = matches!(
@@ -5864,7 +5870,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // doesn't cover them). A function returning `slice<T>` only lends a view and is never
             // freed here. Materializing terminals instead arena-allocate inside an arena, so the loop
             // frees those only outside one.
-            let temp_free = pipeline_source_needs_drop(source, b.arenas.is_empty()).then(|| sv.clone());
+            let temp_free = pipeline_source_needs_drop(b, source, b.arenas.is_empty()).then(|| sv.clone());
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free, zip: None }
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
@@ -6121,7 +6127,7 @@ fn lower_array_par_map_reduce(
     };
     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
     let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
-    let free_src = pipeline_source_needs_drop(source, b.arenas.is_empty());
+    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
     let v = b.fresh_value(elem_out);
     b.push(Stmt::Let(v, Rvalue::ParMapReduce {
         src: src.clone(),

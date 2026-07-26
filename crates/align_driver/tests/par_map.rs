@@ -81,6 +81,25 @@ fn par_map_borrowed_call_source_is_not_freed() {
 }
 
 #[test]
+fn par_map_inside_arena_frees_runtime_output() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  arena {\n    ys := [1, 2, 3].par_map(dbl)\n    print(ys.sum())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-arena-output", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-arena-output", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.lines().any(|line| line.trim_start().starts_with("drop ")), "the malloc-backed par_map output must be dropped inside the arena:\n{text}");
+
+    let ir = emit_llvm(src);
+    assert!(ir.lines().any(|line| line.contains("call void @align_rt_free(")), "the par_map output must be freed through the runtime:\n{ir}");
+}
+
+#[test]
 fn par_map_after_where() {
     if !backend_available() {
         return;
@@ -307,12 +326,18 @@ fn chunks_par_map_chunk_function() {
     if !backend_available() {
         return;
     }
-    // The §11 headline: `chunks(n).par_map(f)` where `f: (slice<T>) -> R` reduces each chunk.
+    // `chunks(n).par_map(f)` remains correct through the sequential collection fallback while
+    // the dedicated chunk-parallel algorithm is out of scope for the AoS range kernel.
     // [1..5].chunks(2) → [1,2],[3,4],[5]; chunk_sum → [3, 7, 5].
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3, 4, 5].chunks(2).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[2])\n  return Ok(())\n}\n";
     let out = build_and_run("pm-chunks", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(!text.contains("par_map["), "chunks must remain on the sequential fallback until its dedicated algorithm lands:\n{text}");
 }
 
 #[test]

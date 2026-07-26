@@ -797,6 +797,23 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs:
     true
 }
 
+/// Whether a `par_map` result is produced by the malloc-backed range-kernel path. The parallel
+/// materializer accepts direct primitive/AoS sources and the admitted length-preserving staged
+/// forms; `chunks`, SoA, string-search, and other layouts deliberately stay on the arena-aware
+/// sequential collector. Keep this predicate shared with MIR and ownership analysis so the
+/// runtime's individually allocated output is never mistaken for arena storage (or vice versa).
+pub fn par_map_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    let source_value = match source {
+        Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+        _ => return false,
+    };
+    if !par_map_kernel_value(source_value, structs, enums) {
+        return false;
+    }
+    stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums)
+}
+
 fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
 }
@@ -5830,6 +5847,8 @@ impl<'a> EscapeCheck<'a> {
                 .iter()
                 .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
                 .all(|part| self.drop_is_individual(part, depth)),
+            ExprKind::ArrayParMap { source, stages, .. }
+                if par_map_parallelizable(source.ty, stages, self.structs, self.enums) => true,
             _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
             }
         };
@@ -6079,10 +6098,14 @@ impl<'a> EscapeCheck<'a> {
                         acc.shorter(self.region_of(capture, depth))
                     })
             }
-            ExprKind::ArrayPartition { .. }
-            | ExprKind::ArrayParMap { .. }
-            | ExprKind::ArraySort { .. }
-            | ExprKind::ArraySortBy { .. } => self.allocation_region(e),
+            ExprKind::ArrayPartition { .. } | ExprKind::ArraySort { .. } | ExprKind::ArraySortBy { .. } => self.allocation_region(e),
+            // The range-kernel runtime always returns a fresh malloc-backed primitive array, even
+            // when the source expression is nested inside an arena. It carries no source views (the
+            // checked `par_map` result is primitive), so it is freely returnable and individually
+            // dropped. Unsupported shapes use the arena-aware sequential collector below.
+            ExprKind::ArrayParMap { source, stages, .. }
+                if par_map_parallelizable(source.ty, stages, self.structs, self.enums) => Region::Static,
+            ExprKind::ArrayParMap { .. } => self.allocation_region(e),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
             // Conservative: even a scalar-only decoded struct is bound to the input region (no

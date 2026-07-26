@@ -4643,6 +4643,75 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if ids.is_empty() { String::new() } else { format!("$struct{}", ids.join("_")) }
     }
 
+    /// Encode a staged kernel's full structural identity with only identifier-safe bytes. The
+    /// readable chain below intentionally keeps source names, but `$` is a legal part of lifted
+    /// names, so joining names with `$` alone is not injective (`a$b` versus `a`, `b`). Include the
+    /// stage kind, length-prefixed callable bytes, element types, field number, and capture types so
+    /// the cache lookup cannot reuse a kernel built for a different chain or aggregate layout.
+    fn par_map_stage_structural_key(stages: &[ParMapStage]) -> String {
+        stages
+            .iter()
+            .map(|stage| {
+                let (kind, field) = match stage.kind {
+                    ParMapStageKind::Map => ("m", "-".to_string()),
+                    ParMapStageKind::Filter => ("f", "-".to_string()),
+                    ParMapStageKind::Project { field } => ("p", field.to_string()),
+                    ParMapStageKind::FilterField { field } => ("w", field.to_string()),
+                };
+                let func = stage.func.as_deref().unwrap_or("");
+                let captures = stage
+                    .capture_tys
+                    .iter()
+                    .map(|ty| Self::par_map_type_key(*ty))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{kind}{field}{}{}:{}:{}:{}",
+                    func.len(),
+                    Self::par_map_hex(func),
+                    Self::par_map_type_key(stage.elem_in),
+                    Self::par_map_type_key(stage.elem_out),
+                    captures
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    fn par_map_type_key(ty: Ty) -> String {
+        Self::par_map_hex(&format!("{ty:?}"))
+    }
+
+    fn par_map_hex(value: &str) -> String {
+        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Check every type-table id that the range-kernel path may hand to `llvm_type`. Normal MIR
+    /// has already passed sema, but codegen also accepts compiler-generated MIR in tests and in
+    /// future tooling; a bad id must be a lowering error rather than an index panic.
+    fn validate_par_map_type(&self, ty: Ty) -> Result<(), CodegenError> {
+        let valid = match ty {
+            Ty::Struct(id) | Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => {
+                self.struct_types.get(id as usize).is_some()
+            }
+            Ty::Tuple(id) => self.tuple_types.get(id as usize).is_some(),
+            Ty::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            Ty::Option(s) => self.validate_par_map_scalar(s),
+            Ty::Result(ok, err) => self.validate_par_map_scalar(ok) && self.validate_par_map_scalar(err),
+            Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => self.validate_par_map_scalar(s),
+            _ => true,
+        };
+        valid.then_some(()).ok_or_else(|| self.err(format!("par_map type table does not contain {ty:?}")))
+    }
+
+    fn validate_par_map_scalar(&self, scalar: Scalar) -> bool {
+        match scalar {
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => self.struct_types.get(id as usize).is_some(),
+            Scalar::Enum(id) => self.enum_types.get(id as usize).is_some(),
+            _ => true,
+        }
+    }
+
     /// The byte offset of logical field `logical` within struct `struct_id`, read from the built
     /// LLVM struct type at the field's *physical* position — so it is correct under reordering.
     fn field_byte_offset(&self, struct_id: u32, logical: u32) -> u64 {
@@ -4907,6 +4976,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return Err(self.err("par_map filter kernels require a filter stage"));
         }
         let field_layout_suffix = Self::par_map_field_layout_suffix(stages);
+        let structural_key = Self::par_map_stage_structural_key(stages);
         let name = match mode {
             ParMapKernelMode::Reduce => format!("{func}$parreducekernel"),
             ParMapKernelMode::Materialize if stages.is_empty() => format!("{func}$parkernel"),
@@ -4921,7 +4991,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     })
                     .collect::<Vec<_>>()
                     .join("$");
-                format!("{func}$parmapchain${chain}{field_layout_suffix}")
+                format!("{func}$parmapchain${chain}{field_layout_suffix}$key${structural_key}")
             }
             ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
                 let suffix = if filter_count { "count" } else { "scatter" };
@@ -4935,12 +5005,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     })
                     .collect::<Vec<_>>()
                     .join("$");
-                format!("{func}$parfilter${suffix}${chain}{field_layout_suffix}")
+                format!("{func}$parfilter${suffix}${chain}{field_layout_suffix}$key${structural_key}")
             }
         };
-        if let Some(f) = self.module.get_function(&name) {
-            return Ok(f.as_global_value().as_pointer_value());
-        }
         let reduce_ty = if reduce {
             Some(match out_ty {
                 BasicTypeEnum::IntType(ty) => ty,
@@ -4951,6 +5018,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         };
         let mut terminal_capture_start = 0usize;
         for stage in stages {
+            self.validate_par_map_type(stage.elem_in)?;
+            self.validate_par_map_type(stage.elem_out)?;
+            for ty in &stage.capture_tys {
+                self.validate_par_map_type(*ty)?;
+            }
             if stage.captures.len() != stage.capture_tys.len() {
                 return Err(self.err(format!(
                     "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
@@ -5022,6 +5094,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return Err(self.err(format!(
                 "par_map function `{func}` has {actual_params} parameters, expected {expected_params}"
             )));
+        }
+        for ty in capture_tys {
+            self.validate_par_map_type(*ty)?;
+        }
+        // Validate the complete staged shape before consulting the module cache. A malformed MIR
+        // node must not silently reuse an earlier kernel merely because its readable name collides.
+        if let Some(f) = self.module.get_function(&name) {
+            return Ok(f.as_global_value().as_pointer_value());
         }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
@@ -7059,6 +7139,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // then run the complete scalar chain in one range kernel. The runtime call is
                 // synchronous, so the entry alloca remains live until every worker has stopped
                 // reading it.
+                let src_ty = self.checked_operand_ty(src)?;
+                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                    return Err(self.err(format!("par_map source must be a slice or AoS array view, got {src_ty:?}")));
+                }
+                let source_elem_ty = match src_ty {
+                    Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                    _ => return Err(self.err("par_map source shape could not be resolved")),
+                };
+                if source_elem_ty != *elem_in {
+                    return Err(self.err(format!(
+                        "par_map source element type {source_elem_ty:?} does not match declared input {elem_in:?}"
+                    )));
+                }
+                self.validate_par_map_type(*elem_in)?;
+                self.validate_par_map_type(*elem_out)?;
+                let mut stage_input = *elem_in;
+                for stage in stages {
+                    if stage.elem_in != stage_input {
+                        return Err(self.err(format!(
+                            "par_map stage input {:?} does not follow previous output {:?}",
+                            stage.elem_in, stage_input
+                        )));
+                    }
+                    match stage.kind {
+                        ParMapStageKind::Map | ParMapStageKind::Project { .. } => stage_input = stage.elem_out,
+                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } if stage.elem_out == stage.elem_in => {}
+                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } => {
+                            return Err(self.err("par_map filter stage must preserve its element type"));
+                        }
+                    }
+                }
                 if captures.len() != capture_tys.len() {
                     return Err(self.err(format!(
                         "par_map capture operand/type count mismatch: {} operands, {} types",
@@ -7078,17 +7190,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         )));
                     }
                     for (op, ty) in stage.captures.iter().zip(&stage.capture_tys) {
+                        let actual = self.checked_operand_ty(op)?;
+                        if actual != *ty {
+                            return Err(self.err(format!(
+                                "par_map stage capture has type {actual:?}, declared {ty:?}"
+                            )));
+                        }
                         all_captures.push(self.operand(op)?);
                         all_capture_tys.push(*ty);
                     }
+                    self.validate_par_map_type(stage.elem_in)?;
+                    self.validate_par_map_type(stage.elem_out)?;
+                }
+                for ty in capture_tys.iter().chain(stages.iter().flat_map(|stage| stage.capture_tys.iter())) {
+                    self.validate_par_map_type(*ty)?;
                 }
                 for (op, ty) in captures.iter().zip(capture_tys) {
+                    let actual = self.checked_operand_ty(op)?;
+                    if actual != *ty {
+                        return Err(self.err(format!("par_map capture has type {actual:?}, declared {ty:?}")));
+                    }
                     all_captures.push(self.operand(op)?);
                     all_capture_tys.push(*ty);
                 }
-                let agg = self.operand(src)?.into_struct_value();
+                let agg = match self.operand(src)? {
+                    BasicValueEnum::StructValue(value) => value,
+                    _ => return Err(self.err("par_map source view is not an LLVM aggregate")),
+                };
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
-                let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
+                let count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
+                    BasicValueEnum::IntValue(value) => value,
+                    _ => return Err(self.err("par_map source view length is not an integer")),
+                };
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
                 let i64t = self.ctx.i64_type();
@@ -11091,6 +11224,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(v)
     }
 
+    /// Read an operand's MIR type without trusting malformed value or argument ids. The ordinary
+    /// `Function::operand_ty` helper is intentionally fast for already-validated MIR; the
+    /// parallel range ABI is an aggregate boundary, so its source type must fail closed before
+    /// codegen indexes a type table or extracts `{ptr,len}` fields.
+    fn checked_operand_ty(&self, op: &Operand) -> Result<Ty, CodegenError> {
+        match op {
+            Operand::Const(Const::Int(_, ty)) | Operand::Const(Const::Float(_, ty)) => Ok(*ty),
+            Operand::Const(Const::Char(_)) => Ok(Ty::Char),
+            Operand::Const(Const::Bool(_)) => Ok(Ty::Bool),
+            Operand::Const(Const::Unit) => Ok(Ty::Unit),
+            Operand::Value(id) => self
+                .f
+                .value_tys
+                .get(*id as usize)
+                .copied()
+                .ok_or_else(|| self.err(format!("value %{id} has no MIR type"))),
+            Operand::Arg(index) => {
+                let slot = self
+                    .f
+                    .params
+                    .get(*index as usize)
+                    .copied()
+                    .ok_or_else(|| self.err(format!("parameter index {index} has no MIR slot")))?;
+                self.f
+                    .slots
+                    .get(slot as usize)
+                    .copied()
+                    .ok_or_else(|| self.err(format!("parameter index {index} references missing slot {slot}")))
+            }
+        }
+    }
+
     /// Read an operand's LLVM value. **Fallible on purpose:** the two non-constant forms look the
     /// value up in a table, and neither lookup is guaranteed by the type system alone.
     ///
@@ -12460,6 +12625,23 @@ mod tests {
         // 0/1-field structs use the linear scan (already O(1)); no table is emitted.
         assert!(build_phf(&[]).is_none());
         assert!(build_phf(&["only"]).is_none());
+    }
+
+    #[test]
+    fn staged_kernel_structural_key_disambiguates_callable_boundaries() {
+        let stage = |func: &str| ParMapStage {
+            kind: ParMapStageKind::Map,
+            func: Some(func.to_string()),
+            captures: Vec::new(),
+            capture_tys: Vec::new(),
+            elem_in: Ty::Bool,
+            elem_out: Ty::Bool,
+        };
+        // The readable `$`-joined names would collide for one callable named `a$b` and two
+        // callables named `a` then `b`; the structural key must keep those kernels distinct.
+        let embedded = FnGen::par_map_stage_structural_key(&[stage("a$b")]);
+        let separated = FnGen::par_map_stage_structural_key(&[stage("a"), stage("b")]);
+        assert_ne!(embedded, separated);
     }
 
     #[test]
