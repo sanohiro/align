@@ -16,6 +16,96 @@ fn work(x: i64) -> i64 {
 
 fn even(x: i64) -> bool = x % 2 == 0
 
+// Width-probe bodies. The wrappers below keep the public benchmark ABI i64 while the reduction
+// and materializing kernels retain the source/result widths that the runtime threshold sees.
+fn inc_i8(x: i8) -> i8 = x + 1
+fn inc_i32(x: i32) -> i32 = x + 1
+fn inc_i64(x: i64) -> i64 = x + 1
+fn widen_i8(x: i8) -> i64 = x as i64
+fn narrow_i64(x: i64) -> i8 = x as i8
+
+pub fn pwidth_i8(s: slice<i8>) -> i64 {
+  total := s.par_map(inc_i8).sum()
+  return total as i64
+}
+
+pub fn swidth_i8(s: slice<i8>) -> i64 {
+  total := s.map(inc_i8).sum()
+  return total as i64
+}
+
+pub fn pwidth_i32(s: slice<i32>) -> i64 {
+  total := s.par_map(inc_i32).sum()
+  return total as i64
+}
+
+pub fn swidth_i32(s: slice<i32>) -> i64 {
+  total := s.map(inc_i32).sum()
+  return total as i64
+}
+
+pub fn pwidth_i64(s: slice<i64>) -> i64 = s.par_map(inc_i64).sum()
+pub fn swidth_i64(s: slice<i64>) -> i64 = s.map(inc_i64).sum()
+
+pub fn pwidth_i8_to_i64(s: slice<i8>) -> i64 = s.par_map(widen_i8).sum()
+pub fn swidth_i8_to_i64(s: slice<i8>) -> i64 = s.map(widen_i8).sum()
+
+pub fn pwidth_i64_to_i8(s: slice<i64>) -> i64 {
+  total := s.par_map(narrow_i64).sum()
+  return total as i64
+}
+
+pub fn swidth_i64_to_i8(s: slice<i64>) -> i64 {
+  total := s.map(narrow_i64).sum()
+  return total as i64
+}
+
+// Materializing controls exercise the ordinary par_map output stride instead of the fused
+// reduction's partial-result stride. A weighted full-output checksum keeps every result observable.
+pub fn pwidth_materialize_i8_to_i64(s: slice<i8>) -> i64 {
+  out := s.par_map(widen_i8)
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + out[i] * (i + 1)
+    i = i + 1
+  }
+}
+
+pub fn swidth_materialize_i8_to_i64(s: slice<i8>) -> i64 {
+  out := s.map(widen_i8).to_array()
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + out[i] * (i + 1)
+    i = i + 1
+  }
+}
+
+pub fn pwidth_materialize_i64_to_i8(s: slice<i64>) -> i64 {
+  out := s.par_map(narrow_i64)
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + (out[i] as i64) * (i + 1)
+    i = i + 1
+  }
+}
+
+pub fn swidth_materialize_i64_to_i8(s: slice<i64>) -> i64 {
+  out := s.map(narrow_i64).to_array()
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + (out[i] as i64) * (i + 1)
+    i = i + 1
+  }
+}
+
 pub fn pmap_cheap(s: slice<i64>) -> i64 = s.par_map(cheap).sum()
 pub fn smap_cheap(s: slice<i64>) -> i64 = s.map(cheap).sum()
 pub fn pmap(s: slice<i64>) -> i64 = s.par_map(work).sum()

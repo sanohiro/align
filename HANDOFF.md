@@ -8,8 +8,9 @@ per-PR journal is preserved in
 _Last updated: 2026-07-26. `main` includes the shipped wave through #654.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
-production behavior. Projection, string, chunk, and aggregate filters remain
-sequential._
+production behavior. The width/stride probe now covers scalar fused and
+materializing maps without changing production behavior. Projection, string,
+chunk, and aggregate filters remain sequential._
 
 ## Start here
 
@@ -155,8 +156,9 @@ focused-verification, low-lock task-group, staged-map, and body/byte-aware grain
 shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shipped stable
 callable scalar `where` compaction, and #654 shipped the task-group record probe. The probe
 measured packed-tight and padded controls without changing production behavior; the cross-size
-gate was not met. Projection/
-aggregate filters and a broader width/aggregate retune remain separate measure-first follow-ups.
+gate was not met. The scalar width/stride measure-first probe covers `i8`, `i32`, and `i64`
+fused/materializing maps around the runtime floor; it leaves aggregate sizes, projection/
+aggregate filters, and any broader width/aggregate retune as separate follow-ups.
 
 Consumer-gated deferrals that remain intentional:
 

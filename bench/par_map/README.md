@@ -5,9 +5,10 @@ the `filter` mode measures stable count/prefix/scatter compaction separately. Th
 a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native|threshold]   # headline comparison or threshold probe
+bench/par_map/run.sh [baseline|v3|native|threshold|width] # headline or threshold probe
 bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
+bench/par_map/run.sh width                  # input/output width and stride probe
 ```
 
 The runtime is linked as a cdylib and the harness supplies runtime-generated input. The Align and
@@ -36,7 +37,7 @@ explicit parallel form.
 `run.sh threshold` warms the process-lifetime pool, repeats each size to cover roughly one million
 body elements per timing, alternates pool/caller-only/sequential order, and reports the median of 31
 paired `pool/seq` and `pool/caller` ratios plus the `pool/seq` p10..p90 spread. The caller-only control
-uses the same materializing `par_map` kernel with the scheduler disabled by the benchmark-only
+uses the same fused-reduction `par_map(...).sum()` kernel with the scheduler disabled by the benchmark-only
 `par-map-probe` runtime feature; standard headline runs use the default runtime without probe
 instrumentation. It probes both a cheap vectorizable body and the heavier headline body around the
 caller-only/pool boundary. On a one-worker host it reports that the probe is skipped because the
@@ -89,6 +90,56 @@ before changing the common floor again.
 
 The benchmark's old spawn and per-element-thunk results remain historical evidence in
 `docs/open-questions.md`; they are not descriptions of the current generated kernel.
+
+## Width and output-stride probe
+
+`run.sh width` is a focused, benchmark-only follow-up to the threshold probe. It exercises fused
+reductions at `i8`, `i32`, and `i64`, widening/narrowing reductions, and materializing maps with
+different result strides. Each case checks the parallel result against its sequential Align
+control, warms the persistent pool, and samples floor-δ, floor, floor+1, and floor+δ with seven
+balanced pool/caller/sequential permutations. The runtime getter supplies the floor; the harness
+does not duplicate the cost model. Aggregate struct shapes are intentionally not included yet.
+
+Native Apple Silicon, 2026-07-26, representative invocation (8 runtime workers):
+
+```
+                   case          n         floor     median pool/seq   median pool/caller   pool/seq p10..p90
+        reduce i8 -> i8     458752        524288               1.014                0.996  1.002..1.014
+        reduce i8 -> i8     524288        524288               1.007                1.000  1.000..1.007
+        reduce i8 -> i8     524289        524288               1.094                1.087  1.091..1.114
+        reduce i8 -> i8     589824        524288               1.115                1.112  1.099..1.254
+      reduce i32 -> i32     114688        131072               1.005                1.001  1.004..1.006
+      reduce i32 -> i32     131072        131072               1.006                0.999  1.003..1.008
+      reduce i32 -> i32     131073        131072               1.217                1.196  1.194..1.261
+      reduce i32 -> i32     147456        131072               1.144                1.124  1.111..1.147
+      reduce i64 -> i64      57344         65536               1.005                1.000  1.004..1.005
+      reduce i64 -> i64      65536         65536               1.005                1.000  1.003..1.005
+      reduce i64 -> i64      65537         65536               1.101                1.090  1.076..1.134
+      reduce i64 -> i64      73728         65536               1.074                1.068  1.058..1.087
+       reduce i8 -> i64     101946        116509               1.016                1.008  1.016..1.024
+       reduce i8 -> i64     116509        116509               1.000                0.994  0.967..1.013
+       reduce i8 -> i64     116510        116509               1.297                1.270  1.262..2.090
+       reduce i8 -> i64     131072        116509               1.412                1.331  1.258..1.791
+       reduce i64 -> i8     101946        116509               1.009                1.002  1.006..1.011
+       reduce i64 -> i8     116509        116509               1.006                1.000  1.005..1.008
+       reduce i64 -> i8     116510        116509               1.111                1.103  1.082..1.205
+       reduce i64 -> i8     131072        116509               1.080                1.068  1.068..1.100
+  materialize i8 -> i64     101946        116509               1.001                0.999  0.999..1.001
+  materialize i8 -> i64     116509        116509               1.000                1.000  1.000..1.001
+  materialize i8 -> i64     116510        116509               1.115                1.117  1.075..1.130
+  materialize i8 -> i64     131072        116509               1.015                1.009  0.979..1.019
+  materialize i64 -> i8     101946        116509               1.002                1.000  0.999..1.003
+  materialize i64 -> i8     116509        116509               0.999                1.000  0.772..1.003
+  materialize i64 -> i8     116510        116509               1.025                1.024  1.022..1.055
+  materialize i64 -> i8     131072        116509               1.064                1.063  1.041..1.066
+```
+
+The byte-aware floor scales as expected: `524,288` for two one-byte strides, `131,072` for two
+four-byte strides, `65,536` for two eight-byte strides, and `116,509` for the mixed one/eight-byte
+cases. The first pooled size is consistently more expensive than caller-only control, including
+the existing `i64` case; this is evidence for retaining a conservative boundary, not a case for
+another common-floor retune. It validates scalar width and output-stride coverage while leaving
+aggregate struct sizes, other hosts, and body-sensitive retuning as separate work.
 
 ## Stable filter compaction probe
 
