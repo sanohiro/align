@@ -147,7 +147,8 @@ compiler-generated aggregate lowering, other hosts, and body-sensitive retuning 
 
 `run.sh aggregate` is a focused runtime-only follow-up. It calls the existing `align_rt_par_map`
 C ABI with concrete `repr(C)` records of 16, 32, 64, and 128 bytes, transforms every word, and
-checks a weighted checksum over every output word. It compares the warm pool, forced caller-only,
+checks every output record against an untimed sequential oracle, then uses a weighted checksum over
+every output word as the measured sink. It compares the warm pool, forced caller-only,
 and Rust materializing sequential controls at floor-δ, floor, floor+1, and floor+δ with seven
 balanced permutations. The runtime getter supplies each input/output-stride floor; the benchmark
 does not duplicate the cost model.

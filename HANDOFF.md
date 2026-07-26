@@ -5,12 +5,13 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #656.
+_Last updated: 2026-07-26. `main` includes the shipped wave through #657.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
-materializing maps without changing production behavior. Projection, string,
-chunk, and aggregate filters remain sequential._
+materializing maps without changing production behavior. #657 adds a runtime-only
+aggregate-like stride probe without changing production behavior. Projection,
+string, chunk, and aggregate filters remain sequential._
 
 ## Start here
 
@@ -71,6 +72,7 @@ facts must live in this repository.
 #654  measure-first task-group record layout probe
 #655  relevance/cost test-selection policy
 #656  scalar par_map width and output-stride measure-first probe
+#657  runtime-only aggregate-like par_map stride measure-first probe
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -159,7 +161,7 @@ shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shippe
 callable scalar `where` compaction, and #654 shipped the task-group record probe. The probe
 measured packed-tight and padded controls without changing production behavior; the cross-size
 gate was not met. The scalar width/stride measure-first probe covers `i8`, `i32`, and `i64`
-fused/materializing maps around the runtime floor; #656 also records runtime-only aggregate-like
+fused/materializing maps around the runtime floor; #657 also records runtime-only aggregate-like
 16/32/64/128-byte record strides with full-output checksums, without changing production behavior.
 Compiler-generated aggregate layouts, projection/aggregate filters, other hosts, and any broader
 width/aggregate retune remain separate follow-ups.

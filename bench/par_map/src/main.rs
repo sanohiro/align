@@ -273,7 +273,7 @@ impl WidthData {
 
 #[cfg(feature = "probe")]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AggregateRecord<const WORDS: usize> {
     words: [u64; WORDS],
 }
@@ -380,10 +380,10 @@ fn aggregate_seq_checksum<const WORDS: usize>(data: &[AggregateRecord<WORDS>]) -
 }
 
 #[cfg(feature = "probe")]
-fn aggregate_runtime_checksum<const WORDS: usize>(
+fn aggregate_runtime_output<const WORDS: usize>(
     data: &[AggregateRecord<WORDS>],
     kernel: RangeKernel,
-) -> u64 {
+) -> *mut u8 {
     let stride = std::mem::size_of::<AggregateRecord<WORDS>>() as i64;
     let output = unsafe {
         align_rt_par_map(
@@ -397,11 +397,35 @@ fn aggregate_runtime_checksum<const WORDS: usize>(
         )
     };
     assert!(!output.is_null(), "aggregate probe returned a null output");
+    output
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_runtime_checksum<const WORDS: usize>(
+    data: &[AggregateRecord<WORDS>],
+    kernel: RangeKernel,
+) -> u64 {
+    let output = aggregate_runtime_output(data, kernel);
     let output_slice =
         unsafe { std::slice::from_raw_parts(output.cast::<AggregateRecord<WORDS>>(), data.len()) };
     let checksum = std::hint::black_box(aggregate_checksum(output_slice));
     unsafe { align_rt_free(output) };
     checksum
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_runtime_validate<const WORDS: usize>(
+    data: &[AggregateRecord<WORDS>],
+    kernel: RangeKernel,
+    expected: &[AggregateRecord<WORDS>],
+    name: &str,
+) {
+    let output = aggregate_runtime_output(data, kernel);
+    let output_slice =
+        unsafe { std::slice::from_raw_parts(output.cast::<AggregateRecord<WORDS>>(), data.len()) };
+    let matches = output_slice == expected;
+    unsafe { align_rt_free(output) };
+    assert!(matches, "aggregate runtime output changed for {name}");
 }
 
 #[cfg(feature = "probe")]
@@ -464,12 +488,9 @@ fn run_aggregate_case<const WORDS: usize>(
 
     for &n in &counts {
         let data = aggregate_data::<WORDS>(n);
-        let expected = aggregate_seq_checksum(&data);
-        assert_eq!(
-            aggregate_runtime_checksum(&data, kernel),
-            expected,
-            "aggregate runtime result changed for {name}, n={n}"
-        );
+        let expected_output: Vec<_> = data.iter().copied().map(aggregate_transform).collect();
+        aggregate_runtime_validate(&data, kernel, &expected_output, name);
+        let expected = aggregate_checksum(&expected_output);
         let reps = (target_elements / n).max(1);
         let mut pool_seq_ratios = Vec::with_capacity(rounds);
         let mut pool_caller_ratios = Vec::with_capacity(rounds);
