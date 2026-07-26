@@ -9,7 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
-align_runtime = { path = "../../crates/align_runtime" }
+align_runtime = { path = "../../crates/align_runtime", features = ["task-group-probe"] }
 
 [profile.release]
 opt-level = 3

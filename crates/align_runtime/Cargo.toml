@@ -22,6 +22,9 @@ alloc-count = []
 # Measurement aid for `bench/par_map`: expose a caller-only switch so the threshold probe can
 # compare the pooled kernel with the same materializing `par_map` kernel without the scheduler.
 par-map-probe = []
+# Measurement aid for `bench/task_group`: expose an idle barrier so timing arms do not inherit
+# detached no-op helper jobs from the persistent pool. This is not a runtime capability.
+task-group-probe = []
 
 [dependencies]
 align_hash = { path = "../align_hash" }

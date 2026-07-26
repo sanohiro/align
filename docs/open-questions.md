@@ -2811,7 +2811,7 @@ Pure; projection, string, and unsupported aggregate forms remain sequential. Dir
 `par_map(...).sum()` fusion (remove the full intermediate write/read) shipped in #647, helper-job
 publication batching shipped in #648, and low-lock task-group claim/completion shipped in #650.
 The current slice adds stable callable primitive-scalar `where` compaction via count/prefix/scatter.
-The task-group record probe now compares split, packed-tight, and cache-line-padded layouts on the
+The task-group record probe now compares split, packed-tight, and cache-line-separated padded layouts on the
 shipped registration ABI; because the split control uses the same bump arena, packed-tight is
 primarily allocation-call/record-shape evidence rather than an isolated locality measurement. The
 cross-size ship gate was not met, so packed task records remain a measure-first follow-up rather

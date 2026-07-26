@@ -7,8 +7,8 @@
 //! production codegen or the runtime ABI.
 
 use align_runtime::{
-    align_rt_tg_alloc, align_rt_tg_begin, align_rt_tg_end, align_rt_tg_register, align_rt_tg_wait,
-    TaskGroup,
+    align_rt_test_par_pool_initialized, align_rt_test_par_pool_wait_idle, align_rt_tg_alloc,
+    align_rt_tg_begin, align_rt_tg_end, align_rt_tg_register, align_rt_tg_wait, TaskGroup,
 };
 use std::hint::black_box;
 use std::mem::{align_of, size_of, transmute};
@@ -321,13 +321,31 @@ fn timed(
     // Keep the aggregate checksum in the measured path so result writes remain observable, but
     // perform the per-task oracle checks in the unmeasured warm-up pass.
     let mut checksum = 0u64;
-    let started = Instant::now();
-    for _ in 0..reps {
-        checksum = checksum.wrapping_add(black_box(run_once(
-            tasks, rounds, sleep_us, layout, fallible,
-        )));
-    }
-    let elapsed = started.elapsed().as_secs_f64() * 1e9 / (tasks * reps) as f64;
+    // `tg_wait` joins task bodies before returning, but the persistent runtime pool may still have
+    // detached no-op helpers queued behind an exhausted cursor. When the pool is active, time each
+    // repetition separately and drain those helpers between repetitions outside the clock. The
+    // one-task caller-only path has no pool and keeps the lower-overhead aggregate timer.
+    let elapsed_seconds = if align_rt_test_par_pool_initialized() {
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..reps {
+            align_rt_test_par_pool_wait_idle();
+            let started = Instant::now();
+            checksum = checksum.wrapping_add(black_box(run_once(
+                tasks, rounds, sleep_us, layout, fallible,
+            )));
+            elapsed += started.elapsed();
+        }
+        elapsed.as_secs_f64()
+    } else {
+        let started = Instant::now();
+        for _ in 0..reps {
+            checksum = checksum.wrapping_add(black_box(run_once(
+                tasks, rounds, sleep_us, layout, fallible,
+            )));
+        }
+        started.elapsed().as_secs_f64()
+    };
+    let elapsed = elapsed_seconds * 1e9 / (tasks * reps) as f64;
     assert_eq!(
         checksum,
         expected.wrapping_mul(reps as u64),
@@ -369,6 +387,11 @@ fn run_case(tasks: usize, rounds: u64, sleep_us: u64, fallible: bool, trials: us
         [1, 0, 2],
         [0, 2, 1],
     ];
+    assert_eq!(
+        trials % ORDERS.len(),
+        0,
+        "TRIALS must be a multiple of the six balanced layout orders"
+    );
     for trial in 0..trials {
         let order = ORDERS[trial % ORDERS.len()];
         let mut elapsed = [0.0; 3];
@@ -409,7 +432,7 @@ fn main() {
     let trials = std::env::var("TRIALS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(9)
+        .unwrap_or(6)
         .max(1);
     let reps = std::env::var("REPS")
         .ok()
@@ -424,7 +447,9 @@ fn main() {
     println!(
         "six-order balanced cycle, median of {trials} trials, {reps} repetitions per timing arm"
     );
-    println!("packed-tight keeps fields adjacent; packed-padded puts each result/error on a cache-line boundary");
+    println!(
+        "packed-tight keeps fields adjacent; packed-padded measures cache-line-separated padding"
+    );
     println!("tasks  rounds  sleep-us  error-slot       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
     let mut cases = vec![
         (1, 0, 0),
@@ -435,6 +460,7 @@ fn main() {
         (4096, 64, 0),
         (128, 0, 50),
     ];
+    let max_tasks = RESULT_FIELD_MASK as usize;
     for tasks in [
         2,
         workers.saturating_sub(1),
@@ -442,7 +468,10 @@ fn main() {
         workers.saturating_add(1),
         workers.saturating_mul(4).saturating_add(1),
     ] {
-        if tasks > 0 && !cases.iter().any(|&(existing, _, _)| existing == tasks) {
+        if tasks > 0
+            && tasks <= max_tasks
+            && !cases.iter().any(|&(existing, _, _)| existing == tasks)
+        {
             cases.push((tasks, 0, 0));
         }
     }

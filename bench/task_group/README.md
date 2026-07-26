@@ -9,7 +9,7 @@ Run it with:
 
 ```sh
 bench/task_group/run.sh
-TRIALS=15 REPS=5 bench/task_group/run.sh
+TRIALS=12 REPS=5 bench/task_group/run.sh
 ```
 
 The harness drives the same `align_rt_tg_register`/`align_rt_tg_wait` ABI for three layouts:
@@ -17,22 +17,27 @@ The harness drives the same `align_rt_tg_register`/`align_rt_tg_wait` ABI for th
 ```text
 split          shipped shape: env + result (+ error) are separate arena allocations
 packed-tight   one record, fields adjacent; the candidate one-allocation shape
-packed-padded  one record, result/error start on cache-line boundaries; false-sharing control
+packed-padded  one record, result/error start on cache-line boundaries; padded-record cost control
 ```
 
 Each performance task runs the same generated-trampoline-shaped body and writes exactly one final
 result. The CPU body is kept live with `black_box`; its result token encodes the task index and
 control fields. An unmeasured correctness pass validates every task slot independently for each
 layout; measured repetitions retain an aggregate checksum so result writes remain observable
-without adding the per-task oracle to the timing. The matrix includes zero-work, CPU-heavy, and
+without adding the per-task oracle to the timing. The matrix includes zero-round, CPU-heavy, and
 bounded blocking-sleep controls, the one-task caller-only path, and worker-derived scheduler/batch
 boundaries; it does not claim to model filesystem or network I/O. Zero-task groups are rejected
 because they contain no record to measure.
 Because the split control uses the same bump arena, its small allocations may already be physically
 adjacent; packed-tight primarily measures the one-allocation shape and allocation-call reduction,
-not an isolated locality improvement. A separate correctness smoke for each layout makes one task
+not an isolated locality improvement. The padded control measures total padding/alignment and cache
+footprint cost; it does not isolate false sharing. A separate correctness smoke for each layout makes one task
 write the shipped `{i32 tag, i32 code}` Error into `err_slot` and checks the pointer returned by
 `tg_wait`.
+
+When the persistent pool is active, the harness drains queued helper jobs between measured
+repetitions outside the clock. This keeps the arm timing focused on the task-group operation rather
+than on late no-op scheduler cleanup.
 
 The probe reports nanoseconds per task, paired median ratios, and the known arena allocation count
 per task (`2/1/1` for infallible and `3/1/1` for fallible; the final three columns are split, tight,
@@ -46,7 +51,7 @@ The recorded native Apple Silicon run used:
 
 ```sh
 LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib \
-TRIALS=31 REPS=7 bench/task_group/run.sh
+TRIALS=30 REPS=7 bench/task_group/run.sh
 ```
 
 The harness prints the host parallelism/runtime worker count with the result. The recorded host
@@ -55,6 +60,7 @@ reported eight workers; release LTO was disabled as above.
 The output is a screening statistic: each row is a median of paired trial ratios. A packed layout
 is not considered repeatable from one process invocation; the ship gate requires the same direction
 across multiple fresh invocations in addition to the cross-size threshold.
+`TRIALS` must be a multiple of six so every layout occupies each arm position equally.
 
 The result is a decision input, not a production optimization. Ship packed records only when
 `packed-tight` shows a repeatable at least 10% win on both tiny and large task groups, and when the
