@@ -61,25 +61,49 @@ pub fn swidth_i64_to_i8(s: slice<i64>) -> i64 {
 }
 
 // Materializing controls exercise the ordinary par_map output stride instead of the fused
-// reduction's partial-result stride. Reading both endpoints keeps the generated output observable.
+// reduction's partial-result stride. A weighted full-output checksum keeps every result observable.
 pub fn pwidth_materialize_i8_to_i64(s: slice<i8>) -> i64 {
   out := s.par_map(widen_i8)
-  return out[0] + out[out.len() - 1]
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + out[i] * (i + 1)
+    i = i + 1
+  }
 }
 
 pub fn swidth_materialize_i8_to_i64(s: slice<i8>) -> i64 {
   out := s.map(widen_i8).to_array()
-  return out[0] + out[out.len() - 1]
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + out[i] * (i + 1)
+    i = i + 1
+  }
 }
 
 pub fn pwidth_materialize_i64_to_i8(s: slice<i64>) -> i64 {
   out := s.par_map(narrow_i64)
-  return (out[0] as i64) + (out[out.len() - 1] as i64)
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + (out[i] as i64) * (i + 1)
+    i = i + 1
+  }
 }
 
 pub fn swidth_materialize_i64_to_i8(s: slice<i64>) -> i64 {
   out := s.map(narrow_i64).to_array()
-  return (out[0] as i64) + (out[out.len() - 1] as i64)
+  mut i := 0
+  mut checksum := 0
+  return loop {
+    if i >= out.len() { break checksum }
+    checksum = checksum + (out[i] as i64) * (i + 1)
+    i = i + 1
+  }
 }
 
 pub fn pmap_cheap(s: slice<i64>) -> i64 = s.par_map(cheap).sum()

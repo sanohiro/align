@@ -37,7 +37,7 @@ explicit parallel form.
 `run.sh threshold` warms the process-lifetime pool, repeats each size to cover roughly one million
 body elements per timing, alternates pool/caller-only/sequential order, and reports the median of 31
 paired `pool/seq` and `pool/caller` ratios plus the `pool/seq` p10..p90 spread. The caller-only control
-uses the same materializing `par_map` kernel with the scheduler disabled by the benchmark-only
+uses the same fused-reduction `par_map(...).sum()` kernel with the scheduler disabled by the benchmark-only
 `par-map-probe` runtime feature; standard headline runs use the default runtime without probe
 instrumentation. It probes both a cheap vectorizable body and the heavier headline body around the
 caller-only/pool boundary. On a one-worker host it reports that the probe is skipped because the
