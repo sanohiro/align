@@ -21,17 +21,18 @@ packed-padded  one record, result/error start on cache-line boundaries; false-sh
 ```
 
 Each performance task runs the same generated-trampoline-shaped body and writes exactly one final
-result. The matrix includes zero-work, CPU-heavy, and bounded blocking-sleep controls; it does not
-claim to model filesystem or network I/O. A separate correctness smoke for each layout makes one
-task write the shipped `{i32 tag, i32 code}` Error into `err_slot` and checks the pointer returned
-by `tg_wait`.
+result. The CPU body is kept live with `black_box`; its result token encodes the task index and
+control fields so every task slot can be validated independently on every repetition. The matrix
+includes zero-work, CPU-heavy, and bounded blocking-sleep controls; it does not claim to model
+filesystem or network I/O. A separate correctness smoke for each layout makes one task write the
+shipped `{i32 tag, i32 code}` Error into `err_slot` and checks the pointer returned by `tg_wait`.
 
 The probe reports nanoseconds per task, paired median ratios, and the known arena allocation count
 per task (`2/1/1` for infallible and `3/1/1` for fallible; the final three columns are split, tight,
-padded). It rotates all six layout permutations and validates every repetition independently, so
-even repetition counts cannot hide a wrong result. Fallible records use the shipped Error size and
-alignment. Release LTO is disabled so the normal runtime C-ABI boundary remains visible; this is
-not an `rt-lto` measurement.
+padded). It rotates all six layout permutations and validates each task result independently, so
+even repetition counts cannot hide swapped or compensating results. Fallible records use the
+shipped Error size and alignment. Release LTO is disabled so the normal runtime C-ABI boundary
+remains visible; this is not an `rt-lto` measurement.
 
 The result is a decision input, not a production optimization. Ship packed records only when
 `packed-tight` shows a repeatable at least 10% win on both tiny and large task groups, and when the

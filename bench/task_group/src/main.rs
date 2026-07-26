@@ -15,6 +15,7 @@ use std::mem::{align_of, size_of, transmute};
 use std::time::{Duration, Instant};
 
 const CACHE_LINE: usize = 64;
+const RESULT_FIELD_MASK: u64 = 0xffff;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -46,6 +47,10 @@ impl Layout {
     const ALL: [Self; 3] = [Self::Split, Self::PackedTight, Self::PackedPadded];
 }
 
+fn expected_result(seed: u64, rounds: u64, sleep_us: u64) -> u64 {
+    (seed << 48) | ((rounds & RESULT_FIELD_MASK) << 32) | (sleep_us & RESULT_FIELD_MASK)
+}
+
 /// The body is deliberately the same for every task and every record layout. `rounds == 0` prices
 /// the scheduler/record path; the nonzero case keeps a body-cost control in the probe. `sleep_us`
 /// adds a bounded blocking control without introducing filesystem or network setup into the probe.
@@ -61,7 +66,10 @@ extern "C" fn task_thunk(env: *const u8) -> i64 {
             .wrapping_add(1_442_695_040_888_963_407);
         value ^= value >> 29;
     }
-    value as i64
+    // Keep the body work live, but return a token whose fields let the caller validate every task
+    // independently without repeating this CPU-heavy loop on the timing path.
+    let _ = black_box(value);
+    expected_result(env.seed, env.rounds, env.sleep_us) as i64
 }
 
 /// Match the generated task trampoline's ABI: invoke the typed body and write one final result.
@@ -117,6 +125,18 @@ fn register_task(
     fallible: bool,
     error: bool,
 ) -> *mut i64 {
+    assert!(
+        task_index <= RESULT_FIELD_MASK as usize,
+        "benchmark task index is not encodable"
+    );
+    assert!(
+        rounds <= RESULT_FIELD_MASK,
+        "benchmark rounds are not encodable"
+    );
+    assert!(
+        sleep_us <= RESULT_FIELD_MASK,
+        "benchmark sleep duration is not encodable"
+    );
     let env_size = size_of::<Env>();
     let scalar_size = size_of::<i64>();
     let scalar_align = align_of::<i64>();
@@ -222,9 +242,18 @@ fn run_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: 
 
     let err = unsafe { align_rt_tg_wait(tg) };
     assert!(err.is_null(), "the probe task body must not fail");
-    slots.into_iter().fold(0u64, |sum, slot| {
-        sum.wrapping_add(unsafe { slot.read() as u64 })
-    })
+    slots
+        .into_iter()
+        .enumerate()
+        .fold(0u64, |sum, (task_index, slot)| {
+            let value = unsafe { slot.read() as u64 };
+            assert_eq!(
+                value,
+                expected_result((task_index + 1) as u64, rounds, sleep_us),
+                "record layout changed task {task_index} result"
+            );
+            sum.wrapping_add(value)
+        })
 }
 
 fn run_error_path(layout: Layout) {
