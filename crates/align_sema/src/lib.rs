@@ -744,25 +744,54 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
     }
 }
 
-/// Whether a staged `par_map` can enter the range-kernel path. The widening remains deliberately
-/// narrow: the source and every length-preserving stage must be a primitive scalar, and only
-/// callable `map`/`where` stages are admitted. Filtering uses the separate stable-compaction
-/// runtime path; projections, `where(.field)`, `str.contains`, `chunks`, and aggregate shapes stay
-/// sequential. Keep this predicate shared by effect checking and MIR lowering so a stage is never
-/// admitted to the parallel kernel without the matching Pure boundary check.
-pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage]) -> bool {
-    let elem = match source {
+/// Whether a staged `par_map` can enter the range-kernel path. The source and every intermediate
+/// value must be a Copy value whose range-kernel ABI is already defined (primitive scalar, `str`,
+/// or a Copy struct). AoS struct fields may be projected in the kernel, and `where(.field)` uses
+/// the same extracted value for stable compaction. `SoA`, string-search, chunks, and other layouts
+/// stay sequential. Keep this predicate shared by effect checking and MIR lowering so a stage is
+/// never admitted to the parallel kernel without the matching Pure and ownership boundaries.
+fn par_map_kernel_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
+        || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums)))
+}
+
+pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    let mut elem = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char) || stages.is_empty() {
+    if !par_map_kernel_value(elem, structs, enums) || stages.is_empty() {
         return false;
     }
     for stage in stages {
-        if !matches!(stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. })
-            || !matches!(stage.out_ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
-        {
-            return false;
+        match stage.kind {
+            hir::StageKind::Map { .. } => {
+                if !par_map_kernel_value(elem, structs, enums) || !par_map_kernel_value(stage.out_ty, structs, enums) {
+                    return false;
+                }
+                elem = stage.out_ty;
+            }
+            hir::StageKind::Where { .. } => {
+                if !par_map_kernel_value(elem, structs, enums) || stage.out_ty != elem {
+                    return false;
+                }
+            }
+            hir::StageKind::Project { .. } => {
+                // Keep the first projection slice scalar-shaped. A nested struct projection can
+                // be added when its field-path ABI is carried explicitly in MIR; falling back is
+                // preferable to guessing a physical offset here.
+                if !matches!(elem, Ty::Struct(_)) || !matches!(stage.out_ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str) {
+                    return false;
+                }
+                elem = stage.out_ty;
+            }
+            hir::StageKind::WhereField { .. } => {
+                if !matches!(elem, Ty::Struct(_)) || stage.out_ty != elem {
+                    return false;
+                }
+            }
+            hir::StageKind::WhereStrContains { .. } => return false,
         }
     }
     true
@@ -3985,6 +4014,8 @@ fn refine_fn_value_types(
             known_effects: Some(known),
             external_effects,
             externs: &externs,
+            structs: &program.structs,
+            enums: &program.enums,
         };
         scan.block(&f.body);
     }
@@ -4034,6 +4065,8 @@ fn compute_effect_sets(
             known_effects: no_known_effects,
             external_effects,
             externs: &externs,
+            structs: &program.structs,
+            enums: &program.enums,
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -4148,6 +4181,8 @@ struct EffectScan<'a> {
     known_effects: Option<&'a std::collections::HashMap<String, FnEffect>>,
     external_effects: &'a std::collections::HashMap<String, FnEffect>,
     externs: &'a std::collections::HashSet<&'a str>,
+    structs: &'a [StructDef],
+    enums: &'a [hir::EnumDef],
 }
 
 impl EffectScan<'_> {
@@ -4865,10 +4900,11 @@ impl EffectScan<'_> {
                 self.calls.push(func.clone());
                 self.parmaps.push((func.clone(), e.span));
                 // A staged chain is only a parallel candidate when MIR/codegen can keep the whole
-                // length-preserving scalar chain inside one range kernel. Its prior callables then
-                // cross the same Pure boundary as the terminal function. The filtered form uses
-                // stable compaction; projection, aggregate sources, and `chunks` remain sequential.
-                if par_map_staged_parallelizable(source.ty, stages) {
+                // length-preserving scalar/AoS chain inside one range kernel. Its prior callables
+                // then cross the same Pure boundary as the terminal function. Compiler-generated
+                // AoS projection and field-filter stages add no callable effect; the filtered form
+                // uses stable compaction. SoA, aggregate layouts, and `chunks` remain sequential.
+                if par_map_staged_parallelizable(source.ty, stages, self.structs, self.enums) {
                     for stage in stages {
                         if let StageKind::Map { func, .. } | StageKind::Where { func, .. } = &stage.kind {
                             self.parmaps.push((func.clone(), e.span));
@@ -16422,9 +16458,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// `source.….par_map(f)` — apply the Pure function `f` to each surviving element and
     /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
     /// whole call graph) and return a primitive scalar. Lowering selects the parallel range kernel
-    /// for direct scalar/slice sources and primitive-scalar length-preserving map stages with Copy
-    /// captures; filtered and unsupported aggregate forms remain sequential, while Move captures
-    /// are rejected by ownership checks.
+    /// for direct scalar/slice/AoS sources and admitted length-preserving scalar/AoS stages with
+    /// Copy captures; filtered field stages use stable compaction. SoA, string-search, chunks, and
+    /// unsupported aggregate forms retain their sequential paths, while Move values are rejected
+    /// by ownership checks.
     fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [fn_arg] = args else {

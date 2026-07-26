@@ -4591,6 +4591,58 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.field_perm[struct_id as usize][logical as usize]
     }
 
+    /// Validate and resolve a compiler-generated AoS field stage. MIR stores field indices in the
+    /// language's logical order; the LLVM aggregate may reorder non-`layout(C)` fields, so every
+    /// range-kernel projection/filter must pass through the same permutation as ordinary field
+    /// access. Return the physical field index and its semantic type. This is a codegen error
+    /// rather than an indexing panic because malformed MIR must fail closed at the ABI boundary.
+    fn par_map_stage_field_info(&self, stage: &ParMapStage) -> Result<(u32, Ty), CodegenError> {
+        let field = match stage.kind {
+            ParMapStageKind::Project { field } | ParMapStageKind::FilterField { field } => field,
+            _ => return Err(self.err("non-field par_map stage passed to field-info validation")),
+        };
+        let Ty::Struct(struct_id) = stage.elem_in else {
+            return Err(self.err(format!("par_map field stage needs a struct input, got {:?}", stage.elem_in)));
+        };
+        let Some(def) = self.structs.get(struct_id as usize) else {
+            return Err(self.err(format!("par_map field stage references missing struct {struct_id}")));
+        };
+        let Some(field_ty) = def.fields.get(field as usize).map(|f| f.ty) else {
+            return Err(self.err(format!("par_map field stage references missing field {field} of struct {struct_id}")));
+        };
+        match stage.kind {
+            ParMapStageKind::Project { .. } if field_ty != stage.elem_out => {
+                return Err(self.err(format!("par_map projection type mismatch: field is {:?}, stage output is {:?}", field_ty, stage.elem_out)));
+            }
+            ParMapStageKind::FilterField { .. } if field_ty != Ty::Bool || stage.elem_out != stage.elem_in => {
+                return Err(self.err("par_map field filter must read a bool and preserve its struct element"));
+            }
+            _ => {}
+        }
+        let Some(physical) = self.field_perm.get(struct_id as usize).and_then(|perm| perm.get(field as usize)).copied() else {
+            return Err(self.err(format!("par_map field stage has no physical mapping for struct {struct_id} field {field}")));
+        };
+        Ok((physical, field_ty))
+    }
+
+    /// Keep generated staged-kernel names distinct when the same callable chain projects fields
+    /// from different struct types. The visible chain remains readable; the layout suffix prevents
+    /// LLVM from reusing a kernel whose input aggregate type or field permutation belongs to another
+    /// AoS type.
+    fn par_map_field_layout_suffix(stages: &[ParMapStage]) -> String {
+        let ids: Vec<String> = stages
+            .iter()
+            .filter_map(|stage| match stage.kind {
+                ParMapStageKind::Project { .. } | ParMapStageKind::FilterField { .. } => Some(match stage.elem_in {
+                    Ty::Struct(id) => id.to_string(),
+                    _ => "invalid".to_string(),
+                }),
+                ParMapStageKind::Map | ParMapStageKind::Filter => None,
+            })
+            .collect();
+        if ids.is_empty() { String::new() } else { format!("$struct{}", ids.join("_")) }
+    }
+
     /// The byte offset of logical field `logical` within struct `struct_id`, read from the built
     /// LLVM struct type at the field's *physical* position — so it is correct under reordering.
     fn field_byte_offset(&self, struct_id: u32, logical: u32) -> u64 {
@@ -4827,11 +4879,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Get (building it once) the `void(context, in_base, out_base, start, end)` range kernel for
-    /// `func`. The kernel owns the counted element loop: typed GEP → load → direct call → store.
-    /// The runtime calls it once per claimed range, so the hot element loop contains no indirect
-    /// callback. Copy captures are loaded once from the immutable call-scoped context. Filter
-    /// kernels use the same ABI: the count pass stores one survivor count to `out_base`, while the
-    /// scatter pass writes survivors at local offsets from the range's prefix-adjusted `out_base`.
+    /// `func`. The kernel owns the counted element loop: typed GEP → load → staged transforms →
+    /// direct call → store. The runtime calls it once per claimed range, so the hot element loop
+    /// contains no indirect callback. Copy captures are loaded once from the immutable call-scoped
+    /// context. Filter kernels use the same ABI: the count pass stores one survivor count to
+    /// `out_base`, while the scatter pass writes survivors at local offsets from the range's
+    /// prefix-adjusted `out_base`. Field stages extract logical AoS fields through the backend
+    /// layout map.
     /// Building it temporarily repositions the shared builder, then restores it.
     fn par_map_range_kernel(
         &self,
@@ -4849,27 +4903,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if reduce && !stages.is_empty() {
             return Err(self.err("par_map reduction kernels cannot contain prior stages"));
         }
-        if filter && !stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter) {
+        if filter && !stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. })) {
             return Err(self.err("par_map filter kernels require a filter stage"));
         }
+        let field_layout_suffix = Self::par_map_field_layout_suffix(stages);
         let name = match mode {
             ParMapKernelMode::Reduce => format!("{func}$parreducekernel"),
             ParMapKernelMode::Materialize if stages.is_empty() => format!("{func}$parkernel"),
             ParMapKernelMode::Materialize => {
-                let chain = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join("$");
-                format!("{func}$parmapchain${chain}")
+                let chain = stages
+                    .iter()
+                    .map(|stage| match stage.kind {
+                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
+                        ParMapStageKind::Filter => stage.func.clone().unwrap_or_else(|| "where".to_string()),
+                        ParMapStageKind::Project { field } => format!("field${field}"),
+                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("$");
+                format!("{func}$parmapchain${chain}{field_layout_suffix}")
             }
             ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
                 let suffix = if filter_count { "count" } else { "scatter" };
                 let chain = stages
                     .iter()
                     .map(|stage| match stage.kind {
-                        ParMapStageKind::Map => stage.func.clone(),
-                        ParMapStageKind::Filter => format!("where${}", stage.func),
+                        ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
+                        ParMapStageKind::Filter => format!("where${}", stage.func.as_deref().unwrap_or("filter")),
+                        ParMapStageKind::Project { field } => format!("field${field}"),
+                        ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
                     })
                     .collect::<Vec<_>>()
                     .join("$");
-                format!("{func}$parfilter${suffix}${chain}")
+                format!("{func}$parfilter${suffix}${chain}{field_layout_suffix}")
             }
         };
         if let Some(f) = self.module.get_function(&name) {
@@ -4888,37 +4954,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
             if stage.captures.len() != stage.capture_tys.len() {
                 return Err(self.err(format!(
                     "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                    stage.func,
+                    stage.func.as_deref().unwrap_or("<field>"),
                     stage.captures.len(),
                     stage.capture_tys.len()
                 )));
             }
-            let target = self
-                .funcs
-                .get(&stage.func)
-                .copied()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
-            let expected_params = stage
-                .capture_tys
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| self.err(format!("par_map stage `{}` capture count overflows", stage.func)))?;
-            let actual_params = target.get_type().get_param_types().len();
-            if actual_params != expected_params {
-                return Err(self.err(format!(
-                    "par_map stage function `{}` has {actual_params} parameters, expected {expected_params}",
-                    stage.func
-                )));
-            }
-            if stage.kind == ParMapStageKind::Filter {
-                let Some(return_type) = target.get_type().get_return_type() else {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
-                };
-                let BasicTypeEnum::IntType(return_type) = return_type else {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
-                };
-                if return_type.get_bit_width() != 1 {
-                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
+            match stage.kind {
+                ParMapStageKind::Project { .. } | ParMapStageKind::FilterField { .. } => {
+                    if stage.func.is_some() || !stage.captures.is_empty() {
+                        return Err(self.err("par_map field stages cannot carry callable captures"));
+                    }
+                    self.par_map_stage_field_info(stage)?;
+                }
+                ParMapStageKind::Map | ParMapStageKind::Filter => {
+                    let Some(stage_func) = stage.func.as_deref() else {
+                        return Err(self.err("par_map callable stage is missing its function"));
+                    };
+                    let target = self
+                        .funcs
+                        .get(stage_func)
+                        .copied()
+                        .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` is missing from codegen")))?;
+                    let expected_params = stage
+                        .capture_tys
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| self.err(format!("par_map stage `{stage_func}` capture count overflows")))?;
+                    let actual_params = target.get_type().get_param_types().len();
+                    if actual_params != expected_params {
+                        return Err(self.err(format!(
+                            "par_map stage function `{stage_func}` has {actual_params} parameters, expected {expected_params}"
+                        )));
+                    }
+                    if stage.kind == ParMapStageKind::Filter {
+                        let Some(return_type) = target.get_type().get_return_type() else {
+                            return Err(self.err(format!("par_map filter `{stage_func}` must return bool")));
+                        };
+                        let BasicTypeEnum::IntType(return_type) = return_type else {
+                            return Err(self.err(format!("par_map filter `{stage_func}` must return bool")));
+                        };
+                        if return_type.get_bit_width() != 1 {
+                            return Err(self.err(format!("par_map filter `{stage_func}` must return bool")));
+                        }
+                    }
                 }
             }
             terminal_capture_start = terminal_capture_start
@@ -5071,38 +5149,77 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let mut current = x;
         let mut capture_start = 0usize;
         for (stage_idx, stage) in stages.iter().enumerate() {
-            let target = self
-                .funcs
-                .get(&stage.func)
-                .copied()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` is missing from codegen", stage.func)))?;
             let capture_end = capture_start
                 .checked_add(stage.capture_tys.len())
                 .ok_or_else(|| self.err("par_map staged capture count overflows"))?;
-            let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
-            call_args.push(current.into());
-            call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-            let stage_value = self
-                .builder
-                .build_call(target, &call_args, "stage")
-                .map_err(|e| self.err(e))?
-                .try_as_basic_value()
-                .basic()
-                .ok_or_else(|| self.err(format!("par_map stage function `{}` must return a value", stage.func)))?;
             match stage.kind {
-                ParMapStageKind::Map => {
-                    current = stage_value;
+                ParMapStageKind::Map | ParMapStageKind::Filter => {
+                    let Some(stage_func) = stage.func.as_deref() else {
+                        return Err(self.err("par_map callable stage is missing its function"));
+                    };
+                    let target = self
+                        .funcs
+                        .get(stage_func)
+                        .copied()
+                        .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` is missing from codegen")))?;
+                    let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
+                    call_args.push(current.into());
+                    call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
+                    let stage_value = self
+                        .builder
+                        .build_call(target, &call_args, "stage")
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` must return a value")))?;
+                    if stage.kind == ParMapStageKind::Map {
+                        current = stage_value;
+                    } else {
+                        let predicate = match stage_value {
+                            BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => value,
+                            _ => return Err(self.err(format!("par_map filter `{stage_func}` must return bool"))),
+                        };
+                        let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
+                        self.builder
+                            .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
+                            .map_err(|e| self.err(e))?;
+                        self.builder.position_at_end(pass);
+                    }
                 }
-                ParMapStageKind::Filter => {
-                    let predicate = match stage_value {
+                ParMapStageKind::Project { .. } => {
+                    let (physical, _) = self.par_map_stage_field_info(stage)?;
+                    let current_struct = match current {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map projection stage needs an aggregate current value")),
+                    };
+                    current = self
+                        .builder
+                        .build_extract_value(current_struct, physical, "project")
+                        .map_err(|e| self.err(e))?;
+                }
+                ParMapStageKind::FilterField { .. } => {
+                    let (physical, field_ty) = self.par_map_stage_field_info(stage)?;
+                    let current_struct = match current {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map field filter needs an aggregate current value")),
+                    };
+                    let field_value = self
+                        .builder
+                        .build_extract_value(current_struct, physical, "wherefield")
+                        .map_err(|e| self.err(e))?;
+                    if field_ty != Ty::Bool {
+                        return Err(self.err("par_map field filter extracted a non-bool value"));
+                    }
+                    let predicate = match field_value {
                         BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => value,
-                        _ => return Err(self.err(format!("par_map filter `{}` must return bool", stage.func))),
+                        _ => return Err(self.err("par_map field filter extracted a non-bool LLVM value")),
                     };
                     let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
                     self.builder
                         .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
                         .map_err(|e| self.err(e))?;
                     self.builder.position_at_end(pass);
+                    current = current_struct.into();
                 }
             }
             capture_start = capture_end;
@@ -6955,7 +7072,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     if stage.captures.len() != stage.capture_tys.len() {
                         return Err(self.err(format!(
                             "par_map stage `{}` capture operand/type count mismatch: {} operands, {} types",
-                            stage.func,
+                            stage.func.as_deref().unwrap_or("<field>"),
                             stage.captures.len(),
                             stage.capture_tys.len()
                         )));
@@ -6993,7 +7110,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let has_filter = stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter);
+                let has_filter = stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }));
                 let sty = slice_struct_type(self.ctx);
                 if has_filter {
                     let count_kernel = self.par_map_range_kernel(

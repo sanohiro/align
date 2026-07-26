@@ -2,9 +2,9 @@
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
 //! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
-//! primitive-scalar length-preserving map/filter stages are fused into that range kernel; unsupported
-//! filters, projections, and aggregate shapes retain the sequential fallback. Move captures are
-//! rejected by ownership checks.
+//! primitive-scalar/AoS length-preserving map/filter/projection stages are fused into that range
+//! kernel; unsupported layouts such as SoA, chunks, and string-search retain the sequential
+//! fallback. Move captures are rejected by ownership checks.
 
 
 mod common;
@@ -107,6 +107,100 @@ fn par_map_over_struct_field() {
     let out = build_and_run("pm-struct", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parkernel")))
+        .unwrap_or_else(|| panic!("an AoS struct source should use the parallel range kernel:\n{ir}"));
+    assert!(kernel.contains("call i32 @net") || kernel.contains("call i32 @\"net\""), "the kernel must call the struct-consuming body directly:\n{kernel}");
+}
+
+#[test]
+fn par_map_over_dynamic_struct_array_uses_aos_stride_kernel() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Emp { base: i32, bonus: i32 }\nfn net(e: Emp) -> i32 = e.base + e.bonus\nfn main() -> Result<(), Error> {\n  xs: array<Emp> := [Emp{base: 10, bonus: 5}, Emp{base: 20, bonus: 7}].to_array()\n  ys := xs.par_map(net)\n  print(ys.len())\n  print(ys[0])\n  print(ys[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-dynamic-struct", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n15\n27\n");
+
+    let ir = emit_llvm(src);
+    assert!(ir.contains("$parkernel"), "a dynamic AoS struct source should use the parallel range kernel:\n{ir}");
+}
+
+#[test]
+fn par_map_rejects_move_aos_elements_before_codegen() {
+    let src = "User { name: string, age: i32 }\nfn age(u: User) -> i32 = u.age\nfn main() -> i32 {\n  users := [User{name: \"a\".clone(), age: 7}]\n  out := users.par_map(age)\n  return out[0]\n}\n";
+    assert!(check_errs("pm-move-struct", src), "par_map must reject a Move struct element by value");
+    assert!(
+        check_diagnostics("pm-move-struct", src).contains("cannot pass a Move element"),
+        "the ownership diagnostic should explain why the AoS range ABI is unavailable"
+    );
+}
+
+#[test]
+fn par_map_after_struct_map_keeps_struct_abi_in_the_range_kernel() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Emp { base: i32, bonus: i32 }\nfn net(e: Emp) -> i32 = e.base + e.bonus\nfn twice(x: i32) -> i32 = x * 2\nfn main() -> Result<(), Error> {\n  out := [Emp{base: 10, bonus: 5}, Emp{base: 20, bonus: 7}].map(net).par_map(twice)\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-struct-map", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "84\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-struct-map", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[net -> twice]"), "a struct map stage should stay in the parallel node:\n{text}");
+
+    let ir = emit_llvm(src);
+    assert!(ir.contains("call i32 @net") || ir.contains("call i32 @\"net\""), "the range kernel must call the aggregate map body directly:\n{ir}");
+}
+
+#[test]
+fn par_map_after_struct_projection_uses_range_kernel() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Emp { active: bool, base: i32 }\nfn twice(x: i32) -> i32 = x * 2\nfn main() -> Result<(), Error> {\n  out := [Emp{active: true, base: 10}, Emp{active: false, base: 50}, Emp{active: true, base: 11}].base.par_map(twice)\n  print(out.len())\n  print(out[0])\n  print(out[2])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-struct-project", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n20\n22\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-struct-project", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[field#1 -> twice]"), "the projection and terminal should share one parallel MIR node:\n{text}");
+
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parmapchain$")))
+        .unwrap_or_else(|| panic!("no projected par_map range kernel in IR:\n{ir}"));
+    assert!(kernel.contains("extractvalue"), "the projected kernel must extract the AoS field in the range loop:\n{kernel}");
+    assert!(kernel.contains("call i32 @twice") || kernel.contains("call i32 @\"twice\""), "the projected kernel must call the terminal body directly:\n{kernel}");
+}
+
+#[test]
+fn par_map_after_struct_field_filter_uses_stable_compaction() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Emp { active: bool, base: i32 }\nfn twice(x: i32) -> i32 = x * 2\nfn main() -> Result<(), Error> {\n  out := [Emp{active: true, base: 10}, Emp{active: false, base: 50}, Emp{active: true, base: 11}].where(.active).base.par_map(twice)\n  print(out.len())\n  print(out[0])\n  print(out[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-struct-filter-project", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n20\n22\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-struct-filter-project", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[where field#0 -> field#1 -> twice]"), "field filtering and projection should remain one ordered parallel node:\n{text}");
+
+    let ir = emit_llvm(src);
+    assert!(ir.contains("$parfilter$count$wherefield$0$field$1"), "the field-filter count kernel must be generated:\n{ir}");
+    assert!(ir.contains("$parfilter$scatter$wherefield$0$field$1"), "the field-filter scatter kernel must be generated:\n{ir}");
 }
 
 #[test]
