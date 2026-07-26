@@ -85,13 +85,13 @@ when the change crosses another boundary:
 2. For code changes, run the focused owner target first. For a private runtime
    helper, use a filtered library test such as
    `cargo test -p align_runtime --lib par_map` rather than the entire runtime
-   library test binary. For documentation-only changes, run `git diff --check`
-   and the relevant consistency or render check when one exists; do not invent
-   a code-test target for prose.
+   library test binary. For documentation-only changes, always run
+   `git diff --check`, then run the relevant consistency or render check when
+   one exists; do not invent a code-test target for prose.
 3. Run the ordinary PR gate required for the change. Rust code changes use
    `scripts/test-pr.sh` as the bounded test gate, with the standard workspace
    build and applicable Clippy checks still required. Documentation-only changes
-   need only their relevant consistency or render check.
+   need only `git diff --check` plus any relevant consistency or render check.
 4. Add a broader target only when the changed behavior is not exercised by the
    owner target, crosses crate/ABI/linker boundaries, changes scheduling or
    resource semantics, or is unusually broad.
@@ -141,10 +141,10 @@ product result, and must be reported separately.
 
 | Change scope | Minimum verification | Add only when |
 | --- | --- | --- |
-| Documentation or policy | `git diff --check` plus the relevant consistency or render check | the document has a checked consumer or generated artifact |
+| Documentation or policy | `git diff --check` | add the relevant consistency or render check when a checked consumer or generated artifact exists |
 | Private helper or local analysis | one filtered owner test | the helper crosses a crate, ABI, linker, scheduler, or resource boundary |
 | Compiler, runtime, or FFI code | focused owner test, `scripts/test-pr.sh`, and applicable Clippy | the focused target does not exercise the changed contract or the change is broad |
-| Optimization or concurrency | owner correctness test plus the named benchmark/probe and the bounded code gate | repeatability, nested progress, cross-platform, or resource behavior is part of the claim |
+| Optimization or concurrency | owner correctness test; add the named benchmark/probe only for a performance or resource claim; `scripts/test-pr.sh` for code changes | repeatability, nested progress, cross-platform, or resource behavior is part of the claim |
 | Broad refactor or versioned release | the bounded gate and the affected owner targets | run `scripts/test-full.sh` when the scope or release process warrants it |
 
 Run each selected target once per unchanged environment. Repeat only when the
