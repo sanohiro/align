@@ -418,13 +418,20 @@ fn aggregate_runtime_validate<const WORDS: usize>(
     data: &[AggregateRecord<WORDS>],
     kernel: RangeKernel,
     expected: &[AggregateRecord<WORDS>],
+    caller_only: bool,
     name: &str,
 ) {
+    if caller_only {
+        unsafe { align_rt_test_par_map_force_caller(1) };
+    }
     let output = aggregate_runtime_output(data, kernel);
     let output_slice =
         unsafe { std::slice::from_raw_parts(output.cast::<AggregateRecord<WORDS>>(), data.len()) };
     let matches = output_slice == expected;
     unsafe { align_rt_free(output) };
+    if caller_only {
+        unsafe { align_rt_test_par_map_force_caller(0) };
+    }
     assert!(matches, "aggregate runtime output changed for {name}");
 }
 
@@ -489,7 +496,8 @@ fn run_aggregate_case<const WORDS: usize>(
     for &n in &counts {
         let data = aggregate_data::<WORDS>(n);
         let expected_output: Vec<_> = data.iter().copied().map(aggregate_transform).collect();
-        aggregate_runtime_validate(&data, kernel, &expected_output, name);
+        aggregate_runtime_validate(&data, kernel, &expected_output, false, name);
+        aggregate_runtime_validate(&data, kernel, &expected_output, true, name);
         let expected = aggregate_checksum(&expected_output);
         let reps = (target_elements / n).max(1);
         let mut pool_seq_ratios = Vec::with_capacity(rounds);
