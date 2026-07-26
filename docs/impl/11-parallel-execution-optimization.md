@@ -849,7 +849,8 @@ unsupported aggregate forms remain sequential.
 - [x] Batch queue publication (2026-07-26).
 - [x] Add adaptive contiguous claims (2026-07-26).
 - [x] Replace per-task barrier mutex/wake with an atomic completion latch (2026-07-26).
-- [x] Measure false sharing before padding (2026-07-26; the padded control did not justify padding).
+- [x] Measure padding/cache-footprint cost before padding (2026-07-26; the padded control did not
+  justify padding and did not isolate false sharing).
 - [x] Probe one-allocation packed task records after block claiming is stable (2026-07-26;
   the cross-size ship gate was not met, so production remains split).
 
