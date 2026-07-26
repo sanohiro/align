@@ -56,6 +56,27 @@ The compiler library list is intentionally explicit in `scripts/test-pr.sh`.
 Adding a new workspace crate does not silently add its tests to every PR; the
 new crate must first be given an intentional owner and gate classification.
 
+## PR sequencing and review cost
+
+The draft PR is a review-ready checkpoint, not the place to discover basic
+correctness problems. Before opening a draft for a code change, finish the
+coherent implementation, run the applicable self-review checklist, run a fresh
+adversarial preflight on the local diff, and pass the focused owner target plus
+the bounded PR gate. `scripts/pre-pr.sh` records those checks against the exact
+HEAD, and `scripts/open-pr.sh` is the required agent path for opening the draft.
+CI rejects a missing or stale attestation. This keeps obvious ownership,
+malformed-input, ABI, and cross-stage omissions out of the external review cycle.
+
+After the draft is opened, run the required host-native and independent reviews
+on the final pushed diff. Batch related review fixes into one follow-up commit
+where possible; do not create one commit per finding. A review command has a
+15-minute watchdog implemented by `scripts/review-bounded.sh`. If it has not
+produced a verdict, the wrapper terminates the whole review process group and
+reports a timeout rather than waiting without a stopping point or repeatedly
+starting the full review. Ordinary review automation must not promote `cargo test
+--workspace` or `scripts/test-full.sh` into the PR path without an explicit
+scope justification.
+
 ## Change-specific verification
 
 The author must run the narrow regression targets that own the changed
