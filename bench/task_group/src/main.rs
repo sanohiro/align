@@ -425,8 +425,8 @@ fn main() {
         "six-order balanced cycle, median of {trials} trials, {reps} repetitions per timing arm"
     );
     println!("packed-tight keeps fields adjacent; packed-padded puts each result/error on a cache-line boundary");
-    println!("tasks  rounds  sleep-us  fallible       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
-    for &(tasks, rounds, sleep_us) in &[
+    println!("tasks  rounds  sleep-us  error-slot       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
+    let mut cases = vec![
         (1, 0, 0),
         (8, 0, 0),
         (128, 0, 0),
@@ -434,7 +434,19 @@ fn main() {
         (128, 64, 0),
         (4096, 64, 0),
         (128, 0, 50),
+    ];
+    for tasks in [
+        2,
+        workers.saturating_sub(1),
+        workers,
+        workers.saturating_add(1),
+        workers.saturating_mul(4).saturating_add(1),
     ] {
+        if tasks > 0 && !cases.iter().any(|&(existing, _, _)| existing == tasks) {
+            cases.push((tasks, 0, 0));
+        }
+    }
+    for &(tasks, rounds, sleep_us) in &cases {
         for fallible in [false, true] {
             run_case(tasks, rounds, sleep_us, fallible, trials, reps);
         }

@@ -25,8 +25,9 @@ result. The CPU body is kept live with `black_box`; its result token encodes the
 control fields. An unmeasured correctness pass validates every task slot independently for each
 layout; measured repetitions retain an aggregate checksum so result writes remain observable
 without adding the per-task oracle to the timing. The matrix includes zero-work, CPU-heavy, and
-bounded blocking-sleep controls and the one-task caller-only path; it does not claim to model
-filesystem or network I/O. Zero-task groups are rejected because they contain no record to measure.
+bounded blocking-sleep controls, the one-task caller-only path, and worker-derived scheduler/batch
+boundaries; it does not claim to model filesystem or network I/O. Zero-task groups are rejected
+because they contain no record to measure.
 Because the split control uses the same bump arena, its small allocations may already be physically
 adjacent; packed-tight primarily measures the one-allocation shape and allocation-call reduction,
 not an isolated locality improvement. A separate correctness smoke for each layout makes one task
@@ -37,7 +38,8 @@ The probe reports nanoseconds per task, paired median ratios, and the known aren
 per task (`2/1/1` for infallible and `3/1/1` for fallible; the final three columns are split, tight,
 padded). It rotates all six layout permutations and validates each task result independently in
 the correctness pass, so even repetition counts cannot hide swapped or compensating results.
-Fallible records use the shipped Error size and alignment. Release LTO is disabled so the normal
+Rows marked `error-slot` use the shipped Error size and alignment but run a successful task body;
+the separate error smoke exercises the actual error return. Release LTO is disabled so the normal
 runtime C-ABI boundary remains visible; this is not an `rt-lto` measurement.
 
 The recorded native Apple Silicon run used:
@@ -49,6 +51,10 @@ TRIALS=31 REPS=7 bench/task_group/run.sh
 
 The harness prints the host parallelism/runtime worker count with the result. The recorded host
 reported eight workers; release LTO was disabled as above.
+
+The output is a screening statistic: each row is a median of paired trial ratios. A packed layout
+is not considered repeatable from one process invocation; the ship gate requires the same direction
+across multiple fresh invocations in addition to the cross-size threshold.
 
 The result is a decision input, not a production optimization. Ship packed records only when
 `packed-tight` shows a repeatable at least 10% win on both tiny and large task groups, and when the

@@ -128,12 +128,14 @@ unsupported filters retain the sequential path.
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-padded controls over the same registration ABI.
 The recorded native Apple Silicon command was `LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib TRIALS=31 REPS=7 bench/task_group/run.sh`;
-the harness reported eight runtime workers and includes the one-task caller-only path. Packed-tight is
-primarily allocation-call/record-shape evidence because the split bump-arena allocations may
-already be physically adjacent. The run improved large groups but did not produce a repeatable 10%
-win across small and fallible groups; padding was materially slower on large groups. Zero-task
-groups are rejected because they contain no record to measure. The production task-group ABI and
-allocation shape remain unchanged until that gate is met.
+the harness reported eight runtime workers and covers the one-task caller-only path plus
+worker-derived scheduler/batch boundaries. Packed-tight is primarily allocation-call/record-shape
+evidence because the split bump-arena allocations may already be physically adjacent. Error-slot
+rows use successful task bodies; the separate smoke exercises the actual error return. The run
+improved large groups but did not meet the median 10% gate across small and error-slot groups;
+repeatability still requires multiple fresh invocations. Padding was materially slower on large
+groups. Zero-task groups are rejected because they contain no record to measure. The production
+task-group ABI and allocation shape remain unchanged until that gate is met.
 
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,

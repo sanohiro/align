@@ -658,13 +658,16 @@ call/locality win. A real filesystem/network workload is a separate resource-pol
 ABI with split, packed-tight, and cache-line-padded records. The recorded command was
 `LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib TRIALS=31 REPS=7 bench/task_group/run.sh`
 on native Apple Silicon; the harness reported eight runtime workers. The high-trial run covers the
-one-task caller-only path, zero-work, CPU-heavy, and
+one-task caller-only path, worker-derived scheduler/batch boundaries, zero-work, CPU-heavy, and
 bounded blocking controls, plus a real error-slot smoke. Zero-task groups are rejected because
-they contain no record to measure. Since the split control uses the same bump arena, packed-tight
-is primarily allocation-call/record-shape evidence, not an isolated locality measurement. The
-probe is scoped to successful captured CPU/blocking tasks for performance; it does not claim
-filesystem/network behavior. The written ship gate requires a repeatable at least 10% packed-tight
-win on both tiny and large groups without a material padded-control penalty; it is not met.
+they contain no record to measure. The error-slot rows use fallible-shaped storage with successful
+task bodies; the separate smoke exercises the actual error return. Since the split control uses the
+same bump arena, packed-tight is primarily allocation-call/record-shape evidence, not an isolated
+locality measurement. The probe is scoped to successful captured CPU/blocking tasks for performance;
+it does not claim filesystem/network behavior. Each row is a median screening statistic from one
+process invocation. The written ship gate requires a repeatable at least 10% packed-tight win on
+both tiny and large groups without a material padded-control penalty across multiple fresh
+invocations; it is not met.
 Production codegen and the runtime ABI therefore retain the current split allocation shape.
 
 ---
