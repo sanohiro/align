@@ -1267,7 +1267,7 @@ arena allocation, including `heap.new`, still require an explicit nested `arena 
 task_group {
   a := spawn(fn { fs.read_file("a.txt") })   // a deferred task; the `fn { }` makes the
   b := spawn(fn { fs.read_file("b.txt") })   // "runs as a separate task" visible
-  wait()?                                     // join all; propagate the first error
+  wait()?                                     // join all; propagate the lowest-spawn-index error
   process(a.get(), b.get())                   // extract each result (after the join)
 }
 ```
@@ -1275,7 +1275,7 @@ task_group {
 `spawn` takes a **lambda** (the deferred work), not a bare call — the deferral is then visible
 in the source (*Nothing hidden*), and it is the same lambda mechanism as `map`/`reduce`/`par_map`
 rather than a second, special-cased one (*One way*). It returns a `Task<R>` handle; `wait()?` is
-the single error boundary (it joins every task and propagates the first `Err`), and `a.get()`
+the single error boundary (it joins every task and propagates the lowest-spawn-index `Err`), and `a.get()`
 reads a task's result after the join.
 
 Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the

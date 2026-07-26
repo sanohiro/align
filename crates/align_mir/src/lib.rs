@@ -316,7 +316,7 @@ pub enum Rvalue {
     /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
     SpawnTask { tg: Operand, closure: Operand, capture_tys: Vec<Ty>, r: Ty, fallible: bool },
     /// `wait()` as a value: join the task_group and yield its outcome. `fallible` → build
-    /// `Result<(), Error>` from the runtime's first error code (`Ok(())` if `0`, else `Err(code)`);
+    /// `Result<(), Error>` from the runtime's lowest-spawn-index error code (`Ok(())` if `0`, else `Err(code)`);
     /// otherwise yields `()`.
     TgWaitResult { tg: Operand, fallible: bool },
     /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.

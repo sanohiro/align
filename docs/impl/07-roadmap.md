@@ -143,7 +143,7 @@ every item below has since completed as recorded in the per-milestone sections, 
    rather than via a scalar-ret `Ty::Fn` value); a per-group `fallible` flag types `wait()` as
    `Result<(), Error>` (else `()`); the per-`(R, fallible)` trampoline returns an `i32` error code
    (storing the `Ok` payload / returning the `Err` code), `tg_wait` collects the workers' codes and
-   returns the first nonzero, `wait()` builds a `Result` from it, and `wait()?` propagates. For a
+   returns the lowest-index nonzero, `wait()` builds a `Result` from it, and `wait()?` propagates. For a
    fallible group only a *successful* `wait()?` enables `get()` (a bare `wait()` does not). **The
    first-class-closures → `task_group` arc (slices ①–④c) is COMPLETE**: closures as values /
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
@@ -193,7 +193,7 @@ every item below has since completed as recorded in the per-milestone sections, 
      `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
      **task_group fallible path was reworked** to carry the full `Error` across threads via a
-     per-task err-slot (`tg_wait` returns the first errored slot). **4b-3 DONE** — explicit error conversion is `result.map_err(f)` (no implicit `?` coercion). **4b-4 DONE** — position-bearing **structured errors** work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read — `examples/structured_error.align`); free-form **`.with_context` was reviewed and NOT adopted** (off-philosophy: structured sum-type payloads are the context mechanism, not dynamic string chaining — rationale in `open-questions.md`). **So 4b (the Error type) is complete** for the planned surface. (ErrCode removed; richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads.)
+     per-task err-slot (`tg_wait` returns the lowest-index errored slot). **4b-3 DONE** — explicit error conversion is `result.map_err(f)` (no implicit `?` coercion). **4b-4 DONE** — position-bearing **structured errors** work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read — `examples/structured_error.align`); free-form **`.with_context` was reviewed and NOT adopted** (off-philosophy: structured sum-type payloads are the context mechanism, not dynamic string chaining — rationale in `open-questions.md`). **So 4b (the Error type) is complete** for the planned surface. (ErrCode removed; richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads.)
    - **4c. Minimal generics + constraints** — the riskiest; approach minimally (tiny builtin bounds,
      explicit monomorphization, no turbofish, no Rust-trait complexity). **4c-1 DONE (the
      unconstrained walking skeleton)** — `fn f<T>(...)` monomorphized per distinct concrete
@@ -1048,9 +1048,9 @@ and `par_map` helpers plus callers drain one shared range cursor under a child-p
 whole-range specialization plan concrete; the direct whole-range kernel shipped 2026-07-25,
 removing the per-element indirect callback and restoring vectorization for cheap arithmetic bodies.
 The direct-source Copy capture context shipped in #643. The direct integer transform-reduce slice
-is implemented in #647. Queue publication batching is implemented in the current change; staged
-pipeline lowering, low-lock task claim/completion, work-aware grain, and split execution-domain
-candidates remain. It proposes no new source syntax.
+shipped in #647, and queue publication batching shipped in #648. Low-lock task-group
+claim/completion is implemented in the current change; staged pipeline lowering, work-aware grain,
+and split execution-domain candidates remain. It proposes no new source syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**
 `12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive

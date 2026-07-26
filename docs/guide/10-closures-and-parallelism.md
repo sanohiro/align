@@ -111,14 +111,14 @@ fn main() -> Result<(), Error> {
     task_group {
         a := spawn(fn { fetch(3) })
         b := spawn(fn { fetch(-1) })
-        wait()?                         // joins ALL tasks, then propagates the first error
+        wait()?                         // joins ALL tasks, then propagates the lowest-index error
         print(a.get() + b.get())        // not reached
     }
     return Ok(())
 }
 ```
 
-`wait()?` is the error boundary of the group: every task completes (no half-joined state), then the first failure propagates as an ordinary `Err`. Parallel error handling with the same one operator as everything else.
+`wait()?` is the error boundary of the group: every task completes (no half-joined state), then the failure from the lowest spawn index propagates as an ordinary `Err`. Parallel error handling uses the same one operator as everything else.
 
 ## Which one, when
 

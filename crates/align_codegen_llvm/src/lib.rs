@@ -998,7 +998,7 @@ fn build_module<'c>(
     );
     funcs.insert(
         "tg_wait".to_string(),
-        // Returns the first errored task's `err_slot` pointer (null if all succeeded).
+        // Returns the lowest-spawn-index errored task's `err_slot` pointer (null if all succeeded).
         module.add_function("align_rt_tg_wait", ptr.fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
@@ -6045,7 +6045,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::TgWaitResult { tg, fallible } => {
                 let tgv = self.operand(tg)?.into();
-                // `tg_wait` returns the first errored task's `err_slot` (null if all succeeded).
+                // `tg_wait` returns the lowest-spawn-index errored task's `err_slot` (null if all succeeded).
                 let errp = self
                     .builder
                     .build_call(self.funcs["tg_wait"], &[tgv], "tgwait")

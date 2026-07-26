@@ -147,12 +147,12 @@ i64 align_rt_par_map_reduce(
 TaskGroup* align_rt_tg_begin()
 void*      align_rt_tg_alloc(TaskGroup*, i64 size, i64 align)
 void       align_rt_tg_register(TaskGroup*, tramp, thunk, env, result_slot, error_slot)
-void*      align_rt_tg_wait(TaskGroup*)   // first error slot, or null
+void*      align_rt_tg_wait(TaskGroup*)   // lowest-index error slot, or null
 void       align_rt_tg_end(TaskGroup*)
 ```
 
 I/O-wait concurrency (`draft.md` §11). Spawn snapshots captures into the task-group region; `wait`
-joins registered tasks using the persistent shared pool and reports the first failure. There is no
+joins registered tasks using the persistent shared pool and reports the failure from the lowest spawn index. There is no
 async/await (`non-goals.md`).
 
 ---
