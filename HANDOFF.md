@@ -5,9 +5,11 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #653.
+_Last updated: 2026-07-26. `main` includes the shipped wave through #654.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
-`par_map`; projection, string, chunk, and aggregate filters remain sequential._
+`par_map`; #654 adds a measure-first task-group record probe without changing
+production behavior. Projection, string, chunk, and aggregate filters remain
+sequential._
 
 ## Start here
 
@@ -65,6 +67,7 @@ facts must live in this repository.
 #651  fuse primitive scalar `par_map` map stages
 #652  bounded body and byte-aware `par_map` grain hints
 #653  stable callable scalar `where` compaction
+#654  measure-first task-group record layout probe
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -150,8 +153,9 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are
 shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shipped stable
-callable scalar `where` compaction. The task-group record probe measured packed-tight and padded
-controls without changing production behavior; the cross-size gate was not met. Projection/
+callable scalar `where` compaction, and #654 shipped the task-group record probe. The probe
+measured packed-tight and padded controls without changing production behavior; the cross-size
+gate was not met. Projection/
 aggregate filters and a broader width/aggregate retune remain separate measure-first follow-ups.
 
 Consumer-gated deferrals that remain intentional:
@@ -175,7 +179,10 @@ each PR. Deep driver regressions, differential fuzz, runtime network/filesystem,
 and performance suites remain explicit change-specific checks;
 `scripts/test-full.sh` retains the full corpus for unusually broad work and
 versioned-release preparation. `docs/impl/16-test-policy.md` records the audit,
-commands, and suite-growth rule.
+commands, suite-growth rule, and the relevance/cost rule: every add-on target
+must name the changed boundary, plausible failure, non-duplicate information,
+and reason its cost is justified. Meaningful expensive checks remain allowed;
+unrelated or duplicative suites do not become mandatory by proximity.
 
 ## Build and test notes
 

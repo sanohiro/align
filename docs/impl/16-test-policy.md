@@ -69,11 +69,14 @@ cargo test -p align_runtime --lib http_client
 cargo test -p align_runtime --lib par_map
 ```
 
-Optimization work runs its named benchmark or measurement probe. Network,
-filesystem, timeout, process, and fd work runs the corresponding real-resource
-target in an unrestricted environment. A test should be added to an existing
-owner target when possible; do not create another cross-cutting integration
-matrix for a unit-level rule.
+Optimization work that changes a performance path, is covered by a `MEASURE-FIRST`
+audit, or makes a performance or resource claim runs its named benchmark or
+measurement probe. A correctness-only change that does not alter a performance
+path uses its owner target and the bounded code gate. Network, filesystem, timeout,
+process, and fd work runs the corresponding real-resource target in an
+unrestricted environment. A test should be added to an existing owner target
+when possible; do not create another cross-cutting integration matrix for a
+unit-level rule.
 
 ## Selection procedure
 
@@ -85,13 +88,13 @@ when the change crosses another boundary:
 2. For code changes, run the focused owner target first. For a private runtime
    helper, use a filtered library test such as
    `cargo test -p align_runtime --lib par_map` rather than the entire runtime
-   library test binary. For documentation-only changes, run `git diff --check`
-   and the relevant consistency or render check when one exists; do not invent
-   a code-test target for prose.
+   library test binary. For documentation-only changes, always run
+   `git diff --check`, then run the relevant consistency or render check when
+   one exists; do not invent a code-test target for prose.
 3. Run the ordinary PR gate required for the change. Rust code changes use
    `scripts/test-pr.sh` as the bounded test gate, with the standard workspace
    build and applicable Clippy checks still required. Documentation-only changes
-   need only their relevant consistency or render check.
+   need only `git diff --check` plus any relevant consistency or render check.
 4. Add a broader target only when the changed behavior is not exercised by the
    owner target, crosses crate/ABI/linker boundaries, changes scheduling or
    resource semantics, or is unusually broad.
@@ -103,6 +106,55 @@ Do not repeat a target already covered by `scripts/test-pr.sh` unless the
 focused invocation selects an additional behavior. Record the reason for every
 expanded target and distinguish a product failure from a host permission,
 network, toolchain, or dependency-linking limitation.
+
+## Relevance and cost rule
+
+Test cost is a reason to narrow the selection, not a reason to skip a meaningful
+check. An additional target is meaningful when all of these are true:
+
+- it executes the changed boundary or a direct consumer of its contract;
+- it can fail for a plausible regression introduced by the change;
+- it adds information not already supplied by an earlier target; and
+- its result has a clear interpretation and stopping point.
+
+If one of those conditions is false, do not run the target merely because it is
+nearby in the same crate or suite. If all are true, run it even when it is
+expensive: soundness, ABI/FFI, scheduler, resource-boundary, cross-platform,
+release, and measurement checks can justify their cost.
+
+Classify verification by scope rather than by a machine-specific wall-clock
+threshold:
+
+```text
+bounded   the ordinary PR gate or a small deterministic owner target
+focused   one owner regression, filtered library test, or named probe
+expanded  multiple owner/resource targets needed for a crossed boundary
+full      scripts/test-full.sh for broad work, release preparation, or an explicit request
+```
+
+For every focused, expanded, or full target added beyond the ordinary gate,
+record four facts in the PR description or handoff: the changed boundary, the
+plausible failure it protects against, why a smaller target is insufficient,
+and why the result is worth its cost. If a target is omitted because it is
+duplicative or unrelated, record that briefly when the omission could otherwise
+look surprising. A host limitation is evidence about the environment, not a
+product result, and must be reported separately.
+
+### Scope matrix
+
+| Change scope | Minimum verification | Add only when |
+| --- | --- | --- |
+| Documentation or policy | `git diff --check` | add the relevant consistency or render check when one exists |
+| Private helper or local analysis | one filtered owner test; Rust changes also use the bounded gate `scripts/test-pr.sh` (including its workspace build) and applicable Clippy | the helper crosses a crate, ABI, linker, scheduler, or resource boundary |
+| Compiler, runtime, or FFI code | focused owner test, `scripts/test-pr.sh`, and applicable Clippy | the focused target does not exercise the changed contract or the change is broad |
+| Optimization or concurrency | owner correctness test; a named benchmark/probe for a changed performance path, a `MEASURE-FIRST` audit, or a performance/resource claim; `scripts/test-pr.sh` for code changes | add fresh-process, cross-platform, stress, or repeatability coverage only when that behavior is part of the changed contract or claim |
+| Broad refactor or versioned release | the bounded gate and the affected owner targets | run `scripts/test-full.sh` when the scope or release process warrants it |
+
+Run each selected target once per unchanged environment. Repeat only when the
+target is inherently statistical, tests fresh processes or hosts, is
+nondeterministic by design, or follows a code/environment change. Do not rerun
+a command solely to obtain a more comforting green result, and do not use a
+full-workspace command as a substitute for identifying the owner target.
 
 ## Full regression
 
