@@ -737,6 +737,8 @@ declare generic parallel reduction settled.
   an Impure callable `where` stage is rejected before it can enter the count/scatter ranges, and
   unsupported stages remain sequential. The accepted/rejected contract is pinned before each
   staged widening.
+- A chunk callable that writes through its `slice` parameter is rejected before `par_map`; the
+  function-value type does not encode `out`, so the body-level view-write check is required.
 - A child-process test runs `workers + 1` task-group tasks, each calling a multi-range `par_map`, and
   completes under a watchdog. Never let a deadlock regression hang the entire test runner.
 - Cover worker counts 1, 2, and the host/default degree through a test-configurable pool.

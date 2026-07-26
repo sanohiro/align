@@ -252,7 +252,7 @@ Implementation slices: **S1 DONE** — tag-only + scalar-payload enums + `Type.V
 Record: `draft.md` §5 (Sum Type), `impl/07-roadmap.md`.
 
 ### Purity model
-**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure function (fixpoint over the call graph). Everything else (arithmetic, reads, builder/arena/heap, owned-value moves) is Pure. `par_map(f)` rejects an Impure `f`. (Sound for the language as it stands: a `par_map` function is `(T) -> R` with no `out` parameter, so reaching an I/O builtin is the only route to impurity.)
+**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, writing through caller-provided `slice`/`soa` storage (including `map_into` and vector stores), or calling an Impure function (fixpoint over the call graph). Private arithmetic, reads, builder/arena/heap, and owned-value moves remain Pure. `par_map(f)` rejects an Impure `f`; the view-write check is deliberately conservative because HIR does not retain enough provenance to prove that a view is private.
 Record: `impl/03-types.md` §8
 
 ### Ordinary sequential pipeline effects and evaluation order
@@ -1300,14 +1300,14 @@ Beyond the JSON→SoA / field-skip thrust (which both external reviews converged
     aggressively. Verified in IR (`attributes #0 = { nounwind }`); test
     `align_functions_are_marked_nounwind`.
   - **`memory(none)` / `readonly` on pure functions — DEFERRED (purity ≠ readonly).** Align's
-    inferred purity (`EffectScan`) means only **"no observable I/O side effect"** — it *explicitly*
-    counts arena/heap allocation, builder use, and reads/writes through args as **pure** (see the
-    `check_parallelism` doc-comment). So a "pure" Align fn may allocate and touch arg-pointed memory →
-    asserting LLVM `readnone`/`readonly` would be **unsound** (LLVM could CSE/DCE a call that really
-    allocates). A sound version needs a *stricter* analysis ("allocation-free + no arg writes, reads
-    only through args" → `readonly`; "scalar args only, no alloc" → `readnone`). Worth it only for
-    non-inlined pure calls with loop-invariant args — pipeline stage fns are inlined by fusion, so the
-    attr is usually moot. Deferred until that stricter analysis exists.
+    inferred purity (`EffectScan`) permits arena/heap allocation, builder use, and mutation of
+    private owned values; writes through caller-provided `slice`/`soa` views are classified Impure.
+    So a "pure" Align fn may still allocate or touch owned argument storage → asserting LLVM
+    `readnone`/`readonly` would be **unsound** (LLVM could CSE/DCE a call that really allocates). A
+    sound version needs a *stricter* analysis ("allocation-free + no arg writes, reads only through
+    args" → `readonly`; "scalar args only, no alloc" → `readnone`). Worth it only for non-inlined
+    pure calls with loop-invariant args — pipeline stage fns are inlined by fusion, so the attr is
+    usually moot. Deferred until that stricter analysis exists.
   - Remaining sound-but-unbuilt: `noalias`/`nonnull`/`dereferenceable`/`align` on pointer args —
     blocked the same way (`nonnull` is false for an empty `{null,0}` slice; aggressive `noalias` wants
     the `map_into(out)` write-construct, deferred above).

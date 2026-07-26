@@ -259,6 +259,32 @@ fn chunks_par_map_impure_rejected() {
 }
 
 #[test]
+fn chunks_par_map_view_write_rejected() {
+    // `out` is not part of the function-value type, so the Pure check must inspect the body rather
+    // than relying on the callable signature. Writing a chunk's slice would race across ranges and
+    // also contradict the generated kernel's readonly context/input contract.
+    let src = "fn touches(out c: slice<i64>) -> i64 {\n  c[0] = 99\n  return c.len()\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-chunks-view-write", src));
+}
+
+#[test]
+fn chunks_par_map_bulk_view_writes_rejected() {
+    let cases = [
+        (
+            "vec-store",
+            "fn touches(out c: slice<i64>) -> i64 {\n  v: vec2<i64> := [1, 2]\n  c.store(0, v)\n  return c[0]\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n",
+        ),
+        (
+            "map-into",
+            "fn inc(x: i64) -> i64 = x + 1\nfn touches(out c: slice<i64>) -> i64 {\n  [1].map(inc).map_into(c)\n  return c[0]\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n",
+        ),
+    ];
+    for (name, src) in cases {
+        assert!(check_errs(&format!("pm-chunks-{name}"), src), "{name} must be impure");
+    }
+}
+
+#[test]
 fn par_map_takes_parallel_path_and_is_correct() {
     if !backend_available() {
         return;
@@ -390,6 +416,16 @@ fn par_map_after_multiple_filters_uses_one_stable_parallel_node() {
 fn impure_where_stage_rejected_before_parallel_widening() {
     let src = "fn noisy(x: i64) -> bool {\n  print(x)\n  return x > 0\n}\nfn finish(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  ys := [1, 2].where(noisy).par_map(finish)\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("pm-where-impure", src));
+}
+
+#[test]
+fn par_map_rejects_mutable_slice_alias_in_where() {
+    // The slice descriptor is Copy, so a lambda can capture an alias of mutable array storage. A
+    // local `mut` rebind of that descriptor must still be treated as a caller-view write, not as
+    // private scalar state; the widened where count/scatter kernels would otherwise race and rerun
+    // the store.
+    let src = "fn main() -> Result<(), Error> {\n  mut xs := [1, 2, 3, 4]\n  view: slice<i64> := xs\n  ys := xs.where(fn x {\n    mut v: slice<i64> := view\n    v[0] = x\n    return true\n  }).par_map(fn x { x })\n  print(ys.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-where-view-write", src));
 }
 
 #[test]

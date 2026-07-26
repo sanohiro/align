@@ -1049,7 +1049,9 @@ fn build_module<'c>(
         ),
         None,
     );
-    add_enum_attr(ctx, par_map_filter, inkwell::attributes::AttributeLoc::Return, "noalias");
+    // The result is an `{ptr, i64}` descriptor returned by value, not a pointer return. LLVM's
+    // `noalias` return attribute is legal only on pointer returns; freshness applies to the
+    // descriptor's `ptr` field and is already enforced by the runtime's exact allocation path.
     funcs.insert("par_map_filter".to_string(), par_map_filter);
     // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, work_weight,
     // range_kernel) -> wrapping integer sum. The runtime keeps only one partial result per claimed
@@ -11814,6 +11816,7 @@ mod tests {
                     .is_some_and(|l| l.contains(needle)),
             }
         };
+        assert!(!group_has("align_rt_par_map_filter", "noalias"), "aggregate filter result must not carry pointer-only noalias:\n{out}");
         // Single-shot allocators get `nofree` + `nounwind` — but deliberately NOT `willreturn` (they
         // `abort` on OOM, so asserting they always return would be a miscompile).
         for sym in [

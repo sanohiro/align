@@ -3846,10 +3846,11 @@ pub fn check_program_with_effects(
 /// Effect/purity inference + the rule that a `par_map` function must be **Pure** (`draft.md` §11,
 /// a Settled decision). A function is **Impure** iff it (transitively) performs an observable
 /// side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure
-/// function. Everything else (arithmetic, field/array reads, builder/arena/heap use, owned-value
-/// moves) is Pure. A `par_map(f)` whose `f` is Impure is rejected. (`f` is `(T) -> R` with no `out`
-/// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
-/// as it stands.)
+/// function. Writes through caller-provided `slice`/`soa` views are also observable side effects;
+/// `map_into` and vector stores use the same classification. Everything else (arithmetic,
+/// field/array reads, builder/arena/heap use, owned-value moves) is Pure. A `par_map(f)` whose `f`
+/// is Impure is rejected. The view-write check is conservative because HIR does not preserve enough
+/// storage provenance to prove that a view is private.
 fn check_parallelism(
     program: &mut Program,
     external_effects: &std::collections::HashMap<String, FnEffect>,
@@ -3866,7 +3867,7 @@ fn check_parallelism(
             );
         } else if impure.contains(&func) {
             diags.error(
-                format!("'par_map' requires a Pure function, but '{func}' has a side effect (it reads/writes I/O); use `reduce` for an accumulation"),
+                format!("'par_map' requires a Pure function, but '{func}' has an observable side effect (I/O or a caller-view write); use `reduce` for an accumulation"),
                 span,
             );
         }
@@ -3875,10 +3876,10 @@ fn check_parallelism(
 
 /// The shared three-valued effect classification stored in function-value types and M15 per-`pub`-fn
 /// interface summaries. [`FnEffect::Impure`] = transitively performs an observable side effect
-/// (I/O); [`FnEffect::Unknown`] = transitively calls a function value whose target is not statically
-/// known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a `par_map`/parallel boundary
-/// both `Impure` and `Unknown` are rejected (fail-closed); the split is kept because the interface
-/// summary records it verbatim and the diagnostics differ.
+/// (I/O or a caller-view write); [`FnEffect::Unknown`] = transitively calls a function value whose
+/// target is not statically known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a
+/// `par_map`/parallel boundary both `Impure` and `Unknown` are rejected (fail-closed); the split is
+/// kept because the interface summary records it verbatim and the diagnostics differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FnEffect {
     Pure,
@@ -4150,6 +4151,19 @@ struct EffectScan<'a> {
 }
 
 impl EffectScan<'_> {
+    /// A write through a view can mutate storage owned by the caller rather than a local value.
+    /// The HIR keeps the view type on the target local but does not retain enough provenance to
+    /// prove that a `slice`/`soa` is backed by private storage, so the Pure boundary fails closed.
+    fn mark_view_write(&mut self, local: LocalId) {
+        if self
+            .locals
+            .get(local as usize)
+            .is_some_and(|local| matches!(local.ty, Ty::Slice(_) | Ty::Soa(_)))
+        {
+            self.impure_direct = true;
+        }
+    }
+
     fn stage_funcs(&mut self, stages: &[Stage]) {
         for s in stages {
             match &s.kind {
@@ -4185,9 +4199,10 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
-                Stmt::AssignIndex { index, value, .. }
-                | Stmt::AssignElemField { index, value, .. }
-                | Stmt::AssignElem { index, value, .. } => {
+                Stmt::AssignIndex { base, index, value }
+                | Stmt::AssignElemField { base, index, value, .. }
+                | Stmt::AssignElem { base, index, value, .. } => {
+                    self.mark_view_write(*base);
                     self.expr(index);
                     self.expr(value);
                 }
@@ -4827,9 +4842,11 @@ impl EffectScan<'_> {
                 self.stage_funcs(stages);
                 self.expr(source);
             }
-            // `map_into` writes each post-stage element into `dst` — a stage-carrying pipeline plus
-            // the destination place (a read of the `out`/`mut` slice), both walked for effects.
+            // `map_into` writes each post-stage element into caller-provided storage. It is an
+            // observable view write even when the destination expression itself is just a local
+            // slice value, so it cannot cross the Pure/parallel boundary.
             ExprKind::ArrayMapInto { source, stages, dst, .. } => {
+                self.impure_direct = true;
                 self.stage_funcs(stages);
                 self.expr(source);
                 self.expr(dst);
@@ -4926,6 +4943,8 @@ impl EffectScan<'_> {
                 self.expr(index);
             }
             ExprKind::VecStore { dst, index, value, .. } => {
+                // `dst` is a writable slice place; the vector store mutates its backing buffer.
+                self.impure_direct = true;
                 self.expr(dst);
                 self.expr(index);
                 self.expr(value);
