@@ -12,7 +12,7 @@ use align_runtime::{
 };
 use std::hint::black_box;
 use std::mem::{align_of, size_of, transmute};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CACHE_LINE: usize = 64;
 
@@ -21,6 +21,15 @@ const CACHE_LINE: usize = 64;
 struct Env {
     seed: u64,
     rounds: u64,
+    sleep_us: u64,
+}
+
+/// The builtin Align `Error` lowers to `{ i32 tag, i32 code }` in the generated task trampoline.
+/// Keep this probe layout tied to that shipped ABI instead of using the host Rust enum layout.
+#[repr(C)]
+struct AlignError {
+    tag: i32,
+    code: i32,
 }
 
 type TaskThunk = extern "C" fn(*const u8) -> i64;
@@ -38,9 +47,13 @@ impl Layout {
 }
 
 /// The body is deliberately the same for every task and every record layout. `rounds == 0` prices
-/// the scheduler/record path; the nonzero case keeps a body-cost control in the probe.
+/// the scheduler/record path; the nonzero case keeps a body-cost control in the probe. `sleep_us`
+/// adds a bounded blocking control without introducing filesystem or network setup into the probe.
 extern "C" fn task_thunk(env: *const u8) -> i64 {
     let env = unsafe { &*env.cast::<Env>() };
+    if env.sleep_us != 0 {
+        std::thread::sleep(Duration::from_micros(env.sleep_us));
+    }
     let mut value = env.seed;
     for _ in 0..env.rounds {
         value = value
@@ -64,6 +77,23 @@ extern "C" fn task_trampoline(
     0
 }
 
+/// Exercise the real fallible error-slot write and `tg_wait` error-pointer return once per layout.
+/// Performance rows use successful tasks so their layout cost is isolated from error selection.
+extern "C" fn error_trampoline(
+    _thunk_ptr: *const u8,
+    env: *mut u8,
+    _slot: *mut u8,
+    err_slot: *mut u8,
+) -> i32 {
+    let code = unsafe { (*env.cast::<Env>()).seed as i32 + 7 };
+    unsafe {
+        err_slot
+            .cast::<AlignError>()
+            .write(AlignError { tag: 4, code });
+    }
+    1
+}
+
 fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     value
@@ -82,20 +112,23 @@ fn register_task(
     tg: *mut TaskGroup,
     task_index: usize,
     rounds: u64,
+    sleep_us: u64,
     layout: Layout,
     fallible: bool,
+    error: bool,
 ) -> *mut i64 {
     let env_size = size_of::<Env>();
     let scalar_size = size_of::<i64>();
     let scalar_align = align_of::<i64>();
-    let error_size = 16usize;
+    let error_size = size_of::<AlignError>();
+    let error_align = align_of::<AlignError>();
 
     let (env, slot, err_slot) = match layout {
         Layout::Split => {
             let env = unsafe { tg_alloc(tg, env_size, align_of::<Env>()) };
             let slot = unsafe { tg_alloc(tg, scalar_size, scalar_align) };
             let err_slot = if fallible {
-                unsafe { tg_alloc(tg, error_size, 8) }
+                unsafe { tg_alloc(tg, error_size, error_align) }
             } else {
                 core::ptr::null_mut()
             };
@@ -117,7 +150,7 @@ fn register_task(
                 if padded {
                     align_up(slot_offset + scalar_size, CACHE_LINE)
                 } else {
-                    align_up(slot_offset + scalar_size, 8)
+                    align_up(slot_offset + scalar_size, error_align)
                 }
             } else {
                 0
@@ -143,10 +176,15 @@ fn register_task(
         env.cast::<Env>().write(Env {
             seed: task_index as u64 + 1,
             rounds,
+            sleep_us,
         });
         align_rt_tg_register(
             tg,
-            task_trampoline as TaskTrampoline,
+            if error {
+                error_trampoline as TaskTrampoline
+            } else {
+                task_trampoline as TaskTrampoline
+            },
             task_thunk as *const u8,
             env,
             slot,
@@ -156,31 +194,70 @@ fn register_task(
     slot.cast::<i64>()
 }
 
-fn run_once(tasks: usize, rounds: u64, layout: Layout, fallible: bool) -> u64 {
-    let tg = align_rt_tg_begin();
-    assert!(!tg.is_null(), "task-group begin failed");
+struct TgGuard(*mut TaskGroup);
+
+impl TgGuard {
+    fn new() -> Self {
+        let tg = align_rt_tg_begin();
+        assert!(!tg.is_null(), "task-group begin failed");
+        Self(tg)
+    }
+}
+
+impl Drop for TgGuard {
+    fn drop(&mut self) {
+        unsafe { align_rt_tg_end(self.0) };
+    }
+}
+
+fn run_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: bool) -> u64 {
+    let guard = TgGuard::new();
+    let tg = guard.0;
     let mut slots = Vec::with_capacity(tasks);
     for task_index in 0..tasks {
-        slots.push(register_task(tg, task_index, rounds, layout, fallible));
+        slots.push(register_task(
+            tg, task_index, rounds, sleep_us, layout, fallible, false,
+        ));
     }
 
     let err = unsafe { align_rt_tg_wait(tg) };
     assert!(err.is_null(), "the probe task body must not fail");
-    let checksum = slots.into_iter().fold(0u64, |sum, slot| {
+    slots.into_iter().fold(0u64, |sum, slot| {
         sum.wrapping_add(unsafe { slot.read() as u64 })
-    });
-    unsafe { align_rt_tg_end(tg) };
-    checksum
+    })
 }
 
-fn timed(tasks: usize, rounds: u64, layout: Layout, fallible: bool, reps: usize) -> (f64, u64) {
-    let started = Instant::now();
-    let mut checksum = 0u64;
-    for _ in 0..reps {
-        checksum ^= black_box(run_once(tasks, rounds, layout, fallible));
+fn run_error_path(layout: Layout) {
+    let guard = TgGuard::new();
+    let tg = guard.0;
+    for task_index in 0..8 {
+        register_task(tg, task_index, 0, 0, layout, true, task_index == 3);
     }
-    let ns_per_task = started.elapsed().as_secs_f64() * 1e9 / (tasks * reps) as f64;
-    (ns_per_task, checksum)
+    let err = unsafe { align_rt_tg_wait(tg) };
+    assert!(!err.is_null(), "the error path must return an err slot");
+    let error = unsafe { err.cast::<AlignError>().read() };
+    assert_eq!(
+        (error.tag, error.code),
+        (4, 11),
+        "fallible error slot ABI mismatch"
+    );
+}
+
+fn timed(
+    tasks: usize,
+    rounds: u64,
+    sleep_us: u64,
+    layout: Layout,
+    fallible: bool,
+    reps: usize,
+    expected: u64,
+) -> f64 {
+    let started = Instant::now();
+    for _ in 0..reps {
+        let checksum = black_box(run_once(tasks, rounds, sleep_us, layout, fallible));
+        assert_eq!(checksum, expected, "record layout changed task results");
+    }
+    started.elapsed().as_secs_f64() * 1e9 / (tasks * reps) as f64
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -188,7 +265,7 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-fn run_case(tasks: usize, rounds: u64, fallible: bool, trials: usize, reps: usize) {
+fn run_case(tasks: usize, rounds: u64, sleep_us: u64, fallible: bool, trials: usize, reps: usize) {
     let mut samples = [
         Vec::with_capacity(trials),
         Vec::with_capacity(trials),
@@ -196,20 +273,27 @@ fn run_case(tasks: usize, rounds: u64, fallible: bool, trials: usize, reps: usiz
     ];
     let mut ratios = Vec::with_capacity(trials);
     let mut padded_ratios = Vec::with_capacity(trials);
-    let warm_checksum = run_once(tasks, rounds, Layout::Split, fallible);
-    let expected_checksum = if reps.is_multiple_of(2) {
-        0
-    } else {
-        warm_checksum
-    };
+    let warm_checksum = run_once(tasks, rounds, sleep_us, Layout::Split, fallible);
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+        [1, 0, 2],
+        [0, 2, 1],
+    ];
     for trial in 0..trials {
-        let order = if trial % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
+        let order = ORDERS[trial % ORDERS.len()];
         let mut elapsed = [0.0; 3];
         for arm in order {
-            let (ns, checksum) = timed(tasks, rounds, Layout::ALL[arm], fallible, reps);
-            assert_eq!(
-                checksum, expected_checksum,
-                "record layouts changed task results"
+            let ns = timed(
+                tasks,
+                rounds,
+                sleep_us,
+                Layout::ALL[arm],
+                fallible,
+                reps,
+                warm_checksum,
             );
             elapsed[arm] = ns;
             samples[arm].push(ns);
@@ -226,7 +310,7 @@ fn run_case(tasks: usize, rounds: u64, fallible: bool, trials: usize, reps: usiz
     let padded_over_packed = median(&mut padded_ratios);
     let allocs = if fallible { "3/1/1" } else { "2/1/1" };
     println!(
-        "{tasks:>6}  {rounds:>6}  {:>8}  {:>10.1}  {:>12.1}  {:>12.1}  {packed_over_split:>8.3}  {padded_over_packed:>8.3}  {allocs}",
+        "{tasks:>6}  {rounds:>6}  {sleep_us:>8}  {:>8}  {:>10.1}  {:>12.1}  {:>12.1}  {packed_over_split:>8.3}  {padded_over_packed:>8.3}  {allocs}",
         if fallible { "yes" } else { "no" },
         medians[0],
         medians[1],
@@ -246,12 +330,24 @@ fn main() {
         .unwrap_or(3)
         .max(1);
     println!("task_group record probe — current split allocation vs one-record layouts");
-    println!("balanced order, median of {trials} trials, {reps} repetitions per timing arm");
+    println!(
+        "six-order balanced cycle, median of {trials} trials, {reps} repetitions per timing arm"
+    );
     println!("packed-tight keeps fields adjacent; packed-padded puts each result/error on a cache-line boundary");
-    println!("tasks  rounds  fallible       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
-    for &(tasks, rounds) in &[(8, 0), (128, 0), (4096, 0), (128, 64), (4096, 64)] {
+    println!("tasks  rounds  sleep-us  fallible       split  packed-tight  packed-padded  tight/split  padded/tight  allocs/task");
+    for &(tasks, rounds, sleep_us) in &[
+        (8, 0, 0),
+        (128, 0, 0),
+        (4096, 0, 0),
+        (128, 64, 0),
+        (4096, 64, 0),
+        (128, 0, 50),
+    ] {
         for fallible in [false, true] {
-            run_case(tasks, rounds, fallible, trials, reps);
+            run_case(tasks, rounds, sleep_us, fallible, trials, reps);
         }
+    }
+    for layout in Layout::ALL {
+        run_error_path(layout);
     }
 }

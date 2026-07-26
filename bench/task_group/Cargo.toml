@@ -13,5 +13,6 @@ align_runtime = { path = "../../crates/align_runtime" }
 
 [profile.release]
 opt-level = 3
-lto = true
+# Keep the normal Rust-to-runtime C-ABI boundary visible; this probe is not an rt-lto measurement.
+lto = false
 codegen-units = 1

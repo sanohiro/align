@@ -648,18 +648,17 @@ again for the result, again for the error, copies the capture environment, then 
 
 This removes runtime calls and improves descriptor/env locality, but it is not automatically a
 cache win: densely packed records can put result words written by different runners on one line.
-Sequence it after block claiming, compare one-record vs current allocation on tiny and I/O-heavy
-tasks, and retain separate allocations if the false-sharing cost exceeds the call/locality win.
+Sequence it after block claiming, compare one-record vs current allocation on tiny, CPU-heavy, and
+blocking controls, and retain separate allocations if the false-sharing cost exceeds the
+call/locality win. A real filesystem/network workload is a separate resource-policy benchmark.
 
 **Measure-first result (2026-07-26):** `bench/task_group/run.sh` now drives the same registration
 ABI with split, packed-tight, and cache-line-padded records. On native Apple Silicon (8 workers),
-the final 31-trial/7-repetition run showed packed-tight wins of about 17–42% on 4096-task cases,
-but no repeatable win across the small/fallible cases: tight/split was `1.063` for 8 fallible
-tasks, `1.016` for 128 fallible zero-work tasks, and `0.949` for 128 fallible body-heavy tasks.
-The padded control was 14–39% slower than packed-tight on the large cases, so padding is not a
-free repair for locality. The written ship gate requires a repeatable at least 10% packed-tight
-win on both tiny and large groups without a material padded-control penalty; it is not met.
-Production codegen and the runtime ABI therefore retain the current split allocation shape.
+the final high-trial run covers zero-work, CPU-heavy, and bounded blocking controls, plus a real
+error-slot smoke. The probe is scoped to successful captured CPU/blocking tasks for performance;
+it does not claim filesystem/network behavior. The written ship gate requires a repeatable at least
+10% packed-tight win on both tiny and large groups without a material padded-control penalty; it is
+not met. Production codegen and the runtime ABI therefore retain the current split allocation shape.
 
 ---
 
