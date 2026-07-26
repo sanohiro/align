@@ -69,11 +69,13 @@ cargo test -p align_runtime --lib http_client
 cargo test -p align_runtime --lib par_map
 ```
 
-Optimization work runs its named benchmark or measurement probe. Network,
-filesystem, timeout, process, and fd work runs the corresponding real-resource
-target in an unrestricted environment. A test should be added to an existing
-owner target when possible; do not create another cross-cutting integration
-matrix for a unit-level rule.
+Optimization work runs its named benchmark or measurement probe when the change
+makes a performance or resource claim. A correctness-only optimization change
+uses its owner target and the bounded code gate. Network, filesystem, timeout,
+process, and fd work runs the corresponding real-resource target in an
+unrestricted environment. A test should be added to an existing owner target
+when possible; do not create another cross-cutting integration matrix for a
+unit-level rule.
 
 ## Selection procedure
 
@@ -141,10 +143,10 @@ product result, and must be reported separately.
 
 | Change scope | Minimum verification | Add only when |
 | --- | --- | --- |
-| Documentation or policy | `git diff --check` | add the relevant consistency or render check when a checked consumer or generated artifact exists |
+| Documentation or policy | `git diff --check` | add the relevant consistency or render check when one exists |
 | Private helper or local analysis | one filtered owner test | the helper crosses a crate, ABI, linker, scheduler, or resource boundary |
 | Compiler, runtime, or FFI code | focused owner test, `scripts/test-pr.sh`, and applicable Clippy | the focused target does not exercise the changed contract or the change is broad |
-| Optimization or concurrency | owner correctness test; add the named benchmark/probe only for a performance or resource claim; `scripts/test-pr.sh` for code changes | repeatability, nested progress, cross-platform, or resource behavior is part of the claim |
+| Optimization or concurrency | owner correctness test; add the named benchmark/probe only for a performance or resource claim; `scripts/test-pr.sh` for code changes | add fresh-process, cross-platform, stress, or repeatability coverage only when that behavior is part of the changed contract or claim |
 | Broad refactor or versioned release | the bounded gate and the affected owner targets | run `scripts/test-full.sh` when the scope or release process warrants it |
 
 Run each selected target once per unchanged environment. Repeat only when the
