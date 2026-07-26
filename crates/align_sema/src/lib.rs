@@ -744,11 +744,12 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
     }
 }
 
-/// Whether a staged `par_map` can enter the single range-kernel path. The first widening slice is
-/// deliberately narrow: the source and every length-preserving `map` result must be a primitive
-/// scalar, and no filtering/projection/`chunks` stage may be present. Keep this predicate shared by
-/// effect checking and MIR lowering so a stage is never admitted to the parallel kernel without the
-/// matching Pure boundary check.
+/// Whether a staged `par_map` can enter the range-kernel path. The widening remains deliberately
+/// narrow: the source and every length-preserving stage must be a primitive scalar, and only
+/// callable `map`/`where` stages are admitted. Filtering uses the separate stable-compaction
+/// runtime path; projections, `where(.field)`, `str.contains`, `chunks`, and aggregate shapes stay
+/// sequential. Keep this predicate shared by effect checking and MIR lowering so a stage is never
+/// admitted to the parallel kernel without the matching Pure boundary check.
 pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage]) -> bool {
     let elem = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -758,7 +759,7 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage]) -> bool 
         return false;
     }
     for stage in stages {
-        if !matches!(stage.kind, hir::StageKind::Map { .. })
+        if !matches!(stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. })
             || !matches!(stage.out_ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
         {
             return false;
@@ -4846,13 +4847,13 @@ impl EffectScan<'_> {
                 self.stage_funcs(stages);
                 self.calls.push(func.clone());
                 self.parmaps.push((func.clone(), e.span));
-                // A staged map is only a parallel candidate when MIR/codegen can keep the whole
+                // A staged chain is only a parallel candidate when MIR/codegen can keep the whole
                 // length-preserving scalar chain inside one range kernel. Its prior callables then
-                // cross the same Pure boundary as the terminal function; filtering, projection,
-                // aggregate sources, and `chunks` remain sequential and keep their old contract.
+                // cross the same Pure boundary as the terminal function. The filtered form uses
+                // stable compaction; projection, aggregate sources, and `chunks` remain sequential.
                 if par_map_staged_parallelizable(source.ty, stages) {
                     for stage in stages {
-                        if let StageKind::Map { func, .. } = &stage.kind {
+                        if let StageKind::Map { func, .. } | StageKind::Where { func, .. } = &stage.kind {
                             self.parmaps.push((func.clone(), e.span));
                         }
                     }

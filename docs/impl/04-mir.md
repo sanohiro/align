@@ -248,10 +248,10 @@ The implemented data-parallel operation is a dedicated materializer:
 
 ```text
 direct source.par_map(f)        → Rvalue::ParMapParallel { src, func, stages: [], captures, capture_tys, elem_in, elem_out, work_weight }
-staged scalar map chain         → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
+staged scalar map/filter chain  → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
 direct stage-free integer par_map(f).sum()
                                 → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight }
-filtered / unsupported par_map → sequential pipeline fallback, preserving capture semantics
+unsupported filtered par_map    → sequential pipeline fallback, preserving capture semantics
 source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
 ```
@@ -259,12 +259,15 @@ task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult;
 `par_map` requires a Pure callable (`03 §8`); the dedicated node lets codegen call the runtime's
 parallel-map API with a generated whole-range kernel. Direct-source Copy captures are lowered once
 into a call-scoped immutable context; the kernel loads them and passes them as direct trailing
-arguments. The kernel contains the typed counted loop and direct calls for a primitive-scalar map
-chain plus the terminal body; the runtime schedules disjoint `[start,end)` ranges. The specialized `ParMapReduce` node covers only a
+arguments. The kernel contains the typed counted loop and direct calls for a primitive-scalar
+map/filter chain plus the terminal body; callable filters use a count/prefix/scatter pair of
+range kernels so output order stays source order. The runtime schedules disjoint `[start,end)`
+ranges. The specialized `ParMapReduce` node covers only a
 direct, stage-free integer `par_map(f).sum()`; its generated kernel folds each range with plain
 wrapping integer addition and publishes one partial result per range, so no transformed array is
-materialized. Filtered/unsupported staged pipelines, `chunks` producers, floating-point sums, and
-arbitrary reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
+materialized. Projection filters, `str.contains` filters, aggregate stages, `chunks` producers,
+floating-point sums, and arbitrary reducers remain on their existing paths. This does not add a
+generic `ParLoop(reduce=…)` node or silently
 parallelize ordinary reductions.
 
 Each parallel node also carries a compiler-generated `work_weight` in `{1, 2, 4}`. The post-lowering

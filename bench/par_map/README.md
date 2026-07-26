@@ -1,10 +1,12 @@
-# `par_map` — data-parallel map (Align pool vs Rust sequential / rayon)
+# `par_map` — data-parallel map/filter (Align pool vs Rust sequential / rayon)
 
-Measures `s.par_map(work).sum()` against Rust sequential and `rayon` (work-stealing pool), varying N.
-The Align runtime uses a persistent worker pool and one generated typed kernel per claimed range.
+Measures `s.par_map(work).sum()` against Rust sequential and `rayon` (work-stealing pool), varying N;
+the `filter` mode measures stable count/prefix/scatter compaction separately. The Align runtime uses
+a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
 bench/par_map/run.sh [baseline|v3|native|threshold]   # headline comparison or threshold probe
+bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 ```
 
@@ -87,3 +89,25 @@ before changing the common floor again.
 
 The benchmark's old spawn and per-element-thunk results remain historical evidence in
 `docs/open-questions.md`; they are not descriptions of the current generated kernel.
+
+## Stable filter compaction probe
+
+The `filter` mode uses a 50% even predicate and the cheap `i64` body. It compares the generated
+two-pass count/prefix/scatter path with a Rust control that materializes the same `i64` result
+array before summing. Each row is the median of 15 alternating paired samples on native Apple
+Silicon (2026-07-26); the ratio is Rust time divided by Align time.
+
+```
+    n   parallel ms   rust seq ms     vs Rust
+    16384         0.146         0.145       0.99x
+    65536         0.374         0.357       0.95x
+    65537         0.151         0.269       1.78x
+   131072         0.321         0.590       1.84x
+  1000000         0.884         3.501       3.96x
+```
+
+The boundary rows show why the existing conservative `65,536` element floor remains useful:
+caller-only sizes stay within about 5% of the materializing sequential control, while the first
+pooled size amortizes the two passes and range publication. This is a directional scalar
+measurement, not a claim that every predicate or selectivity wins; projection, string, chunk, and
+aggregate filters remain outside the shipped parallel slice.

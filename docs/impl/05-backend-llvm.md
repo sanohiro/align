@@ -254,7 +254,8 @@ parallel-map API.
 ```text
 ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
   → synthesize one typed range kernel (context, start..<end)
-  → align_rt_par_map(capture_ctx, in_buf, count, in_stride, out_stride, work_weight, kernel)
+  → align_rt_par_map(...) for map-only stages
+  → align_rt_par_map_filter(..., count_kernel, scatter_kernel) for callable `where` stages
   → owned array<elem_out>
 
 task_group → align_rt_tg_begin / tg_alloc / tg_register / tg_wait / tg_end
@@ -271,7 +272,10 @@ and vectorize that loop; the runtime invokes the function pointer once per coars
 element. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses plain wrapping
 addition, and stores one partial at the range output pointer; the runtime combines the partials and
 returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in the same
-ordered range kernel; filtered and unsupported staged forms use the sequential pipeline fallback.
+ordered range kernel. Callable primitive-scalar `where` stages emit a count kernel and a scatter
+kernel; the runtime prefix-sums per-range survivor counts and passes each scatter range its stable
+output offset. The Pure chain is intentionally evaluated in both passes. Projection, `str.contains`,
+aggregate, and unsupported staged forms use the sequential pipeline fallback.
 `work_weight` is a bounded MIR hint (`1`, `2`, or `4`) materialized as an `i64` argument; it is
 combined with the concrete input/output strides by the runtime and does not change the source or
 language ABI.

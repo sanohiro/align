@@ -5,9 +5,9 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #651.
-The current change adds the first conservative body/byte-aware `par_map` grain hint; the broader
-width/aggregate sweep remains a measure-first follow-up._
+_Last updated: 2026-07-26. `main` includes the shipped wave through #652.
+The current change adds stable compaction for callable primitive-scalar `where` stages before
+`par_map`; projection, string, chunk, and aggregate filters remain sequential._
 
 ## Start here
 
@@ -63,6 +63,7 @@ facts must live in this repository.
 #649  focused test selection policy
 #650  low-lock task-group claims and completion
 #651  fuse primitive scalar `par_map` map stages
+#652  bounded body and byte-aware `par_map` grain hints
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -111,11 +112,17 @@ ratios for cheap and heavy bodies; the value remains host- and body-sensitive, s
 rerun `bench/par_map/run.sh threshold` before another retune.
 
 #651 carries the first primitive-scalar length-preserving `map` stages into the
-same ordered range kernel. The current grain slice adds a compiler-generated
-1/2/4 body hint and input/output byte-aware floor. An aggressive reduction of the
-common `i64` floor was measured at the boundary and regressed pool/caller by about
-7%, so the shipped first model keeps that floor conservative until width and
-aggregate measurements justify a broader retune.
+same ordered range kernel. #652 adds a compiler-generated 1/2/4 body hint and
+input/output byte-aware floor. An aggressive reduction of the common `i64` floor
+was measured at the boundary and regressed pool/caller by about 7%, so the first
+model keeps that floor conservative until width and aggregate measurements justify
+a broader retune.
+
+The current slice adds callable primitive-scalar `where` stages to the same ordered
+range pipeline. It counts survivors per range, prefixes byte offsets, then scatters
+in source order into an exact-sized owned array. Pure map and predicate stages are
+rerun by the two kernels; projection, string, chunk, aggregate, and other
+unsupported filters retain the sequential path.
 
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
@@ -125,10 +132,11 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 ## Next work
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
-focused-verification, low-lock task-group, and staged-map slices are shipped in #643, #644, #646,
-#647, #648, #649, #650, and #651. The current change is the conservative body/byte-aware grain
-slice; filtered compaction, packed task records, false-sharing measurement, and a broader
-width/aggregate retune remain separate measure-first follow-ups.
+focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are
+shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. The current change is
+stable callable scalar `where` compaction; packed task records, false-sharing measurement,
+projection/aggregate filters, and a broader width/aggregate retune remain separate measure-first
+follow-ups.
 
 Consumer-gated deferrals that remain intentional:
 

@@ -24,7 +24,7 @@ pub mod thinlto_spike;
 pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
-use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, Program, Rvalue, Slot, Stmt, Term, ValueId};
+use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{enum_is_move, payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
@@ -1037,6 +1037,20 @@ fn build_module<'c>(
     // range kernel, so we don't assert anything about what that does).
     add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
     funcs.insert("par_map".to_string(), par_map);
+    // `par_map` with callable `where` stages: (capture_ctx, in_buf, count, in_stride, out_stride,
+    // work_weight, count_kernel, scatter_kernel) -> {out_buf, survivor_count}. The runtime first
+    // counts stable survivors per range, then reruns the Pure stage chain to scatter in source
+    // order at prefix-computed offsets.
+    let par_map_filter = module.add_function(
+        "align_rt_par_map_filter",
+        slice_struct_type(ctx).fn_type(
+            &[ptr.into(), ptr.into(), i64t.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into(), ptr.into()],
+            false,
+        ),
+        None,
+    );
+    add_enum_attr(ctx, par_map_filter, inkwell::attributes::AttributeLoc::Return, "noalias");
+    funcs.insert("par_map_filter".to_string(), par_map_filter);
     // `par_map(...).sum()`: (capture_ctx, in_buf, count, in_stride, result_stride, work_weight,
     // range_kernel) -> wrapping integer sum. The runtime keeps only one partial result per claimed
     // range, so no full transformed output buffer is materialized.
@@ -3819,6 +3833,14 @@ fn mark_private_helper<'c>(f: FunctionValue<'c>) {
     f.set_linkage(Linkage::Private);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParMapKernelMode {
+    Materialize,
+    Reduce,
+    FilterCount,
+    FilterScatter,
+}
+
 /// `private unnamed_addr`: a codegen-emitted constant global (string bytes, JSON field-descriptor
 /// table, perfect-hash table). `private` hides the symbol — nothing references these by name, only
 /// by the pointer we return. `unnamed_addr` declares the *address* is not significant (only the
@@ -4805,7 +4827,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Get (building it once) the `void(context, in_base, out_base, start, end)` range kernel for
     /// `func`. The kernel owns the counted element loop: typed GEP → load → direct call → store.
     /// The runtime calls it once per claimed range, so the hot element loop contains no indirect
-    /// callback. Copy captures are loaded once from the immutable call-scoped context.
+    /// callback. Copy captures are loaded once from the immutable call-scoped context. Filter
+    /// kernels use the same ABI: the count pass stores one survivor count to `out_base`, while the
+    /// scatter pass writes survivors at local offsets from the range's prefix-adjusted `out_base`.
     /// Building it temporarily repositions the shared builder, then restores it.
     fn par_map_range_kernel(
         &self,
@@ -4813,19 +4837,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
         capture_tys: &[Ty],
-        reduce: bool,
+        mode: ParMapKernelMode,
         stages: &[ParMapStage],
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let reduce = mode == ParMapKernelMode::Reduce;
+        let filter = matches!(mode, ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter);
+        let filter_count = mode == ParMapKernelMode::FilterCount;
+        let filter_scatter = mode == ParMapKernelMode::FilterScatter;
         if reduce && !stages.is_empty() {
             return Err(self.err("par_map reduction kernels cannot contain prior stages"));
         }
-        let name = if reduce {
-            format!("{func}$parreducekernel")
-        } else if stages.is_empty() {
-            format!("{func}$parkernel")
-        } else {
-            let chain = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join("$");
-            format!("{func}$parmapchain${chain}")
+        if filter && !stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter) {
+            return Err(self.err("par_map filter kernels require a filter stage"));
+        }
+        let name = match mode {
+            ParMapKernelMode::Reduce => format!("{func}$parreducekernel"),
+            ParMapKernelMode::Materialize if stages.is_empty() => format!("{func}$parkernel"),
+            ParMapKernelMode::Materialize => {
+                let chain = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join("$");
+                format!("{func}$parmapchain${chain}")
+            }
+            ParMapKernelMode::FilterCount | ParMapKernelMode::FilterScatter => {
+                let suffix = if filter_count { "count" } else { "scatter" };
+                let chain = stages
+                    .iter()
+                    .map(|stage| match stage.kind {
+                        ParMapStageKind::Map => stage.func.clone(),
+                        ParMapStageKind::Filter => format!("where${}", stage.func),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("$");
+                format!("{func}$parfilter${suffix}${chain}")
+            }
         };
         if let Some(f) = self.module.get_function(&name) {
             return Ok(f.as_global_value().as_pointer_value());
@@ -4864,6 +4907,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     "par_map stage function `{}` has {actual_params} parameters, expected {expected_params}",
                     stage.func
                 )));
+            }
+            if stage.kind == ParMapStageKind::Filter {
+                let Some(return_type) = target.get_type().get_return_type() else {
+                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
+                };
+                let BasicTypeEnum::IntType(return_type) = return_type else {
+                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
+                };
+                if return_type.get_bit_width() != 1 {
+                    return Err(self.err(format!("par_map filter `{}` must return bool", stage.func)));
+                }
             }
             terminal_capture_start = terminal_capture_start
                 .checked_add(stage.capture_tys.len())
@@ -4944,6 +4998,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let head = self.ctx.append_basic_block(kernel, "head");
         let body = self.ctx.append_basic_block(kernel, "body");
         let done = self.ctx.append_basic_block(kernel, "done");
+        let reject = filter.then(|| self.ctx.append_basic_block(kernel, "filter.reject"));
+        let cont = filter.then(|| self.ctx.append_basic_block(kernel, "filter.cont"));
         self.builder.position_at_end(entry);
         let context = kernel.get_nth_param(0).unwrap().into_pointer_value();
         let in_base = kernel.get_nth_param(1).unwrap().into_pointer_value();
@@ -4969,11 +5025,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
         };
         self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
 
-        // head: i = phi [start, entry], [i+1, body]; enter while i < end.
+        // head: i = phi [start, entry], [i+1, cont/body]; enter while i < end. Filter kernels
+        // also carry a stable survivor/output index for the current range.
         self.builder.position_at_end(head);
         let phi = self.builder.build_phi(i64t, "i").map_err(|e| self.err(e))?;
         phi.add_incoming(&[(&start, entry)]);
         let i = phi.as_basic_value().into_int_value();
+        let survivor_phi = if filter {
+            let survivor = self.builder.build_phi(i64t, "survivors").map_err(|e| self.err(e))?;
+            let zero = i64t.const_zero();
+            survivor.add_incoming(&[(&zero, entry)]);
+            Some(survivor)
+        } else {
+            None
+        };
+        let output_index_phi = if filter_scatter {
+            let output_index = self.builder.build_phi(i64t, "out.index").map_err(|e| self.err(e))?;
+            let zero = i64t.const_zero();
+            output_index.add_incoming(&[(&zero, entry)]);
+            Some(output_index)
+        } else {
+            None
+        };
         let acc_phi = if let Some(reduce_ty) = reduce_ty {
             let acc = self.builder.build_phi(reduce_ty, "acc").map_err(|e| self.err(e))?;
             let zero = reduce_ty.const_zero();
@@ -4995,7 +5068,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
         let mut current = x;
         let mut capture_start = 0usize;
-        for stage in stages {
+        for (stage_idx, stage) in stages.iter().enumerate() {
             let target = self
                 .funcs
                 .get(&stage.func)
@@ -5007,49 +5080,124 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
             call_args.push(current.into());
             call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-            current = self
+            let stage_value = self
                 .builder
                 .build_call(target, &call_args, "stage")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| self.err(format!("par_map stage function `{}` must return a value", stage.func)))?;
+            match stage.kind {
+                ParMapStageKind::Map => {
+                    current = stage_value;
+                }
+                ParMapStageKind::Filter => {
+                    let predicate = match stage_value {
+                        BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 1 => value,
+                        _ => return Err(self.err(format!("par_map filter `{}` must return bool", stage.func))),
+                    };
+                    let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
+                    self.builder
+                        .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(pass);
+                }
+            }
             capture_start = capture_end;
         }
-        let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
-        call_args.push(current.into());
-        call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-        let r = self
-            .builder
-            .build_call(target, &call_args, "r")
-            .map_err(|e| self.err(e))?
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| self.err("par_map function must return a value"))?;
-        if let Some(acc_phi) = &acc_phi {
-            let r = match r {
-                BasicValueEnum::IntValue(v) => v,
-                _ => return Err(self.err("par_map reduction function must return an integer")),
-            };
-            let next_acc = self
-                .builder
-                .build_int_add(acc_phi.as_basic_value().into_int_value(), r, "acc.next")
+        let survivor_block = self.builder.get_insert_block().expect("par_map survivor predecessor");
+        if filter {
+            if filter_scatter {
+                let mut call_args: Vec<BasicMetadataValueEnum<'c>> =
+                    Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
+                call_args.push(current.into());
+                call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
+                let r = self
+                    .builder
+                    .build_call(target, &call_args, "r")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("par_map function must return a value"))?;
+                let out_index = output_index_phi.expect("filter scatter output index").as_basic_value().into_int_value();
+                let out_p = unsafe {
+                    self.builder.build_in_bounds_gep(out_ty, out_base, &[out_index], "out.elem").map_err(|e| self.err(e))?
+                };
+                self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+            }
+            self.builder
+                .build_unconditional_branch(cont.expect("filter continuation block"))
                 .map_err(|e| self.err(e))?;
-            acc_phi.add_incoming(&[(&next_acc, body)]);
+            self.builder.position_at_end(reject.expect("filter reject block"));
+            self.builder
+                .build_unconditional_branch(cont.expect("filter continuation block"))
+                .map_err(|e| self.err(e))?;
+            self.builder.position_at_end(cont.expect("filter continuation block"));
+            let accepted = self.builder.build_phi(self.ctx.bool_type(), "accepted").map_err(|e| self.err(e))?;
+            let true_value = self.ctx.bool_type().const_int(1, false);
+            let false_value = self.ctx.bool_type().const_zero();
+            accepted.add_incoming(&[(&true_value, survivor_block), (&false_value, reject.expect("filter reject block"))]);
+            let accepted_i64 = self
+                .builder
+                .build_int_z_extend(accepted.as_basic_value().into_int_value(), i64t, "accepted.i64")
+                .map_err(|e| self.err(e))?;
+            let survivor_next = self
+                .builder
+                .build_int_add(survivor_phi.expect("filter survivor count").as_basic_value().into_int_value(), accepted_i64, "survivors.next")
+                .map_err(|e| self.err(e))?;
+            survivor_phi.expect("filter survivor count").add_incoming(&[(&survivor_next, cont.expect("filter continuation block"))]);
+            if let Some(output_index_phi) = &output_index_phi {
+                let output_next = self
+                    .builder
+                    .build_int_add(output_index_phi.as_basic_value().into_int_value(), accepted_i64, "out.next")
+                    .map_err(|e| self.err(e))?;
+                output_index_phi.add_incoming(&[(&output_next, cont.expect("filter continuation block"))]);
+            }
+            let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
+            phi.add_incoming(&[(&next, cont.expect("filter continuation block"))]);
+            self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
         } else {
-            let out_p = unsafe {
-                self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
-            };
-            self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+            let mut call_args: Vec<BasicMetadataValueEnum<'c>> =
+                Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
+            call_args.push(current.into());
+            call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
+            let r = self
+                .builder
+                .build_call(target, &call_args, "r")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("par_map function must return a value"))?;
+            if let Some(acc_phi) = &acc_phi {
+                let r = match r {
+                    BasicValueEnum::IntValue(v) => v,
+                    _ => return Err(self.err("par_map reduction function must return an integer")),
+                };
+                let next_acc = self
+                    .builder
+                    .build_int_add(acc_phi.as_basic_value().into_int_value(), r, "acc.next")
+                    .map_err(|e| self.err(e))?;
+                acc_phi.add_incoming(&[(&next_acc, body)]);
+            } else {
+                let out_p = unsafe {
+                    self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
+                };
+                self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+            }
+            let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
+            phi.add_incoming(&[(&next, body)]);
+            self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
         }
-        let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
-        phi.add_incoming(&[(&next, body)]);
-        self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
 
         self.builder.position_at_end(done);
         if let Some(acc_phi) = &acc_phi {
             self.builder
                 .build_store(out_base, acc_phi.as_basic_value())
+                .map_err(|e| self.err(e))?;
+        }
+        if filter_count {
+            self.builder
+                .build_store(out_base, survivor_phi.expect("filter count survivor count").as_basic_value())
                 .map_err(|e| self.err(e))?;
         }
         self.builder.build_return(None).map_err(|e| self.err(e))?;
@@ -6843,33 +6991,81 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, &all_capture_tys, false, stages)?;
-                // The runtime allocates the output (overflow-guarded), runs the kernel across
-                // threads, and returns the owned buffer.
-                let out_buf = self
-                    .builder
-                    .build_call(
-                        self.funcs["par_map"],
-                        &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
-                        "obuf",
-                    )
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value()
-                    .basic()
-                    .expect("align_rt_par_map returns a pointer")
-                    .into_pointer_value();
-                // Result owned array `{ out_buf, count }`.
+                let has_filter = stages.iter().any(|stage| stage.kind == ParMapStageKind::Filter);
                 let sty = slice_struct_type(self.ctx);
-                let r = self
-                    .builder
-                    .build_insert_value(sty.get_poison(), out_buf, 0, "pmptr")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                self.builder
-                    .build_insert_value(r, count, 1, "pmlen")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                if has_filter {
+                    let count_kernel = self.par_map_range_kernel(
+                        func,
+                        in_ty,
+                        out_ty,
+                        &all_capture_tys,
+                        ParMapKernelMode::FilterCount,
+                        stages,
+                    )?;
+                    let scatter_kernel = self.par_map_range_kernel(
+                        func,
+                        in_ty,
+                        out_ty,
+                        &all_capture_tys,
+                        ParMapKernelMode::FilterScatter,
+                        stages,
+                    )?;
+                    // The runtime counts each stable range, computes prefix offsets, then reruns
+                    // the Pure chain to scatter survivors in source order into the exact buffer.
+                    self.builder
+                        .build_call(
+                            self.funcs["par_map_filter"],
+                            &[
+                                context.into(),
+                                in_ptr.into(),
+                                count.into(),
+                                in_stride.into(),
+                                out_stride.into(),
+                                work_weight.into(),
+                                count_kernel.into(),
+                                scatter_kernel.into(),
+                            ],
+                            "pfilter",
+                        )
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .expect("align_rt_par_map_filter returns a slice")
+                } else {
+                    let kernel = self.par_map_range_kernel(
+                        func,
+                        in_ty,
+                        out_ty,
+                        &all_capture_tys,
+                        ParMapKernelMode::Materialize,
+                        stages,
+                    )?;
+                    // The runtime allocates the output (overflow-guarded), runs the kernel across
+                    // threads, and returns the owned buffer.
+                    let out_buf = self
+                        .builder
+                        .build_call(
+                            self.funcs["par_map"],
+                            &[context.into(), in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), work_weight.into(), kernel.into()],
+                            "obuf",
+                        )
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .expect("align_rt_par_map returns a pointer")
+                        .into_pointer_value();
+                    // Result owned array `{ out_buf, count }`.
+                    let r = self
+                        .builder
+                        .build_insert_value(sty.get_poison(), out_buf, 0, "pmptr")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    self.builder
+                        .build_insert_value(r, count, 1, "pmlen")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value()
+                        .into()
+                }
             }
             Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight } => {
                 // The reduction kernel writes one wrapping integer partial per claimed range;
@@ -6912,7 +7108,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, true, &[])?;
+                let kernel = self.par_map_range_kernel(func, in_ty, out_ty, capture_tys, ParMapKernelMode::Reduce, &[])?;
                 let raw = self
                     .builder
                     .build_call(

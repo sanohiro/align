@@ -118,6 +118,13 @@ void* align_rt_par_map(
   i64 work_weight,
   void (*kernel)(void* capture_ctx, void* in_buf, void* out_buf, i64 start, i64 end))
 
+{ void* ptr, i64 len } align_rt_par_map_filter(
+  void* capture_ctx, void* in_buf, i64 count,
+  i64 in_stride, i64 out_stride,
+  i64 work_weight,
+  void (*count_kernel)(void* capture_ctx, void* in_buf, void* counts, i64 start, i64 end),
+  void (*scatter_kernel)(void* capture_ctx, void* in_buf, void* out, i64 start, i64 end))
+
 i64 align_rt_par_map_reduce(
   void* capture_ctx, void* in_buf, i64 count,
   i64 in_stride, i64 result_stride,
@@ -136,8 +143,13 @@ i64 align_rt_par_map_reduce(
 - The kernel is a generated typed loop around a Pure function (`03 §8`), so output ranges do not
   race. It receives a call-scoped immutable capture context, the complete bases, and one disjoint
   `[start,end)` range; it loads captures once and calls the known body directly per element. A
-  primitive-scalar length-preserving `map` chain uses the same ordered loop; filtered and unsupported
-  staged cases still use the sequential collect path.
+  primitive-scalar length-preserving `map` chain uses the same ordered loop.
+- `align_rt_par_map_filter` is the stable materialization path for callable primitive-scalar
+  `where` stages. Its count kernel writes one survivor count per range; the runtime prefix-sums those
+  counts in input order, allocates the exact result, and invokes the scatter kernel with one stable
+  byte offset per range. The map/filter chain is Pure and is intentionally evaluated in both passes;
+  the result is `{null,0}` when no element survives. Projection filters, `str.contains`, aggregate
+  stages, and `chunks` remain on the sequential path.
 - `align_rt_par_map_reduce` is the specialized direct, stage-free integer
   `par_map(f).sum()` path. It allocates one 8-byte-aligned partial slot per claimed range rather
   than an element-sized output array, invokes the same caller-draining range scheduler, and combines
