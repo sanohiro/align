@@ -579,8 +579,8 @@ only panic payload selection behind a mutex, and protects the final `notify_one`
 mutex. The caller
 still drains the shared cursor, nested groups still make progress under pool saturation, and late
 helpers still exit before touching exhausted task descriptors. This removes the per-task barrier
-mutex and `notify_all`; body-aware grain, false-sharing measurement, and blocking-pool policy remain
-separate follow-ups.
+mutex and `notify_all`; body-aware grain and blocking-pool policy remain separate follow-ups. The
+task-group record probe also included a padded control, which did not justify cache-line padding.
 
 ### 8.2 Batch pool submission — SHIPPED 2026-07-26
 

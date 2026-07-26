@@ -486,4 +486,10 @@ fn main() {
     for layout in Layout::ALL {
         run_error_path(layout);
     }
+    if align_rt_test_par_pool_initialized() {
+        assert!(
+            align_rt_test_par_pool_wait_idle(),
+            "a measurement pool job panicked"
+        );
+    }
 }
