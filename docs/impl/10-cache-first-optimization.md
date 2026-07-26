@@ -568,9 +568,9 @@ The parallel-runtime shape, newly confirmed nested-pool deadlock, and wider gene
 recorded in [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md). This
 subsection remains the cache-locality gate; document 11 is the parallel correctness source.
 
-Queue publication batching shipped on 2026-07-26: `par_map` and `task_group` now enqueue helper
-jobs through one `ParPool` queue critical section. Low-lock task-group claiming and completion
-shipped in the current change: runners claim contiguous batches, normal completion uses atomics,
+Queue publication batching shipped on 2026-07-26 in #648: `par_map` and `task_group` now enqueue
+helper jobs through one `ParPool` queue critical section. Low-lock task-group claiming and completion
+shipped on 2026-07-26 in #650: runners claim contiguous batches, normal completion uses atomics,
 and only panic payload selection plus the final wake path use mutexes. Body-aware grain, false
 sharing, and blocking-pool policy remain separate measure-first probes.
 

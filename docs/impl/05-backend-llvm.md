@@ -252,7 +252,7 @@ MIR's dedicated direct-source `ParMapParallel` materializer (`04 §6`) goes to t
 parallel-map API.
 
 ```text
-ParMapParallel { src, func, captures, capture_tys, elem_in, elem_out }
+ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out }
   → synthesize one typed range kernel (context, start..<end)
   → align_rt_par_map(capture_ctx, in_buf, count, in_stride, out_stride, kernel)
   → owned array<elem_out>
@@ -270,8 +270,9 @@ call-scoped context, calls the Pure Align function directly, and stores each out
 and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
 element. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses plain wrapping
 addition, and stores one partial at the range output pointer; the runtime combines the partials and
-returns the result bits. Staged `par_map` forms use the sequential pipeline fallback before codegen,
-and the fused node excludes `chunks`, floating-point sums, and arbitrary reducers. There is no
+returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in the same
+ordered range kernel; filtered and unsupported staged forms use the sequential pipeline fallback.
+The fused node excludes `chunks`, floating-point sums, and arbitrary reducers. There is no
 generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---

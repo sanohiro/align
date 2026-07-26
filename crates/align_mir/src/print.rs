@@ -363,12 +363,24 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Chunks { src, n, elem } => {
             format!("chunks({}, {} x {})", operand_str(src), operand_str(n), crate::ty_name(*elem))
         }
-        Rvalue::ParMapParallel { src, func, captures, elem_in, elem_out, .. } => {
-            let caps = captures.iter().map(operand_str).collect::<Vec<_>>().join(", ");
-            if caps.is_empty() {
-                format!("par_map[{}]({}: {} -> {})", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+        Rvalue::ParMapParallel { src, func, stages, captures, elem_in, elem_out, .. } => {
+            let caps = stages
+                .iter()
+                .flat_map(|stage| stage.captures.iter())
+                .chain(captures.iter())
+                .map(operand_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let chain = if stages.is_empty() {
+                func.clone()
             } else {
-                format!("par_map[{}]({}: {} -> {}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+                let prefix = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join(" -> ");
+                format!("{prefix} -> {func}")
+            };
+            if caps.is_empty() {
+                format!("par_map[{chain}]({}: {} -> {})", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+            } else {
+                format!("par_map[{chain}]({}: {} -> {}; captures=[{}])", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
         Rvalue::ParMapReduce { src, func, captures, elem_in, elem_out, .. } => {

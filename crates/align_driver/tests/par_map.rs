@@ -2,7 +2,8 @@
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
 //! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
-//! staged forms retain the sequential fallback and Move captures are rejected by ownership checks.
+//! primitive-scalar length-preserving map stages are fused into that range kernel; filters retain
+//! the sequential fallback and Move captures are rejected by ownership checks.
 
 
 mod common;
@@ -294,6 +295,43 @@ fn cheap_par_map_range_kernel_vectorizes_after_specialization() {
 }
 
 #[test]
+fn par_map_after_length_preserving_maps_uses_one_range_kernel() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn add_one(x: i64) -> i64 = x + 1\nfn triple(x: i64) -> i64 = x * 3\nfn finish(x: i64) -> i64 = x - 1\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3].map(add_one).map(triple).par_map(finish)\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-staged-map", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "24\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-staged-map", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[add_one -> triple -> finish]"), "the map chain should be one parallel MIR node:\n{text}");
+
+    let ir = emit_llvm(src);
+    let kernel = ir
+        .split("define ")
+        .find(|part| part.lines().next().is_some_and(|line| line.contains("$parmapchain$")))
+        .unwrap_or_else(|| panic!("no staged par_map range kernel in IR:\n{ir}"));
+    let kernel = kernel.split_once("\n}\n").map_or(kernel, |(body, _)| body);
+    for func in ["@add_one", "@triple", "@finish"] {
+        assert!(kernel.contains(&format!("call i64 {func}")), "staged kernel must call {func} directly:\n{kernel}");
+    }
+}
+
+#[test]
+fn staged_par_map_captures_share_one_immutable_context() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn triple(x: i64) -> i64 = x * 3\nfn main() -> Result<(), Error> {\n  add := 1\n  bias := 2\n  out := [1, 2, 3].map(fn x { x + add }).map(triple).par_map(fn x { x + bias })\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-staged-captures", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "33\n");
+}
+
+#[test]
 fn par_map_after_where_stays_sequential() {
     if !backend_available() {
         return;
@@ -311,6 +349,18 @@ fn par_map_after_where_stays_sequential() {
 }
 
 // --- purity (Pure requirement) ---
+
+#[test]
+fn impure_named_map_stage_rejected_before_parallel_widening() {
+    let src = "fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn finish(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  ys := [1, 2].map(noisy).par_map(finish)\n  print(ys.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-staged-impure-named", src));
+}
+
+#[test]
+fn impure_capturing_map_stage_rejected_before_parallel_widening() {
+    let src = "fn main() -> Result<(), Error> {\n  k := 10\n  ys := [1, 2].map(fn x {\n    print(x)\n    return x + k\n  }).par_map(fn x { x * 2 })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-staged-impure-capture", src));
+}
 
 #[test]
 fn par_map_impure_function_rejected() {

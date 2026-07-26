@@ -128,8 +128,9 @@ i64 align_rt_par_map_reduce(
   `ParPool`, and return the buffer pointer. Small inputs run on the caller to avoid pool overhead.
 - The kernel is a generated typed loop around a Pure function (`03 §8`), so output ranges do not
   race. It receives a call-scoped immutable capture context, the complete bases, and one disjoint
-  `[start,end)` range; it loads captures once and calls the known body directly per element. Staged
-  cases still use the sequential collect path.
+  `[start,end)` range; it loads captures once and calls the known body directly per element. A
+  primitive-scalar length-preserving `map` chain uses the same ordered loop; filtered and unsupported
+  staged cases still use the sequential collect path.
 - `align_rt_par_map_reduce` is the specialized direct, stage-free integer
   `par_map(f).sum()` path. It allocates one 8-byte-aligned partial slot per claimed range rather
   than an element-sized output array, invokes the same caller-draining range scheduler, and combines
