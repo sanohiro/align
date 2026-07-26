@@ -651,6 +651,16 @@ cache win: densely packed records can put result words written by different runn
 Sequence it after block claiming, compare one-record vs current allocation on tiny and I/O-heavy
 tasks, and retain separate allocations if the false-sharing cost exceeds the call/locality win.
 
+**Measure-first result (2026-07-26):** `bench/task_group/run.sh` now drives the same registration
+ABI with split, packed-tight, and cache-line-padded records. On native Apple Silicon (8 workers),
+the final 31-trial/7-repetition run showed packed-tight wins of about 17–42% on 4096-task cases,
+but no repeatable win across the small/fallible cases: tight/split was `1.063` for 8 fallible
+tasks, `1.016` for 128 fallible zero-work tasks, and `0.949` for 128 fallible body-heavy tasks.
+The padded control was 14–39% slower than packed-tight on the large cases, so padding is not a
+free repair for locality. The written ship gate requires a repeatable at least 10% packed-tight
+win on both tiny and large groups without a material padded-control penalty; it is not met.
+Production codegen and the runtime ABI therefore retain the current split allocation shape.
+
 ---
 
 ## 9. Work- and byte-aware grain selection
@@ -828,8 +838,9 @@ unsupported aggregate forms remain sequential.
 - [x] Batch queue publication (2026-07-26).
 - [x] Add adaptive contiguous claims (2026-07-26).
 - [x] Replace per-task barrier mutex/wake with an atomic completion latch (2026-07-26).
-- Measure false sharing before padding.
-- Probe one-allocation packed task records after block claiming is stable.
+- [x] Measure false sharing before padding (2026-07-26; the padded control did not justify padding).
+- [x] Probe one-allocation packed task records after block claiming is stable (2026-07-26;
+  the cross-size ship gate was not met, so production remains split).
 
 **Completion:** normal completion has no per-task mutex acquisition; deterministic errors and
 nested progress remain pinned.

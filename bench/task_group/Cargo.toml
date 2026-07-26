@@ -1,0 +1,17 @@
+[package]
+name = "task-group-record-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep the benchmark isolated from the parent workspace. It drives the shipped task-group C ABI
+# directly so the comparison prices record layout and scheduler work, not compiler test harnesses.
+[workspace]
+
+[dependencies]
+align_runtime = { path = "../../crates/align_runtime" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

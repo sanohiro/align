@@ -125,6 +125,12 @@ in source order into an exact-sized owned array. Pure map and predicate stages a
 rerun by the two kernels; projection, string, chunk, aggregate, and other
 unsupported filters retain the sequential path.
 
+The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
+allocations with one-record tight and cache-line-padded controls over the same registration ABI.
+The native Apple Silicon 31-trial/7-repetition run improved large groups but did not produce a
+repeatable 10% win across small and fallible groups; padding was materially slower on large groups.
+The production task-group ABI and allocation shape remain unchanged until that gate is met.
+
 The last recorded full workspace run before #636 was 2748 passed / 0 failed,
 with clippy clean. #636 then passed focused Linux runtime/process tests, clippy,
 and the macOS release-build CI path. A local `cargo build --release --workspace`
@@ -134,10 +140,10 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are
-shipped in #643, #644, #646, #647, #648, #649, #650, #651, #652, and #653. Stable callable
-scalar `where` compaction is shipped; packed task records, false-sharing measurement,
-projection/aggregate filters, and a broader width/aggregate retune remain separate measure-first
-follow-ups.
+shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shipped stable
+callable scalar `where` compaction. The task-group record probe measured packed-tight and padded
+controls without changing production behavior; the cross-size gate was not met. Projection/
+aggregate filters and a broader width/aggregate retune remain separate measure-first follow-ups.
 
 Consumer-gated deferrals that remain intentional:
 
