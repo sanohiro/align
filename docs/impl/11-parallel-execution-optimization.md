@@ -701,8 +701,9 @@ provides a stable coarse distinction without source annotations. For common scal
 measured 65,536-element floor remains a safety bound; narrower shapes can require more elements and
 wider shapes can use fewer. An aggressive body-driven reduction of the common `i64` floor was measured
 and rejected after creating short ranges and slowing the boundary case by about 7%. Keep the
-already-planned cheap-body lint as user guidance; a broader width/aggregate sweep must earn any
-further threshold retune. The current fused range kernel has no materialized intermediate stages, so
+already-planned cheap-body lint as user guidance; a compiler aggregate/layout and cross-host sweep
+must earn any further threshold retune. The current fused range kernel has no materialized
+intermediate stages, so
 staged bytes are zero in this first byte model; a future materializing producer needs its own measured
 memory-pressure term.
 
@@ -789,8 +790,12 @@ declare generic parallel reduction settled.
   treating the floor as a general cost model (`bench/par_map/run.sh width`, 2026-07-26 native
   Apple Silicon); the measured floors scale from `65,536` (`i64`/`i64`) to `524,288` (`i8`/`i8`)
   and retain the conservative common boundary.
-- [ ] Sweep aggregate struct sizes and other hosts before treating the scalar result as a general
-  cost model.
+- [x] Probe runtime aggregate-like record strides at 16/32/64/128 bytes, with full-output
+  checksums around each runtime floor (`bench/par_map/run.sh aggregate`, 2026-07-26 native Apple
+  Silicon). This direct-ABI probe measures scheduler byte/stride behavior only; it does not claim
+  compiler-generated aggregate `par_map` support or justify a production retune by itself.
+- [ ] Sweep compiler-generated aggregate structs, projection/aggregate filters, and other hosts
+  before treating the scalar and runtime-record results as a general cost model.
 - Record sequential, old parallel, and new parallel results separately; report cold pool and warm
   steady state.
 
@@ -870,8 +875,8 @@ nested progress remain pinned.
   filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar `where`; field,
   string, projection, chunks, and aggregate forms remain sequential.
 - ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in #652
-  2026-07-26;** broader width/aggregate measurement and any more aggressive body-driven retune remain
-  deferred.
+  2026-07-26;** scalar width and runtime aggregate-like stride measurements are recorded; compiler
+  aggregate layouts, other hosts, and any more aggressive body-driven retune remain deferred.
 - ~~Probe stable parallel compaction for callable scalar `where`.~~ **SHIPPED 2026-07-26** with
   count/prefix/scatter range kernels; projection/string/aggregate filters remain deferred.
   The focused `bench/par_map/run.sh filter` probe measured the 50% scalar case on native Apple

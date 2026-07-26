@@ -28,6 +28,9 @@ struct SliceI32 {
     len: i64,
 }
 
+#[cfg(feature = "probe")]
+type RangeKernel = extern "C" fn(*const u8, *const u8, *mut u8, i64, i64);
+
 extern "C" {
     /// `pub fn pmap_cheap(s: slice<i64>) -> i64` — cheap vectorizable body.
     #[cfg(feature = "probe")]
@@ -87,6 +90,23 @@ extern "C" {
     /// Benchmark-only worker-count getter, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_workers() -> i64;
+    /// Benchmark-only direct runtime entry point for aggregate-like stride probes. This bypasses
+    /// compiler-generated aggregate lowering deliberately; the probe owns the concrete record
+    /// kernel and measures only the runtime's materializing range scheduler.
+    #[cfg(feature = "probe")]
+    fn align_rt_par_map(
+        context: *const u8,
+        in_buf: *const u8,
+        count: i64,
+        in_stride: i64,
+        out_stride: i64,
+        work_weight: i64,
+        kernel: RangeKernel,
+    ) -> *mut u8;
+    /// The output from `align_rt_par_map` uses the runtime allocator and must be released by its
+    /// matching C-ABI free function.
+    #[cfg(feature = "probe")]
+    fn align_rt_free(ptr: *mut u8);
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -248,6 +268,246 @@ impl WidthData {
             WidthSource::I32 => (self.i32s.as_ptr().cast(), self.i32s.len() as i64),
             WidthSource::I64 => (self.i64s.as_ptr().cast(), self.i64s.len() as i64),
         }
+    }
+}
+
+#[cfg(feature = "probe")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AggregateRecord<const WORDS: usize> {
+    words: [u64; WORDS],
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_transform<const WORDS: usize>(
+    mut record: AggregateRecord<WORDS>,
+) -> AggregateRecord<WORDS> {
+    for (word_index, word) in record.words.iter_mut().enumerate() {
+        let salt = 0x9E3779B97F4A7C15u64
+            .wrapping_add((word_index as u64).wrapping_mul(0xD1B54A32D192ED03));
+        *word = word
+            .wrapping_add(salt)
+            .rotate_left((word_index % 63) as u32);
+    }
+    record
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_kernel_impl<const WORDS: usize>(
+    in_buf: *const u8,
+    out_buf: *mut u8,
+    start: i64,
+    end: i64,
+) {
+    let Ok(start) = usize::try_from(start) else {
+        return;
+    };
+    let Ok(end) = usize::try_from(end) else {
+        return;
+    };
+    if end < start {
+        return;
+    }
+    let input = in_buf.cast::<AggregateRecord<WORDS>>();
+    let output = out_buf.cast::<AggregateRecord<WORDS>>();
+    for index in start..end {
+        let record = unsafe { input.add(index).read() };
+        unsafe {
+            output.add(index).write(aggregate_transform(record));
+        }
+    }
+}
+
+#[cfg(feature = "probe")]
+macro_rules! aggregate_kernel_wrapper {
+    ($name:ident, $words:literal) => {
+        extern "C" fn $name(
+            _context: *const u8,
+            in_buf: *const u8,
+            out_buf: *mut u8,
+            start: i64,
+            end: i64,
+        ) {
+            aggregate_kernel_impl::<$words>(in_buf, out_buf, start, end);
+        }
+    };
+}
+
+#[cfg(feature = "probe")]
+aggregate_kernel_wrapper!(aggregate_kernel_16, 2);
+#[cfg(feature = "probe")]
+aggregate_kernel_wrapper!(aggregate_kernel_32, 4);
+#[cfg(feature = "probe")]
+aggregate_kernel_wrapper!(aggregate_kernel_64, 8);
+#[cfg(feature = "probe")]
+aggregate_kernel_wrapper!(aggregate_kernel_128, 16);
+
+#[cfg(feature = "probe")]
+fn aggregate_data<const WORDS: usize>(n: usize) -> Vec<AggregateRecord<WORDS>> {
+    let mut state = 0x243F6A8885A308D3u64;
+    let mut data = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut words = [0u64; WORDS];
+        for (word_index, word) in words.iter_mut().enumerate() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *word = state ^ (row as u64).rotate_left((word_index % 63) as u32);
+        }
+        data.push(AggregateRecord { words });
+    }
+    data
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_checksum<const WORDS: usize>(data: &[AggregateRecord<WORDS>]) -> u64 {
+    data.iter().enumerate().fold(0u64, |total, (row, record)| {
+        record
+            .words
+            .iter()
+            .enumerate()
+            .fold(total, |total, (word_index, &word)| {
+                let weight = (row as u64 + 1).wrapping_mul(word_index as u64 + 3);
+                total.wrapping_add(word.wrapping_mul(weight))
+            })
+    })
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_seq_checksum<const WORDS: usize>(data: &[AggregateRecord<WORDS>]) -> u64 {
+    let output: Vec<_> = data.iter().copied().map(aggregate_transform).collect();
+    aggregate_checksum(&output)
+}
+
+#[cfg(feature = "probe")]
+fn aggregate_runtime_checksum<const WORDS: usize>(
+    data: &[AggregateRecord<WORDS>],
+    kernel: RangeKernel,
+) -> u64 {
+    let stride = std::mem::size_of::<AggregateRecord<WORDS>>() as i64;
+    let output = unsafe {
+        align_rt_par_map(
+            std::ptr::null(),
+            data.as_ptr().cast(),
+            data.len() as i64,
+            stride,
+            stride,
+            1,
+            kernel,
+        )
+    };
+    assert!(!output.is_null(), "aggregate probe returned a null output");
+    let output_slice =
+        unsafe { std::slice::from_raw_parts(output.cast::<AggregateRecord<WORDS>>(), data.len()) };
+    let checksum = std::hint::black_box(aggregate_checksum(output_slice));
+    unsafe { align_rt_free(output) };
+    checksum
+}
+
+#[cfg(feature = "probe")]
+fn elapsed_aggregate_runtime_ms<const WORDS: usize>(
+    data: &[AggregateRecord<WORDS>],
+    kernel: RangeKernel,
+    caller_only: bool,
+    reps: usize,
+) -> (f64, u64) {
+    if caller_only {
+        unsafe { align_rt_test_par_map_force_caller(1) };
+    }
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    for _ in 0..reps {
+        checksum = checksum.wrapping_add(std::hint::black_box(aggregate_runtime_checksum(
+            data, kernel,
+        )));
+    }
+    let elapsed = started.elapsed().as_secs_f64() * 1e3;
+    if caller_only {
+        unsafe { align_rt_test_par_map_force_caller(0) };
+    }
+    (elapsed, checksum)
+}
+
+#[cfg(feature = "probe")]
+fn elapsed_aggregate_seq_ms<const WORDS: usize>(
+    data: &[AggregateRecord<WORDS>],
+    reps: usize,
+) -> (f64, u64) {
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    for _ in 0..reps {
+        checksum = checksum.wrapping_add(std::hint::black_box(aggregate_seq_checksum(data)));
+    }
+    (started.elapsed().as_secs_f64() * 1e3, checksum)
+}
+
+#[cfg(feature = "probe")]
+fn run_aggregate_case<const WORDS: usize>(
+    name: &str,
+    kernel: RangeKernel,
+    rounds: usize,
+    target_elements: usize,
+) {
+    let stride = std::mem::size_of::<AggregateRecord<WORDS>>();
+    assert!(matches!(stride, 16 | 32 | 64 | 128));
+    let floor = usize::try_from(unsafe {
+        align_rt_test_par_map_min_chunk_for(stride as i64, stride as i64, 1)
+    })
+    .expect("runtime par_map aggregate floor must be non-negative");
+    let delta = (floor / 8).max(1);
+    let counts = [
+        floor.saturating_sub(delta).max(1),
+        floor,
+        floor.saturating_add(1),
+        floor.saturating_add(delta),
+    ];
+
+    for &n in &counts {
+        let data = aggregate_data::<WORDS>(n);
+        let expected = aggregate_seq_checksum(&data);
+        assert_eq!(
+            aggregate_runtime_checksum(&data, kernel),
+            expected,
+            "aggregate runtime result changed for {name}, n={n}"
+        );
+        let reps = (target_elements / n).max(1);
+        let mut pool_seq_ratios = Vec::with_capacity(rounds);
+        let mut pool_caller_ratios = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let order = match round % 6 {
+                0 => [0, 1, 2],
+                1 => [2, 1, 0],
+                2 => [1, 0, 2],
+                3 => [2, 0, 1],
+                4 => [1, 2, 0],
+                _ => [0, 2, 1],
+            };
+            let mut elapsed = [0.0; 3];
+            let mut checksums = [0u64; 3];
+            for arm in order {
+                (elapsed[arm], checksums[arm]) = match arm {
+                    0 => elapsed_aggregate_runtime_ms(&data, kernel, false, reps),
+                    1 => elapsed_aggregate_runtime_ms(&data, kernel, true, reps),
+                    _ => elapsed_aggregate_seq_ms(&data, reps),
+                };
+            }
+            let expected_total = expected.wrapping_mul(reps as u64);
+            assert_eq!(
+                checksums, [expected_total; 3],
+                "aggregate checksum changed for {name}, n={n}"
+            );
+            pool_seq_ratios.push(elapsed[0] / elapsed[2]);
+            pool_caller_ratios.push(elapsed[0] / elapsed[1]);
+        }
+        pool_seq_ratios.sort_by(f64::total_cmp);
+        pool_caller_ratios.sort_by(f64::total_cmp);
+        println!(
+            "{name:>19}  {n:>9}  {floor:>12}  {:>18.3}  {:>19.3}  {:.3}..{:.3}",
+            percentile(&pool_seq_ratios, 0.5),
+            percentile(&pool_caller_ratios, 0.5),
+            percentile(&pool_seq_ratios, 0.1),
+            percentile(&pool_seq_ratios, 0.9),
+        );
     }
 }
 
@@ -694,6 +954,60 @@ fn run_width() {
     }
 }
 
+#[cfg(feature = "probe")]
+fn run_aggregate() {
+    let runtime_workers = usize::try_from(unsafe { align_rt_test_par_map_workers() })
+        .expect("runtime par_map worker count must be positive");
+    if runtime_workers <= 1 {
+        println!(
+            "par_map aggregate stride probe skipped: runtime reports {runtime_workers} worker; the pool path is intentionally disabled on a one-worker host"
+        );
+        return;
+    }
+
+    const ROUNDS: usize = 7;
+    const TARGET_ELEMENTS: usize = 131_072;
+    // Warm the process-lifetime pool before the first record shape. The probe is about the
+    // steady-state range scheduler; cold-start behavior belongs to the separate runtime gate.
+    let warm = aggregate_data::<2>(131_072);
+    std::hint::black_box(aggregate_runtime_checksum(&warm, aggregate_kernel_16));
+
+    println!(
+        "par_map aggregate stride probe ({ROUNDS} balanced samples, {runtime_workers} workers; target {TARGET_ELEMENTS} elements per timing)"
+    );
+    println!(
+        "Runtime-only materializing probe: aggregate compiler forms remain sequential; counts are floor-δ, floor, floor+1, and floor+δ."
+    );
+    println!(
+        "{:>19}  {:>9}  {:>12}  {:>18}  {:>19}  {:>18}",
+        "record", "n", "floor", "median pool/seq", "median pool/caller", "pool/seq p10..p90"
+    );
+    run_aggregate_case::<2>(
+        "record 16 bytes",
+        aggregate_kernel_16,
+        ROUNDS,
+        TARGET_ELEMENTS,
+    );
+    run_aggregate_case::<4>(
+        "record 32 bytes",
+        aggregate_kernel_32,
+        ROUNDS,
+        TARGET_ELEMENTS,
+    );
+    run_aggregate_case::<8>(
+        "record 64 bytes",
+        aggregate_kernel_64,
+        ROUNDS,
+        TARGET_ELEMENTS,
+    );
+    run_aggregate_case::<16>(
+        "record 128 bytes",
+        aggregate_kernel_128,
+        ROUNDS,
+        TARGET_ELEMENTS,
+    );
+}
+
 fn run_filter() {
     const ROUNDS: usize = 15;
     println!(
@@ -771,6 +1085,18 @@ fn main() {
         #[cfg(not(feature = "probe"))]
         {
             eprintln!("width mode requires the probe feature");
+            std::process::exit(2);
+        }
+    }
+    if std::env::args().nth(1).as_deref() == Some("aggregate") {
+        #[cfg(feature = "probe")]
+        {
+            run_aggregate();
+            return;
+        }
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("aggregate mode requires the probe feature");
             std::process::exit(2);
         }
     }
