@@ -126,8 +126,8 @@ fn register_task(
     error: bool,
 ) -> *mut i64 {
     assert!(
-        task_index <= RESULT_FIELD_MASK as usize,
-        "benchmark task index is not encodable"
+        task_index < RESULT_FIELD_MASK as usize,
+        "benchmark task index and result seed are not encodable"
     );
     assert!(
         rounds <= RESULT_FIELD_MASK,
@@ -230,7 +230,47 @@ impl Drop for TgGuard {
     }
 }
 
-fn run_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: bool) -> u64 {
+struct CompletedRun {
+    guard: TgGuard,
+    slots: Vec<*mut i64>,
+}
+
+impl CompletedRun {
+    fn checksum(self) -> u64 {
+        let Self { guard, slots } = self;
+        let checksum = slots.into_iter().fold(0u64, |sum, slot| {
+            sum.wrapping_add(unsafe { slot.read() as u64 })
+        });
+        drop(guard);
+        checksum
+    }
+
+    fn validated_checksum(self, rounds: u64, sleep_us: u64) -> u64 {
+        let Self { guard, slots } = self;
+        let checksum = slots
+            .into_iter()
+            .enumerate()
+            .fold(0u64, |sum, (task_index, slot)| {
+                let value = unsafe { slot.read() as u64 };
+                assert_eq!(
+                    value,
+                    expected_result((task_index + 1) as u64, rounds, sleep_us),
+                    "record layout changed task {task_index} result"
+                );
+                sum.wrapping_add(value)
+            });
+        drop(guard);
+        checksum
+    }
+}
+
+fn begin_run(
+    tasks: usize,
+    rounds: u64,
+    sleep_us: u64,
+    layout: Layout,
+    fallible: bool,
+) -> CompletedRun {
     let guard = TgGuard::new();
     let tg = guard.0;
     let mut slots = Vec::with_capacity(tasks);
@@ -242,18 +282,15 @@ fn run_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: 
 
     let err = unsafe { align_rt_tg_wait(tg) };
     assert!(err.is_null(), "the probe task body must not fail");
-    slots
-        .into_iter()
-        .enumerate()
-        .fold(0u64, |sum, (task_index, slot)| {
-            let value = unsafe { slot.read() as u64 };
-            assert_eq!(
-                value,
-                expected_result((task_index + 1) as u64, rounds, sleep_us),
-                "record layout changed task {task_index} result"
-            );
-            sum.wrapping_add(value)
-        })
+    CompletedRun { guard, slots }
+}
+
+fn run_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: bool) -> u64 {
+    begin_run(tasks, rounds, sleep_us, layout, fallible).checksum()
+}
+
+fn validate_once(tasks: usize, rounds: u64, sleep_us: u64, layout: Layout, fallible: bool) -> u64 {
+    begin_run(tasks, rounds, sleep_us, layout, fallible).validated_checksum(rounds, sleep_us)
 }
 
 fn run_error_path(layout: Layout) {
@@ -281,12 +318,22 @@ fn timed(
     reps: usize,
     expected: u64,
 ) -> f64 {
+    // Keep the aggregate checksum in the measured path so result writes remain observable, but
+    // perform the per-task oracle checks in the unmeasured warm-up pass.
+    let mut checksum = 0u64;
     let started = Instant::now();
     for _ in 0..reps {
-        let checksum = black_box(run_once(tasks, rounds, sleep_us, layout, fallible));
-        assert_eq!(checksum, expected, "record layout changed task results");
+        checksum = checksum.wrapping_add(black_box(run_once(
+            tasks, rounds, sleep_us, layout, fallible,
+        )));
     }
-    started.elapsed().as_secs_f64() * 1e9 / (tasks * reps) as f64
+    let elapsed = started.elapsed().as_secs_f64() * 1e9 / (tasks * reps) as f64;
+    assert_eq!(
+        checksum,
+        expected.wrapping_mul(reps as u64),
+        "record layout changed task results"
+    );
+    elapsed
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -302,7 +349,14 @@ fn run_case(tasks: usize, rounds: u64, sleep_us: u64, fallible: bool, trials: us
     ];
     let mut ratios = Vec::with_capacity(trials);
     let mut padded_ratios = Vec::with_capacity(trials);
-    let warm_checksum = run_once(tasks, rounds, sleep_us, Layout::Split, fallible);
+    let warm_checksum = validate_once(tasks, rounds, sleep_us, Layout::Split, fallible);
+    for layout in Layout::ALL {
+        let checksum = validate_once(tasks, rounds, sleep_us, layout, fallible);
+        assert_eq!(
+            checksum, warm_checksum,
+            "record layout changed task results"
+        );
+    }
     const ORDERS: [[usize; 3]; 6] = [
         [0, 1, 2],
         [1, 2, 0],
