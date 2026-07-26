@@ -3,14 +3,14 @@
 # Rust `rayon` (work-stealing pool). The kernel pulls in the Align runtime, so the harness links
 # `libalign_runtime.so` (cdylib — dynamic, over the C-ABI, so its std doesn't collide with ours).
 #
-#   bench/par_map/run.sh [baseline|v3|native|threshold|filter|width]   (default: native)
+#   bench/par_map/run.sh [baseline|v3|native|threshold|filter|width|aggregate]   (default: native)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 mode="${1:-native}"
 case "$mode" in
   native) align_tgt="native"; rust_tgt="native" ;;
-  threshold|filter|width) align_tgt="native"; rust_tgt="native" ;;
+  threshold|filter|width|aggregate) align_tgt="native"; rust_tgt="native" ;;
   v3) case "$(uname -m)" in x86_64|amd64) align_tgt="x86-64-v3"; rust_tgt="x86-64-v3" ;; *) echo "v3 is x86_64-only" >&2; exit 1 ;; esac ;;
   baseline)
     align_tgt="baseline"
@@ -19,7 +19,7 @@ case "$mode" in
       *) rust_tgt="generic" ;;
     esac
     ;;
-  *) echo "usage: run.sh [baseline|v3|native|threshold|filter|width]" >&2; exit 2 ;;
+  *) echo "usage: run.sh [baseline|v3|native|threshold|filter|width|aggregate]" >&2; exit 2 ;;
 esac
 
 ( cd ../.. && cargo build -q --release --bin alignc )
@@ -38,7 +38,7 @@ trap 'rm -f "$KOBJ"' EXIT
 
 echo "target: $mode (Align=$align_tgt, Rust=$rust_tgt)"
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=$rust_tgt"
-if [ "$mode" = threshold ] || [ "$mode" = width ]; then
+if [ "$mode" = threshold ] || [ "$mode" = width ] || [ "$mode" = aggregate ]; then
   ( cd ../.. && cargo build -q --release -p align_runtime --features par-map-probe )
   [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic lib in $RT_DIR" >&2; exit 1; }
   ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release --features probe -- "$mode"

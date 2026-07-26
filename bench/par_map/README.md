@@ -5,10 +5,11 @@ the `filter` mode measures stable count/prefix/scatter compaction separately. Th
 a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native|threshold|width] # headline or threshold probe
+bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate] # headline or threshold probe
 bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 bench/par_map/run.sh width                  # input/output width and stride probe
+bench/par_map/run.sh aggregate              # runtime aggregate-like record-stride probe
 ```
 
 The runtime is linked as a cdylib and the harness supplies runtime-generated input. The Align and
@@ -98,7 +99,8 @@ reductions at `i8`, `i32`, and `i64`, widening/narrowing reductions, and materia
 different result strides. Each case checks the parallel result against its sequential Align
 control, warms the persistent pool, and samples floor-δ, floor, floor+1, and floor+δ with seven
 balanced pool/caller/sequential permutations. The runtime getter supplies the floor; the harness
-does not duplicate the cost model. Aggregate struct shapes are intentionally not included yet.
+does not duplicate the cost model. Compiler-generated aggregate shapes are intentionally not
+included in this scalar probe.
 
 Native Apple Silicon, 2026-07-26, representative invocation (8 runtime workers):
 
@@ -139,7 +141,50 @@ four-byte strides, `65,536` for two eight-byte strides, and `116,509` for the mi
 cases. The first pooled size is consistently more expensive than caller-only control, including
 the existing `i64` case; this is evidence for retaining a conservative boundary, not a case for
 another common-floor retune. It validates scalar width and output-stride coverage while leaving
-aggregate struct sizes, other hosts, and body-sensitive retuning as separate work.
+compiler-generated aggregate lowering, other hosts, and body-sensitive retuning as separate work.
+
+## Aggregate-like runtime stride probe
+
+`run.sh aggregate` is a focused runtime-only follow-up. It calls the existing `align_rt_par_map`
+C ABI with concrete `repr(C)` records of 16, 32, 64, and 128 bytes, transforms every word, and
+checks every output record against an untimed sequential oracle, then uses a weighted checksum over
+every output word as the measured sink. It compares the warm pool, forced caller-only,
+and Rust materializing sequential controls at floor-δ, floor, floor+1, and floor+δ with seven
+balanced permutations. The runtime getter supplies each input/output-stride floor; the benchmark
+does not duplicate the cost model.
+
+This deliberately measures the scheduler's byte/stride behavior without claiming compiler support
+for aggregate `par_map` forms. The current compiler still lowers aggregate, projection, and
+aggregate-filter shapes sequentially. It is evidence for the runtime cost model only, and does not
+justify a production retune by itself.
+
+Native Apple Silicon, 2026-07-26, representative invocation (8 runtime workers):
+
+```
+             record          n         floor     median pool/seq   median pool/caller   pool/seq p10..p90
+    record 16 bytes      28672         32768               0.984                1.004  0.979..1.045
+    record 16 bytes      32768         32768               1.005                1.000  0.997..1.011
+    record 16 bytes      32769         32768               1.078                1.074  1.073..1.104
+    record 16 bytes      36864         32768               1.045                1.051  1.043..1.063
+    record 32 bytes      14336         16384               0.999                1.001  0.997..1.018
+    record 32 bytes      16384         16384               1.000                1.007  0.984..1.008
+    record 32 bytes      16385         16384               1.076                1.072  1.072..1.093
+    record 32 bytes      18432         16384               1.049                1.054  1.016..1.065
+    record 64 bytes       7168          8192               1.005                0.998  0.937..1.010
+    record 64 bytes       8192          8192               1.012                1.000  1.009..1.040
+    record 64 bytes       8193          8192               1.059                1.041  1.052..1.083
+    record 64 bytes       9216          8192               1.056                1.036  1.049..1.069
+   record 128 bytes       3584          4096               1.056                0.989  1.050..1.056
+   record 128 bytes       4096          4096               1.053                0.986  1.050..1.060
+   record 128 bytes       4097          4096               1.155                1.088  1.138..1.208
+   record 128 bytes       4608          4096               1.161                1.091  1.159..1.168
+```
+
+The floor follows the two-record byte volume: 32,768, 16,384, 8,192, and 4,096 elements for
+16/32/64/128-byte records. The first pooled size is slower than caller-only for the narrow and
+medium records and is 1.088x at the 128-byte boundary; the 128-byte pool is slightly faster at
+the exact floor in this run because the caller control is memory-bound. The boundary jump and
+the varied ratios are useful scheduler evidence, not a general aggregate performance claim.
 
 ## Stable filter compaction probe
 
