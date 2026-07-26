@@ -2,8 +2,9 @@
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. A direct source
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
 //! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
-//! primitive-scalar length-preserving map stages are fused into that range kernel; filters retain
-//! the sequential fallback and Move captures are rejected by ownership checks.
+//! primitive-scalar length-preserving map/filter stages are fused into that range kernel; unsupported
+//! filters, projections, and aggregate shapes retain the sequential fallback. Move captures are
+//! rejected by ownership checks.
 
 
 mod common;
@@ -84,11 +85,16 @@ fn par_map_after_where() {
     if !backend_available() {
         return;
     }
-    // Stages before par_map compose: keep >2, then *10 → [30, 40, 50]; sum = 120.
+    // Stable compaction preserves source order: keep >2, then *10 → [30, 40, 50].
     let src = "fn big(x: i64) -> bool = x > 2\nfn dec(x: i64) -> i64 = x * 10\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3, 4, 5].where(big).par_map(dec)\n  print(out.sum())\n  return Ok(())\n}\n";
     let out = build_and_run("pm-where", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "120\n");
+
+    let src = "fn big(x: i64) -> bool = x > 2\nfn dec(x: i64) -> i64 = x * 10\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3, 4, 5].where(big).par_map(dec)\n  print(out.len())\n  print(out[0])\n  print(out[2])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-where-order", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n30\n50\n");
 }
 
 #[test]
@@ -253,6 +259,32 @@ fn chunks_par_map_impure_rejected() {
 }
 
 #[test]
+fn chunks_par_map_view_write_rejected() {
+    // `out` is not part of the function-value type, so the Pure check must inspect the body rather
+    // than relying on the callable signature. Writing a chunk's slice would race across ranges and
+    // also contradict the generated kernel's readonly context/input contract.
+    let src = "fn touches(out c: slice<i64>) -> i64 {\n  c[0] = 99\n  return c.len()\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-chunks-view-write", src));
+}
+
+#[test]
+fn chunks_par_map_bulk_view_writes_rejected() {
+    let cases = [
+        (
+            "vec-store",
+            "fn touches(out c: slice<i64>) -> i64 {\n  v: vec2<i64> := [1, 2]\n  c.store(0, v)\n  return c[0]\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n",
+        ),
+        (
+            "map-into",
+            "fn inc(x: i64) -> i64 = x + 1\nfn touches(out c: slice<i64>) -> i64 {\n  [1].map(inc).map_into(c)\n  return c[0]\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(touches)\n  print(s.len())\n  return Ok(())\n}\n",
+        ),
+    ];
+    for (name, src) in cases {
+        assert!(check_errs(&format!("pm-chunks-{name}"), src), "{name} must be impure");
+    }
+}
+
+#[test]
 fn par_map_takes_parallel_path_and_is_correct() {
     if !backend_available() {
         return;
@@ -361,20 +393,61 @@ fn staged_par_map_captures_share_one_immutable_context() {
 }
 
 #[test]
-fn par_map_after_where_stays_sequential() {
+fn par_map_after_multiple_filters_uses_one_stable_parallel_node() {
     if !backend_available() {
         return;
     }
-    // With a prior stage (`where`), par_map falls back to the sequential collect loop (a parallel
-    // split can't see through the filter). Still correct: keep >2, *10 → [30,40,50], sum 120.
-    let src = "fn big(x: i64) -> bool = x > 2\nfn dec(x: i64) -> i64 = x * 10\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3, 4, 5].where(big).par_map(dec)\n  print(out.sum())\n  return Ok(())\n}\n";
-    let out = build_and_run("pm-seq", src);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "120\n");
+    // Both filters run in source order, and only the survivors reach the terminal map: [2, 4] → [6, 12].
+    let src = "fn positive(x: i64) -> bool = x > 0\nfn even(x: i64) -> bool = x % 2 == 0\nfn dec(x: i64) -> i64 = x * 3\nfn main() -> Result<(), Error> {\n  out := [-2, -1, 0, 1, 2, 3, 4].where(positive).where(even).par_map(dec)\n  print(out.sum())\n  print(out.len())\n  print(out[0])\n  print(out[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-multi-where", src);
+    assert_eq!(out.status.code(), Some(0), "stdout={} stderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n2\n6\n12\n");
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(!text.contains("par_map["), "a staged par_map should stay sequential:\n{text}");
+    assert!(text.contains("par_map[where positive -> where even -> dec]"), "filters should use one parallel MIR node:\n{text}");
+
+    let ir = emit_llvm(src);
+    assert!(ir.contains("$parfilter$count$"), "filter count kernel should be emitted:\n{ir}");
+    assert!(ir.contains("$parfilter$scatter$"), "filter scatter kernel should be emitted:\n{ir}");
+}
+
+#[test]
+fn impure_where_stage_rejected_before_parallel_widening() {
+    let src = "fn noisy(x: i64) -> bool {\n  print(x)\n  return x > 0\n}\nfn finish(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  ys := [1, 2].where(noisy).par_map(finish)\n  print(ys.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-where-impure", src));
+}
+
+#[test]
+fn par_map_rejects_mutable_slice_alias_in_where() {
+    // The slice descriptor is Copy, so a lambda can capture an alias of mutable array storage. A
+    // local `mut` rebind of that descriptor must still be treated as a caller-view write, not as
+    // private scalar state; the widened where count/scatter kernels would otherwise race and rerun
+    // the store.
+    let src = "fn main() -> Result<(), Error> {\n  mut xs := [1, 2, 3, 4]\n  view: slice<i64> := xs\n  ys := xs.where(fn x {\n    mut v: slice<i64> := view\n    v[0] = x\n    return true\n  }).par_map(fn x { x })\n  print(ys.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-where-view-write", src));
+}
+
+#[test]
+fn par_map_filter_empty_result_is_a_valid_owned_array() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn never(x: i64) -> bool = x < 0\nfn finish(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3].where(never).par_map(finish)\n  print(out.len())\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-where-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n");
+}
+
+#[test]
+fn par_map_filter_captures_share_the_context_record() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  limit := 1\n  bias := 10\n  out := [0, 1, 2, 3].where(fn x { x > limit }).par_map(fn x { x + bias })\n  print(out.len())\n  print(out[0])\n  print(out[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-where-capture", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n12\n13\n");
 }
 
 // --- purity (Pure requirement) ---

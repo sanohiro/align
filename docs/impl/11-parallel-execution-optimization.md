@@ -38,17 +38,18 @@ Do the work in this order:
    generated typed kernel per claimed range; its direct-call loop inlines and vectorizes.
 4. ~~Extend that kernel with a read-only capture context, removing the current sequential fallback
    for capturing `par_map`.~~ **SHIPPED 2026-07-25.** Direct-source Copy captures now use the same
-   range kernel; filtered and unsupported aggregate cases remain sequential.
+   range kernel; filtered and unsupported aggregate cases remained sequential until the stable
+   callable-filter slice below.
 5. ~~Replace `task_group`'s per-task mutex/wake path with batched claims and a low-lock completion
    latch; batch queue submission too.~~ **SHIPPED 2026-07-26** in #648 and #650.
 6. ~~Fuse integer `par_map(...).sum()` so the parallel operation never writes and rereads its full
    intermediate array.~~ **SHIPPED 2026-07-26.** Direct, stage-free scalar maps now use a reduction
    range kernel with one wrapping partial per claimed range; staged reduction and `chunks` forms
    remain on their existing paths.
-7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (first slice).**
-   Primitive-scalar `map` stages before `par_map` now execute in one ordered range kernel, with every
-   stage and the terminal callable checked Pure. Gate `where` separately because stable compaction
-   needs counts and prefix offsets; projections, `chunks`, and other aggregate shapes remain
+7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (map slice);**
+   primitive-scalar `map` stages before `par_map` execute in one ordered range kernel. The callable
+   primitive-scalar `where` slice now uses stable count/prefix/scatter compaction, with every stage
+   and the terminal callable checked Pure; projections, `chunks`, and other aggregate shapes remain
    sequential.
 8. Choose grain from bytes and estimated body work, not a fixed element count alone. Evaluate
    separate CPU and blocking-I/O execution domains only after the common work-first fix.
@@ -115,13 +116,18 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
 - Move captures remain rejected by the existing ownership checks;
 - primitive-scalar `map(...).par_map(...)` chains use the same range kernel, including their stage
   captures;
-- `where(...).par_map(...)` is sequential;
+- callable primitive-scalar `where(...).par_map(...)` chains use the stable count/prefix/scatter
+  range path and preserve source order;
 - projections and unsupported aggregate source shapes are sequential.
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That node carries a source, terminal
-function, ordered prior-map records, flattened Copy capture operands/types, input/output element
-types, and a bounded post-lowering body-work hint (`1`, `2`, or `4`).
+function, ordered prior map/filter records, flattened Copy capture operands/types, input/output
+element types, and a bounded post-lowering body-work hint (`1`, `2`, or `4`). A callable filter
+chain emits two generated range kernels; the runtime counts survivors, computes ordered prefix
+offsets, and scatters the chain's terminal results into an exact output buffer. The chain is
+re-evaluated in the second pass because all admitted callables are Pure; field/projection and
+aggregate forms remain sequential.
 
 ### 3.2 Whole-range kernel — SHIPPED 2026-07-25
 
@@ -432,7 +438,7 @@ The late-runner proof from the work-first scheduler is load-bearing: a queued ru
 after the synchronous call has drained must inspect only scheduler-owned state, observe no range to
 claim, and exit without touching the caller's context.
 
-### 7.3 Length-preserving staged pipelines — SHIPPED 2026-07-26 (first slice)
+### 7.3 Length-preserving staged pipelines — map and callable-filter slices shipped 2026-07-26
 
 Prior primitive-scalar `map` stages preserve length and can be fused directly into the same generated
 range kernel. Field projections are a separate future slice because their layout and ABI gates are
@@ -441,17 +447,23 @@ not covered here:
 ```text
 source.map(f).map(g).par_map(h)
   -> one ordered parallel range loop containing f -> g -> h
+
+source.where(p).map(f).par_map(h)
+  -> count ranges -> prefix survivor counts -> scatter one ordered output range per claim
 ```
 
-The first slice covers a direct scalar/slice source followed only by primitive-scalar `map` stages.
-The compiler flattens all Copy captures into one call-scoped immutable context and emits one ordered
-range kernel containing each stage and the terminal body. `EffectScan` records every callable that
-enters this kernel at the same Pure boundary as the terminal function, including named and lifted
-capturing forms. Ordered output and drop behavior match the sequential collect loop.
+The map slice covers a direct scalar/slice source followed only by primitive-scalar `map` stages.
+The callable-filter slice adds primitive-scalar `where` stages to the same source shape. The compiler
+flattens all Copy captures into one call-scoped immutable context. Map-only chains emit one ordered
+range kernel; filtered chains emit a count kernel and a scatter kernel. The runtime prefix-sums
+survivor counts in source order and passes each scatter range its exact output offset. `EffectScan`
+records every callable that enters either kernel at the same Pure boundary as the terminal function,
+including named and lifted capturing forms. Ordered output and drop behavior match the sequential
+collect loop; empty survivor sets return a null pointer with length zero.
 
-Filters, projections, `chunks`, and aggregate element shapes remain on the sequential path. Do not
-widen those forms implicitly: `where` changes output length and needs a stable compaction algorithm;
-projections and aggregate layouts need their own layout/ABI gates.
+Field projections, `str.contains`, `chunks`, and aggregate element shapes remain on the sequential
+path. Do not widen those forms implicitly: projections and aggregate layouts need their own layout/
+ABI gates. The callable-filter implementation uses the documented two-pass algorithm:
 
 `where(...).par_map(...)` is a separate gate because output length is unknown. Two viable stable
 algorithms are:
@@ -463,7 +475,8 @@ algorithms are:
 
 Do not use one global atomic output cursor: it introduces a hot cache line and loses stable order.
 Selectivity, predicate cost, scratch bytes, extra reads, and memory bandwidth determine the winner;
-keep the current sequential path until a crossover is measured.
+the current slice intentionally chooses the scratch-free two-pass form and keeps any wider filter
+families on the sequential path until a scalar-vs-SIMD/materialization crossover is measured.
 
 ### 7.4 Transform-reduce fusion — SHIPPED 2026-07-26
 
@@ -706,8 +719,9 @@ slice updated both descriptions on 2026-07-13; retain this invariant in later sc
 
 MIR uses the dedicated `ParMapParallel` materializer; codegen now expands it into the explicit typed
 range loop instead of an element thunk. Copy captures use the call-scoped context described above;
-primitive-scalar map stages carry ordered records in that same node. The node now also carries a
-bounded body-work hint; filtered/aggregate stages remain sequential. No complete
+primitive-scalar map/filter stages carry ordered records in that same node. Filtered materialization
+uses count/prefix/scatter range kernels, while projection and aggregate stages remain sequential.
+The node now also carries a bounded body-work hint; no complete
 source-visible associativity/floating-order rule exists, and this map-only kernel does not silently
 declare generic parallel reduction settled.
 
@@ -720,8 +734,11 @@ declare generic parallel reduction settled.
 - Capturing Impure closure through a function value is rejected from `par_map`; mutation removes
   the call edge and fails the test.
 - An Impure named or capturing prior `map` stage is rejected before it can enter a parallel range;
-  `where` and unsupported stages remain sequential. The accepted/rejected contract is pinned before
-  each staged widening.
+  an Impure callable `where` stage is rejected before it can enter the count/scatter ranges, and
+  unsupported stages remain sequential. The accepted/rejected contract is pinned before each
+  staged widening.
+- A chunk callable that writes through its `slice` parameter is rejected before `par_map`; the
+  function-value type does not encode `out`, so the body-level view-write check is required.
 - A child-process test runs `workers + 1` task-group tasks, each calling a multi-range `par_map`, and
   completes under a watchdog. Never let a deadlock regression hang the entire test runner.
 - Cover worker counts 1, 2, and the host/default degree through a test-configurable pool.
@@ -738,6 +755,9 @@ declare generic parallel reduction settled.
 - Cheap arithmetic positive case vectorizes after specialization. Both are regression-pinned.
 - Transform-reduce fires only for a directly consumed temporary; wrapping partial adds carry no
   `nsw`/`nuw`, and panic is inspected before partial slots are read.
+- Callable-filter compaction preserves source order, exact survivor length, empty output, Copy
+  captures, and threshold-adjacent ranges; the count pass and scatter pass use the same ordered
+  range scheduler and no global output cursor.
 - [x] Remeasure the post-specialization threshold across body costs and element counts around the
   boundary (`bench/par_map/run.sh threshold`, 2026-07-26 native Apple Silicon); retain cold-start,
   element-width, aggregate-size, and cross-host checks before the next retune.
@@ -799,8 +819,9 @@ with zero idle pool workers.
 - [x] Pin ordered/drop behavior for capturing cases (2026-07-25).
 
 **Current:** direct scalar/slice/chunk maps, including Copy-capturing forms, and primitive-scalar
-length-preserving `map` stages use the range path with no indirect call inside the hot loop. Filtered
-and unsupported aggregate forms remain sequential.
+length-preserving `map`/callable-`where` stages use the range path with no indirect call inside the
+hot loop. Callable filters use a stable count/prefix/scatter pair; projection, `str.contains`, and
+unsupported aggregate forms remain sequential.
 
 ### Slice P2 — low-lock task execution
 
@@ -818,11 +839,18 @@ nested progress remain pinned.
 - ~~Fuse wrapping-integer `par_map(...).sum()` and eliminate its full intermediate array.~~
   **SHIPPED 2026-07-26;** staged and `chunks` producer materialization remain later slices.
 - ~~Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
-  length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (first primitive-scalar map slice).**
-- ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in the current slice
+  length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (primitive-scalar map and callable
+  filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar `where`; field,
+  string, projection, chunks, and aggregate forms remain sequential.
+- ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in #652
   2026-07-26;** broader width/aggregate measurement and any more aggressive body-driven retune remain
   deferred.
-- Probe stable parallel compaction for `where` separately.
+- ~~Probe stable parallel compaction for callable scalar `where`.~~ **SHIPPED 2026-07-26** with
+  count/prefix/scatter range kernels; projection/string/aggregate filters remain deferred.
+  The focused `bench/par_map/run.sh filter` probe measured the 50% scalar case on native Apple
+  Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
+  materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence
+  for the bounded slice and threshold, not a blanket claim for other predicates or selectivities.
 - Probe explicit-parallel producer/ordered-terminal materialization elision.
 
 ### Slice P4 — resource policy, only if earned

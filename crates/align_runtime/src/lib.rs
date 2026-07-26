@@ -1848,8 +1848,11 @@ struct ParMapWork {
     /// Zero means the kernel receives the global output base and indexes it by the global element
     /// index. A non-zero value means each claimed range receives a distinct output slot at
     /// `out_addr + range * range_output_stride`; this is the partial-result shape used by the
-    /// fused integer reduction.
+    /// fused integer reduction. `range_output_offsets_addr` is an alternative for stable
+    /// compaction: it points to one prefix-computed byte offset per range and is used when
+    /// nonzero. The offsets are call-scoped and the caller joins every range before returning.
     range_output_stride: usize,
+    range_output_offsets_addr: usize,
     kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
     barrier: std::sync::Mutex<ParMapBarrier>,
     complete: std::sync::Condvar,
@@ -1871,7 +1874,12 @@ fn drain_par_map(work: &ParMapWork) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let start = i64::try_from(start).expect("par_map range start came from an i64 count");
             let end = i64::try_from(end).expect("par_map range end came from an i64 count");
-            let out_addr = if work.range_output_stride == 0 {
+            let out_addr = if work.range_output_offsets_addr != 0 {
+                let offset = unsafe { *(work.range_output_offsets_addr as *const usize).add(range) };
+                work.out_addr
+                    .checked_add(offset)
+                    .expect("par_map range output address overflow")
+            } else if work.range_output_stride == 0 {
                 work.out_addr
             } else {
                 let offset = range
@@ -1951,10 +1959,17 @@ fn par_map_execution_plan(count: usize, in_stride: usize, out_stride: usize, wor
     par_map_plan(count, workers, min_chunk)
 }
 
-/// Run one generated range kernel over the caller-only or pooled plan. `range_output_stride == 0`
-/// preserves the materializing `par_map` ABI (the kernel indexes one global output array); a
-/// non-zero stride gives each range a separate output slot, allowing a reduction kernel to publish
-/// one partial without an element-sized output buffer.
+/// Output routing for one generated range-kernel call. `range_output_stride == 0` preserves the
+/// materializing `par_map` ABI (the kernel indexes one global output array); a non-zero stride gives
+/// each range a separate output slot, allowing a reduction kernel to publish one partial without an
+/// element-sized output buffer. `range_output_offsets` is the stable-compaction prefix form.
+struct ParMapOutput<'a> {
+    base: *mut u8,
+    range_output_stride: usize,
+    range_output_offsets: Option<&'a [usize]>,
+}
+
+/// Run one generated range kernel over the caller-only or pooled plan.
 fn run_par_map_ranges(
     context: *const u8,
     in_buf: *const u8,
@@ -1964,11 +1979,42 @@ fn run_par_map_ranges(
     range_output_stride: usize,
     plan: Option<(usize, usize)>,
 ) -> usize {
+    run_par_map_ranges_with_output(
+        context,
+        in_buf,
+        count,
+        kernel,
+        ParMapOutput { base: out_buf, range_output_stride, range_output_offsets: None },
+        plan,
+    )
+}
+
+/// Run a generated range kernel with optional per-range output offsets. A nonempty offset slice is
+/// used by stable filtering after its prefix sum; each offset is a byte displacement from the
+/// final output base. The slice stays alive until the caller has joined every range.
+fn run_par_map_ranges_with_output(
+    context: *const u8,
+    in_buf: *const u8,
+    count: usize,
+    kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
+    output: ParMapOutput<'_>,
+    plan: Option<(usize, usize)>,
+) -> usize {
     let end = i64::try_from(count).expect("par_map count was validated from i64");
     let Some((nchunks, per)) = plan else {
-        kernel(context, in_buf, out_buf, 0, end);
+        let out = output
+            .range_output_offsets
+            .and_then(|offsets| offsets.first().copied())
+            .map_or(output.base, |offset| {
+                let address = (output.base as usize).checked_add(offset).expect("par_map output offset overflow");
+                address as *mut u8
+            });
+        kernel(context, in_buf, out, 0, end);
         return 1;
     };
+    if let Some(offsets) = output.range_output_offsets {
+        debug_assert_eq!(offsets.len(), nchunks, "one output offset per planned range");
+    }
     let (pool, _) = par_pool();
     // Helpers and the caller share one claim loop. The caller therefore drains all of its own
     // ranges even when every pool worker is blocked in another nested structured operation.
@@ -1979,8 +2025,9 @@ fn run_par_map_ranges(
         count,
         context_addr: context as usize,
         in_addr: in_buf as usize,
-        out_addr: out_buf as usize,
-        range_output_stride,
+        out_addr: output.base as usize,
+        range_output_stride: output.range_output_stride,
+        range_output_offsets_addr: output.range_output_offsets.map_or(0, |offsets| offsets.as_ptr() as usize),
         kernel,
         barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
         complete: std::sync::Condvar::new(),
@@ -2049,6 +2096,109 @@ pub unsafe extern "C" fn align_rt_par_map(
     let plan = par_map_execution_plan(count, in_stride, out_stride, work_weight);
     run_par_map_ranges(context, in_buf, out_buf, count, kernel, 0, plan);
     out_buf
+}
+
+/// `par_map` with callable `where` stages: count stable survivors per range, prefix-sum those
+/// counts in input order, then rerun the Pure map/filter chain to scatter into an exact output
+/// buffer. The two kernels have the ordinary range-kernel ABI. The count kernel receives one
+/// distinct eight-byte count slot per range; the scatter kernel receives the final output base plus
+/// one prefix-computed byte offset per range. Re-running the admitted chain is intentional: the
+/// language's `par_map` boundary already requires every callable to be Pure, and this keeps the
+/// runtime scratch-free and the final output allocation exact.
+///
+/// `count <= 0` or zero survivors returns `{null, 0}`. The output is ordered by source index, and
+/// the result buffer is freed by the generated owned-array drop.
+///
+/// # Safety
+/// `in_buf` must point to `count` elements of `in_stride` bytes for both kernel passes. The count
+/// kernel must store one nonnegative survivor count into its supplied output pointer; the scatter
+/// kernel must write only its range's survivors at local offsets from the supplied output pointer.
+/// Both kernels must agree on the Pure stage chain. `work_weight` is an internal compiler hint.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_par_map_filter(
+    context: *const u8,
+    in_buf: *const u8,
+    count: i64,
+    in_stride: i64,
+    out_stride: i64,
+    work_weight: i64,
+    count_kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
+    scatter_kernel: extern "C" fn(*const u8, *const u8, *mut u8, i64, i64),
+) -> AlignStr {
+    if count <= 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let count = safe_len(count).unwrap_or_else(|_| panic_abort("par_map filter count overflow"));
+    let Ok(in_stride) = safe_len(in_stride) else {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    };
+    let Ok(out_stride) = safe_len(out_stride) else {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    };
+    if out_stride == 0 {
+        panic_abort("par_map filter output stride invalid");
+    }
+    let _in_bytes = count
+        .checked_mul(in_stride)
+        .and_then(|bytes| isize::try_from(bytes).ok())
+        .unwrap_or_else(|| panic_abort("par_map filter input size overflow"));
+    // Every survivor is at most one source element, so this upper bound validates all later
+    // prefix-byte arithmetic before the count kernel runs. It also keeps a malformed stride from
+    // wrapping the scheduler's output offsets.
+    let _max_out_bytes = count
+        .checked_mul(out_stride)
+        .and_then(|bytes| isize::try_from(bytes).ok())
+        .unwrap_or_else(|| panic_abort("par_map filter output size overflow"));
+
+    let plan = par_map_execution_plan(count, in_stride, out_stride, work_weight);
+    let ranges = plan.map_or(1, |(nchunks, _)| nchunks);
+    let mut survivor_counts = vec![0_u64; ranges];
+    run_par_map_ranges(
+        context,
+        in_buf,
+        survivor_counts.as_mut_ptr().cast::<u8>(),
+        count,
+        count_kernel,
+        core::mem::size_of::<u64>(),
+        plan,
+    );
+
+    let mut offsets = vec![0usize; ranges];
+    let mut total = 0usize;
+    for (range, &raw_count) in survivor_counts.iter().enumerate() {
+        let survivors = usize::try_from(raw_count).unwrap_or_else(|_| panic_abort("par_map filter survivor count overflow"));
+        if survivors > count {
+            panic_abort("par_map filter survivor count invalid");
+        }
+        offsets[range] = total
+            .checked_mul(out_stride)
+            .and_then(|bytes| isize::try_from(bytes).ok())
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or_else(|| panic_abort("par_map filter output offset overflow"));
+        total = total
+            .checked_add(survivors)
+            .filter(|&n| n <= count)
+            .unwrap_or_else(|| panic_abort("par_map filter survivor total overflow"));
+    }
+    if total == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let bytes = total
+        .checked_mul(out_stride)
+        .and_then(|bytes| isize::try_from(bytes).ok())
+        .and_then(|bytes| i64::try_from(bytes).ok())
+        .unwrap_or_else(|| panic_abort("par_map filter output size overflow"));
+    let out_buf = align_rt_alloc(bytes);
+    run_par_map_ranges_with_output(
+        context,
+        in_buf,
+        count,
+        scatter_kernel,
+        ParMapOutput { base: out_buf, range_output_stride: 0, range_output_offsets: Some(&offsets) },
+        plan,
+    );
+    let output_len = i64::try_from(total).unwrap_or_else(|_| panic_abort("par_map filter survivor count overflow"));
+    AlignStr { ptr: out_buf as *const u8, len: output_len }
 }
 
 /// `par_map(...).sum()`: run a generated integer-reduction range kernel and combine one wrapping
@@ -23409,6 +23559,40 @@ mod tests {
         unsafe { output.cast::<i64>().write(total) };
     }
 
+    extern "C" fn par_map_filter_count(
+        _context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let start = usize::try_from(start).unwrap();
+        let end = usize::try_from(end).unwrap();
+        let input = unsafe { std::slice::from_raw_parts(input.cast::<i64>(), end) };
+        let count = input[start..end].iter().filter(|&&value| value % 3 == 0).count();
+        unsafe { output.cast::<u64>().write(count as u64) };
+    }
+
+    extern "C" fn par_map_filter_scatter(
+        _context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let start = usize::try_from(start).unwrap();
+        let end = usize::try_from(end).unwrap();
+        let input = unsafe { std::slice::from_raw_parts(input.cast::<i64>(), end) };
+        let output = output.cast::<i64>();
+        let mut out = 0usize;
+        for &value in &input[start..end] {
+            if value % 3 == 0 {
+                unsafe { output.add(out).write(value.wrapping_mul(2)) };
+                out += 1;
+            }
+        }
+    }
+
     #[test]
     fn par_map_plan_balances_threshold_adjacent_ranges() {
         const MIN: usize = 65_536;
@@ -23484,6 +23668,56 @@ mod tests {
             };
             let want = input.iter().copied().fold(0_i64, i64::wrapping_add);
             assert_eq!(got, want, "count={count}");
+        }
+    }
+
+    #[test]
+    fn par_map_filter_stably_compacts_across_threshold_boundary() {
+        for &count in &[1_i64, 65_536, 65_537, 131_073] {
+            let input: Vec<i64> = (0..count).collect();
+            let result = unsafe {
+                align_rt_par_map_filter(
+                    core::ptr::null(),
+                    input.as_ptr().cast::<u8>(),
+                    count,
+                    size_of::<i64>() as i64,
+                    size_of::<i64>() as i64,
+                    1,
+                    par_map_filter_count,
+                    par_map_filter_scatter,
+                )
+            };
+            let expected: Vec<i64> = input
+                .iter()
+                .copied()
+                .filter(|value| value % 3 == 0)
+                .map(|value| value.wrapping_mul(2))
+                .collect();
+            assert_eq!(result.len, i64::try_from(expected.len()).unwrap(), "count={count}");
+            let actual_len = usize::try_from(result.len).unwrap();
+            let actual = unsafe { std::slice::from_raw_parts(result.ptr.cast::<i64>(), actual_len) };
+            assert_eq!(actual, expected.as_slice(), "count={count}");
+            unsafe { align_rt_free(result.ptr as *mut u8) };
+        }
+    }
+
+    #[test]
+    fn par_map_filter_rejects_invalid_lengths_before_kernel() {
+        for &(count, in_stride, out_stride) in &[(0_i64, -1_i64, -1_i64), (1, -1, 8), (1, 8, -1)] {
+            let result = unsafe {
+                align_rt_par_map_filter(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    count,
+                    in_stride,
+                    out_stride,
+                    1,
+                    par_map_filter_count,
+                    par_map_filter_scatter,
+                )
+            };
+            assert!(result.ptr.is_null(), "invalid lengths must not enter the kernels");
+            assert_eq!(result.len, 0, "invalid lengths must return an empty view");
         }
     }
 

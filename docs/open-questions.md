@@ -252,7 +252,7 @@ Implementation slices: **S1 DONE** — tag-only + scalar-payload enums + `Type.V
 Record: `draft.md` §5 (Sum Type), `impl/07-roadmap.md`.
 
 ### Purity model
-**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure function (fixpoint over the call graph). Everything else (arithmetic, reads, builder/arena/heap, owned-value moves) is Pure. `par_map(f)` rejects an Impure `f`. (Sound for the language as it stands: a `par_map` function is `(T) -> R` with no `out` parameter, so reaching an I/O builtin is the only route to impurity.)
+**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, writing through caller-provided `slice`/`soa` storage (including `map_into` and vector stores), or calling an Impure function (fixpoint over the call graph). Private arithmetic, reads, builder/arena/heap, and owned-value moves remain Pure. `par_map(f)` rejects an Impure `f`; the view-write check is deliberately conservative because HIR does not retain enough provenance to prove that a view is private.
 Record: `impl/03-types.md` §8
 
 ### Ordinary sequential pipeline effects and evaluation order
@@ -268,7 +268,7 @@ operations plus builtin `sum`/`count`/`min`/`max` retain the mask/identity-selec
 Record: `draft.md` §8, `docs/language-spec.md`, `impl/12-pipeline-closure-memory-io-simd-audit.md` §3
 
 ### Lambdas / closures — IMPLEMENTED (map/where/all reducers + capture)
-**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site (a loop-invariant argument the backend hoists), so there is no closure environment / allocation. Capture is wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a direct-source capturing `par_map` and primitive-scalar length-preserving `map` stages now use the generated parallel range kernel with one call-scoped immutable capture context, while filtered and unsupported aggregate forms retain the sequential path. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures, and every callable entering the staged kernel is checked Pure. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
+**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site (a loop-invariant argument the backend hoists), so there is no closure environment / allocation. Capture is wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a direct-source capturing `par_map` and primitive-scalar length-preserving `map` stages now use the generated parallel range kernel with one call-scoped immutable capture context; callable primitive-scalar `where` stages use stable count/prefix/scatter compaction, while projection, string, chunk, aggregate, and other unsupported forms retain the sequential path. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures, and every callable entering the staged kernel is checked Pure. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
 Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
 ### First-class closures + `task_group` — SETTLED + IMPLEMENTED (fully-escaping fn values deferred)
@@ -1300,14 +1300,14 @@ Beyond the JSON→SoA / field-skip thrust (which both external reviews converged
     aggressively. Verified in IR (`attributes #0 = { nounwind }`); test
     `align_functions_are_marked_nounwind`.
   - **`memory(none)` / `readonly` on pure functions — DEFERRED (purity ≠ readonly).** Align's
-    inferred purity (`EffectScan`) means only **"no observable I/O side effect"** — it *explicitly*
-    counts arena/heap allocation, builder use, and reads/writes through args as **pure** (see the
-    `check_parallelism` doc-comment). So a "pure" Align fn may allocate and touch arg-pointed memory →
-    asserting LLVM `readnone`/`readonly` would be **unsound** (LLVM could CSE/DCE a call that really
-    allocates). A sound version needs a *stricter* analysis ("allocation-free + no arg writes, reads
-    only through args" → `readonly`; "scalar args only, no alloc" → `readnone`). Worth it only for
-    non-inlined pure calls with loop-invariant args — pipeline stage fns are inlined by fusion, so the
-    attr is usually moot. Deferred until that stricter analysis exists.
+    inferred purity (`EffectScan`) permits arena/heap allocation, builder use, and mutation of
+    private owned values; writes through caller-provided `slice`/`soa` views are classified Impure.
+    So a "pure" Align fn may still allocate or touch owned argument storage → asserting LLVM
+    `readnone`/`readonly` would be **unsound** (LLVM could CSE/DCE a call that really allocates). A
+    sound version needs a *stricter* analysis ("allocation-free + no arg writes, reads only through
+    args" → `readonly`; "scalar args only, no alloc" → `readnone`). Worth it only for non-inlined
+    pure calls with loop-invariant args — pipeline stage fns are inlined by fusion, so the attr is
+    usually moot. Deferred until that stricter analysis exists.
   - Remaining sound-but-unbuilt: `noalias`/`nonnull`/`dereferenceable`/`align` on pointer args —
     blocked the same way (`nonnull` is false for an empty `{null,0}` slice; aggressive `noalias` wants
     the `map_into(out)` write-construct, deferred above).
@@ -2807,11 +2807,11 @@ watchdog close the progress path. The already-recorded whole-range specializatio
 direct call, and cheap arithmetic vectorizes after inlining. Direct-source Copy-capturing `par_map`
 also uses the range kernel through a synchronous immutable context. The first primitive-scalar
 length-preserving `map` stages now enter the same ordered kernel, with every stage callable checked
-Pure; filtered and unsupported aggregate forms remain sequential. Direct wrapping-integer
+Pure; projection, string, and unsupported aggregate forms remain sequential. Direct wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read) shipped in #647, helper-job
 publication batching shipped in #648, and low-lock task-group claim/completion shipped in #650.
-The current change adds the conservative body/byte-aware grain hint; packed task records, a broader
-width/aggregate sweep, and stable `where` compaction remain.
+The current slice adds stable callable primitive-scalar `where` compaction via count/prefix/scatter;
+packed task records, projection/aggregate filters, and a broader width/aggregate sweep remain.
 Applying the already-recorded blocking-worker direction to generic `task_group` stays a later
 mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of

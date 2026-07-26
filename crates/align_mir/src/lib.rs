@@ -304,10 +304,19 @@ pub enum Stmt {
     DropValue(Operand),
 }
 
-/// One prior length-preserving `map` call in a fused staged `par_map` range kernel. Captures are
-/// flattened into the surrounding [`Rvalue::ParMapParallel`] context in stage order.
+/// A length-preserving stage in a fused staged `par_map` range kernel. Captures are flattened into
+/// the surrounding [`Rvalue::ParMapParallel`] context in stage order. `Filter` stages keep the
+/// current element only when their callable returns `true`; the runtime uses a stable two-pass
+/// compaction for those nodes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParMapStageKind {
+    Map,
+    Filter,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParMapStage {
+    pub kind: ParMapStageKind,
     pub func: String,
     pub captures: Vec<Operand>,
     pub capture_tys: Vec<Ty>,
@@ -545,15 +554,17 @@ pub enum Rvalue {
     /// `par_map(f)` over a `{ptr,len}` source `src` — apply the Pure `func` to each element in
     /// parallel (runtime `align_rt_par_map` + a generated whole-range kernel), materializing an
     /// owned `array<elem_out>` `{ out_buf, count }`. `stages` holds prior primitive-scalar `map`
-    /// calls that are fused into the same kernel; it is empty for a direct source. `elem_in` is the
-    /// source element type and `elem_out` is `func`'s return. All captures are Copy values passed
-    /// through one call-scoped immutable context record. The runtime never retains that record; the
-    /// generated kernel loads and forwards each stage and terminal value. `work_weight` is a small
-    /// post-lowering cost hint (1/2/4) combined with element byte width by the runtime.
+    /// calls that are fused into the same kernel; it is empty for a direct source. `Filter` stages
+    /// are primitive-scalar predicates and preserve the current element; they use a stable
+    /// two-pass compaction in the runtime. `elem_in` is the source element type and `elem_out` is
+    /// `func`'s return. All captures are Copy values passed through one call-scoped immutable
+    /// context record. The runtime never retains that record; the generated kernel loads and
+    /// forwards each stage and terminal value. `work_weight` is a small post-lowering cost hint
+    /// (1/2/4) combined with element byte width by the runtime.
     ParMapParallel {
         src: Operand,
         func: String,
-        /// Prior length-preserving primitive-scalar maps. Empty for a direct `par_map`.
+        /// Prior length-preserving primitive-scalar map/filter stages. Empty for a direct `par_map`.
         stages: Vec<ParMapStage>,
         captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
@@ -4071,19 +4082,21 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
-            // With a direct scalar source, or a length-preserving primitive-scalar map chain, run
-            // in parallel via one range kernel. Copy captures are lowered once into the call-scoped
-            // context record; filters, projections, chunks, and aggregate sources retain the
-            // sequential collect loop.
+            // With a direct scalar source, or a length-preserving primitive-scalar map/filter chain,
+            // run in parallel via one range kernel. Copy captures are lowered once into the
+            // call-scoped context record; callable filters use stable two-pass compaction, while
+            // projections, chunks, and aggregate sources retain the sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
                 Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 _ => None,
             };
             let staged_parallel = align_sema::par_map_staged_parallelizable(source.ty, stages);
-            let all_map_stages = stages.iter().all(|stage| matches!(&stage.kind, hir::StageKind::Map { .. }));
+            let all_parallel_stages = stages
+                .iter()
+                .all(|stage| matches!(&stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }));
             if (stages.is_empty() || staged_parallel)
-                && all_map_stages
+                && all_parallel_stages
                 && let Some(elem_in) = elem_in {
                     let src = match source.ty {
                         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
@@ -4097,10 +4110,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     let mut stage_records = Vec::with_capacity(stages.len());
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
-                        if let hir::StageKind::Map { func, captures } = &stage.kind {
+                        if let hir::StageKind::Map { func, captures } | hir::StageKind::Where { func, captures } = &stage.kind {
                             let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
                             let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
                             stage_records.push(ParMapStage {
+                                kind: if matches!(&stage.kind, hir::StageKind::Map { .. }) {
+                                    ParMapStageKind::Map
+                                } else {
+                                    ParMapStageKind::Filter
+                                },
                                 func: func.clone(),
                                 captures: capture_ops,
                                 capture_tys,
@@ -4110,7 +4128,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             stage_elem_in = stage.out_ty;
                         }
                     }
-                    debug_assert_eq!(stage_records.len(), stages.len(), "parallel staged par_map must contain only map stages");
+                    debug_assert_eq!(stage_records.len(), stages.len(), "parallel staged par_map must contain only map/filter stages");
                     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
                     let capture_ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
                     // Free the source buffer if it is an owned temporary the runtime just consumed.

@@ -1,7 +1,7 @@
 //! Textual output of MIR (`alignc emit-mir`, `docs/impl/04-mir.md` §8).
 //! Used to inspect the CFG and confirm lowering / optimizations (predictability).
 
-use crate::{ty_name, Block, Const, Function, Operand, Program, Rvalue, Stmt, Term};
+use crate::{ty_name, Block, Const, Function, Operand, ParMapStageKind, Program, Rvalue, Stmt, Term};
 use align_ast::{BinOp, UnOp};
 use std::fmt::Write;
 
@@ -374,7 +374,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let chain = if stages.is_empty() {
                 func.clone()
             } else {
-                let prefix = stages.iter().map(|stage| stage.func.as_str()).collect::<Vec<_>>().join(" -> ");
+                let prefix = stages
+                    .iter()
+                    .map(|stage| match stage.kind {
+                        ParMapStageKind::Map => stage.func.clone(),
+                        ParMapStageKind::Filter => format!("where {}", stage.func),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
                 format!("{prefix} -> {func}")
             };
             if caps.is_empty() {

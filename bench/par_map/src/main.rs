@@ -23,6 +23,8 @@ extern "C" {
     fn pmap(s: Slice) -> i64;
     /// `pub fn smap(s: slice<i64>) -> i64` — sequential `s.map(work).sum()`.
     fn smap(s: Slice) -> i64;
+    /// `pub fn pfilter(s: slice<i64>) -> i64` — stable count/prefix/scatter filter followed by a cheap map.
+    fn pfilter(s: Slice) -> i64;
     /// Benchmark-only runtime switch, present in the opt-in `par-map-probe` runtime build.
     #[cfg(feature = "probe")]
     fn align_rt_test_par_map_force_caller(force: i32);
@@ -56,6 +58,15 @@ fn rust_rayon(s: &[i64]) -> i64 {
     s.par_iter()
         .map(|&x| work(x))
         .reduce(|| 0i64, i64::wrapping_add)
+}
+
+fn rust_filter_seq(s: &[i64]) -> i64 {
+    let output: Vec<i64> = s
+        .iter()
+        .filter(|&&x| x % 2 == 0)
+        .map(|&x| x.wrapping_mul(3).wrapping_add(1))
+        .collect();
+    output.iter().copied().fold(0i64, i64::wrapping_add)
 }
 
 fn gen(n: usize) -> Vec<i64> {
@@ -348,6 +359,57 @@ fn run_threshold() {
     }
 }
 
+fn run_filter() {
+    const ROUNDS: usize = 15;
+    println!(
+        "par_map filter (stable count/prefix/scatter vs Rust materializing sequential control)"
+    );
+    println!(
+        "{:>9}  {:>12}  {:>12}  {:>10}",
+        "n", "parallel ms", "rust seq ms", "vs Rust"
+    );
+    for &n in &[16_384usize, 65_536, 65_537, 131_072, 1_000_000] {
+        let data = gen(n);
+        let slice = Slice {
+            ptr: data.as_ptr(),
+            len: n as i64,
+        };
+        let expected = rust_filter_seq(&data);
+        assert_eq!(
+            unsafe { pfilter(slice) },
+            expected,
+            "parallel filter result"
+        );
+
+        let mut parallel_samples = Vec::with_capacity(ROUNDS);
+        let mut rust_seq_samples = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            let mut elapsed = [0.0; 2];
+            let order = match round % 2 {
+                0 => [0, 1],
+                _ => [1, 0],
+            };
+            for arm in order {
+                let started = Instant::now();
+                match arm {
+                    0 => std::hint::black_box(unsafe { pfilter(slice) }),
+                    1 => std::hint::black_box(rust_filter_seq(&data)),
+                    _ => unreachable!(),
+                };
+                elapsed[arm] = started.elapsed().as_secs_f64() * 1e3;
+            }
+            parallel_samples.push(elapsed[0]);
+            rust_seq_samples.push(elapsed[1]);
+        }
+        let parallel_ms = median(parallel_samples);
+        let rust_seq_ms = median(rust_seq_samples);
+        println!(
+            "{n:>9}  {parallel_ms:>12.3}  {rust_seq_ms:>12.3}  {:>9.2}x",
+            rust_seq_ms / parallel_ms,
+        );
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("threshold") {
         #[cfg(feature = "probe")]
@@ -360,6 +422,10 @@ fn main() {
             eprintln!("threshold mode requires the probe feature");
             std::process::exit(2);
         }
+    }
+    if std::env::args().nth(1).as_deref() == Some("filter") {
+        run_filter();
+        return;
     }
     run_standard();
 }

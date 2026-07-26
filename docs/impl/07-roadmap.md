@@ -565,8 +565,9 @@ are compiler-known builtins, monomorphic per element type.
   and `reduce`/`scan`/`partition`/`any`/`all`/`par_map` (a `captures` field on each node, threaded
   to the per-element call). A direct-source `par_map` with Copy captures uses the generated range
   kernel through an immutable call-scoped context; primitive-scalar length-preserving `map` stages
-  use the same kernel, while filtered or unsupported forms remain sequential, and Move captures are
-  rejected. All three flow analyses (`MoveCheck`/`EscapeCheck`/
+  use the same kernel, and callable primitive-scalar `where` stages use stable count/prefix/scatter
+  compaction. Projection, string, chunk, aggregate, and other unsupported forms remain sequential,
+  and Move captures are rejected. All three flow analyses (`MoveCheck`/`EscapeCheck`/
   `EffectScan`) walk stage and node captures. First-class function values remain a follow-up.
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
@@ -1017,9 +1018,10 @@ already lives in `docs/open-questions.md`.
   with a fail-closed higher-order unknown-target gate; #465 later moved concrete callable effects
   into `FnTy` and removed address-taking call edges. The saturated `task_group -> par_map`
   forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A
-  primitive-scalar length-preserving `map` chain before `par_map` now uses the same range kernel;
-  filtered `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop, and Move captures
-  remain rejected by ownership checks.
+  primitive-scalar length-preserving `map` chains before `par_map` now use the same range kernel;
+  callable primitive-scalar `where(p).par_map(f)` uses stable count/prefix/scatter compaction, while
+  projection, string, chunk, aggregate, and other unsupported filters retain the sequential collect
+  loop. Move captures remain rejected by ownership checks.
   Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
   function values + indirect call (①), a lambda as a first-class value with typed parameters (②a),
@@ -1051,8 +1053,9 @@ whole-range specialization plan concrete; the direct whole-range kernel shipped 
 removing the per-element indirect callback and restoring vectorization for cheap arithmetic bodies.
 The direct-source Copy capture context shipped in #643. The direct integer transform-reduce slice
 shipped in #647, queue publication batching shipped in #648, and low-lock task-group claim/completion
-shipped in #650. The first primitive-scalar length-preserving staged `map` lowering is the current
-change; work-aware grain, stable `where` compaction, and split execution-domain candidates remain.
+shipped in #650. The first primitive-scalar length-preserving staged `map` lowering is shipped. The
+callable primitive-scalar stable `where` compaction is the current change; packed task records,
+false-sharing measurement, and split execution-domain candidates remain.
 It proposes no new source syntax.
 
 **Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**

@@ -263,6 +263,7 @@ exact guarded source order (`draft.md` §8).
 Effect = Pure | Impure(reason)
 A function/lambda has its effect inferred from its body:
   modifying an outer mut binding   → Impure
+  writing through a `slice`/`soa` view (including `map_into` and `vec.store`) → Impure
   calling a side-effecting std fn (I/O etc.)  → Impure
   if none of the above             → Pure
 ```
