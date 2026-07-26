@@ -4546,6 +4546,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// LLVM's store size omits an aggregate's tail padding, while typed GEP and the runtime's
+    /// element buffer contract advance by the ABI allocation size. Use the latter for every
+    /// dynamically allocated element buffer and for range-kernel strides so padded AoS structs
+    /// cannot overlap or under-allocate their rows.
+    fn element_allocation_size(&self, ty: BasicTypeEnum<'c>) -> u64 {
+        self.target_data.get_abi_size(&ty)
+    }
+
     fn stack_header_slot_for_operand(&self, op: &Operand) -> Option<Slot> {
         match op {
             Operand::Value(v) => self.stack_header_load_values.get(v).copied(),
@@ -4974,6 +4982,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         if filter && !stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. })) {
             return Err(self.err("par_map filter kernels require a filter stage"));
+        }
+        if mode == ParMapKernelMode::Materialize
+            && stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }))
+        {
+            return Err(self.err("par_map materialize kernels cannot contain filter stages"));
         }
         let field_layout_suffix = Self::par_map_field_layout_suffix(stages);
         let structural_key = Self::par_map_stage_structural_key(stages);
@@ -6806,7 +6819,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // not necessarily a power of two, so it cannot double as an allocator alignment).
                 let i64t = self.ctx.i64_type();
                 let elem_ty = self.llvm_type(*elem);
-                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&elem_ty), false);
+                let elem_bytes = i64t.const_int(self.element_allocation_size(elem_ty), false);
                 let elem_align = i64t.const_int(self.target_data.get_abi_alignment(&elem_ty) as u64, false);
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
@@ -6820,7 +6833,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::HeapAllocBuf { count, elem } => {
                 // bytes = count * sizeof(elem); heap-allocate (freed by a later Drop).
                 let i64t = self.ctx.i64_type();
-                let elem_bytes = i64t.const_int(self.target_data.get_store_size(&self.llvm_type(*elem)), false);
+                let elem_bytes = i64t.const_int(self.element_allocation_size(self.llvm_type(*elem)), false);
                 let count_v = self.operand(count)?.into_int_value();
                 let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
@@ -7155,6 +7168,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 self.validate_par_map_type(*elem_in)?;
                 self.validate_par_map_type(*elem_out)?;
+                if !matches!(*elem_out, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char) {
+                    return Err(self.err("par_map range output must be a non-owning primitive scalar"));
+                }
                 let mut stage_input = *elem_in;
                 for stage in stages {
                     if stage.elem_in != stage_input {
@@ -7225,8 +7241,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
                 let i64t = self.ctx.i64_type();
-                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
-                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
+                let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if all_capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
@@ -7341,8 +7357,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     _ => return Err(self.err("par_map reduction result must be an integer")),
                 };
                 let i64t = self.ctx.i64_type();
-                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
-                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
+                let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight = i64t.const_int(u64::from(*work_weight), false);
                 let context = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
@@ -11562,6 +11578,55 @@ mod tests {
         assert!(
             text.contains("has no LLVM value"),
             "the missing-value read must say so, got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_par_map_region_result_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let return_str = Function {
+            name: "return_str".to_string(),
+            params: vec![0],
+            ret: Ty::Str,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![Ty::Str],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![Stmt::Let(0, Rvalue::StrLit("x".to_string()))],
+                stmt_lines: vec![(0, 0)],
+                term: Term::Return(Some(Operand::Value(0))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "return_str".to_string(),
+                        stages: vec![],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: i64_ty,
+                        elem_out: Ty::Str,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true })), Ty::DynArray(Scalar::Str)],
+            vec![Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![],
+            vec![],
+            vec![return_str],
+        )
+        .expect_err("a range par_map must reject a region-bearing result before LLVM lowering");
+        assert!(
+            err.to_string().contains("non-owning primitive scalar"),
+            "the codegen guard should name the result contract, got: {err}"
         );
     }
 

@@ -814,6 +814,14 @@ pub fn par_map_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[Stru
     stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums)
 }
 
+/// Whether the owned array produced by the range-kernel `par_map` path contains only values that
+/// carry no source region. The semantic result gate below admits exactly this set; keeping the
+/// predicate beside the ownership/region consumers also makes malformed HIR fail closed instead
+/// of turning a future region-bearing result into a freely returnable value.
+fn par_map_result_is_plain_primitive(ty: Ty) -> bool {
+    matches!(ty, Ty::DynArray(Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char))
+}
+
 fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
 }
@@ -5848,7 +5856,8 @@ impl<'a> EscapeCheck<'a> {
                 .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
                 .all(|part| self.drop_is_individual(part, depth)),
             ExprKind::ArrayParMap { source, stages, .. }
-                if par_map_parallelizable(source.ty, stages, self.structs, self.enums) => true,
+                if par_map_parallelizable(source.ty, stages, self.structs, self.enums)
+                    && par_map_result_is_plain_primitive(e.ty) => true,
             _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
             }
         };
@@ -6104,7 +6113,8 @@ impl<'a> EscapeCheck<'a> {
             // checked `par_map` result is primitive), so it is freely returnable and individually
             // dropped. Unsupported shapes use the arena-aware sequential collector below.
             ExprKind::ArrayParMap { source, stages, .. }
-                if par_map_parallelizable(source.ty, stages, self.structs, self.enums) => Region::Static,
+                if par_map_parallelizable(source.ty, stages, self.structs, self.enums)
+                    && par_map_result_is_plain_primitive(e.ty) => Region::Static,
             ExprKind::ArrayParMap { .. } => self.allocation_region(e),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
             // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
@@ -16509,7 +16519,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // The result must materialize into `array<R>`, i.e. be a primitive scalar.
-        let Some(scalar) = ty_to_scalar(r).filter(|s| scalar_to_prim(*s).is_some()) else {
+        let Some(scalar) = ty_to_scalar(r).filter(|s| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) else {
             self.diags.error(
                 format!("'par_map' result must be a primitive scalar (int/float/bool/char), got {}", ty_name(r)),
                 span,

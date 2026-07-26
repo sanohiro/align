@@ -150,12 +150,44 @@ fn par_map_over_dynamic_struct_array_uses_aos_stride_kernel() {
 }
 
 #[test]
+fn par_map_over_padded_aos_uses_abi_stride() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Row { active: bool, amount: i64 }\nfn amount(row: Row) -> i64 = row.amount\nfn main() -> Result<(), Error> {\n  rows: array<Row> := [Row{active: true, amount: 3}, Row{active: false, amount: 7}].to_array()\n  out := rows.par_map(amount)\n  print(out[0])\n  print(out[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-padded-aos", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n7\n");
+
+    let ir = emit_llvm(src);
+    let call = ir
+        .lines()
+        .find(|line| line.contains("@align_rt_par_map("))
+        .unwrap_or_else(|| panic!("no par_map runtime call in IR:\n{ir}"));
+    assert!(call.contains(", i64 16, i64 8,"), "the padded AoS input must use its ABI stride:\n{call}");
+    assert!(
+        ir.contains("@llvm.umul.with.overflow.i64(i64 2, i64 16)"),
+        "the padded AoS source buffer must multiply its count by the 16-byte ABI row size:\n{ir}"
+    );
+}
+
+#[test]
 fn par_map_rejects_move_aos_elements_before_codegen() {
     let src = "User { name: string, age: i32 }\nfn age(u: User) -> i32 = u.age\nfn main() -> i32 {\n  users := [User{name: \"a\".clone(), age: 7}]\n  out := users.par_map(age)\n  return out[0]\n}\n";
     assert!(check_errs("pm-move-struct", src), "par_map must reject a Move struct element by value");
     assert!(
         check_diagnostics("pm-move-struct", src).contains("cannot pass a Move element"),
         "the ownership diagnostic should explain why the AoS range ABI is unavailable"
+    );
+}
+
+#[test]
+fn par_map_rejects_region_bearing_result() {
+    let src = "fn identity(x: str) -> str = x\nfn main() -> i32 {\n  xs := [\"a\"].par_map(identity)\n  return xs.len() as i32\n}\n";
+    assert!(check_errs("pm-region-result", src), "par_map must reject a borrowed str result");
+    assert!(
+        check_diagnostics("pm-region-result", src).contains("'par_map' result must be a primitive scalar"),
+        "the diagnostic should explain the non-owning primitive result contract"
     );
 }
 
