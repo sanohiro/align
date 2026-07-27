@@ -590,6 +590,58 @@ idea is rejected.
 - **v1 impact:** D11/D12 are required for the first public DB release; they do not block early
   vertical development.
 
+### F39 — streaming execution did not own or borrow parameter storage
+
+- **Classification:** ownership or soundness risk; performance risk.
+- **Problematic design location:** `rows`/`rows_stmt` with SQLite text/blob Params.
+- **Current Align constraint:** `str` and slices are borrowed views, while SQLite may retain a bound
+  pointer across the API return and perform `sqlite3_step` only on later `next`.
+- **Actual failure:** the caller could drop or mutate parameter storage after `rows` returns,
+  leaving SQLite with a dangling pointer.
+- **Recommendation:** the common contract releases all Params provenance at operation return. V1
+  SQLite uses `SQLITE_TRANSIENT`-equivalent bind copies; prepared statements keep the native copy
+  until reset/rebind/finalize. Async/future PostgreSQL paths retain their own bytes. Pin source
+  invalidation before first `next`, partial-bind cleanup, and copied-byte/allocation counts.
+  Zero-copy bind requires a separate explicit driver-qualified contract and return provenance.
+- **v1 impact:** soundness blocker for D8 text/blob streaming and D6 prepared text/blob execution.
+
+### F40 — dynamic SQL did not expose its driver restriction
+
+- **Classification:** specification ambiguity; Align philosophy conflict.
+- **Problematic design location:** D14's concrete `db.dynamic_rows` example.
+- **Current Align constraint:** dialect choice and native dependency must remain visible; dynamic SQL
+  has no static artifact/preparer that can infer portability.
+- **Actual failure:** relying on the runtime `exec` driver hides the restriction and delays a
+  dialect mismatch until SQL execution.
+- **Recommendation:** require an exact source-visible `db.Driver` argument with no `Any` value,
+  compare it before sending SQL, and retain explicit parameter/execute-option slices. Native forms
+  add a separate native option slice.
+- **v1 impact:** D14 API blocker; not part of the D1–D12 first release.
+
+### F41 — verified core signature tables included unimplemented L4/L6 forms
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** `core-design/arena-heap.md` and
+  `core-design/array-slice-pipeline.md` “Signatures (verified)” tables.
+- **Current Align constraint:** `arena out {}` and the region builder are settled prerequisites but
+  not implemented before L4/L6.
+- **Actual failure:** an implementation agent could treat unavailable APIs as shipped, and current
+  example verification cannot prove those lines.
+- **Recommendation:** keep only shipped forms in verified tables and place L4/L6 signatures in
+  clearly marked “required, not implemented yet” blocks in both language mirrors.
+- **v1 impact:** status/documentation blocker before prerequisite implementation starts.
+
+### F42 — category metadata calls omitted the mandatory option slice
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** §18.2 category calls versus §13.2's one option-bearing form.
+- **Current Align constraint:** Align has no default arguments; `[]` is the explicit no-option value.
+- **Actual failure:** D12 could implement optionless public overloads or leave unclear whether
+  category calls are wrappers around another primitive.
+- **Recommendation:** every `meta_*` category primitive ends in `slice<db.MetaOption>`. Native forms
+  take that common slice plus a separate native option slice. Show `[]` in every conceptual call.
+- **v1 impact:** D12 API blocker and therefore first-public-release blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -619,8 +671,9 @@ idea is rejected.
    invalidating unchanged consumers. Function values similarly retain/join return provenance across
    separate compilation.
 9. **Named parameters:** dialect-aware lexical occurrence table. SQLite uses native named
-   parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
-   ordinal for repeats.
+    parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
+    ordinal for repeats. Streaming APIs release source Params provenance at return by using
+    execution-owned/native bind storage; SQLite v1 uses transient-copy semantics.
 10. **Typed Row decode:** monomorphized ordinal decoder thunk with direct field writes and runtime
     contract guards; no reflection or per-row name lookup. V1 static Row is `RegionPlain`; owned
     strings/arrays remain Params/Output forms rather than a hidden alternate Row materializer.
@@ -638,7 +691,8 @@ idea is rejected.
     ordinary build consumes canonical artifacts and never connects. Explicit SQLite migration
     replay uses one canonical validated version order and ordered fingerprint.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
-    slices and no silent ignore.
+    slices and no silent ignore. Category metadata calls each carry the mandatory `MetaOption`
+    slice.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b; prove fake
     Query artifacts before native code; put SQLite and PostgreSQL scalar verticals before
     streaming/transactions/compound output; complete migrations and category metadata/EXPLAIN in
@@ -694,6 +748,11 @@ documents:
 32. Keep the Japanese prepared-statement example identical in semantics to the English original.
 33. Make D11 SQL migrations and D12 category metadata/EXPLAIN part of the first public release
     gate; retain D13/D14 as committed additive work.
+34. Define parameter-storage retention through streaming execution and measure its bind copies.
+35. Require an exact visible driver argument on every dynamic SQL operation.
+36. Separate shipped verified signatures from required-but-unimplemented L4/L6 signatures.
+37. Add `slice<db.MetaOption>` to every category metadata primitive and a separate native slice to
+    driver-native forms.
 
 ## 5. Revised implementation roadmap
 
@@ -707,20 +766,20 @@ documents:
 | L5 | tagged file/inline inputs, Query artifacts, descriptor skeleton | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
-| D1 | fake-driver Query binder/decoder and scanner | artifact/cache/placeholder matrix | thunk overhead and warm cache |
+| D1 | fake-driver Query binder/decoder and scanner | artifact/cache/placeholder/retention matrix | thunk overhead and warm cache |
 | D2 | scalar SQLite Query vertical | cardinality, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
 | D4 | scalar PostgreSQL Query vertical (`BufferedFull`) | rewrite, SQLSTATE, mismatch, cleanup, delivery counts | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
-| D6 | dependent prepared statements | sequential reuse and child-before-parent Drop | prepare reuse/reprepare |
+| D6 | dependent prepared statements | sequential reuse, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
 | D7 | tx plus common exec view | consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
-| D8 | typed rows and row generations | old-view rejection, clone retention, physical delivery counts | row decode/iteration |
+| D8 | typed rows and row generations | old-view rejection, Params-source invalidation, clone retention, delivery counts | row decode/iteration/bind copies |
 | D9 | all option scopes, timeout, cancellation | applied/unsupported/conflict matrix | option/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | SQL migrations; initial-release gate | checksum/order/transaction/status | migration startup/large history |
-| D12 | category metadata and EXPLAIN; initial-release gate | category isolation; ANALYZE executes visibly | catalog query count/latency |
+| D12 | category metadata and EXPLAIN; initial-release gate | option/native-slice and category isolation; ANALYZE executes visibly | catalog query count/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
-| D14 | dynamic rows and proved callback surfaces | allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
+| D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
 ## 6. Exact first implementation PR
 
@@ -797,11 +856,13 @@ The delivery is not performance-complete without:
   files;
 - D4 direct libpq comparison with transported/buffered/decoded rows reported separately;
 - D6 prepare reuse versus reprepare;
-- D8 row iteration/decode, physical-delivery counts, and retained-copy costs;
+- D8 row iteration/decode, Params bind copied bytes/allocations, physical-delivery counts, and
+  retained-row-copy costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
 - D11 migration startup/status cost and ordered history scaling at 10/100/1000 applied files;
 - D12 category metadata query count and EXPLAIN latency;
-- D13 batch/SoA/native throughput on each driver.
+- D13 batch/SoA/native throughput on each driver;
+- D14 dynamic dispatch/mismatch overhead versus direct driver-qualified execution.
 
 Benchmark results are evidence and regression anchors. They may not justify removing ownership,
 runtime contract validation, explicit options, or one-statement semantics.

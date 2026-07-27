@@ -13,7 +13,6 @@
 
 ```text
 arena { … }                 // expression block; all arena allocations freed at }, O(1)
-arena out { … }             // 必須 L4 形式。同じ arena を `out: region` として束縛する
 heap.new(x)   -> box<T>     // ONE arg; must be inside an arena {}; T = primitive scalar only
 b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
@@ -24,7 +23,13 @@ out-mode parameterで、whitespaceではなくtoken lookaheadで区別する。
 
 box の表面はこれで全部である — `.set()` も deref 演算子もない。
 
-名前付き arena の行は確定済みの前提機能であり、まだ実装されていない。これは
+必須L4 signature（**未実装**）:
+
+```text
+arena out { … }             // 同じ arena を `out: region` として束縛する
+```
+
+名前付き arena formは確定済みの前提機能である。これは
 `box<T>` を拡張するものではない。`out` は通常のライブラリ関数へ渡せる、
 スコープ限定のアロケーション先 capability である。匿名 arena と名前付き arena
 は同じ begin/end と一括 cleanup を使う。完全な契約は

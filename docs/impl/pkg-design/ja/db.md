@@ -231,6 +231,7 @@ db.command<P>
 db.stmt<P, R>
 db.rows<R>
 db.exec_result
+db.Driver
 db.row
 db.value
 ```
@@ -246,6 +247,8 @@ db.value
 - `db.rows<R>`: 1実行だけのone-pass typed stream。native bufferが必要な間、
   statement/connectionへdependencyを持つ。
 - `db.exec_result`: affected rowsと利用可能なcommand status。
+- `db.Driver { SQLite, PostgreSQL }`: error/metadata/delivery observation/D14 dynamic SQL
+  restrictionで使うexact public identity。`Any` variantはない。
 - `db.row` / `db.value`: 明示的dynamic escape hatch。
 
 common rootがresource typeを宣言し、rawだけを受ける `pub` Drop hookを
@@ -373,6 +376,7 @@ StaticQueryArtifact       producer implementation
   driver restriction
   canonical static options
   named-parameter occurrence/source maps
+  driver別parameter retention class
   checked metadata reference/digest
   generated binder/decoder bodies
 
@@ -419,6 +423,28 @@ token spanだけを `$n` へ置換し、それ以外のbyteを保存する。art
 rewrite-format version、source-to-wire span mapを持つ。metadata keyはdriver/source hash/
 wire hash/rewrite version/static optionを含み、runtimeは選択したwire bytesを正確に送り、
 engine位置を可能な範囲でsource spanへ戻す。
+
+#### 5.6.1 bind storageの保持
+
+common execution contractがparameter storageをborrowするのはoperationがreturnするまでだけ。
+`rows`/`rows_stmt` もstream resourceを返す前にbindを完了するか、execution-owned storageへ
+全valueを保持する。返された `db.rows<R>` はParams由来provenanceを持たず、statement/
+connection/native result ownerだけへdependentである。callerはreturn後、最初の `next`
+より前でも元text/blob ownerをdrop/reassign/mutateできる。
+
+v1 SQLiteはscalarをby-valueで渡し、`str`/`slice<u8>` とowned `string`/`array<u8>` のbytesを
+`SQLITE_TRANSIENT` semanticsでbindする。SQLiteはreturn前に必要なcopyを所有する。
+prepared statementはreset/rebind/finalizeまでnative copyを保持し、live rows dependencyが
+resetを禁止する。partial-bind/native errorもtemporaryを全て解放し、moved Params ownerを
+exactly onceでconsume/dropする。
+
+初期PostgreSQL `BufferedFull` pathは同期libpq callのreturn前にparameter transmissionを完了
+する。将来のsingle-row/portal/pipeline/async pathはnative protocolが不要になるまで自身の
+parameter bytesを保持する。これはper-execution bind copyでありper-row copyではない。
+test/benchmarkはtext/blob copy bytesとallocationをrow decodeと分けて報告する。zero-copy
+bindは明示driver-qualified surface、全source ownerへ結ぶreturn provenance、独立measurement
+を必要とし、黙ってborrowed bindへ切り替えない。generated driver binder planは各fieldの
+retention classを記録し、Query/execution inspectionは `BindValue` / `BindCopy` を表示する。
 
 ### 5.7 Row
 
@@ -794,7 +820,7 @@ command      db.command_file(slice<db.CommandOption>)
 prepare      db.prepare(exec, query, slice<db.PrepareOption>)
 execution    db.execute/one/maybe_one/all/rows(..., slice<db.ExecuteOption>)
 transaction  db.begin(conn, slice<db.TxOption>)
-metadata     db.metadata(exec, request, slice<db.MetaOption>)
+metadata     db.meta_database/meta_schemas/...(..., slice<db.MetaOption>)
 EXPLAIN      db.explain(exec, query, params, slice<db.ExplainOption>)
 ```
 
@@ -1071,6 +1097,23 @@ query plan
 request typeとoptionをcategoryごとに分け、1 category requestが無関係なcatalogをfetch
 しないことをquery-count testで固定する。
 
+conceptual common callは全て末尾に `slice<db.MetaOption>` を1つ持ち、`[]` がno optionを
+表す。
+
+```align
+database := db.meta_database(exec, detail, [])?
+schemas := db.meta_schemas(exec, detail, [])?
+tables := db.meta_tables(exec, schema_filter, detail, [])?
+table := db.meta_table(exec, table_ref, detail, [])?
+columns := db.meta_columns(exec, table_ref, detail, [])?
+keys := db.meta_keys(exec, table_ref, detail, [])?
+indexes := db.meta_indexes(exec, table_ref, detail, [])?
+query_meta := db.meta_query(exec, query(), detail, [])?
+```
+
+対応する `sqlite.meta_*_native` / `postgres.meta_*_native` はcommon sliceとdriver-native
+option sliceを別々に受ける。optionless overloadはない。
+
 ### 18.3 database
 
 database名、driver、engine version、encoding/collationなど要求した基本情報だけ。
@@ -1123,13 +1166,18 @@ detailなどをdriver-qualified dataで提供する。
 typed Queryがprimary pathである。runtime SQLが本当に必要な場合だけ、別surfaceで明示する。
 
 ```text
-db.dynamic_execute(...)
-db.dynamic_rows(...) -> db.rows<db.row>
+db.dynamic_execute(exec, db.Driver.SQLite, sql, params, execute_options)
+db.dynamic_rows(exec, db.Driver.SQLite, sql, params, out, execute_options)
+  -> db.rows<db.row>
 db.row.get(index) -> db.value
 ```
 
 dynamic APIはtyped Query descriptor、checked artifact、struct decodeを装わない。SQL string、
-driver restriction、parameter value slice、result accessがsourceに見える。`db.value` は
+exact `db.Driver` restriction、parameter value slice、result access、末尾の
+`slice<db.ExecuteOption>` がsourceに見える。restrictionは `exec` から推測せず、SQL送信前に
+handleと比較してmismatchをerrorにする。driver-native formは
+`sqlite.dynamic_*_native` / `postgres.dynamic_*_native` のmodule path自体をexact restriction
+とし、common/native option sliceを別々に受ける。`db.value` は
 ownedかself-containedな最小sumとし、native pointerを保持しない。name-based struct writeや
 runtime reflectionは導入しない。exact surfaceはD14で実装するが、typed Queryをdynamic
 engine経由で実装してはならない。
@@ -1151,6 +1199,7 @@ protocol/transaction state不明のconnectionをpoolやcallerへ返さない。t
 - 1 Query = 1 visible statement = 1 execution。
 - `one`/`maybe_one` は2 delivered rowsでdecodeを停止し、driver delivery costを別に測る。
 - row viewは可能な範囲でzero-copy、retention copyは `clone_in` に見える。
+- parameter bind retention/copy classとcopied bytes/allocationを可視・計測可能にする。
 - materialization allocation先は明示region。
 - region builderはhidden heapなし、compact passは正確に1回。
 - all handle Drop/finalize/rollback/closeは成功/全error pathでexactly once。
@@ -1166,6 +1215,7 @@ driver-qualified pathとして追加する。
 
 - generated binder/decoder対hand-written native loop;
 - SQLite package path対direct libsqlite3;
+- SQLite streamed text/blob transient bindのcopy bytes/allocation;
 - PostgreSQL package path対direct libpq;
 - file/inline Query artifact generationとcold/warm rebuild;
 - SQLite canonical migration catalog/replay（10/100/1000 files）;
@@ -1231,7 +1281,8 @@ protocolの1 statement性、parameter/result metadata、nullability evidence、c
 
 inline/sibling SQLからdescriptor/artifactを作り、exact source identityと
 SQLite source/PostgreSQL `$n` wire entry・reverse span map、named occurrence table、
-binder/decoder thunk、flat scalar Row、interface/implementation/cache invalidationをDBなしで
+binder/decoder thunk、driver別 `BindValue` / `BindCopy`、flat scalar Row、
+interface/implementation/cache invalidationをDBなしで
 証明する。reflectionとper-row name lookupがないことをbenchmark/IRで確認する。
 
 ### D2 — 最小SQLite vertical
@@ -1275,6 +1326,7 @@ runtime describe comparison。
 
 dependent `db.stmt<P,R>`、connection/driver check、prepare option、
 `rows_stmt` の `borrow mut` statement parameter、rows Drop後のsequential reuse、
+text/blob rebind時の旧transient copy解放、partial-bind failureの全binding/Params cleanup、
 全path finalize/close、
 implicit global cacheなし。prepared/common/reprepare costを別々に測る。
 
@@ -1288,6 +1340,8 @@ public traitなし。
 
 `db.rows<Row>`、`next` generation、text/blob owner-tied view、old-view compile rejection、
 `clone_in` retention、bounded batchの前提、SQLite/libpq両driverのpointer-validity test。
+SQLite text/blob Params sourceを`rows` return後/最初の`next`前にdrop/mutateするtest、
+transient bind copy bytes/allocation/partial-error cleanup、per-row parameter copy 0を固定する。
 PostgreSQL初期pathは `BufferedFull` 上のone-pass decodeで、single-row/portal deliveryはD13。
 
 ### D9 — scoped native option、timeout、cancellation
@@ -1310,7 +1364,8 @@ ordered SQL file、checksum/history、transaction capability、status/check、�
 
 ### D12 — category metadataとEXPLAIN
 
-database/schema/table/column/key/constraint/index/Query/planの分離、PostgreSQL native detail、
+database/schema/table/column/key/constraint/index/Query/planの分離、各common categoryの
+`MetaOption` slice、native formの追加native option slice、PostgreSQL native detail、
 SQLite native detail、1 categoryが無関係categoryをfetchしないtest。
 `EXPLAIN ANALYZE` は実行を明示する。
 
@@ -1322,7 +1377,8 @@ explicit pool、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback
 
-minimal owned `db.value` とindexed `db.row`、visible dynamic SQL/value slice/driver restriction、
+minimal owned `db.value` とindexed `db.row`、visible dynamic SQL/value slice/exact
+`db.Driver` restriction/execute option、pre-send mismatch rejection、
 typed Queryと別artifact path、reflectionなし。SQLite function/collationやPostgreSQL
 notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明してから追加する。
 
@@ -1393,6 +1449,14 @@ execution-count付きで実証する。
 49. English/Japaneseのprepared-statement exampleは同じsignatureに対してtype-checkする。
 50. 最初のpublic database releaseはdriver-relevantなD1〜D12を完了し、D13/D14はcommitted
     additive workとして続く。
+51. `rows`/`rows_stmt` はreturn時にParams source provenanceを全て解放し、SQLite v1は
+    measured transient text/blob bind copyによって最初の `next` 前のsource invalidationを
+    許可する。
+52. dynamic SQLはexact `db.Driver` をsourceに書き、SQL送信前に照合する。
+53. verified core signature tableはshipped formだけを含み、L4/L6 formは担当PRまで
+    required-but-unimplementedと明記する。
+54. 全category metadata primitiveは1つの `MetaOption` sliceを持ち、native formは別の
+    native option sliceを1つ追加する。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

@@ -127,6 +127,7 @@ The following must remain visible in source or in the declared Query contract:
 SQL statement
 SQL execution count
 parameter binding
+parameter retention/copy class
 allocation destination
 error boundary
 transaction boundary
@@ -307,6 +308,7 @@ db.command<P>
 db.stmt<P, R>
 db.rows<R>
 db.exec_result
+db.Driver
 db.row
 db.value
 ```
@@ -326,6 +328,8 @@ Required meaning:
 - `db.rows<R>` is a Move, one-pass typed row stream for exactly one execution, carrying a dependency
   on its statement/connection while native buffers need it.
 - `db.exec_result` contains affected-row and available command-status information.
+- `db.Driver { SQLite, PostgreSQL }` is the exact public driver identity used in errors, metadata,
+  delivery observations, and D14's explicit dynamic-SQL restriction; it has no `Any` variant.
 - `db.row` and `db.value` are explicit dynamic escape hatches.
 
 The common root declares the resource types and names `pub`, raw-only Drop hooks in
@@ -500,6 +504,7 @@ producer implementation / StaticQueryArtifact
   exact source bytes/hash
   deterministic per-driver wire bytes/hash and source map
   parameter occurrence/source-span table
+  per-driver parameter retention classes
   checked-metadata policy/digest
   generated bind and decode thunks
 ```
@@ -602,6 +607,37 @@ The compiler/preparer reports:
 - a parameter requiring an explicit native type declaration.
 
 Values are always bound parameters. Value interpolation into SQL text is not a typed-Query feature.
+
+#### 5.6.1 Binding retention
+
+The common execution contract borrows parameter storage only until the operation returns. This
+includes `rows` and `rows_stmt`: before exposing a stream resource, the driver must finish binding
+or retain every value in execution-owned storage. The returned `db.rows<R>` carries no borrow
+provenance from `Params`; it remains dependent only on its statement/connection and native result
+owners. The caller may therefore drop, replace, or mutate the original text/blob owner immediately
+after `rows`/`rows_stmt` returns and before the first `next`.
+
+Version 1 SQLite binding is exact:
+
+- scalar fields are passed by value;
+- `str`/`slice<u8>` and owned `string`/`array<u8>` payload bytes are bound with
+  `SQLITE_TRANSIENT` semantics, so SQLite owns its required copy before the call returns;
+- a prepared statement retains that native copy until reset/rebind/finalize, and the rows dependency
+  prevents reset while the execution is live;
+- partial-bind and native errors release every temporary and consume/drop each moved Params owner
+  exactly once.
+
+The baseline PostgreSQL `BufferedFull` path completes parameter transmission through the synchronous
+libpq call before returning its owned result. Any later single-row, portal, pipeline, or asynchronous
+path must retain its own parameter bytes until the native protocol no longer uses them.
+
+These are per-execution bind copies, never per-row copies. Tests and benchmarks report text/blob
+bytes copied and allocations separately from row decode. The generated driver binder plan records
+the retention class for every field, and Query/execution inspection reports the applicable
+`BindValue`/`BindCopy` class; this copy is documented Query cost, not an invisible optimizer choice.
+A future zero-copy bind mode requires an explicit driver-qualified surface, return provenance tying
+the execution to every source owner, and its own measurements; a driver may not silently substitute
+borrowed binding.
 
 ### 5.7 Row
 
@@ -1549,7 +1585,7 @@ command      db.command_file(slice<db.CommandOption>)
 prepare      db.prepare(exec, query, slice<db.PrepareOption>)
 execution    db.execute/one/maybe_one/all/rows(..., slice<db.ExecuteOption>)
 transaction  db.begin(conn, slice<db.TxOption>)
-metadata     db.metadata(exec, request, slice<db.MetaOption>)
+metadata     db.meta_database/meta_schemas/...(..., slice<db.MetaOption>)
 EXPLAIN      db.explain(exec, query, params, slice<db.ExplainOption>)
 ```
 
@@ -1990,19 +2026,22 @@ category.
 Conceptual common calls:
 
 ```align
-database := db.meta_database(exec, detail)?
-schemas := db.meta_schemas(exec, detail)?
-tables := db.meta_tables(exec, schema_filter, detail)?
-table := db.meta_table(exec, table_ref, detail)?
-columns := db.meta_columns(exec, table_ref, detail)?
-keys := db.meta_keys(exec, table_ref, detail)?
-indexes := db.meta_indexes(exec, table_ref, detail)?
-query_meta := db.meta_query(exec, query(), detail)?
+database := db.meta_database(exec, detail, [])?
+schemas := db.meta_schemas(exec, detail, [])?
+tables := db.meta_tables(exec, schema_filter, detail, [])?
+table := db.meta_table(exec, table_ref, detail, [])?
+columns := db.meta_columns(exec, table_ref, detail, [])?
+keys := db.meta_keys(exec, table_ref, detail, [])?
+indexes := db.meta_indexes(exec, table_ref, detail, [])?
+query_meta := db.meta_query(exec, query(), detail, [])?
 plan := db.explain(exec, query(), params, options)?
 ```
 
-These are distinct calls. `meta_table(Full)` does not automatically fetch columns, keys, indexes, or
-plans.
+These are distinct public primitives. Each metadata category has exactly one form whose final
+argument is `slice<db.MetaOption>`; `[]` means no options. The corresponding
+`sqlite.meta_*_native`/`postgres.meta_*_native` form receives that common slice plus one
+driver-native option slice. `meta_table(Full)` does not automatically fetch columns, keys, indexes,
+or plans.
 
 ### 18.3 Database metadata
 
@@ -2162,7 +2201,14 @@ The native package may expose:
 Static typed Queries are the default. Runtime SQL is explicit and weaker.
 
 ```align
-rows := db.dynamic_rows(exec, sql_text, params, out)?
+rows := db.dynamic_rows(
+  exec,
+  db.Driver.SQLite,
+  sql_text,
+  params,
+  out,
+  [],
+)?
 ```
 
 Dynamic results use:
@@ -2171,6 +2217,13 @@ Dynamic results use:
 db.row
 db.value
 ```
+
+The second argument is an exact `db.Driver` value, not `AnySupportedDriver` and not an inferred
+property of `exec`. `db.dynamic_execute` and `db.dynamic_rows` compare it with the execution handle
+and return `DriverMismatch` before sending SQL. Their parameter values are an explicit slice, and
+their final argument is `slice<db.ExecuteOption>`. A driver-native variant is itself qualified as
+`sqlite.dynamic_*_native`/`postgres.dynamic_*_native`; that module path is its exact restriction,
+and it receives one common option slice plus one native option slice.
 
 They do not silently decode into an arbitrary typed struct using reflection.
 
@@ -2214,6 +2267,7 @@ Performance is a headline requirement, but measured behavior wins over slogans.
 7. one-pass compound shaping
 8. native binary/columnar paths remain possible
 9. database-specific optimization remains visible and usable
+10. parameter bind retention/copy bytes are explicit and measurable
 ```
 
 ### 21.2 One statement is not automatically fastest
@@ -2230,6 +2284,7 @@ explosion. If an application explicitly chooses two Queries after measurement, i
 The implementation roadmap must add benchmarks for at least:
 
 - SQLite parameter bind + one-row typed decode;
+- SQLite streamed text/blob bind with transient-copy bytes and allocations separated;
 - PostgreSQL parameter bind + one-row typed decode;
 - file/inline Query artifact generation and cold/warm rebuild;
 - SQLite canonical migration catalog/replay at 10/100/1000 files;
@@ -2342,6 +2397,7 @@ Before a native database:
 - preserve exact source SQL identity while generating deterministic SQLite/source and
   PostgreSQL/`$n` wire entries plus reverse span maps;
 - generate binder/decoder thunks;
+- record per-driver `BindValue`/`BindCopy` retention classes for every Params field;
 - exercise named-parameter occurrence tables;
 - decode a fake flat scalar row;
 - prove interface/implementation/cache invalidation boundaries;
@@ -2414,6 +2470,8 @@ reported reason when it is unavailable. The direct-libpq comparison benchmark is
 - explicit prepare options;
 - `rows_stmt` with a `borrow mut` statement parameter and repeated sequential execution after each
   rows Drop;
+- text/blob rebind replaces the previous transient native copy only after the prior rows Drop;
+- partial-bind failure clears every installed binding and drops moved Params exactly once;
 - finalize/close on Drop and errors;
 - no implicit global statement cache.
 
@@ -2434,6 +2492,8 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - dependent `db.rows<R>` resource;
 - `next(borrow mut rows)` generation invalidation;
 - owner-tied `resource.view_from_raw` with invalid pointer/length/UTF-8 rejection;
+- SQLite text/blob Params source Drop/mutation after `rows` returns and before first `next`;
+- transient bind copied-byte/allocation/partial-error cleanup counts, with no per-row parameter copy;
 - SQLite current-row views;
 - PostgreSQL `BufferedFull` path first; `rows` is one-pass decode over that owned result, while
   explicitly selected single-row/portal delivery is D13;
@@ -2489,6 +2549,9 @@ Common categories:
 - static Query parameters/results;
 - explicit EXPLAIN.
 
+Each common category operation has one `MetaOption` slice. Each driver-native form has that common
+slice plus one separate native option slice; neither has an optionless overload.
+
 Native detail:
 
 - PostgreSQL OIDs/types/opclasses/index details/JSON plans;
@@ -2515,7 +2578,8 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
 ### D14 — dynamic SQL and native callbacks
 
 - settle and implement the minimal owned `db.value` sum and indexed `db.row`;
-- require a visible dynamic SQL string, explicit value slice, and explicit driver restriction;
+- require a visible dynamic SQL string, explicit value slice, exact `db.Driver` restriction, and
+  execute-option slice; reject driver mismatch before SQL send;
 - keep dynamic execution separate from typed Query descriptors and checked artifacts;
 - decode dynamic rows by indexed access only, with no struct reflection or name-based field writes;
 - add SQLite function/collation and PostgreSQL notice/COPY callback surfaces only after the
@@ -2606,6 +2670,13 @@ The design is implemented correctly only if all are true:
 49. English and Japanese prepared-statement examples type-check against the same signature.
 50. The first public database release completes driver-relevant D1–D12; D13/D14 remain committed
     additive work.
+51. `rows`/`rows_stmt` release all source Params provenance at return; SQLite v1 uses measured
+    transient text/blob bind copies and permits source invalidation before first `next`.
+52. Dynamic SQL names one exact `db.Driver` in source and checks it before sending SQL.
+53. Verified core signature tables contain only shipped forms; L4/L6 forms are marked required but
+    unimplemented until their owning PRs land.
+54. Every category metadata primitive has one `MetaOption` slice, and native forms add one separate
+    native option slice.
 
 ---
 

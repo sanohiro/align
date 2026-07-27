@@ -17,7 +17,6 @@ current, deliberately tight, limits.
 
 ```text
 arena { … }                 // expression block; all arena allocations freed at }, O(1)
-arena out { … }             // required L4 form; binds the same arena as `out: region`
 heap.new(x)   -> box<T>     // ONE arg; must be inside an arena {}; T = primitive scalar only
 b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
@@ -28,7 +27,13 @@ out-mode parameter. Parsing uses token lookahead, not whitespace.
 
 That is the entire box surface — no `.set()`, no deref operator.
 
-The named arena line is a settled prerequisite, not yet implemented. It does not widen `box<T>`:
+Required L4 signature, **not implemented yet**:
+
+```text
+arena out { … }             // binds the same arena as `out: region`
+```
+
+The named arena form is a settled prerequisite. It does not widen `box<T>`:
 `out` is a scope-limited allocation-destination capability for ordinary library functions, and
 anonymous/named arenas share the same begin/end and bulk cleanup. Full contract:
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §4.

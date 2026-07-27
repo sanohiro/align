@@ -333,3 +333,9 @@ and Rows. DB primitives have one mandatory option-slice form, mutable-borrow exa
 bindings with unchanged call syntax, and both language mirrors agree. The first public database
 release gate includes D11 migrations and D12 category metadata/EXPLAIN; D13/D14 remain committed
 additive work.
+
+Streaming execution also settled parameter retention: the common API releases source Params
+provenance when the call returns, SQLite v1 uses measured transient text/blob bind copies, and
+future asynchronous paths retain execution-owned bytes. Dynamic SQL carries an exact visible
+`db.Driver`; metadata category calls carry their `MetaOption` slice. Core ledgers list L4/L6 forms
+as required-but-unimplemented instead of calling them verified shipped signatures.

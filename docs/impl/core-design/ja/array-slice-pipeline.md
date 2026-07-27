@@ -43,9 +43,14 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
                                    (evens, odds) := xs.partition(p)
 
 array_builder<T>()                 // 実装済みの heap grow/freeze 形式
-array_builder<T>(out: region)      // 必須 L6 の region/plain-struct 形式
 builder.push(value)
 builder.build() -> array<T>
+```
+
+必須L6 signature（**未実装**）:
+
+```text
+array_builder<T>(out: region)      // region/plain-struct 形式
 ```
 
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。

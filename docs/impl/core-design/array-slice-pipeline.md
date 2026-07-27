@@ -46,9 +46,14 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
                                    (evens, odds) := xs.partition(p)
 
 array_builder<T>()                 // shipped heap grow/freeze form
-array_builder<T>(out: region)      // required L6 region/plain-struct form
 builder.push(value)
 builder.build() -> array<T>
+```
+
+Required L6 signature, **not implemented yet**:
+
+```text
+array_builder<T>(out: region)      // region/plain-struct form
 ```
 
 Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { … }`, or the
