@@ -4838,8 +4838,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Range kernels load values by value on every iteration and may run the same source slot on
-    /// multiple workers. Only primitive scalars, borrowed `str`, and non-Move Copy structs have a
-    /// safe by-value ABI here. Keep this codegen-side ownership gate beside the table-id validator:
+    /// multiple workers. Primitive scalars, borrowed `str`, and non-Move Copy structs have a safe
+    /// by-value ABI here. Keep this codegen-side ownership gate beside the table-id validator:
     /// hand-built/future MIR must not turn an unchecked `{ptr,len}` Move value into a repeated
     /// load-and-drop or a copied owning capture.
     fn validate_par_map_kernel_type(&self, ty: Ty) -> Result<(), CodegenError> {
@@ -4849,6 +4849,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
         valid
             .then_some(())
             .ok_or_else(|| self.err(format!("par_map range kernel values must be primitive, str, or a Copy struct, got {ty:?}")))
+    }
+
+    /// A range input may additionally be a borrowed `slice<T>` header. This is the element value
+    /// loaded from the owned `array<slice<T>>` header produced by `chunks`; it is safe to copy into
+    /// a worker call, but it must not silently widen the output side of a staged map.
+    fn validate_par_map_input_type(&self, ty: Ty) -> Result<(), CodegenError> {
+        if matches!(ty, Ty::Slice(_)) {
+            self.validate_par_map_type(ty)
+        } else {
+            self.validate_par_map_kernel_type(ty)
+        }
     }
 
     /// Captures are loaded once from the immutable context record and passed by value to the
@@ -5216,7 +5227,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         {
             return Err(self.err("par_map materialize kernels cannot contain filter stages"));
         }
-        self.validate_par_map_kernel_type(elem_in)?;
+        self.validate_par_map_input_type(elem_in)?;
         self.validate_par_map_kernel_type(elem_out)?;
         let reduce_ty = if reduce {
             Some(match out_ty {
@@ -5228,8 +5239,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
         };
         let mut terminal_capture_start = 0usize;
         for stage in stages {
-            self.validate_par_map_kernel_type(stage.elem_in)?;
-            self.validate_par_map_kernel_type(stage.elem_out)?;
+            self.validate_par_map_input_type(stage.elem_in)?;
+            if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }) {
+                if stage.elem_out != stage.elem_in {
+                    return Err(self.err("par_map filter stage must preserve its element type"));
+                }
+                self.validate_par_map_input_type(stage.elem_out)?;
+            } else {
+                self.validate_par_map_kernel_type(stage.elem_out)?;
+            }
             for ty in &stage.capture_tys {
                 self.validate_par_map_capture_type(*ty)?;
             }
@@ -7378,11 +7396,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // synchronous, so the entry alloca remains live until every worker has stopped
                 // reading it.
                 let src_ty = self.checked_operand_ty(src)?;
-                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
-                    return Err(self.err(format!("par_map source must be a slice or AoS array view, got {src_ty:?}")));
+                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                    return Err(self.err(format!("par_map source must be a slice, chunk array, or AoS array view, got {src_ty:?}")));
                 }
                 let source_elem_ty = match src_ty {
                     Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                    Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
                     Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
                     _ => return Err(self.err("par_map source shape could not be resolved")),
                 };
@@ -7391,7 +7410,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         "par_map source element type {source_elem_ty:?} does not match declared input {elem_in:?}"
                     )));
                 }
-                self.validate_par_map_kernel_type(*elem_in)?;
+                self.validate_par_map_input_type(*elem_in)?;
                 self.validate_par_map_kernel_type(*elem_out)?;
                 let Some(output_scalar) = ty_to_scalar(*elem_out).filter(|scalar| matches!(scalar, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) else {
                     return Err(self.err("par_map range output must be a non-owning primitive scalar"));
@@ -7436,8 +7455,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             stage.capture_tys.len()
                         )));
                     }
-                    self.validate_par_map_kernel_type(stage.elem_in)?;
-                    self.validate_par_map_kernel_type(stage.elem_out)?;
+                    self.validate_par_map_input_type(stage.elem_in)?;
+                    if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }) {
+                        if stage.elem_out != stage.elem_in {
+                            return Err(self.err("par_map filter stage must preserve its element type"));
+                        }
+                        self.validate_par_map_input_type(stage.elem_out)?;
+                    } else {
+                        self.validate_par_map_kernel_type(stage.elem_out)?;
+                    }
                     for (op, ty) in stage.captures.iter().zip(&stage.capture_tys) {
                         let actual = self.checked_operand_ty(op)?;
                         if actual != *ty {
@@ -7588,7 +7614,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         "par_map reduction result {result_ty:?} does not match declared output {elem_out:?}"
                     )));
                 }
-                self.validate_par_map_kernel_type(*elem_in)?;
+                self.validate_par_map_input_type(*elem_in)?;
                 self.validate_par_map_kernel_type(*elem_out)?;
                 for (op, ty) in captures.iter().zip(capture_tys) {
                     let actual = self.checked_operand_ty(op)?;
@@ -7598,11 +7624,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.validate_par_map_capture_type(*ty)?;
                 }
                 let src_ty = self.checked_operand_ty(src)?;
-                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
-                    return Err(self.err(format!("par_map reduction source must be a slice or AoS array view, got {src_ty:?}")));
+                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
+                    return Err(self.err(format!("par_map reduction source must be a slice, chunk array, or AoS array view, got {src_ty:?}")));
                 }
                 let source_elem_ty = match src_ty {
                     Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+                    Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
                     Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
                     _ => return Err(self.err("par_map reduction source shape could not be resolved")),
                 };
@@ -12011,6 +12038,151 @@ mod tests {
             err.to_string().contains("primitive, str, or a Copy struct"),
             "the codegen ownership guard should reject Move kernel values, got: {err}"
         );
+    }
+
+    #[test]
+    fn malformed_chunk_par_map_element_type_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let chunk_ty = Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true }));
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "return_i64".to_string(),
+                        stages: vec![],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: i64_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![chunk_ty, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![chunk_ty],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("a chunk par_map with a scalar element declaration must fail before kernel lowering");
+        assert!(err.to_string().contains("source element type"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_chunk_par_map_reduce_element_type_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let chunk_ty = Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true }));
+        let return_i64 = Function {
+            name: "return_i64".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![i64_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapReduce {
+                        src: Operand::Value(0),
+                        func: "return_i64".to_string(),
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: i64_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![chunk_ty, i64_ty],
+            vec![chunk_ty],
+            vec![],
+            vec![],
+            vec![return_i64],
+        )
+        .expect_err("a chunk reduction with a scalar element declaration must fail before kernel lowering");
+        assert!(err.to_string().contains("reduction source element type"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_chunk_filter_element_type_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let chunk_ty = Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true }));
+        let input_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let wrong_output_ty = Ty::Slice(Scalar::Int(IntTy { bits: 32, signed: true }));
+        let keep = Function {
+            name: "keep".to_string(),
+            params: vec![0],
+            ret: Ty::Bool,
+            slots: vec![input_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Bool(true)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let finish = Function {
+            name: "finish".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![wrong_output_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(
+                    1,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "finish".to_string(),
+                        stages: vec![ParMapStage {
+                            kind: ParMapStageKind::Filter,
+                            func: Some("keep".to_string()),
+                            captures: vec![],
+                            capture_tys: vec![],
+                            elem_in: input_ty,
+                            elem_out: wrong_output_ty,
+                        }],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: input_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![chunk_ty, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![chunk_ty],
+            vec![],
+            vec![],
+            vec![keep, finish],
+        )
+        .expect_err("a chunk filter that changes its slice type must fail before kernel lowering");
+        assert!(err.to_string().contains("filter stage must preserve"), "got: {err}");
     }
 
     #[test]

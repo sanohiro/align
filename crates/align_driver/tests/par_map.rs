@@ -3,8 +3,9 @@
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
 //! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
 //! primitive-scalar/AoS length-preserving map/filter/projection stages are fused into that range
-//! kernel; unsupported layouts such as SoA, chunks, and string-search retain the sequential
-//! fallback. Move captures are rejected by ownership checks.
+//! kernel; `chunks` supplies borrowed `slice` range values to the same kernel; unsupported layouts
+//! such as SoA and string-search retain the sequential fallback. Move captures are rejected by
+//! ownership checks.
 
 
 mod common;
@@ -393,33 +394,112 @@ fn main() -> i32 = 0
 
 #[test]
 fn chunks_par_map_chunk_function() {
-    if !backend_available() {
-        return;
-    }
-    // `chunks(n).par_map(f)` remains correct through the sequential collection fallback while
-    // the dedicated chunk-parallel algorithm is out of scope for the AoS range kernel.
+    // `chunks(n).par_map(f)` loads each borrowed chunk view as a range-kernel element.
     // [1..5].chunks(2) → [1,2],[3,4],[5]; chunk_sum → [3, 7, 5].
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3, 4, 5].chunks(2).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[2])\n  return Ok(())\n}\n";
-    let out = build_and_run("pm-chunks", src);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n");
-
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "pm-chunks", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(!text.contains("par_map["), "chunks must remain on the sequential fallback until its dedicated algorithm lands:\n{text}");
+    assert!(text.contains("par_map[chunk_sum]("), "chunks should use the range-kernel path:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n");
+}
+
+#[test]
+fn chunks_par_map_materialization_crosses_runtime_floor() {
+    // Keep the materializing path separate from the reduction test: 65,537 one-element chunks
+    // force worker ranges while loading borrowed slice headers and writing an owned result array.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  sums := xs.chunks(1).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[65536])\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks-large", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[chunk_sum]("), "large chunks map should use the materializing range kernel:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-large", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "65537\n0\n65536\n");
 }
 
 #[test]
 fn chunks_par_map_then_reduce() {
+    // Chunk-parallel sums, then a final reduction over the per-chunk results: 3+7+11 = 21.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  total := [1, 2, 3, 4, 5, 6].chunks(2).par_map(chunk_sum).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks-reduce", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map_reduce[chunk_sum]("), "direct chunk sum should use the partial reducer:\n{text}");
+    assert!(!text.contains("par_map[chunk_sum]("), "direct chunk sum must not materialize per-chunk results:\n{text}");
     if !backend_available() {
         return;
     }
-    // Chunk-parallel sums, then a final reduction over the per-chunk results: 3+7+11 = 21.
-    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  total := [1, 2, 3, 4, 5, 6].chunks(2).par_map(chunk_sum).sum()\n  print(total)\n  return Ok(())\n}\n";
     let out = build_and_run("pm-chunks-reduce", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "21\n");
+}
+
+#[test]
+fn chunks_par_map_reduction_crosses_runtime_floor() {
+    // 65,537 one-element chunks cross the caller-only floor, so this exercises the slice-header
+    // input ABI on worker ranges as well as the direct chunk reduction. The sum is 0..=65,536.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  total := xs.chunks(1).par_map(chunk_sum).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks-reduce-large", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map_reduce[chunk_sum]("), "large chunk reduction should use the partial reducer:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-reduce-large", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2147516416\n");
+}
+
+#[test]
+fn chunks_par_map_filter_preserves_slice_inputs() {
+    let src = "fn keep(c: slice<i64>) -> bool = c.len() == 2\nfn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3, 4, 5].chunks(2).where(keep).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[1])\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks-filter", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[where keep -> chunk_sum]("), "chunk filter should stay in one range kernel:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-filter", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n7\n");
+}
+
+#[test]
+fn chunks_par_map_rejects_slice_result() {
+    let src = "fn identity(c: slice<i64>) -> slice<i64> = c\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3].chunks(1).par_map(identity)\n  print(sums.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-chunks-slice-result", src), "par_map must reject a borrowed slice result");
+    assert!(
+        check_diagnostics("pm-chunks-slice-result", src).contains("'par_map' result must be a primitive scalar"),
+        "the rejection should name the result contract"
+    );
+}
+
+#[test]
+fn chunks_par_map_reduction_preserves_integer_wrap_across_workers() {
+    let src = "fn keep(c: slice<i8>) -> i8 = c[0]\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i8> := array_builder()\n  mut i := 0\n  loop {\n    b.push(127)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  total := xs.chunks(1).par_map(keep).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "pm-chunks-reduce-wrap", src);
+    assert!(!checked.diags.has_errors(), "unexpected errors:\n{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map_reduce[keep]("), "chunk wrap test should use the partial reducer:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-reduce-wrap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "127\n");
 }
 
 #[test]

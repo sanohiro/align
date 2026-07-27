@@ -560,7 +560,9 @@ pub enum Rvalue {
     Chunks { src: Operand, n: Operand, elem: Ty },
     /// `par_map(f)` over a `{ptr,len}` source `src` — apply the Pure `func` to each element in
     /// parallel (runtime `align_rt_par_map` + a generated whole-range kernel), materializing an
-    /// owned `array<elem_out>` `{ out_buf, count }`. `stages` holds prior admitted scalar/AoS
+    /// owned `array<elem_out>` `{ out_buf, count }`. A chunk source is an `array<slice<T>>` view;
+    /// its borrowed slice headers are loaded as range elements and the chunk header buffer is
+    /// released after the synchronous runtime call. `stages` holds prior admitted scalar/AoS
     /// map, filter, projection, and field-filter stages that are fused into the same kernel; it
     /// is empty for a direct source. `Filter` and `FilterField` stages preserve the current
     /// element and use a stable two-pass compaction in the runtime. `Project` extracts an AoS
@@ -580,11 +582,13 @@ pub enum Rvalue {
         elem_out: Ty,
         work_weight: u8,
     },
-    /// `par_map(f).sum()` over a direct, stage-free scalar source whose result is an integer:
-    /// apply the Pure `func` in parallel and combine one wrapping partial sum per claimed range,
-    /// without materializing the transformed array. `elem_in` is the function parameter type and
-    /// `elem_out` is the integer result/fold type. The generated range kernel writes one partial
-    /// value to the per-range output slot supplied by the runtime.
+    /// `par_map(f).sum()` over a direct, stage-free scalar or chunk source whose result is an
+    /// integer: apply the Pure `func` in parallel and combine one wrapping partial sum per claimed
+    /// range, without materializing the transformed array. For a chunk source, only the
+    /// `array<slice<T>>` header array remains materialized by `chunks`; it is dropped after the
+    /// reduction. `elem_in` is the function parameter type and `elem_out` is the integer
+    /// result/fold type. The generated range kernel writes one partial value to the per-range
+    /// output slot supplied by the runtime.
     ParMapReduce {
         src: Operand,
         func: String,
@@ -3984,14 +3988,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             // An explicitly parallel, directly-consumed integer map can fold its result in the
             // range kernel. This removes the full transformed array and the serial reread while
             // preserving the existing `par_map` Pure boundary and wrapping integer semantics.
-            // Keep staged maps and `chunks(...).par_map(...)` on their existing paths: the former
-            // is not yet a whole-range pipeline, and the latter's explicit producer materialization
-            // is a separate optimization slice.
+            // Keep staged maps on their existing paths: they are not yet a whole-range reduction.
+            // A direct `chunks(...).par_map(...)` is now eligible because its borrowed slice
+            // headers are safe range-kernel values and the integer reducer already accepts any
+            // fixed-width input stride.
             if stages.is_empty()
                 && let hir::ExprKind::ArrayParMap { source: map_source, stages: map_stages, func, captures, elem } = &source.kind
                 && map_stages.is_empty()
                 && matches!(elem, Ty::Int(_))
-                && !matches!(map_source.ty, Ty::DynSliceArray(_))
                 && let Some(elem_in) = direct_par_map_elem_in(map_source.ty)
             {
                 return lower_array_par_map_reduce(b, map_source, func, captures, elem_in, *elem);
@@ -4090,13 +4094,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
-            // With a direct source, or a length-preserving scalar/AoS map/filter/projection chain,
-            // run in parallel via one range kernel. Copy captures are lowered once into the
-            // call-scoped context record; callable and field filters use stable two-pass
-            // compaction. SoA, chunks, string-search, and unsupported aggregate layouts retain the
-            // sequential collect loop.
+            // With a direct scalar/AoS source, a chunk source, or a length-preserving scalar/AoS
+            // map/filter/projection chain, run in parallel via one range kernel. Copy captures are
+            // lowered once into the call-scoped context record; callable and field filters use
+            // stable two-pass compaction. SoA, string-search, and unsupported aggregate layouts
+            // retain the sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
+                Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
                 _ => None,
             };
@@ -4104,7 +4109,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 && let Some(elem_in) = elem_in
             {
                     let src = match source.ty {
-                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
+                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) => lower_expr(b, source),
                         _ => {
                             let (slot, n) = array_source_slot(b, source);
                             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
@@ -6094,12 +6099,13 @@ fn lower_where_str_contains_pred(b: &mut Builder, nl: &NeedleLower, elem: Operan
     }
 }
 
-/// Return the function parameter type for the direct range-kernel `par_map` shapes. The reduction
-/// fusion intentionally excludes `array<slice<T>>` (`chunks`) because its producer/materialization
-/// elision has a separate cost and ownership contract.
+/// Return the function parameter type for the direct range-kernel `par_map` shapes. A
+/// `DynSliceArray` source is the owned header array produced by `chunks`; each range element is a
+/// borrowed `slice<T>` value.
 fn direct_par_map_elem_in(ty: Ty) -> Option<Ty> {
     match ty {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => Some(align_sema::scalar_to_ty(s)),
+        Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
         _ => None,
     }
 }
@@ -6116,7 +6122,7 @@ fn lower_array_par_map_reduce(
     elem_out: Ty,
 ) -> Operand {
     let src = match source.ty {
-        Ty::Slice(_) | Ty::DynArray(_) => lower_expr(b, source),
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
         Ty::Array(_, _) => {
             let (slot, n) = array_source_slot(b, source);
             let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));

@@ -148,15 +148,18 @@ i64 align_rt_par_map_reduce(
   `where` stages. Its count kernel writes one survivor count per range; the runtime prefix-sums those
   counts in input order, allocates the exact result, and invokes the scatter kernel with one stable
   byte offset per range. The map/filter chain is Pure and is intentionally evaluated in both passes;
-  the result is `{null,0}` when no element survives. Projection filters, `str.contains`, aggregate
-  stages, and `chunks` remain on the sequential path.
+  the result is `{null,0}` when no element survives. SoA projections, `str.contains`, aggregate
+  stages, and other unsupported layouts remain on the sequential path. A `chunks` source uses the
+  ordinary range kernel with `slice<T>` element headers; the chunk-header allocation is still
+  materialized by `align_rt_chunks` and freed by the synchronous consumer.
 - `align_rt_par_map_reduce` is the specialized direct, stage-free integer
   `par_map(f).sum()` path. It allocates one 8-byte-aligned partial slot per claimed range rather
   than an element-sized output array, invokes the same caller-draining range scheduler, and combines
   the `result_stride`-wide wrapping integer partials in range order. `result_stride` is 1, 2, 4, or
   8 bytes. The kernel must store exactly one integer partial at its supplied `partial` pointer;
-  worker panics are joined and resumed before partials are read. This is not a generic parallel
-  reduction contract: staged pipelines, `chunks` producers, floating-point sums, and arbitrary
+  worker panics are joined and resumed before partials are read. Scalar and `chunks` sources share
+  this entry point; for `chunks`, only the owned header array remains as producer storage. This is
+  not a generic parallel reduction contract: staged pipelines, floating-point sums, and arbitrary
   reducers remain outside this entry point.
 
 ---

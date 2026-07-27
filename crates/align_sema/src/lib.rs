@@ -746,34 +746,42 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
 
 /// Whether a staged `par_map` can enter the range-kernel path. The source and every intermediate
 /// value must be a Copy value whose range-kernel ABI is already defined (primitive scalar, `str`,
-/// or a Copy struct). AoS struct fields may be projected in the kernel, and `where(.field)` uses
-/// the same extracted value for stable compaction. `SoA`, string-search, chunks, and other layouts
-/// stay sequential. Keep this predicate shared by effect checking and MIR lowering so a stage is
-/// never admitted to the parallel kernel without the matching Pure and ownership boundaries.
+/// a borrowed `slice`, or a Copy struct). A borrowed `slice` is an input-only range value for
+/// `array<slice<T>>` (`chunks`); it may be passed to the terminal or a callable `where`, but a
+/// map still has to produce a plain range-kernel output. AoS struct fields may be projected in the
+/// kernel, and `where(.field)` uses the same extracted value for stable compaction. `SoA`,
+/// string-search, and other layouts stay sequential. Keep this predicate shared by effect
+/// checking and MIR lowering so a stage is never admitted to the parallel kernel without the
+/// matching Pure and ownership boundaries.
 fn par_map_kernel_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
         || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums)))
 }
 
+fn par_map_kernel_input_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+    par_map_kernel_value(ty, structs, enums) || matches!(ty, Ty::Slice(_))
+}
+
 pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     let mut elem = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+        Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_value(elem, structs, enums) || stages.is_empty() {
+    if !par_map_kernel_input_value(elem, structs, enums) || stages.is_empty() {
         return false;
     }
     for stage in stages {
         match stage.kind {
             hir::StageKind::Map { .. } => {
-                if !par_map_kernel_value(elem, structs, enums) || !par_map_kernel_value(stage.out_ty, structs, enums) {
+                if !par_map_kernel_input_value(elem, structs, enums) || !par_map_kernel_value(stage.out_ty, structs, enums) {
                     return false;
                 }
                 elem = stage.out_ty;
             }
             hir::StageKind::Where { .. } => {
-                if !par_map_kernel_value(elem, structs, enums) || stage.out_ty != elem {
+                if !par_map_kernel_input_value(elem, structs, enums) || stage.out_ty != elem {
                     return false;
                 }
             }
@@ -798,17 +806,19 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs:
 }
 
 /// Whether a `par_map` result is produced by the malloc-backed range-kernel path. The parallel
-/// materializer accepts direct primitive/AoS sources and the admitted length-preserving staged
-/// forms; `chunks`, SoA, string-search, and other layouts deliberately stay on the arena-aware
-/// sequential collector. Keep this predicate shared with MIR and ownership analysis so the
-/// runtime's individually allocated output is never mistaken for arena storage (or vice versa).
+/// materializer accepts direct primitive/AoS sources, `array<slice<T>>` chunk sources, and the
+/// admitted length-preserving staged forms; SoA, string-search, and other layouts deliberately
+/// stay on the arena-aware sequential collector. Keep this predicate shared with MIR and
+/// ownership analysis so the runtime's individually allocated output is never mistaken for arena
+/// storage (or vice versa).
 pub fn par_map_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     let source_value = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+        Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_value(source_value, structs, enums) {
+    if !par_map_kernel_input_value(source_value, structs, enums) {
         return false;
     }
     stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums)
@@ -16499,8 +16509,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// `source.….par_map(f)` — apply the Pure function `f` to each surviving element and
     /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
     /// whole call graph) and return a primitive scalar. Lowering selects the parallel range kernel
-    /// for direct scalar/slice/AoS sources and admitted length-preserving scalar/AoS stages with
-    /// Copy captures; filtered field stages use stable compaction. SoA, string-search, chunks, and
+    /// for direct scalar/slice/AoS/chunk sources and admitted length-preserving scalar/AoS stages
+    /// with Copy captures; filtered field stages use stable compaction. SoA, string-search, and
     /// unsupported aggregate forms retain their sequential paths, while Move values are rejected
     /// by ownership checks.
     fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {

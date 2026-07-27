@@ -249,10 +249,14 @@ The implemented data-parallel operation is a dedicated materializer:
 ```text
 direct scalar/AoS source.par_map(f)
                                 → Rvalue::ParMapParallel { src, func, stages: [], captures, capture_tys, elem_in, elem_out, work_weight }
+direct chunk source.chunks(n).par_map(f)
+                                → Rvalue::ParMapParallel { src: array<slice<T>>, func, stages: [], captures, capture_tys, elem_in: slice<T>, elem_out, work_weight }
 staged scalar/AoS map/filter/project chain
                                 → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
 direct stage-free integer par_map(f).sum()
                                 → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight }
+direct stage-free integer chunks(n).par_map(f).sum()
+                                → Rvalue::ParMapReduce { src: array<slice<T>>, func, captures, capture_tys, elem_in: slice<T>, elem_out, work_weight }
 unsupported filtered par_map    → sequential pipeline fallback, preserving capture semantics
 source.chunks(n)                 → Rvalue::Chunks (a collection/view operation, not a loop hint)
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
@@ -265,12 +269,13 @@ arguments. The kernel contains the typed counted loop and direct calls for primi
 or Copy-struct map/filter values plus the terminal body. AoS projection stages extract the logical
 field after the backend layout permutation; `where(.field)` stages use the same count/prefix/
 scatter pair as callable filters, so output order stays source order. The runtime schedules
-disjoint `[start,end)` ranges. The specialized `ParMapReduce` node covers only a
-direct, stage-free integer `par_map(f).sum()`; its generated kernel folds each range with plain
-wrapping integer addition and publishes one partial result per range, so no transformed array is
-materialized. SoA projections, `str.contains` filters, `chunks` producers, floating-point sums, and
-arbitrary reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)`
-node or silently
+disjoint `[start,end)` ranges. A chunk source loads each borrowed `slice<T>` header as one range
+element; the owned chunk-header buffer remains materialized by `Rvalue::Chunks` and is dropped after
+the synchronous consumer. The specialized `ParMapReduce` node covers direct, stage-free integer
+`par_map(f).sum()` for scalar and chunk sources; its generated kernel folds each range with plain
+wrapping integer addition and publishes one partial result per range, so no transformed result
+array is materialized. SoA projections, `str.contains` filters, floating-point sums, and arbitrary
+reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
 parallelize ordinary reductions.
 
 Each parallel node also carries a compiler-generated `work_weight` in `{1, 2, 4}`. The post-lowering
