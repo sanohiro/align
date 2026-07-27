@@ -11,7 +11,10 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, enum_is_move, may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move, FloatTy, IntTy, Layout, Scalar, Ty};
+use align_sema::{
+    DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
+};
 use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -2359,9 +2362,15 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         }
         // A partial owned-field move out of a struct (`n := u.name`) took the `string` field's
         // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
-        // null there, not the buffer the new binding now owns. (Sema allows this only for a depth-1
-        // `string` field; deeper paths / Move-struct fields stay rejected, so `path` is `[idx]`.)
-        hir::ExprKind::Field { root, path } if path.len() == 1 && (e.ty == Ty::String || align_sema::is_move_handle(e.ty)) => {
+        // null there, not the buffer the new binding now owns. Sema allows this for a depth-1
+        // `string`, `Option<string>`, or Move-handle field; deeper paths / Move-struct fields stay
+        // rejected, so `path` is `[idx]`.
+        hir::ExprKind::Field { root, path }
+            if path.len() == 1
+                && (e.ty == Ty::String
+                    || e.ty == Ty::Option(Scalar::String)
+                    || align_sema::is_move_handle(e.ty)) =>
+        {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
@@ -2369,7 +2378,10 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // struct slot (the whole `{ tag, payloads }` aggregate) so the struct's exit `Drop` →
         // `drop_enum` reads tag 0 and frees null, not the buffer `ps` now owns. Mirrors the `string`
         // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
-        hir::ExprKind::Field { root, path } if path.len() == 1 && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.enums)) => {
+        hir::ExprKind::Field { root, path }
+            if path.len() == 1
+                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums)) =>
+        {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
@@ -2714,16 +2726,32 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             }
         }
         hir::Stmt::AssignField { root, path, value } => {
+            // Like whole-local `s = s`, exact field self-assignment preserves the value and its
+            // ownership. Dropping the destination before reloading the identical RHS would read
+            // freed storage; storing and then nulling the identical source would erase it.
+            if matches!(
+                &value.kind,
+                hir::ExprKind::Field { root: source, path: source_path }
+                    if source == root && source_path == path
+            ) {
+                return;
+            }
             // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
             // leaves stored under the extended path); a scalar value is a single field store.
-            // If the leaf being overwritten is an owned `string` field, free the OLD value first
-            // (else it leaks — Slice 3 handled whole-struct reassign, not field-level) and null the
-            // RHS's moved source so it isn't double-freed. (Slice 4b: an owned nested-struct value
-            // `u.addr = Address{…}` still expands via `store_value_at` — its own owned fields are a
-            // later slice; only a direct `string` leaf is drop-of-old'd here.)
-            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. }) && field_ty_at(b, *root, path) == Ty::String;
+            // If the leaf being overwritten has L1a's supported owned Drop plan (`string` or
+            // `Option<string>`), drop the OLD value first and null a moved RHS source after the
+            // replacement is stored. Nested aggregate replacement remains in its owning slice.
+            let leaf_ty = field_ty_at(b, *root, path);
+            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums);
+            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. })
+                && (matches!(leaf_plan, DropPlan::Leaf(Ty::String))
+                    || matches!(
+                        leaf_plan,
+                        DropPlan::Option(ref payload)
+                            if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
+                    ));
             if drop_old_field {
-                let old = b.fresh_value(Ty::String);
+                let old = b.fresh_value(leaf_ty);
                 b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
                 b.push(Stmt::DropValue(Operand::Value(old)));
             }

@@ -1,0 +1,291 @@
+//! L1a: the canonical recursive Drop plan and `Option<string>` struct fields.
+//!
+//! Runtime cases intentionally exercise ownership transfers and replacement. A stale alias
+//! double-frees and aborts; a missing transfer corrupts the observed payload. Allocation/free
+//! parity is measured by `bench/owned_tagged_payload`.
+
+mod common;
+use common::*;
+
+const DECL: &str = "Item { detail: Option<string>, n: i64 }\n";
+
+fn mir_text(src: &str) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "owned-tagged-payload.align", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
+}
+
+#[test]
+fn option_string_field_constructs_none_and_some() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { detail: Option<string>, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  a := Item { detail: None, n: 3 }\n",
+        "  b := Item { detail: Some(\"hello\".clone()), n: 4 }\n",
+        "  s := b.detail else { return 90 }\n",
+        "  return (a.n + b.n + s.len()) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-basic", src).status.code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn whole_struct_return_and_pass_transfer_one_owner() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn make(some: bool) -> Item {{\n\
+           if some {{ return Item {{ detail: Some(\"abc\".clone()), n: 5 }} }}\n\
+           return Item {{ detail: None, n: 7 }}\n\
+         }}\n\
+         fn take(v: Item) -> i64 {{\n\
+           s := v.detail else {{ return v.n }}\n\
+           return v.n + s.len()\n\
+         }}\n\
+         fn main() -> i32 {{ return (take(make(true)) + take(make(false))) as i32 }}\n"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-transfer", &src)
+            .status
+            .code(),
+        Some(15)
+    );
+}
+
+#[test]
+fn whole_struct_replacement_covers_all_tag_transitions() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn main() -> i32 {{\n\
+           mut v := Item {{ detail: Some(\"old\".clone()), n: 1 }}\n\
+           v = Item {{ detail: Some(\"newer\".clone()), n: 2 }}\n\
+           v = Item {{ detail: None, n: 3 }}\n\
+           v = Item {{ detail: Some(\"final\".clone()), n: 4 }}\n\
+           s := v.detail else {{ return 90 }}\n\
+           return (v.n + s.len()) as i32\n\
+         }}\n"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-reassign", &src)
+            .status
+            .code(),
+        Some(9)
+    );
+}
+
+#[test]
+fn field_replacement_covers_all_tag_transitions() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn main() -> i32 {{\n\
+           mut v := Item {{ detail: Some(\"old\".clone()), n: 7 }}\n\
+           v.detail = Some(\"newer\".clone())\n\
+           v.detail = None\n\
+           v.detail = Some(\"final\".clone())\n\
+           s := v.detail else {{ return 90 }}\n\
+           return (v.n + s.len()) as i32\n\
+         }}\n"
+    );
+    let mir = mir_text(&src);
+    assert_eq!(
+        mir.matches("drop_value").count(),
+        3,
+        "each old tagged field must be dropped before replacement:\n{mir}"
+    );
+    let ir = emit_llvm(&src);
+    assert!(
+        ir.matches("dropoptissome").count() >= 4,
+        "replacement and final struct Drop must all test the tag:\n{ir}"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-replace", &src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn field_self_assignment_preserves_value_and_ownership() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn main() -> i32 {{\n\
+           mut v := Item {{ detail: Some(\"hello\".clone()), n: 7 }}\n\
+           v.detail = v.detail\n\
+           s := v.detail else {{ return 90 }}\n\
+           return (v.n + s.len()) as i32\n\
+         }}\n"
+    );
+    let mir = mir_text(&src);
+    assert_eq!(
+        mir.matches("drop_value").count(),
+        0,
+        "exact field self-assignment must be an ownership-preserving no-op:\n{mir}"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-self-assign", &src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
+fn if_match_and_loop_edges_keep_one_live_payload() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn choose(some: bool) -> Item {{\n\
+           v := if some {{ Item {{ detail: Some(\"edge\".clone()), n: 2 }} }} else {{ Item {{ detail: None, n: 3 }} }}\n\
+           return v\n\
+         }}\n\
+         fn main() -> i32 {{\n\
+           mut v := choose(false)\n\
+           mut i := 0\n\
+           loop {{\n\
+             if i >= 3 {{ break }}\n\
+             v = choose(i == 2)\n\
+             i = i + 1\n\
+           }}\n\
+           n := match v.detail {{ Some(s) => s.len(), None => 90 }}\n\
+           return (v.n + n) as i32\n\
+         }}\n"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-edges", &src)
+            .status
+            .code(),
+        Some(6)
+    );
+}
+
+#[test]
+fn nested_outer_struct_uses_the_same_recursive_plan() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Inner { detail: Option<string> }\n",
+        "Outer { inner: Inner, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  o := Outer { inner: Inner { detail: Some(\"nested\".clone()) }, n: 2 }\n",
+        "  s := o.inner.detail else { return 90 }\n",
+        "  return (o.n + s.len()) as i32\n",
+        "}\n",
+    );
+    // Deep partial moves remain explicitly deferred in L1a.
+    assert!(check_errs("owned-option-field-deep-partial", src));
+
+    let supported = concat!(
+        "Inner { detail: Option<string> }\n",
+        "Outer { inner: Inner, n: i64 }\n",
+        "fn size(o: Outer) -> i64 = o.n\n",
+        "fn main() -> i32 {\n",
+        "  o := Outer { inner: Inner { detail: Some(\"nested\".clone()) }, n: 8 }\n",
+        "  return size(o) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-nested", supported)
+            .status
+            .code(),
+        Some(8)
+    );
+}
+
+#[test]
+fn early_try_drops_already_initialized_owned_fields() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Pair { first: string, detail: Option<string> }\n",
+        "fn maybe(fail: bool) -> Result<string, Error> {\n",
+        "  if fail { return Err(error(17)) }\n",
+        "  return Ok(\"ok\".clone())\n",
+        "}\n",
+        "fn build(fail: bool) -> Result<i64, Error> {\n",
+        "  p := Pair { first: \"first\".clone(), detail: Some(maybe(fail)?) }\n",
+        "  return Ok(p.first.len())\n",
+        "}\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  print(build(true)?)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-early-try", src)
+            .status
+            .code(),
+        Some(17)
+    );
+}
+
+#[test]
+fn option_move_struct_remains_an_l1b_diagnostic() {
+    let src = concat!(
+        "Inner { name: string }\n",
+        "Outer { value: Option<Inner> }\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "option-move-struct.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "Option<MoveStruct> must remain rejected"
+    );
+    assert!(
+        rendered.contains("L1b"),
+        "diagnostic must name the owning slice:\n{rendered}"
+    );
+}
+
+#[test]
+fn llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation() {
+    let src = concat!(
+        "Item { detail: Option<string> }\n",
+        "fn none() -> Item = Item { detail: None }\n",
+        "fn main() -> i32 {\n",
+        "  x := none()\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let ir = emit_llvm(src);
+    assert!(
+        ir.contains("dropoptissome"),
+        "Drop must test the Option tag:\n{ir}"
+    );
+    let none_start = ir
+        .find("define internal")
+        .expect("missing function definition");
+    let none_body = &ir[none_start..ir.find("\n}").map_or(ir.len(), |end| end + 2)];
+    assert!(
+        !none_body.contains("@align_rt_alloc") && !none_body.contains("@malloc"),
+        "the None constructor must not allocate:\n{none_body}"
+    );
+}

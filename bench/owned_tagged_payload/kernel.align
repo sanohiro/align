@@ -1,0 +1,83 @@
+ScalarRow { n: i64 }
+TaggedRow { detail: Option<string>, n: i64 }
+Pair { first: string, detail: Option<string> }
+
+pub fn scalar_rows(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    row := ScalarRow { n: i % 17 }
+    total = total + row.n
+    i = i + 1
+  }
+}
+
+pub fn tagged_none(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    row := TaggedRow { detail: None, n: i % 17 }
+    total = total + row.n
+    i = i + 1
+  }
+}
+
+pub fn tagged_some(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    row := TaggedRow { detail: Some("payload".clone()), n: i % 17 }
+    total = total + row.n
+    i = i + 1
+  }
+}
+
+pub fn tagged_sparse(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    if i % 100 == 0 {
+      row := TaggedRow { detail: Some("payload".clone()), n: i % 17 }
+      total = total + row.n
+    } else {
+      row := TaggedRow { detail: None, n: i % 17 }
+      total = total + row.n
+    }
+    i = i + 1
+  }
+}
+
+pub fn tagged_replace(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    mut row := TaggedRow { detail: Some("old".clone()), n: i % 17 }
+    row.detail = Some("new".clone())
+    row.detail = None
+    row.detail = Some("final".clone())
+    total = total + row.n
+    i = i + 1
+  }
+}
+
+fn fail_string() -> Result<string, Error> = Err(error(17))
+
+fn construct_then_fail() -> Result<i64, Error> {
+  pair := Pair { first: "first".clone(), detail: Some(fail_string()?) }
+  return Ok(pair.first.len())
+}
+
+pub fn tagged_early_try(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    total = total + (construct_then_fail() else 0)
+    i = i + 1
+  }
+}

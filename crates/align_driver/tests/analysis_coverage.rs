@@ -7,6 +7,30 @@
 mod common;
 use common::*;
 
+#[test]
+fn recursive_drop_plan_is_cycle_safe() {
+    let src = "\
+Node { next: Option<Node> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("recursive-drop-plan", src),
+        "an inline recursive tagged field must diagnose instead of recursing or panicking"
+    );
+}
+
+#[test]
+fn unsupported_owned_option_field_fails_closed() {
+    let src = "\
+Holder { values: Option<array<i64>> }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("unsupported-owned-option-field", src),
+        "L1a must not silently admit another owned Option field"
+    );
+}
+
 // --- 1-2: an arena value escaping through a `match` arm (region_of lacked `Match`) ---
 #[test]
 fn arena_value_escaping_via_match_arm_is_rejected() {

@@ -1204,7 +1204,7 @@ borrow-bearing type are prohibited.
 
 ### L1a — recursive DropPlan framework and `Option<string>` fields
 
-This is the first implementation PR. Its exact scope is:
+**Status: complete.** This first implementation slice:
 
 - introduce one canonical recursive owned-value/Drop-plan classifier after all struct/enum
   definitions are resolved;
@@ -1265,9 +1265,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 bench/owned_tagged_payload/run.sh
 ```
 
-The focused test invokes successful programs under the repository's double-free/leak-sensitive
-allocation harness and compile-fail programs through the normal diagnostic path. The benchmark is
-manual evidence recorded in the PR; it does not become an ordinary CI gate.
+The focused test runs successful programs through the normal double-free-sensitive runtime path and
+compile-fail programs through the normal diagnostic path. The manual alloc-count benchmark is the
+leak-sensitive gate, including field tag transitions and early-`?` construction cleanup; it does
+not become an ordinary CI gate.
+
+Recorded native Apple Silicon evidence:
+
+```text
+scalar:         1.671 ms  alloc=       0 free=       0
+None:           1.639 ms  alloc=       0 free=       0
+Some:          38.861 ms  alloc= 1000000 free= 1000000
+1%-Some:        2.188 ms  alloc=   10000 free=   10000
+replacement:   61.374 ms  alloc= 3000000 free= 3000000
+early `?`:     17.625 ms  alloc= 1000000 free= 1000000
+raw LLVM Option Drop tag branches: 26
+```
+
+The counts are the correctness gate; timings are one manual regression record and remain
+host-sensitive.
 
 ### L1b — Move sum/Option/Result payload completion
 

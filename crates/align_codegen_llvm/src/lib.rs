@@ -25,7 +25,10 @@ pub mod pgo;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, ConstElem, Function, Operand, ParMapStage, ParMapStageKind, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{enum_is_move, payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
+use align_sema::{
+    drop_plan, enum_is_move, scalar_to_ty, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy,
+    Layout, Scalar, StructDef, TupleDef, Ty, ERROR_VARIANT_CODE,
+};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -6020,7 +6023,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // element's owned fields read {null,0} until constructed — its per-element
                         // `Drop` then frees nulls on an unwritten element (no-op). (Slice 4a.)
                         self.llvm_type(ty).into_array_type().const_zero().into()
-                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..)) {
+                    } else if (matches!(ty, Ty::Option(_) | Ty::Result(..))
+                        && drop_plan(ty, self.structs, self.enums).needs_drop())
+                        || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..))
+                    {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
                         // unconstructed / moved-out path (no-op) — see `drop_struct_fields`. A Move enum
@@ -6062,6 +6068,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     let zero: inkwell::values::BasicValueEnum = match self.structs[sid as usize].fields[*idx as usize].ty {
                         Ty::Enum(eid) => self.enum_types[eid as usize].const_zero().into(),
+                        Ty::Option(payload) => {
+                            option_struct_type(self.ctx, payload, self.struct_types, self.enum_types)
+                                .const_zero()
+                                .into()
+                        }
                         // A Move **handle** field is a single opaque POINTER, not a `{ptr,len}` —
                         // zeroing it with a 16-byte slice struct would clobber the next field.
                         // `handle_free_fn` is the same predicate that decides its drop is a pointer
@@ -6135,7 +6146,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if payload_is_move(ty) {
+                    } else if matches!(ty, Ty::Option(_) | Ty::Result(..))
+                        && drop_plan(ty, self.structs, self.enums).needs_drop()
+                    {
                         // An Option/Result owning a Move payload: free each owned payload field
                         // (null-safe — the inactive arm reads {null,0}/null, and a moved-out aggregate
                         // was nulled at the move site). A `reader`/`writer` payload is a bare handle
@@ -6313,14 +6326,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
                 Stmt::DropValue(op) => {
-                    // Free the buffer of an owned `{ptr, len}` value (an unbound temporary). An
-                    // `array<string>` temporary would need the deep free, but none is produced today
-                    // (`fs.read_dir` is always bound via `?`), so the shallow free stays correct here.
+                    let ty = self.f.operand_ty(op);
                     let agg = self.operand(op)?.into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "dropvalptr").map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_call(self.funcs["free"], &[ptr.into()], "")
-                        .map_err(|e| self.err(e))?;
+                    if ty == Ty::Option(Scalar::String) {
+                        self.drop_option_string_aggregate(agg)?;
+                    } else {
+                        // Free the buffer of an owned `{ptr, len}` value (an unbound temporary). An
+                        // `array<string>` temporary would need the deep free, but none is produced
+                        // today (`fs.read_dir` is always bound via `?`), so the shallow free stays
+                        // correct here.
+                        let ptr = self
+                            .builder
+                            .build_extract_value(agg, 0, "dropvalptr")
+                            .map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["free"], &[ptr.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
                 }
             }
         }
@@ -9751,6 +9773,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ptr = self.builder.build_extract_value(agg, 0, "dropfldptr").map_err(|e| self.err(e))?;
                     self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
+                // L1a's first conditional owned leaf. Test the tag before loading/freeing the
+                // payload: `None` leaves its payload storage semantically uninitialized, while
+                // `Some` owns exactly one string buffer. Construction currently zero-initializes
+                // the aggregate as an additional defense, but Drop correctness does not rely on it.
+                Ty::Option(Scalar::String) => {
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropopt").map_err(|e| self.err(e))?;
+                    let oty = option_struct_type(self.ctx, Scalar::String, self.struct_types, self.enum_types);
+                    let option = self
+                        .builder
+                        .build_load(oty, fp, "dropoptv")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    self.drop_option_string_aggregate(option)?;
+                }
                 // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
                 Ty::Struct(nid) if struct_is_move(nid, self.structs, self.enums) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropnest").map_err(|e| self.err(e))?;
@@ -9761,7 +9797,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // owned buffer via `drop_enum` (a non-Move enum owns nothing → not a Move struct field →
                 // never reaches here). `DropFlagInit` zeroes the aggregate, so a moved-out / unconstructed
                 // enum field reads tag 0 and frees `null` — null-safe, single-free every path.
-                Ty::Enum(eid) if enum_is_move(eid, self.enums) => {
+                Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums) => {
                     let fp = self.builder.build_struct_gep(st, base, pi, "dropenumfld").map_err(|e| self.err(e))?;
                     self.drop_enum(fp, eid)?;
                 }
@@ -9823,6 +9859,52 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Drop an `Option<string>` aggregate by testing its live tag before reading the payload.
+    /// Shared by recursive struct Drop and field-replacement `DropValue`, so both paths have the
+    /// same inactive-storage rule and LLVM CFG.
+    fn drop_option_string_aggregate(
+        &self,
+        option: inkwell::values::StructValue<'c>,
+    ) -> Result<(), CodegenError> {
+        let tag = self
+            .builder
+            .build_extract_value(option, 0, "dropopttag")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let some = self.ctx.append_basic_block(self.func, "drop.opt.some");
+        let cont = self.ctx.append_basic_block(self.func, "drop.opt.cont");
+        let is_some = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.ctx.i8_type().const_int(1, false),
+                "dropoptissome",
+            )
+            .map_err(|e| self.err(e))?;
+        self.builder
+            .build_conditional_branch(is_some, some, cont)
+            .map_err(|e| self.err(e))?;
+        self.builder.position_at_end(some);
+        let payload = self
+            .builder
+            .build_extract_value(option, 1, "dropoptpayload")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        let ptr = self
+            .builder
+            .build_extract_value(payload, 0, "dropoptptr")
+            .map_err(|e| self.err(e))?;
+        self.builder
+            .build_call(self.funcs["free"], &[ptr.into()], "")
+            .map_err(|e| self.err(e))?;
+        self.builder
+            .build_unconditional_branch(cont)
+            .map_err(|e| self.err(e))?;
+        self.builder.position_at_end(cont);
         Ok(())
     }
 
