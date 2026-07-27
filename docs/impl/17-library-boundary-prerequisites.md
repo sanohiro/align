@@ -145,9 +145,14 @@ rejected. Binding preserves both return summaries; a mutable function local or c
 unions the sorted parameter-index sets, so the indirect result is tied to every owner/region that
 any reachable target may use. When its return type may carry borrow provenance, an unresolved
 function-typed parameter conservatively includes every `Borrow`/`BorrowMut` input plus every
-by-value/out Copy input whose type recursively carries a view or `resource_ref`; it does not make a
-consumed by-value Move owner returnable. When the return may carry region provenance, it includes
-every `region` input. Corrupt/out-of-range summaries fail closed.
+by-value/out input whose type recursively may carry a view, `resource_ref`, dependent resource, or
+other embedded borrow — including Move inputs. Call transfer captures that embedded provenance
+before nulling the moved source and attaches it to the indirect result. This does not legalize
+returning a view of a consumed owner that dies in the callee; ordinary callee escape checking still
+rejects that shape. It does preserve a moved dependent child or Move aggregate that is itself
+returned. When the return may carry region provenance, the fallback includes every explicit
+`region` input plus region provenance embedded in all compatible value inputs. Corrupt/out-of-range
+summaries fail closed.
 
 The inferred `Effect` and return summaries remain excluded from written source-level function-type
 equality; parameter modes are not. They are concrete checked-HIR/interface facts consumed by
@@ -200,8 +205,10 @@ to the same caller local. This does not make builders legal aggregate fields.
 An opaque resource declaration names its exactly-once Drop hook:
 
 ```align
-pub resource conn = internal.drop_conn
-pub resource stmt<P, R> = internal.drop_stmt
+import pkg.db.internal.resource
+
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 ```
 
 A resource declaration is not a data struct or sum type. It defines an opaque one-word native
@@ -266,10 +273,10 @@ Rules:
   `pkg.db.postgres`, and `pkg.db.internal.*` are privileged descendants; an importing application or
   another package is not.
 - The `pub` Drop-hook module accepts only `raw` and need not import the resource-declaring module.
-  The root may therefore reference `pkg.db.internal.drop_conn`, while a driver descendant imports
-  the root type and constructs it directly from an expected `db.conn`; `internal` never imports the
-  root and the graph stays acyclic. Package `internal` visibility keeps the hook out of consumer
-  source APIs; the generated root thunk supplies separate-compilation linkage.
+  The root may therefore reference `pkg.db.internal.resource.drop_conn`, while a driver descendant
+  imports the root type and constructs it directly from an expected `db.conn`; `internal` never
+  imports the root and the graph stays acyclic. Package `internal` visibility keeps the hook out of
+  consumer source APIs; the generated root thunk supplies separate-compilation linkage.
 - Module visibility is enforced even inside `unsafe`; unsafe does not bypass representation
   privilege.
 
@@ -696,6 +703,10 @@ conditional Drop, a Move struct/sum needs a recursive tagged payload plan, and a
 replace these values with codes, empty-string sentinels, an opaque error allocation, or a
 database-private Result.
 
+The implementation split is exact: L1a admits only the required `Option<string>` struct-field leaf
+and establishes the recursive plan framework; L1b admits Move struct/sum payloads in
+Option/Result/user sums, including `Option<MoveStruct>`, and completes tagged control flow.
+
 The settled rule is:
 
 - `Option<T>`, `Result<T,E>`, and user sum payloads may contain any finite, non-recursive type with
@@ -738,9 +749,14 @@ The new semantics must be explicit before LLVM:
 - HIR resource types carry declaration identity and the producer-owned Drop-thunk identity/ABI
   fingerprint.
 - MIR locals keep the existing path-local cleanup bit for resources and Move aggregates.
-- MIR has generic resource construction, dependent construction, borrow, raw-view construction,
-  raw extraction, ownership transfer, and Drop;
+- MIR has generic `ResourceFromRaw`, dependent
+  `ResourceFromRawBorrowed { resource_def, raw, parent_ref }`, borrow,
+  `ResourceViewFromRaw { resource_def, owner_ref, ptr, len, view_kind, validation_plan }`, raw
+  extraction, ownership transfer, and Drop operations;
   there is no `DbConnDrop`/`HttpServerDrop` family.
+- dependent construction carries the parent generation through HIR/MIR, while raw-view construction
+  carries explicit checked size/null/alignment/UTF-8 validation and its successful owner
+  generation; LLVM only lowers those facts.
 - a `BorrowMut` call ends the owner generation in checked-HIR borrow state before the call.
 - direct and indirect calls share the same parameter-mode ABI and alias/provenance checks, including
   the indirect target's joined return summaries.
@@ -755,18 +771,19 @@ borrow-bearing type are prohibited.
 
 ## 10. Implementation PR sequence
 
-### L1a — recursive DropPlan and `Option<Move>` fields
+### L1a — recursive DropPlan framework and `Option<string>` fields
 
 This is the first implementation PR. Its exact scope is:
 
 - introduce one canonical recursive owned-value/Drop-plan classifier after all struct/enum
   definitions are resolved;
-- make `Option<Move>` a legal struct field;
+- make `Option<string>` a legal struct field and use it as the first conditional owned leaf;
 - mark the enclosing struct Move;
 - emit tag-tested Drop for the field on normal/early cleanup and drop-old reassignment;
 - move/null the live payload on whole-struct moves and supported field extraction;
-- keep recursive types, nested partial moves not covered by the existing place machinery, and
-  arbitrary Move collection elements rejected with explicit diagnostics;
+- keep `Option<MoveStruct>`, Move sum/Result payloads, recursive types, nested partial moves not
+  covered by the existing place machinery, and arbitrary Move collection elements rejected with
+  explicit diagnostics until their owning slices;
 - add no database, resource, borrow syntax, or runtime library dependency.
 
 Planned changed files:
@@ -798,7 +815,7 @@ Acceptance:
 - replacing `Some(old)` drops old before installing new; `Some -> None` drops old; `None -> Some`
   does not touch uninitialized payload;
 - `?` during construction drops every already-initialized owned field exactly once;
-- a nested owned struct inside `Option` recurses through the same plan;
+- `Option<MoveStruct>` still receives the explicit L1b-not-yet-supported diagnostic;
 - invalid recursive and unsupported deep partial-move cases fail with diagnostics, never panic;
 - emitted LLVM has one tag branch on Drop and no allocation on the `None`/unrelated success path;
 - `scripts/test-pr.sh` and workspace Clippy pass after the focused test.
@@ -833,7 +850,8 @@ Scope:
 
 Acceptance includes the exact `NativeError`/`DbError`/`Result<Option<Output>,DbError>` shape from
 §8.1, with allocation counters proving cleanup on every success/error control-flow edge and no
-error allocation on an `Ok` hot path.
+error allocation on an `Ok` hot path. It also includes `Option<MoveStruct>` with nested owned fields,
+proving recursive tag-driven Drop and move/null behavior; this case is not an L1a acceptance test.
 
 ### L2 — borrowed parameters and interface summaries
 
@@ -859,6 +877,8 @@ Acceptance:
 - function-value binding and indirect calls retain all four parameter modes exactly;
 - borrow-returning function-value joins union return-borrow/region summaries, and an unresolved
   higher-order parameter uses the all-compatible-input summary;
+- an indirect identity over a by-value dependent child/Move view aggregate transfers its embedded
+  parent provenance to the result; the parent cannot drop early;
 - a deterministic exclusive-state shaper is Pure, while captured mutation and unsafe/I/O remain
   Impure;
 - imported and same-unit functions produce identical diagnostics;
@@ -885,6 +905,9 @@ Acceptance:
 - a ref cannot survive owner move/drop/mutable borrow;
 - a dependent resource prevents parent move/drop/mutable borrow until the child drops;
 - a raw-derived `str`/slice cannot outlive the supplied resource generation;
+- emitted MIR contains `ResourceFromRawBorrowed` with the exact parent generation and
+  `ResourceViewFromRaw` with the complete validation plan; no generic raw cast substitutes for
+  either operation;
 - invalid native pointer/length pairs never become safe views;
 - another package cannot construct or extract the resource, including in `unsafe`;
 - a root resource, raw-only internal Drop hook, and driver descendant type-check with an acyclic

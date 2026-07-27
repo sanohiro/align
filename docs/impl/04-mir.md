@@ -61,18 +61,42 @@ Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **
 The library boundary adds generic MIR operations, never package-specific variants:
 
 ```text
-ResourceFromRaw { resource_def, raw }       // unsafe; establishes ownership
-ResourceBorrow { resource_def, owner_place }// Copy ResourceRef
-ResourceRaw { resource_def, resource_ref }  // unsafe; non-owning extraction
-ResourceIntoRaw { resource_def, owner_place }// unsafe; consumes + clears Drop flag
-CloneIn { value, region_handle, plan }       // explicit recursive region copy
-RegionBuilderNew/Push/Build { ... }          // visible region allocation/copy operations
-StaticQueryDescriptor { artifact_id }        // producer-owned immutable descriptor
+ResourceFromRaw { resource_def, raw }
+  // unsafe; establishes independent ownership
+ResourceFromRawBorrowed { resource_def, raw, parent_ref }
+  // unsafe; establishes Move child plus parent-generation dependency
+ResourceBorrow { resource_def, owner_place }
+  // Copy ResourceRef
+ResourceViewFromRaw { resource_def, owner_ref, ptr, len, view_kind, validation_plan }
+  // unsafe boundary; checked owner-tied str/slice view result
+ResourceRaw { resource_def, resource_ref }
+  // unsafe; non-owning extraction
+ResourceIntoRaw { resource_def, owner_place }
+  // unsafe; consumes + clears Drop flag
+CloneIn { value, region_handle, plan }
+  // explicit recursive region copy
+RegionBuilderNew/Push/Build { ... }
+  // visible region allocation/copy operations
+StaticQueryDescriptor { artifact_id }
+  // producer-owned immutable descriptor
 ```
 
 Ordinary `Drop`/`DropValue` consults the resource definition's producer-owned Drop thunk; no
 `DbConnDrop`, `RegexDrop`, or sibling type family is added. `ResourceIntoRaw` leaves the source
 uninitialized on every continuing path, exactly like another Move transfer.
+
+`ResourceFromRawBorrowed` carries the exact imported/local resource declaration identity, the raw
+handle, and a checked `ResourceRef` for the parent generation. The result is a Move resource whose
+cleanup must precede any invalidating move, mutable borrow, or Drop of that parent generation.
+That dependency is a typed HIR/MIR fact and is preserved through moves, aggregates, calls, and
+interfaces; it is not reconstructed from raw values in LLVM.
+
+`ResourceViewFromRaw` is the explicit unsafe-to-safe boundary for package-owned native buffers.
+Its `validation_plan` performs checked signed-to-size conversion, size arithmetic, null/zero-length
+handling, alignment for non-byte views, and UTF-8 validation for `str` before the operation returns
+a safe `Option<str>`/`Option<slice<T>>`. A successful view carries the exact `owner_ref` generation.
+Failure returns `None` without creating a view. MIR-to-LLVM lowers these checks and the resulting
+fat-view representation mechanically; codegen may not invent, omit, or weaken them.
 
 `Borrow` and `BorrowMut` parameters use a non-null pointer to caller-owned storage in the internal
 ABI. They are never materialized as an owning copy in the callee. The callee may read through a
@@ -87,8 +111,9 @@ provenance; LLVM does not decide borrow legality.
 `Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical direct-call
 ABI and applies the stored result provenance. Function-value joins require exact mode equality and
 union both summary sets. An unresolved higher-order parameter uses every compatible view/region
-input rather than `None`. No indirect-call shim copies a borrowed owner, changes a parameter mode,
-or drops result provenance.
+input rather than `None`, including embedded provenance in a by-value Move operand. The call
+snapshots that provenance before its ordinary move/null and attaches it to the result. No
+indirect-call shim copies a borrowed owner, changes a parameter mode, or drops result provenance.
 
 A resource Drop operation names the resource-declaring producer's generated hidden support thunk,
 whose symbol and ABI fingerprint come from the imported resource summary. The thunk calls the

@@ -3607,6 +3607,10 @@ Result are rejected alternatives. The feature does not admit recursive types or 
 collections of Move elements. Design and the L1a/L1b PR split:
 `impl/17-library-boundary-prerequisites.md` §8/§10.
 
+The split is normative: L1a establishes the recursive plan and admits `Option<string>` as a struct
+field while still rejecting `Option<MoveStruct>`; L1b admits Move structs/sums as
+Option/Result/user-sum payloads and completes `match`/`else`/`?`/join behavior.
+
 ### Named arena region capability — Settled 2026-07-27 (required before `pkg.db`)
 
 The anonymous `arena {}` form remains. `arena out { ... }` additionally binds a Copy,
@@ -3631,7 +3635,9 @@ generation. Parameter modes and inferred return-borrow summaries are part of the
 interface; `Fn`/`FnTy` also retains every mode so indirect calls use the direct-call ABI.
 Concrete function values additionally retain inferred return-borrow/region summaries; joins union
 their parameter sets, and unresolved higher-order parameters conservatively use every compatible
-input. User-written lifetime parameters are not introduced. Mutation rooted only in an explicit
+input, including embedded provenance in by-value Move aggregates/dependent resources. Call transfer
+snapshots that provenance before move/null and attaches it to the returned Move value. User-written
+lifetime parameters are not introduced. Mutation rooted only in an explicit
 `borrow mut` parameter remains Pure when there is no other Impure operation; it is an alias-checked
 exclusive input effect, not hidden captured mutation.
 
@@ -3640,7 +3646,8 @@ distinguishes `borrow name: T`/`out name: T` modes from parameters named
 `borrow: T`/`out: region`; item-position lookahead distinguishes a resource declaration from
 ordinary `resource.*` intrinsic paths.
 
-`pub resource name = internal.drop_name` declares a package-defined opaque one-word Move owner
+`pub resource name = pkg.native.internal.resource.drop_name` declares a package-defined opaque
+one-word Move owner
 with an exactly-once Drop hook. The source hook is a `pub fn(raw) -> ()` inside the allowed
 `internal` subtree and performs destruction in an `unsafe {}` body; there is no `unsafe fn` syntax.
 The resource producer synthesizes a hidden support thunk whose symbol/ABI fingerprint crosses

@@ -64,9 +64,9 @@ idea is rejected.
 - **Actual failure:** `Option<string>` inside `db.NativeError`, `Result<MoveOutput,db.Error>`,
   `else`, `?`, or `match` can be rejected or, if admitted incompletely, leak/double-drop the active
   payload.
-- **Recommendation:** implement L1a recursive `DropPlan` plus `Option<Move>` fields, then L1b all
-  finite non-recursive Move sum/Option/Result payload paths. Tag-test Drop and null every moved
-  source.
+- **Recommendation:** implement L1a recursive `DropPlan` framework plus the required
+  `Option<string>` field leaf, then L1b Move structs/sums in all finite non-recursive
+  sum/Option/Result payload paths. Tag-test Drop and null every moved source.
 - **v1 impact:** blocker for the public error and Output contract. It is the first prerequisite PR.
 
 ### F2 — by-value Move parameters cannot express reusable handles
@@ -448,6 +448,84 @@ idea is rejected.
   and an ordered tuple fingerprint. Validate the whole catalog before execution.
 - **v1 impact:** D3 blocker for migration-backed SQLite prepare; resolved in §§16.6/17.
 
+### F29 — unresolved higher-order calls lost provenance embedded in Move inputs
+
+- **Classification:** ownership or soundness risk; prerequisite feature missing.
+- **Problematic design location:** L2's fail-closed return-provenance rule for an unresolved
+  function target.
+- **Current Align constraint:** a by-value Move input may itself contain views, a dependent
+  resource, or another value carrying owner/region provenance.
+- **Actual failure:** an indirect identity such as `fn(Child) -> Child` could omit the input's
+  parent generation from its result summary, allowing the parent to be invalidated while the
+  returned child remains live.
+- **Recommendation:** recursively snapshot every compatible input's embedded owner/region roots
+  before ordinary move/null, including by-value Move inputs, and attach their conservative union
+  to the indirect result. Continue to reject a result that would expose a bare view of a dying
+  owner.
+- **v1 impact:** soundness blocker for L2 and function values.
+
+### F30 — resource Drop-hook examples used an unresolvable relative path
+
+- **Classification:** current Align conflict; specification ambiguity.
+- **Problematic design location:** L3 resource declaration examples using `internal.drop_*`.
+- **Current Align constraint:** sibling/cross-module names are absolute qualified paths; Align has
+  no import alias or implicit relative `internal` namespace.
+- **Actual failure:** the canonical example does not resolve unless the compiler adds a
+  resource-specific name lookup exception.
+- **Recommendation:** import the internal module normally and spell the hook as the fully qualified
+  `pkg.db.internal.resource.drop_name`. The generated producer thunk records that resolved symbol;
+  no special path rule is added.
+- **v1 impact:** blocker for an implementable L3 declaration grammar; now resolved.
+
+### F31 — PostgreSQL full-result delivery contradicted the cardinality cost promise
+
+- **Classification:** performance risk; specification ambiguity.
+- **Problematic design location:** `one`/`maybe_one` promised to read only enough rows for
+  cardinality while the initial libpq design used full-result delivery.
+- **Current Align constraint:** ordinary libpq buffered-result execution transports and stores the
+  full server result before Align can inspect its first two rows.
+- **Actual failure:** users could reasonably infer bounded network/memory work from a decoder-only
+  two-row limit; a large cardinality error would still transport and buffer every row.
+- **Recommendation:** state separately that `one`/`maybe_one` decode at most two delivered rows.
+  Label each driver observation `Step`, `BufferedFull`, `SingleRow`, or `PortalBatch`, pin
+  transported/buffered/decoded counts, and make the initial PostgreSQL path explicitly
+  `BufferedFull`. D13 adds explicitly selected single-row/portal delivery; requested unsupported
+  modes fail instead of downgrading.
+- **v1 impact:** not a correctness blocker for the D4 baseline after disclosure; bounded PostgreSQL
+  transport is a scheduled D13 capability and must not be falsely promised earlier.
+
+### F32 — L1a and L1b both claimed `Option<MoveStruct>`
+
+- **Classification:** specification ambiguity; implementation complexity.
+- **Problematic design location:** L1a's exact first-PR acceptance versus L1b's Move tagged-payload
+  scope.
+- **Current Align constraint:** `Option<string>` as an owned field leaf is a narrower compiler step
+  than admitting arbitrary Move structs as tagged payloads.
+- **Actual failure:** an implementer could not tell whether `Option<MoveStruct>` must pass or remain
+  a diagnostic in the first PR, making its acceptance and review boundary unstable.
+- **Recommendation:** L1a establishes the recursive `DropPlan` framework but admits only
+  `Option<string>` as the owned field leaf, including outer structs that contain such fields.
+  `Option<MoveStruct>` remains an explicit L1b diagnostic. L1b alone admits Move struct/sum
+  payloads in Option/Result/user sums.
+- **v1 impact:** does not change the required L1a→L1b sequence; the exact split must be fixed before
+  implementation starts.
+
+### F33 — dependent resource and native-view semantics were absent from the MIR inventory
+
+- **Classification:** prerequisite feature missing; ownership or soundness risk.
+- **Problematic design location:** L3 `from_raw_borrowed` and checked owner-tied raw views versus
+  `04-mir.md`'s generic operation list.
+- **Current Align constraint:** ownership, dependencies, and unsafe-to-safe validation must be
+  settled in typed HIR/MIR; LLVM is pure lowering.
+- **Actual failure:** a generic raw cast or late codegen decision could lose the parent generation
+  or omit size/null/alignment/UTF-8 checks.
+- **Recommendation:** add explicit
+  `ResourceFromRawBorrowed { resource_def, raw, parent_ref }` and
+  `ResourceViewFromRaw { resource_def, owner_ref, ptr, len, view_kind, validation_plan }`
+  operations. Tests inspect exact MIR and prove the dependency and complete checked validation plan
+  survive separate compilation.
+- **v1 impact:** soundness blocker for L3 and therefore for safe DB text/blob rows.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -537,15 +615,23 @@ documents:
 21. Carry and join return-borrow/region summaries in function values and indirect calls.
 22. Give inline SQL a tagged descriptor-item identity and decoded-literal diagnostic map.
 23. Define one validated numeric migration order/fingerprint for SQLite prepare and D11 migrate.
+24. Preserve owner/region provenance embedded in compatible by-value Move inputs across unresolved
+    higher-order calls.
+25. Use only normally resolved fully qualified resource Drop-hook paths.
+26. Separate decoder cardinality limits from driver transport/buffering and label every delivery
+    mode.
+27. Assign `Option<MoveStruct>` exclusively to L1b while keeping L1a limited to
+    `Option<string>` field leaves.
+28. Represent dependent construction and checked owner-tied raw views explicitly in MIR.
 
 ## 5. Revised implementation roadmap
 
 | PR | Scope | Required focused tests | Benchmark/evidence |
 |---|---|---|---|
-| L1a | Recursive DropPlan; `Option<Move>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
+| L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
 | L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | joined-target direct/indirect and per-unit parity | borrowed-call and interface-size cost |
-| L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
+| L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact MIR, cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
 | L5 | tagged file/inline inputs, Query artifacts, descriptor skeleton | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
@@ -553,11 +639,11 @@ documents:
 | D1 | fake-driver Query binder/decoder and scanner | artifact/cache/placeholder matrix | thunk overhead and warm cache |
 | D2 | scalar SQLite Query vertical | cardinality, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
-| D4 | scalar PostgreSQL Query vertical | rewrite, SQLSTATE, mismatch, cleanup | package versus libpq |
+| D4 | scalar PostgreSQL Query vertical (`BufferedFull`) | rewrite, SQLSTATE, mismatch, cleanup, delivery counts | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
 | D6 | dependent prepared statements | sequential reuse and child-before-parent Drop | prepare reuse/reprepare |
 | D7 | tx plus common exec view | consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
-| D8 | typed rows and row generations | old-view rejection and clone retention | row decode/iteration |
+| D8 | typed rows and row generations | old-view rejection, clone retention, physical delivery counts | row decode/iteration |
 | D9 | all option scopes, timeout, cancellation | applied/unsupported/conflict matrix | option/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | SQL migrations | checksum/order/transaction/status | migration startup/large history |
@@ -573,11 +659,11 @@ or static-input code.
 Scope:
 
 - add one canonical recursive owned-value `DropPlan` after type definitions resolve;
-- allow `Option<Move>` as a struct field and classify its enclosing struct as Move;
+- allow `Option<string>` as a struct field and classify its enclosing struct as Move;
 - emit tag-tested Drop on normal return, early return, and reassignment;
 - move/null the live payload on supported whole-value moves;
-- retain explicit diagnostics for recursive types, unsupported deep partial moves, and arbitrary
-  Move collection elements.
+- retain explicit diagnostics for `Option<MoveStruct>` (owned by L1b), recursive types, unsupported
+  deep partial moves, and arbitrary Move collection elements.
 
 Planned files:
 
@@ -616,7 +702,8 @@ Acceptance behavior:
 - `Some` drops exactly once across return, `?`, branches, loops, and reassignment;
 - `Some(old) -> Some(new)` and `Some -> None` drop old before replacement;
 - `None -> Some` does not run a spurious Drop;
-- nested finite owned structs recurse through the same plan;
+- nested outer Move structs containing `Option<string>` fields recurse through the same plan;
+- `Option<MoveStruct>` remains a clean compile error naming L1b;
 - malformed/unsupported types produce diagnostics rather than compiler panic;
 - generated LLVM has a tag guard and introduces no allocation on `None`.
 
@@ -628,7 +715,7 @@ The delivery is not performance-complete without:
 - L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver, plus
   joined return-summary/interface size/time;
 - L3 resource construction/ref/dependent cross-unit Drop thunk/native-view checks versus direct
-  current handle path;
+  current handle path, with exact MIR-operation counts;
 - L4 named/anonymous arena parity;
 - L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, and public
   contract changes, plus file/inline and descriptor-count scaling;
@@ -637,9 +724,9 @@ The delivery is not performance-complete without:
 - D2 direct libsqlite3 comparison;
 - D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
   files;
-- D4 direct libpq comparison;
+- D4 direct libpq comparison with transported/buffered/decoded rows reported separately;
 - D6 prepare reuse versus reprepare;
-- D8 row iteration/decode and retained-copy costs;
+- D8 row iteration/decode, physical-delivery counts, and retained-copy costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
 - D12 category metadata query count and EXPLAIN latency;
 - D13 batch/SoA/native throughput on each driver.

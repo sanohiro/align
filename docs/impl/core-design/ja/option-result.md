@@ -30,6 +30,11 @@ error(c)                            // sugar: constructs the Code-carrying Error
 
 `Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。現在の実装は、複数の所有権付き Move ペイロード形状を `scalar_arg` で拒否し、コンパイラ既知の std ハンドルだけを例外扱いしている。この例外列挙は `pkg.db` の前に必ず置き換える。有限かつ非再帰な任意の Move ペイロードを、ひとつの再帰的なタグ付き `DropPlan` で扱う。タグ付きコンテナ自身を Move とし、活性なペイロードだけを Drop し、構築 / `match` / `else` / `?` では所有権を移動して移動元を無効化する。実装は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b が担当する。それまでは現在の診断を正直なコンパイラ境界として維持し、新しいライブラリハンドルの例外を増やしてはならない。
 
+PR境界は厳密である。L1aが許可する所有権付きstruct field leafは
+`Option<string>` だけであり、`Option<MoveStruct>` は引き続き拒否する。L1bがMove
+struct/sumをOption/Result/user sumのpayloadとして許可し、そのtagged control flowを
+完成させる。
+
 ## Effects
 
 Pure な機構である。`?` は制御フローであってエフェクトではない。関数が impure になるのは、その関数が *呼び出す* 処理を通じてのみである。

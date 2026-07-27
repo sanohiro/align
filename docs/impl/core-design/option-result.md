@@ -40,6 +40,10 @@ the active payload, and moves/nulls it through construction/`match`/`else`/`?`. 
 implementation. Until those slices land, the existing diagnostics remain the honest compiler
 boundary; new library handles must not add another exception.
 
+The PR boundary is exact: L1a admits only `Option<string>` as an owned struct-field leaf and leaves
+`Option<MoveStruct>` rejected; L1b admits Move structs/sums as Option/Result/user-sum payloads and
+completes their tagged control flow.
+
 ## Effects
 
 Pure machinery. `?` is control flow, not an effect; a function is impure only through what it

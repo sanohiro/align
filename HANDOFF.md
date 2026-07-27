@@ -240,8 +240,8 @@ The query-centered `pkg.db` design and its general library-boundary prerequisite
 `docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
 review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). The next
 implementation slice is L1a only: the canonical recursive Drop plan and sound
-`Option<Move>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L6 are complete. The required order is L1a recursive DropPlan/owned Option
+`Option<string>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+variants before L1a–L6 are complete. The required order is L1a recursive DropPlan/`Option<string>`
 fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query artifacts, and L6 the
 region plain-struct builder. L2 includes contextual parameter parsing, mutable Copy state, and

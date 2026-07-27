@@ -661,7 +661,9 @@ existing lexical `Region`, so an old row/buffer/resource view becomes invalid ev
 lexically in scope. All parameter modes are retained in function-value types; direct and indirect
 calls share one ABI and alias/provenance check. Concrete function values also retain
 `ReturnBorrowSummary`/`ReturnRegionSummary`; joins union possible target inputs and unresolved
-higher-order parameters fail closed to every compatible input.
+higher-order parameters fail closed to every compatible input, including embedded provenance in
+by-value Move aggregates/dependent resources. Call transfer snapshots that provenance before
+nulling the source and attaches it to the returned value.
 
 The conservative "return borrows every view argument" rule is replaced by an inferred,
 canonical `ReturnBorrowSummary::Params(indices)` exported with the function signature. A second

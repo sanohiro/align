@@ -768,8 +768,10 @@ fresh generation. Parameter modes are part of named-function and function-value 
 lifetime roots remain inferred — there are no written lifetime parameters. A concrete function
 value retains inferred return-borrow and return-region parameter sets. Assignment/control-flow
 joins union them; an unresolved higher-order parameter conservatively names every compatible
-view/region input. Passing the same owner through overlapping `borrow mut`, `borrow`, or `out`
-arguments is rejected.
+input, including embedded provenance in a by-value Move aggregate/dependent resource. The call
+captures that provenance before moving/nulling the source and transfers it to the result; this does
+not permit a callee to return a bare view of an owner it destroys. Passing the same owner through
+overlapping `borrow mut`, `borrow`, or `out` arguments is rejected.
 
 `borrow`, `out`, and `resource` are contextual rather than reserved words. Parameter lookahead
 recognizes `borrow name: T`, `borrow mut name: T`, and `out name: T` as modes, while `borrow: T` and
@@ -1740,8 +1742,10 @@ A package may turn a persistent non-null native pointer into an opaque Move reso
 type-owned Drop hook:
 
 ```align
-pub resource conn = internal.drop_conn
-pub resource stmt<P, R> = internal.drop_stmt
+import pkg.db.internal.resource
+
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 ```
 
 The hook is a `pub` function in the package's allowed `internal` subtree, accepts only `raw`, returns

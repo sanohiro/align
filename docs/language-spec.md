@@ -259,7 +259,9 @@ return a view of the fresh generation. Copy mutable borrow is the in-place state
 Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
 also retain every mode and both return-borrow/region summaries, so indirect and direct calls use the
 same ABI and result lifetime. Function-value joins union the possible target summaries; an
-unresolved higher-order parameter uses every compatible input. Lifetimes are never written.
+unresolved higher-order parameter uses every compatible input, including embedded borrow/region
+provenance in a by-value Move value. That provenance transfers with a returned Move result; a bare
+view of an owner destroyed inside the callee remains illegal. Lifetimes are never written.
 Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the body has no other
 Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
 and database work remain Impure.
@@ -503,7 +505,9 @@ names one library; a repeated name links once.
 An FFI wrapper may declare an opaque Move resource:
 
 ```align
-pub resource conn = internal.drop_conn
+import pkg.db.internal.resource
+
+pub resource conn = pkg.db.internal.resource.drop_conn
 ```
 
 The hook is a `pub fn(raw) -> ()` in the package's allowed `internal` subtree and performs native

@@ -118,8 +118,12 @@ field accessやshaperがSQLを実行してはならない。driverがretry、pag
 ### 2.4 機構は隠せるがcost classは隠さない
 
 libsqlite3/libpq、binary decode、buffer reuseなどの内部機構は選択できる。ただし、
-`one`、`maybe_one`、`all`、`rows`、`next_batch`、shapingが読み込む行数、
-materialization、copyのcost classは公開契約から分かるようにする。
+`one`/`maybe_one` がdecodeするのは最大2 delivered rowsだが、transport/bufferingの共通上限
+ではない。SQLiteは最大2回stepする。初期PostgreSQLはlibpq `BufferedFull` なので全resultを
+transport/bufferした後に最大2行をdecodeする。`rows` はone-pass consumptionでありnetwork
+streaming保証ではない。test/bench observationは `Step` / `BufferedFull` / `SingleRow` /
+`PortalBatch` とtransported/buffered/decoded countを固定する。D13のsingle-row/portalは明示
+optionで選び、unsupportedならerrorで、黙ってdowngradeしない。
 
 ### 2.5 薄い共通層と明示的native extension
 
@@ -464,7 +468,8 @@ rows       one-pass stream
 next_batch bounded batch
 ```
 
-`one`/`maybe_one` はcardinalityを証明するのに必要な行まで読む。`all` はstructural
+`one`/`maybe_one` はcardinality判定に最大2 delivered rowsをdecodeするが、§2.4の
+driver-specific transport/buffering costは別である。`all` はstructural
 `RegionPlain<R>` を要求し、region builderのchunk growthと1回のcompact passを使う。
 これはpublic traitではないcompile-time structural checkで、v1 static Rowはすべて満たす。
 名前からmaterialize/streamが分からない
@@ -1144,7 +1149,7 @@ protocol/transaction state不明のconnectionをpoolやcallerへ返さない。t
 
 - generated binder/decoder。per-row reflection/name lookupなし。
 - 1 Query = 1 visible statement = 1 execution。
-- short `one`/`maybe_one` はcardinality証明後に停止。
+- `one`/`maybe_one` は2 delivered rowsでdecodeを停止し、driver delivery costを別に測る。
 - row viewは可能な範囲でzero-copy、retention copyは `clone_in` に見える。
 - materialization allocation先は明示region。
 - region builderはhidden heapなし、compact passは正確に1回。
@@ -1205,7 +1210,7 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)。
 
 ```text
-L1a recursive DropPlan + Option<Move> field
+L1a recursive DropPlan framework + Option<string> field
 L1b Move sum/Option/Result payload completion
 L2  contextual borrow mode + Copy mutation + Fn mode/joined provenance + interface summary
 L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
@@ -1255,6 +1260,7 @@ storage-class/NULL validation。
 
 D2と同じcommon Query module形状、libpq connection、dialect-aware named scanと `$n` rewrite、
 同名ordinal reuse、scalar bind/decode、SQLSTATE/owned detail、send前driver mismatch、
+初期 `BufferedFull` delivery（`one` decodeは最大2行でもtransportは全result）、
 両driverでportable `CAST(:value AS BIGINT)`、execution count/cleanup。明示設定された
 local/ephemeral PostgreSQLでintegration testし、未設定時は理由付きskip。direct libpq
 benchmarkはenvironment-gated。
@@ -1281,6 +1287,7 @@ public traitなし。
 
 `db.rows<Row>`、`next` generation、text/blob owner-tied view、old-view compile rejection、
 `clone_in` retention、bounded batchの前提、SQLite/libpq両driverのpointer-validity test。
+PostgreSQL初期pathは `BufferedFull` 上のone-pass decodeで、single-row/portal deliveryはD13。
 
 ### D9 — scoped native option、timeout、cancellation
 
@@ -1367,6 +1374,13 @@ execution-count付きで実証する。
 38. indirect borrow-returning callは全possible target owner/regionをconservativeに保持する。
 39. inline SQLはitem-based tagged identityを持ち、diagnosticを `.align` literalへ戻す。
 40. SQLite migration-backed prepareは実行前に1つのnumeric orderを検証/fingerprintする。
+41. unresolved higher-order callはcompatibleなby-value Move input内部のprovenanceを保持する。
+42. resource Drop hookは通常の完全修飾module pathを使い、resource専用name lookupを持たない。
+43. PostgreSQL `BufferedFull` は、`one`/`maybe_one` の2-row decode limitとは別にfull
+    transport/bufferingを報告する。
+44. L1aは `Option<string>` field leafだけを許可し、`Option<MoveStruct>` はL1bだけが許可する。
+45. dependent resource constructionとchecked owner-tied native viewはloweringを通して明示的な
+    typed MIR operationである。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

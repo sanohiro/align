@@ -248,8 +248,10 @@ At item start, `resource ident ... "="` is a resource declaration; elsewhere `re
 ordinary identifier. A recognized resource intrinsic therefore uses the normal dotted-call grammar.
 
 ```align
-pub resource conn = internal.drop_conn
-pub resource stmt<P, R> = internal.drop_stmt
+import pkg.db.internal.resource
+
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 ```
 
 This is an opaque nominal Move type declaration, not a third data-type body syntax. The right-hand

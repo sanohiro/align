@@ -3507,7 +3507,7 @@ SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptan
 `18-pkg-db-review.md`.
 
 ```text
-L1a recursive DropPlan + Option<Move> fields
+L1a recursive DropPlan framework + Option<string> fields
 L1b Move sum/Option/Result payload completion
 L2  contextual parameter modes + function-value modes/joined provenance + interface summaries
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent resource_ref views

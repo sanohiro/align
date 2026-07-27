@@ -143,12 +143,20 @@ paginate, add a SELECT, split one Query into several round trips, or ignore a na
 The implementation may choose libsqlite3 calls, libpq calls, binary decoding, statement caching,
 buffer reuse, or another internal mechanism. The public contract must still make the cost class clear:
 
-- `one` reads at most the rows needed to prove exactly one;
-- `maybe_one` reads at most the rows needed to prove zero-or-one;
+- `one`/`maybe_one` decode at most two delivered rows to decide cardinality; this is not a universal
+  bound on database transport or driver buffering;
+- SQLite steps at most twice for `one`/`maybe_one`;
+- the initial PostgreSQL path uses libpq full-result delivery, so the server result is transported
+  and buffered in full before the cardinality decoder inspects at most two rows;
 - `all` materializes the full result into the supplied region;
-- `rows` is a one-pass stream;
+- `rows` is one-pass consumption, not by itself a promise of network streaming;
 - `next_batch` materializes one bounded batch;
 - shaping is one pass unless its code visibly asks for another data structure or sort.
+
+Driver tests/bench observations label physical delivery as `Step`, `BufferedFull`, `SingleRow`, or
+`PortalBatch` and pin transported/buffered/decoded row counts where the native API exposes them.
+The baseline D4/D8 PostgreSQL path is `BufferedFull`; D13 adds explicitly selected single-row/portal
+paths. A requested delivery option is applied or rejected as unsupported, never silently downgraded.
 
 ### 2.5 Thin common layer, explicit native extensions
 
@@ -726,6 +734,8 @@ Semantics:
 
 - `one`: zero rows -> `NotFound`; more than one -> `Cardinality`.
 - `maybe_one`: zero -> `None`; one -> `Some`; more than one -> `Cardinality`.
+- both stop decoding after a second delivered row, but retain §2.4's driver-specific transport and
+  buffering cost;
 - `one`/`maybe_one`/`all`: clone view-bearing fields into the supplied `region`; their results are
   tied to that region.
 - `all`: requires structural `RegionPlain<R>`, grows region chunks, and performs the region
@@ -2289,7 +2299,7 @@ Land the seven PRs specified in
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md), in order:
 
 ```text
-L1a recursive DropPlan + Option<Move> fields
+L1a recursive DropPlan framework + Option<string> fields
 L1b Move sum/Option/Result payload completion
 L2  contextual borrow modes + Copy mutation + Fn modes/joined provenance + interface summaries
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
@@ -2368,6 +2378,8 @@ This milestone lands before promising that a typed Query is database-checked.
 
 - PostgreSQL `db.conn` over libpq;
 - the same common Query module shape as D2;
+- explicit `BufferedFull` delivery observation; `one` decodes at most two rows but transport may
+  contain the complete result;
 - dialect-aware named-source scan and `$n` rewrite;
 - repeated source name reuses one ordinal;
 - scalar bind/decode;
@@ -2415,7 +2427,8 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - `next(borrow mut rows)` generation invalidation;
 - owner-tied `resource.view_from_raw` with invalid pointer/length/UTF-8 rejection;
 - SQLite current-row views;
-- PostgreSQL full-result path first, single-row mode only when explicitly selected;
+- PostgreSQL `BufferedFull` path first; `rows` is one-pass decode over that owned result, while
+  explicitly selected single-row/portal delivery is D13;
 - early Drop/finalize;
 - one-million-row scalar and borrowed-text benchmarks;
 - compile-fail tests for use-after-next, storage in a longer-lived builder, return, branch, and loop.
@@ -2568,6 +2581,13 @@ The design is implemented correctly only if all are true:
 38. Indirect borrow-returning calls conservatively retain every possible target owner/region.
 39. Inline SQL has an item-based tagged source identity and maps diagnostics to its `.align` literal.
 40. SQLite migration-backed prepare validates and fingerprints one numeric order before execution.
+41. Unresolved higher-order calls retain provenance embedded in compatible by-value Move inputs.
+42. Resource Drop hooks use normal fully qualified module paths; no resource-only lookup exists.
+43. PostgreSQL `BufferedFull` reports full transport/buffering separately from the two-row decode
+    limit of `one`/`maybe_one`.
+44. L1a admits only `Option<string>` field leaves; L1b alone admits `Option<MoveStruct>`.
+45. Dependent resource construction and checked owner-tied native views remain explicit typed MIR
+    operations through lowering.
 
 ---
 

@@ -305,3 +305,24 @@ memory alignment
 cache alignment
 SIMD alignment
 ```
+
+---
+
+## General library-boundary prerequisites for query-centric database packages
+
+The query-centric database review settled a general language/library boundary direction
+(2026-07-27). `pkg.db` does not import `std.http`; both packages use the same language-level
+resource, borrow-provenance, owner-tied native-view, named-region, and deterministic-static-input
+facilities.
+
+The implementation sequence is deliberately prerequisite-first. L1a establishes the recursive
+`DropPlan` framework but admits only `Option<string>` field leaves; L1b owns
+`Option<MoveStruct>` and other finite Move tagged payloads. Indirect-call provenance includes roots
+embedded in compatible by-value Move inputs. Resource Drop hooks resolve through ordinary fully
+qualified module paths, and dependent construction plus checked raw views are explicit typed MIR
+operations rather than LLVM or package-name exceptions.
+
+The initial PostgreSQL Query vertical is explicitly `BufferedFull`: `one`/`maybe_one` decode at most
+two delivered rows, but transport and native buffering may contain the complete result. Physical
+delivery is measured and labelled separately; later single-row/portal modes are selected
+capabilities, never silent substitutions.

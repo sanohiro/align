@@ -277,10 +277,12 @@ reference type or a package-name table.
 The same `ParamMode` entries are retained in `Fn`/`FnTy`. Concrete function values additionally
 carry `ReturnBorrowSummary` and `ReturnRegionSummary`. Function-value assignment and control-flow
 joins union both parameter-index sets; an unresolved higher-order parameter whose result may carry
-provenance conservatively names every compatible view/region input. Interface codecs,
-direct/indirect call checking, and codegen must agree on these facts; there is no mode- or
-provenance-erasing adapter. The inferred effect and return summaries remain outside written
-source-signature equality, but parameter modes participate.
+provenance conservatively names every compatible input, including a by-value Move value with an
+embedded view/dependent-resource root. Call checking snapshots embedded provenance before move/null
+and transfers it to the result; callee escape checking still rejects a bare view whose consumed
+owner dies there. Interface codecs, direct/indirect call checking, and codegen must agree on these
+facts; there is no mode- or provenance-erasing adapter. The inferred effect and return summaries
+remain outside written source-signature equality, but parameter modes participate.
 
 ### Opaque resources
 
