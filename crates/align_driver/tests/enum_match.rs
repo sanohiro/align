@@ -628,8 +628,8 @@ fn move_enum_struct_field_is_move_and_drops_clean() {
     if !backend_available() {
         return;
     }
-    // J3: a Move sum-type field (an owned-array payload variant) is now supported — it makes the
-    // enclosing struct Move (`ty_owns_buffer_rec`'s enum arm), and `drop_struct_fields`'s `Ty::Enum`
+    // J3: a Move sum-type field (an owned-array payload variant) is now supported — the recursive
+    // DropPlan makes the enclosing struct Move, and `drop_struct_fields`'s `Ty::Enum`
     // arm frees the live variant's buffer via the tag-switched `drop_enum`. Construct a struct holding
     // a `Nums([...])` field, read the payload through a `match m.c`, and let the struct drop at scope
     // end. A clean run proves single-free (the owned array is freed exactly once, by the struct's Drop

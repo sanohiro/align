@@ -3435,9 +3435,9 @@ pub fn check_program_with_effects(
                 span,
             );
         }
-        // A **Move** enum field (an owned `array<T>` payload variant, J2) is now supported (J3): it
-        // makes the enclosing struct Move (`ty_owns_buffer_rec`'s enum arm reads the `enums` table),
-        // and `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched
+        // A **Move** enum field (an owned `array<T>` payload variant, J2) is now supported (J3): the
+        // canonical recursive DropPlan makes the enclosing struct Move, and
+        // `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched
         // `drop_enum`. No rejection here — a Move enum field is as legal as a `string`/owned-array field.
     }
 
@@ -24399,8 +24399,8 @@ fn resolve_user_type(
 /// Whether `ty` is a bare Move **handle** — a single opaque-pointer resource handle whose drop
 /// closes/frees it (a reader/writer/buffer, a socket, a file, an http request/response/client/
 /// server/ctx/stream, a cli command/parsed). Admitted as a struct field (F1②, the pkg.web request
-/// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (`ty_owns_buffer_rec`
-/// already classifies it so), and its recursive drop closes the handle exactly once. This set MUST
+/// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (the canonical DropPlan
+/// classifies the handle as a leaf), and its recursive drop closes the handle exactly once. This set MUST
 /// stay in lockstep with `align_codegen_llvm::handle_free_fn` (a field type allowed here but not
 /// freed there would leak). Excludes `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer
 /// drops) and the `{ptr,len}` owned collections (`string`/`array` — their own field arms).
@@ -24455,22 +24455,20 @@ fn is_field_ok(ty: Ty) -> bool {
     match ty {
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error => true,
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
-        // J1b). An enum is **never Move** today (its payloads are scalar / `str` / non-Move struct —
-        // `enum_payload_ok`), so it needs no recursive `Drop`; a `str`-bearing enum field region-ties
-        // the enclosing struct to the borrowed storage (`struct_has_str_rec` / `tracks_region` handle
-        // that). Owned enum payloads (`array<Struct>`, tag-switched drop) are J2 — when they land, this
-        // arm gains the same non-Move / Drop split the `array<T>` field has.
+        // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
+        // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
+        // enclosing struct to borrowed storage (`struct_has_str_rec` / `tracks_region` handle that).
         Ty::Enum(_) => true,
         // A Move **handle** field (F1②, the pkg.web request `Ctx` owning its `http_request_ctx`). A
         // bare pointer handle (`file`, `http_request_ctx`, a reader/writer/buffer, a socket, an http
         // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
         // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
-        // handle arm → the null-safe `*_free`; `ty_owns_buffer_rec` already classifies the struct as
-        // Move). The admitted set matches codegen's `handle_free_fn`.
+        // handle arm → the null-safe `*_free`; the DropPlan leaf makes the struct Move). The admitted
+        // set matches codegen's `handle_free_fn`.
         _ if is_move_handle(ty) => true,
         // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
         // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no
-        // heap (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays **Copy** — a Move
+        // heap (its DropPlan is `None`, so the enclosing struct stays **Copy** — a Move
         // `Ctx` would be consumed by its own accessors) and needs no drop. It region-ties the
         // enclosing struct to the request buffer: `region_of(StructLit)` folds in each field's region,
         // so a `Ctx` built from a local ctx handle cannot outlive it.
@@ -24478,7 +24476,7 @@ fn is_field_ok(ty: Ty) -> bool {
         // A **`slice<T>` view** field (`Ctx { params: slice<str> }`, F1③ of the pkg.web plan — the
         // request's captured param slots). A slice is a Copy `{ptr,len}` **borrow** of a backing
         // buffer (16 bytes / 8-align — `abi_type`/`ty_size_align` already size it), owns no heap
-        // (`ty_owns_buffer_rec` excludes it, so the enclosing struct stays non-Move) and needs no
+        // (its DropPlan is `None`, so the enclosing struct stays non-Move) and needs no
         // drop. It region-ties the enclosing struct to the borrowed buffer: `region_of(StructLit)`
         // folds in each field value's region, so a struct holding a slice field cannot outlive the
         // buffer the slice views (the escape check enforces it). A `slice<str>` element also carries
@@ -24486,7 +24484,7 @@ fn is_field_ok(ty: Ty) -> bool {
         Ty::Slice(_) => true,
         // A **function-value** field (`Route.handler: fn(Ctx) -> Result<(), Error>`, F1① of the
         // pkg.web plan). A `Ty::Fn` is a Copy `{fn_ptr, env_ptr}` closure struct (16 bytes, 8-align —
-        // `abi_type`/`ty_size_align` already size it), owns no heap (`ty_owns_buffer_rec` excludes it,
+        // `abi_type`/`ty_size_align` already size it), owns no heap (its DropPlan is `None`,
         // so the enclosing struct stays non-Move) and borrows nothing (no region). The field carries
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.

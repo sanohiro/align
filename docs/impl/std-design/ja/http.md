@@ -739,7 +739,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
       16 対 8 の過大報告をしていることに注意。両方を直し、`sema_and_codegen_struct_layout_agree` に行を
       足す。あれは手書きのテーブルで、Move ハンドルにも `Ty::Fn` にも `Ty::Slice` フィールドにも行が無い。
       あえて追加**しない**もの: `ty_is_move`、`is_owned_droppable`、`handle_free_fn`、
-      `null_moved_source`、`ty_owns_buffer_rec`（囲む struct を Move にしてはならない）、そして — 重要な
+      `null_moved_source`、`DropPlan` の所有 leaf 集合（囲む struct を Move にしてはならない）、そして — 重要な
       ことに — **`Scalar` variant は作らない**。これにより、fail-closed のデフォルトのままビューは
       `Option`/`Result` のペイロードと配列要素から締め出される（専用の診断を用意する価値はある: 今日は
       「must be a scalar (composite payloads are not supported yet)」と報告する。答えは正しいが筋書きが

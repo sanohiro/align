@@ -187,6 +187,56 @@ fn conditional_field_replacement_drops_old_only_on_live_paths() {
 }
 
 #[test]
+fn match_and_loop_field_replacement_keep_path_local_ownership() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         Choice {{ Reuse, Fresh }}\n\
+         fn main() -> i32 {{\n\
+           mut a := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           a.detail = match Choice.Reuse {{\n\
+             Reuse => a.detail\n\
+             Fresh => Some(\"new\".clone())\n\
+           }}\n\
+           mut b := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           b.detail = match Choice.Fresh {{\n\
+             Reuse => b.detail\n\
+             Fresh => Some(\"new\".clone())\n\
+           }}\n\
+           mut c := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           c.detail = loop {{\n\
+             if true {{ break c.detail }}\n\
+             break Some(\"new\".clone())\n\
+           }}\n\
+           mut d := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           d.detail = loop {{\n\
+             if false {{ break d.detail }}\n\
+             break Some(\"new\".clone())\n\
+           }}\n\
+           w := a.detail else {{ return 90 }}\n\
+           x := b.detail else {{ return 91 }}\n\
+           y := c.detail else {{ return 92 }}\n\
+           z := d.detail else {{ return 93 }}\n\
+           return (w.len() + x.len() + y.len() + z.len()) as i32\n\
+         }}\n"
+    );
+    let mir = mir_text(&src);
+    assert_eq!(
+        mir.matches("drop_value").count(),
+        4,
+        "match and loop joins must each drop their path-local old destination:\n{mir}"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-match-loop-replace", &src)
+            .status
+            .code(),
+        Some(16)
+    );
+}
+
+#[test]
 fn if_match_and_loop_edges_keep_one_live_payload() {
     if !backend_available() {
         return;

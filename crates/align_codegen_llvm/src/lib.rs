@@ -9793,7 +9793,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.drop_struct_fields(fp, nid)?;
                 }
                 // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
-                // struct Move (`ty_owns_buffer_rec`'s enum arm). Tag-switch and free the live variant's
+                // struct Move through the recursive DropPlan. Tag-switch and free the live variant's
                 // owned buffer via `drop_enum` (a non-Move enum owns nothing → not a Move struct field →
                 // never reaches here). `DropFlagInit` zeroes the aggregate, so a moved-out / unconstructed
                 // enum field reads tag 0 and frees `null` — null-safe, single-free every path.

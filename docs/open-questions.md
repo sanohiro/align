@@ -4387,8 +4387,8 @@ array element, not new union work). **J3a — SHIPPED: the multimodal union as a
 field** (`Message { content: Content }`). A Move enum (an owned `array<Struct>` payload variant) is now
 a legal struct field — it makes the enclosing struct **Move**, so the full multimodal
 `content: str | array<Part>` union composes into a record and decodes/encodes both shapes, round-tripping
-byte-identically. **Classifier:** `struct_is_move`/`struct_is_move_rec`/`ty_owns_buffer_rec` grew an
-`enums` param + a `Ty::Enum` arm (`enum_is_move`) — threaded through every caller (mir `Builder`,
+byte-identically. **Classifier:** the canonical recursive `DropPlan` has struct and enum nodes and
+`struct_is_move`/`enum_is_move` derive from it — threaded through every caller (mir `Builder`,
 codegen, sema's `ty_is_move`/`is_owned_droppable`/`ty_capture_is_move`/`reject_move_struct_payload`/
 `enum_payload_ok`), so **every** Move-ness question (MoveCheck, drop-flag, escape, Result/Option-payload
 rejection) sees a struct-with-Move-enum-field as Move in lockstep. The pass-0c-2 rejection was lifted.

@@ -58,8 +58,8 @@ fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes w
 `Option` fields (trailing-comma layout), and `array<Struct>` fields. **J3a** extends this to a **Move**
 union field — the full multimodal `content: str | array<Part>` (`Content { Text(str), Parts(array<Part>) }`)
 composes into `Message`, decoding/encoding both shapes and round-tripping byte-identically. A Move-enum
-field makes the enclosing struct **Move**: `struct_is_move`/`ty_owns_buffer_rec` became enum-aware (a
-`Ty::Enum` arm consulting `enum_is_move`, threaded through every Move-ness caller in lockstep), and
+field makes the enclosing struct **Move**: the canonical recursive `DropPlan` sees the enum payload
+and `struct_is_move`/`enum_is_move` derive from it in lockstep, and
 `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched `drop_enum`; the
 runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to free the union's owned
 payload on the decode error path. `match m.content { … }` moves the owned payload out and zeroes the

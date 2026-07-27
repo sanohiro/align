@@ -53,8 +53,8 @@ SHIPPED）:** 構造体フィールドは union であってよい（`Message { 
 合成される。**J3a** はこれを **Move** union フィールドへ拡張する — 完全なマルチモーダル
 `content: str | array<Part>`（`Content { Text(str), Parts(array<Part>) }`）が `Message` に合成され、
 両シェイプを decode/encode して byte-identical にラウンドトリップする。Move-enum フィールドは外側 struct を
-**Move** にする: `struct_is_move`/`ty_owns_buffer_rec` が enum 対応（`enum_is_move` を参照する `Ty::Enum`
-アーム、全 Move 判定呼び出し箇所へ一括スレッド）になり、`drop_struct_fields` の `Ty::Enum` アームが
+**Move** にする: canonical な再帰的 `DropPlan` が enum payload を認識し、
+`struct_is_move`/`enum_is_move` はそこから一貫して導出される。`drop_struct_fields` の `Ty::Enum` アームが
 tag-switched な `drop_enum` で生きているバリアントを解放する。ランタイム `drop_decoded_owned` には
 **kind-6** アーム（`→ drop_decoded_union`）が加わり、decode エラーパスで union の所有 payload を解放する。
 `match m.content { … }` は所有 payload をムーブアウトしフィールドをゼロ化する（`NullStructField` が型対応
