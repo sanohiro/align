@@ -645,6 +645,53 @@ fn move_enum_struct_field_is_move_and_drops_clean() {
 }
 
 #[test]
+fn copy_variant_binding_does_not_consume_a_direct_move_enum_field() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  m := Msg { c: Content.Text(\"hello\") }\n",
+        "  first := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  second := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  return (first * 10 + second) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-copy-field-rematch", src).status.code(),
+        Some(55)
+    );
+}
+
+#[test]
+fn materialized_move_enum_scrutinee_transfers_each_control_source() {
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  m := Msg { c: Content.Text(\"hello\") }\n",
+        "  other := Msg { c: Content.Text(\"other\") }\n",
+        "  first := match if true { m.c } else { other.c } { Text(t) => t.len(), _ => 0 }\n",
+        "  second := match m.c { Text(t) => t.len(), _ => 0 }\n",
+        "  return (first * 10 + second) as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "enum-control-source-transfer.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "materializing a Move enum control result must transfer its field source"
+    );
+    assert!(
+        rendered.contains("use of moved field 'c' of 'm'"),
+        "diagnostic must identify the transferred control source:\n{rendered}"
+    );
+}
+
+#[test]
 fn move_enum_nested_field_match_binding_rejected() {
     // J3 soundness: matching a Move enum through a NESTED struct-field place (`match o.inner.c`) and
     // binding its owned payload cannot null the buffer — `null_moved_source` / `NullStructField` reach

@@ -10039,9 +10039,9 @@ impl<'a> MoveCheck<'a> {
     ///
     /// The scrutinee has already been evaluated non-consuming, so statements, conditions, and
     /// nested operations must not be walked again. Re-enter only transparent/control-result tails
-    /// and direct places, mirroring MIR's `null_moved_source` plus path-local control-result stores.
-    /// This keeps nested Move-binding matches linear instead of recursively evaluating each
-    /// scrutinee twice.
+    /// and direct places, mirroring MIR's `null_moved_source`. Control expressions transfer their
+    /// result sources during their own single evaluation when they fill a Move-typed join slot, so
+    /// this helper deliberately does not re-enter them.
     fn consume_match_result(&mut self, e: &Expr, moved: &mut MovedSet, direct: bool) {
         match &e.kind {
             ExprKind::Local(id) if self.is_move(*id) => {
@@ -10082,66 +10082,9 @@ impl<'a> MoveCheck<'a> {
                     self.consume_match_result(value, moved, direct);
                 }
             }
-            ExprKind::If { then, els, .. } => {
-                let incoming_borrows = self.borrows.clone();
-                let mut then_moved = moved.clone();
-                self.borrows = incoming_borrows.clone();
-                if let Some(value) = &then.value {
-                    self.consume_match_result(value, &mut then_moved, false);
-                }
-                let then_borrows = self.borrows.clone();
-                let mut else_moved = moved.clone();
-                self.borrows = incoming_borrows.clone();
-                if let Some(value) = &els.value {
-                    self.consume_match_result(value, &mut else_moved, false);
-                }
-                let else_borrows = self.borrows.clone();
-                *moved = match (hir_block_diverges(then), hir_block_diverges(els)) {
-                    (false, false) => &then_moved | &else_moved,
-                    (true, false) => else_moved,
-                    (false, true) => then_moved,
-                    (true, true) => moved.clone(),
-                };
-                self.borrows = match (hir_block_diverges(then), hir_block_diverges(els)) {
-                    (false, false) => BorrowState::join(&then_borrows, &else_borrows),
-                    (true, false) => else_borrows,
-                    (false, true) => then_borrows,
-                    (true, true) => incoming_borrows,
-                };
-            }
-            ExprKind::Match { arms, .. } => {
-                let incoming_borrows = self.borrows.clone();
-                let mut joined: Option<MovedSet> = None;
-                let mut joined_borrows: Option<BorrowState> = None;
-                for arm in arms {
-                    let mut arm_moved = moved.clone();
-                    self.borrows = incoming_borrows.clone();
-                    self.consume_match_result(&arm.body, &mut arm_moved, direct);
-                    if hir_expr_diverges(&arm.body) {
-                        continue;
-                    }
-                    joined = Some(match joined {
-                        None => arm_moved,
-                        Some(state) => &state | &arm_moved,
-                    });
-                    joined_borrows = Some(match joined_borrows {
-                        None => self.borrows.clone(),
-                        Some(state) => BorrowState::join(&state, &self.borrows),
-                    });
-                }
-                if let Some(state) = joined {
-                    *moved = state;
-                }
-                self.borrows = joined_borrows.unwrap_or(incoming_borrows);
-            }
-            // The success operand is consumed while evaluating `ElseUnwrap`; only its fallback
-            // inherits the outer result's consumption.
-            ExprKind::ElseUnwrap { fallback, .. } => {
-                self.consume_match_result(fallback, moved, false);
-            }
             // Constructors consume their payloads during ordinary evaluation; loop `break` values
-            // are likewise direct consuming sites. Fresh results and Copy places own no source
-            // slot for the outer match to clear.
+            // and Move-typed control results transfer theirs while filling their join slot. Fresh
+            // results and Copy places own no source slot for the outer match to clear.
             _ => {}
         }
     }
@@ -10207,11 +10150,13 @@ impl<'a> MoveCheck<'a> {
                     } else if consuming
                         && (e.ty == Ty::String
                             || e.ty == Ty::Option(Scalar::String)
-                            || is_move_handle(e.ty))
+                            || is_move_handle(e.ty)
+                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums)))
                     {
                         // A partial move of a depth-1 owned `string`/`Option<string>` field (`n := u.name`,
                         // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
-                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle):
+                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle), or
+                        // a Move enum field materialized through control flow:
                         // mark just that field moved. The
                         // struct's recursive `Drop` frees null there (MIR nulls the field on move);
                         // the struct can no longer move as a whole, and the field can't be reused,
@@ -10452,7 +10397,12 @@ impl<'a> MoveCheck<'a> {
                 // not a direct move site (like an `if`/`else` arm). A `Result<string, Error> else`
                 // yields a Move (`string`) result, moved at its binding site — treating the fallback
                 // consistently (arm value, not a direct move) keeps that sound.
-                self.expr(fallback, moved, consuming, false);
+                self.expr(
+                    fallback,
+                    moved,
+                    consuming || self.is_move_ty(e.ty),
+                    false,
+                );
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
@@ -10503,6 +10453,9 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
+                // MIR materializes a Move-typed match result into a join slot, transferring each
+                // live arm source even when the surrounding expression only borrows that result.
+                let result_consuming = consuming || self.is_move_ty(e.ty);
                 // Arms are mutually exclusive, so each is checked in the *same* incoming state:
                 // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
                 // Without this the arms share one set, so a value consumed in arm A is wrongly seen
@@ -10571,7 +10524,7 @@ impl<'a> MoveCheck<'a> {
                         // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
                         clear_moved(&mut m, *binding);
                     }
-                    self.expr(&a.body, &mut m, consuming, direct);
+                    self.expr(&a.body, &mut m, result_consuming, direct);
                     if hir_expr_diverges(&a.body) {
                         continue;
                     }
@@ -10603,16 +10556,19 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.expr(cond, moved, false, false);
+                // A Move result is transferred into MIR's join slot regardless of whether its
+                // surrounding consumer borrows or moves the completed control expression.
+                let result_consuming = consuming || self.is_move_ty(e.ty);
                 // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
                 // bound owned local out through it is rejected (the `direct = false`).
                 let incoming_borrows = self.borrows.clone();
                 let mut m1 = moved.clone();
                 self.borrows = incoming_borrows.clone();
-                self.block(then, &mut m1, consuming, false);
+                self.block(then, &mut m1, result_consuming, false);
                 let b1 = self.borrows.clone();
                 let mut m2 = moved.clone();
                 self.borrows = incoming_borrows.clone();
-                self.block(els, &mut m2, consuming, false);
+                self.block(els, &mut m2, result_consuming, false);
                 let b2 = self.borrows.clone();
                 // Join the branch states — but a branch that always diverges (`return`) contributes
                 // nothing past the `if`, so its moves must not poison the fall-through. (Without this,

@@ -10738,7 +10738,11 @@ fn lower_match_enum(
         bind_payload(b, arm);
         // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
         // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
-        if !arm.bindings.is_empty() {
+        if arm.bindings.iter().any(|local| {
+            b.slots
+                .get(*local as usize)
+                .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+        }) {
             null_moved_source(b, scrutinee);
         }
         finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
@@ -10746,7 +10750,11 @@ fn lower_match_enum(
     }
     let d = &arms[default_idx];
     bind_payload(b, d);
-    if !d.bindings.is_empty() {
+    if d.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    }) {
         null_moved_source(b, scrutinee);
     }
     finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);

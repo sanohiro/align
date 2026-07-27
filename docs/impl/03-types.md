@@ -241,8 +241,10 @@ DropPlan =
 ```
 
 A composite is Move iff `plan.needs_drop()` is true; all-Copy composites retain their exact
-topology with a cached false bit. `Option`, `Result`, and `Enum` are tag-tested so only the active
-payload is dropped. The same plan drives move/null-source and drop-old
+topology with a cached false bit. The topology records the active-payload rule. User enums and the
+recursive `Option<string>` field/temporary path lower it with a tag test; standalone legacy
+`Option`/`Result` scalar-payload slots retain their zero-initialized inactive-field cleanup until
+L1b unifies the remaining tagged lowering. The same plan drives move/null-source and drop-old
 classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
 plans are rejected with the existing recursive-type diagnostic. Nominal struct and sum nodes are
 memoized by type ID, shared, and carry their computed Move bit, so both construction and
