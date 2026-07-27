@@ -626,6 +626,10 @@ StaticQueryArtifact
   query_id
   Params canonical type
   Row canonical type
+  Params canonical fingerprint
+  Row canonical fingerprint
+  binder ABI version
+  decoder ABI version
   driver restriction
   static semantic options
   SQL source identity: File(logical path) | Inline(query_id)
@@ -648,6 +652,8 @@ StaticCommandArtifact
   statement_kind = Command
   unit, item, command_id
   Params canonical type
+  Params canonical fingerprint
+  binder ABI version
   driver restriction
   static semantic options
   SQL source identity and exact bytes/hash
@@ -657,6 +663,27 @@ StaticCommandArtifact
   per-driver binding plan and retention classes
   per-driver checked-metadata policy/state/digest
 ```
+
+The canonical artifact codec is:
+
+```text
+magic                ASCII "ALIGNQRY" | "ALIGNCMD" (8 bytes)
+format_version       u32 little-endian
+integer/ABI version  fixed-width little-endian
+enum/bool/tag         u8 using the declaration order
+Hash128               lo u64 then hi u64, little-endian
+string/byte field     u64 little-endian length, then exact bytes
+Option                u8 0 | 1, then payload when 1
+sequence              u64 little-endian count, then elements in semantic order
+```
+
+Fields follow the artifact listings above. Maps are never encoded by map iteration: permitted-driver
+entries use `SQLite`, then `PostgreSQL`; parameter occurrences use source-byte order; every other
+sequence names its order in the field contract. Params/Row canonical fingerprints are `Hash128::of`
+the same fully substituted canonical type bytes used by `IStaticQuery`/`IStaticCommand`.
+Binder/decoder ABI versions are `u32`; changing a generated thunk calling/layout contract increments
+the corresponding version even when the logical type is unchanged. The artifact digest is
+`Hash128::of` over the complete bytes beginning at `magic`.
 
 It has the same generated Params binder and source/wire/cache invalidation rules as a Query. It has
 no Row contract, result-column metadata, or decode thunk. `command_id` uses the same fully-qualified
@@ -1109,6 +1136,8 @@ Scope:
 - versioned Query/command artifacts and interface summaries;
 - generated `QueryStatic`/`CommandStatic` data skeletons, including per-driver bind plans and checked
   state.
+- canonical Params/Row fingerprints plus binder/decoder ABI versions in artifact bytes,
+  reproducibility checks, and cache keys.
 
 Acceptance:
 
@@ -1116,6 +1145,8 @@ Acceptance:
 - a descriptor accepts exactly one whole-body static constructor; nested, conditional, multiple,
   generic, argument-taking, and helper-wrapped forms fail before artifact creation;
 - two descriptor functions in one module receive distinct Query/command IDs and artifact/thunk slots;
+- Query/command artifacts round-trip byte-identically with the exact magic, endian, field order,
+  fingerprints, ABI versions, and permitted-driver order from §6.2;
 - unchanged consumers still hit when the public Query/command contract is unchanged;
 - public Params/Row/restriction changes invalidate Query consumers, and public
   Params/restriction changes invalidate command consumers;

@@ -2363,8 +2363,10 @@ db.ColumnMeta
   origin_schema, origin_table, origin_column: Option<str>
 
 db.KeyMeta
-  schema, table, name: str
+  schema, table: str
+  name: Option<str>
   kind: MetaKeyKind
+  key_ordinal: i64
   term_ordinal: i64
   local_column, referenced_schema, referenced_table, referenced_column, expression: Option<str>
   match_policy: Option<MetaForeignKeyMatch>
@@ -2411,8 +2413,11 @@ db.QueryPlan
 Every optional field outside the selected detail is `None`. At the selected detail, unavailable
 engine evidence is also `None`; empty text, zero, and `false` are real reported values and never
 stand for absence. A field that is not applicable to that record discriminator is `None` even at
-`Full`. Required identity fields are present at every detail. Results use byte-lexicographic `str`
-ordering after the category keys below, so engine/catalog iteration order is never observable.
+`Full`. A required evidence enum uses its explicit `Unknown`/`Native` state when evidence is
+suppressed or unavailable; it is never guessed. Required identity fields are present at every
+detail. An optional identity explicitly named in the matrix is requested at every detail and uses
+`None` only when the engine exposes no value. Results use byte-lexicographic `str` ordering after
+the category keys below, so engine/catalog iteration order is never observable.
 
 | Category | Rows and required fields at every detail | `Names` | `Summary` | `Full` |
 |---|---|---|---|---|
@@ -2420,12 +2425,22 @@ ordering after the category keys below, so engine/catalog iteration order is nev
 | `SchemaMeta` | one per selected schema, ordered by `name`; `name`, `visible`, `system` | `owner = None` | request `owner` | same common fields as Summary |
 | `TableMeta` | one per selected table/view, ordered by `(schema, name)`; `schema`, `name`, `kind` | all optional fields `None` | request `native_kind`, `owner`, `estimated_rows` | Summary plus `comment` |
 | `ColumnMeta` | one per column, physical/result order; `ordinal` is zero-based; `schema`, `table`, `name`, `ordinal` | optional fields `None`; `nullable = Unknown` | request `logical_type`, `native_type`, and catalog-column `nullable` | Summary plus `native_type_id`, default/generated/identity/collation/comment, and view-origin fields |
-| `KeyMeta` | one row per key/constraint term, ordered by `(name, term_ordinal)`; `term_ordinal` is zero-based; identity, `kind`, ordinal required | all optional fields `None` | request local/referenced names and `expression` | Summary plus match/update/delete, deferral, and validation evidence |
+| `KeyMeta` | one row per key/constraint term, ordered by `(key_ordinal, term_ordinal)`; both ordinals are zero-based; schema/table, `kind`, ordinals required; optional `name` identity requested at every detail | only `name` may be `Some`; other optional fields `None` | Names plus local/referenced names and `expression` | Summary plus match/update/delete, deferral, and validation evidence |
 | `IndexMeta` | one row per term, ordered by `(name, term_ordinal)` with key terms before included terms; `term_ordinal` is zero-based across that order; identity, ordinal, `term_kind` required | all optional fields `None` | request unique/primary backing, column/expression/predicate, and sort/null order | Summary plus native method/opclass and valid/ready evidence |
-| `QueryMeta` | ordering and discriminator rules below; Query/driver identity, class, artifact/state, source/wire hashes, rewrite version, and `entry` required on every row | one `Summary` row only | Summary then all Parameter and Column rows with source names/aliases and logical types | same rows plus checked native/origin/nullability and prepare/schema/server evidence |
+| `QueryMeta` | ordering and discriminator rules below; Query/driver identity, class, artifact/state, source/wire hashes, rewrite version, and `entry` required on every row | one `Summary` row only | exactly Summary, then every Parameter, then every Column; source names/aliases and logical types | same row groups plus checked native/origin/nullability and prepare/schema/server evidence |
 
 `ColumnMeta.nullable` describes the catalog column declaration when requested; it does not prove
-the nullability of a Query result. `QueryMeta.nullable` follows §16.3.1.
+the nullability of a Query result. It is `Unknown` at Names and whenever catalog evidence is
+unavailable at Summary/Full. `QueryMeta.nullable` follows §16.3.1.
+
+Constraint names are optional and are not assumed unique; `None` means the engine exposes no name
+and no synthetic name is fabricated. For each table, the driver builds each complete common key
+group, canonically sorts groups by `(kind tag, name Option tag/bytes, ordered
+local/reference/expression term signature)`, then assigns `key_ordinal` from zero. Tied signatures
+produce byte-identical common groups, so their physical order cannot affect common output. Every
+term of a group repeats that `key_ordinal`; `term_ordinal` starts at zero within the group.
+Names/Summary may suppress non-identity fields after this identity/order computation, never before
+it.
 
 `QueryMeta` has these exact discriminator rules:
 
@@ -2435,23 +2450,28 @@ the nullability of a Query result. `QueryMeta.nullable` follows §16.3.1.
 | `Parameter` | absent at Names; one per distinct source parameter at Summary/Full, ordered by protocol ordinal | one-based protocol ordinal (`$1` is 1) | `source_name`, `logical_type`; plus checked `native_type`/`native_type_id` at Full |
 | `Column` | absent at Names; one per Row field at Summary/Full, ordered by decoder position | zero-based decoder ordinal | `source_alias`, `logical_type`; plus checked `native_type`/`native_type_id`, structured origin, and §16.3.1 `nullable` at Full |
 
-On `Summary` and `Parameter` entries, `nullable` is `Unknown`. `source_alias` is inapplicable to
-Parameter, `source_name` is inapplicable to Column, and every origin field is inapplicable to
-Parameter. The `metadata_fingerprint` and prepare/schema/server identities occur only on the
-`Summary` entry; they are not duplicated on Parameter/Column rows. A `Declared` Query has no
-checked-only fields at any detail.
+The complete row order is the one Summary entry, every Parameter in increasing protocol ordinal,
+then every Column in increasing decoder ordinal; the groups are never interleaved. On `Summary` and
+`Parameter` entries, `nullable` is `Unknown`. A Column entry is also `Unknown` at Summary, at Full
+when checked evidence is unavailable/ambiguous, and at every detail for a `Declared` Query.
+`source_alias` is inapplicable to Parameter, `source_name` is inapplicable to Column, and every
+origin field is inapplicable to Parameter. The `metadata_fingerprint` and prepare/schema/server
+identities occur only on the `Summary` entry; they are not duplicated on Parameter/Column rows. A
+`Declared` Query has no checked-only fields at any detail.
 
-`artifact_digest` is the 32-character lowercase hexadecimal `Hash128::of` value of the exact
-versioned D1 `StaticQueryArtifact` bytes emitted for this Query descriptor (the digest is not
-embedded in those bytes). The bytes cover Query identity, driver restriction, source SQL, static
+`artifact_digest` is the 32-character lowercase hexadecimal `Hash128::of(...).to_hex()` value
+(`lo`, then `hi`) of the exact versioned D1 `StaticQueryArtifact` bytes emitted for this Query
+descriptor (the digest is not embedded in those bytes). The bytes cover Query identity, driver
+restriction, source SQL, static
 Query options, Params/Row fingerprints, binder/decoder ABI versions, and every permitted driver's
 wire SQL/rewrite/binding/checked-metadata entry in `Driver` enum order. The same digest is repeated
 on each driver-specific `QueryMeta` row for that descriptor. Runtime options, connection/secret
 data, requested `MetaDetail`, and metadata output ordering are excluded.
 
-Keys/constraints and indexes with several terms are repeated flat rows sharing `name`, ordered by
-`term_ordinal`; index key terms precede included terms and `term_kind` distinguishes them. A category
-result never hides a nested allocation. `db.QueryMeta` begins with one
+Keys/constraints and indexes with several terms are repeated flat rows. Key groups use
+`key_ordinal` because `name` need not be unique; terms use `term_ordinal`. Index key terms precede
+included terms and `term_kind` distinguishes them. A category result never hides a nested
+allocation. `db.QueryMeta` begins with one
 `Summary` row followed by ordered parameter and column rows. `source_sql_hash`,
 `driver_wire_sql_hash`, and `rewrite_format_version` are always present because D1 creates them for
 every static Query/driver even in `Declared` state. Other optional fields are `None` when the
@@ -2502,6 +2522,9 @@ driver/native metadata call. Rejection returns `db.Error.Encode(db.ContractError
 item, message: "metadata identifier contains U+0000" })`. `item` is exactly
 `"metadata.schema"`, `"metadata.table.schema"`, or `"metadata.table.name"` for the corresponding
 component. No SQL/catalog request is sent on this error.
+Validation follows public record declaration order. `SchemaRef` checks `name`; `TableRef` checks
+`schema` before `name`. If both TableRef components contain U+0000, the result is therefore
+`item = "metadata.table.schema"`. Both-driver tests pin this dual-invalid precedence.
 
 Every string byte and every result array is allocated in the explicit `out` region before the native
 metadata/result buffer is released. No returned value borrows a connection, result, statement, or
@@ -2575,10 +2598,11 @@ column order
 referenced table/columns
 match/update/delete actions
 deferrability where supported
-constraint name
+optional engine-reported constraint name
 ```
 
-Composite keys preserve ordered columns.
+Composite keys preserve ordered columns and `key_ordinal` grouping even when names are absent or
+duplicated.
 
 ### 18.8 Index metadata
 
@@ -2882,6 +2906,8 @@ Before a native database:
 - construct `db.query<P,R>` from inline and sibling SQL;
 - construct `db.command<P>` from inline and sibling SQL;
 - emit/load `StaticQueryArtifact` and `StaticCommandArtifact`;
+- serialize canonical Params/Row fingerprints and binder/decoder ABI versions exactly as L5's
+  versioned artifact schema requires;
 - preserve exact source SQL identity while generating deterministic SQLite/source and
   PostgreSQL/`$n` wire entries plus reverse span maps;
 - generate the shared Params binder for both kinds and a Query-only decoder thunk;
@@ -2895,10 +2921,11 @@ Before a native database:
   `sqlite.CommandOption`, and `postgres.QueryOption`/`postgres.CommandOption` exactly as §11–§13;
 - prove no runtime reflection or per-row name lookup.
 
-Tests mutate SQL-only, private Query/command, public Params/Row, driver restriction, and per-driver
-metadata digests independently. They compile-fail a command with a Row/decode contract and prove an
-unchanged public command consumer is not recompiled by a SQL-only producer edit. Benchmark generated
-Query/command binders, the Query decoder, and warm-cache behavior.
+Tests mutate SQL-only, private Query/command, public Params/Row, driver restriction, binder/decoder
+ABI versions, and per-driver metadata digests independently. They round-trip the exact artifact
+schema, compile-fail a command with a Row/decode contract, and prove an unchanged public command
+consumer is not recompiled by a SQL-only producer edit. Benchmark generated Query/command binders,
+the Query decoder, and warm-cache behavior.
 
 ### D2 — minimal SQLite Query vertical
 
@@ -3088,7 +3115,10 @@ survives native-result cleanup until its destination arena ends; category arrays
 that arena; every §18.2.1 category/detail/entry projection, ordering, ordinal base, unavailable
 field, and artifact digest is exact; multi-term keys/indexes remain flat ordered rows; and
 `meta_table` reports `NotFound`. Both drivers reject U+0000 in every `SchemaRef`/`TableRef`
-component with the exact Query-less Encode item before any native/catalog request.
+component with the exact Query-less Encode item before any native/catalog request. The matrix
+includes Declared/checked/unknown-nullability cells, a Query with both Parameters and Columns, a
+TableRef whose schema and name are both invalid, and two same-named constraints whose canonical
+`key_ordinal` groups are pinned. An unnamed constraint returns `name = None`.
 Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
 category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
 operation.
@@ -3280,7 +3310,8 @@ The design is implemented correctly only if all are true:
 87. Metadata filters use exact Copy `SchemaRef`/`TableRef` inputs with no search-path, `main`, or SQL
     interpolation inference.
 88. `KeyMeta` preserves foreign-key match/update/delete, deferrability, initial deferral, and
-    validation evidence when available.
+    validation evidence when available, and groups duplicate names deterministically by
+    `key_ordinal`.
 89. `IndexMeta` preserves key/included position, uniqueness/primary backing, sort/null order,
     predicate/expression/native method/opclass, and valid/ready evidence when available.
 90. `ColumnMeta` and `QueryMeta` contain the exact native identity, origin, checked-artifact,
@@ -3288,9 +3319,10 @@ The design is implemented correctly only if all are true:
 91. D0 records engine/version nullability/origin evidence; D3 and D5 own fail-closed support
     matrices before merge, `Unknown` never proves non-null, and every runtime NULL guard remains.
 92. Every metadata category/detail and `MetaQueryEntry` discriminator follows §18.2.1's exact row,
-    field-presence, ordering, ordinal, and `artifact_digest` contract.
+    field-presence, Unknown-state, group-ordering, ordinal, and artifact-schema/digest contract.
 93. Metadata schema/table inputs reject U+0000 as the exact Query-less `db.Error.Encode` before any
-    native/catalog request on both drivers.
+    native/catalog request on both drivers, with declaration-order precedence for multi-invalid
+    inputs.
 
 ---
 

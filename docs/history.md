@@ -372,6 +372,9 @@ exact `SchemaRef`/`TableRef` inputs and complete flat Column/Key/Index/Query rec
 nullability is fail-closed: D0 records actual engine evidence, D3/D5 own the driver matrices,
 ambiguous evidence is `Unknown`, and catalog `NOT NULL` alone never removes runtime NULL checking.
 Metadata `Names`/`Summary`/`Full` and Query entry rows have one exact presence/order/ordinal/digest
-matrix, and schema/table reference components reject U+0000 before native access.
+matrix, including every Unknown state and Summary→Parameter→Column group order. The canonical
+artifact codec serializes the fingerprints/ABI versions named by its digest, duplicate constraint
+names use a canonical `key_ordinal`, and schema/table reference components reject U+0000 before
+native access in declaration order.
 The repository's design process now requires one public-contract ledger and an author-side
 ledger-to-prose pass before independent review.

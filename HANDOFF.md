@@ -260,10 +260,12 @@ identity. `resource.borrow` is public safe ownership-only access while raw forms
 declaring-subtree privileged. `db.exec_result` is exactly the Copy affected-row record. Every D11
 live command has explicit entry/catalog/driver/target inputs. D12 uses exact `SchemaRef`/`TableRef`
 and complete flat Column/Key/Index/Query records, with exact detail/discriminator projection,
-ordinal/digest semantics, and pre-native U+0000 rejection for identifier components. D0 records the
-actual engine/version origin/nullability evidence; D3/D5 own fail-closed driver matrices, ambiguous
-evidence remains `Unknown`, and runtime NULL guards remain mandatory. The first public database
-release gate is
+Unknown-state and Summary→Parameter→Column ordering, ordinal/digest semantics, and declaration-order
+U+0000 rejection precedence for identifier components. Duplicate constraint names use a canonical
+`key_ordinal`. The L5/D1 artifact has an exact canonical codec and serializes every Params/Row
+fingerprint and binder/decoder ABI version named by that digest. D0 records the actual
+engine/version origin/nullability evidence; D3/D5 own fail-closed driver matrices, ambiguous evidence
+remains `Unknown`, and runtime NULL guards remain mandatory. The first public database release gate is
 driver-relevant D1–D12: D4 merge/release requires non-skippable provisioned PostgreSQL CI; D11 uses
 the exact atomic-default/dirty-forbidden migration contract; and D12 returns flat metadata/plan
 records into an explicit region. D13/D14 remain committed additive work. Native feasibility probes

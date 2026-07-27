@@ -69,7 +69,7 @@ listed source agree.
 | Offline metadata artifacts | explicit prepare only; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/reproducible/offline/cache matrix and artifact time/size | pipeline/cache plans, DB EN/JA |
 | Options/errors/result | finite scope-specific sums; unsupported is error; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/error-buffer tests and zero-allocation result check | DB EN/JA |
 | Migrations | exact entry/catalog/driver/target CLI; SQL catalog identity; atomic default; one-statement dirty exceptional path | D11 | CLI-input/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
-| Metadata records | exact typed refs, pre-native identifier validation, detail/discriminator projection, ordinals/digest, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | input/detail/entry/field/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
+| Metadata records | exact typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
 | Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
 | Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
 
@@ -1172,6 +1172,69 @@ idea is rejected.
   Query-less `db.Error.Encode` items and negative tests on both drivers.
 - **v1 impact:** D12 input-safety blocker.
 
+### F82 — non-optional nullability cells remained implicit
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** DB §18.2.1 optional/unavailable rule versus non-optional
+  `ColumnMeta.nullable`/`QueryMeta.nullable`.
+- **Current Align constraint:** the decoder must not manufacture positive nullability evidence when
+  detail suppresses it, a Query is Declared, or the engine has no answer.
+- **Actual failure:** implementations could select different enum values for the same matrix cell
+  and one could treat absent evidence as non-null.
+- **Recommendation:** require `Unknown` for every suppressed, unavailable, ambiguous, or Declared
+  cell and test the complete state/detail product.
+- **v1 impact:** D3/D5/D12 soundness/compatibility blocker.
+
+### F83 — Query metadata row groups could be interleaved
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §18.2.1 QueryMeta ordering.
+- **Current Align constraint:** flat region records have no secondary iterator contract; consumers
+  depend on one deterministic sequence.
+- **Actual failure:** Parameter and Column rows could each be internally ordered yet interleaved
+  differently by the two drivers.
+- **Recommendation:** require Summary, then all Parameters, then all Columns and test a Query
+  containing both groups.
+- **v1 impact:** D12 cross-driver compatibility blocker.
+
+### F84 — artifact digest inputs exceeded the canonical artifact schema
+
+- **Classification:** current Align conflict; specification ambiguity.
+- **Problematic design location:** DB §18.2.1 `artifact_digest` versus prerequisite §6.2.
+- **Current Align constraint:** a digest over exact emitted bytes can include only serialized
+  versioned artifact fields.
+- **Actual failure:** the metadata contract named Params/Row fingerprints and binder/decoder ABI
+  versions that the canonical artifact record did not serialize, forcing an agent to omit them or
+  invent an incompatible encoding.
+- **Recommendation:** add those exact fields to Query/command artifact schemas and D1
+  round-trip/invalidation tests.
+- **v1 impact:** L5/D1/D12 cache/separate-compilation blocker.
+
+### F85 — multi-invalid metadata refs had no error precedence
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §18.2 SchemaRef/TableRef U+0000 errors.
+- **Current Align constraint:** diagnostics and no-side-effect validation must be deterministic
+  across drivers.
+- **Actual failure:** a TableRef with U+0000 in both components could return schema or name error
+  depending on driver validation order.
+- **Recommendation:** validate public record declaration order (`schema` then `name`) and pin the
+  dual-invalid case.
+- **v1 impact:** D12 diagnostic compatibility blocker.
+
+### F86 — constraint name was used as if it were unique
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §18.2.1 KeyMeta ordering/grouping.
+- **Current Align constraint:** flat rows need an explicit stable group identity; SQLite permits
+  multiple constraints with the same declared name.
+- **Actual failure:** `(name, term_ordinal)` cannot distinguish same-named keys and lets catalog
+  iteration order affect common output.
+- **Recommendation:** make the reported name optional, add zero-based `key_ordinal`, derive it from
+  a canonical complete common key signature before detail suppression, and test unnamed/duplicate
+  names.
+- **v1 impact:** D12 metadata identity/determinism blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1343,6 +1406,12 @@ documents:
 74. Move the nullability/origin evidence contract to D0/D3/D5 and keep runtime NULL guards.
 75. Define exact metadata detail/discriminator projections, ordinals, ordering, and artifact digest.
 76. Reject U+0000 in every metadata schema/table reference before a native/catalog request.
+77. Fill every non-optional nullability cell with fail-closed `Unknown` when evidence is absent.
+78. Order QueryMeta rows as Summary, all Parameters, then all Columns.
+79. Serialize the fingerprints and binder/decoder ABI versions named by the artifact digest.
+80. Define declaration-order error precedence for multi-invalid metadata references.
+81. Represent absent constraint names honestly and group duplicate names with a canonical
+    zero-based `key_ordinal`.
 
 ## 5. Revised implementation roadmap
 
@@ -1357,7 +1426,7 @@ documents:
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |
 | D0 | SQLite/libpq capability probes only | native lifecycle plus exact origin/nullability evidence observations | recorded driver/version evidence matrix |
-| D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
+| D1 | fake-driver Query/command binder, Query decoder, scanner, static options | artifact fingerprint/ABI round-trip plus cache/placeholder/retention matrices | thunk overhead and warm cache |
 | D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, NUL/PRAGMA validation, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline, migration catalog/order, and fail-closed origin/nullability matrix | prepare/check time and artifact size |
 | D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, Text-hex/Binary bytea, NUL/query-less error, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
@@ -1368,7 +1437,7 @@ documents:
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-input exact-policy SQL migrations; initial-release gate | CLI selector, checksum/order/atomic/dirty/repair/status | migration startup/large history |
-| D12 | exact validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | identifier/detail/entry/field/ordinal/digest/lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/record bytes/latency |
+| D12 | exact validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown and group-order matrix; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE executes visibly | catalog query count/record bytes/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -1502,6 +1571,13 @@ The final ledger closeout then found F80–F81 in the one metadata row: the row 
 types but had not expanded detail/discriminator presence or input encoding. The stale-HEAD host
 review was stopped immediately rather than allowed to consume its remaining bound. The metadata
 ledger row was expanded first, then propagated as §18.2.1 plus the two-driver negative-test gate.
+The first focused verification of that table found F82–F85: four still-unfilled Cartesian-product
+or cross-schema cells. The table was made total for Unknown state and group order, the canonical
+artifact schema gained the fields named by its digest, and input validation gained explicit
+multi-invalid precedence. Each stale review was stopped at the finding rather than restarted or
+allowed to run to its bound.
+The stopped host checkpoint also demonstrated that SQLite accepts duplicate constraint names. F86
+therefore replaces name-based grouping with the canonical `key_ordinal` before the next closeout.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.
