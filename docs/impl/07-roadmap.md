@@ -3539,12 +3539,15 @@ the exact engine/version origin and result-nullability information actually avai
 `NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database,
 including the exact top-level/nested codec, checked-in Query/command byte+digest goldens,
-serialized Params/Row fingerprints, and binder/decoder ABI versions. Option
+structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan/thunk, and
+binder/decoder ABI versions. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
 connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
-The checked-metadata merge gates D3 and D5 each check in the corresponding conservative
+The checked-metadata merge gates D3 and D5 each pin the exact derived path, canonical JSON and
+identity streams, independent byte/digest goldens, and corresponding conservative
 origin/nullability support matrix measured by D0; ambiguous evidence remains `Unknown`, and runtime
-NULL validation is never optimized away. D9 completes shared deadline enforcement/native
+NULL validation is never optimized away. D2 owns SQLite's one active-execution lease and overlap
+cleanup matrix. D9 completes shared deadline enforcement/native
 cancellation cleanup and the cross-scope disposition
 audit; it does not add a public cancel resource or replace an
 interim surface. D2 and D4 deliberately remain scalar verticals; their purpose is to connect the
@@ -3552,15 +3555,18 @@ final Query-centered API to each native library without inventing a temporary dy
 and every database release require a provisioned non-skippable PostgreSQL CI job; reported skips are
 local-only. D10 is part of the initial database release rather than a future relationship feature.
 
-D11 SQL migrations use the exact required-by-default/forbidden-one-statement policy and dirty-state
-repair contract. Every migrate/status/check/repair invocation explicitly names its entry,
+D11 SQL migrations use the versioned `ALIGNMIG`/`ALIGNSID` codec/goldens plus the exact
+required-by-default/forbidden-one-statement policy and dirty-state repair contract. Every
+migrate/status/check/repair invocation explicitly names its entry,
 migration catalog, driver, and matching database target. D12 returns exact flat metadata/plan
 records into an explicit region. Its gate includes the complete category/detail/discriminator
 projection and ordinal/digest matrix plus pre-native U+0000 rejection for every schema/table
 reference component on both drivers. The matrix includes every Declared/checked/Unknown cell,
 Summary→Parameter→Column group order, canonical duplicate-constraint `key_ordinal`, and
 same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
-multi-invalid error precedence. Both are part
+multi-invalid error precedence. The D12 gate syntax-checks the exact declarations and positional
+examples, and separately compiled Query metadata must come from the producer-owned plan/thunk
+without runtime artifact I/O. D11 and D12 are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

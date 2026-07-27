@@ -143,6 +143,15 @@ independent review:
 - every canonical persisted or exchanged format fixes all scalar widths and
   tags, every nested record and sequence order, malformed-input rejection, and
   independently checked semantic-to-byte and byte-to-semantic golden vectors;
+- every type/cache fingerprint states whether it is nominal or structural; a
+  structural contract includes the complete reachable definition graph;
+- every promised runtime inspection field names the producer-owned table or
+  thunk that supplies it without reflection or artifact/source I/O;
+- every operation that changes connection-global or process-global native
+  state defines overlap exclusion, failed-second-operation behavior, and
+  exhaustion/error/Drop restoration order;
+- every normative code example is syntax-checked, and declarations are shown
+  separately from positional call expressions;
 - no milestone consumes a decision or capability scheduled for a later
   milestone;
 - `draft.md`, `docs/language-spec.md`, implementation plans, package designs,

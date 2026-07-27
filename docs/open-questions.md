@@ -3972,6 +3972,16 @@ exact derived checked-metadata logical path and `Missing` or
 paths before a frontend-cache hit. Creation, deletion, or change invalidates the action; directory
 scanning and mtime identity remain forbidden.
 
+The Query/command artifact contract is structural and executable: Params/Row fingerprints include
+the complete reachable instantiated definition graph; Query carries a producer-owned metadata
+plan/materialization thunk for runtime inspection; checked metadata uses the exact
+`.align-db/<driver>/<Hash128(descriptor_id)>.json` canonical codec; and migration/schema identities use
+the versioned `ALIGNMIG`/`ALIGNSID` streams. All have independent byte/digest goldens. Mutable
+prepare targets require an explicit non-secret schema ID because an offline normal build cannot
+rediscover ambient database state. SQLite connection-global execution/timeout state is serialized
+by one package-tracked active-execution lease; a second Copy execution view fails before native
+state change.
+
 Dependency *names* remain derivable from source (`grep 'import pkg\.'` — no manifest to drift,
 same argument as M15's unit graph). Only *sources/versions* need recording, and that record
 (`align.lock` at the project root: name → URL + rev + content hash, written and read **only** by

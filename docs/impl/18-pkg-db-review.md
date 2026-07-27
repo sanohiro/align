@@ -60,16 +60,16 @@ listed source agree.
 | Borrowed calls | `borrow`/`borrow mut` modes, all-peer alias rejection, return roots, and cleanup ABI are interface facts | L2 | direct/indirect/imported alias/provenance/cleanup matrix | draft, language spec, types/MIR plans, prerequisite plan |
 | Opaque resources | public safe `resource.borrow`; raw forms are declaring-subtree privileged; dependent child and view provenance is explicit | L3 | cross-unit Drop, escape/raw-transfer negatives, resource/view overhead | draft, language spec, frontend/types/MIR, prerequisite plan |
 | Region and builder | explicit `region`; closed `RegionPlain`; one measured builder compact pass | L4/L6/L7 | escape/bound/copy-count tests and push/freeze benchmark | draft, language spec, types/MIR, core builder, prerequisite plan |
-| Query/command descriptors | one whole-body item, exact `Params`/flat `Row`, unique identity, generated binder/decoder, no reflection; canonical top-level/nested artifact codec with Params/Row fingerprints and binder/decoder ABI versions | L5/D1 | descriptor/interface/cache matrix, checked-in Query/command byte+digest goldens, and thunk benchmark | frontend/types/MIR, prerequisite plan, DB EN/JA |
+| Query/command descriptors | one whole-body item, exact `Params`/flat `Row`, unique identity, structural reachable-definition fingerprints, canonical top-level/nested artifact codec, binder/decoder ABI versions, and producer-owned QueryMeta plan/thunk; no reflection | L5/D1 | descriptor/interface/cache/runtime-metadata matrix, checked-in Query/command byte+digest goldens, and thunk benchmark | frontend/types/MIR, prerequisite plan, DB EN/JA |
 | Static SQL inputs | tagged sibling/relative/inline identity; source and driver-wire hashes/spans are distinct deterministic inputs | L5/D1 | create/change/delete/path/span/incremental matrix | language docs, pipeline/cache plans, DB EN/JA |
 | Parameters | one dialect-aware source scan; stable first-occurrence ordinals; SQLite named and PostgreSQL `$n`; explicit retention/copy | D1/D4/D8 | scanner/rewrite/bind-lifetime matrix and bind benchmark | DB EN/JA |
 | Typed rows | generated ordinal decoder; runtime count/type/NULL guard; row generation invalidates views; retention uses `clone_in` | D1/D8 | stale-view/decode/retention negatives and row-loop benchmark | memory model, DB EN/JA |
 | Connection/transaction execution | closed `db.exec` resource-reference sum from both conn and tx; no public driver trait | D7 | alias/consume/rollback/dispatch tests and dispatch cost | prerequisite plan, DB EN/JA |
 | Shaping | one visible Query execution and rows loop; Pure one-pass step; no structural extra SQL | D10 | many-to-one/one-to-many execution-count tests and shaping benchmark | DB EN/JA, core builder |
-| Offline metadata artifacts | explicit prepare only; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/reproducible/offline/cache matrix and artifact time/size | pipeline/cache plans, DB EN/JA |
-| Options/errors/result | finite scope-specific sums; unsupported is error; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/error-buffer tests and zero-allocation result check | DB EN/JA |
-| Migrations | exact entry/catalog/driver/target CLI; SQL catalog identity; atomic default; one-statement dirty exceptional path | D11 | CLI-input/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
-| Metadata records | exact typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
+| Offline metadata artifacts | explicit prepare only; exact derived pathname and canonical fail-closed JSON/identity codecs with independent goldens; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/malformed/reproducible/offline/cache/byte-golden matrix and artifact time/size | pipeline/cache plans, prerequisite plan, DB EN/JA |
+| Options/errors/result | finite scope-specific sums; unsupported is error; connection-global state has one explicit lease; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/overlap/Drop-order/error-buffer tests and zero-allocation result check | DB EN/JA |
+| Migrations | exact entry/catalog/driver/target CLI; versioned catalog/schema-identity codecs and independent goldens; atomic default; one-statement dirty exceptional path | D11 | CLI-input/byte-golden/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
+| Metadata records | exact parseable signatures, typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | syntax/input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
 | Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
 | Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
 
@@ -1273,6 +1273,78 @@ idea is rejected.
   prerequisite source in the ledger row.
 - **v1 impact:** design-completion blocker before L5 implementation starts.
 
+### F90 — nominal type references were mistaken for structural fingerprints
+
+- **Classification:** current Align conflict; implementation complexity.
+- **Problematic design location:** prerequisite §6.2 Params/Row fingerprint codec.
+- **Current Align constraint:** a named type reference does not encode its same-path field
+  definition, while checked metadata must become stale when that definition changes.
+- **Actual failure:** field name/order/type/nullability edits could leave artifact and metadata
+  fingerprints unchanged.
+- **Recommendation:** serialize the complete sorted reachable instantiated definition graph and
+  hash that structural contract; pin same-path definition edits.
+- **v1 impact:** L5/D1/D3/D5 cache and decode soundness blocker.
+
+### F91 — runtime Query metadata had no producer-owned data source
+
+- **Classification:** prerequisite feature missing; current Align conflict.
+- **Problematic design location:** prerequisite §6.3 versus DB §18.2 `meta_query`.
+- **Current Align constraint:** ordinary package code has no reflection and normal runtime code
+  cannot read compiler artifacts or `.align-db`.
+- **Actual failure:** a separately compiled Query could not provide declared parameter/Row records
+  or checked native/origin evidence promised by D12.
+- **Recommendation:** serialize a QueryMeta plan/evidence table and emit a producer-owned
+  materialization thunk in the descriptor ABI.
+- **v1 impact:** L5/D1/D12 implementation blocker.
+
+### F92 — checked metadata had no exact path or canonical JSON codec
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** DB §16.3.
+- **Current Align constraint:** prepare and offline compilation are independent producers/consumers
+  and must agree on exact paths, bytes, malformed-input behavior, and digests.
+- **Actual failure:** key order, tags, escaping, numeric forms, query-ID hashing, and evidence
+  identities could differ while each implementation claimed canonical JSON.
+- **Recommendation:** fix descriptor-ID pathname derivation, every JSON field/key order/encoding,
+  derived identity streams, fail-closed validation, and independent SQLite/PostgreSQL goldens.
+- **v1 impact:** D3/D5 offline/reproducibility blocker.
+
+### F93 — SQLite streamed timeout overrides could overlap
+
+- **Classification:** ownership or soundness risk; performance risk.
+- **Problematic design location:** DB §11.2 `BusyTimeoutNs` with Copy `db.exec`.
+- **Current Align constraint:** dependent resources block owner destruction, not a second Copy
+  execution view, while SQLite busy timeout is connection-global.
+- **Actual failure:** two row streams could overwrite and restore each other's timeout in the wrong
+  order and expose one execution's policy to another.
+- **Recommendation:** give each SQLite native connection one explicit active-execution lease and
+  reject every overlapping native operation before state change/call; pin cleanup order.
+- **v1 impact:** D2/D8 runtime correctness blocker.
+
+### F94 — migration catalog tuples had no canonical byte identity
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §16.6/D11 migration fingerprint.
+- **Current Align constraint:** SQLite preparation and migration commands are separate consumers of
+  one schema identity.
+- **Actual failure:** version width, filename framing, content hash, and final digest could differ,
+  producing false stale/current results.
+- **Recommendation:** define the versioned `ALIGNMIG`/`ALIGNSID` binary streams and independent
+  empty/non-empty byte+digest goldens.
+- **v1 impact:** D3/D11 reproducibility blocker.
+
+### F95 — normative metadata examples used nonexistent named/typed call arguments
+
+- **Classification:** current Align conflict.
+- **Problematic design location:** DB §18.2 metadata calls.
+- **Current Align constraint:** Align calls are positional; `name: Type` is declaration syntax, not
+  an argument expression.
+- **Actual failure:** the promised exact public API examples did not parse and left signatures
+  ambiguous for implementation.
+- **Recommendation:** show exact declarations separately, use typed local bindings plus positional
+  calls, and syntax-check every normative example.
+- **v1 impact:** D12 API-definition blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1290,18 +1362,20 @@ idea is rejected.
    chunk/compact helpers. No DB-specific runtime Query engine or handle type.
 5. **Compiler/semantic support:** L1a–L7, recognized Query constructors, static-input tracking,
    Query contract checking, placeholder scan/source maps, artifacts/hashes, and generated
-   binder/decoder thunks.
+   binder/decoder/QueryMeta thunks.
 6. **Static `db.query<Params,Row>`:** a Copy immutable descriptor data record plus direct generated
-   binder/decoder functions. Its function body is exactly one constructor, giving the item one
-   unique artifact identity. The rowless `db.command<Params>` uses the same statement artifact,
-   static ABI, binder, and cache rules minus Row/result/decode. Neither is an object with reflection
-   or a runtime SQL parser. L7 makes ordinary generic Query execution helpers representable.
+   binder/decoder/QueryMeta functions and structural type contracts. Its function body is exactly
+   one constructor, giving the item one unique artifact identity. The rowless
+   `db.command<Params>` uses the same statement artifact, static ABI, binder, and cache rules minus
+   Row/result/decode/QueryMeta. Neither is an object with reflection or a runtime SQL parser. L7
+   makes ordinary generic Query execution helpers representable.
 7. **Sibling `.align`/`.sql`:** a path-free registered constructor maps the defining module's exact
    extension to `.sql`; exact source bytes, logical path, kind, and digest are deterministic inputs,
    separate from deterministic driver wire bytes. Inline SQL instead uses `Inline(query_id)` and a
    decoded-literal source map.
 8. **Module export:** `IStaticQuery` carries the public contract; `StaticQueryArtifact` carries SQL
-   and implementation metadata. A private SQL-only edit rebuilds/relinks the producer without
+   and implementation metadata, including the structural contract and producer-owned runtime
+   QueryMeta plan/thunk. A private SQL-only edit rebuilds/relinks the producer without
    invalidating unchanged consumers. Function values retain parameter/capture provenance and the
    Move-return cleanup ABI across separate compilation. Static manifests also key every exact
    per-driver checked-metadata missing/present state.
@@ -1326,10 +1400,11 @@ idea is rejected.
     `array<R>` package signature. Builders stay separate mutable locals and are borrowed by the
     Pure step.
 15. **Offline checked metadata:** explicit prepare/check tooling invokes real database engines;
-    ordinary build consumes canonical artifacts and never connects. Explicit SQLite migration
-    replay uses one canonical validated version order and ordered fingerprint. Checked state is
-    driver-indexed, so an unpinned CheckedRequired descriptor requires current artifacts for both
-    SQLite and PostgreSQL. The pre-frontend manifest keys exact Missing/Present metadata state.
+    ordinary build consumes the exact derived path and fail-closed canonical JSON and never
+    connects. Explicit SQLite migration replay uses the versioned `ALIGNMIG`/`ALIGNSID` identity;
+    mutable targets name a schema ID. Checked state is driver-indexed, so an unpinned
+    CheckedRequired descriptor requires current artifacts for both SQLite and PostgreSQL. The
+    pre-frontend manifest keys exact Missing/Present metadata state.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
     slices and no silent ignore. The minimum constructors/defaults/conflicts are fixed in §§11–13;
     their owning milestones precede every consumer. Category metadata calls carry an explicit
@@ -1450,6 +1525,17 @@ documents:
 80. Define declaration-order error precedence for multi-invalid metadata references.
 81. Represent absent constraint names honestly and group duplicate names with a canonical
     zero-based `key_ordinal`.
+82. Include every Full-detail policy/evidence field in the canonical key-group signature.
+83. Fix every Query/command artifact scalar, nested record, order, rejection rule, and independent
+    byte/digest golden.
+84. Keep the strengthened codec/fingerprint/ABI/golden contract in the author-side ledger.
+85. Fingerprint complete reachable structural Params/Row definitions, not nominal references.
+86. Carry a producer-owned QueryMeta plan/materialization thunk in the artifact/descriptor ABI.
+87. Define the exact checked-metadata descriptor path, canonical JSON/identity codecs, validation,
+    and independent driver goldens.
+88. Serialize SQLite connection-global execution with one explicit overlap-safe lease.
+89. Define the versioned migration catalog/schema-identity codecs and independent goldens.
+90. Show exact metadata declarations separately from syntax-checked positional call examples.
 
 ## 5. Revised implementation roadmap
 
@@ -1460,22 +1546,22 @@ documents:
 | L2 | contextual borrow modes, Copy mutation/drop-old, Fn parameter/capture provenance, Move-return cleanup ABI | all-peer alias matrix, nested-view selectors, captured/joined direct/indirect, cleanup-bit per-unit parity | borrowed-call, return ABI, and interface-size cost |
 | L3 | resource/ref, linkable Drop thunk, dependent child/native view, root-only raw transfer | exact MIR, cross-unit Drop, invalid pointer/escape/projection | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
-| L5 | tagged file/inline/checked-metadata inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/metadata-create-change-delete/reproducibility matrix | cold/warm producer/consumer rebuild |
+| L5 | tagged file/inline/checked-metadata inputs, structural Query/command artifacts, QueryMeta descriptor/thunk skeletons | cache/path/inline-span/same-path-type-edit/metadata-create-change-delete/runtime-plan/golden/reproducibility matrix | cold/warm producer/consumer rebuild and metadata thunk |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |
 | D0 | SQLite/libpq capability probes only | native lifecycle plus exact origin/nullability evidence observations | recorded driver/version evidence matrix |
-| D1 | fake-driver Query/command binder, Query decoder, scanner, static options | artifact fingerprint/ABI round-trip plus cache/placeholder/retention matrices | thunk overhead and warm cache |
-| D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, NUL/PRAGMA validation, cleanup, execution count | package versus libsqlite3 |
-| D3 | SQLite prepare/check metadata | stale/policy/offline, migration catalog/order, and fail-closed origin/nullability matrix | prepare/check time and artifact size |
+| D1 | fake-driver Query/command binder, Query decoder/metadata plan, scanner, static options | independent artifact byte/digest golden plus structural fingerprint/cache/placeholder/retention/runtime-metadata matrices | thunk overhead and warm cache |
+| D2 | scalar SQLite Query/command + connection/execution options/lease | cardinality, option/overlap disposition, NUL/PRAGMA validation, cleanup, execution count | package/lease versus libsqlite3 |
+| D3 | SQLite prepare/check metadata | exact JSON/path/identity goldens, malformed/stale/policy/offline, `ALIGNMIG`/`ALIGNSID`, and fail-closed origin/nullability matrix | prepare/check/codec time and artifact size |
 | D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, Text-hex/Binary bytea, NUL/query-less error, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
-| D5 | PostgreSQL checked metadata | recreated-schema reproducibility plus expression/outer-join/catalog-nullability matrix | describe/prepare time |
+| D5 | PostgreSQL checked metadata | exact JSON/path/identity golden, recreated-schema reproducibility, expression/outer-join/catalog-nullability matrix | describe/prepare/codec time |
 | D6 | dependent prepared statements + prepare option sums | sequential reuse, disposition, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
 | D7 | tx options plus common exec view | combination rejection, consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
-| D8 | typed rows and row generations | old-view rejection, Params-source invalidation, type matrix, busy-timeout lifetime, clone retention, delivery counts | row decode/iteration/bind copies |
+| D8 | typed rows and row generations | old-view rejection, Params-source invalidation, type matrix, busy-timeout lifetime, stream-overlap/Drop lease, clone retention, delivery counts | row decode/iteration/bind copies/lease |
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
-| D11 | exact-input exact-policy SQL migrations; initial-release gate | CLI selector, checksum/order/atomic/dirty/repair/status | migration startup/large history |
-| D12 | exact validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown and group-order matrix; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE executes visibly | catalog query count/record bytes/latency |
+| D11 | exact-input exact-policy SQL migrations with versioned identity codec; initial-release gate | CLI selector, byte/digest golden, checksum/order/atomic/dirty/repair/status | migration fingerprint/startup/large history |
+| D12 | exact parseable validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | syntax; runtime plan source; multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown/group order; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE visible | catalog query count/record bytes/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -1549,24 +1635,26 @@ The delivery is not performance-complete without:
   current handle path, with exact MIR-operation counts;
 - L4 named/anonymous arena parity;
 - L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, public, and
-  checked-metadata create/change/delete states, plus file/inline and descriptor-count scaling;
+  checked-metadata create/change/delete states, plus structural-definition, QueryMeta thunk,
+  file/inline, and descriptor-count scaling;
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
 - L7 nested-generic inference/monomorph compile time, interface and mono-key size, emitted code size,
   cache reuse, and absence of runtime dictionary/indirect-call overhead;
 - D0 records the exact engine/version origin/nullability evidence matrix rather than timing a
   production path;
-- D1 generated Query/command binder and Query decoder versus hand-written field/ordinal code;
-- D2 direct libsqlite3 comparison, including zero-allocation `db.exec_result`;
-- D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
-  files;
+- D1 generated Query/command binder and Query decoder/metadata thunk versus hand-written
+  field/ordinal code;
+- D2 direct libsqlite3 comparison, including zero-allocation `db.exec_result` and lease overhead;
+- D3 prepare/check canonical JSON time/size, structural evidence scaling, and migration
+  fingerprint/replay scaling at 10/100/1000 files;
 - D4 direct libpq comparison with transported/buffered/decoded rows reported separately and
   zero-allocation `db.exec_result`;
 - D6 prepare reuse versus reprepare;
 - D8 row iteration/decode, Params bind copied bytes/allocations, physical-delivery counts, and
-  retained-row-copy costs;
+  retained-row-copy/lease costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
 - D11 migration CLI startup/status cost and ordered history scaling at 10/100/1000 applied files,
-  with target parsing separated from database-open time;
+  including identity-codec time, with target parsing separated from database-open time;
 - D12 category metadata query count, exact record bytes, region bytes/compact count, native-buffer
   copy bytes, and EXPLAIN latency;
 - D13 batch/SoA/native throughput on each driver;
@@ -1621,6 +1709,11 @@ key signature still omitted policy/evidence fields, the artifact codec still nam
 without fixing their bytes, and the ledger had not absorbed the strengthened descriptor contract.
 The key signature now contains every Full-detail common field, §6.2 fixes the complete top-level and
 nested codec plus independent Query/command goldens, and the ledger owns those exact requirements.
+The required final whole-diff host review then found six older cross-surface omissions, F90–F95,
+which the intentionally narrow F87–F89 closeout did not cover. They were not handled by another
+open-ended author/reviewer loop: one ledger pass added structural type identity, the runtime
+QueryMeta source, exact checked-metadata and migration codecs, SQLite connection-state exclusion,
+and syntax-checked metadata declarations/calls, then propagated those six decisions together.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

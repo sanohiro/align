@@ -369,16 +369,18 @@ producer/artifact identityへ入り、diagnosticはliteralへ戻る。
 ```text
 StaticQueryArtifact       producer implementation
   query id
+  structural Params/Row contract/fingerprint
   source identity: File(logical path) | Inline(query_id)
   exact source SQL bytes/hash
   driver別wire SQL bytes/hashとsource map
-  Params/Row identities
   driver restriction
   canonical static options
   named-parameter occurrence/source maps
   driver別binding plan/parameter retention class
   driver別checked metadata policy/state/reference/digest
+  declared QueryMeta planとdriver別checked evidence
   generated binder/decoder bodies
+  generated QueryMeta materialization thunk
 
 IStaticQuery              public interface contract
   fully qualified query id
@@ -398,6 +400,8 @@ SQL-only/private metadata変更はproducer object/artifactをinvalidateするが
 同じconsumerは再type-checkしない。Params/Row/restriction/public option/required metadata
 policy変更はconsumerをinvalidateする。runtime descriptorはimmutable dataとdirect
 function pointer/thunkだけを持つ。
+producer-owned QueryMeta table/thunkはD12 rowをcaller regionへmaterializeし、runtimeで
+decoder codeをinspectしたり `.align-db` を開いたりしない。
 
 ### 5.5 1 descriptor = 1 statement
 
@@ -770,7 +774,17 @@ Persistent/Normalizeはprepareだけ、execution BusyTimeoutはそのexecution�
 restoreする。`execute`/`one`/`maybe_one`/`all` はreturn前、`rows`/`rows_stmt` はrows resourceが
 prior package-tracked valueを保持し、exhaustion/terminal step error/Drop時にconnection/
 statement dependency解放前にrestoreする。restore失敗はunknown policyのconnectionを返さず
-poison/closeする。capability不足はUnsupportedでありfallback/ignoreしない。extension loadingは
+poison/closeする。SQLite v1はnative connectionごとにpackage-tracked active-execution
+leaseを1つだけ持つ。synchronous executionはreturnまで、`rows`/`rows_stmt`は
+exhaustion/error/Dropまでleaseを保持する。lease ownerの`next`/Drop以外に同じnative
+connectionへ到達するoperationは、bind/timeout変更/native call前に
+`Unsupported(ContractError { item: "sqlite.connection.active_execution",
+message: "SQLite connection already has an active execution" })`でrejectする。attempt対象が
+Query/commandならそのID、Query-lessならNoneを使う。Copy `db.exec`からtimeout/statement stateを
+overlapさせない意図的v1制限であり、failed second attemptはfirst leaseのsaved valueを
+read/restoreしない。ordinary/timeout streamの両方向overlap、second override失敗後のfirst
+Drop、exhaustion/error cleanup、restore失敗poisonをtestする。capability不足はUnsupportedで
+ありfallback/ignoreしない。extension loadingは
 v1で公開せずdisabledのまま。SQLite optionをPostgreSQLへ渡すことは型エラーである。
 
 ### 11.3 native feature
@@ -1087,33 +1101,102 @@ CheckedOptionalで黙って使ってはならず、使うのはdigest一致し�
 ### 16.2 明示prepare command
 
 ```text
-alignc db prepare app.align --driver sqlite --database dev.sqlite
+alignc db prepare app.align --driver sqlite --database dev.sqlite --schema-id dev-v1
 alignc db prepare app.align --driver sqlite --memory --migrations db/migrations
-alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL
-alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --query app.user
-alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --check
+alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --schema-id dev-v1
+alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --schema-id dev-v1 --query app.user
+alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --schema-id dev-v1 --check
 ```
 
 entry moduleとdriverは必須。Query discoveryはreachable static Query/command graphだけを
 対象にし、directoryをscanしない。SQLiteで明示した `--migrations <dir>` だけは§16.6の
 catalogをtool action内で列挙する。`--query` は対象をさらに絞る。prepare regeneration
 modeだけがmissing/stale artifactを許し、`--check` は何も書かない。normal buildは
-environmentを読まずDBへ接続しない。
+environmentを読まずDBへ接続しない。mutableなSQLite DB fileとPostgreSQL targetは
+non-empty/non-secret UTF-8かつU+0000なしの `--schema-id` を必須にする。
+`--memory [--migrations]` は§16.6からidentityをderiveして `--schema-id` を禁止する。
 
 ### 16.3 metadata location
 
 ```text
 .align-db/
-  sqlite/
-  postgres/
+  sqlite/<descriptor-id-hash>.json
+  postgres/<descriptor-id-hash>.json
 ```
 
-artifactはversioned canonical formatで、Query id、File(logical path)|Inline(query_id) source
-identity、source SQL hash、driver wire SQL hash、rewrite-format version、option hash、
-Params/Row contract、driver/engine identity、
-schema/search-path/extension evidence、parameter/result metadata、
-nullability/origin confidence、生成時刻以外のreproducible identityを持つ。secret/URLを
-保存しない。
+`descriptor-id-hash` はQueryのquery_idまたはcommand_idである`descriptor_id` exact bytesの
+`Hash128::of(...).to_hex()`。directoryはexactに
+`sqlite|postgres`、filenameは32 lowercase hexと`.json`。compilerはdirectory scanをせず
+descriptor/driverから1 pathをderiveし、内部ID/driver不一致やhash collisionをdiagnosticにする。
+
+v1 JSONは1 objectの1行とexact LF、BOM/他whitespaceなし。keyは下記orderで、
+duplicate/unknown/missing/out-of-orderをrejectする。string escapeはexactに
+`\"`、`\\`、`\b`、`\t`、`\n`、`\f`、`\r`、残りU+0000〜U+001Fはlowercase
+`\u00xx`、slashはescapeせず、他Unicodeはraw UTF-8。integerはshortest decimalで
+leading zero/plus/negative zeroなし。Optionはpayloadまたは`null`。decode後のre-encodeが
+byte-identicalでなければnoncanonicalとしてrejectする。
+
+```text
+format_version: 1
+descriptor_id: string
+module: string
+item: string
+driver: "sqlite" | "postgres"
+driver_restriction: "any_supported_driver" | "sqlite_only" | "postgres_only"
+statement_kind: "query" | "command"
+statement_class: "select" | "dml" | "ddl" | "native" | "unknown"
+source_identity:
+  File   => { kind: "file", logical_path: string }
+  Inline => { kind: "inline", descriptor_id: string }
+source_sql_hash: Hash128Hex
+wire_sql_hash: Hash128Hex
+rewrite_format_version: u32
+static_options_hash: Hash128Hex
+params_fingerprint: Hash128Hex
+row_fingerprint: Hash128Hex | null
+schema_fingerprint: Hash128Hex
+engine_version: string
+driver_version: string
+search_path: array<string>
+extensions: array<{ schema: string, name: string, version: string | null }>
+parameters: array<{
+  source_name: string, protocol_ordinal: u32, logical_type: string,
+  native_type: string | null, native_type_id: i64 | null
+}>
+columns: array<{
+  ordinal: u32, source_alias: string, logical_type: string,
+  native_type: string | null, native_type_id: i64 | null,
+  nullable: "yes" | "no" | "unknown",
+  origin_schema: string | null, origin_table: string | null,
+  origin_column: string | null
+}>
+```
+
+各nested objectのkey orderも表示順。Hash128Hexは`lo`、`hi`順の32 lowercase hex。
+parameterはone-based protocol ordinal、columnはzero-based decoder ordinal順。
+search_pathはsemantic order、extensionは`(schema,name,version Option tag/bytes)`の
+UTF-8 byte順。SQLiteのsearch_path/extensionsはempty。commandはrow fingerprint null、
+columns empty。`static_options_hash`はu32 count prefixを含むcomplete
+`sequence<StaticOption>` encodingのHash128。hash/fingerprint/ordinal/nameはL5 artifactと
+一致必須。`logical_type`はfieldのsubstituted `CanonicalType` rootに対するformatterの
+canonical fully-qualified Align spellingで、alias/source layout spellingを残さない。
+`driver_restriction`はL5 artifactと一致し、selected driverを許可しなければならない。
+
+complete file bytesの`Hash128::of`が`metadata_fingerprint`。`schema_identity`は
+`schema_fingerprint`。`server_identity`は
+`"ALIGNSRV", u32 1, Driver tag, engine_version, driver_version,
+sequence<search_path>, sequence<{schema string,name string,version Option<string>}>`のL5 binary
+codec digest。`prepare_identity`は
+`"ALIGNPRP", u32 1, descriptor_id, Driver tag, metadata_fingerprint, server_identity`のdigest。
+全identityは`to_hex()`で、JSON自身へ埋めずcompilerがderiveする。compilerはordered
+native evidenceとidentityをproducer-owned QueryMeta planへcopyし、runtimeはfileを開かない。
+
+invalid UTF-8/JSON、noncanonical escape/number/key order、wrong type/tag、non-dense ordinal、
+count/name/hash/source mismatch、trailing byteをpanicせずrejectする。malformed fileは
+CheckedOptionalでもhard diagnostic、well-formed staleだけ§16.4に従う。
+`checked_metadata_{sqlite_query,postgres_command}_v1.json`と`.digest`のindependent-reference
+goldenをD3/D5で固定し、全Option/escape/native ID/origin/nullability/source identityを含める。
+secret/URLを保存しない。
 
 ### 16.4 stale判定
 
@@ -1143,11 +1226,27 @@ build/checkやQuery discoveryは行わない。v1 rule:
 - fileはUTF-8 exact bytes、newline normalizationなし;
 - 全selected fileのU+0000を最初のmigration適用前に拒否;
 - 各file全体をその順でmigration scriptとして適用（Queryの1-statement rule対象外）;
-- `(version, exact UTF-8 filename, content hash)` のordered tuple列をschema fingerprintへ入れる。
+- 次のexact bytesをencodeしてfingerprintする。
+
+```text
+magic "ALIGNMIG", u32 format_version 1, u32 entry_count
+numeric version順の各entry:
+  version u32
+  filename string                 # L5 u32 length + exact UTF-8 bytes
+  content_hash Hash128            # exact file bytesのHash128
+catalog_fingerprint = complete bytesのHash128.to_hex()
+```
+
+`migration_catalog_{empty,nonempty}_v1.hex`と`.digest`のindependent-reference goldenを持ち、
+nonempty fixtureはnon-ASCII filenameとnewline非正規化SQLを含む。
 
 name/version/gap/symlink/UTF-8 errorは1件目を適用する前に報告する。D11のmigrateも同じ
-catalog ruleを再利用する。PRAGMA、attached DB、extension policyをartifactへ記録し、
-undeclared ambient stateを使わない。
+catalog ruleを再利用する。schema identity bytesは
+`"ALIGNSID", u32 1, Driver tag, source tag`に続け、
+SQLite memoryは`Option<catalog_fingerprint>`、SQLite databaseは明示`schema_id`、
+PostgreSQLは明示`schema_id`とsemantic-order search_path、canonical-order extensionsを
+encodeし、そのHash128を`schema_fingerprint`にする。v1 memory prepareはPRAGMA/attachment
+inputを公開せず、追加時はversioned stream fieldが必要。undeclared ambient stateを使わない。
 
 ### 16.7 PostgreSQL prepare environment
 
@@ -1454,23 +1553,65 @@ QueryMetaはSummary 1行の後にparameter/column行をordinal順で返す。det
 Option.Noneだがbase identityは常に存在する。`source_sql_hash`、`driver_wire_sql_hash`、
 `rewrite_format_version` はDeclaredでもD1が全static Query/driverに生成するため常に存在する。
 
-common callは全て明示destination `out: region` をoption sliceの直前に持つ。
+common declarationは全て明示destination `out: region` をoption sliceの直前に持つ。
 
 ```align
+pub fn meta_database(
+  exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
+) -> Result<db.DatabaseMeta, db.Error>
+pub fn meta_schemas(
+  exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.SchemaMeta>, db.Error>
+pub fn meta_tables(
+  exec: db.exec, schema_filter: Option<db.SchemaRef>, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.TableMeta>, db.Error>
+pub fn meta_table(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<db.TableMeta, db.Error>
+pub fn meta_columns(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.ColumnMeta>, db.Error>
+pub fn meta_keys(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.KeyMeta>, db.Error>
+pub fn meta_indexes(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.IndexMeta>, db.Error>
+pub fn meta_query<P, R>(
+  exec: db.exec, query: db.query<P, R>, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.QueryMeta>, db.Error>
+pub fn explain<P, R>(
+  exec: db.exec, query: db.query<P, R>, params: P,
+  out: region, options: slice<db.ExplainOption>,
+) -> Result<db.QueryPlan, db.Error>
+```
+
+call argumentは通常のpositional syntaxで、typeはbinding/declarationにだけ書く。
+
+```align
+schema_filter: Option<db.SchemaRef> = None
+table_ref: db.TableRef = db.TableRef { schema: "main", name: "users" }
+q := query()
 database: db.DatabaseMeta = db.meta_database(exec, detail, out, [])?
 schemas: array<db.SchemaMeta> = db.meta_schemas(exec, detail, out, [])?
 tables: array<db.TableMeta> =
-  db.meta_tables(exec, schema_filter: Option<db.SchemaRef>, detail, out, [])?
+  db.meta_tables(exec, schema_filter, detail, out, [])?
 table: db.TableMeta =
-  db.meta_table(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_table(exec, table_ref, detail, out, [])?
 columns: array<db.ColumnMeta> =
-  db.meta_columns(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_columns(exec, table_ref, detail, out, [])?
 keys: array<db.KeyMeta> =
-  db.meta_keys(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_keys(exec, table_ref, detail, out, [])?
 indexes: array<db.IndexMeta> =
-  db.meta_indexes(exec, table_ref: db.TableRef, detail, out, [])?
-query_meta: array<db.QueryMeta> = db.meta_query(exec, query(), detail, out, [])?
-plan: db.QueryPlan = db.explain(exec, query(), params, out, options)?
+  db.meta_indexes(exec, table_ref, detail, out, [])?
+query_meta: array<db.QueryMeta> = db.meta_query(exec, q, detail, out, [])?
+plan: db.QueryPlan = db.explain(exec, q, params, out, options)?
 ```
 
 対応する `sqlite.meta_*_native` / `postgres.meta_*_native` はcommon sliceとdriver-native
@@ -1614,7 +1755,10 @@ driver-qualified pathとして追加する。
 - SQLite streamed text/blob transient bindのcopy bytes/allocation;
 - PostgreSQL package path対direct libpq;
 - file/inline Query/command artifact generationとcold/warm rebuild;
-- SQLite canonical migration catalog/replay（10/100/1000 files）;
+- structural contract/artifactとQueryMeta thunk（1/10/100 reachable definitions）;
+- canonical checked-metadata JSON encode/decode（10/100/1000 columns）;
+- SQLite canonical migration catalog fingerprint/replay（10/100/1000 files）;
+- SQLite active-execution lease acquire/release/rejected-overlap;
 - prepare reuse対reprepare;
 - rows iteration/decode;
 - region builder push/freeze/copy count;
@@ -1684,9 +1828,11 @@ SQLite source/PostgreSQL `$n` wire entry・reverse span map、named occurrence t
 Query/command別interface/implementation/cache invalidationをDBなしで証明する。commandは
 Row/decodeを持たず、それ以外のidentity/hash/checked/binding schemaを共有する。static
 common/native Query/Command option sumもここで実装する。L5のversioned artifact schema通り
-canonical Params/Row fingerprintとbinder/decoder ABI versionをserializeし、round-tripと
-各ABI version変更のinvalidationを固定する。reflectionとper-row name lookupがないことを
-benchmark/IRで確認する。
+reachable definitionを含むstructural Params/Row contract/fingerprintとbinder/decoder ABI
+versionをserializeし、independent byte/digest goldenとsame-path field
+name/order/type/Option変更のinvalidationを固定する。producer-owned Declared QueryMeta
+plan/materialization thunkも生成し、separate compiled Queryでruntime artifact/source I/Oなしを
+testする。reflectionとper-row name lookupがないことをbenchmark/IRで確認する。
 
 ### D2 — 最小SQLite vertical
 
@@ -1698,6 +1844,7 @@ benchmark/IRで確認する。
 - 0/1/2+ cardinality;
 - structured SQLite primary/extended error;
 - §11のexact SQLite connection/baseline execute option sumと全conflict/unsupported branch;
+- connection-wide active-execution leaseとpre-native overlap rejection/cleanup;
 - execution-count hook;
 - 全pathでclose/finalize exactly once。
 
@@ -1706,8 +1853,9 @@ breadthは含めない。direct libsqlite3 loopと比較する。
 
 ### D3 — checked metadata core + SQLite
 
-`.align-db/sqlite` canonical artifact、`alignc db prepare`/`--check`、explicit temp/in-memory
-schema setupとcanonical migration catalog/order/fingerprint test、
+`.align-db/sqlite` exact derived path/canonical fail-closed JSONとindependent byte/digest golden、
+`alignc db prepare`/`--check`、producer-owned checked QueryMeta evidence、explicit
+temp/in-memory schema setupと`ALIGNMIG`/`ALIGNSID` catalog/order/fingerprint golden、
 Declared/CheckedOptional/CheckedRequired、stale/missing診断、offline normal build、runtime
 storage-class/NULL validation、§16.3.1のSQLite origin/nullability matrixを所有する。
 ambiguous/outer-join resultは `Unknown` のままにする。
@@ -1731,7 +1879,8 @@ direct libpq benchmarkは通常PRではenvironment-gatedだがD4初回/release e
 
 ### D5 — PostgreSQL checked metadata
 
-`.align-db/postgres`、engine/search path/extension/schema fingerprint、type name/OID evidence、
+`.align-db/postgres`の同じexact JSON/path/derived-identity codecとPostgreSQL command golden、
+engine/search path/extension/schema fingerprint、type name/OID evidence、
 §16.3.1のPostgreSQL origin/nullability matrix（catalog `NOT NULL`だけではarbitrary
 expression/outer joinをnon-nullにしない）、equivalent recreated schemaでreproducible
 `--check`、runtime describe comparison。
@@ -1760,6 +1909,8 @@ SQLite text/blob Params sourceを`rows` return後/最初の`next`前にdrop/muta
 transient bind copy bytes/allocation/partial-error cleanup、per-row parameter copy 0を固定する。
 exact初期common type mapping全てのruntime bind/decode/nullability matrixもここで完成する。
 PostgreSQL初期pathは `BufferedFull` 上のone-pass decodeで、single-row/portal deliveryはD13。
+SQLite ordinary/timeout stream overlapの両方向reject、failed second attemptがfirstのsaved
+stateをrestoreしないこと、firstのexhaustion/error/Drop lease cleanupも固定する。
 
 ### D9 — scoped native option、deadline enforcement、cancellation cleanup
 
@@ -1780,7 +1931,8 @@ Pure step（`borrow mut state`、0個以上の独立した `borrow mut` builder�
 
 ### D11 — SQL migration
 
-ordered SQL file、checksum/history、先頭lineのexact required/forbidden policy、
+ordered SQL file、D3と共有するexact `ALIGNMIG`/`ALIGNSID` byte/digest golden、
+checksum/history、先頭lineのexact required/forbidden policy、
 required default atomicity、forbidden 1-statement制限、Applying/Failed dirty state、
 checksum-bound repair、全file適用前のU+0000拒否、
 明示 `alignc db migrate/status/check/repair`。
@@ -1799,6 +1951,9 @@ cell、ParameterとColumnを両方持つQuery、schema/nameが両方invalidなTa
 2個についてtermが同一でaction/deferral policyだけが異なる場合もcanonical
 `key_ordinal` groupを固定する。矛盾するnative policy rowはordinalを与えずfailする。
 unnamed constraintは `name = None` を返す。
+§18.2のexact declarationとpositional call exampleをparse/format testし、separate compiled
+Queryのmetadata rowがproducer-owned plan/thunkだけからruntime artifact I/Oなしで得られる
+ことを固定する。
 `EXPLAIN ANALYZE` は実行を明示する。
 
 ### D13 — batch、SoA、高価値native path

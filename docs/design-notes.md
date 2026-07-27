@@ -307,6 +307,11 @@ implementation hash, and exported typed contract. This keeps the minimal SQLite 
 from inventing a second compiler path. A portable CheckedRequired descriptor means checked on every
 permitted driver; mixed SQLite/PostgreSQL evidence remains visible instead of collapsing to a
 misleading boolean.
+The artifact fingerprints the complete reachable structural Params/Row definitions, not only their
+names. A Query additionally owns a static metadata plan and generated materialization thunk, so
+runtime inspection remains possible across separate compilation without reflection or reading
+source/metadata files. Checked metadata and migration/schema identities have versioned exact codecs
+and independent goldens; “canonical” is never an agreement between two copies of the same encoder.
 
 **Database configuration is closed, scoped data.** Connection, static statement, prepare, execute,
 transaction, metadata, and EXPLAIN options have distinct finite sums and separate common/native
@@ -315,6 +320,10 @@ driver-selected examples. A requested variant is applied or rejected before SQL 
 stored in a reflection bag or ignored for portability. Each milestone lands the option type its
 operation consumes, while the later cancellation milestone completes shared machinery rather than
 replacing a provisional API.
+Connection-global native state also has an explicit owner: SQLite v1 permits one active execution
+lease per physical connection. A second Copy execution view cannot overlap timeout/statement state;
+it fails before mutation or native access, and the owning stream alone restores state on
+exhaustion, error, or Drop.
 
 **Catalog output owns its destination, and exceptional migrations fail dirty.** Metadata and plans
 copy flat records and strings into a caller-named region before native buffers die; multi-term

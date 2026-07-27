@@ -55,6 +55,11 @@ errors, and removes deferred logical types from first-release examples.
 A final artifact/metadata closeout fixes the complete Query/command binary schema and independent
 byte/digest goldens, and gives duplicate or unnamed constraints a canonical ordinal derived from
 all Full-detail common fields rather than from the reported name or catalog order.
+The final whole-diff gate additionally makes type fingerprints structural, gives runtime
+`QueryMeta` a producer-owned plan/thunk, fixes the checked-metadata and migration/schema binary
+identities with independent goldens, serializes SQLite connection-global execution through one
+explicit lease, and syntax-checks the exact metadata declarations and positional calls. Mutable
+prepare targets carry an explicit non-secret schema ID; normal builds remain offline.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:

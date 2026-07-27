@@ -578,10 +578,12 @@ CheckedMetadataInput {
 }
 ```
 
-The logical path is derived exactly from the descriptor/driver identity; no directory scan is
-allowed. Before a frontend-cache lookup, a matching manifest re-stats and, when present, reads and
-hashes each exact `File` and checked-metadata path. Creation, deletion, content change, or format
-version change therefore changes the action key. `Inline` SQL never causes a source-file read, but
+The logical path is exactly
+`.align-db/{sqlite|postgres}/{Hash128::of(descriptor_id.as_bytes()).to_hex()}.json` as fixed by DB
+§16.3, where `descriptor_id` is the Query ID or command ID; no directory scan is allowed. Before a
+frontend-cache lookup, a matching manifest re-stats and, when present, reads and hashes each exact
+`File` and checked-metadata path. Creation, deletion, content change, or format version change
+therefore changes the action key. `Inline` SQL never causes a source-file read, but
 its derived checked-metadata entries are still validated. A missing or mismatched manifest runs
 import/name resolution and regenerates it before any static file is treated as an input. The
 manifest is a cache index, not a build manifest, and is never accepted across a
@@ -624,8 +626,8 @@ StaticQueryArtifact
   unit
   item
   query_id
-  Params canonical type
-  Row canonical type
+  Params canonical structural contract
+  Row canonical structural contract
   Params canonical fingerprint
   Row canonical fingerprint
   binder ABI version
@@ -650,7 +652,7 @@ exact differences:
 StaticCommandArtifact
   format_version
   unit, item, command_id
-  Params canonical type
+  Params canonical structural contract
   Params canonical fingerprint
   binder ABI version
   driver restriction
@@ -668,7 +670,7 @@ The canonical artifact codec is:
 ```text
 magic                ASCII "ALIGNQRY" | "ALIGNCMD" (8 bytes)
 format_version       u32 little-endian
-integer/ABI version  u32 little-endian unless a field below says u64
+integer/ABI version  u32 little-endian; native type IDs use two's-complement i64 little-endian
 enum/bool/tag         u8 using the explicit tags below
 Hash128               lo u64 then hi u64, little-endian
 string/byte field     u32 little-endian length, then exact bytes
@@ -687,15 +689,39 @@ VerificationState       Declared = 0 | DatabaseChecked = 1
 BindRetention           BindValue = 0 | BindCopy = 1
 StaticOptionOwner       Common = 0 | SQLite = 1 | PostgreSQL = 2
 CanonicalType           Named = 0 | Tuple = 1 | Fn = 2
+CanonicalDefinition     Struct = 0 | Sum = 1
+MetaStatementClass      Select = 0 | Dml = 1 | Ddl = 2 | Native = 3 | Unknown = 4
+MetaNullability         Yes = 0 | No = 1 | Unknown = 2
 ```
 
-`CanonicalType` is the existing `align_interface` type subencoding: `Named` is
+`CanonicalType` uses the existing `align_interface` type-reference subencoding: `Named` is
 `tag, path: string, args: sequence<CanonicalType>`; `Tuple` is
 `tag, elems: sequence<CanonicalType>`; and `Fn` is
-`tag, params: sequence<CanonicalType>, result: CanonicalType`. Params and Row entries are fully
-substituted and contain no type parameter. Their fingerprints are `Hash128::of` over exactly that
-stored subencoding. The owning interface's ordinary reachable-type definitions and
-`interface_hash` remain responsible for changes to a named struct's field definitions.
+`tag, params: sequence<CanonicalType>, result: CanonicalType`. Params and Row roots are fully
+substituted and contain no type parameter. A stored Params/Row contract is not only that nominal
+root. Its exact structural encoding is:
+
+```text
+CanonicalContract
+  root: CanonicalType
+  definitions: sequence<CanonicalDefinition>
+
+CanonicalDefinition
+  path: string
+  args: sequence<CanonicalType>
+  kind: u8
+  Struct => fields: sequence<{ name: string, type: CanonicalType }>
+  Sum    => variants: sequence<{ name: string, payload: sequence<CanonicalType> }>
+```
+
+`definitions` contains every reachable user-defined instantiated type exactly once, including the
+root definition, sorted by the complete encoded `(path, args)` key. Builtins have no definition
+entry. Struct fields and sum variants/payloads use source declaration order. Recursive edges remain
+`Named` references, so the graph encoding terminates. Two definition entries with the same key, a
+missing reachable definition, an unreachable extra definition, or a non-substituted type parameter
+is invalid. Params/Row fingerprints are `Hash128::of` over the complete stored
+`CanonicalContract`, so field name, order, type, `Option` shape, variant, or reachable layout changes
+the fingerprint even when the nominal path is unchanged.
 
 The exact nested records are:
 
@@ -733,6 +759,43 @@ BindingEntry
   field_type_fingerprint: Hash128
   retention: BindRetention
 
+DeclaredParameterMeta
+  ordinal: u32                       # one-based protocol ordinal
+  source_name: string
+  logical_type: string
+
+DeclaredColumnMeta
+  ordinal: u32                       # zero-based decoder ordinal
+  source_alias: string
+  logical_type: string
+
+CheckedParameterMeta
+  ordinal: u32
+  native_type: Option<string>
+  native_type_id: Option<i64>
+
+CheckedColumnMeta
+  ordinal: u32
+  native_type: Option<string>
+  native_type_id: Option<i64>
+  origin_schema: Option<string>
+  origin_table: Option<string>
+  origin_column: Option<string>
+  nullable: MetaNullability
+
+CheckedQueryEvidence
+  prepare_identity: string
+  schema_identity: string
+  server_identity: string
+  parameters: sequence<CheckedParameterMeta>
+  columns: sequence<CheckedColumnMeta>
+
+QueryMetaPlan
+  statement_class: MetaStatementClass
+  visible: bool
+  parameters: sequence<DeclaredParameterMeta>
+  columns: sequence<DeclaredColumnMeta>
+
 DecodedSpanEntry
   decoded_span: Span
   defining_file_span: Span
@@ -741,7 +804,8 @@ CheckedMetadata
   policy: CheckPolicy
   state: VerificationState
   Declared        => no further fields
-  DatabaseChecked => metadata_format_version: u32, metadata_digest: Hash128
+  DatabaseChecked => metadata_format_version: u32, metadata_digest: Hash128,
+                     query_evidence: Option<CheckedQueryEvidence>
 
 DriverEntry
   driver: Driver
@@ -767,8 +831,15 @@ this table with the same `protocol_ordinal`. There is one `BindingEntry` for eve
 ordered by `params_field_ordinal`; the ordinals must be dense from zero, source names unique, and
 protocol ordinals dense from one in first-source-occurrence order. The occurrence-name set and
 binding-name set must be equal; an unused Params field or placeholder without a field is rejected
-before encoding. `field_type_fingerprint` hashes the exact fully substituted `CanonicalType`
-subencoding of that Params field.
+before encoding. `field_type_fingerprint` hashes the complete `CanonicalContract` rooted at that
+fully substituted Params field type.
+
+`QueryMetaPlan.parameters` and `.columns` use dense ordinals in their documented bases and contain
+the declared names/types used by D12 at Summary/Full. Checked evidence uses the same ordinal sets
+and order. It is `Some` for a DatabaseChecked Query and `None` for a DatabaseChecked command;
+Declared entries have no evidence payload. `visible` is exactly whether the descriptor item is
+`pub`; named package/project descriptors emit `system = false` in D12. The producer rejects checked
+evidence whose statement class, ordinals, counts, or identities disagree with the declared plan.
 
 There is one `RewriteEntry` for every placeholder occurrence, including identity rewrites, in the
 same order as `occurrences`. Each pair names the complete source and wire placeholder spans.
@@ -792,8 +863,8 @@ StaticQueryArtifact
   unit: string
   item: string
   query_id: string
-  params_type: CanonicalType
-  row_type: CanonicalType
+  params_type: CanonicalContract
+  row_type: CanonicalContract
   params_fingerprint: Hash128
   row_fingerprint: Hash128
   binder_abi_version: u32
@@ -806,6 +877,7 @@ StaticQueryArtifact
   occurrences: sequence<ParameterOccurrence>
   driver_entries: sequence<DriverEntry>
   decoded_span_map: sequence<DecodedSpanEntry>
+  query_meta_plan: QueryMetaPlan
 
 StaticCommandArtifact
   magic = "ALIGNCMD"
@@ -813,7 +885,7 @@ StaticCommandArtifact
   unit: string
   item: string
   command_id: string
-  params_type: CanonicalType
+  params_type: CanonicalContract
   params_fingerprint: Hash128
   binder_abi_version: u32
   driver_restriction: DriverRestriction
@@ -832,9 +904,10 @@ Version 1 encodes `format_version = 1`. `unit` is the canonical fully-qualified 
 Maps are never encoded by map iteration. `driver_entries` contains exactly the restriction's
 permitted set in `SQLite`, then `PostgreSQL` order. `CheckedMetadata.policy` must equal the effective
 common static `Check` option for every entry. Hash fields must equal `Hash128::of` over their named
-exact byte field. IDs must equal the fully-qualified `unit + item` identity rule. A decoder rejects
-an unknown tag/version, duplicate or out-of-order element, invalid span, fingerprint/hash mismatch,
-restriction/driver mismatch, policy mismatch, ID mismatch, trailing byte, or truncated field.
+exact byte field. IDs must equal the exact `unit + "." + item` identity rule. A decoder rejects
+an unknown tag/version, duplicate/missing/unreachable type definition, duplicate or out-of-order
+element, invalid span, fingerprint/hash mismatch, restriction/driver mismatch, policy/evidence
+mismatch, ID mismatch, trailing byte, or truncated field.
 
 Binder/decoder ABI versions are `u32`; changing a generated thunk calling/layout contract increments
 the corresponding version even when the logical type is unchanged. The artifact digest is
@@ -843,8 +916,9 @@ the corresponding version even when the logical type is unchanged. The artifact 
 L5 checks in one Query and one command semantic fixture plus their exact
 `crates/align_driver/tests/golden/static_{query,command}_v1.hex` bytes and sibling `.digest` files
 containing 32-lowercase-hex `Hash128::to_hex()` values. The Query fixture is portable, uses repeated
-named parameters, an inline escape, both retention classes, mixed Declared/DatabaseChecked driver
-state, and non-empty rewrite/span maps. The command fixture is PostgreSQL-pinned, file-backed, has
+named parameters, a nested structural Row definition, an inline escape, both retention classes,
+mixed Declared/DatabaseChecked driver state, non-empty QueryMeta evidence, and non-empty rewrite/span
+maps. The command fixture is PostgreSQL-pinned, file-backed, has
 `ParameterType` and `CheckedRequired`, and proves the omitted Row/decoder fields. A standalone
 test-only reference encoder implements the table above without calling the production artifact
 codec and produces the reviewed goldens. Tests decode each golden, compare every semantic field,
@@ -886,12 +960,17 @@ data owned by the producer unit:
 ```text
 QueryStatic
   query ID/hash
+  artifact digest
   driver mask
+  source-SQL hash
   per-driver wire-SQL pointer/length/hash
+  per-driver rewrite-format version
   static-option pointer
   per-driver binding-plan pointer/retention classes
+  producer-owned QueryMetaPlan and per-driver checked-evidence pointers
   generated bind thunk
   generated decode thunk
+  generated QueryMeta materialization thunk
   per-driver checked-metadata state/fingerprint
 ```
 
@@ -911,6 +990,13 @@ CommandStatic
 For Query, `P` and `R` are compile-time phantom contracts; for command, only `P` exists. The generated
 binder reads known field offsets from `P`; the Query decoder writes known offsets in `R`. There is no
 per-row field-name lookup, reflection, boxing, or map allocation.
+
+The QueryMeta thunk is generated code, not reflection. Given the selected driver, `MetaDetail`, and
+explicit output region, it materializes exactly the Summary/Parameter/Column rows from the
+producer-owned plan and checked-evidence tables. It never reads source files, `.align-db`, interface
+summaries, decoder code, or a database at runtime. D1 emits and tests the table/thunk skeleton for
+Declared Queries; D3/D5 populate checked evidence; D12 exposes the ordinary package call. Commands
+carry no QueryMeta plan or thunk.
 
 The producer's descriptor function returns the corresponding static pointer. When the item is
 `pub`, its interface exports that descriptor contract. Generated thunks stay in the producer object
@@ -1303,7 +1389,8 @@ Scope:
 - versioned Query/command artifacts and interface summaries;
 - generated `QueryStatic`/`CommandStatic` data skeletons, including per-driver bind plans and checked
   state.
-- canonical Params/Row fingerprints plus binder/decoder ABI versions in artifact bytes,
+- structural Params/Row contracts/fingerprints, QueryMeta plan/thunk data, plus binder/decoder ABI
+  versions in artifact bytes,
   reproducibility checks, and cache keys.
 
 Acceptance:
@@ -1318,6 +1405,8 @@ Acceptance:
 - unchanged consumers still hit when the public Query/command contract is unchanged;
 - public Params/Row/restriction changes invalidate Query consumers, and public
   Params/restriction changes invalidate command consumers;
+- a same-path Params/Row field name/order/type/Option/reachable-definition edit changes its
+  structural fingerprint, artifact digest, checked-metadata match, and generated thunk plan;
 - absolute/escaping/symlink paths fail;
 - a U+0000 byte in file or inline SQL fails at its exact source span before artifact generation;
 - a shadowing local or same-spelled user function does not read/register a file;
@@ -1331,6 +1420,8 @@ Acceptance:
   map; no fake filesystem path enters identity or diagnostics;
 - Query and command both retain source/wire/occurrence/bind/checked/cache identity; command omits
   only Row/result/decode, and command bind never uses reflection;
+- a separately compiled Query's Declared and checked QueryMeta rows come only from its static
+  plan/materialization thunk and remain available without source/interface/artifact file I/O;
 - CheckedRequired validates every permitted driver, while CheckedOptional preserves an explicit
   mixed per-driver state;
 - artifact bytes are reproducible across checkout roots and process runs.

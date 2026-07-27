@@ -500,13 +500,16 @@ public interface
   static semantic options
 
 producer implementation / StaticQueryArtifact
+  structural Params/Row contracts and fingerprints
   SQL source identity: File(logical path) | Inline(query_id)
   exact source bytes/hash
   deterministic per-driver wire bytes/hash and source map
   parameter occurrence/source-span table
   per-driver binding plan and parameter retention classes
   per-driver checked-metadata policy/state/digest
+  declared QueryMeta plan and per-driver checked evidence
   generated bind and decode thunks
+  generated QueryMeta materialization thunk
 ```
 
 A static constructor is legal only as the complete single-expression body of one named,
@@ -523,6 +526,8 @@ consumers.
 The runtime descriptor points to immutable producer-owned static data, per-driver wire/binding/
 checked entries, and generated binder/decoder thunks. `P` and `R` are compile-time contracts; there
 is no runtime reflection, per-row field-name lookup, or consumer-side Query-body instantiation.
+The producer-owned QueryMeta table/thunk materializes D12 inspection rows into the caller's region;
+it does not inspect decoder code or open `.align-db` at runtime.
 
 ### 5.5 One descriptor, one statement
 
@@ -1473,6 +1478,20 @@ when that execution actually ends; it conflicts with another busy-timeout value.
 resource retains the override and the connection's package-tracked prior value, then restores it on
 exhaustion, terminal step error, or Drop before releasing the connection/statement dependency.
 Restoration failure poisons/closes the connection rather than returning it with unknown policy.
+SQLite v1 also gives every native connection one package-tracked active-execution lease.
+Synchronous execution holds it until return; `rows`/`rows_stmt` retains it until
+exhaustion/error/Drop. Except for `next`/Drop through the resource that owns the lease, every second
+operation that would reach that native
+connection—whether or not it requests a timeout—is rejected before binding, changing timeout state,
+or making a native call. The error is
+`db.Error.Unsupported(db.ContractError { query_id, item:
+"sqlite.connection.active_execution", message:
+"SQLite connection already has an active execution" })`; `query_id` is the attempted
+Query/command ID or `None` for a Query-less operation. This deliberately restricted v1 rule prevents
+connection-global timeout state and active statements from overlapping through Copy `db.exec`
+views. A failed second attempt never reads/restores the first lease's saved value. Tests pin
+ordinary/timeout stream overlap in both directions, a failed second override followed by first-stream
+Drop, exhaustion/error cleanup, and restore failure poisoning.
 Exactly zero or one transaction mode is accepted, with `Deferred` as the `[]` default.
 `IncludeInternalObjects` and
 `IncludeHiddenColumns` apply only to metadata categories for which SQLite exposes those objects.
@@ -1977,10 +1996,10 @@ one “checked” boolean or describe a Declared driver as database-type-checked
 ### 16.2 Explicit preparation command
 
 ```sh
-alignc db prepare app.align --driver sqlite --database dev.sqlite
+alignc db prepare app.align --driver sqlite --database dev.sqlite --schema-id dev-v1
 alignc db prepare app.align --driver sqlite --memory --migrations db/migrations
-alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL
-alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL --check
+alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL --schema-id dev-v1
+alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL --schema-id dev-v1 --check
 ```
 
 The entry `.align` path and one `--driver` are required in v1. Query discovery uses exactly the
@@ -1990,11 +2009,15 @@ SQLite `--migrations <dir>` catalog is a separate tool input governed by §16.6.
 project root plus `.align-db/`. A later tool-only config file may shorten these flags, but it is not
 a compiler manifest and is not required by the first implementation.
 
-SQLite accepts exactly one schema environment: `--database <path>`, or `--memory` optionally
-initialized from the canonical migration sequence in `--migrations <dir>` (§16.6). PostgreSQL accepts `--url-env
-<name>`; the environment variable's value is read only by this explicit command. Direct URL flags
-may exist for local use but must be warned as shell-history-visible. The command prints the selected
-driver, schema source, server/library version, and Query count before writing.
+SQLite accepts exactly one schema environment: `--database <path> --schema-id <id>`, or `--memory`
+optionally initialized from the canonical migration sequence in `--migrations <dir>` (§16.6).
+PostgreSQL accepts `--url-env <name> --schema-id <id>`; the environment variable's value is read only
+by this explicit command. `schema-id` is a non-empty, non-secret UTF-8 release/schema identity chosen
+by the caller and must contain no U+0000. It is required for a mutable database target because
+normal offline builds cannot rediscover that target's schema. The migration-backed memory form
+derives its identity and forbids `--schema-id`. Direct URL flags may exist for local use but must be
+warned as shell-history-visible. The command prints the selected driver, schema source/identity,
+server/library version, and Query count before writing.
 
 This is the only workflow allowed to contact a database. It:
 
@@ -2019,35 +2042,154 @@ only the selected metadata artifact and never contacts the database.
 
 ### 16.3 Metadata location
 
-A possible layout:
+For each descriptor/driver pair, the path is exact:
 
 ```text
 .align-db/
   sqlite/
-    <query-id-hash>.json
+    <descriptor-id-hash>.json
   postgres/
-    <query-id-hash>.json
+    <descriptor-id-hash>.json
 ```
 
-Version 1 uses canonical UTF-8 JSON with fixed field order, LF newlines, sorted arrays where order is
-not semantic, and no JSON object whose iteration order affects identity. Every file contains:
+`descriptor-id-hash` is `Hash128::of(descriptor_id.as_bytes()).to_hex()`. `descriptor_id` is the
+Query's `query_id` or command's `command_id`. The driver directory is exactly
+`sqlite` or `postgres`; the filename uses the 32 lowercase hexadecimal characters plus `.json`.
+The compiler derives this path from the descriptor and driver without scanning `.align-db`. A file
+whose internal Query ID or driver disagrees with its derived path is invalid; a hash collision is a
+diagnostic, never aliasing.
+
+Version 1 uses this canonical UTF-8 JSON codec:
+
+- the file is one JSON object on one line followed by exactly one LF;
+- there is no other whitespace and no byte-order mark;
+- object keys appear in the exact orders below; duplicate, unknown, missing, or out-of-order keys
+  are invalid;
+- strings emit `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, and `\r`; every other U+0000–U+001F scalar
+  uses lowercase `\u00xx`; `/` is not escaped and all other Unicode is exact UTF-8, never `\u`;
+- integers are shortest ASCII decimal with no leading zero or `+`; negative zero is invalid;
+- an `Option` is its payload or JSON `null`; enum tags are the lowercase strings listed below;
+- decoding must reproduce the exact bytes on re-encode. Merely accepting semantically equivalent
+  noncanonical JSON is forbidden.
+
+The top-level key order and value types are exact:
 
 ```text
-format_version
-query_id, module, item, driver
-SQL source identity: File(logical path) | Inline(query_id)
-source-SQL hash, driver-wire-SQL hash, rewrite-format version, static-options hash
-Params fingerprint and, for Query only, Row fingerprint
-schema fingerprint
-engine/driver version
-PostgreSQL search_path and extension assumptions, when applicable
-parameters: source name, protocol ordinal, logical/native type
-columns for Query only: ordinal, source alias, logical/native type, nullable/origin evidence
+format_version: 1
+descriptor_id: string
+module: string
+item: string
+driver: "sqlite" | "postgres"
+driver_restriction: "any_supported_driver" | "sqlite_only" | "postgres_only"
+statement_kind: "query" | "command"
+statement_class: "select" | "dml" | "ddl" | "native" | "unknown"
+source_identity: SourceIdentity
+source_sql_hash: Hash128Hex
+wire_sql_hash: Hash128Hex
+rewrite_format_version: u32
+static_options_hash: Hash128Hex
+params_fingerprint: Hash128Hex
+row_fingerprint: Hash128Hex | null
+schema_fingerprint: Hash128Hex
+engine_version: string
+driver_version: string
+search_path: array<string>
+extensions: array<Extension>
+parameters: array<Parameter>
+columns: array<Column>
+
+SourceIdentity File key order:
+  kind: "file"
+  logical_path: string
+
+SourceIdentity Inline key order:
+  kind: "inline"
+  descriptor_id: string
+
+Extension key order:
+  schema: string
+  name: string
+  version: string | null
+
+Parameter key order:
+  source_name: string
+  protocol_ordinal: u32
+  logical_type: string
+  native_type: string | null
+  native_type_id: i64 | null
+
+Column key order:
+  ordinal: u32
+  source_alias: string
+  logical_type: string
+  native_type: string | null
+  native_type_id: i64 | null
+  nullable: "yes" | "no" | "unknown"
+  origin_schema: string | null
+  origin_table: string | null
+  origin_column: string | null
 ```
+
+`Hash128Hex` is exactly `Hash128::to_hex()` (`lo`, then `hi`), 32 lowercase hexadecimal
+characters. `module`, `item`, and `descriptor_id` obey L5's exact identity rule. `row_fingerprint` is
+non-null exactly for Query. Parameters use one-based protocol ordinal order; columns use zero-based
+decoder order. `search_path` preserves semantic lookup order. `extensions` sorts by the complete
+UTF-8-byte tuple `(schema, name, version Option tag/bytes)`. SQLite requires empty `search_path` and
+`extensions`; PostgreSQL records both explicitly, including empty arrays.
+`logical_type` is the formatter's canonical fully-qualified Align spelling of that field's
+substituted `CanonicalType` root; aliases are resolved and no source-layout spelling enters it.
+
+`source_sql_hash`, `wire_sql_hash`, `static_options_hash`, and structural Params/Row fingerprints
+and `driver_restriction` must match the L5 artifact inputs; the selected driver must be permitted.
+`schema_fingerprint` is the exact preparation schema identity;
+it is the §16.6 `ALIGNSID` stream digest, not an engine-dependent JSON/object hash. PostgreSQL binds
+the explicit schema ID plus engine-reported search path and extension assumptions. The
+engine-provided parameter/result order must match the declared binder/decoder plan. Commands require
+`columns = []`.
+`static_options_hash` is `Hash128::of` over the complete encoded
+`sequence<StaticOption>` field, including its u32 count prefix.
+
+The complete file bytes have `metadata_fingerprint = Hash128::of(bytes)`. The runtime QueryMeta
+identities are derived, not self-referential JSON fields:
+
+```text
+schema_identity  = schema_fingerprint
+
+server stream:
+  magic "ALIGNSRV", u32 version 1, Driver tag,
+  engine_version string, driver_version string,
+  search_path sequence<string>,
+  extensions sequence<{ schema: string, name: string, version: Option<string> }>
+server_identity = Hash128::of(server stream).to_hex()
+
+prepare stream:
+  magic "ALIGNPRP", u32 version 1, descriptor_id string, Driver tag,
+  metadata_fingerprint Hash128, server_identity Hash128
+prepare_identity = Hash128::of(prepare stream).to_hex()
+```
+
+Binary stream integers, strings, sequences, Options, and Hash128 values use L5 §6.2's codec.
+`CheckedMetadata.metadata_digest` is `metadata_fingerprint` and
+`metadata_format_version = 1`. The compiler copies the derived identities and ordered native
+parameter/column evidence into the producer-owned QueryMeta plan; runtime code never opens this
+file.
 
 Native PostgreSQL OIDs may be recorded as environment evidence, but volatile OIDs are not the sole
 canonical type or schema identity. Canonical type names and schema-qualified identities are stored
 alongside them.
+
+The reader rejects invalid UTF-8/JSON, noncanonical escaping/number/key order, wrong field types,
+unknown tags, non-dense ordinals, count/name mismatches, invalid hashes, source/artifact mismatch,
+and trailing bytes without panicking. A malformed selected file is a hard diagnostic even under
+`CheckedOptional`; a well-formed but stale file follows §16.4. Preparation `--check` constructs the
+same semantic record and compares the complete canonical bytes without writing.
+
+D3/D5 check in standalone-reference goldens at
+`crates/align_driver/tests/golden/checked_metadata_{sqlite_query,postgres_command}_v1.json` and
+sibling `.digest` files. The production writer, production reader, and a test-only reference writer
+share no encoding functions and must all match the checked-in bytes/digest. The fixtures exercise
+every Option state, escaping class, native ID, origin/nullability state, repeated parameter order,
+and both source identities.
 
 Secrets and connection URLs are never stored.
 
@@ -2154,13 +2296,45 @@ static Query discovery. Version 1:
 - rejects U+0000 in every selected file before applying the first migration;
 - applies each whole file as a migration script in that order; the one-statement Query rule does not
   apply to migration scripts;
-- computes the schema-input fingerprint from the ordered tuples
-  `(version, exact UTF-8 filename, content hash)`.
+- encodes and fingerprints the migration catalog exactly as follows:
+
+```text
+magic "ALIGNMIG"                    # 8 bytes
+format_version u32 = 1
+entry_count u32
+for each migration in numeric version order:
+  version u32
+  filename string                   # L5 u32 length + exact UTF-8 bytes
+  content_hash Hash128              # Hash128::of(exact file bytes)
+catalog_fingerprint = Hash128::of(complete bytes).to_hex()
+```
+
+No path outside the exact filename enters the stream. Count overflow is a pre-execution error.
+`crates/align_driver/tests/golden/migration_catalog_{empty,nonempty}_v1.hex` and their `.digest`
+siblings pin both cases; the non-empty fixture contains non-ASCII filename bytes and SQL without
+newline normalization. A standalone reference encoder shares no production codec function.
 
 All name/version/gap/symlink/UTF-8 errors are reported before applying the first migration.
 `alignc db migrate` in D11 reuses this exact catalog rule rather than inventing another order.
-Declared PRAGMAs, attached databases, and extension availability also enter the recorded schema
-environment; undeclared ambient connection state is forbidden.
+The exact preparation schema identity stream is:
+
+```text
+magic "ALIGNSID", u32 version 1, Driver tag, source tag
+source tag 0, SQLite memory:
+  catalog_fingerprint: Option<Hash128>   # None means the explicit empty schema
+source tag 1, SQLite database:
+  schema_id: string
+source tag 2, PostgreSQL:
+  schema_id: string
+  search_path: sequence<string>
+  extensions: sequence<Extension>
+schema_fingerprint = Hash128::of(complete bytes).to_hex()
+```
+
+The `Extension` binary record and sequence order are those in §16.3. V1 memory preparation exposes
+no PRAGMA/attachment input; adding either requires fields in this versioned stream. A configured
+database uses the explicit `schema-id`; PostgreSQL additionally binds the engine-reported search
+path and extensions. Undeclared ambient connection state is forbidden.
 
 ### 16.7 PostgreSQL preparation environment
 
@@ -2485,27 +2659,70 @@ are always present. Driver-native operations return corresponding driver-specifi
 `RegionPlain` records
 and may add native fields, but use the same destination rule.
 
-The exact common signatures and calls are:
+The exact common declarations are:
 
 ```align
+pub fn meta_database(
+  exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
+) -> Result<db.DatabaseMeta, db.Error>
+pub fn meta_schemas(
+  exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.SchemaMeta>, db.Error>
+pub fn meta_tables(
+  exec: db.exec, schema_filter: Option<db.SchemaRef>, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.TableMeta>, db.Error>
+pub fn meta_table(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<db.TableMeta, db.Error>
+pub fn meta_columns(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.ColumnMeta>, db.Error>
+pub fn meta_keys(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.KeyMeta>, db.Error>
+pub fn meta_indexes(
+  exec: db.exec, table_ref: db.TableRef, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.IndexMeta>, db.Error>
+pub fn meta_query<P, R>(
+  exec: db.exec, query: db.query<P, R>, detail: db.MetaDetail,
+  out: region, options: slice<db.MetaOption>,
+) -> Result<array<db.QueryMeta>, db.Error>
+pub fn explain<P, R>(
+  exec: db.exec, query: db.query<P, R>, params: P,
+  out: region, options: slice<db.ExplainOption>,
+) -> Result<db.QueryPlan, db.Error>
+```
+
+Calls use ordinary positional arguments; types belong on bindings/declarations, never in an
+argument:
+
+```align
+schema_filter: Option<db.SchemaRef> = None
+table_ref: db.TableRef = db.TableRef { schema: "main", name: "users" }
+q := query()
 database: db.DatabaseMeta =
   db.meta_database(exec, detail, out, [])?
 schemas: array<db.SchemaMeta> =
   db.meta_schemas(exec, detail, out, [])?
 tables: array<db.TableMeta> =
-  db.meta_tables(exec, schema_filter: Option<db.SchemaRef>, detail, out, [])?
+  db.meta_tables(exec, schema_filter, detail, out, [])?
 table: db.TableMeta =
-  db.meta_table(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_table(exec, table_ref, detail, out, [])?
 columns: array<db.ColumnMeta> =
-  db.meta_columns(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_columns(exec, table_ref, detail, out, [])?
 keys: array<db.KeyMeta> =
-  db.meta_keys(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_keys(exec, table_ref, detail, out, [])?
 indexes: array<db.IndexMeta> =
-  db.meta_indexes(exec, table_ref: db.TableRef, detail, out, [])?
+  db.meta_indexes(exec, table_ref, detail, out, [])?
 query_meta: array<db.QueryMeta> =
-  db.meta_query(exec, query(), detail, out, [])?
+  db.meta_query(exec, q, detail, out, [])?
 plan: db.QueryPlan =
-  db.explain(exec, query(), params, out, options)?
+  db.explain(exec, q, params, out, options)?
 ```
 
 These are distinct public primitives. Each metadata category has exactly one form whose final
@@ -2800,7 +3017,10 @@ The implementation roadmap must add benchmarks for at least:
 - SQLite streamed text/blob bind with transient-copy bytes and allocations separated;
 - PostgreSQL parameter bind + one-row typed decode;
 - file/inline Query/command artifact generation and cold/warm rebuild;
-- SQLite canonical migration catalog/replay at 10/100/1000 files;
+- structural contract/artifact and QueryMeta thunk bytes/time at 1/10/100 reachable definitions;
+- canonical checked-metadata JSON encode/decode/validation at 10/100/1000 columns;
+- SQLite canonical migration catalog fingerprint/replay at 10/100/1000 files;
+- SQLite active-execution lease acquire/release/rejected-overlap overhead;
 - prepared repeated execution;
 - large streamed flat result;
 - one-to-many one-pass shaping;
@@ -2911,11 +3131,13 @@ Before a native database:
 - construct `db.query<P,R>` from inline and sibling SQL;
 - construct `db.command<P>` from inline and sibling SQL;
 - emit/load `StaticQueryArtifact` and `StaticCommandArtifact`;
-- serialize canonical Params/Row fingerprints and binder/decoder ABI versions exactly as L5's
-  versioned artifact schema requires;
+- serialize structural reachable-definition Params/Row contracts/fingerprints and binder/decoder
+  ABI versions exactly as L5's versioned artifact schema requires;
 - preserve exact source SQL identity while generating deterministic SQLite/source and
   PostgreSQL/`$n` wire entries plus reverse span maps;
 - generate the shared Params binder for both kinds and a Query-only decoder thunk;
+- generate the producer-owned Declared QueryMeta plan/materialization thunk without reflection or
+  runtime artifact/source I/O;
 - record per-driver `BindValue`/`BindCopy` retention classes for every Params field;
 - exercise named-parameter occurrence tables;
 - decode a fake flat scalar row;
@@ -2926,11 +3148,12 @@ Before a native database:
   `sqlite.CommandOption`, and `postgres.QueryOption`/`postgres.CommandOption` exactly as §11–§13;
 - prove no runtime reflection or per-row name lookup.
 
-Tests mutate SQL-only, private Query/command, public Params/Row, driver restriction, binder/decoder
-ABI versions, and per-driver metadata digests independently. They round-trip the exact artifact
-schema, compile-fail a command with a Row/decode contract, and prove an unchanged public command
-consumer is not recompiled by a SQL-only producer edit. Benchmark generated Query/command binders,
-the Query decoder, and warm-cache behavior.
+Tests mutate SQL-only, private Query/command, same-path Params/Row field name/order/type/Option/
+reachable definitions, driver restriction, binder/decoder ABI versions, and per-driver metadata
+digests independently. They match the independent byte/digest goldens, materialize a separately
+compiled Declared QueryMeta table, compile-fail a command with a Row/decode contract, and prove an
+unchanged public command consumer is not recompiled by a SQL-only producer edit. Benchmark generated
+Query/command binders, the Query decoder/metadata thunk, and warm-cache behavior.
 
 ### D2 — minimal SQLite Query vertical
 
@@ -2945,6 +3168,8 @@ The first native vertical is deliberately exact:
 - structured SQLite primary/extended errors;
 - the exact SQLite connection and baseline execution option sums from §11, including every
   conflict/unsupported branch;
+- one connection-wide active-execution lease with pre-native overlap rejection and exact
+  exhaustion/error/Drop restoration;
 - one execution-count hook;
 - close/finalize exactly once on success and every error exit.
 
@@ -2956,8 +3181,10 @@ equivalent direct libsqlite3 loop.
 
 - canonical `.align-db/sqlite` artifact;
 - `alignc db prepare` and `--check`;
-- explicit temporary/in-memory schema setup with canonical migration catalog/order/fingerprint
-  tests;
+- exact derived path, canonical fail-closed JSON, independent byte/digest golden, and
+  producer-owned checked QueryMeta evidence;
+- explicit temporary/in-memory schema setup with `ALIGNMIG`/`ALIGNSID`
+  catalog/order/fingerprint goldens;
 - Declared/CheckedOptional/CheckedRequired;
 - the §16.3.1 SQLite origin/nullability evidence matrix, with ambiguous and outer-join results
   remaining `Unknown`;
@@ -2999,6 +3226,7 @@ release performance gate.
 ### D5 — PostgreSQL checked metadata
 
 - canonical `.align-db/postgres` artifact;
+- the same exact JSON/path/derived-identity codec and independent PostgreSQL command golden;
 - engine version, search path, extension, and schema fingerprints;
 - type names plus OID evidence;
 - the §16.3.1 PostgreSQL origin/nullability evidence matrix, including proof that catalog `NOT NULL`
@@ -3040,6 +3268,8 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - transient bind copied-byte/allocation/partial-error cleanup counts, with no per-row parameter copy;
 - complete runtime bind/decode/nullability tests for every exact first-release common type mapping;
 - SQLite current-row views;
+- SQLite ordinary/timeout stream overlap rejection in both directions, failed-second-attempt
+  non-restoration, and first-stream exhaustion/error/Drop lease cleanup;
 - PostgreSQL `BufferedFull` path first; `rows` is one-pass decode over that owned result, while
   explicitly selected single-row/portal delivery is D13;
 - early Drop/finalize;
@@ -3079,6 +3309,7 @@ Compound Query support is part of the first product contract, not a later ORM en
 ### D11 — SQL migrations
 
 - SQL migration discovery/order;
+- the exact `ALIGNMIG` catalog and `ALIGNSID` schema-identity byte/digest goldens shared with D3;
 - driver-specific multi-statement execution rules;
 - checksums/history/status/check;
 - exact first-line `transaction=required|forbidden` policy;
@@ -3126,6 +3357,9 @@ TableRef whose schema and name are both invalid, and two same-named constraints 
 `key_ordinal` groups are pinned even when their terms match and only their action/deferral policy
 differs. Contradictory native policy rows fail instead of acquiring an ordinal. An unnamed
 constraint returns `name = None`.
+The exact declarations and ordinary positional call examples in §18.2 are parsed/formatted by the
+documentation example test. A separately compiled Query's metadata rows come from its producer-owned
+plan/thunk with zero runtime source/artifact reads.
 Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
 category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
 operation.
