@@ -376,6 +376,34 @@ fn matching_wrapped_owned_sources_tracks_local_and_conditional_moves() {
 }
 
 #[test]
+fn match_binding_uses_post_evaluation_borrow_roots() {
+    let src = concat!(
+        "fn take(s: string) -> i64 = s.len()\n",
+        "fn main() -> i32 {\n",
+        "  first := \"first\".clone()\n",
+        "  second := \"second\".clone()\n",
+        "  mut view: str := first\n",
+        "  n := match { view = second; Some(view) } {\n",
+        "    Some(s) => { used := take(second); print(s); s.len() }\n",
+        "    None => 0\n",
+        "  }\n",
+        "  return n as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "match-post-evaluation-borrow.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "the arm binding must borrow the source selected while evaluating the scrutinee"
+    );
+    assert!(
+        rendered.contains("use of invalidated borrow 's': its source 'second' was moved"),
+        "diagnostic must name the post-evaluation owner:\n{rendered}"
+    );
+}
+
+#[test]
 fn nested_outer_struct_uses_the_same_recursive_plan() {
     if !backend_available() {
         return;

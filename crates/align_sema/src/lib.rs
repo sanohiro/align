@@ -10035,6 +10035,117 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Transfer only the bound source(s) that produced a match scrutinee's result value.
+    ///
+    /// The scrutinee has already been evaluated non-consuming, so statements, conditions, and
+    /// nested operations must not be walked again. Re-enter only transparent/control-result tails
+    /// and direct places, mirroring MIR's `null_moved_source` plus path-local control-result stores.
+    /// This keeps nested Move-binding matches linear instead of recursively evaluating each
+    /// scrutinee twice.
+    fn consume_match_result(&mut self, e: &Expr, moved: &mut MovedSet, direct: bool) {
+        match &e.kind {
+            ExprKind::Local(id) if self.is_move(*id) => {
+                if !direct {
+                    let name = &self.f.locals[*id as usize].name;
+                    self.diags.error(
+                        format!(
+                            "cannot move owned value '{name}' out through a conditional \
+                             expression yet; bind the `if`/`else` result to a local first"
+                        ),
+                        e.span,
+                    );
+                }
+                self.invalidate_owner(*id);
+                moved.insert(MovedKey::Whole(*id));
+            }
+            ExprKind::Field { root, path } if path.len() == 1 => {
+                let field = path[0];
+                if e.ty == Ty::String
+                    || e.ty == Ty::Option(Scalar::String)
+                    || is_move_handle(e.ty)
+                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums))
+                {
+                    self.invalidate_owner(*root);
+                    moved.insert(MovedKey::Field(*root, field));
+                } else if self.is_move_ty(e.ty) {
+                    self.diags.error(
+                        "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                        e.span,
+                    );
+                }
+            }
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => {
+                if let Some(value) = &block.value {
+                    self.consume_match_result(value, moved, direct);
+                }
+            }
+            ExprKind::If { then, els, .. } => {
+                let incoming_borrows = self.borrows.clone();
+                let mut then_moved = moved.clone();
+                self.borrows = incoming_borrows.clone();
+                if let Some(value) = &then.value {
+                    self.consume_match_result(value, &mut then_moved, false);
+                }
+                let then_borrows = self.borrows.clone();
+                let mut else_moved = moved.clone();
+                self.borrows = incoming_borrows.clone();
+                if let Some(value) = &els.value {
+                    self.consume_match_result(value, &mut else_moved, false);
+                }
+                let else_borrows = self.borrows.clone();
+                *moved = match (hir_block_diverges(then), hir_block_diverges(els)) {
+                    (false, false) => &then_moved | &else_moved,
+                    (true, false) => else_moved,
+                    (false, true) => then_moved,
+                    (true, true) => moved.clone(),
+                };
+                self.borrows = match (hir_block_diverges(then), hir_block_diverges(els)) {
+                    (false, false) => BorrowState::join(&then_borrows, &else_borrows),
+                    (true, false) => else_borrows,
+                    (false, true) => then_borrows,
+                    (true, true) => incoming_borrows,
+                };
+            }
+            ExprKind::Match { arms, .. } => {
+                let incoming_borrows = self.borrows.clone();
+                let mut joined: Option<MovedSet> = None;
+                let mut joined_borrows: Option<BorrowState> = None;
+                for arm in arms {
+                    let mut arm_moved = moved.clone();
+                    self.borrows = incoming_borrows.clone();
+                    self.consume_match_result(&arm.body, &mut arm_moved, direct);
+                    if hir_expr_diverges(&arm.body) {
+                        continue;
+                    }
+                    joined = Some(match joined {
+                        None => arm_moved,
+                        Some(state) => &state | &arm_moved,
+                    });
+                    joined_borrows = Some(match joined_borrows {
+                        None => self.borrows.clone(),
+                        Some(state) => BorrowState::join(&state, &self.borrows),
+                    });
+                }
+                if let Some(state) = joined {
+                    *moved = state;
+                }
+                self.borrows = joined_borrows.unwrap_or(incoming_borrows);
+            }
+            // The success operand is consumed while evaluating `ElseUnwrap`; only its fallback
+            // inherits the outer result's consumption.
+            ExprKind::ElseUnwrap { fallback, .. } => {
+                self.consume_match_result(fallback, moved, false);
+            }
+            // Constructors consume their payloads during ordinary evaluation; loop `break` values
+            // are likewise direct consuming sites. Fresh results and Copy places own no source
+            // slot for the outer match to clear.
+            _ => {}
+        }
+    }
+
     fn expr(
         &mut self,
         e: &Expr,
@@ -10399,7 +10510,6 @@ impl<'a> MoveCheck<'a> {
                 // (`=> { return … }`) contributes nothing to the fall-through, so its moves must not
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
-                let scrutinee_roots = self.borrow_sources(scrutinee);
                 // Extracting a Move payload consumes the scrutinee on precisely those arms that
                 // bind one. Walk that consuming form once through the ordinary expression
                 // dataflow, so blocks and control-flow values cannot drift from MIR's recursive,
@@ -10410,34 +10520,26 @@ impl<'a> MoveCheck<'a> {
                     .iter()
                     .flat_map(|arm| &arm.bindings)
                     .any(|binding| self.is_move(*binding));
-                let (evaluated, evaluated_borrows, consumed, consumed_borrows) = if has_move_binding {
-                    // The scrutinee is evaluated on every runtime path, including an arm that
-                    // binds no Move payload. Compute that common state separately: a block may
-                    // consume another local in a statement before yielding the tagged value.
-                    // Suppress this probe's diagnostics because the consuming walk immediately
-                    // below visits the same evaluation once with the real sink.
-                    let mut evaluated = moved.clone();
-                    let mut sink = Diagnostics::new();
-                    std::mem::swap(self.diags, &mut sink);
-                    self.borrows = incoming_borrows.clone();
-                    self.expr(scrutinee, &mut evaluated, false, false);
-                    let evaluated_borrows = self.borrows.clone();
-                    std::mem::swap(self.diags, &mut sink);
-
-                    let mut state = moved.clone();
-                    self.borrows = incoming_borrows.clone();
-                    self.expr(scrutinee, &mut state, true, true);
-                    (
-                        evaluated,
-                        evaluated_borrows,
-                        Some(state),
-                        Some(self.borrows.clone()),
-                    )
+                // Evaluate once for every arm. If a Move payload can be extracted, derive its
+                // transfer state by walking only the already-evaluated result source; never
+                // recursively re-evaluate the scrutinee (nested matches must stay linear).
+                self.borrows = incoming_borrows.clone();
+                self.expr(scrutinee, moved, false, false);
+                let evaluated = moved.clone();
+                let evaluated_borrows = self.borrows.clone();
+                let (consumed, consumed_borrows) = if has_move_binding {
+                    let mut state = evaluated.clone();
+                    self.borrows = evaluated_borrows.clone();
+                    self.consume_match_result(scrutinee, &mut state, true);
+                    (Some(state), Some(self.borrows.clone()))
                 } else {
-                    self.borrows = incoming_borrows.clone();
-                    self.expr(scrutinee, moved, false, false);
-                    (moved.clone(), self.borrows.clone(), None, None)
+                    (None, None)
                 };
+                // An evaluated block/control value may have reassigned a view before yielding it.
+                // Derive payload-binding provenance from that post-evaluation state, not the
+                // incoming state, or the binding can retain stale roots and outlive its real owner.
+                self.borrows = evaluated_borrows.clone();
+                let scrutinee_roots = self.borrow_sources(scrutinee);
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {

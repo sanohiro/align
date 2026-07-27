@@ -235,11 +235,14 @@ DropPlan =
   None
   Leaf(kind)
   Struct(indexed field plans, including None)
-  Tagged(tag offset, variant payload plans)
+  Option(payload plan)
+  Result(ok plan, error plan)
+  Enum(indexed variant payload plans)
 ```
 
-A composite is Move iff its plan is not `None`. `Tagged` covers `Option`, `Result`, and user sums;
-only the active payload is dropped. The same plan drives move/null-source and drop-old
+A composite is Move iff `plan.needs_drop()` is true; all-Copy composites retain their exact
+topology with a cached false bit. `Option`, `Result`, and `Enum` are tag-tested so only the active
+payload is dropped. The same plan drives move/null-source and drop-old
 classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
 plans are rejected with the existing recursive-type diagnostic. Nominal struct and sum nodes are
 memoized by type ID, shared, and carry their computed Move bit, so both construction and
