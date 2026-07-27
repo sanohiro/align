@@ -563,8 +563,9 @@ The measure-only `bench/par_map/run.sh chunks` probe ran on Linux x86_64 on 2026
 runtime workers. For one million `i64` source elements and chunk widths 1/2/8/64/256/1024, an
 early one-sided-validation run was rejected as a timing artifact. The corrected probe uses the same
 non-inlined pointer/alignment/order/length checksum helper in both timed arms, with a fresh
-materialized-buffer validation before each timing series; its two final invocations ranged from
-1.183x to 1.304x of the allocation-free cursor control. The producer is consistently slower in
+materialized-buffer validation before each timing series and the same checked header-span arithmetic
+in both arms; its two final invocations ranged from 1.249x to 1.336x of the allocation-free cursor
+control. The producer is consistently slower in
 this isolated runtime probe, which earns an end-to-end no-header design measurement, but not a
 production allocation-removal change by itself. Any such design must preserve the borrowed-slice
 ownership and synchronous cleanup contract and measure chunk-body, scheduler, and consumer costs
@@ -927,7 +928,7 @@ nested progress remain pinned.
   chunk-source range path has a baseline.~~ **MEASURED 2026-07-27** with the runtime-only
   `bench/par_map/run.sh chunks` probe; an early one-sided-validation result was rejected as a timing
   artifact, then symmetric pointer/alignment/order/length validation in both timed arms produced
-  1.183x–1.304x across two final Linux x86_64 invocations. This earns an end-to-end no-header
+  1.249x–1.336x across two final Linux x86_64 invocations. This earns an end-to-end no-header
   design measurement, but not a production allocation-removal change by itself. Its runtime-owned
   header buffer is held by an RAII cleanup guard, so validation failures are covered by the same
   cleanup contract as the timed path.

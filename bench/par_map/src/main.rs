@@ -448,6 +448,31 @@ fn aggregate_runtime_checksum<const WORDS: usize>(
 
 #[cfg(feature = "probe")]
 #[inline(never)]
+fn checked_chunk_header_span(ptr: *const u8, count: usize) -> usize {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<ChunkHeader>())
+        .expect("chunk header byte size must fit usize");
+    let address = std::hint::black_box(ptr as usize);
+    assert_eq!(
+        address % std::mem::align_of::<ChunkHeader>(),
+        0,
+        "chunk header buffer is not aligned"
+    );
+    let _end = address
+        .checked_add(bytes)
+        .expect("chunk header end address must fit usize");
+    bytes
+}
+
+#[cfg(feature = "probe")]
+unsafe fn chunk_header_slice<'a>(headers: ChunkHeader, count: usize) -> &'a [ChunkHeader] {
+    assert!(!headers.ptr.is_null(), "chunks header buffer is null");
+    checked_chunk_header_span(headers.ptr, count);
+    unsafe { std::slice::from_raw_parts(headers.ptr.cast::<ChunkHeader>(), count) }
+}
+
+#[cfg(feature = "probe")]
+#[inline(never)]
 fn checked_chunk_entry_checksum(
     data: &[i64],
     ptr: *const u8,
@@ -481,6 +506,8 @@ fn checked_chunk_entry_checksum(
 #[cfg(feature = "probe")]
 fn chunk_cursor_checksum(data: &[i64], chunk: usize) -> u64 {
     assert!(chunk > 0);
+    let header_count = data.len().div_ceil(chunk);
+    checked_chunk_header_span(data.as_ptr().cast(), header_count);
     let mut start = 0usize;
     let mut checksum = 0u64;
     while start < data.len() {
@@ -521,7 +548,7 @@ fn materialized_chunk_checksum(data: &[i64], chunk: usize) -> u64 {
         "chunks producer returned an unexpected header count"
     );
     let count = usize::try_from(headers.len).expect("chunks producer returned a valid count");
-    let entries = unsafe { std::slice::from_raw_parts(headers.ptr.cast::<ChunkHeader>(), count) };
+    let entries = unsafe { chunk_header_slice(headers, count) };
     let mut checksum = 0u64;
     for (index, entry) in entries.iter().enumerate() {
         let start = index
@@ -565,7 +592,7 @@ fn validate_materialized_chunks(data: &[i64], chunk: usize) {
         "chunks producer returned an unexpected header count"
     );
     let count = usize::try_from(headers.len).expect("chunks producer returned a valid count");
-    let entries = unsafe { std::slice::from_raw_parts(headers.ptr.cast::<ChunkHeader>(), count) };
+    let entries = unsafe { chunk_header_slice(headers, count) };
     for (index, entry) in entries.iter().enumerate() {
         let start = index
             .checked_mul(chunk)

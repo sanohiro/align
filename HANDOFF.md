@@ -207,7 +207,7 @@ Compiler-generated aggregate layouts, projection/aggregate filters, other hosts,
 width/aggregate retune remain separate follow-ups. The merged #660 chunk-source
 range path intentionally retains the `chunks` header allocation. The measure-only
 `bench/par_map/run.sh chunks` probe on Linux x86_64 used symmetric validation in both
-timed arms and showed 1.183x–1.304x versus the allocation-free cursor control across
+timed arms and showed 1.249x–1.336x versus the allocation-free cursor control across
 two final invocations; an earlier one-sided-validation result was rejected as a timing
 artifact. This earns an end-to-end no-header design measurement, but not a production
 allocation-removal change by itself. Review of the harness also found that a failed ABI

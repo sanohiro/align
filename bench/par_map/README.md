@@ -197,7 +197,8 @@ control does not model a shipped no-header parallel implementation; it isolates 
 allocation and header-write cost before any production lowering change is considered.
 Both timed arms use the same non-inlined pointer/alignment/order/length checksum helper, so ABI
 validation does not become a one-sided timing cost. A pre-timing pass checks a fresh materialized
-header buffer, and the probe uses an RAII cleanup guard for the runtime-owned buffer so a failed ABI
+header buffer; both arms also perform the same checked header-span arithmetic (the cursor uses a
+virtual span). The probe uses an RAII cleanup guard for the runtime-owned buffer so a failed ABI
 assertion cannot leak it.
 
 Representative Linux x86_64 run on 2026-07-27 (32 runtime workers, 15 alternating samples, second
@@ -205,16 +206,16 @@ of two invocations with symmetric validation in both timed arms):
 
 ```
  chunk   headers   materialize ms   cursor ms   materialize/cursor
-      1   1000000            2.572       2.041               1.260x
-      2    500000            2.530       2.104               1.202x
-      8    125000            2.550       2.103               1.212x
-     64     15625            2.498       1.956               1.277x
-    256      3907            2.511       2.097               1.197x
-   1024       977            2.529       1.945               1.300x
+      1   1000000            2.781       2.167               1.283x
+      2    500000            2.766       2.214               1.249x
+      8    125000            2.742       2.125               1.290x
+     64     15625            2.691       2.081               1.293x
+    256      3907            2.692       2.054               1.311x
+   1024       977            2.716       2.071               1.311x
 ```
 
 The producer was consistently slower in the symmetric probe: the two final invocations ranged from
-1.183x to 1.304x of the cursor control. This earns an end-to-end no-header chunk-range design
+1.249x to 1.336x of the cursor control. This earns an end-to-end no-header chunk-range design
 measurement, but not a production allocation-removal change by itself: chunk-body cost, scheduler
 cost, consumer layout, and the ownership contract still need to be measured together.
 
