@@ -234,7 +234,7 @@ resolution and generic monomorphization:
 DropPlan =
   None
   Leaf(kind)
-  Struct(fields with non-None plans)
+  Struct(indexed field plans, including None)
   Tagged(tag offset, variant payload plans)
 ```
 

@@ -10410,15 +10410,33 @@ impl<'a> MoveCheck<'a> {
                     .iter()
                     .flat_map(|arm| &arm.bindings)
                     .any(|binding| self.is_move(*binding));
-                let (consumed, consumed_borrows) = if has_move_binding {
+                let (evaluated, evaluated_borrows, consumed, consumed_borrows) = if has_move_binding {
+                    // The scrutinee is evaluated on every runtime path, including an arm that
+                    // binds no Move payload. Compute that common state separately: a block may
+                    // consume another local in a statement before yielding the tagged value.
+                    // Suppress this probe's diagnostics because the consuming walk immediately
+                    // below visits the same evaluation once with the real sink.
+                    let mut evaluated = moved.clone();
+                    let mut sink = Diagnostics::new();
+                    std::mem::swap(self.diags, &mut sink);
+                    self.borrows = incoming_borrows.clone();
+                    self.expr(scrutinee, &mut evaluated, false, false);
+                    let evaluated_borrows = self.borrows.clone();
+                    std::mem::swap(self.diags, &mut sink);
+
                     let mut state = moved.clone();
                     self.borrows = incoming_borrows.clone();
                     self.expr(scrutinee, &mut state, true, true);
-                    (Some(state), Some(self.borrows.clone()))
+                    (
+                        evaluated,
+                        evaluated_borrows,
+                        Some(state),
+                        Some(self.borrows.clone()),
+                    )
                 } else {
                     self.borrows = incoming_borrows.clone();
                     self.expr(scrutinee, moved, false, false);
-                    (None, None)
+                    (moved.clone(), self.borrows.clone(), None, None)
                 };
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
@@ -10427,7 +10445,7 @@ impl<'a> MoveCheck<'a> {
                     let mut m = if arm_moves_payload {
                         consumed.as_ref().expect("Move binding has consumed state").clone()
                     } else {
-                        moved.clone()
+                        evaluated.clone()
                     };
                     self.borrows = if arm_moves_payload {
                         consumed_borrows
@@ -10435,7 +10453,7 @@ impl<'a> MoveCheck<'a> {
                             .expect("Move binding has consumed borrow state")
                             .clone()
                     } else {
-                        incoming_borrows.clone()
+                        evaluated_borrows.clone()
                     };
                     for binding in &a.bindings {
                         let roots = if self.local_may_borrow(*binding) {

@@ -344,6 +344,21 @@ fn matching_wrapped_owned_sources_tracks_local_and_conditional_moves() {
             ),
             "use of moved field 'detail' of 'v'",
         ),
+        (
+            "matched-scrutinee-evaluation-move.align",
+            concat!(
+                "Item { detail: Option<string>, n: i64 }\n",
+                "fn take(s: string) -> i64 = s.len()\n",
+                "fn main() -> i32 {\n",
+                "  owned := \"side effect\".clone()\n",
+                "  v := Item { detail: None, n: 4 }\n",
+                "  n := match { used := take(owned); v.detail } { Some(s) => { return 90 }, None => 0 }\n",
+                "  again := owned\n",
+                "  return (n + v.n) as i32\n",
+                "}\n",
+            ),
+            "use of moved value 'owned'",
+        ),
     ];
     for (name, src, expected) in cases {
         let mut sm = SourceMap::new();
