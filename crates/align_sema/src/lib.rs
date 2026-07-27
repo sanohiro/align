@@ -966,6 +966,23 @@ pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropP
     .clone()
 }
 
+/// Whether a tagged payload needs recursive/deep cleanup that L1a's shallow Option/Result
+/// destructor cannot perform.
+fn tagged_payload_needs_l1b_drop(
+    payload: Scalar,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+) -> bool {
+    match payload {
+        Scalar::DynStructArray(id) => struct_is_move(id, structs, enums),
+        Scalar::DynResponseArray => true,
+        _ => {
+            !payload.is_move()
+                && drop_plan(scalar_to_ty(payload), structs, enums).needs_drop()
+        }
+    }
+}
+
 fn drop_plan_rec(
     ty: Ty,
     structs: &[StructDef],
@@ -1655,8 +1672,9 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
 /// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
 /// bound places are borrowed from their binding instead; a block is transparent to its value (see
-/// [`borrow_transparent_value`]). Control-flow nodes are conservatively eligible and their per-path
-/// runtime temporary bit prevents a bound arm from being dropped.
+/// [`borrow_transparent_value`]), and a task group is transparent when its ordinary tail value is a
+/// bound place because the group owns task storage only. Control-flow nodes are conservatively
+/// eligible and their per-path runtime temporary bit prevents a bound arm from being dropped.
 ///
 /// The second half of MIR's `lower_borrowed_owned` condition, with [`needs_drop_flag`] — shared
 /// here so `MoveCheck`'s borrow liveness ends a temporary's generation at exactly the loop edge
@@ -1664,6 +1682,12 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
 pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
     if let Some(inner) = borrow_transparent_value(e) {
         return may_need_synthetic_owner(inner);
+    }
+    // A task_group owns task storage, not ordinary lexical locals. A bound tail place therefore
+    // remains borrowed from that place in a borrowing context; only a genuinely fresh tail needs
+    // a hidden owner. Region escape remains checked on the TaskGroup wrapper itself.
+    if let hir::ExprKind::TaskGroup(block) = &e.kind {
+        return block.value.as_deref().is_some_and(may_need_synthetic_owner);
     }
     match &e.kind {
         hir::ExprKind::Local(_)
@@ -5581,6 +5605,9 @@ enum EscapeFlowOp<'a> {
     /// A by-value call transfers a Move value to the callee. Arena-owned storage cannot cross
     /// that function boundary because the callee has no caller-region provenance.
     CallTransfer(&'a Expr, u32),
+    /// `?` returns the active Err payload from the function. An owned error must therefore be
+    /// free-standing, not allocated in an arena that exit cleanup ends before the return.
+    TryErrEscape(&'a Expr, u32),
     ReturnEscape(&'a Expr, u32),
 }
 
@@ -5800,6 +5827,19 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
+            EscapeFlowOp::TryErrEscape(result, depth) => {
+                let contains_arena_owned =
+                    self.try_error_contains_arena_owned(result, depth);
+                if contains_arena_owned {
+                    self.diags.error(
+                        "cannot propagate an arena-owned error through `?` (the arena is freed before the error returns); use a free-standing owned error"
+                            .to_string(),
+                        result.span,
+                    );
+                } else {
+                    self.check_try_error_borrow_escape(result, depth);
+                }
+            }
             EscapeFlowOp::ReturnEscape(value, depth) => {
                 self.check_return_escape(value, depth)
             }
@@ -5860,6 +5900,93 @@ impl<'a> EscapeCheck<'a> {
             // A function result cannot borrow arena-owned storage across its own return boundary.
             ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => false,
             _ => !self.drop_is_individual(e, depth),
+        }
+    }
+
+    /// Check the implicit Err return edge of `?` for a borrowed payload. This is independent of
+    /// cleanup ownership: a `str` or `slice` needs no Drop but may still borrow a local or arena
+    /// allocation that is destroyed before the propagated Result reaches the caller.
+    ///
+    /// Fresh constructors preserve variant precision. A bound or control-flow Result uses its
+    /// conservative joined region because L1a has no per-variant borrow-provenance bit.
+    fn check_try_error_borrow_escape(&mut self, result: &Expr, depth: u32) {
+        let Ty::Result(_, err) = result.ty else {
+            return;
+        };
+        if !self.region_bearing(scalar_to_ty(err)) {
+            return;
+        }
+        match &result.kind {
+            ExprKind::ResultOk(_) => {}
+            ExprKind::ResultErr(error) => self.check_return_escape(error, depth),
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                if let Some(value) = &block.value {
+                    self.check_try_error_borrow_escape(value, depth);
+                }
+            }
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => {
+                if let Some(value) = &block.value {
+                    self.check_try_error_borrow_escape(value, depth + 1);
+                }
+            }
+            ExprKind::If { then, els, .. } => {
+                for block in [then, els] {
+                    if let Some(value) = &block.value {
+                        self.check_try_error_borrow_escape(value, depth);
+                    }
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    self.check_try_error_borrow_escape(&arm.body, depth);
+                }
+            }
+            _ => self.check_return_escape(result, depth),
+        }
+    }
+
+    /// Whether the Err payload implicitly returned by `?` may be arena-owned. Preserve variant
+    /// precision for fresh constructors; a bound/control-flow Result uses the conservative joined
+    /// ownership bit because L1a has only one cleanup-provenance bit for the aggregate.
+    fn try_error_contains_arena_owned(&mut self, result: &Expr, depth: u32) -> bool {
+        let Ty::Result(_, err) = result.ty else {
+            return false;
+        };
+        if !needs_drop_flag(
+            scalar_to_ty(err),
+            self.structs,
+            self.tuples,
+            self.enums,
+        ) {
+            return false;
+        }
+        match &result.kind {
+            ExprKind::ResultOk(_) => false,
+            ExprKind::ResultErr(error) => {
+                self.call_transfer_contains_arena_owned(error, depth)
+            }
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth)),
+            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
+                .value
+                .as_ref()
+                .is_some_and(|value| self.try_error_contains_arena_owned(value, depth + 1)),
+            ExprKind::If { then, els, .. } => [then, els].iter().any(|block| {
+                block
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| self.try_error_contains_arena_owned(value, depth))
+            }),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .any(|arm| self.try_error_contains_arena_owned(&arm.body, depth)),
+            // A callee cannot return arena-owned storage across its own function boundary.
+            ExprKind::Call { .. }
+            | ExprKind::CallFnValue { .. }
+            | ExprKind::ResultMapErr { .. } => false,
+            _ => self.call_transfer_contains_arena_owned(result, depth),
         }
     }
 
@@ -7796,8 +7923,12 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(f, depth);
                 }
             }
+            ExprKind::Try(i) => {
+                self.walk(i, depth);
+                self.push_flow_op(EscapeFlowOp::TryErrEscape(i, depth));
+            }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
+            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
@@ -9331,6 +9462,13 @@ impl<'a> MoveCheck<'a> {
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
             ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
+            // A task_group owns only spawned task storage. Its bound ordinary tail place keeps the
+            // same borrow root; region escape is checked separately on the wrapper.
+            ExprKind::TaskGroup(block) => {
+                if let Some(value) = &block.value {
+                    roots.extend(self.storage_roots(value));
+                }
+            }
             // Not a fail-open default: this DELEGATES to [`Self::borrow_sources`], whose own
             // classification is exhaustive, so a new `ExprKind` is still forced to be classified —
             // there, once, rather than in both places. The arms above exist only because a *place*
@@ -9928,7 +10066,13 @@ impl<'a> MoveCheck<'a> {
                         ExprKind::Field { root: source, path: source_path }
                             if source == root && source_path == path
                     );
-                    self.expr(value, moved, true, true);
+                    if self_assign {
+                        // MIR emits no code for an exact place self-assignment. Analyze the read
+                        // without consuming it so existing borrows of the root stay valid too.
+                        self.expr(value, moved, false, false);
+                    } else {
+                        self.expr(value, moved, true, true);
+                    }
                     // The assignment installs a live replacement even when its RHS moved out of
                     // this same field through a transparent wrapper, consuming call, or one arm of
                     // a control-flow expression. MIR zeros the source on precisely the paths that
@@ -12247,17 +12391,40 @@ impl<'a, 't> Checker<'a, 't> {
     /// recompile after the pre-existing error is fixed. A *warning* (e.g. the unnecessary-heap lint)
     /// does not gate it: the error count, not the diagnostic count, is the checkpoint.
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
-        // No expected type → nothing to reconcile; `constrain(_, None)` is a no-op, so skip the
-        // error-count checkpoints entirely (the common case for most sub-expressions).
-        let Some(_) = expected else {
-            return self.check_expr_inner(e, None);
-        };
         let errors_before = self.diags.error_count();
         let result = self.check_expr_inner(e, expected);
-        if self.diags.error_count() == errors_before {
+        if self.diags.error_count() == errors_before && expected.is_some() {
             self.constrain(result.ty, expected, e.span);
         }
+        if self.diags.error_count() == errors_before
+            && self.has_unsupported_recursive_tagged_payload(result.ty)
+        {
+            self.diags.error(
+                format!(
+                    "materializing {} with a recursive Move payload is not supported yet — consume the producer directly with `?`; retained Move Option/Result payloads are implemented in L1b",
+                    self.ty_display(result.ty)
+                ),
+                e.span,
+            );
+        }
         result
+    }
+
+    /// Whether `ty` is an Option/Result whose payload needs recursive Drop but is not one of the
+    /// legacy shallow Move scalars already handled by the tagged destructor.
+    fn has_unsupported_recursive_tagged_payload(&self, ty: Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Option(payload) => self.has_unsupported_recursive_tagged_scalar(payload),
+            Ty::Result(ok, err) => {
+                self.has_unsupported_recursive_tagged_scalar(ok)
+                    || self.has_unsupported_recursive_tagged_scalar(err)
+            }
+            _ => false,
+        }
+    }
+
+    fn has_unsupported_recursive_tagged_scalar(&self, payload: Scalar) -> bool {
+        tagged_payload_needs_l1b_drop(payload, self.structs, self.enums)
     }
 
     fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
@@ -22137,7 +22304,25 @@ impl<'a, 't> Checker<'a, 't> {
             (Some(ok), Ty::Result(_, err)) => ty_to_scalar(ok).map(|o| Ty::Result(o, err)),
             _ => None,
         };
-        let v = self.check_expr(inner, inner_expected);
+        // Bypass only the outer materialization guard: this tagged Result is a transient producer
+        // consumed immediately by `?`. Nested subexpressions still go through `check_expr`, so a
+        // retained recursive tagged value cannot be smuggled through an operand expression.
+        let errors_before = self.diags.error_count();
+        let v = self.check_expr_inner(inner, inner_expected);
+        if self.diags.error_count() == errors_before && inner_expected.is_some() {
+            self.constrain(v.ty, inner_expected, inner.span);
+        }
+        if self.diags.error_count() == errors_before
+            && matches!(
+                self.resolve(v.ty),
+                Ty::Result(_, err) if self.has_unsupported_recursive_tagged_scalar(err)
+            )
+        {
+            self.diags.error(
+                "propagating a recursive Move error payload through `?` is not supported yet — Move Result error payloads are implemented in L1b",
+                inner.span,
+            );
+        }
         // `wait()?` on a fallible task_group: control only continues past the `?` if no task failed
         // (the `Err` was propagated), so every task succeeded → `get()` is now safe (slice ④c-2).
         // Recognised when `?` is applied directly to `wait()` (`wait()?`, also `w := wait()?`);
@@ -24036,11 +24221,10 @@ fn collection_scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics
     }
 }
 
-/// An `Option`/`Result` payload may not be a **Move struct** (one that owns a `string`/owned field):
-/// the canonical Drop plan sees the recursive ownership, but L1b must add nested tagged lowering
-/// and move-out/null-container semantics. Maps such a payload to `None` (with an error); passes
-/// anything else through unchanged.
-fn reject_move_struct_payload(
+/// An `Option`/`Result` payload may not require recursive or deep cleanup: the canonical Drop plan
+/// sees that ownership, but L1b must add tagged lowering and move-out/null-container semantics.
+/// Maps such a payload to `None` (with an error); passes shallow supported payloads through.
+fn reject_unsupported_tagged_payload(
     s: Option<Scalar>,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
@@ -24049,14 +24233,11 @@ fn reject_move_struct_payload(
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
     match s {
-        Some(Scalar::Struct(id)) if struct_is_move(id, structs, enums) => {
-            let name = structs
-                .get(id as usize)
-                .map_or("<invalid struct>", |def| def.name.as_str());
+        Some(payload) if tagged_payload_needs_l1b_drop(payload, structs, enums) => {
             diags.error(
                 format!(
-                    "{what} cannot be the Move struct '{}' yet — recursive Move tagged payloads are implemented in L1b",
-                    name
+                    "{what} cannot be {} yet — recursive/deep Move tagged payloads are implemented in L1b",
+                    ty_name(scalar_to_ty(payload))
                 ),
                 span,
             );
@@ -24491,7 +24672,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, cx.enums, "Option payload", span, diags) {
+            match reject_unsupported_tagged_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, cx.enums, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -24584,8 +24765,8 @@ fn resolve_type(
                 }
             };
             match (
-                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, cx.enums, "Result ok payload", span, diags),
-                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, cx.enums, "Result err payload", span, diags),
+                reject_unsupported_tagged_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, cx.enums, "Result ok payload", span, diags),
+                reject_unsupported_tagged_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, cx.enums, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,

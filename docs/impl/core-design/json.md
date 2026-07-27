@@ -67,7 +67,10 @@ field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggreg
 `Drop` frees null there (single-free). The union's variants are part of the structural MIR type
 tables, so a variant change invalidates the decode/encode cache. **Boundary:** because a
 Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
-`Message` decode target binds with `?`. The following J3b slice supplies owned-element deep free, so
+`Message` decode target binds with `?`. A top-level Move-union decode must likewise be consumed
+directly with `?`; retaining or returning its raw `Result<MoveUnion, Error>` is an L1b diagnostic
+because recursive tagged-payload Drop is not yet available. The following J3b slice supplies
+owned-element deep free, so
 `Chat { messages: array<Message> }` also round-trips when `Message` is Move.
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned

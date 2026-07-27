@@ -1209,6 +1209,10 @@ borrow-bearing type are prohibited.
 - introduce one canonical recursive owned-value/Drop-plan classifier after all struct/enum
   definitions are resolved;
 - make `Option<string>` a legal struct field and use it as the first conditional owned leaf;
+- permit a recursive Move `Result` Ok producer only when an immediate `?` consumes the tagged
+  aggregate; the Err payload must remain shallow because `?` propagates it, and retaining or
+  returning the raw tagged value—or declaring it in a parameter/return type—remains an explicit
+  L1b diagnostic;
 - mark the enclosing struct Move;
 - emit tag-tested Drop for the field on normal/early cleanup and drop-old reassignment;
 - move/null the live payload on whole-struct moves and supported field extraction;
@@ -1251,6 +1255,10 @@ Acceptance:
 - replacing `Some(old)` drops old before installing new; `Some -> None` drops old; `None -> Some`
   does not touch uninitialized payload;
 - `?` during construction drops every already-initialized owned field exactly once;
+- `?` over a bound Result transfers a shallow Move Err before exit cleanup, with allocation/free
+  parity at the caller;
+- an arena-owned shallow Move Err is rejected at `?` because exit cleanup would end its arena
+  before propagation;
 - `Option<MoveStruct>` still receives the explicit L1b-not-yet-supported diagnostic;
 - invalid recursive and unsupported deep partial-move cases fail with diagnostics, never panic;
 - emitted LLVM has one tag branch on Drop and no allocation on the `None`/unrelated success path;

@@ -24,7 +24,7 @@ trap 'rm -f "$KERNEL_O" "$KERNEL_LL"' EXIT
 "$ALIGNC" emit-obj kernel.align "$KERNEL_O" --target-cpu "$align_tgt" \
   --export scalar_rows --export tagged_none --export tagged_some --export tagged_sparse \
   --export tagged_replace --export tagged_conditional_replace --export tagged_match_loop_replace \
-  --export tagged_early_try
+  --export tagged_early_try --export tagged_move_error_try
 "$ALIGNC" emit-llvm kernel.align --target-cpu "$align_tgt" > "$KERNEL_LL"
 
 echo "target: $mode"

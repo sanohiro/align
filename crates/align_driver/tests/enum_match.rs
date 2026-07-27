@@ -765,6 +765,10 @@ fn wrapped_copy_only_wildcard_preserves_an_owned_enum_source() {
             "{ if true { left.c } else { right.c } }",
         ),
         (
+            "enum-task-group-direct-wildcard-borrow",
+            "task_group { left.c }",
+        ),
+        (
             "enum-task-group-wildcard-borrow",
             "task_group { if true { left.c } else { right.c } }",
         ),

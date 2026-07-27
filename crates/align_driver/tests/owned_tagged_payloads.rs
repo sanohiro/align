@@ -246,6 +246,28 @@ fn field_self_assignment_preserves_value_and_ownership() {
 }
 
 #[test]
+fn field_self_assignment_preserves_existing_borrows() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "User { name: string }\n",
+        "fn main() -> i32 {\n",
+        "  mut user := User { name: \"hello\".clone() }\n",
+        "  view: str := user.name\n",
+        "  user.name = user.name\n",
+        "  return view.len() as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("owned-field-self-assign-borrow", src)
+            .status
+            .code(),
+        Some(5)
+    );
+}
+
+#[test]
 fn conditional_field_replacement_drops_old_only_on_live_paths() {
     if !backend_available() {
         return;
@@ -593,6 +615,276 @@ fn option_struct_that_is_move_through_enum_remains_an_l1b_diagnostic() {
     assert!(
         rendered.contains("Option<MoveStruct> is implemented in L1b"),
         "diagnostic must report the unsupported cleanup shape:\n{rendered}"
+    );
+}
+
+#[test]
+fn retained_result_with_recursive_move_payload_is_an_l1b_diagnostic() {
+    for (name, src, expected) in [
+        (
+            "user-result-move-enum.align",
+            concat!(
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "fn main() -> i32 {\n",
+                "  result: Result<Content, Error> := Ok(Content.Parts([Part { kind: \"owned\" }].to_array()))\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "nullable/fallible owned union is a later slice",
+        ),
+        (
+            "json-result-move-enum.align",
+            concat!(
+                "import core.json\n",
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "fn main() -> i32 {\n",
+                "  result: Result<Content, Error> := json.decode(\"[]\")\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "recursive/deep Move tagged payloads are implemented in L1b",
+        ),
+        (
+            "json-result-move-struct-array.align",
+            concat!(
+                "import core.json\n",
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "Message { content: Content }\n",
+                "fn main() -> i32 {\n",
+                "  result: Result<array<Message>, Error> := json.decode(\"[]\")\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "recursive/deep Move tagged payloads are implemented in L1b",
+        ),
+        (
+            "http-result-response-array.align",
+            concat!(
+                "import std.http\n",
+                "fn main() -> i32 {\n",
+                "  urls := [\"http://x/\"]\n",
+                "  cl := http.client()\n",
+                "  result := cl.get_many(urls, 1)\n",
+                "  return 0\n",
+                "}\n",
+            ),
+            "retained Move Option/Result payloads are implemented in L1b",
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "retaining Result<MoveEnum, Error> must remain rejected"
+        );
+        assert!(
+            rendered.contains(expected),
+            "diagnostic must report the unsupported cleanup shape:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn recursive_move_tagged_payloads_are_rejected_in_signatures() {
+    for (name, src) in [
+        (
+            "result-move-enum-param.align",
+            concat!(
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "fn discard(value: Result<Content, Error>) -> i32 = 0\n",
+                "fn main() -> i32 = 0\n",
+            ),
+        ),
+        (
+            "option-move-enum-param.align",
+            concat!(
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "fn discard(value: Option<Content>) -> i32 = 0\n",
+                "fn main() -> i32 = 0\n",
+            ),
+        ),
+        (
+            "result-move-struct-array-param.align",
+            concat!(
+                "Part { kind: str }\n",
+                "Content { Text(str), Parts(array<Part>) }\n",
+                "Message { content: Content }\n",
+                "fn discard(value: Result<array<Message>, Error>) -> i32 = 0\n",
+                "fn main() -> i32 = 0\n",
+            ),
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "unsupported tagged cleanup must be rejected at the declared type boundary"
+        );
+        assert!(
+            rendered.contains("recursive/deep Move tagged payloads are implemented in L1b"),
+            "diagnostic must identify the owning slice:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn immediate_try_may_consume_a_recursive_move_result() {
+    let src = concat!(
+        "import core.json\n",
+        "Part { kind: str }\n",
+        "Content { Text(str), Parts(array<Part>) }\n",
+        "fn decode() -> Result<(), Error> {\n",
+        "  content: Content := json.decode(\"[]\")?\n",
+        "  return Ok(())\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "immediate-try-move-enum.align", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "an immediate `?` owns the decoded payload without retaining its tagged Result:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+}
+
+#[test]
+fn try_cannot_propagate_an_arena_owned_shallow_move_error() {
+    for (name, body) in [
+        (
+            "direct-arena-error.align",
+            "    value: i64 := Err([1, 2].to_array())?\n",
+        ),
+        (
+            "bound-arena-error.align",
+            concat!(
+                "    result: Result<i64, array<i64>> := Err([1, 2].to_array())\n",
+                "    value := result?\n",
+            ),
+        ),
+    ] {
+        let src = format!(
+            "fn relay() -> Result<i64, array<i64>> {{\n  arena {{\n{body}    return Ok(value)\n  }}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, &src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "an arena-owned error cannot survive the implicit return edge of `?`: {name}"
+        );
+        assert!(
+            rendered.contains("cannot propagate an arena-owned error through `?`"),
+            "diagnostic must identify the implicit escape:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn try_cannot_propagate_a_borrowed_error() {
+    for (name, body) in [
+        (
+            "direct-borrowed-error.align",
+            "  value: i64 := Err(view)?\n",
+        ),
+        (
+            "bound-borrowed-error.align",
+            concat!(
+                "  result: Result<i64, str> := Err(view)\n",
+                "  value := result?\n",
+            ),
+        ),
+    ] {
+        let src = format!(
+            "fn relay() -> Result<i64, str> {{\n  storage := \"boom\".clone()\n  view: str := storage\n{body}  return Ok(value)\n}}\nfn main() -> i32 = 0\n"
+        );
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, &src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "a borrowed error cannot survive the implicit return edge of `?`: {name}"
+        );
+        assert!(
+            rendered.contains("cannot return a view that borrows local storage"),
+            "diagnostic must identify the dangling implicit return:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn try_may_propagate_a_free_standing_error_from_inside_an_arena() {
+    let src = concat!(
+        "fn relay() -> Result<i64, string> {\n",
+        "  arena {\n",
+        "    value: i64 := Err(\"boom\".clone())?\n",
+        "    return Ok(value)\n",
+        "  }\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "free-standing-arena-error.align", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "`string.clone()` is free-standing even when called inside an arena:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+}
+
+#[test]
+fn try_cannot_propagate_a_recursive_move_error_payload() {
+    let src = concat!(
+        "Part { kind: str }\n",
+        "Content { Text(str), Parts(array<Part>) }\n",
+        "fn base() -> Result<i64, Error> = Err(error(1))\n",
+        "fn own_error(e: Error) -> Content = Content.Parts([Part { kind: \"owned\" }].to_array())\n",
+        "fn relay() -> Result<(), Content> {\n",
+        "  value := base().map_err(own_error)?\n",
+        "  return Ok(())\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "try-move-error.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "`?` propagates rather than consumes its error payload"
+    );
+    assert!(
+        rendered.contains("propagating a recursive Move error payload through `?`"),
+        "diagnostic must identify the unsupported propagation path:\n{rendered}"
+    );
+}
+
+#[test]
+fn try_transfers_a_bound_shallow_move_error_payload() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn fail() -> Result<i64, string> = Err(\"boom\".clone())\n",
+        "fn relay() -> Result<i64, string> {\n",
+        "  result := fail()\n",
+        "  value := result?\n",
+        "  return Ok(value)\n",
+        "}\n",
+        "fn main() -> i32 = match relay() {\n",
+        "  Ok(value) => value as i32,\n",
+        "  Err(message) => message.len() as i32,\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("try-bound-move-error", src).status.code(),
+        Some(4)
     );
 }
 

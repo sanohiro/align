@@ -243,7 +243,12 @@ canonical recursive Drop plan and sound `Option<string>` struct fields are imple
 tag-tested Drop, move/null handling, focused analysis coverage, and an alloc-count benchmark.
 Partial Move-leaf replacement fails closed without an exact drop-old lowering, and fixed-array
 field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
-larger Move leaves. The next implementation slice is L1b only: Move tagged payloads through
+larger Move leaves. A recursive Move `Result` Ok producer is accepted only when `?` consumes it
+immediately; its Err payload must stay shallow because `?` propagates it, and retaining or returning
+the raw tagged value—or declaring it in a parameter/return type—is an L1b diagnostic. Bound shallow
+Move errors transfer out before `?` runs exit cleanup, and an arena-owned Err is rejected before
+that implicit return. The next
+implementation slice is L1b only: Move tagged payloads through
 Option/Result/user sums. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
 variants before L1a–L7 are complete. The remaining required order is L1b Move tagged payloads
 through Result, L2 borrow

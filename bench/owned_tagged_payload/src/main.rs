@@ -12,6 +12,7 @@ extern "C" {
     fn tagged_conditional_replace(reps: i64) -> i64;
     fn tagged_match_loop_replace(reps: i64) -> i64;
     fn tagged_early_try(reps: i64) -> i64;
+    fn tagged_move_error_try(reps: i64) -> i64;
     fn align_rt_alloc_count() -> i64;
     fn align_rt_free_count() -> i64;
 }
@@ -27,7 +28,7 @@ fn measure(kernel: Kernel, reps: i64) -> (i64, i64, Duration, i64) {
 
 fn main() {
     let reps = 1_000_000;
-    let rows: [(&str, Kernel, i64, Option<i64>); 8] = [
+    let rows: [(&str, Kernel, i64, Option<i64>); 9] = [
         ("scalar", scalar_rows, 0, None),
         ("none", tagged_none, 0, None),
         ("some", tagged_some, reps, None),
@@ -41,6 +42,12 @@ fn main() {
         ),
         ("match-loop", tagged_match_loop_replace, reps * 3, None),
         ("early-try", tagged_early_try, reps, Some(0)),
+        (
+            "move-err-try",
+            tagged_move_error_try,
+            reps,
+            Some(reps * 4),
+        ),
     ];
     let mut failed = false;
     let mut checksum = None;

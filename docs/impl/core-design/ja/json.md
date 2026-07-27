@@ -61,7 +61,9 @@ tag-switched な `drop_enum` で生きているバリアントを解放する。
 = `{tag,payloads}` 集約全体をゼロ化）ので、struct の `Drop` はそこで null を解放する（単一解放）。
 union のバリアントは構造化 MIR の型テーブルに含まれるので、バリアント変更で decode/encode キャッシュが
 無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
-payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。続く J3b
+payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。top-level
+Move union の decode も `?` で直接消費しなければならない。raw
+`Result<MoveUnion, Error>` の保持・返却は、再帰的 tagged-payload Drop が未実装のため L1b 診断となる。続く J3b
 スライスが所有要素の deep free を提供するため、`Message` が Move の場合も
 `Chat { messages: array<Message> }` までラウンドトリップする。
 

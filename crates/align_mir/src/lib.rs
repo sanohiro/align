@@ -2444,9 +2444,8 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
         hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
             block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
         }
-        // A task_group is not borrow-transparent: its tail local dies with the scope, so the
-        // wrapper is a fresh value in the caller. Forward that local's ordinary ownership bit to
-        // the synthetic owner instead of classifying the inner Local as a borrowed place.
+        // A TaskGroup reaches this arm only when its tail can be fresh: may_need_synthetic_owner
+        // sees through a bound tail place. Forward the fresh value's ordinary ownership bit.
         hir::ExprKind::TaskGroup(_) => lowered_drop_flag(b, e, operand),
         _ => lowered_drop_flag(b, e, operand),
     }
@@ -2509,9 +2508,8 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
     let live = temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
     b.push(Stmt::Store(owner, operand.clone()));
     b.set_drop_flag_operand(owner, live);
-    // A task_group result is fresh to the enclosing expression but may be backed by a bound tail
-    // local inside the scope. The hidden borrow owner takes that value, so clear the inner source
-    // exactly as the consumed-call path does before both cleanups can observe it as live.
+    // A task_group reaches this hidden-owner path only for a tail that can be fresh. Transfer its
+    // source exactly as the consumed-call path does before both cleanups can observe it as live.
     if matches!(e.kind, hir::ExprKind::TaskGroup(_)) {
         null_moved_source(b, e);
     }
@@ -10599,6 +10597,10 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
     let propagated = b.fresh_value(b.ret);
     b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
+    // `?` consumes the Result on both edges. A bound source with an owned Err payload must be
+    // cleared before exit cleanup, or its local Drop frees the same payload now owned by the
+    // returned `Err` (use-after-free / double-free in the caller).
+    null_moved_source(b, inner);
     // `?` exits the function: free open arenas and drop owned locals first.
     b.emit_exit_cleanup();
     b.terminate(Term::Return(Some(Operand::Value(propagated))));
@@ -10606,8 +10608,7 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
     // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
     // slot — its exit `Drop` then frees null, not the moved-out buffer (no double-free). On the
-    // Err edge the source's ok payload is already {null,0} (zeroed at construction), so the
-    // exit-cleanup drop there is a harmless no-op.
+    // Err edge clears the source above because its error payload may itself be Move.
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
@@ -10736,9 +10737,8 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 .unwrap_or(Operand::Const(Const::Bool(false)))
         };
         b.set_drop_flag_operand(owner, live);
-        // A consuming match transferred every fresh/materialized source into this owner. A
-        // task-group result is also fresh to its caller even when backed by a bound tail local.
-        // Copy-only ordinary scopes keep bound sources borrowed (their temporary bit is false).
+        // A consuming match transferred every fresh/materialized source into this owner. Copy-only
+        // bound sources, including a task-group bound tail place, remain borrowed.
         if binds_move_payload || match_scrutinee_transfers_source_to_owner(scrutinee) {
             null_moved_source(b, scrutinee);
         }
@@ -10792,7 +10792,8 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
 /// Whether a fresh match scrutinee structurally consumes a bound source into the hidden owner.
 /// Control-flow joins handle this path-by-path in `store_control_result`; direct bound places remain
 /// borrowed. Constructor wrappers consume their payload, including through transparent scopes.
-/// A task-group result is always fresh to its caller, even when its tail is a bound local.
+/// A task-group reaches this helper only when its tail can be fresh; a bound tail place does not
+/// need a synthetic owner and is filtered by `may_need_synthetic_owner` before this helper is used.
 fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::OptionSome(_)
@@ -11516,7 +11517,7 @@ mod tests {
     }
 
     #[test]
-    fn task_group_tail_moves_clear_the_inner_source_and_forward_ownership() {
+    fn task_group_tail_moves_clear_the_inner_source() {
         let p = lower(
             "fn make() -> string {\n  return task_group { s := \"hello\".clone(); s }\n}\nfn take(s: string) -> i64 = s.len()\nfn call() -> i64 = take(task_group { s := \"world\".clone(); s })\nfn main() -> i32 = 0\n",
         );
@@ -11551,19 +11552,6 @@ mod tests {
             );
         }
 
-        let call = p.fns.iter().find(|f| f.name == "call").expect("call MIR");
-        assert!(
-            call.blocks.iter().flat_map(|block| &block.stmts).any(
-                |stmt| matches!(
-                    stmt,
-                    Stmt::Store(slot, Operand::Value(value))
-                        if call.slots[*slot as usize] == Ty::Bool
-                            && call.value_tys[*value as usize] == Ty::Bool
-                )
-            ),
-            "a consumed task_group value must forward its runtime ownership bit:\n{}",
-            print::function_to_string(call)
-        );
     }
 
     #[test]
