@@ -195,6 +195,8 @@ free the `{ptr,len}` header array, and compares it with an allocation-free contr
 the same chunk pointer/length cursor work. Both paths produce and validate the same checksum. The
 control does not model a shipped no-header parallel implementation; it isolates the producer's
 allocation and header-write cost before any production lowering change is considered.
+Validation runs outside the timed region, and the probe uses an RAII cleanup guard for the
+runtime-owned header buffer so a failed ABI assertion cannot leak it.
 
 Representative Linux x86_64 run on 2026-07-27 (32 runtime workers, 15 alternating samples, second
 of two invocations after moving validation outside the timed loop):

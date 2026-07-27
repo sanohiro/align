@@ -926,7 +926,9 @@ nested progress remain pinned.
   `bench/par_map/run.sh chunks` probe; after moving validation outside the timed loop, the two
   final Linux x86_64 invocations ranged from 0.918x to 1.024x of the allocation-free cursor
   control. No production allocation-removal change is earned; an end-to-end no-header design and
-  its ownership/cleanup proof remain deferred unless a consumer-level benefit appears.
+  its ownership/cleanup proof remain deferred unless a consumer-level benefit appears. The probe's
+  runtime-owned header buffer is held by an RAII cleanup guard, so validation failures are covered
+  by the same cleanup contract as the timed path.
 
 ### Slice P4 — resource policy, only if earned
 

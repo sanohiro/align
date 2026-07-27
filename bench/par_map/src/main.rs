@@ -22,6 +22,25 @@ struct ChunkHeader {
     len: i64,
 }
 
+#[cfg(feature = "probe")]
+struct OwnedChunkHeaders(*mut u8);
+
+#[cfg(feature = "probe")]
+impl OwnedChunkHeaders {
+    fn new(ptr: *const u8) -> Self {
+        Self(ptr.cast_mut())
+    }
+}
+
+#[cfg(feature = "probe")]
+impl Drop for OwnedChunkHeaders {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { align_rt_free(self.0) };
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[cfg(feature = "probe")]
@@ -456,6 +475,7 @@ fn materialized_chunk_checksum(data: &[i64], chunk: usize) -> u64 {
             std::mem::size_of::<i64>() as i64,
         )
     };
+    let _owned_headers = OwnedChunkHeaders::new(headers.ptr);
     assert!(
         !headers.ptr.is_null(),
         "chunks producer returned no header buffer"
@@ -475,7 +495,6 @@ fn materialized_chunk_checksum(data: &[i64], chunk: usize) -> u64 {
             .wrapping_add((offset as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .wrapping_add(entry.len as u64);
     }
-    unsafe { align_rt_free(headers.ptr.cast_mut()) };
     std::hint::black_box(checksum)
 }
 
@@ -489,6 +508,7 @@ fn validate_materialized_chunks(data: &[i64], chunk: usize) {
             std::mem::size_of::<i64>() as i64,
         )
     };
+    let _owned_headers = OwnedChunkHeaders::new(headers.ptr);
     assert!(
         !headers.ptr.is_null(),
         "chunks producer returned no header buffer"
@@ -516,7 +536,6 @@ fn validate_materialized_chunks(data: &[i64], chunk: usize) {
         start += expected_len;
     }
     assert_eq!(start, data.len(), "chunks headers did not cover the source");
-    unsafe { align_rt_free(headers.ptr.cast_mut()) };
 }
 
 #[cfg(feature = "probe")]

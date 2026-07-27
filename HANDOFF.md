@@ -209,9 +209,11 @@ range path intentionally retains the `chunks` header allocation. The measure-onl
 `bench/par_map/run.sh chunks` probe on Linux x86_64 showed 0.918x–1.024x versus
 the allocation-free cursor control across two final invocations after moving
 validation outside the timed loop; no production allocation-removal change is
-earned. Revisit only if an end-to-end no-header design shows a consumer-level
-benefit. Compiler-generated aggregate layouts remain the next separate widening
-candidate.
+earned. Review of the measure-only harness also found that a failed ABI assertion
+could leak the runtime-owned header buffer; the follow-up uses an RAII cleanup guard
+and reran the probe plus probe-feature Clippy clean. Revisit only if an end-to-end
+no-header design shows a consumer-level benefit. Compiler-generated aggregate layouts
+remain the next separate widening candidate.
 
 Consumer-gated deferrals that remain intentional:
 
