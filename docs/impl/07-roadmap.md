@@ -3497,31 +3497,83 @@ answered and resolved, and the English validation summary was posted before squa
 audit structural item is the explicit value-carrying-control-flow region/move/drop matrix and its
 1:1 tests.
 
+## Post-M15 mandatory library-boundary prerequisites
+
+`pkg.db` establishes a concrete consumer for six language/compiler gaps that are general to
+ordinary native-backed packages. They are not optional database polish and must land before a
+SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptance matrix are
+`17-library-boundary-prerequisites.md`; the database sequence that follows is
+`pkg-design/db.md` §23. The feasibility findings and revision rationale are
+`18-pkg-db-review.md`.
+
+```text
+L1a recursive DropPlan + Option<Move> fields
+L1b Move sum/Option/Result payload completion
+L2  borrowed parameters + interface-visible return provenance
+L3  package-defined opaque Move resources + dependent resource_ref views
+L4  named arena region capability + clone_in
+L5  deterministic static source inputs + static Query artifacts
+L6  region-backed RegionPlain array_builder
+ D0 native SQLite/libpq feasibility probes
+ D1 generated Query plan over a fake driver
+ D2 minimal SQLite Query vertical
+ D3 SQLite checked metadata
+ D4 minimal PostgreSQL Query vertical
+ D5 PostgreSQL checked metadata
+ D6 prepared statements
+ D7 transactions/common execution view
+ D8 typed streaming rows
+ D9 scoped options/cancellation
+D10 one-pass compound Output
+D11 SQL migrations
+D12 category metadata + EXPLAIN
+D13 batch/SoA/high-value native paths
+D14 dynamic SQL + proved callback surfaces
+```
+
+L1a–L6 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
+they are being built, but no probe API becomes public. D1 must prove source/artifact/binder/
+decoder/separate-compilation behavior without a database. D2 and D4 deliberately remain scalar
+verticals; their purpose is to connect the final Query-centered API to each native library without
+inventing a temporary dynamic API. D10 is part of the initial database release rather than a
+future relationship feature.
+
+D11–D14 are committed additive database work, not an unspecified deferral. They must not delay the
+two driver verticals or weaken the Query/compound-output contract. Normal builds remain offline at
+every stage; only the explicit `alignc db prepare` tool action may contact a database.
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).
 
 ```text
-error type design          → finalized in M2
-ownership syntax           → finalized in M3
-arena API (explicit allocator) → finalized in M3
-minimal generics system    → finalized before starting M4 (array operations require generics)
-out params + noalias       → right after Memory Model v2 (extends EscapeCheck/MoveCheck)
-arena checkpoint/rollback  → std arena API, after Memory Model v2
-SoA layout + align(N)      → finalized in M6 (keep array lowering layout-parametric before then)
-string SSO                 → settled: NOT adopted (open-questions Settled)
-panic / unwinding          → settled: no unwind, plain-call CFG (open-questions Settled)
-purity inference           → finalized in M7 (integral with par_map checking)
-presence of SIMD intrinsics → finalized in M6
-reflection                 → out of v1 scope
-FFI                        → out of v1 *language* core; design before std.compress / pkg DB
-                             drivers (they wrap C engines via FFI). Reconsider after M8.
-backend/runtime perf       → deferrable backlog (VLA/SVE, nontemporal, fast-math, LTO,
-                             -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
-                             io_uring) — open-questions Future "Hardware & backend optimization
-                             backlog". No front-end change; add after the core + std.
+error type design             → settled and shipped in M2
+ownership syntax              → settled and shipped in M3
+named arena destination       → settled for L4; not an allocator trait
+minimal generics system       → settled and shipped before M4; remains closed
+recursive tagged Move payloads → settled; mandatory L1a/L1b
+borrowed parameters           → settled; mandatory L2
+opaque native resources       → settled; mandatory L3
+out params + noalias          → settled existing mechanism; shared with L2 alias checks
+arena checkpoint/rollback     → rejected after measurement; scoped arenas remain
+SoA layout + align(N)         → settled in M6; later DB batch path reuses it
+string SSO                    → settled: NOT adopted
+panic / unwinding             → settled: no unwind, plain-call CFG
+purity inference              → settled and shipped; D10 shapers require Pure callbacks
+presence of SIMD intrinsics   → settled in M6
+reflection                    → not used by Query bind/decode; out of v1 scope
+FFI                           → v1 shipped; L3 supplies its general persistent-resource boundary
+static source inputs          → settled narrow constructor registration; mandatory L5
+region plain-struct builder   → settled; mandatory L6
+backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-math, LTO,
+                                -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
+                                io_uring); no DB-specific frontend shortcut
 ```
 
 ## Out of v1 Scope (intentional)
 
-As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, incremental compilation, and self-hosting are outside v1. However, keeping MIR backend-agnostic does not obstruct future additions (`00-overview.md`).
+As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, whole-frontend
+incremental compilation, and self-hosting are outside v1. The shipped per-unit interface/object
+cache still gives separate-compilation invalidation; L5 extends that existing identity to static
+Query inputs and artifacts without promising a new incremental frontend. Keeping MIR
+backend-agnostic does not obstruct future additions (`00-overview.md`).

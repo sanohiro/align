@@ -34,6 +34,9 @@ Ty =
   Option(Ty)
   Result(Ty, Ty)
   Named(DefId, [Ty])        // struct / sum type. Generic actual arguments
+  Resource(DefId, [Ty])     // opaque package-defined Move owner
+  ResourceRef(DefId, [Ty])  // Copy view of one resource owner generation
+  RegionCap                 // scope-bound `region` allocation capability
   Tuple(TupleId)            // anonymous product `(T, U, ...)`; interned by element list
   Fn([Ty], Ty, Effect)     // lambda / function value
   Var(id)                   // inference variable (during inference only)
@@ -43,16 +46,23 @@ Ty =
 
 `Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements: primitive scalars (Copy / `Static`), `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, the struct-with-`str`-field rule), and owned `string`/`array<T>` (which make the tuple **Move**). An owned tuple is restricted to a **temporary** — returned or destructured, not bound to a variable or passed as a parameter — so it never occupies a drop slot; building `(a, b)` from owned locals nulls those source slots (move-out), and the destructure targets are ordinary owned locals freed by the normal drop set. `partition`/`chunks` and their tuple/view machinery have shipped; lifting the owned-tuple binding/parameter cut remains an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 
-### Region (lifetime tag)
-Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.
+### Region and owner-generation provenance
+
+View-bearing values (`Slice`, `Str`, recursively view-bearing aggregates, and `ResourceRef`) carry
+inferred provenance. Users never write a lifetime. It appears only in diagnostics and exported
+function summaries.
 
 ```text
 Region =
   Static        // string literal / const pool
-  Heap          // from explicit heap
-  Value         // inside an owned value (shares the value's lifetime)
+  Frame(root)   // view into a caller/local owner generation
   Arena(id)     // from a specific arena block
 ```
+
+An owner-root/generation fact is tracked alongside the region for views obtained from mutable
+storage or a resource. Ending that generation invalidates the view even when its lexical region
+would otherwise continue. A checked imported call receives the same fact through
+`ReturnBorrowSummary`; no producer body is required.
 
 ---
 
@@ -189,16 +199,36 @@ Copy (value, safe to bit-copy)
   Vec / Mask / Bitset
   structs whose fields are all Copy
   Slice (copying the view; the pointed-to data is not copied. Region constraints handled separately)
+  ResourceRef (copying the view; owner generation constraints handled separately)
+  RegionCap (copying the scope capability; escape/storage restrictions handled separately)
 
 Move (owning, linear)
   Array / String / Buffer / Builder
   Heap box
+  Resource
   structs containing a Move type
 ```
 
 Copy/Move is field-derived, not controlled by an ABI-size threshold. A large all-Copy struct remains
 Copy; passing it by value may be diagnosed as a performance lint without changing ownership
 semantics (`draft.md` §6.2).
+
+`Option`, `Result`, structs, and user sums share one recursive `DropPlan` derived after nominal type
+resolution and generic monomorphization:
+
+```text
+DropPlan =
+  None
+  Leaf(kind)
+  Struct(fields with non-None plans)
+  Tagged(tag offset, variant payload plans)
+```
+
+A composite is Move iff its plan is not `None`. `Tagged` covers `Option`, `Result`, and user sums;
+only the active payload is dropped. The same plan drives move/null-source and drop-old
+classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
+plans are rejected with the existing recursive-type diagnostic. Collection element eligibility is
+separate and does not follow merely from having a Drop plan.
 
 ### Checking
 Flow analysis over the CFG. When a Move-type value is consumed (assigned as a value / passed as a value argument / returned by value), the original binding becomes dead. Using a dead binding is a **compile error**.
@@ -210,6 +240,48 @@ print(data);          // error: data has already been moved
 ```
 
 Copying is explicit via `clone()`. This constraint does not apply to `Copy` types.
+
+### Borrowed parameters
+
+Each named-function parameter has one mode:
+
+```text
+ByValue     existing rule; a Move argument is consumed
+Out         writable non-alias slice destination
+Borrow      shared access; caller retains ownership
+BorrowMut   exclusive access; caller retains ownership and the old generation ends
+```
+
+For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned view may be tied
+to that parameter's caller-side root and generation. For `BorrowMut`, the call site must provide a
+writable bound place, no overlapping borrow may be passed in the same call, and the owner's
+previous generation becomes dead before the call. Returned views belong to the new generation.
+An unbound Move temporary is rejected for either borrow mode.
+
+Checked HIR infers `ReturnBorrowSummary::Params(indices)` by recursively walking every possible
+view in the return value. The exported signature carries the parameter modes and summary. Whole-
+program and interface-only checking must produce identical borrow roots and diagnostics. This is
+the same `BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second
+reference type or a package-name table.
+
+### Opaque resources
+
+A `Resource(DefId, args)` is always Move and owns one non-null native handle. Its declaration
+provides the Drop hook; module checking restricts representation intrinsics to the declaring
+package's `internal` subtree. `ResourceRef` is Copy but inherits the precise owner generation and
+is invalid after move, replacement, Drop, or `BorrowMut`.
+
+A resource created from `from_raw_borrowed` also carries the parent `ResourceRef` provenance.
+The child is still an owner, but it recursively tracks a borrow: moving the child transfers that
+fact, dropping it releases the fact, and any attempted parent invalidation while the child lives is
+rejected. A view built by `resource.view_from_raw` carries the supplied resource root/generation
+through its `Option` and any later aggregate wrapper.
+
+Resources and resource references fail the task-capture/Send check. A resource may occur in a
+one-owner Move aggregate and uses the existing recursive Drop and path-local cleanup flag.
+Resources are excluded from Copy arrays, pipeline elements, region builders, equality, printing,
+and safe FFI signatures. The exhaustive type-class checks are structural; they must not inspect
+resource names.
 
 ### out arguments and no-alias
 `out dst: slice<T>` means "`dst` is a region distinct from the other inputs". Recorded on the HIR as both a check (that `dst` does not alias other arguments at the call site) and optimization info (no-alias), then passed to MIR/codegen (`draft.md` §7).
@@ -225,7 +297,10 @@ Copying is explicit via `clone()`. This constraint does not apply to `Copy` type
 > `array<Struct>`/`builder`) are freed by per-binding MIR `Drop` outside an arena and bulk-freed
 > inside one. The authoritative model + per-slice ledger is `08-memory-model-v2.md`.
 
-`arena {}` introduces an `Arena(id)` region into the block. Views derived from allocations inside the block bear this region.
+`arena {}` introduces an `Arena(id)` region into the block. `arena out {}` introduces the same
+region and additionally binds `out: region`. Passing that capability to an ordinary function
+substitutes the exact caller arena for the callee's region parameter; allocations through it and
+returned owned values receive `Arena(id)`.
 
 **Escape rule**: a value bearing `Arena(id)` must not outlive its arena block. Concretely, the following are made **compile errors**.
 
@@ -246,10 +321,15 @@ arena {
 }
 ```
 
-Region propagation is inferred by flow analysis; users write nothing. Only on violation does the
-error message surface a region (for example, "this view is bound to an arena block"). Nested arenas
-use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`; named/explicit allocator syntax is a
-separate possible language extension, not an unsettled part of this checker.
+Region propagation is inferred by flow analysis; users write no lifetime. Only on violation does
+the error message surface a region (for example, "this view is bound to an arena block"). Nested
+arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
+
+A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
+binding outside the arena, captured by a task, or passed to FFI. An interface signature with a
+`region` parameter carries `ReturnRegionSummary::Params(indices)`, allowing an imported caller to
+tie returned owned data to the selected arena. `clone_in(out)` is the explicit copy from a
+shorter-lived view into that region; the checker never inserts it.
 
 ---
 
@@ -263,6 +343,7 @@ exact guarded source order (`draft.md` §8).
 Effect = Pure | Impure(reason)
 A function/lambda has its effect inferred from its body:
   modifying an outer mut binding   → Impure
+  modifying storage rooted only in a `borrow mut` parameter → Pure (explicit exclusive input)
   writing through a `slice`/`soa` view (including `map_into` and `vec.store`) → Impure
   calling a side-effecting std fn (I/O etc.)  → Impure
   if none of the above             → Pure
@@ -346,7 +427,12 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - .field fixed to either FieldAccess or Project(field)
 - field selectors made into concretized closures
 - Region of view types
+- owner-root/generation provenance for every recursively view-bearing value
 - marking of move points (consume positions) and dead bindings
+- `ByValue`/`Out`/`Borrow`/`BorrowMut` on parameters and calls
+- resource declaration identity, Drop hook, and path-local cleanup ownership
+- canonical recursive `DropPlan` for struct/sum/Option/Result ownership
+- `ReturnBorrowSummary` and `ReturnRegionSummary`
 - the no-alias flag of out arguments
 - the Effect of each function/closure
 ```
@@ -364,14 +450,17 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 
 ---
 
-## 12. Remaining refinements
+## 12. Required next refinements
 
 ```text
 - lint for the numeric default type (when i64 is excessive in large arrays)
-- precise per-function return-borrow summaries, so a call result is tied only to the argument
-  it actually borrows rather than to a conservative aggregate region
+- implement borrowed parameter modes and precise return summaries
+- implement package-defined resources/resource references
+- implement named region parameters and destination substitution
+- implement recursive tagged Move payloads
 ```
 
 Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is
 field-derived; nested arena ordering is implemented; and minimal generics monomorphize before MIR.
-Those are settled rules, not open design questions.
+The library-boundary entries above are settled prerequisites, not open design questions; their
+implementation sequence is `17-library-boundary-prerequisites.md` L1a–L4.

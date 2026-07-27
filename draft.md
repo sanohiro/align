@@ -751,6 +751,27 @@ while the mapper expression is evaluated, and includes mapper-capture borrows in
 A Move value leaving a value-carrying scope such as `task_group` transfers the trailing local's
 ownership bit and clears that inner source before the outer return or call takes ownership.
 
+A function may explicitly borrow a value instead of taking ownership:
+
+```align
+fn inspect(borrow c: Conn) -> i64
+fn advance(borrow mut rows: Rows) -> Option<Row>
+```
+
+The borrow modes apply to Move types; Copy values already pass without consuming ownership.
+`borrow` leaves a Move argument owned by the caller. The callee cannot move, replace, or drop it; a
+view returned from the call is inferred to borrow the exact caller-side owner generation.
+`borrow mut` also leaves ownership with the caller, but has exclusive access for the call and ends
+the owner's previous storage generation. Older views become invalid; a returned view belongs to the
+fresh generation. Borrow modes are part of the function interface, while lifetime roots remain
+inferred — there are no written lifetime parameters. Passing the same owner through overlapping
+`borrow mut`, `borrow`, or `out` arguments is rejected.
+
+Mutation whose root is an explicit `borrow mut` parameter remains Pure if the function performs no
+other Impure operation. It is an exclusive input effect, like mutating an owned local/builder, not
+mutation of hidden captured state. Alias checking makes the root unique at the call. Unsafe, FFI,
+I/O, and database work remain Impure regardless of parameter mode.
+
 One aggregate value uses one path-local cleanup bit. Its owned members must therefore use one
 allocation mode: all free-standing or all arena-owned. Mixing the two in one tuple, struct, sum
 value, or owned array is a compile error; keep them separate or construct every owned member in the
@@ -758,6 +779,15 @@ same mode. Replacing an owned field or element must preserve the aggregate's mod
 do not affect this rule. A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
 but its owned fields or elements cannot be mutated until the mode is definite. Direct Move-struct
 and fixed-array bindings retain every completed field owner until initialization succeeds.
+
+Tagged values use the same ownership rule recursively. `Option<T>`, `Result<T,E>`, and user sum
+variants may carry any finite, non-recursive type whose Drop plan is known. The enclosing value is
+Move when any possible live payload is Move. Drop tests the active tag and drops only that payload;
+construction moves the payload and clears its source; `match`, `else`, and `?` move a selected
+payload out and clear the container. An `Ok` success path does not allocate merely because its
+error type owns strings. This supports structured owned errors and
+`Result<Option<MoveOutput>, MoveError>` without a second error model. It does not imply arbitrary
+arrays of Move elements; collection element layout/drop remains a separate explicit capability.
 
 ### 6.4 Arena
 
@@ -772,6 +802,24 @@ arena {
 Allocations inside an arena are freed all at once when the block ends.
 
 A view inside an arena cannot escape the arena.
+
+An arena may bind its allocation capability when ordinary functions need to construct into that
+exact region:
+
+```align
+fn collect(input: slice<User>, out: region) -> array<User>
+
+arena out {
+  value := collect(input, out)
+  use(value)
+}
+```
+
+`region` is a Copy, non-owning, scope-bound capability created only by `arena name {}`. It cannot be
+returned, stored in an aggregate, sent to a task, or passed through FFI. A value allocated through it
+has that exact inferred arena region and cannot outlive the lexical arena block. Anonymous
+`arena {}` and named `arena out {}` are the same ownership mechanism; the latter only makes the
+allocation destination passable. There is no allocator trait or ambient caller-arena lookup.
 
 ### 6.5 Heap
 
@@ -1669,6 +1717,34 @@ A block names one library; several blocks may share or differ, and a repeated na
 is the mechanism the library-wrapper strategy rides on — `std`/`pkg` own thin Align wrappers and
 `link(...)` the mature C engines rather than reimplementing them.
 
+### Opaque native resources
+
+A package may turn a persistent non-null native pointer into an opaque Move resource with a
+type-owned Drop hook:
+
+```align
+pub resource conn = internal.drop_conn
+pub resource stmt<P, R> = internal.drop_stmt
+```
+
+The hook is an internal `unsafe fn(raw) -> ()`. A resource is one opaque pointer, always Move, and
+calls the hook exactly once on ordinary cleanup. Only the declaring module/internal subtree may use
+`resource.from_raw`, `resource.from_raw_borrowed`, `resource.view_from_raw`, `resource.raw`, and
+`resource.into_raw`; `unsafe` does not bypass visibility.
+`resource.borrow(r)` returns a Copy `resource_ref<R>` tied to the owner's inferred generation.
+Owner move/Drop or a `borrow mut` call invalidates it. Resources and references are non-Send by
+default. This is the one mechanism used by native `std` handles and FFI-backed `pkg` libraries; safe
+APIs never expose `raw` or manual destroy.
+
+`resource.from_raw_borrowed(ptr, parent_ref)` creates an owned child resource tied to one parent
+resource generation; the compiler keeps the parent alive until the child drops.
+`resource.view_from_raw(owner_ref, ptr, len)` is the native zero-copy view constructor: inside
+`unsafe`, and only in the resource's declaring/internal code, it returns an expected `Option<str>`
+or `Option<slice<FFIScalar>>` tied to that owner generation. `None` reports a negative or
+unrepresentable length, a non-empty null pointer, misalignment, or invalid UTF-8 for `str`; an empty
+null pointer is a valid empty view. Foreign range validity remains the unsafe wrapper's proof
+obligation. There is no owner-free safe conversion from `raw` to a view.
+
 ### `layout(C)` — a C-compatible struct layout
 
 A struct's memory layout is normally the compiler's own business — a non-`layout(C)` struct has an
@@ -1832,8 +1908,10 @@ returning, and `match`ing it, an exported sum type is fully usable across module
 A **package** is a *distribution-layer* unit — the module subtree a tool (or a human) vendors under
 `pkg/` — and the compiler never learns what one is: resolution, visibility, effects, escape, and
 capabilities all carry over unchanged from the module system above. The package graph, like the
-unit graph, is discovered from `import`s + the filesystem, so a build is hermetic on the source tree
-alone (no manifest, no search paths, no registry lookup at compile time). A package is its root
+unit graph, is discovered from `import`s + the filesystem, so a build is hermetic on reachable source
+inputs (no manifest, no search paths, no registry lookup at compile time). Besides `.align` units, a
+compiler-known static constructor may register an exact file as a content-hashed source input; it
+cannot scan, execute code, read environment state, or access the network. A package is its root
 module file `pkg/<name>.align` plus, optionally, its submodule tree `pkg/<name>/…`; a package's own
 sibling imports are written absolute (`import pkg.web.internal.util`), the same path a consumer
 writes, so vendoring is literally copying the subtree into `pkg/` — there is no develop-layout vs
@@ -1961,6 +2039,7 @@ Has a SIMD fast path in the standard implementation.
 
 ```text
 array_builder<T>()      // open an empty growable typed builder
+array_builder<T>(out)   // grow in the explicitly supplied region
 b.push(v)               // append one element (mut receiver)
 b.append(xs: slice<T>)  // bulk-append Copy-scalar elements (mut receiver)
 b.build() -> array<T>   // freeze into an owned array<T> (consumes the builder)
@@ -1999,12 +2078,20 @@ a live element/slice borrow would dangle across a `push`. The builder confines
 growth to a phase with no outstanding borrows, then freezes to the immutable,
 borrowable `array<T>`.
 
-Element set v1 = **Copy scalars** (int/float/bool/char) **+ `string`**. A `string`
+The individually owned heap form accepts **Copy scalars** (int/float/bool/char) **+ `string`**. A
+`string`
 element is **moved** into the builder by `push` (its source is nulled; the builder's
 `Drop` deep-frees any pushed-but-not-frozen strings), so `append` — which bulk-copies
 a borrowed `slice<T>` — is offered only for Copy-scalar elements. Owned collections,
-`str` views, structs, and other Move handles as the element type are rejected at the
-type argument (the settled v1 boundary).
+`str` views, structs, and other Move handles as the element type are rejected for this
+heap form.
+
+The region form is the required generalization for ordinary libraries. `out: region` comes from
+`arena out {}`. It accepts recursively plain scalars, options, fixed arrays, structs, and
+region-valid `str`/bytes views; resources, raw values, functions, and independently owned fields are
+rejected. It grows in arena chunks with no hidden heap allocation, then `build()` performs one
+documented compacting pass into the exact contiguous arena result. A short-lived view must be copied
+first with `clone_in(out)`. The heap form above retains zero-copy freeze.
 
 ### core.json
 

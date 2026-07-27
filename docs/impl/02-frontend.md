@@ -39,7 +39,7 @@ ident   = (letter | "_") (letter | digit | "_")*
 
 ### Keywords (reserved words)
 ```text
-fn  mut  return  if  else  match  arena  unsafe
+fn  mut  borrow  return  if  else  match  arena  unsafe  resource
 module  import  pub
 true  false
 ```
@@ -132,7 +132,7 @@ import_decl = "import" path END
 path        = ident ("." ident)*
 END         = newline-inserted ";" | explicit ";"   // lexer-generated (operators & symbols §)
 
-item        = vis? ( fn_decl | type_decl | const_decl )
+item        = vis? ( fn_decl | type_decl | resource_decl | const_decl )
 vis         = "pub"
 ```
 
@@ -147,7 +147,8 @@ vis         = "pub"
 ```ebnf
 fn_decl   = "fn" ident generics? "(" params? ")" ret? fn_body
 params    = param ("," param)* ","?
-param     = "out"? ident ":" type
+param     = param_mode? ident ":" type
+param_mode= "out" | "borrow" | "borrow" "mut"
 ret       = "->" type
 fn_body   = block | "=" expr END          // single expression uses the = expr form (the only form)
 generics  = "<" generic_param ("," generic_param)* ">"
@@ -162,7 +163,14 @@ fn classify(u: User) -> str {
 }
 
 fn fill(out dst: slice<f32>, v: f32) { dst = v }
+fn inspect(borrow c: Conn) -> i64 = native_id(c)
+fn advance(borrow mut rows: Rows) -> Option<Row> = internal_next(rows)
 ```
+
+`out`, `borrow`, and `borrow mut` are mutually exclusive parameter modes. They are preserved in
+the AST and exported function signature; a call has no mode marker. `borrow mut` is parsed as one
+mode, not as a mutable local declaration. The checking and return-provenance rules are in
+`03-types.md` and `17-library-boundary-prerequisites.md` §2.
 
 ### Type declarations (keyword-less)
 
@@ -199,6 +207,23 @@ Shape {
 
 `// OPEN:` whether to allow named fields in a variant (`Rect { w: f32, h: f32 }`). If allowed, extend the variant body to also accept struct_body.
 
+### Opaque resource declarations
+
+```ebnf
+resource_decl = "resource" ident generics? "=" path END
+```
+
+```align
+pub resource conn = internal.drop_conn
+pub resource stmt<P, R> = internal.drop_stmt
+```
+
+This is an opaque nominal Move type declaration, not a third data-type body syntax. The right-hand
+path is the exactly-once Drop hook and must name an allowed function in the declaring package's
+`internal` subtree. Resource representation operations are compiler intrinsics restricted by
+module visibility and `unsafe`; they are not parsed as special resource syntax. Full type and
+lowering rules are in `17-library-boundary-prerequisites.md` §3.
+
 ### Global constants
 
 ```ebnf
@@ -212,6 +237,24 @@ A top-level `:=` is a compile-time constant (immutable). `mut` is not allowed. O
 **Aggregate (array) constants (S1, 2026-07-17).** An initializer may be an array literal. `ConstEval::array` folds each element with the same evaluation as a scalar (element type inferred from the elements, or pushed down from a `slice<T>` annotation), yielding `ConstVal::Array(elems, elem)`. Unlike a scalar constant this *does* reach the backend: `const_literal` substitutes it as `hir::ExprKind::ConstArray { elems, elem, len }` typed **`slice<elem>` / `Region::Static`** (not a synthesized `ArrayLit` — that would reproduce the §8.4 alloca+stores), lowered to `mir::Rvalue::ConstArray` and then to a `[N x T]` (or `[N x {ptr,len}]` for `str`) `private unnamed_addr constant` global with a static `{ptr,len}` view. A **constant index folds to the element** in sema (`check_index`, no load); a dynamic index / `.len()` / pipeline flows through the existing borrowed-slice paths. The type gate accepts only a `slice<T>` annotation of a scalar / `str` element (an `array<T>` annotation, or a `slice<Struct>`, is rejected); struct constants / elements and non-scalar element positions (calls, `as`, nested arrays, aggregate-const refs) stay deferred. The new `ExprKind::ConstArray` / `Rvalue::ConstArray` are wired through every exhaustive HIR/MIR analysis arm (effect scan, `region_of`, escape/`slice_is_local`, `MoveCheck`, `finalize_expr`, `print`) as an inert, Copy, `Static` leaf.
 
 Two soundness checks ride the read-only nature of the rodata view. (1) **Read-only enforcement:** a constant view (or a string literal's `.bytes()`) may not be written through — `TABLE[i] = v` or an `out slice<T>` argument would store into the `constant` global. A `readonly_locals` provenance set on the `Checker` is grown at each binding / slice reassignment whose initializer is a read-only view (`hir_is_readonly_view`, insert-only so a value read-only on any reaching path stays flagged) and checked at `check_place` (element assignment) and the `out`-argument site. (2) **Producer-side `pub`-constant surface (Pass 0d-2):** a `pub` constant's initializer may reference only `pub` constants — its value ships in the interface summary and is re-folded in importing units, so a private reference would type-check whole-program yet fail per-unit; the check (mirroring the generic `pub`-fn body rule) makes both build paths reach the same verdict.
+
+### Registered static source inputs
+
+A compiler-known static constructor remains an ordinary `Call` in the AST. After import/name
+resolution proves the callee is the recognized constructor, the producer unit records a
+`StaticInputRef` containing the constructor kind, literal argument or same-basename mode, defining
+source file, and call span. A local named `db`, an unimported path, or a user function with the same
+spelling does not register an input.
+
+On a cold source/import identity, the driver runs import/name resolution first, resolves only those
+proven `StaticInputRef` paths under the project/package root, reads exact UTF-8 bytes, and adds their
+logical paths and hashes to the producer identity. Successful resolution may persist a versioned
+`StaticInputManifest` keyed by that exact source/import-resolution digest. Only a matching manifest
+may supply the paths before a later frontend-cache lookup; a source/import/schema mismatch discards
+it and resolves again. Thus no lexical candidate can cause a false file read or cache hit. The
+compiler does not scan sibling files. SQL diagnostics use the registered `SourceMap` file ID and
+byte spans. The artifact/cache split is specified in
+`17-library-boundary-prerequisites.md` §§5–6.
 
 ---
 
@@ -394,7 +437,7 @@ Distinguished from named functions (`fn ident (`) by "name + presence/absence of
 
 ### arena / unsafe (expressions)
 ```ebnf
-arena_expr  = "arena" block
+arena_expr  = "arena" ident? block
 unsafe_expr = "unsafe" block
 ```
 ```align
@@ -403,7 +446,15 @@ arena {
   users: array<User> := json.decode(data)?
   process(users)?
 }
+
+arena out {
+  result := build(input, out)?
+  use(result)
+}
 ```
+
+The optional identifier binds a scope-limited value of builtin type `region`. It is not a user
+allocator object and is not part of the result of the arena expression.
 
 ### String prefixes (template / html / json / raw)
 ```ebnf
@@ -467,6 +518,7 @@ struct File { module: Option<Path>, imports: Vec<Path>, items: Vec<Item> }
 enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
+    Resource(ResourceDecl),
     Const(ConstDecl),
 }
 
@@ -479,12 +531,19 @@ struct FnDecl {
     body: FnBody,            // Block | ExprEq
     span: Span,
 }
-struct Param { is_out: bool, name: Ident, ty: Type }
+enum ParamMode { ByValue, Out, Borrow, BorrowMut }
+struct Param { mode: ParamMode, name: Ident, ty: Type }
 
 struct TypeDecl { vis: Vis, name: Ident, generics: Vec<GenericParam>, kind: TypeKind }
 enum TypeKind { Struct(Vec<Field>), Sum(Vec<Variant>) }
 struct Field { name: Ident, ty: Type }
 struct Variant { name: Ident, payload: Vec<Type> }
+struct ResourceDecl {
+    vis: Vis,
+    name: Ident,
+    generics: Vec<GenericParam>,
+    drop_hook: Path,
+}
 
 enum Stmt {
     Let { is_mut: bool, name: Ident, ty: Option<Type>, init: Expr },
@@ -511,7 +570,7 @@ enum Expr {
     Else { lhs: Box<Expr>, rhs: ElseBody },     // unwrap-or-else
     Block(Block),
     Loop(Block),
-    Arena(Block),
+    Arena { binding: Option<Ident>, body: Block },
     Unsafe(Block),
     TaskGroup(Block),
     Lambda { params: Vec<Ident>, body: Block },
@@ -543,6 +602,8 @@ forms; `Stmt` includes `break`. Generic actual arguments at expression position 
   and recursive/nested patterns are not part of the current surface.
 - There are no expression-position generic arguments (no turbofish); context/annotations infer them.
 - Lambda parameter types are inferred at a typed use site and written when a lambda is a value.
+- Named-function parameters preserve `ByValue`/`Out`/`Borrow`/`BorrowMut` in interfaces.
+- Resource declarations are nominal opaque owners; they do not reuse the struct/sum disambiguation.
 - Plain `template` holes contain full expressions. html/raw/JSON-template variants remain deferred.
 - `///` collection for generated API documentation remains future tooling work.
 ```

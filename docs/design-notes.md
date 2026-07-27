@@ -245,6 +245,38 @@ hardware-aligned choice: predictable allocation beats convenience, and an in-are
 bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
 reason exceptions and GC were — it hides cost.)
 
+**Native state belongs behind one package-defined resource boundary.** A database connection,
+compiled regular expression, socket, process, and compression context are the same language
+problem: a native owner is Move, its safe operations borrow it, and its destructor must run
+exactly once. Encoding each one as a new compiler-known type makes `std` privileged forever and
+prevents ordinary `pkg` code from providing equally safe wrappers; exposing `raw` plus `close`
+instead makes the safety invariant a caller convention. The common answer is a
+package-defined opaque `resource` whose representation and Drop hook are accessible only to the
+declaring package's `internal` unsafe code. Shared `borrow` and invalidating `borrow mut`
+parameters preserve caller ownership, while inferred owner generations prevent a returned view
+from surviving replacement, mutation, or Drop. This generalizes the existing Move/Drop and
+borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
+ownership model.
+
+**Structured owned errors complete the existing tagged-value model.** A native library error
+needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
+compound operation may return a Move output through the same `Result`. Replacing that with numeric
+codes, empty-string sentinels, or an opaque boxed error would create a second weaker error model.
+The proper completion is recursive tagged Move payloads: `Option`, `Result`, and user sums derive
+the same Drop plan as structs, drop only the active payload, and move/null it through `match`,
+`else`, and `?`. The success path allocates nothing for an unused Move error. This is a general
+language completeness fix with the database as consumer, not database error magic.
+
+**A named `region` is a destination capability, not an allocator abstraction.** Compound
+database reads and streaming decoders need ordinary library functions to construct caller-owned
+arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only
+the existing arena's allocation destination as a scope-limited capability. Passing `out:
+region` neither transfers the arena nor makes allocation implicit: the destination remains
+visible at the call site and the result remains bounded by the same inferred region lattice.
+There is no allocator trait, lifetime parameter, cross-arena sharing, or automatic copy. An
+explicit `clone_in(out)` marks the unavoidable transition from a short-lived input view to
+owned output.
+
 **An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
 A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would
 contradict the model: ownership is decided by the *type*, and a compile-time table owns nothing. It is

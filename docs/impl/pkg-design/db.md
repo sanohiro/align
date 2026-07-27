@@ -11,14 +11,15 @@ ordinary vendorable `pkg` subtrees.
 
 ## Status
 
-**DESIGN PROPOSAL — query-centric SQL/database package.**
+**DESIGN OF RECORD — query-centric SQL/database package.**
 
 Initial required drivers: **SQLite and PostgreSQL**.
 
-The semantic decisions in this document are the proposed contract. Exact API spellings remain
-provisional where the current parser, ownership model, FFI surface, or package conventions require a
-small adjustment. Such an adjustment must preserve the visible SQL, execution-count, ownership, and
-native-extension guarantees below.
+The semantic decisions and API shapes in this document are the contract. Implementation begins only
+after the general library-boundary prerequisites in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) ship. Those
+features are required Align language/compiler work, not database-private builtins and not optional
+future cleanup.
 
 Normative words (`MUST`, `MUST NOT`, `SHOULD`, `MAY`) are intentional requirements.
 
@@ -52,7 +53,7 @@ The database layer is intentionally thin:
 - Common mechanisms share one API when only common behavior and types are used.
 - Database-specific connection, Query, prepare, execution, transaction, metadata, and plan controls
   remain available and visible.
-- A normal `align build` is offline and never contacts a database.
+- A normal `alignc build` is offline and never contacts a database.
 - Optional database-generated Query metadata strengthens checking and may be mandatory in CI.
 - Plain Align structs may be reused, but there is no database-level `Model` or `Entity` concept.
 - JOINs, CTEs, grouping, window functions, native operators, and database-specific optimization stay
@@ -181,8 +182,8 @@ PostgreSQL. Code using a PostgreSQL or SQLite feature is deliberately pinned to 
 
 ### 2.6 Offline normal builds
 
-`align build`, `alignc build`, and ordinary module checking MUST NOT connect to a live database or the
-network.
+`alignc build`, `alignc check`, and ordinary module checking MUST NOT connect to a live database or
+the network.
 
 Authoritative database parsing/type resolution may run in an explicit preparation command and its
 result may be stored as checked metadata. The compiler need not reimplement PostgreSQL or SQLite SQL
@@ -220,7 +221,7 @@ semantics or hide acquisition/wait costs.
 
 ## 4. Package layout
 
-### 4.1 Initial packages
+### 4.1 Initial package and public modules
 
 ```text
 pkg.db
@@ -228,7 +229,14 @@ pkg.db.sqlite
 pkg.db.postgres
 ```
 
-Possible future packages:
+Under Align's settled package rule, these are **three public module boundaries in one vendorable
+`pkg/db` package subtree**, not three independently versioned packages. `pkg.db` is the root common
+module; `pkg.db.sqlite` and `pkg.db.postgres` are driver submodules. This preserves the requested
+qualified API names while respecting one package version per build and the acyclic import graph.
+The root/internal layer never imports a public driver module; driver modules call downward into the
+common/internal layer.
+
+Possible future public submodules or separately named package roots:
 
 ```text
 pkg.db.pool
@@ -237,13 +245,31 @@ pkg.db.mysql
 pkg.db.duckdb
 ```
 
-The common package owns the semantic contracts. Driver packages own connection construction, native
-types/options, authoritative prepare/describe integration, and driver metadata.
+The common module owns semantic contracts and closed internal resource dispatch. Driver submodules
+own public connection construction, native types/options, authoritative prepare/describe
+integration, and driver metadata. A future independently distributed third-party driver uses a
+distinct package root unless Align first settles an external driver-registration mechanism; v1 does
+not pretend `pkg.db.thirdparty` can be independently versioned.
 
-### 4.2 Minimal language impact
+### 4.2 Required general language foundation
 
-Version 1 SHOULD be implemented as first-party package modules with narrowly scoped compiler/runtime
-support. It SHOULD NOT require:
+Version 1 is implemented as first-party package modules over the general library-boundary foundation
+defined in [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md).
+The following must ship before a database driver:
+
+- recursive tagged Move payloads for structured owned errors and Move outputs through `Result`;
+- `borrow` and `borrow mut` function parameters with interface-visible return-borrow summaries;
+- package-defined opaque/dependent Move resources with exactly-once Drop, `resource_ref<R>`, and
+  owner-tied native views;
+- `arena name {}` and its scope-bound `region` capability;
+- deterministic compiler-registered static source inputs and Query artifacts;
+- region-backed `array_builder<PlainStruct>`.
+
+The same machinery is available to `std.http`, `std.net`, `std.process`, and other native libraries.
+`pkg.db` does not depend on `std.http`, and the compiler must not recognize database package names to
+implement ownership or borrow safety.
+
+The design does not require:
 
 - a `database` keyword;
 - annotations or decorators;
@@ -255,7 +281,7 @@ support. It SHOULD NOT require:
 - macros;
 - a second compile-time language.
 
-The compiler may recognize static Query constructors such as `db.query_file()` because they need the
+The compiler recognizes static Query constructors such as `db.query_file([])` because they need the
 expected `Params` and `Row` types, the current source path, a SQL-content hash, and build-dependency
 tracking. This is a narrow builtin-driven static-data feature, analogous to other compiler-known
 formats, not general metaprogramming.
@@ -279,22 +305,70 @@ db.value
 
 Required meaning:
 
-- `db.conn` is a Move handle owning one physical SQLite or PostgreSQL connection.
-- `db.tx` is a Move transaction handle tied to one connection. Dropping an active transaction performs
-  fail-safe rollback, never commit.
+- `db.conn` is an opaque Move resource owning one physical SQLite or PostgreSQL connection.
+- `db.tx` is an opaque Move resource that owns the connection moved into a transaction. Dropping an
+  active transaction performs fail-safe rollback and then closes the connection, never commit.
 - `db.exec` is a short-lived borrowed execution view produced from either a connection or a
   transaction. This lets a Query be reused inside and outside a transaction without a public trait.
 - `db.query<P, R>` is a Copy static descriptor containing SQL identity, parameter contract, row
   contract, driver restriction, SQL hash, and static options.
 - `db.command<P>` is the non-row descriptor. A statement with `RETURNING` is a Query.
-- `db.stmt<P, R>` is a prepared Move statement tied to the physical connection that prepared it.
-- `db.rows<R>` is a Move, one-pass typed row stream for exactly one execution.
+- `db.stmt<P, R>` is a prepared Move statement carrying an inferred dependency on the physical
+  connection that prepared it.
+- `db.rows<R>` is a Move, one-pass typed row stream for exactly one execution, carrying a dependency
+  on its statement/connection while native buffers need it.
 - `db.exec_result` contains affected-row and available command-status information.
 - `db.row` and `db.value` are explicit dynamic escape hatches.
 
-The exact spelling of `conn.exec()` / `tx.exec()` may change if package-defined methods are not
-available. The semantic requirement is one concrete borrowed execution type with two visible
-constructors, not a trait hierarchy or runtime interface boxing.
+The common package declares the resource types. `pkg.db.internal` owns a tagged native state and the
+FFI declarations/drop/operation dispatch for the two first-party drivers; public driver constructors
+call into that internal module. The root/common module therefore does not import its driver
+submodules and no module cycle is created. Adding a first-party driver deliberately extends this
+closed internal dispatch. There is no public driver trait, trait object, or driver-provided resource
+ABI.
+
+Execution views use the required borrowed-parameter surface:
+
+```align
+pub fn exec_conn(borrow c: db.conn) -> db.exec
+pub fn exec_tx(borrow t: db.tx) -> db.exec
+```
+
+`db.exec` is a Copy sum over `resource_ref<db.conn>` and `resource_ref<db.tx>`. Its provenance is
+therefore the source resource generation. Moving/dropping a connection, or committing/rolling back a
+transaction, invalidates every derived execution view.
+
+### 4.4 Implementation boundary
+
+After L1a–L6, the following are ordinary first-party Align package code:
+
+- public handles/descriptors/options/errors/metadata data shapes;
+- the closed common/SQLite/PostgreSQL module API;
+- safe wrappers around private `extern "C" link("sqlite3")` and `link("pq")` declarations;
+- connection/transaction/statement/rows lifecycle code using general resources;
+- driver-specific bind/step/result/metadata calls;
+- Query-local `run`, Pure shaping steps, builders, and output types;
+- migrations as SQL and their explicit package/tool orchestration.
+
+The compiler/frontend owns only work that cannot be expressed as runtime package code:
+
+- L1a–L6 language, ownership, region, interface, and MIR support;
+- recognized static Query/command constructors and exact input tracking;
+- descriptor/command type checking from expected `Params`/`Row`;
+- dialect-aware placeholder occurrence/source maps and statement screening;
+- versioned static artifacts and interface/implementation hashing;
+- generated direct field-offset binder and ordinal decoder thunks;
+- Query diagnostics mapped to `.sql` spans.
+
+`align_runtime` needs general helpers only: region-builder chunk/compact allocation, checked
+owner-tied native view construction/UTF-8 validation, and existing arena/allocation primitives. It
+MUST NOT contain SQLite/PostgreSQL Query semantics, SQL parsing, field reflection, or DB handle
+types. Basic driver calls go directly from package-generated code to libsqlite3/libpq.
+
+`align_driver` owns explicit tooling (`alignc db prepare`, later migrate/status/check), deterministic
+artifact I/O, and tool-only database/schema setup. The external SQLite/libpq libraries remain the
+authoritative SQL engines. This division keeps normal package behavior ordinary, confines unsafe
+native boundaries, and prevents either `std.http` or a database-specific compiler ownership path.
 
 ---
 
@@ -333,10 +407,10 @@ pub Row {
   group_name: Option<str>,
 }
 
-pub fn query() -> db.query<Params, Row> = db.query_file()
+pub fn query() -> db.query<Params, Row> = db.query_file([])
 ```
 
-The no-argument `query_file()` resolves the same-basename sibling SQL file:
+The path-free `query_file([])` resolves the same-basename sibling SQL file:
 
 ```text
 user_with_groups.align -> user_with_groups.sql
@@ -351,15 +425,17 @@ A Query may explicitly link another static SQL file:
 
 ```align
 pub fn query() -> db.query<Params, Row> =
-  db.query_file("legacy/user_lookup.sql")
+  db.query_file("legacy/user_lookup.sql", [])
 ```
 
 Rules:
 
 - the path is a compile-time string literal;
-- it is relative to the project/query root;
+- it is relative to the defining `.align` module's directory;
 - absolute paths are rejected;
-- escaping the project root is rejected;
+- lexical `..` or symlink escape outside the project/package root is rejected;
+- the file must be UTF-8 and is registered in `SourceMap`;
+- the exact SQL bytes are hashed and sent to the database without newline normalization;
 - the file content is a build input;
 - a changed file changes the Query hash and invalidates checked metadata.
 
@@ -371,7 +447,7 @@ Short SQL may be inline:
 
 ```align
 pub fn query() -> db.query<Params, User> =
-  db.query("SELECT id, name, email FROM users WHERE id = :id")
+  db.query("SELECT id, name, email FROM users WHERE id = :id", [])
 ```
 
 The expression must be static. A runtime `string` cannot become a typed Query.
@@ -379,7 +455,36 @@ The expression must be static. A runtime `string` cannot become a typed Query.
 Complex SQL SHOULD use a `.sql` file because it is easier to review, format, run in database tools,
 EXPLAIN, and diff as SQL.
 
-### 5.4 One descriptor, one statement
+### 5.4 Descriptor, artifact, and incremental identity
+
+`db.query<P, R>` is the compiler-known Copy descriptor specified in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md). The Query module
+owns:
+
+```text
+public interface
+  descriptor item name
+  Params and Row types
+  driver restriction
+  static semantic options
+
+producer implementation / StaticQueryArtifact
+  SQL logical path and exact bytes/hash
+  parameter occurrence/source-span table
+  checked-metadata policy/digest
+  generated bind and decode thunks
+```
+
+The Query ID is the fully-qualified module path plus descriptor function name, never an absolute
+filesystem path. A SQL-only edit recompiles/relinks the producer and invalidates checked metadata,
+but it does not recompile consumers when `Params`, `Row`, driver restriction, and static semantic
+options are unchanged. A public-contract change updates `interface_hash` and invalidates consumers.
+
+The runtime descriptor points to immutable producer-owned static data and generated binder/decoder
+thunks. `P` and `R` are compile-time contracts; there is no runtime reflection, per-row field-name
+lookup, or consumer-side Query-body instantiation.
+
+### 5.5 One descriptor, one statement
 
 A static Query source contains exactly one executable application statement.
 
@@ -411,10 +516,10 @@ one named Query
 Migration files are a separate tool format and may contain multiple statements according to the
 migration runner’s documented rules.
 
-### 5.5 Params
+### 5.6 Params
 
-`Params` is a named struct. Every SQL value placeholder maps to exactly one field unless the driver’s
-native placeholder model explicitly allows positional reuse.
+`Params` is a named struct. Every distinct SQL value-placeholder name maps to exactly one field. The
+same name may occur more than once and always reuses that field.
 
 Portable SQL uses named parameters in source:
 
@@ -434,21 +539,28 @@ pub Params {
 
 The prepare step lowers named parameters to the driver protocol:
 
-- SQLite binds by the native named parameter;
-- PostgreSQL lowers deterministically to `$1`, `$2`, ... while retaining the source names in
-  diagnostics and metadata.
+- SQLite resolves and binds each native `:name`;
+- PostgreSQL assigns `$1`, `$2`, ... by first lexical occurrence and reuses the same ordinal for
+  later occurrences of the same name;
+- both retain original byte spans and names in diagnostics and metadata.
+
+The scanner is dialect-aware lexical analysis, not a regular expression and not a SQL resolver. It
+recognizes quoted strings/identifiers, line/block comments, PostgreSQL dollar-quoted strings, and
+the PostgreSQL `::` cast token. Portable Query source accepts only `:identifier` placeholders outside
+those forms. Mixing `?`, `$1`, `@name`, or another native placeholder form into a portable Query is
+an error; a driver-pinned Query may define an explicit native mapping.
 
 The compiler/preparer reports:
 
 - missing fields;
 - unused fields;
-- duplicate or ambiguous placeholders;
+- mixed or ambiguous placeholder forms;
 - incompatible types;
 - a parameter requiring an explicit native type declaration.
 
 Values are always bound parameters. Value interpolation into SQL text is not a typed-Query feature.
 
-### 5.6 Row
+### 5.7 Row
 
 `Row` is the exact, flat result-column contract.
 
@@ -485,10 +597,18 @@ Rules:
 - casts are explicit in SQL when the database result type is ambiguous;
 - decoding is generated/statically described, not reflection-based.
 
+The generated decoder writes directly to known `Row` field offsets. At prepare/execution setup, the
+driver builds one column-ordinal plan and checks count, names, and available native types. The hot
+row loop uses that plan and performs no name lookup.
+
+`Declared` does not prove database types or nullability. SQLite storage classes are checked for every
+decoded value. PostgreSQL native type identities are checked when the statement is described.
+Unexpected NULL for a non-`Option` field and any incompatible runtime value return `db.Error.Decode`.
+
 A reusable struct may be used directly as `Row` when its exact fields match. A Query-specific `Row` is
 normal for joins and projections.
 
-### 5.7 Output
+### 5.8 Output
 
 `Output` is optional. It describes the logical value the application wants after reading the flat row
 stream.
@@ -520,7 +640,8 @@ Output = nested or segmented application value
 
 ## 6. Execution surface
 
-API spelling is provisional; the behavior is normative.
+The common operation names and parameter ownership modes below are normative. Driver packages add
+only the qualified native variants defined by their option scopes.
 
 ### 6.1 Commands
 
@@ -532,7 +653,7 @@ pub Params {
   name: str,
 }
 
-pub fn command() -> db.command<Params> = db.command_file()
+pub fn command() -> db.command<Params> = db.command_file([])
 ```
 
 Execution returns:
@@ -550,19 +671,21 @@ A DML statement with `RETURNING` is `db.query<P, R>`.
 The common operations are:
 
 ```text
-execute(exec, command, params)  -> Result<db.exec_result, db.Error>
-one(exec, query, params, arena) -> Result<R, db.Error>
-maybe_one(...)                  -> Result<Option<R>, db.Error>
-all(...)                        -> Result<array<R>, db.Error>
-rows(...)                       -> Result<db.rows<R>, db.Error>
-prepare(...)                    -> Result<db.stmt<P,R>, db.Error>
+execute(exec, command, params)   -> Result<db.exec_result, db.Error>
+one(exec, query, params, out)    -> Result<R, db.Error>
+maybe_one(..., out)              -> Result<Option<R>, db.Error>
+all(..., out)                    -> Result<array<R>, db.Error>
+rows(...)                        -> Result<db.rows<R>, db.Error>
+prepare(...)                     -> Result<db.stmt<P,R>, db.Error>
 ```
 
 Semantics:
 
 - `one`: zero rows -> `NotFound`; more than one -> `Cardinality`.
 - `maybe_one`: zero -> `None`; one -> `Some`; more than one -> `Cardinality`.
-- `all`: materializes every row in the supplied arena/region.
+- `one`/`maybe_one`/`all`: clone view-bearing fields into the supplied `region`; their results are
+  tied to that region.
+- `all`: grows region chunks and performs the region builder's one documented compacting pass.
 - `rows`: one-pass stream; no implicit materialization.
 - `execute`: never decodes rows.
 
@@ -576,27 +699,52 @@ A Query module may expose its preferred operation:
 pub fn run(
   exec: db.exec,
   params: Params,
-  arena: Arena,
+  out: region,
 ) -> Result<Option<User>, db.Error> {
-  return db.maybe_one(exec, query(), params, arena)
+  return db.maybe_one(exec, query(), params, out, [])
 }
 ```
 
 For a compound result:
 
 ```align
+State {
+  parent: Option<User>,
+  groups: array_builder<Group>,
+}
+
+fn step(
+  borrow mut state: State,
+  row: Row,
+  out: region,
+) -> Result<(), db.Error> {
+  // Pure row-to-state code. Copy row views with `.clone_in(out)` before retaining them.
+  return Ok(())
+}
+
 pub fn run(
   exec: db.exec,
   params: Params,
-  arena: Arena,
+  out: region,
 ) -> Result<Option<Output>, db.Error> {
-  rows := db.rows(exec, query(), params)?
-  return shape(rows, arena)
+  mut state := State {
+    parent: None,
+    groups: array_builder(out),
+  }
+  rows := db.rows(exec, query(), params, [])?
+  loop {
+    row := db.next(rows)? else { break }
+    step(state, row, out)?
+  }
+  return finish(state)
 }
 ```
 
 This keeps the SQL path and result mode inside the named Query module while preserving visible
-execution and allocation.
+execution and allocation. The normal `loop` is intentional: it avoids adding a database-special
+generic callback ABI or extending Align's closed minimal-generics surface merely to hide a loop.
+`borrow mut` gives the Pure step exclusive access without transferring the arena-owned Move state
+across a by-value call.
 
 ### 6.4 Prepared statements
 
@@ -617,6 +765,12 @@ A prepared statement:
 - does not silently migrate between pooled connections;
 - does not imply a global cache.
 
+`prepare` returns a dependent resource tied to `exec`'s underlying connection.
+`rows_stmt(borrow mut stmt, params, options)` returns a row resource tied to the statement's fresh
+generation. The compiler therefore rejects reuse/finalization of the statement until that row
+resource drops; after Drop, another execution may borrow the statement again. Direct
+`rows(exec, query, ...)` similarly returns a resource dependent on the underlying connection.
+
 A future cache is explicit and must expose its scope and capacity.
 
 ### 6.5 Connection and transaction reuse
@@ -626,15 +780,14 @@ A Query accepts `db.exec`, not a connection-specific public trait.
 Conceptually:
 
 ```align
-outside := conn.exec()
-inside := tx.exec()
+outside := db.exec_conn(conn)
+inside := db.exec_tx(tx)
 
-result1 := user_with_groups.run(outside, params, arena)?
-result2 := user_with_groups.run(inside, params, arena)?
+result1 := user_with_groups.run(outside, params, out)?
+result2 := user_with_groups.run(inside, params, out)?
 ```
 
-If package-defined methods are unavailable, two named constructors may produce the same borrowed
-`db.exec` type. The important properties are:
+The two named constructors produce the same borrowed `db.exec` type. The important properties are:
 
 - Query code is identical inside/outside a transaction;
 - transaction ownership remains visible at the call site;
@@ -713,52 +866,56 @@ pub Output {
 }
 ```
 
-The shaper performs one pass:
+The Query-local exclusive state and Pure step perform one pass:
 
 ```align
-pub fn shape(
-  rows: db.rows<Row>,
-  arena: Arena,
-) -> Result<Option<Output>, db.Error> {
-  first := rows.next()? else return None
+State {
+  seen: bool,
+  user_id: i64,
+  user_name: str,
+  groups: array_builder<Group>,
+}
 
-  user := User {
-    id: first.user_id,
-    name: first.user_name,
+fn step(
+  borrow mut state: State,
+  row: Row,
+  out: region,
+) -> Result<(), db.Error> {
+  if state.seen {
+    if row.user_id != state.user_id {
+      return Err(inconsistent_parent_id())
+    }
+    if row.user_name != state.user_name {
+      return Err(inconsistent_parent_name())
+    }
+  } else {
+    state.seen = true
+    state.user_id = row.user_id
+    state.user_name = row.user_name.clone_in(out)
   }
 
-  mut groups: array_builder<Group> := array_builder(arena)
-  append_group(groups, first)?
-
-  loop {
-    row := rows.next()? else break
-
-    if row.user_id != user.id {
-      return Error.Cardinality
-    }
-
-    if row.user_name != user.name {
-      return Error.Decode
-    }
-
-    append_group(groups, row)?
-  }
-
-  return Some(Output {
-    user: user,
-    groups: groups.build(),
+  group_id := row.group_id else return Ok(())
+  group_name := row.group_name else return Err(partial_child())
+  state.groups.push(Group {
+    id: group_id,
+    name: group_name.clone_in(out),
   })
+  return Ok(())
 }
 ```
 
-The exact builder support is a prerequisite to settle. The semantics are fixed:
+`run` initializes `user_name` to the static empty view while `seen == false`, constructs exactly one
+`db.rows` stream, advances it in a normal `loop`, calls `step(state, row, out)` once per row, and
+freezes the builder in `finish`. The helper error constructors above return fully populated
+`db.Error` values for this Query identity. The recursive tagged-Move, builder, and region support
+are mandatory prerequisites, not decisions left to the driver. The semantics are:
 
 - no second SQL statement;
 - no hidden lazy load;
 - no hash map;
 - no hidden sort;
 - one row pass;
-- child allocation goes to the supplied arena;
+- child allocation goes to the supplied `region`;
 - parent columns repeated by the JOIN are validated consistently;
 - `NULL` child columns mean “no child row,” not a partially initialized child.
 
@@ -890,29 +1047,46 @@ and tests can count two executions.
 
 ## 8. Shaping contract
 
-### 8.1 Shaping cannot access a database
+### 8.1 Canonical shaping is a Pure exclusive-state transition
 
-A conventional shaper receives only data and allocation context:
+The canonical Query shaper is a Pure row-to-state function:
 
 ```text
-shape(rows: db.rows<Row>, arena: Arena) -> Result<Output, db.Error>
+step(borrow mut state: State, row: Row, out: region) -> Result<(), db.Error>
 ```
 
 It does not receive:
 
+- `db.rows`;
 - `db.conn`;
 - `db.tx`;
 - `db.exec`;
 - a prepared statement;
 - a pool.
 
-A lint SHOULD reject calls to database execution APIs from a conventional Query `shape` function.
-The semantic design does not depend on the lint: standard examples and generated helpers must never
-provide an execution handle to shaping.
+The Query-local `run` function is Impure: it creates exactly one `db.rows` execution, advances it in
+one visible Align `loop`, and passes each row to the step before the next advance. The step must have
+inferred effect `Pure`. Connection construction, Query execution, metadata calls, and all other
+database I/O are Impure, so the existing effect checker structurally rejects them from the step's
+transitive call graph. Mutation rooted in the explicit exclusive `borrow mut state`, builder
+operations on that state, and explicit region allocation remain Pure. The state is not copied or
+moved into the call; it stays owned by `run`, which also avoids the existing ban on passing an
+arena-owned Move value by value.
+
+There is deliberately no v1 `db.fold` higher-order helper. A normal `loop` is already Align's one
+sequential-control form, keeps row advancement visible, and avoids either a database-special
+callback rule or widening the closed minimal-generics/function-value surface. A later general
+stream-fold primitive would require an independent non-database consumer and the same visible
+cost/ownership contract.
+
+The low-level `db.rows` API is also the mechanism used by this Query-local loop. Arbitrary code may
+stream rows, but only the Pure step is called the conventional Query shaper. If the Impure
+orchestrator executes another Query, the second call is visible and its execution-count test
+expects two; a named Query helper that promises one execution fails its acceptance test.
 
 ### 8.2 One-pass by default
 
-A shaper SHOULD consume `db.rows<Row>` once. It may:
+A step receives each `Row` once. It may:
 
 - validate repeated parent values;
 - map a row;
@@ -967,46 +1141,53 @@ Typed decoding uses a precomputed field/column plan. The hot path does not:
 
 ### 9.2 Row views
 
-A streamed `Row` may contain borrowed `str`/`bytes` views into the current driver result buffer. Those
-views are region-bound and cannot escape after the row/batch advances unless cloned into an explicit
-region.
+A streamed `Row` may contain borrowed `str`/`bytes` views into the current driver result buffer.
+`next(borrow mut rows)` ends the previous resource generation. The generated decoder roots every
+view-bearing field in the new generation, so an older row cannot be used after the next call unless
+its data was first copied with `clone_in(out)`.
 
 The driver must document its validity window:
 
 ```text
-row-at-a-time  views valid until next()
+row-at-a-time  views valid until the next mutable borrow (`next`/`reset`/finalize)
 batch          views valid while the batch lives
-materialized   views/owned values valid for the destination arena
+materialized   views/owned values valid for the destination region
 ```
 
 The compiler/runtime must reject or prevent a borrowed row view from escaping its window.
 
 ### 9.3 Materialized results
 
-`all`, `one`, `maybe_one`, and shaping that builds arrays receive an explicit arena/region. They do not
-silently choose the global heap.
+`all`, `one`, `maybe_one`, and shaping that builds arrays receive the explicit `region` capability
+bound by `arena name {}`. They do not silently choose the global heap.
 
 ```align
-rows := db.all(exec, query(), params, arena)?
+arena out {
+  rows := db.all(exec, query(), params, out, [])?
+  use(rows)
+}
 ```
 
-Owned escape requires explicit clone/copy according to the normal Align memory model.
+The returned value is tied to `out` and cannot escape the arena block. Longer-lived output requires a
+visible copy into another valid owner/region according to the normal Align memory model.
 
 ### 9.4 Builder prerequisite
 
-Compound output requires a settled way to append plain structs into an arena-backed builder and then
-freeze without a second element copy.
+Compound output uses the general region builder specified in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md):
 
 Required capability:
 
 ```text
-array_builder<PlainStruct>
+array_builder<PlainStruct>(out)
   push(value)
   build() -> array<PlainStruct>
 ```
 
-This is a shared language/core prerequisite, not an excuse for a private database-only container.
-Until it exists, a database implementation must not hide an equivalent heap vector behind the API.
+The builder grows in region chunks and performs one documented compacting element pass into the final
+contiguous array. It performs no hidden heap allocation. View-bearing fields must already outlive
+`out`; streamed text is copied with `clone_in(out)` before `push`. This is a shared language/core
+prerequisite, not an excuse for a private database-only container.
 
 ### 9.5 Batch and SoA path
 
@@ -1212,7 +1393,7 @@ The design must not block:
 - detailed `EXPLAIN` formats.
 
 The initial public release requires the common Query/transaction path, native options, checked
-metadata, and basic plan access. COPY/pipeline/notify may follow.
+metadata, and basic plan access. COPY/pipeline/notify are scheduled in D13.
 
 ---
 
@@ -1223,18 +1404,82 @@ metadata, and basic plan access. COPY/pipeline/notify may follow.
 Options are scoped, not one untyped bag:
 
 ```text
-ConnectOption
-QueryOption
-PrepareOption
-ExecuteOption
-TxOption
-MetaOption
-ExplainOption
+db.QueryOption             static common Query semantics
+db.CommandOption           static common command semantics
+db.PrepareOption           common prepare controls
+db.ExecuteOption           common one-execution controls
+db.TxOption                common transaction semantics
+db.MetaOption              common metadata categories
+db.ExplainOption           common plan controls
+
+sqlite.ConnectOption       SQLite connection controls
+sqlite.QueryOption         SQLite static Query controls
+sqlite.CommandOption       SQLite static command controls
+sqlite.PrepareOption       SQLite prepare controls
+sqlite.ExecuteOption       SQLite execution controls
+sqlite.TxOption            SQLite transaction controls
+sqlite.MetaOption          SQLite metadata controls
+sqlite.ExplainOption       SQLite plan controls
+
+postgres.*Option           corresponding PostgreSQL-native scopes
 ```
 
 A driver option passed at the wrong scope is a compile-time type error.
 
-### 13.2 No silent ignore
+Common operations accept only common options. A native option selects a driver-qualified operation:
+
+```align
+db.execute(exec, command, params, common_options)
+sqlite.execute_native(exec, command, params, common_options, sqlite_options)
+postgres.execute_native(exec, command, params, common_options, postgres_options)
+```
+
+This avoids an untyped option bag, a circular dependency from `pkg.db` to every driver, and a public
+trait. Driver-qualified static Query options pin the Query descriptor to that driver and participate
+in its public semantic artifact. Runtime connection/prepare/execution options never change the
+Query's static identity.
+
+### 13.2 Option value representation
+
+Every `*Option` above is a finite public sum type. Operation arguments are
+`slice<ThatScopeOption>`; `[]` explicitly means no options. Option payloads are Copy scalars,
+`str` views consumed during the call, or static type/Query identities. A driver must copy any
+runtime string it retains after the call. An option list is not stored as an untyped map and is
+never inspected through reflection.
+
+Static Query/command option arguments are more restricted: a recognized constructor accepts only a
+fixed literal list of option constructors whose payloads are literals, type identities, or other
+compiler-known constants. A runtime local, environment read, FFI result, or arbitrary function call
+in a static option is a compile-time error. The canonical option tag/payload encoding participates
+in `StaticQueryArtifact`/`StaticCommandArtifact`; driver-pinning options also participate in
+`IStaticQuery`/`IStaticCommand`.
+
+Every primitive operation has one option-bearing form:
+
+```text
+connection   driver.connect(input, slice<driver.ConnectOption>)
+Query        db.query_file(slice<db.QueryOption>)
+             driver.query_file(slice<db.QueryOption>, slice<driver.QueryOption>)
+command      db.command_file(slice<db.CommandOption>)
+             driver.command_file(slice<db.CommandOption>, slice<driver.CommandOption>)
+prepare      db.prepare(exec, query, slice<db.PrepareOption>)
+execution    db.execute/one/maybe_one/all/rows(..., slice<db.ExecuteOption>)
+transaction  db.begin(conn, slice<db.TxOption>)
+metadata     db.metadata(exec, request, slice<db.MetaOption>)
+EXPLAIN      db.explain(exec, query, params, slice<db.ExplainOption>)
+```
+
+The corresponding `driver.*_native` form receives the common option slice and one additional
+driver option slice. It does not reinterpret a driver option as a common option. There are no
+default arguments, optionless overloads, fluent option builders, string-key option maps, or
+process-global option state. Query-local `run` helpers decide visibly whether to accept an option
+slice from their caller or pass `[]`.
+
+Connection, Query, prepare, execution, transaction, metadata, and EXPLAIN therefore have distinct
+static types even when two variants happen to carry the same scalar. D9 may add variants to these
+settled containers; it must not invent another representation.
+
+### 13.3 No silent ignore
 
 Every option has one of these outcomes:
 
@@ -1246,7 +1491,7 @@ rejected as conflicting
 
 “Ignored for portability” is forbidden.
 
-### 13.3 Precedence
+### 13.4 Precedence
 
 Each driver documents whether an operation-scoped option may override a connection default. The
 recommended rule:
@@ -1257,7 +1502,7 @@ recommended rule:
 - connection defaults are fallback values only for explicitly overrideable properties;
 - duplicate/conflicting non-overrideable options are errors.
 
-### 13.4 Driver restriction
+### 13.5 Driver restriction
 
 A Query descriptor records:
 
@@ -1267,9 +1512,9 @@ SQLiteOnly
 PostgreSQLOnly
 ```
 
-`db.query_file()` starts portable in API terms, though its SQL may still fail driver preparation.
-`sqlite.query_file()` and `postgres.query_file()` explicitly pin the descriptor. Native options also
-pin it.
+`db.query_file([])` starts portable in API terms, though its SQL may still fail driver preparation.
+`sqlite.query_file([], [])` and `postgres.query_file([], [])` explicitly pin the descriptor. Native
+options also pin it.
 
 Executing a pinned Query with the wrong driver fails before SQL is sent (`DriverMismatch`).
 
@@ -1285,18 +1530,21 @@ translation.
 ```align
 tx := db.begin(conn, common_tx_options)?
 
-result := update_account.run(tx.exec(), params, arena)?
+result := update_account.run(db.exec_tx(tx), params, out)?
 
-tx.commit()?
+conn := db.commit(tx)?
 ```
 
 Rollback is explicit:
 
 ```align
-tx.rollback()?
+conn := db.rollback(tx)?
 ```
 
-Dropping an active transaction performs fail-safe rollback. It MUST NOT commit.
+`begin` consumes `conn`; the caller cannot use the connection while the transaction is active.
+`commit` and `rollback` consume `tx` and return the connection on success. A failed explicit end or
+Drop performs best-effort rollback and closes the owned connection; it never returns a connection in
+an unknown transaction state and MUST NOT commit.
 
 ### 14.2 Native transaction options
 
@@ -1329,31 +1577,64 @@ drivers.
 
 ## 15. Errors
 
-Database operations return a structured database error type rather than aborting for recoverable
-failures.
-
-Proposed stable categories:
+Database operations return a structured database error rather than aborting for recoverable
+failures. The v1 payloads are:
 
 ```align
+db.NativeError {
+  driver: db.Driver,
+  code: Option<string>,
+  extended_code: Option<i64>,
+  sqlstate: Option<string>,
+  message: string,
+  detail: Option<string>,
+  constraint: Option<string>,
+  table: Option<string>,
+  column: Option<string>,
+}
+
+db.CardinalityError {
+  expected_min: i64,
+  expected_max: i64,
+  observed_at_least: i64,
+}
+
+db.ContractError {
+  query_id: string,
+  item: string,
+  message: string,
+}
+
 db.Error {
-  Connection,
-  Timeout,
-  Cancelled,
+  Connection(db.NativeError),
+  Timeout(db.NativeError),
+  Cancelled(db.NativeError),
   NotFound,
-  Cardinality,
-  Constraint,
-  Serialization,
-  Deadlock,
-  SchemaMismatch,
-  DriverMismatch,
-  Decode,
-  InvalidQuery,
-  Unsupported,
+  Cardinality(db.CardinalityError),
+  Constraint(db.NativeError),
+  Serialization(db.NativeError),
+  Deadlock(db.NativeError),
+  SchemaMismatch(db.ContractError),
+  DriverMismatch(db.ContractError),
+  Decode(db.ContractError),
+  InvalidQuery(db.ContractError),
+  Unsupported(db.ContractError),
   Native(db.NativeError),
 }
 ```
 
-Exact payload shapes depend on current sum-type/owned-string capability, but the semantics are:
+Every native string is copied into owned Align storage before the driver result/error buffer is
+released. Errors are therefore Move values and never borrow a connection, statement, or row buffer.
+Allocating detailed strings on the error path is accepted and measured separately from the success
+hot path.
+
+This surface depends on recursive tagged Move payloads: `Option<string>` fields use conditional
+Drop, `db.Error` variants recursively own `db.NativeError`/`db.ContractError`, and
+`Result<T,db.Error>` moves/drops the active payload through `?` and `match`. The `Ok` path allocates
+no error storage. Numeric-only errors, empty strings as absence, or an opaque heap error are not
+acceptable substitutes.
+
+The semantics are:
 
 - stable categories for ordinary control flow;
 - driver code/message/detail retained where available;
@@ -1373,38 +1654,66 @@ and retry.
 
 ### 16.1 Three check levels
 
-A Query may have these verification states:
+A Query has an observed verification state and a static policy:
 
 ```text
+state
 Declared
   static SQL source exists; Params/Row are valid Align types; hash is known
 
 DatabaseChecked
   the selected database engine prepared/described the SQL and emitted metadata
 
-RequiredChecked
-  build/CI requires current matching checked metadata
+policy
+DeclaredOnly
+CheckedOptional
+CheckedRequired
 ```
 
-The package/compiler must not describe a merely Declared Query as fully database-type-checked.
+`CheckedRequired` makes missing or stale metadata a compile error. `CheckedOptional` uses current
+matching metadata when present and otherwise remains honestly `Declared`. The package/compiler must
+not describe a merely Declared Query as fully database-type-checked.
 
 ### 16.2 Explicit preparation command
 
 ```sh
-align db prepare
+alignc db prepare app.align --driver sqlite --database dev.sqlite
+alignc db prepare app.align --driver sqlite --memory --migrations db/migrations
+alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL
+alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL --check
 ```
 
-The command:
+The entry `.align` path and one `--driver` are required in v1. Query discovery uses exactly the
+entry's reachable import graph; it never scans the project for `.sql` files. `--query
+<fully-qualified-id>` may repeat to restrict that set. The output root is the entry build's project
+root plus `.align-db/`. A later tool-only config file may shorten these flags, but it is not a
+compiler manifest and is not required by the first implementation.
 
-1. loads project database configuration;
+SQLite accepts exactly one schema environment: `--database <path>`, or `--memory` optionally
+initialized from the ordered SQL files in `--migrations <dir>`. PostgreSQL accepts `--url-env
+<name>`; the environment variable's value is read only by this explicit command. Direct URL flags
+may exist for local use but must be warned as shell-history-visible. The command prints the selected
+driver, schema source, server/library version, and Query count before writing.
+
+This is the only workflow allowed to contact a database. It:
+
+1. reads explicit command flags and optional tool-only preparation configuration;
 2. applies/selects the intended schema environment;
 3. asks SQLite or PostgreSQL to prepare/describe every selected static Query;
 4. records parameter/result/native type information and nullability where available;
 5. records driver/version/schema identity;
 6. records the SQL hash and relevant option hash;
-7. writes deterministic repository metadata.
+7. writes deterministic repository metadata;
+8. supports `--check`, which fails when regeneration would change repository metadata.
 
-A normal build reads this metadata but never contacts the database.
+Preparation compiles the reachable units in an explicit regeneration mode that still enforces every
+language/Query contract but temporarily treats missing/stale checked metadata as the artifact to
+regenerate. A normal `build`/`check` never enters that mode. `--check` performs the same describe
+work, compares canonical bytes, writes nothing, and exits nonzero on missing/stale/different output.
+
+Connection URLs and secrets come from explicit command arguments or environment variables used by
+this command only. They are not compiler build inputs and are never written. A normal build reads
+only the selected metadata artifact and never contacts the database.
 
 ### 16.3 Metadata location
 
@@ -1413,38 +1722,70 @@ A possible layout:
 ```text
 .align-db/
   sqlite/
-    <query-id>.json
+    <query-id-hash>.json
   postgres/
-    <query-id>.json
+    <query-id-hash>.json
 ```
 
-The exact encoding may be binary or JSON. It must be deterministic, reviewable through a tool, and
-keyed by Query identity plus SQL/options/schema hash.
+Version 1 uses canonical UTF-8 JSON with fixed field order, LF newlines, sorted arrays where order is
+not semantic, and no JSON object whose iteration order affects identity. Every file contains:
+
+```text
+format_version
+query_id, module, item, driver
+SQL hash, static-options hash
+Params and Row fingerprints
+schema fingerprint
+engine/driver version
+PostgreSQL search_path and extension assumptions, when applicable
+parameters: source name, protocol ordinal, logical/native type
+columns: ordinal, source alias, logical/native type, nullable/origin evidence
+```
+
+Native PostgreSQL OIDs may be recorded as environment evidence, but volatile OIDs are not the sole
+canonical type or schema identity. Canonical type names and schema-qualified identities are stored
+alongside them.
 
 Secrets and connection URLs are never stored.
 
+For each static Query/driver pair, the compiler derives the one metadata pathname from the Query ID
+hash. Its action key records `Missing` or `Present(content_hash)` even under `CheckedOptional`.
+Creating, deleting, or editing the file therefore invalidates the producer without a directory
+scan. Exact current metadata contributes to the Query artifact/implementation hash; only its public
+semantic consequences contribute to the exported Query interface.
+
 ### 16.4 Stale metadata
 
-If SQL, Params, Row, static options, driver, or declared schema identity changes, existing checked
-metadata becomes stale.
+If Query identity, SQL, Params, Row, static options, driver, metadata format, or declared schema
+identity changes, existing checked metadata becomes stale.
 
 Modes:
 
 ```text
-optional   warn or fall back to Declared
-required   compilation/CI error
+CheckedOptional   use exact current metadata or remain Declared
+CheckedRequired   compilation/CI error
 ```
 
 No stale metadata may be silently treated as current.
+
+`CheckedOptional` with missing/stale metadata emits the same honest Declared descriptor as if no
+metadata existed; it never embeds stale evidence. `CheckedRequired` fails before object-cache reuse.
+The explicit preparation regeneration mode in §16.2 is the sole exception needed to create the
+missing artifact.
 
 ### 16.5 No full custom SQL engine in v1
 
 Version 1 SHOULD NOT implement a complete PostgreSQL/SQLite parser, resolver, function catalog,
 implicit-cast engine, or nullability analyzer.
 
-The database engine is authoritative during `align db prepare`. Align may perform lightweight static
-work for file validation, placeholder scanning, statement count, hashing, diagnostics, and obvious
-contract errors.
+The database engine is authoritative during `alignc db prepare`. Align performs only lexical work for
+file validation, placeholder scanning/rewriting, statement-count screening, hashing, source maps,
+diagnostics, and obvious contract errors. Driver prepare is still authoritative for statement count
+and SQL validity.
+
+Database-checked metadata is evidence for one recorded schema environment, not a proof that runtime
+data cannot differ. Execution setup still checks result count/name/native types, and per-row decoding
+still rejects NULL or SQLite storage-class mismatches.
 
 This keeps implementation thin and database behavior accurate while preserving offline normal builds.
 
@@ -1490,10 +1831,10 @@ Migrations remain SQL. There is no schema DSL and no struct-to-DDL generation.
 Proposed tooling:
 
 ```sh
-align db migrate
-align db status
-align db check
-align db prepare
+alignc db migrate
+alignc db status
+alignc db check
+alignc db prepare
 ```
 
 `migrate` applies pending migrations with driver-appropriate locking and a migration history table.
@@ -1707,7 +2048,7 @@ The native package may expose:
 Static typed Queries are the default. Runtime SQL is explicit and weaker.
 
 ```align
-rows := db.dynamic_rows(exec, sql_text, params, arena)?
+rows := db.dynamic_rows(exec, sql_text, params, out)?
 ```
 
 Dynamic results use:
@@ -1824,7 +2165,7 @@ query db.queries.customer_totals:
 ```text
 checked metadata is stale:
   SQL hash changed for db/queries/user_by_id.sql
-  run: align db prepare
+  run: alignc db prepare
 ```
 
 ```text
@@ -1838,109 +2179,183 @@ Unsupported/unknown native options must identify the option and driver rather th
 
 ## 23. Roadmap
 
-The implementation follows vertical slices. A milestone is complete only when an `.align` program
-runs end to end and tests cover execution count, decoded values, ownership/drop behavior, and errors.
+The implementation follows small prerequisite and vertical PRs. A database PR is not allowed to
+paper over a missing prerequisite with a package-name special case. Every executable milestone runs
+an `.align` program end to end and tests execution count, decoded values, ownership/Drop, cleanup, and
+errors.
 
-### M0 — design closure and driver spikes
+### L1a–L6 — mandatory Align library-boundary prerequisites
 
-Settle before broad coding:
+Land the seven PRs specified in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md), in order:
 
-- package placement and full-qualified public names;
-- static `query<P,R>` descriptor representation;
-- same-basename SQL build dependency;
-- Params/Row static mapping representation;
-- `db.exec` ownership/lifetime shape;
-- row-view validity windows;
-- libsqlite3 integration spike;
-- libpq integration spike;
-- authoritative prepare/describe metadata available from each driver;
-- compound-output builder prerequisite;
-- error payload feasibility;
-- exact v1 type mappings.
+```text
+L1a recursive DropPlan + Option<Move> fields
+L1b Move sum/Option/Result payload completion
+L2  borrow / borrow mut parameters + interface return-borrow summaries
+L3  package-defined opaque/dependent Move resource + resource_ref/native views + exactly-once Drop
+L4  named arena binding + region + clone_in
+L5  deterministic static inputs + StaticQueryArtifact + descriptor skeleton
+L6  region-backed PlainStruct array_builder
+```
 
-Deliverable: a feasibility report with rejected alternatives and a vertical PR sequence. Do not start
-with a broad SQL parser or ORM layer.
+All focused tests and benchmarks in that plan are gates. No SQLite or PostgreSQL safe public
+connection type lands before L3; no Query file support lands outside L5; no compound-output private
+vector lands before L6.
 
-### M1 — SQLite walking skeleton
+### D0 — native driver feasibility probes
 
-End-to-end SQLite slice:
+Read-only/throwaway probes establish:
 
-- `import pkg.db` / `pkg.db.sqlite`;
-- connect/close;
-- sibling `.sql` Query descriptor;
-- one named Params struct;
-- scalar parameter binding;
-- one typed flat Row;
-- `one`, `maybe_one`, `all`, `execute`;
-- explicit arena materialization;
-- structured SQLite errors;
-- execution-count test;
-- direct-libsqlite3 comparison benchmark.
+- exact libsqlite3 and libpq library/ABI availability on supported targets;
+- SQLite prepare tail-pointer statement-count behavior;
+- SQLite column pointer validity across `step/reset/finalize`;
+- PostgreSQL extended-query single-statement behavior;
+- libpq full-result and single-row pointer validity;
+- parameter/result metadata and nullability actually available from each engine;
+- cancellation and cleanup behavior.
 
-This milestone proves the Query model, not only the driver wrapper.
+The deliverable is recorded evidence in this document or a focused audit, not production raw handles.
 
-### M2 — PostgreSQL parity
+### D1 — generated Query plan over a fake driver
 
-End-to-end PostgreSQL slice with the same common Query module shape:
+Before a native database:
 
-- libpq/native client integration;
-- connect/close;
-- named source parameter lowering to protocol order;
-- common primitive types;
-- one/maybe-one/all/execute;
-- SQLSTATE/native error retention;
-- Query driver restriction;
-- common Query code exercised against both drivers where SQL is portable;
-- direct-libpq comparison benchmark.
+- construct `db.query<P,R>` from inline and sibling SQL;
+- emit/load `StaticQueryArtifact`;
+- generate binder/decoder thunks;
+- exercise named-parameter occurrence tables;
+- decode a fake flat scalar row;
+- prove interface/implementation/cache invalidation boundaries;
+- prove no runtime reflection or per-row name lookup.
 
-SQLite and PostgreSQL are both required before declaring the initial API shape stable.
+Tests mutate SQL-only, private Query, public Params/Row, driver restriction, and metadata digest
+independently. Benchmark generated binder/decoder calls and warm-cache behavior.
 
-### M3 — streaming, prepare, transaction, native options
+### D2 — minimal SQLite Query vertical
 
-- `db.rows<R>` one-pass stream;
-- row view/lifetime enforcement;
-- prepared Move statement;
-- connection and transaction -> common `db.exec` view;
-- begin/commit/rollback and rollback-on-Drop;
+The first native vertical is deliberately exact:
+
+- in-memory SQLite connection as `db.conn`;
+- one `db.command<Params>` inserting an `i64`;
+- one sibling-file `db.query<Params,Row>` selecting one `i64`;
+- Params and Row contain only self-contained scalar fields;
+- `execute` and `one`;
+- zero/one/more-than-one cardinality behavior;
+- structured SQLite primary/extended errors;
+- one execution-count hook;
+- close/finalize exactly once on success and every error exit.
+
+It does not include text views, `all`, streaming, transactions, migrations, dynamic rows, metadata
+catalogs, or native options. The benchmark compares prepared bind + one-row decode with an equivalent
+direct libsqlite3 loop.
+
+### D3 — checked Query metadata core + SQLite
+
+- canonical `.align-db/sqlite` artifact;
+- `alignc db prepare` and `--check`;
+- explicit temporary/in-memory schema setup;
+- Declared/CheckedOptional/CheckedRequired;
+- stale SQL/options/type/schema diagnostics;
+- normal-build no-network test;
+- runtime SQLite storage-class and NULL validation.
+
+This milestone lands before promising that a typed Query is database-checked.
+
+### D4 — minimal PostgreSQL Query vertical
+
+- PostgreSQL `db.conn` over libpq;
+- the same common Query module shape as D2;
+- dialect-aware named-source scan and `$n` rewrite;
+- repeated source name reuses one ordinal;
+- scalar bind/decode;
+- SQLSTATE and owned native error detail;
+- driver restriction before SQL send;
+- portable `CAST(:value AS BIGINT)` Query exercised on both drivers;
+- execution-count hook and cleanup tests.
+
+Integration tests use an explicitly configured local/ephemeral PostgreSQL instance and skip with a
+reported reason when it is unavailable. The direct-libpq comparison benchmark is environment-gated.
+
+### D5 — PostgreSQL checked metadata
+
+- canonical `.align-db/postgres` artifact;
+- engine version, search path, extension, and schema fingerprints;
+- type names plus OID evidence;
+- conservative nullability/origin evidence;
+- `--check` reproducibility across equivalent recreated schemas;
+- runtime describe comparison.
+
+### D6 — prepared statement lifecycle
+
+- typed dependent `db.stmt<P,R>` resource;
+- connection binding and driver mismatch checks;
+- explicit prepare options;
+- `rows_stmt(borrow mut stmt, ...)` and repeated sequential execution after each rows Drop;
+- finalize/close on Drop and errors;
+- no implicit global statement cache.
+
+Benchmark direct prepared execution, common-layer execution, and re-prepare cost separately.
+
+### D7 — transaction and common execution view
+
+- `db.begin` consumes `db.conn`;
+- `db.exec_conn` and `db.exec_tx` return the same borrowed type;
+- `db.commit`/`db.rollback` consume `db.tx` and return `db.conn`;
+- Drop rollback closes the connection;
 - SQLite begin modes;
-- PostgreSQL isolation/read-only/deferrable options;
-- connection/Query/prepare/execution option scopes;
+- PostgreSQL isolation/read-only/deferrable combinations;
+- use-after-end and conn/tx alias rejection.
+
+### D8 — typed row streaming
+
+- dependent `db.rows<R>` resource;
+- `next(borrow mut rows)` generation invalidation;
+- owner-tied `resource.view_from_raw` with invalid pointer/length/UTF-8 rejection;
+- SQLite current-row views;
+- PostgreSQL full-result path first, single-row mode only when explicitly selected;
+- early Drop/finalize;
+- one-million-row scalar and borrowed-text benchmarks;
+- compile-fail tests for use-after-next, storage in a longer-lived builder, return, branch, and loop.
+
+### D9 — scoped native options, timeout, and cancellation
+
+- common versus driver-qualified option entry points;
+- connection/Query/prepare/execute/transaction scopes;
+- applied/unsupported/conflicting outcomes;
 - no-silent-ignore tests;
-- cancellation/timeout basics;
-- statement/result cleanup tests.
+- SQLite busy/locking controls;
+- PostgreSQL timeout/cancel path;
+- statement/result cleanup under cancellation.
 
-### M4 — migrations and database-checked Queries
+### D10 — compound Output
 
-- SQL migration runner;
-- migration history/checksums/status;
-- `align db migrate`;
-- `align db prepare`;
-- deterministic Query metadata;
-- SQL/options/type/schema hashes;
-- optional vs required checked mode;
-- stale metadata diagnostics;
-- SQLite temporary-schema preparation path;
-- PostgreSQL development/ephemeral preparation path;
-- no live database access during normal build test.
+- canonical Pure state-transition step plus one visible Query-local rows loop;
+- `region` output and `clone_in`;
+- one parent plus one-to-many output;
+- repeated-parent consistency and null-child rules;
+- segmented many-parent output;
+- transaction + master projection;
+- User + Groups;
+- exactly one SQL execution;
+- no hidden sort/hash/materialization;
+- builder allocation/copy-count and high-fanout benchmarks.
 
-### M5 — compound Output
+Compound Query support is part of the first product contract, not a later ORM enhancement.
 
-- one parent plus one-to-many output in one SQL execution;
-- Query-local one-pass shaper;
-- arena-backed plain-struct builder prerequisite shipped or explicitly landed first;
-- repeated-parent consistency checks;
-- null-child handling;
-- no-DB-access shaper lint/test;
-- transaction + master projection example;
-- User + Groups example;
-- multiple-child tagged/native-aggregate examples;
-- execution-count and memory benchmarks.
+### D11 — SQL migrations
 
-Compound Query support is part of the first product contract, not a future ORM enhancement.
+- SQL migration discovery/order;
+- driver-specific multi-statement execution rules;
+- checksums/history/status/check;
+- transaction policy and partial-failure reporting;
+- explicit `alignc db migrate/status/check`.
 
-### M6 — fine-grained metadata
+Migration implementation reuses connections/resources but does not change typed Query semantics.
 
-Common metadata:
+### D12 — category-specific metadata and EXPLAIN
+
+Common categories:
 
 - database;
 - schema/attached database;
@@ -1948,7 +2363,7 @@ Common metadata:
 - columns;
 - primary/unique/foreign keys and constraints;
 - indexes;
-- Query parameters/results;
+- static Query parameters/results;
 - explicit EXPLAIN.
 
 Native detail:
@@ -1956,43 +2371,45 @@ Native detail:
 - PostgreSQL OIDs/types/opclasses/index details/JSON plans;
 - SQLite STRICT/WITHOUT ROWID/hidden columns/index origin/query-plan details.
 
-Tests verify that requesting table metadata does not implicitly fetch every column/key/index category.
+Tests prove that one requested category does not fetch unrelated categories. `EXPLAIN ANALYZE`
+remains a visibly executing operation.
 
-### M7 — batch and data-oriented decode
+### D13 — batch, SoA, and high-value native paths
 
-- bounded `next_batch`;
-- row-batch validity regions;
-- segmented many-parent outputs;
-- general adjacent grouping only if it has a non-DB consumer and settled core design;
-- PostgreSQL binary parameter/result path;
-- direct `soa<Row>` decode for eligible plain structs;
-- nullable validity bitmap;
-- batch/SoA benchmarks and no-intermediate-AoS verification.
-
-### M8 — high-value native extensions
-
-Consumer-driven additions:
-
-- PostgreSQL COPY;
-- PostgreSQL pipeline/single-row modes;
-- LISTEN/NOTIFY;
-- richer native/custom-type mapping;
-- SQLite backup/incremental blob;
-- FTS/virtual-table helpers where they remain thin;
+- bounded `next_batch` and batch generations;
+- PostgreSQL binary parameter/result formats;
+- segmented child buffers and nullable validity bitmaps;
+- direct eligible `soa<Row>` decode with no intermediate AoS;
+- PostgreSQL COPY/pipeline/single-row/LISTEN-NOTIFY;
+- SQLite backup/incremental blob/FTS helpers;
 - explicit pool package;
 - additional drivers only after the common contracts are proven.
 
 No roadmap item may add hidden relationship loading or a Query-builder DSL.
 
+### D14 — dynamic SQL and native callbacks
+
+- settle and implement the minimal owned `db.value` sum and indexed `db.row`;
+- require a visible dynamic SQL string, explicit value slice, and explicit driver restriction;
+- keep dynamic execution separate from typed Query descriptors and checked artifacts;
+- decode dynamic rows by indexed access only, with no struct reflection or name-based field writes;
+- add SQLite function/collation and PostgreSQL notice/COPY callback surfaces only after the
+  callback-capture, abort, reentrancy, and thread rules are proved;
+- pin statement count, value allocation, callback lifetime, and cleanup behavior.
+
+This slice is committed after the typed Query product. It is not permission to route typed Query
+execution through a reflective dynamic engine.
+
 ### Initial release gate
 
-The first release presented as Align database support requires M0–M6 for both SQLite and PostgreSQL.
-M7/M8 are performance/native extensions, but the design and APIs before them must leave those paths
-open.
+The first release presented as Align database support requires L1a–L6 and D1–D10 for both SQLite and
+PostgreSQL where the milestone is driver-relevant. D11–D14 remain committed roadmap work, not
+architectural deferrals, but migrations/catalog breadth/batch/native extensions do not block the
+first Query product.
 
 A release that handles only single-table model loading is incomplete even if CRUD works. At least one
-many-to-one/master projection and one one-to-many compound Output must be end-to-end, execution-count
-pinned, and documented.
+many-to-one/master projection and one one-to-many compound Output must be end-to-end,
+execution-count pinned, and documented.
 
 ---
 
@@ -2026,49 +2443,51 @@ The design is implemented correctly only if all are true:
 23. Compound examples include transaction+master and User+Groups.
 24. Tests pin SQL execution count and no hidden follow-up Queries.
 25. Benchmarks compare package overhead against direct native-driver loops.
+26. All handles use the general opaque-resource/borrow machinery; no `pkg.db`-named ownership rule
+    exists in the compiler.
+27. Caller-selected materialization uses `arena name {}` and `region`, with no ambient allocator.
+28. SQL-only edits invalidate the producer/query artifact without needlessly recompiling unchanged
+    consumers.
+29. Canonical compound shaping uses a Pure `borrow mut` state transition, so transitive database
+    I/O is rejected; its Query-local orchestrator contains one visible rows loop.
+30. Region builder allocation and its single compacting pass are measured and visible.
+31. Structured owned `db.Error` and Move Output use ordinary recursive `Option`/`Result`/sum Drop;
+    the successful path allocates no error storage.
+32. `pkg.db`, `.sqlite`, and `.postgres` are acyclic modules in one `pkg/db` package subtree, not
+    falsely independent package versions.
 
 ---
 
 ## 25. Open decisions before implementation
 
-These are implementation-shape decisions, not permission to weaken the settled semantics:
+The load-bearing implementation shape is settled here and in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md). Remaining
+consumer-driven type/native-surface decisions are:
 
-1. Exact package-call spelling for operations on opaque Move handles, given current method support.
-2. Representation of static `db.query<P,R>` descriptors in module interfaces and incremental caches.
-3. Whether `query_file()` is a compiler intrinsic, sema-known package call, or generated static table
-   entry.
-4. Exact row-stream borrow representation and the compiler check that invalidates row views on
-   `next()`.
-5. Arena-backed `array_builder<PlainStruct>` design and its shared non-database uses.
-6. Final stable database error payloads under current owned-string/sum-type limits.
-7. Decimal, UUID, temporal, JSON/JSONB, and native array representations.
-8. How much nullability/origin information PostgreSQL and SQLite reliably expose during preparation.
-9. Whether adjacent grouping starts as Query-local code or a settled core stream primitive.
-10. Checked-metadata encoding and project configuration location.
-11. The minimal safe dynamic-row value set.
-12. Native callback safety for SQLite functions/collations, deferred unless a real consumer requires it.
+1. Decimal precision/scale representation.
+2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
+3. The exact conservative nullability/origin evidence each supported engine/version exposes.
+4. The minimal safe dynamic `db.row`/`db.value` set.
+5. Native callback safety for SQLite functions/collations.
+6. Which COPY/pipeline/backup/blob operations have a measured consumer.
 
-The implementer must report these before writing the broad feature. “The driver library made the
-choice for us” is not a design rationale.
+These items have roadmap homes in D12–D14. They do not permit weakening Query identity,
+one-execution semantics, ownership, static artifacts, runtime validation, or option rejection.
+“The driver library made the choice for us” is not a design rationale.
 
 ---
 
-## 26. Instructions for Codex/implementation agents
+## 26. Instructions for implementation agents
 
-Before coding, produce a review with:
-
-1. conflicts with current `draft.md`, ownership, generics, module, FFI, and package rules;
-2. required compiler changes versus package/runtime-only work;
-3. the smallest SQLite and PostgreSQL vertical slices;
-4. static descriptor and checked-metadata representation;
-5. row-view lifetime strategy;
-6. compound-output builder prerequisites;
-7. error and native-option representation;
-8. proposed PR sequence with end-to-end tests and benchmarks;
-9. features from this document that should be deferred only because a stated prerequisite is missing;
-10. any proposal that would accidentally introduce an ORM, hidden SQL, reflection, a trait hierarchy,
-    or a second query language.
-
-Do not implement a large horizontal SQL subsystem first. Do not build single-table CRUD and call the
-Query model complete. The first implementation path must preserve the final Query-centric shape from
-the first SQLite and PostgreSQL programs onward.
+1. Read this document and `../17-library-boundary-prerequisites.md` completely.
+2. Implement L1a–L6 in order; do not start a safe driver API before their owning gate.
+3. Run the Align compiler self-review for every Rust PR.
+4. Keep every PR at one roadmap slice and add its listed negative/cleanup tests.
+5. Do not introduce a database keyword, ORM, Query DSL, runtime reflection, public trait hierarchy,
+   ambient allocator, manual public close, or package-name ownership special case.
+6. Do not replace a missing prerequisite with `raw`, an explicit destroy function, a hidden heap
+   vector, a lint-only lifetime rule, or a whole-program-only shortcut.
+7. Preserve the separate-compilation/cache contract from D1 onward.
+8. Record measured native metadata behavior rather than guessing from SQLite/PostgreSQL documentation.
+9. Treat SQL execution-count and allocation/copy-count tests as correctness tests.
+10. Do not build single-table CRUD and call the Query model complete.

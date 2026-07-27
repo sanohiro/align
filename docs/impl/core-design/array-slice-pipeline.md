@@ -44,6 +44,11 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
+
+array_builder<T>()                 // shipped heap grow/freeze form
+array_builder<T>(out: region)      // required L6 region/plain-struct form
+builder.push(value)
+builder.build() -> array<T>
 ```
 
 Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { … }`, or the
@@ -90,6 +95,12 @@ For `zip(...).map_into(dst)`, the proof covers **every** source. Runtime source 
 input-vs-output scope; sources are allowed to alias one another and are never declared disjoint.
 
 ## Spec'd but not implemented
+
+- **Region-backed plain-struct builder (required L6):** `array_builder<T>(out)` grows in chunks in
+  the explicit region, accepts recursive `RegionPlain` elements, and performs one documented final
+  compacting pass. A short-lived view must use `clone_in(out)` before insertion. It has no hidden
+  heap allocation and does not change the shipped heap builder's zero-copy freeze. Design:
+  [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §7.
 
 - Slicing/indexing **Move-element** collections ("slicing a collection of the Move type … not
   supported yet"). Fixed arrays of Move structs and owned struct-array fields already have

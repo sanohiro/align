@@ -246,6 +246,26 @@ Replacing an owned field or element must preserve the existing mode. Borrowed me
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
 runtime mode, but mutation requires a definite mode.
 
+`Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
+known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the
+active tag, while construction/extraction moves the payload and clears its old owner. Structured
+owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
+ownership models. Arbitrary collections of Move elements remain a separate container capability.
+
+Move-typed function parameters may instead be `borrow x: T` or `borrow mut x: T`; Copy values
+already pass without consuming ownership. A shared borrow does not consume its owner and may return
+an inferred view of the current generation. A mutable borrow is exclusive for the call, ends the
+previous generation, and may return a view of the fresh generation. Borrow modes and inferred
+return-borrow summaries cross module interfaces; lifetimes are never written.
+Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the body has no other
+Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
+and database work remain Impure.
+
+`arena name {}` binds a scope-local `region` capability. Ordinary functions may accept that value to
+allocate into the exact caller-selected arena; returned arena values remain tied to the lexical
+block. The capability is Copy but cannot escape, enter aggregates/tasks/FFI, or be constructed by
+users. Anonymous `arena {}` is the same mechanism without a bound capability.
+
 ### Error handling
 
 ```text
@@ -472,6 +492,23 @@ An `extern "C" link("name")` clause names an external library to link (`-lname`)
 always-linked libc/libm — the visible dependency the `std`/`pkg` C-engine wrappers ride on. A block
 names one library; a repeated name links once.
 
+An FFI wrapper may declare an opaque Move resource:
+
+```align
+pub resource conn = internal.drop_conn
+```
+
+The internal `unsafe fn(raw) -> ()` hook runs exactly once on ordinary cleanup. Construction/raw
+extraction/ownership transfer are private resource intrinsics; a safe public API exposes neither
+`raw` nor manual destroy. `resource_ref<R>` is a Copy view tied to the owner generation and is
+invalidated by owner move/Drop or mutable borrow. Resources are non-Send by default.
+
+`resource.from_raw_borrowed(ptr, parent_ref)` creates a Move child resource tied to one parent
+generation, so the parent cannot move/drop before the child. The private unsafe
+`resource.view_from_raw(owner_ref, ptr, len)` returns an `Option<str>` or
+`Option<slice<FFIScalar>>` tied to that generation after shape/alignment/UTF-8 checks; foreign range
+validity remains the wrapper's unsafe obligation. No owner-free safe raw-to-view conversion exists.
+
 Deliberately out of FFI v1 (draft §15): MEMORY-class or larger-than-16-byte structs by value, and
 all by-value struct ABIs other than x86-64 SysV (struct-by-pointer covers the portable case);
 `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
@@ -509,6 +546,11 @@ items — a private same-module fn/type/const in a generic `pub` body is rejecte
 cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
 qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
 
+Hermetic input discovery includes reachable `.align` units and exact static files explicitly
+registered by compiler-known constructors. Such a constructor cannot scan directories, run code,
+read environment state, or contact the network. Static file content hashes participate in the owning
+unit's cache/implementation identity.
+
 **Packages (the `pkg` layer).** A *package* is a distribution-layer subtree under `pkg/<name>/` (root
 `pkg/<name>.align` + optional submodules), discovered from imports + the filesystem with no manifest —
 the compiler adds no new concept, only two pure path rules on import edges: (1) the **`internal`**
@@ -527,6 +569,7 @@ core.result
 
 core.array
 core.slice
+core.array_builder
 
 core.vec
 core.mask
@@ -542,6 +585,11 @@ core.math
 
 core.arena
 ```
+
+`array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
+`array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
+arena chunks with no hidden heap allocation and performs one documented compacting pass at
+`build()`. Shorter-lived views must first use `clone_in(out)`.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-

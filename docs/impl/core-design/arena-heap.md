@@ -17,12 +17,18 @@ current, deliberately tight, limits.
 
 ```text
 arena { … }                 // expression block; all arena allocations freed at }, O(1)
+arena out { … }             // required L4 form; binds the same arena as `out: region`
 heap.new(x)   -> box<T>     // ONE arg; must be inside an arena {}; T = primitive scalar only
 b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
 ```
 
 That is the entire box surface — no `.set()`, no deref operator.
+
+The named arena line is a settled prerequisite, not yet implemented. It does not widen `box<T>`:
+`out` is a scope-limited allocation-destination capability for ordinary library functions, and
+anonymous/named arenas share the same begin/end and bulk cleanup. Full contract:
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §4.
 
 ## Type & ownership classification
 
@@ -61,6 +67,9 @@ The reference implementation of the region model: `region_of(box) = Arena(depth)
   against `mut` locals and arena values, which already cover the patterns.
 - Escaping boxes (a box that outlives its arena / a global heap tier) — deliberately absent;
   the ownership model's answer to "longer-lived" is Move types, not box lifetimes.
+- **Named `region` implementation (required L4):** parse/bind `arena out {}`, substitute the exact
+  arena through ordinary calls, enforce no escape/storage/task/FFI, and add `clone_in(out)`. The
+  design is settled; only the implementation is outstanding.
 
 ## Pitfalls
 

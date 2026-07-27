@@ -236,6 +236,17 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
+The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
+`docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
+review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). The next
+implementation slice is L1a only: the canonical recursive Drop plan and sound
+`Option<Move>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+variants before L1a–L6 are complete. The required order is L1a recursive DropPlan/owned Option
+fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
+resources, L4 named region capability, L5 deterministic static inputs/Query artifacts, and L6 the
+region plain-struct builder. Native feasibility probes may run independently but create no public
+API.
+
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are
 shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shipped stable
@@ -319,6 +330,9 @@ Language semantics and surface       draft.md
 Current decisions and open items     docs/open-questions.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
+Current pkg.db contract              docs/impl/pkg-design/db.md
+Native library boundary prerequisites docs/impl/17-library-boundary-prerequisites.md
+pkg.db feasibility review            docs/impl/18-pkg-db-review.md
 Cache architecture and parity resolution    docs/impl/10-cache-first-optimization.md
 Test execution policy                docs/impl/16-test-policy.md
 Closure/memory/I/O/SIMD audit        docs/impl/12-pipeline-closure-memory-io-simd-audit.md

@@ -41,6 +41,11 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
+
+array_builder<T>()                 // 実装済みの heap grow/freeze 形式
+array_builder<T>(out: region)      // 必須 L6 の region/plain-struct 形式
+builder.push(value)
+builder.build() -> array<T>
 ```
 
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。
@@ -69,6 +74,13 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 `zip(...).map_into(dst)` では、すべての source と `dst` が重複しないことが証明される。ランタイムの source 読み込みは 1 つの input-vs-output スコープを共有し、source 同士のエイリアスは許可されており、互いに disjoint であるとは宣言されない。
 
 ## 仕様先行(未実装)
+
+- **region-backed plain-struct builder（必須 L6）**: `array_builder<T>(out)` は明示された
+  region 内でchunk単位に成長し、再帰的な `RegionPlain` 要素を受け入れ、最後に文書化された
+  1回のcompact passを行う。短命なviewは挿入前に `clone_in(out)` しなければならない。
+  hidden heap allocationはなく、実装済みheap builderのzero-copy freezeも変更しない。
+  設計は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
+  §7にある。
 
 - **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、読み出しを借用とするか所有権移動とするかという規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。

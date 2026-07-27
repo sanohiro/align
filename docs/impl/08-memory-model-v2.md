@@ -9,7 +9,8 @@ boundary.** The text below retains the original design narrative, while §11 rec
 shipped. Later slices also delivered tuples, `partition`, `array<slice>`/`chunks`, whole-struct
 indexing for supported element shapes, deep-drop `array<string>` producers, and `buffer`.
 Important remaining boundaries include `array<Struct>.clone()`, Move-element indexing, and precise
-per-function return-borrow summaries.
+per-function return-borrow summaries. The settled library-boundary extension that closes the last
+item and adds named destination regions/resources is §14; it is required but not yet implemented.
 
 It exists because the deferred "ideal forms" of M4 and M5 both rest on one foundation:
 - M5 `json.decode` for `str` / `array<T>` / nested fields → zero-copy views region-tied to
@@ -35,16 +36,19 @@ v2 **generalizes these three into one region model** and adds owned heap collect
 
 (From `CLAUDE.md` / `design-notes.md` — non-negotiable.)
 
-- **No visible lifetimes.** Regions are *inferred*, never written in source. There is no
+- **No visible lifetimes.** Borrow lifetimes and owner generations are *inferred*, never written
+  in source. There is no
   `'a`-style annotation, ever. This is the hard constraint that shapes the whole design:
-  the region system is an analysis, not a surface type parameter.
+  the region system is an analysis, not a surface lifetime parameter. The `region` capability
+  settled in §14 selects an allocation destination; it does not name a lifetime relation.
 - **Nothing hidden.** Allocation must be visible in source. The compiler never silently
   inserts a heap allocation or a copy the user did not write. (This decides §9.)
 - **Predictable performance.** An abstraction must not silently change cost class. A small
   source edit must not turn a zero-copy borrow into a hidden full copy.
-- **One ownership model.** value / arena / explicit heap — no new keyword, ownership stays a
-  property of the type (`array`/`string`/`buffer`/heap = Move; primitives/small structs/
-  `slice` = Copy).
+- **One ownership model.** value / arena / explicit heap — ownership stays a property of the
+  type (`array`/`string`/`buffer`/heap/resource = Move; primitives/small structs/
+  `slice`/`resource_ref` = Copy). A package-defined `resource` enters the existing Move/Drop
+  model; it does not create manual-close ownership.
 - **Compiler-friendly by restriction.** The region lattice is total and the rule is a single
   comparison, so the checker stays simple and the optimizer keeps no-alias / contiguous /
   arena-lifetime facts.
@@ -422,8 +426,9 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
        is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
        allocates its fresh accumulator at `depth`.)
    - **Since shipped:** array and nested-struct field decode. Precise per-function borrow inference
-     (which argument, if any, a call result actually borrows) remains a refinement that could lift
-     the conservative region join described in 6b.
+     (which argument, if any, a call result actually borrows) is now a required library-boundary
+     prerequisite (§14). Until that slice lands, the conservative join described in 6b remains the
+     implementation behavior.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
    owned/drop machinery.
    - **[done] 7a — owned `string` + `str.clone()`.** Added `Ty::String`, the heap-owned dual of
@@ -629,3 +634,62 @@ decode-escape semantics and lifted several deferrals. All of the following are n
 - Deep element drop is implemented for producer-owned `array<string>`. It does not imply that every
   container position accepts a Move element: struct fields, sum-type payloads, and element indexing
   retain their documented ownership restrictions.
+
+---
+
+## 14. Settled library-boundary extension (required before `pkg.db`)
+
+The complete design and ordered implementation plan are
+`17-library-boundary-prerequisites.md`. This section fixes how it extends, rather than replaces,
+Memory Model v2.
+
+### 14.1 Recursive tagged Move payloads
+
+Before DB errors/outputs can use the existing `Result` model, `Option`, `Result`, and user sums must
+share the recursive owned-value Drop plan already used by structs. The active tag selects the only
+payload dropped or moved out; the enclosing path-local individual-vs-arena cleanup bit remains the
+single allocation-mode fact. This enables `Option<string>` fields, Move structs/sums as payloads,
+and Move errors propagated by `?` without boxing or a second error type. It does not admit
+recursive types or arbitrary Move-element collections.
+
+### 14.2 Borrowed parameter modes and summaries
+
+`borrow x: T` and `borrow mut x: T` are parameter modes for Move owners. They are not reference
+types and introduce no writable lifetime syntax. Shared borrow preserves the caller's owner;
+mutable borrow additionally ends the previous owner generation. `BorrowState` tracks that
+generation beside the existing lexical `Region`, so an old row/buffer/resource view becomes
+invalid even when it remains lexically in scope.
+
+The conservative "return borrows every view argument" rule is replaced by an inferred,
+canonical `ReturnBorrowSummary::Params(indices)` exported with the function signature. A second
+`ReturnRegionSummary` identifies explicit `region` parameters that may own returned values.
+Imported and same-unit calls therefore apply the same provenance without loading the function body.
+
+### 14.3 Package-defined resources
+
+An opaque `resource` is one native ownership leaf in the existing Move aggregate model. Its
+declared Drop hook is emitted through the same path-local cleanup flags, reverse lexical cleanup,
+early-exit cleanup, and recursive aggregate Drop as `string`/`array` owners. `resource_ref<R>` is
+a Copy view whose provenance is the owner's exact generation. Resource operations add no second
+escape checker, manual close protocol, or package-name special case.
+
+A dependent resource additionally retains an inferred parent `resource_ref` provenance until it
+drops. Native raw views retain the supplied resource generation through the ordinary view
+provenance machinery. Parent-before-child Drop/move and owner-free raw-to-view construction are
+therefore rejected by the same `BorrowState`.
+
+### 14.4 Named destination regions
+
+`arena out {}` binds the already-created arena handle as a scope-limited `region` capability.
+Allocations through a callee's `out: region` substitute that exact `Arena(k)` into the existing
+lattice. The capability cannot outlive the block, cross FFI/tasks, or be stored in an aggregate.
+`clone_in(out)` is an explicit copy into that destination. Anonymous `arena {}` and its cleanup
+remain unchanged.
+
+### 14.5 Mandatory safety matrix
+
+The implementation must cover direct and aggregate view provenance through normal return, `?`,
+`if`, `match`, `loop`/`break`, reassignment, destructuring, function interfaces, and resource Drop.
+A mutable borrow kills the old generation on every continuing and error result path. Every new
+type/HIR/MIR/interface variant participates in the exhaustive region, move, cleanup, effect, task,
+ABI, print, and codec classifications; a catch-all default is a soundness defect.

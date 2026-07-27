@@ -1,5 +1,32 @@
 # History of Align
 
+## General library boundaries and Query-centric databases
+
+Database design exposed several gaps that were already recurring in HTTP, networking, process, and
+other native libraries. Adding another list of compiler-known handle types was rejected
+(2026-07-27). Database-name-specific ownership rules, runtime reflection, an ambient allocator, and
+online normal builds were rejected for the same reason: they hide semantics or duplicate a general
+language rule.
+
+The chosen direction is:
+
+```text
+finite recursive DropPlan for tagged Move payloads
+borrow / borrow mut parameter modes with interface summaries
+package-defined opaque and dependent resources
+owner-tied native views
+named arena region capabilities
+deterministic static source inputs and Query artifacts
+region-backed plain-struct builders
+```
+
+These are mandatory library-boundary prerequisites, not private database builtins and not optional
+cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:
+one named Query owns one visible statement, typed Params and exact flat Row, and ordinary Pure Align
+code may shape that one row stream without receiving a database handle.
+
+---
+
 ## The first idea
 
 The project began with a simple observation.
