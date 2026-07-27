@@ -946,12 +946,14 @@ impl DropPlan {
 pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropPlan {
     let mut struct_cache = vec![None; structs.len()];
     let mut enum_cache = vec![None; enums.len()];
+    let mut struct_active = vec![false; structs.len()];
+    let mut enum_active = vec![false; enums.len()];
     drop_plan_rec(
         ty,
         structs,
         enums,
-        &mut Vec::new(),
-        &mut Vec::new(),
+        &mut struct_active,
+        &mut enum_active,
         &mut struct_cache,
         &mut enum_cache,
     )
@@ -963,8 +965,8 @@ fn drop_plan_rec(
     ty: Ty,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
-    struct_path: &mut Vec<u32>,
-    enum_path: &mut Vec<u32>,
+    struct_active: &mut [bool],
+    enum_active: &mut [bool],
     struct_cache: &mut [Option<std::sync::Arc<DropPlan>>],
     enum_cache: &mut [Option<std::sync::Arc<DropPlan>>],
 ) -> std::sync::Arc<DropPlan> {
@@ -973,13 +975,16 @@ fn drop_plan_rec(
             if let Some(plan) = struct_cache.get(id as usize).and_then(Clone::clone) {
                 return plan;
             }
-            if struct_path.contains(&id) {
+            let Some(active) = struct_active.get(id as usize).copied() else {
+                return std::sync::Arc::new(DropPlan::Invalid);
+            };
+            if active {
                 return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = structs.get(id as usize) else {
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
-            struct_path.push(id);
+            struct_active[id as usize] = true;
             let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
                 .fields
                 .iter()
@@ -991,15 +996,15 @@ fn drop_plan_rec(
                             field.ty,
                             structs,
                             enums,
-                            struct_path,
-                            enum_path,
+                            struct_active,
+                            enum_active,
                             struct_cache,
                             enum_cache,
                         ),
                     )
                 })
                 .collect();
-            struct_path.pop();
+            struct_active[id as usize] = false;
             let needs_drop = fields
                 .iter()
                 .any(|(_, plan)| plan.needs_drop());
@@ -1015,8 +1020,8 @@ fn drop_plan_rec(
             scalar_to_ty(payload),
             structs,
             enums,
-            struct_path,
-            enum_path,
+            struct_active,
+            enum_active,
             struct_cache,
             enum_cache,
         ))),
@@ -1025,8 +1030,8 @@ fn drop_plan_rec(
                 scalar_to_ty(ok),
                 structs,
                 enums,
-                struct_path,
-                enum_path,
+                struct_active,
+                enum_active,
                 struct_cache,
                 enum_cache,
             ),
@@ -1034,8 +1039,8 @@ fn drop_plan_rec(
                 scalar_to_ty(err),
                 structs,
                 enums,
-                struct_path,
-                enum_path,
+                struct_active,
+                enum_active,
                 struct_cache,
                 enum_cache,
             ),
@@ -1044,13 +1049,16 @@ fn drop_plan_rec(
             if let Some(plan) = enum_cache.get(id as usize).and_then(Clone::clone) {
                 return plan;
             }
-            if enum_path.contains(&id) {
+            let Some(active) = enum_active.get(id as usize).copied() else {
+                return std::sync::Arc::new(DropPlan::Invalid);
+            };
+            if active {
                 return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = enums.get(id as usize) else {
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
-            enum_path.push(id);
+            enum_active[id as usize] = true;
             let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
                 .variants
                 .iter()
@@ -1063,8 +1071,8 @@ fn drop_plan_rec(
                                 scalar_to_ty(*payload),
                                 structs,
                                 enums,
-                                struct_path,
-                                enum_path,
+                                struct_active,
+                                enum_active,
                                 struct_cache,
                                 enum_cache,
                             )
@@ -1072,7 +1080,7 @@ fn drop_plan_rec(
                         .collect()
                 })
                 .collect();
-            enum_path.pop();
+            enum_active[id as usize] = false;
             let needs_drop = variants
                 .iter()
                 .flatten()
@@ -26685,6 +26693,34 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&fields[0].1, &fields[1].1),
             "repeated nominal children must share one memoized DropPlan node"
+        );
+    }
+
+    #[test]
+    fn drop_plan_handles_a_deep_linear_nominal_chain() {
+        let mut structs = vec![StructDef {
+            name: "S0".to_string(),
+            fields: vec![FieldDef {
+                name: "copy".to_string(),
+                ty: Ty::Bool,
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        for depth in 1..512 {
+            structs.push(StructDef {
+                name: format!("S{depth}"),
+                fields: vec![FieldDef {
+                    name: "next".to_string(),
+                    ty: Ty::Struct((depth - 1) as u32),
+                }],
+                align: None,
+                c_repr: false,
+            });
+        }
+        assert!(
+            !drop_plan(Ty::Struct(511), &structs, &[]).needs_drop(),
+            "ID-indexed visitation must classify a deep Copy chain without path scans"
         );
     }
 }
