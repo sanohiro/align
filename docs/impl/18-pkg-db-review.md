@@ -1577,7 +1577,8 @@ Scope:
 - emit tag-tested Drop on normal return, early return, and reassignment;
 - move/null the live payload on supported whole-value moves;
 - retain explicit diagnostics for `Option<MoveStruct>` (owned by L1b), recursive types, unsupported
-  deep partial moves, and arbitrary Move collection elements.
+  deep partial moves, arbitrary Move collection elements, and fixed-array element-field replacement
+  of `Option<string>`; whole-element replacement remains the supported collection update.
 
 Planned files:
 
@@ -1619,6 +1620,8 @@ Acceptance behavior:
 - `Some(old) -> Some(new)` and `Some -> None` drop old before replacement;
 - `None -> Some` does not run a spurious Drop;
 - nested outer Move structs containing `Option<string>` fields recurse through the same plan;
+- fixed-array element-field replacement of `Option<string>` is a clean diagnostic rather than an
+  untyped `string`-slot Drop; whole-element replacement uses the recursive plan;
 - `Option<MoveStruct>` remains a clean compile error naming L1b;
 - malformed/unsupported types produce diagnostics rather than compiler panic;
 - generated LLVM has a tag guard and introduces no allocation on `None`.

@@ -1215,6 +1215,9 @@ borrow-bearing type are prohibited.
 - keep `Option<MoveStruct>`, Move sum/Result payloads, recursive types, nested partial moves not
   covered by the existing place machinery, and arbitrary Move collection elements rejected with
   explicit diagnostics until their owning slices;
+- keep fixed-array element-field replacement of `Option<string>` rejected explicitly; replacing
+  the whole element is supported, while a tagged partial collection write needs its own typed
+  conditional-Drop lowering;
 - add no database, resource, borrow syntax, or runtime library dependency.
 
 Planned changed files:

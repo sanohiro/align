@@ -125,6 +125,72 @@ fn field_replacement_covers_all_tag_transitions() {
 }
 
 #[test]
+fn fixed_array_option_string_field_replacement_is_rejected() {
+    let cases = [
+        (
+            "owned-option-fixed-array-field-inline.align",
+            concat!(
+                "Item { detail: Option<string>, n: i64 }\n",
+                "fn main() -> i32 {\n",
+                "  mut items := [Item { detail: Some(\"old\".clone()), n: 1 }]\n",
+                "  items[0].detail = Some(\"new\".clone())\n",
+                "  return 0\n",
+                "}\n",
+            ),
+        ),
+        (
+            "owned-option-fixed-array-field-bound.align",
+            concat!(
+                "Item { detail: Option<string>, n: i64 }\n",
+                "fn main() -> i32 {\n",
+                "  mut items := [Item { detail: Some(\"old\".clone()), n: 1 }]\n",
+                "  value := Some(\"new\".clone())\n",
+                "  items[0].detail = value\n",
+                "  return 0\n",
+                "}\n",
+            ),
+        ),
+    ];
+    for (name, src) in cases {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "tagged fixed-array field replacement must remain rejected: {name}"
+        );
+        assert!(
+            rendered.contains(
+                "element-field assignment of `Option<string>` into a fixed struct array is not supported yet"
+            ),
+            "diagnostic must name the unsupported ownership shape in {name}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn fixed_array_option_string_whole_element_replacement_is_supported() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { detail: Option<string>, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut items := [Item { detail: Some(\"old\".clone()), n: 1 }]\n",
+        "  value := Item { detail: Some(\"newer\".clone()), n: 7 }\n",
+        "  items[0] = value\n",
+        "  return items[0].n as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("owned-option-fixed-array-whole-element", src)
+            .status
+            .code(),
+        Some(7)
+    );
+}
+
+#[test]
 fn field_self_assignment_preserves_value_and_ownership() {
     if !backend_available() {
         return;

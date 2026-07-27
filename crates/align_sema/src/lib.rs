@@ -12117,6 +12117,19 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return Place::Err;
                 }
+                // Fixed struct-array field replacement currently has one owned-leaf lowering:
+                // `string`, whose old `{ptr,len}` slot is dropped unconditionally. Reusing that
+                // operation for `Option<string>` would interpret the tag as a pointer and would
+                // neither conditionally drop the old payload nor transfer/null the new payload.
+                // Keep the tagged collection-partial-write shape explicit until its typed Drop
+                // lowering lands; whole-element replacement already uses the recursive Drop plan.
+                if !soa && !is_dyn && leaf_ty == Ty::Option(Scalar::String) {
+                    self.diags.error(
+                        "element-field assignment of `Option<string>` into a fixed struct array is not supported yet (tagged owned fields need conditional Drop handling; replace the whole element)",
+                        place.span,
+                    );
+                    return Place::Err;
+                }
                 let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
                 if i.ty == Ty::Error {
                     return Place::Err;

@@ -3537,9 +3537,11 @@ L1a establishes the canonical cycle-safe recursive `DropPlan` classifier and adm
 `Option<string>` as the first conditional owned struct-field leaf. Enclosing and nested structs are
 Move, Drop tests the `Option` tag before freeing the live string, supported partial moves zero the
 whole tagged field, and whole-value return/pass/control-flow/reassignment reuse the existing
-path-local cleanup bit. `Option<MoveStruct>` and every other owned `Option` field remain explicit
-L1b diagnostics. The focused ownership and analysis suites plus the alloc-count probe pin balanced
-Some frees, zero None allocations, and the raw LLVM tag guard.
+path-local cleanup bit. Fixed-array element-field replacement of `Option<string>` remains an
+explicit diagnostic until tagged partial collection writes have a typed conditional-Drop lowering;
+whole-element replacement is supported. `Option<MoveStruct>` and every other owned `Option` field
+remain explicit L1b diagnostics. The focused ownership and analysis suites plus the alloc-count
+probe pin balanced Some frees, zero None allocations, and the raw LLVM tag guard.
 
 L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
 they are being built, but no probe API becomes public. Its recorded SQLite/libpq evidence includes
