@@ -83,6 +83,14 @@ fn main() -> i32 {
 }
 
 #[test]
+fn element_replace_from_a_variable_consumes_the_source() {
+    assert!(check_errs(
+        "ms-elem-replace-var-move",
+        "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut us := [User{name: \"a\".clone(), age: 1}]\n  v := User{name: \"new\".clone(), age: 7}\n  us[0] = v\n  return v.age as i32\n}\n"
+    ));
+}
+
+#[test]
 fn whole_array_reassignment_is_rejected() {
     // A fixed array can't be *wholly* reassigned (array values aren't materialized) — assign
     // elements individually. Clean error for a Move-struct array (and a scalar array alike).
@@ -199,6 +207,14 @@ fn main() -> i32 {
 ";
     // "aaaa" freed (drop-of-old), "cc"(2) stored; us[1] "bee"(3) untouched → 2 + 3 = 5.
     assert_eq!(build_and_run("ms-elem-field-reassign", src).status.code(), Some(5));
+}
+
+#[test]
+fn element_owned_field_reassign_consumes_the_source() {
+    assert!(check_errs(
+        "ms-elem-field-reassign-move",
+        "User { name: string }\nfn main() -> i32 {\n  mut us := [User{name: \"old\".clone()}]\n  s := \"new\".clone()\n  us[0].name = s\n  return s.len() as i32\n}\n"
+    ));
 }
 
 #[test]

@@ -9943,12 +9943,9 @@ impl<'a> MoveCheck<'a> {
                         self.invalidate_owner(*root);
                     }
                 }
-                // `base[index] = value` / `base[index].field = value` — writing an element is a use
-                // of `base` (an owned array could have been moved away), so flag use-after-move on
-                // it; index and value are read (not moved; Copy).
-                Stmt::AssignIndex { base, index, value }
-                | Stmt::AssignElemField { base, index, value, .. }
-                | Stmt::AssignElem { base, index, value, .. } => {
+                // `base[index] = value` — primitive array elements are Copy, so the index and value
+                // are read without consuming either.
+                Stmt::AssignIndex { base, index, value } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
@@ -9956,6 +9953,20 @@ impl<'a> MoveCheck<'a> {
                     }
                     self.expr(index, moved, false, false);
                     self.expr(value, moved, false, false);
+                }
+                // Struct element-field and whole-element stores may install an owned `string` or
+                // Move struct. MIR drops the old destination and nulls a moved RHS source, so
+                // MoveCheck must consume that RHS as well. Copy-only dynamic/SoA stores are
+                // unaffected by a consuming context.
+                Stmt::AssignElemField { base, index, value, .. }
+                | Stmt::AssignElem { base, index, value, .. } => {
+                    self.check_borrow_use(*base, index.span);
+                    if whole_moved(moved, *base) {
+                        let name = &self.f.locals[*base as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), index.span);
+                    }
+                    self.expr(index, moved, false, false);
+                    self.expr(value, moved, true, true);
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }

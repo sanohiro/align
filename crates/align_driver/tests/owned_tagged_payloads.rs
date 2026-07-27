@@ -191,6 +191,30 @@ fn fixed_array_option_string_whole_element_replacement_is_supported() {
 }
 
 #[test]
+fn fixed_array_option_string_whole_element_replacement_consumes_source() {
+    let src = concat!(
+        "Item { detail: Option<string>, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut items := [Item { detail: Some(\"old\".clone()), n: 1 }]\n",
+        "  value := Item { detail: Some(\"newer\".clone()), n: 7 }\n",
+        "  items[0] = value\n",
+        "  return value.n as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "owned-option-fixed-array-whole-element-move.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "whole-element replacement must consume a Move-struct source"
+    );
+    assert!(
+        rendered.contains("use of moved value 'value'"),
+        "diagnostic must identify the consumed source:\n{rendered}"
+    );
+}
+
+#[test]
 fn field_self_assignment_preserves_value_and_ownership() {
     if !backend_available() {
         return;
