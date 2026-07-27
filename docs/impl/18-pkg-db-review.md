@@ -69,7 +69,7 @@ listed source agree.
 | Offline metadata artifacts | explicit prepare only; exact derived pathname and canonical fail-closed JSON/identity codecs with independent goldens; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/malformed/reproducible/offline/cache/byte-golden matrix and artifact time/size | pipeline/cache plans, prerequisite plan, DB EN/JA |
 | Options/errors/result | finite scope-specific sums; unsupported is error; connection-global state has one explicit lease; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/overlap/Drop-order/error-buffer tests and zero-allocation result check | DB EN/JA |
 | Migrations | exact entry/catalog/driver/target CLI; versioned catalog/schema-identity codecs and independent goldens; atomic default; one-statement dirty exceptional path | D11 | CLI-input/byte-golden/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
-| Metadata records | exact parseable signatures, typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | syntax/input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
+| Metadata records | exact signature notation plus parseable positional calls, typed refs, pre-native identifier validation/precedence, detail/state/discriminator projection, ordinals/digest, duplicate-key identity, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | signature-table/syntax/input/detail/state/entry/field/identity/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
 | Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
 | Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
 
@@ -1341,8 +1341,8 @@ idea is rejected.
   an argument expression.
 - **Actual failure:** the promised exact public API examples did not parse and left signatures
   ambiguous for implementation.
-- **Recommendation:** show exact declarations separately, use typed local bindings plus positional
-  calls, and syntax-check every normative example.
+- **Recommendation:** show exact signatures as non-source notation, use typed local bindings plus
+  positional calls, and syntax-check every normative Align example.
 - **v1 impact:** D12 API-definition blocker.
 
 ## 3. Answers to the requested feasibility checks
@@ -1535,7 +1535,7 @@ documents:
     and independent driver goldens.
 88. Serialize SQLite connection-global execution with one explicit overlap-safe lease.
 89. Define the versioned migration catalog/schema-identity codecs and independent goldens.
-90. Show exact metadata declarations separately from syntax-checked positional call examples.
+90. Show exact metadata signature notation separately from syntax-checked positional call examples.
 
 ## 5. Revised implementation roadmap
 
@@ -1561,7 +1561,7 @@ documents:
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-input exact-policy SQL migrations with versioned identity codec; initial-release gate | CLI selector, byte/digest golden, checksum/order/atomic/dirty/repair/status | migration fingerprint/startup/large history |
-| D12 | exact parseable validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | syntax; runtime plan source; multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown/group order; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE visible | catalog query count/record bytes/latency |
+| D12 | exact signature notation and parseable validated calls/typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | signature-table parity; syntax; runtime plan source; multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown/group order; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE visible | catalog query count/record bytes/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 

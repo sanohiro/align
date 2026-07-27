@@ -3564,9 +3564,9 @@ projection and ordinal/digest matrix plus pre-native U+0000 rejection for every 
 reference component on both drivers. The matrix includes every Declared/checked/Unknown cell,
 Summary→Parameter→Column group order, canonical duplicate-constraint `key_ordinal`, and
 same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
-multi-invalid error precedence. The D12 gate syntax-checks the exact declarations and positional
-examples, and separately compiled Query metadata must come from the producer-owned plan/thunk
-without runtime artifact I/O. D11 and D12 are part
+multi-invalid error precedence. The D12 gate compares exact signature notation with the owning API
+table, syntax-checks positional examples, and requires separately compiled Query metadata to come
+from the producer-owned plan/thunk without runtime artifact I/O. D11 and D12 are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

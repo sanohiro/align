@@ -792,7 +792,6 @@ CheckedQueryEvidence
 
 QueryMetaPlan
   statement_class: MetaStatementClass
-  visible: bool
   parameters: sequence<DeclaredParameterMeta>
   columns: sequence<DeclaredColumnMeta>
 
@@ -837,9 +836,8 @@ fully substituted Params field type.
 `QueryMetaPlan.parameters` and `.columns` use dense ordinals in their documented bases and contain
 the declared names/types used by D12 at Summary/Full. Checked evidence uses the same ordinal sets
 and order. It is `Some` for a DatabaseChecked Query and `None` for a DatabaseChecked command;
-Declared entries have no evidence payload. `visible` is exactly whether the descriptor item is
-`pub`; named package/project descriptors emit `system = false` in D12. The producer rejects checked
-evidence whose statement class, ordinals, counts, or identities disagree with the declared plan.
+Declared entries have no evidence payload. The producer rejects checked evidence whose statement
+class, ordinals, counts, or identities disagree with the declared plan.
 
 There is one `RewriteEntry` for every placeholder occurrence, including identity rewrites, in the
 same order as `occurrences`. Each pair names the complete source and wire placeholder spans.

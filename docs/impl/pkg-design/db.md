@@ -2335,6 +2335,11 @@ The `Extension` binary record and sequence order are those in §16.3. V1 memory 
 no PRAGMA/attachment input; adding either requires fields in this versioned stream. A configured
 database uses the explicit `schema-id`; PostgreSQL additionally binds the engine-reported search
 path and extensions. Undeclared ambient connection state is forbidden.
+Independent reference fixtures
+`crates/align_driver/tests/golden/schema_identity_{sqlite_empty,sqlite_migrations,sqlite_database,postgres}_v1.hex`
+and sibling `.digest` files pin all three source tags, both catalog Option states, non-ASCII
+`schema_id`/search-path strings, and canonical extension ordering. Production and reference encoders
+share no codec functions.
 
 ### 16.7 PostgreSQL preparation environment
 
@@ -2661,7 +2666,7 @@ and may add native fields, but use the same destination rule.
 
 The exact common declarations are:
 
-```align
+```text
 pub fn meta_database(
   exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
 ) -> Result<db.DatabaseMeta, db.Error>
@@ -2698,8 +2703,9 @@ pub fn explain<P, R>(
 ) -> Result<db.QueryPlan, db.Error>
 ```
 
-Calls use ordinary positional arguments; types belong on bindings/declarations, never in an
-argument:
+The block above is exact API signature notation, not a bodyless Align source file. Calls below are
+ordinary syntax-checked Align positional expressions; types belong on bindings/declarations, never
+in an argument:
 
 ```align
 schema_filter: Option<db.SchemaRef> = None
@@ -3357,9 +3363,10 @@ TableRef whose schema and name are both invalid, and two same-named constraints 
 `key_ordinal` groups are pinned even when their terms match and only their action/deferral policy
 differs. Contradictory native policy rows fail instead of acquiring an ordinal. An unnamed
 constraint returns `name = None`.
-The exact declarations and ordinary positional call examples in §18.2 are parsed/formatted by the
-documentation example test. A separately compiled Query's metadata rows come from its producer-owned
-plan/thunk with zero runtime source/artifact reads.
+The ordinary positional call example in §18.2 is parsed/formatted by the documentation example
+test; the exact signature-notation block is compared with the owning API table. A separately
+compiled Query's metadata rows come from its producer-owned plan/thunk with zero runtime
+source/artifact reads.
 Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
 category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
 operation.

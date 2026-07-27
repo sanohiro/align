@@ -1247,6 +1247,9 @@ SQLite memoryは`Option<catalog_fingerprint>`、SQLite databaseは明示`schema_
 PostgreSQLは明示`schema_id`とsemantic-order search_path、canonical-order extensionsを
 encodeし、そのHash128を`schema_fingerprint`にする。v1 memory prepareはPRAGMA/attachment
 inputを公開せず、追加時はversioned stream fieldが必要。undeclared ambient stateを使わない。
+`schema_identity_{sqlite_empty,sqlite_migrations,sqlite_database,postgres}_v1.hex`と`.digest`の
+independent reference fixtureで全source tag、catalog Option両state、non-ASCII
+schema_id/search_path、extension canonical orderを固定し、production codecを共有しない。
 
 ### 16.7 PostgreSQL prepare environment
 
@@ -1555,7 +1558,7 @@ Option.Noneだがbase identityは常に存在する。`source_sql_hash`、`drive
 
 common declarationは全て明示destination `out: region` をoption sliceの直前に持つ。
 
-```align
+```text
 pub fn meta_database(
   exec: db.exec, detail: db.MetaDetail, out: region, options: slice<db.MetaOption>,
 ) -> Result<db.DatabaseMeta, db.Error>
@@ -1592,7 +1595,8 @@ pub fn explain<P, R>(
 ) -> Result<db.QueryPlan, db.Error>
 ```
 
-call argumentは通常のpositional syntaxで、typeはbinding/declarationにだけ書く。
+上はbodyless Align sourceではなくexact API signature notation。下のcall argumentは
+syntax-checkする通常のpositional Align syntaxで、typeはbinding/declarationにだけ書く。
 
 ```align
 schema_filter: Option<db.SchemaRef> = None
@@ -1951,9 +1955,9 @@ cell、ParameterとColumnを両方持つQuery、schema/nameが両方invalidなTa
 2個についてtermが同一でaction/deferral policyだけが異なる場合もcanonical
 `key_ordinal` groupを固定する。矛盾するnative policy rowはordinalを与えずfailする。
 unnamed constraintは `name = None` を返す。
-§18.2のexact declarationとpositional call exampleをparse/format testし、separate compiled
-Queryのmetadata rowがproducer-owned plan/thunkだけからruntime artifact I/Oなしで得られる
-ことを固定する。
+§18.2のpositional call exampleをparse/formatし、signature notationはowning API tableと
+比較する。separate compiled Queryのmetadata rowがproducer-owned plan/thunkだけからruntime
+artifact I/Oなしで得られることを固定する。
 `EXPLAIN ANALYZE` は実行を明示する。
 
 ### D13 — batch、SoA、高価値native path
