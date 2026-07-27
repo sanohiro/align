@@ -3623,19 +3623,30 @@ order are in `impl/17-library-boundary-prerequisites.md` §§2, 4, and 7.
 
 ### Borrowed parameters and package-defined opaque resources — Settled 2026-07-27
 
-Library code may declare `borrow x: T` and `borrow mut x: T` parameters. A shared borrow preserves
-caller ownership and may return a view tied to the caller's exact owner generation. A mutable
-borrow additionally ends the previous generation, invalidating every older view, and returns any
-new view in the fresh generation. Borrow modes and inferred return-borrow summaries are part of
-the exported interface. User-written lifetime parameters are not introduced. Mutation rooted only
-in an explicit `borrow mut` parameter remains Pure when there is no other Impure operation; it is
-an alias-checked exclusive input effect, not hidden captured mutation.
+Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow is for Move
+types: it preserves caller ownership and may return a view tied to the caller's exact owner
+generation. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
+the previous generation, invalidates every older view, and returns any new view in the fresh
+generation. Parameter modes and inferred return-borrow summaries are part of the exported
+interface; `Fn`/`FnTy` also retains every mode so indirect calls use the direct-call ABI.
+User-written lifetime parameters are not introduced. Mutation rooted only in an explicit
+`borrow mut` parameter remains Pure when there is no other Impure operation; it is an alias-checked
+exclusive input effect, not hidden captured mutation.
+
+`borrow`, `out`, and `resource` are contextual words, not globally reserved tokens. Exact lookahead
+distinguishes `borrow name: T`/`out name: T` modes from parameters named
+`borrow: T`/`out: region`; item-position lookahead distinguishes a resource declaration from
+ordinary `resource.*` intrinsic paths.
 
 `pub resource name = internal.drop_name` declares a package-defined opaque one-word Move owner
-with an exactly-once Drop hook. Only the declaring module's canonical descendant subtree may
-construct or extract its `raw` representation, and only inside `unsafe`. The raw-only Drop-hook
-module need not import the declaring root, so a driver descendant can construct the root resource
-without a root↔internal cycle. Safe code receives a non-owning
+with an exactly-once Drop hook. The source hook is a `pub fn(raw) -> ()` inside the allowed
+`internal` subtree and performs destruction in an `unsafe {}` body; there is no `unsafe fn` syntax.
+The resource producer synthesizes a hidden support thunk whose symbol/ABI fingerprint crosses
+interfaces, so consumer cleanup links without importing the internal source module. Only the
+declaring module's canonical descendant subtree may construct or extract the `raw` representation,
+and only inside `unsafe`. The raw-only Drop-hook module need not import the declaring root, so a
+driver descendant can construct the root resource without a root↔internal cycle. Safe code receives
+a non-owning
 `resource_ref<R>` through borrowing; it cannot close, transfer, or outlive the owner generation.
 `resource.from_raw_borrowed` lets a child resource retain one parent generation until child Drop.
 The unsafe internal `resource.view_from_raw` returns an owner-tied checked `Option<str>`/slice; no
@@ -3901,6 +3912,12 @@ content hash; the compiler never scans a directory, consults an environment vari
 script, or contacts a service to discover it. This narrow rule lets a named Query own
 same-basename SQL while preserving the original hermetic-build invariant. It is not a general
 compile-time file API.
+
+For Query/command artifacts, the recognized constructor is legal only as the complete
+single-expression body of one named zero-argument non-generic descriptor function. Conditional,
+multiple, nested, helper-wrapped, block-bodied, and ordinary expression uses are rejected. The
+fully qualified module/function identity is therefore a unique artifact/thunk slot and remains
+stable under line movement.
 
 Dependency *names* remain derivable from source (`grep 'import pkg\.'` — no manifest to drift,
 same argument as M15's unit graph). Only *sources/versions* need recording, and that record

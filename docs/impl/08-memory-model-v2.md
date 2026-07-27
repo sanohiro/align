@@ -654,11 +654,12 @@ recursive types or arbitrary Move-element collections.
 
 ### 14.2 Borrowed parameter modes and summaries
 
-`borrow x: T` and `borrow mut x: T` are parameter modes for Move owners. They are not reference
-types and introduce no writable lifetime syntax. Shared borrow preserves the caller's owner;
-mutable borrow additionally ends the previous owner generation. `BorrowState` tracks that
-generation beside the existing lexical `Region`, so an old row/buffer/resource view becomes
-invalid even when it remains lexically in scope.
+`borrow x: T` is a shared parameter mode for Move owners. `borrow mut x: T` accepts a writable Move
+or Copy place, updates caller storage, and ends the previous generation. They are not reference
+types and introduce no writable lifetime syntax. `BorrowState` tracks that generation beside the
+existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
+lexically in scope. All parameter modes are retained in function-value types; direct and indirect
+calls share one ABI and alias/provenance check.
 
 The conservative "return borrows every view argument" rule is replaced by an inferred,
 canonical `ReturnBorrowSummary::Params(indices)` exported with the function signature. A second
@@ -668,8 +669,10 @@ Imported and same-unit calls therefore apply the same provenance without loading
 ### 14.3 Package-defined resources
 
 An opaque `resource` is one native ownership leaf in the existing Move aggregate model. Its
-declared Drop hook is emitted through the same path-local cleanup flags, reverse lexical cleanup,
-early-exit cleanup, and recursive aggregate Drop as `string`/`array` owners. `resource_ref<R>` is
+producer-owned hidden support thunk calls the `pub` raw-only hook inside the package's `internal`
+boundary and is emitted through the same path-local cleanup flags, reverse lexical cleanup,
+early-exit cleanup, and recursive aggregate Drop as `string`/`array` owners. The thunk identity
+crosses interfaces, so a consumer links cleanup without importing internal source. `resource_ref<R>` is
 a Copy view whose provenance is the owner's exact generation. Resource operations add no second
 escape checker, manual close protocol, or package-name special case.
 

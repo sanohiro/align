@@ -244,8 +244,10 @@ implementation slice is L1a only: the canonical recursive Drop plan and sound
 variants before L1a–L6 are complete. The required order is L1a recursive DropPlan/owned Option
 fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query artifacts, and L6 the
-region plain-struct builder. Native feasibility probes may run independently but create no public
-API.
+region plain-struct builder. L2 includes contextual parameter parsing, mutable Copy state, and
+function-value modes. L3 includes a producer-owned linkable Drop thunk. L5 permits exactly one
+whole-body static constructor per uniquely named descriptor item. Native feasibility probes may run
+independently but create no public API.
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are

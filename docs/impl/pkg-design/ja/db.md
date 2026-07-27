@@ -244,9 +244,11 @@ db.value
 - `db.exec_result`: affected rowsと利用可能なcommand status。
 - `db.row` / `db.value`: 明示的dynamic escape hatch。
 
-common rootがresource typeを宣言し、rawだけを受けるDrop hookを
-`pkg.db.internal.resource` に置く。resource表現intrinsicは宣言moduleのdescendant subtree
-だけが使える。public driver descendantは `pkg.db` をimportし、raw-only internal FFI
+common rootがresource typeを宣言し、rawだけを受ける `pub` Drop hookを
+`pkg.db.internal.resource` に置く。hookは通常のfnと `unsafe {}` bodyで書き、
+resource宣言からproducer-owned hidden support thunkを生成する。consumer cleanupは
+internal moduleをimportせずそのthunkへlinkする。resource表現intrinsicは宣言moduleの
+descendant subtreeだけが使える。public driver descendantは `pkg.db` をimportし、raw-only internal FFI
 helperの結果を検査して、expected `db.conn` として `resource.from_raw` を直接呼ぶ。
 internal Drop-hook moduleは `pkg.db` をimportしない。
 
@@ -334,7 +336,8 @@ pub fn query() -> db.query<Params, Row> =
 
 pathはcompile-time literalで、定義module directoryからのrelative pathである。
 absolute path、lexical `..`、project/package root外へのsymlink escapeを拒否する。
-UTF-8 exact bytesをSourceMapへ登録し、newline normalizationなしでhash/sendする。
+UTF-8 exact source bytesをSourceMapへ登録し、newline normalizationなしでhashする。
+runtimeは選択driver用に決定的に生成したwire entryを送る。
 
 ### 5.3 inline SQL
 
@@ -369,6 +372,13 @@ IStaticQuery              public interface contract
   driver restriction
   public static options
 ```
+
+static constructorは、named・zero-argument・non-generic descriptor functionの
+single-expression body全体として正確に1回だけ書ける。conditional、multiple、block、
+nested、helper wrapper、通常expressionでの使用はcompile errorである。Query IDは
+fully-qualified module path + descriptor function nameとし、同じmodule内の2 descriptorは
+別artifact/thunk slotを持つ。private descriptorはmodule内だけ、`pub` descriptorはinterface
+外へ公開できる。
 
 SQL-only/private metadata変更はproducer object/artifactをinvalidateするが、public contractが
 同じconsumerは再type-checkしない。Params/Row/restriction/public option/required metadata
@@ -516,8 +526,9 @@ pub fn step(
 
 `step` はPureでDB handleを受けない。stateとbuilderへのmutationは明示的 `borrow mut`
 inputだけにrootedする。builderはstruct fieldへ入れず、runの独立した
-`mut groups := array_builder(out)` localとして保持し、最後に `groups.build()` をconsumeする。
-runのrows loopがSQLを1回だけ実行する。
+`mut groups := array_builder(out)` localとして保持する。runはCopy/view stateの検証を先に
+終え、`groups_out := groups.build()` として、Output/Resultを同じrun内で直接構築する。
+arena-owned arrayを通常functionへby-valueで渡さない。runのrows loopがSQLを1回だけ実行する。
 
 ### 7.3 一対多: 複数parent
 
@@ -1169,10 +1180,10 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 ```text
 L1a recursive DropPlan + Option<Move> field
 L1b Move sum/Option/Result payload completion
-L2  borrow/borrow mut + interface return provenance
-L3  opaque/dependent resource + resource_ref/native view
+L2  contextual borrow mode + Copy mutation + Fn mode + interface return provenance
+L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
 L4  named arena region + clone_in
-L5  deterministic static input + Query artifact
+L5  deterministic static input + one-item Query identity/artifact
 L6  RegionPlain region array_builder
 ```
 
@@ -1320,6 +1331,11 @@ execution-count付きで実証する。
 30. region builder allocationと1 compact passを測る。
 31. structured Move error/Outputはordinary recursive tagged Drop、Ok path error allocationなし。
 32. 3 moduleは1つの `pkg/db` subtreeでacyclic。
+33. contextual `borrow`/`out`/`resource` parsingでcanonical signature/intrinsicがparseできる。
+34. Copy stateのmutable borrowとindirect borrow-mode callがcaller mutation/ABIを保存する。
+35. imported resource Dropがproducer thunkへlinkしexactly once。
+36. 1 descriptorはwhole-body constructor 1個とunique artifact/thunk slotを持つ。
+37. arena-built compound arrayはinlineでOutputへ入り、通常by-value callを越えない。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

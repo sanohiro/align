@@ -251,12 +251,15 @@ problem: a native owner is Move, its safe operations borrow it, and its destruct
 exactly once. Encoding each one as a new compiler-known type makes `std` privileged forever and
 prevents ordinary `pkg` code from providing equally safe wrappers; exposing `raw` plus `close`
 instead makes the safety invariant a caller convention. The common answer is a
-package-defined opaque `resource` whose representation and Drop hook are accessible only to the
-declaring module's unsafe descendant subtree. Its raw-only Drop-hook module need not import the
+package-defined opaque `resource` whose representation is accessible only to the declaring
+module's unsafe descendant subtree. Its raw-only source hook is `pub` only inside the package's
+`internal` boundary; the resource producer supplies a hidden linkable Drop thunk, so consumers
+neither import the hook nor lose separate-compilation cleanup. The hook module need not import the
 declaring root, so a driver submodule can construct the public root resource without a cycle or a
-public raw constructor. Shared `borrow` and invalidating `borrow mut`
-parameters preserve caller ownership, while inferred owner generations prevent a returned view
-from surviving replacement, mutation, or Drop. This generalizes the existing Move/Drop and
+public raw constructor. Shared `borrow` preserves Move ownership; invalidating `borrow mut` also
+updates a writable Copy state aggregate in place. Parameter modes remain part of function values,
+so indirect calls cannot erase the ownership ABI. Inferred owner generations prevent a returned
+view from surviving replacement, mutation, or Drop. This generalizes the existing Move/Drop and
 borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
 ownership model.
 

@@ -20,6 +20,13 @@ deterministic static source inputs and Query artifacts
 region-backed plain-struct builders
 ```
 
+The same review fixed the boundary details before implementation: `borrow mut` may update a writable
+Copy aggregate; parameter modes survive in function-value types; contextual `borrow`/`out`/
+`resource` words keep intrinsic paths and `out: region` parseable; a resource producer emits a
+hidden linkable Drop thunk for its `pub` internal raw hook; and each static Query constructor is the
+single whole body of one uniquely named descriptor item. Arena-owned builder output is finalized
+inline rather than passed through a forbidden by-value call.
+
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:
 one named Query owns one visible statement, typed Params and exact flat Row, and ordinary Pure Align

@@ -63,6 +63,8 @@ removed outright (no alias survives, per the no-backward-compat rule).
   precedent).
 - `array_builder<T>` is one mutable-local Move owner. A helper may mutate the same owner through a
   `borrow mut` parameter after L2, but the builder is never an aggregate field or return value.
+- An arena-owned result of `array_builder(out).build()` is consumed into its final aggregate in the
+  same function; it is not passed by value through an ordinary call boundary.
 - Slices are Copy views; a `mut slice<T>` binding (or `out` param) is the one writable-view form.
 - `.count()` is the *pipeline* length (composes with `where`); `.len()` is the direct read. Both
   exist on purpose — do not merge them.

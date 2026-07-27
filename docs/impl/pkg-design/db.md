@@ -320,12 +320,14 @@ Required meaning:
 - `db.exec_result` contains affected-row and available command-status information.
 - `db.row` and `db.value` are explicit dynamic escape hatches.
 
-The common root declares the resource types and names raw-only Drop hooks in
-`pkg.db.internal.resource`. Resource representation privilege applies to the declaring module's
-descendant subtree. A public driver descendant imports `pkg.db`, obtains tagged raw native state
-from raw-only internal FFI helpers, checks failure, and calls `resource.from_raw` with expected type
-`db.conn`; no public raw constructor exists. The internal Drop-hook module accepts only `raw` and
-does not import `pkg.db`. The dependency direction is therefore:
+The common root declares the resource types and names `pub`, raw-only Drop hooks in
+`pkg.db.internal.resource`. Each hook is an ordinary function with an `unsafe {}` body; the resource
+declaration generates the root producer's hidden support thunk used by separate-compilation cleanup.
+Resource representation privilege applies to the declaring module's descendant subtree. A public
+driver descendant imports `pkg.db`, obtains tagged raw native state from raw-only internal FFI
+helpers, checks failure, and calls `resource.from_raw` with expected type `db.conn`; no public raw
+constructor exists. The internal Drop-hook module accepts only `raw` and does not import `pkg.db`.
+The dependency direction is therefore:
 
 ```text
 pkg.db                    -> pkg.db.internal.resource   (raw Drop/dispatch)
@@ -445,7 +447,8 @@ Rules:
 - absolute paths are rejected;
 - lexical `..` or symlink escape outside the project/package root is rejected;
 - the file must be UTF-8 and is registered in `SourceMap`;
-- the exact SQL bytes are hashed and sent to the database without newline normalization;
+- the exact source SQL bytes are hashed without newline normalization; the selected deterministic
+  driver wire entry is sent at runtime;
 - the file content is a build input;
 - a changed file changes the Query hash and invalidates checked metadata.
 
@@ -486,10 +489,16 @@ producer implementation / StaticQueryArtifact
   generated bind and decode thunks
 ```
 
-The Query ID is the fully-qualified module path plus descriptor function name, never an absolute
-filesystem path. A SQL-only edit recompiles/relinks the producer and invalidates checked metadata,
-but it does not recompile consumers when `Params`, `Row`, driver restriction, and static semantic
-options are unchanged. A public-contract change updates `interface_hash` and invalidates consumers.
+A static constructor is legal only as the complete single-expression body of one named,
+zero-argument, non-generic descriptor function. The body contains exactly one resolved constructor
+call. Conditional, repeated, block-bodied, nested, helper-wrapped, and ordinary expression uses are
+compile errors. A private descriptor is valid within its module; `pub` exports it. The Query ID is
+the fully-qualified module path plus descriptor function name, never an absolute filesystem path or
+an ambiguous call span. Two descriptor functions in one module therefore receive distinct
+artifact/thunk slots. A SQL-only edit recompiles/relinks the producer and invalidates checked
+metadata, but it does not recompile consumers when `Params`, `Row`, driver restriction, and static
+semantic options are unchanged. A public-contract change updates `interface_hash` and invalidates
+consumers.
 
 The runtime descriptor points to immutable producer-owned static data and generated binder/decoder
 thunks. `P` and `R` are compile-time contracts; there is no runtime reflection, per-row field-name
@@ -765,7 +774,12 @@ pub fn run(
     row := db.next(rows)? else { break }
     step(state, groups, row, out)?
   }
-  return finish(state, groups.build())
+  parent := state.parent else return Ok(None)
+  groups_out := groups.build()
+  return Ok(Some(Output {
+    parent,
+    groups: groups_out,
+  }))
 }
 ```
 
@@ -774,7 +788,10 @@ execution and allocation. The normal `loop` is intentional: it avoids adding a d
 generic callback ABI or extending Align's closed minimal-generics surface merely to hide a loop.
 `borrow mut` gives the Pure step exclusive access without transferring the arena-owned Move state
 or builder across a by-value call. The builder remains one separate mutable local; L6 does not put
-builders in aggregate fields or add aggregate builder movement.
+builders in aggregate fields or add aggregate builder movement. Final validation that needs only
+Copy/view state may run before `build()`, but the arena-owned array is not passed by value to a
+helper. The Query-local `run` consumes the builder and constructs the returned Output/Result inline,
+so the existing arena-owned call-boundary rule remains intact.
 
 ### 6.4 Prepared statements
 
@@ -936,8 +953,12 @@ fn step(
 
 `run` initializes `user_name` to the static empty view while `seen == false`, binds a separate
 `mut groups := array_builder(out)` local, constructs exactly one `db.rows` stream, advances it in a
-normal `loop`, calls `step(state, groups, row, out)` once per row, and passes `groups.build()` to
-`finish`. The helper error constructors above return fully populated
+normal `loop`, and calls `step(state, groups, row, out)` once per row. It returns `None` when
+`state.seen` is false; otherwise it validates/finalizes the Copy parent state, binds
+`groups_out := groups.build()`, and directly constructs
+`Ok(Some(Output { user: User { ... }, groups: groups_out }))` in `run`. It never passes the
+arena-owned array through an ordinary by-value function call. The helper error constructors above
+return fully populated
 `db.Error` values for this Query identity. The recursive tagged-Move, builder, and region support
 are mandatory prerequisites, not decisions left to the driver. The semantics are:
 
@@ -2233,10 +2254,10 @@ Land the seven PRs specified in
 ```text
 L1a recursive DropPlan + Option<Move> fields
 L1b Move sum/Option/Result payload completion
-L2  borrow / borrow mut parameters + interface return-borrow summaries
-L3  package-defined opaque/dependent Move resource + resource_ref/native views + exactly-once Drop
+L2  contextual borrow modes + Copy mutation + Fn modes + interface return-borrow summaries
+L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
-L5  deterministic static inputs + StaticQueryArtifact + descriptor skeleton
+L5  deterministic static inputs + one-item Query identity + StaticQueryArtifact/descriptor
 L6  region-backed PlainStruct array_builder
 ```
 
@@ -2501,6 +2522,11 @@ The design is implemented correctly only if all are true:
     the successful path allocates no error storage.
 32. `pkg.db`, `.sqlite`, and `.postgres` are acyclic modules in one `pkg/db` package subtree, not
     falsely independent package versions.
+33. Contextual `borrow`/`out`/`resource` parsing accepts every canonical signature and intrinsic.
+34. Mutable borrowing Copy state and indirect borrow-mode calls preserve caller mutation and ABI.
+35. Imported resource Drop links through the producer thunk and executes exactly once.
+36. Each descriptor contains one whole-body constructor and owns one unique artifact/thunk slot.
+37. Arena-built compound arrays enter Output inline and never cross an ordinary by-value call.
 
 ---
 

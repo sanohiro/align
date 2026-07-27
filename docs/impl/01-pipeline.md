@@ -54,7 +54,9 @@ executable
 - Resolution of `module` / `import`, symbol table construction, binding references → definitions.
 - Visibility (`pub`) checking.
 - Resolution of compiler-known static constructors. Only a resolved recognized callee with literal
-  definition-time input may register a static file; a same-spelled local/user function cannot.
+  definition-time input may register a static file; a same-spelled local/user function cannot. A
+  Query/command constructor must be the single whole expression body of a named zero-argument
+  non-generic descriptor function, making module+item one unique artifact identity.
 
 ### Sema (2) Type Inference / Type Checking (`align_sema`)
 - Local type inference (deciding the type of `x := 10`) and reconciliation with annotations.
@@ -93,7 +95,7 @@ executable
 ### Codegen (`align_codegen_llvm`)
 - MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM's vector type / select and emits vector instructions deterministically.
 - Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
-- Package resources become generic Drop-hook calls. Generated Query bind/decode thunks and immutable
+- Package resources become generic producer-owned Drop-thunk calls. Generated Query bind/decode thunks and immutable
   descriptors lower from MIR/static artifacts without runtime reflection.
 
 ### Driver (`align_driver`)

@@ -77,9 +77,9 @@ idea is rejected.
 - **Current Align constraint:** an ordinary Move parameter consumes its argument. Existing builtin
   handles have bespoke receiver behavior; there is no general public function parameter mode for a
   shared or exclusive borrow.
-- **Actual failure:** a package function either consumes the connection/statement/state on every
-  call or requires another compiler-known database handle exception. Passing a Move shaping state by
-  value also makes the one-pass shaper unusable.
+- **Actual failure:** a package function either consumes the connection/statement on every call or
+  requires another compiler-known database handle exception. A reusable Move shaper state would
+  have the same problem; Copy-state in-place mutation is covered separately by F20.
 - **Recommendation:** L2 adds `borrow` and `borrow mut` parameter modes, unchanged call syntax,
   caller-side alias checks, interface-visible return provenance, and Pure classification for
   mutation rooted only in an explicit exclusive input.
@@ -324,12 +324,98 @@ idea is rejected.
   These are scheduled prerequisites for their features, not vague “maybe later” items.
 - **v1 impact:** later additions; only D1–D10 block the initial Query product.
 
+### F19 — reserved `resource`/`borrow` words make required intrinsics unparsable
+
+- **Classification:** current Align conflict; specification ambiguity.
+- **Problematic design location:** L2 parameter syntax and L3 `resource.from_raw`/
+  `resource.borrow` calls.
+- **Current Align constraint:** dotted paths require identifier segments; globally reserving
+  `resource` and `borrow` removes those identifiers.
+- **Actual failure:** the canonical resource API cannot reach parsing, and `out: region` is
+  greedily misread as an out-mode prefix.
+- **Recommendation:** make `borrow`, `out`, and `resource` contextual. Exact token lookahead
+  distinguishes mode/declaration positions from ordinary parameter names and dotted paths.
+- **v1 impact:** blocker for L2/L3 syntax; resolved in the revised prerequisite grammar.
+
+### F20 — Move-only `borrow mut` cannot update the canonical Copy shaper state
+
+- **Classification:** current Align conflict; prerequisite feature missing.
+- **Problematic design location:** `pkg-design/db.md` §§6.3 and 7.2 `step(borrow mut state: State)`.
+- **Current Align constraint:** the proposed L2 text originally rejected both borrow modes for Copy,
+  but the state made from bool/integer/view fields is Copy.
+- **Actual failure:** passing it by value discards mutations, while the declared `borrow mut` form is
+  rejected.
+- **Recommendation:** keep shared borrow Move-only, but admit mutable borrow of any writable Move or
+  Copy place with one pointer-to-caller-storage ABI and generation invalidation.
+- **v1 impact:** blocker for D10; resolved as a general in-place state capability.
+
+### F21 — resource Drop hooks lacked valid syntax and separate-compilation linkage
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** L3's original `unsafe fn drop_conn(raw)` and private sibling hook.
+- **Current Align constraint:** Align has `unsafe {}` blocks, not unsafe-function declarations;
+  private sibling items are neither source-visible to the root nor linkable from consumer cleanup.
+- **Actual failure:** the resource declaration cannot resolve, or an imported resource Drop has no
+  legal symbol.
+- **Recommendation:** use a `pub fn(raw) -> ()` inside the package's allowed `internal` subtree with
+  an unsafe body. The resource producer synthesizes a non-user-callable hidden support thunk and
+  exports its symbol/ABI fingerprint in resource metadata.
+- **v1 impact:** blocker and soundness requirement for every L3 resource.
+
+### F22 — function values erased borrow/out parameter modes
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** L2 function modes versus existing first-class named functions.
+- **Current Align constraint:** current `Fn`/`FnTy` records argument types/return/effect but not
+  `ParamMode`.
+- **Actual failure:** binding `inspect` then indirectly calling it can select a by-value ABI, consume
+  a Move owner, or miscompile a caller-storage pointer.
+- **Recommendation:** define `Fn([(ParamMode,Ty)],Ret,Effect)` end to end. Exact mode equality and the
+  direct-call ABI apply to bindings, joins, interfaces, indirect calls, and codegen.
+- **v1 impact:** blocker for sound L2; must ship in the L2 prerequisite PR.
+
+### F23 — `out: region` conflicts with out-parameter parsing
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** every L4/D10 destination-region signature.
+- **Current Align constraint:** `out` is a contextual parameter-mode word.
+- **Actual failure:** greedy mode parsing consumes the intended parameter name and fails at `:`.
+- **Recommendation:** exact lookahead: `out ident :` is a mode plus name; `out :` is an ordinary
+  name. Apply the same contextual rule to `borrow`.
+- **v1 impact:** blocker for L4 syntax; resolved in the frontend contract.
+
+### F24 — region-built arrays cannot cross the ordinary by-value helper boundary
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** original `finish(state, groups.build())`.
+- **Current Align constraint:** an arena-owned Move value cannot be passed by value to an ordinary
+  function.
+- **Actual failure:** the canonical compound-output example is ill-typed or would need an unsafe
+  hidden transfer.
+- **Recommendation:** validate Copy/view state before build, then consume the builder and construct
+  Output/Option/Result inline in Query-local `run`. Do not add a DB-specific region-transfer call.
+- **v1 impact:** blocker for the example, resolved without broadening L4.
+
+### F25 — function-only Query IDs collide when one function has multiple constructors
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** static constructors as unrestricted ordinary calls versus Query
+  ID = module + descriptor function.
+- **Current Align constraint:** one function can otherwise contain nested, conditional, or repeated
+  calls with the same item identity.
+- **Actual failure:** SQL bytes, generated thunks, and artifact slots collide or become
+  control-flow-dependent build inputs.
+- **Recommendation:** accept a recognized constructor only as the entire single-expression body of
+  one named zero-argument non-generic descriptor function. Reject every other placement.
+- **v1 impact:** blocker for deterministic L5 artifacts; resolved in the revised descriptor rule.
+
 ## 3. Answers to the requested feasibility checks
 
-1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move
-   calls, imported return provenance, dependent native handles, named regions, current generics, and
-   static non-Align inputs. L1a–L6 are the required general repairs. Module/FFI/package rules are
-   compatible after the revised layering.
+1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
+   calls, function-value modes, imported return provenance, dependent native handles/linkable Drop,
+   contextual parameter parsing, named regions, current generics, and static non-Align inputs.
+   L1a–L6 are the required general repairs. Module/FFI/package rules are compatible after the
+   revised layering.
 2. **Package boundary:** `pkg.db`, `.sqlite`, and `.postgres` are appropriate public names only as
    three modules of one vendorable `pkg/db` subtree. They are not three independent versions.
 3. **Ordinary package code:** public data shapes, options/errors/metadata, safe FFI wrappers,
@@ -341,9 +427,11 @@ idea is rejected.
    Query contract checking, placeholder scan/source maps, artifacts/hashes, and generated
    binder/decoder thunks.
 6. **Static `db.query<Params,Row>`:** a Copy immutable descriptor data record plus direct generated
-   binder/decoder functions. It is not an object with reflection or a runtime SQL parser.
+   binder/decoder functions. Its function body is exactly one constructor, giving the item one
+   unique artifact identity. It is not an object with reflection or a runtime SQL parser.
 7. **Sibling `.align`/`.sql`:** a path-free registered constructor maps the defining module's exact
-   extension to `.sql`; exact bytes, logical path, kind, and digest are deterministic inputs.
+   extension to `.sql`; exact source bytes, logical path, kind, and digest are deterministic inputs,
+   separate from deterministic driver wire bytes.
 8. **Module export:** `IStaticQuery` carries the public contract; `StaticQueryArtifact` carries SQL
    and implementation metadata. A private SQL-only edit rebuilds/relinks the producer without
    invalidating unchanged consumers.
@@ -358,7 +446,8 @@ idea is rejected.
 12. **Conn/tx execution:** two concrete constructors produce one `db.exec` Copy sum of resource
     references. No public trait hierarchy.
 13. **One-pass shaping:** Query-local visible rows loop plus Pure exclusive-state `step`; the step
-    has no DB handle, and transitive effects reject hidden I/O.
+    has no DB handle, and transitive effects reject hidden I/O. The orchestrator constructs its
+    arena-owned Output inline after builder finalization.
 14. **Compound Output builders:** L6 region-backed `RegionPlain` builder with chunk growth and one
     measured compacting pass. Builders stay separate mutable locals and are borrowed by the Pure
     step.
@@ -383,7 +472,8 @@ documents:
 
 1. Make L1a–L6 mandatory before a safe driver.
 2. Replace builtin-handle enumeration with general package-defined/dependent resources.
-3. Add borrowed parameters, imported return provenance, and the exclusive-input purity rule.
+3. Add contextual borrowed parameters, mutable Copy-state update, function-value parameter modes,
+   imported return provenance, and the exclusive-input purity rule.
 4. Add named region capabilities and a region-backed plain-struct builder.
 5. Define exact static-input resolution, SourceMap behavior, hashes, and cache boundaries.
 6. Split Query public interface from producer implementation artifact.
@@ -396,6 +486,12 @@ documents:
 13. Make option representation/scopes/disposition exact.
 14. Define explicit offline prepare/check modes and canonical metadata invalidation.
 15. Split minimal SQLite/PostgreSQL verticals from broad metadata/native/dynamic work.
+16. Make resource Drop source hooks valid `pub` internal functions with unsafe bodies and generated
+    producer-owned linkable thunks.
+17. Parse `borrow`/`out`/`resource` contextually, including `out: region`.
+18. Restrict each static constructor to one whole-body descriptor item with a unique Query ID.
+19. Keep region builders as separate locals and construct arena-owned compound output inline.
+20. Separate exact source SQL identity from deterministic per-driver wire SQL identity.
 
 ## 5. Revised implementation roadmap
 
@@ -403,8 +499,8 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan; `Option<Move>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | `borrow`, `borrow mut`, effect/provenance summaries | same-unit/per-unit alias and escape parity | borrowed-call and interface-size cost |
-| L3 | resource, resource_ref, dependent child, native view | exact Drop, invalid pointer, parent/child escape | resource/ref/view overhead and IR |
+| L2 | contextual borrow modes, Copy mutation, Fn modes, provenance | direct/indirect and same/per-unit parity | borrowed-call and interface-size cost |
+| L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
 | L5 | static inputs, Query/command artifacts, descriptor skeleton | cache matrix, path safety, reproducibility | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
@@ -484,10 +580,13 @@ Acceptance behavior:
 The delivery is not performance-complete without:
 
 - L1a/L1b tagged-Move branch, allocation, and Drop counts;
-- L2 borrowed call versus current builtin receiver plus interface summary size/time;
-- L3 resource construction/ref/dependent Drop/native-view checks versus direct current handle path;
+- L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver, plus
+  interface summary size/time;
+- L3 resource construction/ref/dependent cross-unit Drop thunk/native-view checks versus direct
+  current handle path;
 - L4 named/anonymous arena parity;
-- L5 cold and warm rebuild matrix for unchanged, SQL-only, private, and public contract changes;
+- L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, and public
+  contract changes, plus descriptor-count scaling;
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
 - D1 generated binder/decoder versus hand-written field/ordinal code;
 - D2 direct libsqlite3 comparison;

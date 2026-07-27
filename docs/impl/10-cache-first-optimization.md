@@ -17,7 +17,8 @@ items below remain proposals, not descriptions of a missing CAS. Audit baseline:
 > deliberately cold run, but is no longer a correctness-audit workaround.
 
 > **Static-input extension settled 2026-07-27 (not yet implemented):** a producer unit may declare
-> exact static inputs only through a compiler-known constructor. Its sorted
+> exact static inputs only through a compiler-known constructor used as the single whole body of a
+> named zero-argument non-generic descriptor function. Its sorted
 > `(logical_path, content_hash, consumer_kind)` list joins source in the unit action identity.
 > Query source SQL plus deterministic per-driver wire SQL/rewrite maps, metadata, and generated
 > thunks affect `impl_hash` and producer object/link identity; the

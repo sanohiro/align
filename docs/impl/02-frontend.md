@@ -37,14 +37,22 @@ C/Rust style.
 ident   = (letter | "_") (letter | digit | "_")*
 ```
 
-### Keywords (reserved words)
+### Keywords
 ```text
-fn  mut  borrow  return  if  else  match  arena  unsafe  resource
+reserved:
+fn  mut  return  if  else  match  arena  unsafe
 module  import  pub
 true  false
+
+contextual:
+borrow  out  resource
 ```
 
 Type names (`i32` etc.) and built-ins (`array` `slice` `vec` `mask` `Option` `Result` etc.) are **not reserved words**. They are treated as ordinary identifiers defined by the standard library, keeping the language core small. `template` / `html` / `json` / `raw` are string prefixes (see below): weak, context-limited keywords.
+
+`borrow`, `out`, and `resource` lex as identifiers. The parser recognizes them only in the exact
+declaration positions below. They therefore remain legal path segments and member names, including
+the required `resource.from_raw` and `resource.borrow` intrinsics.
 
 ### Literals
 
@@ -140,7 +148,16 @@ vis         = "pub"
 
 **Multi-file user modules (slice B1 — DONE).** The driver (`align_driver::check`) resolves user-module imports (any import not under `core`/`std`) by **filename convention**: `import geom` → `geom.align` in the entry file's directory, loaded transitively (BFS, dedup, cycle-safe), each verified to declare `module geom`. sema's `check_file` is now a one-module wrapper over `check_program(&[Module])`, which checks all modules together: functions are **per-module mangled** (`module$fn`; the entry module is unmangled, so single-file output is byte-identical and two modules may share a name), a bare call resolves in the caller's module (`resolve_local_fn`), and `mod.fn(...)` resolves cross-module with `pub` visibility (`resolve_qualified_fn`). **Nested paths (B2 — DONE):** `import util.math` → `util/math.align` (declaring `module util.math`); the driver joins import segments into a directory path, and sema's `flatten_module_path` collapses the dotted call receiver (`util.math.fn`) to resolve it. **Cross-module type export (DONE):** types are **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry unmangled), recorded in a `type_table` (module → bare → canonical + `pub`). `pub` exports a struct/enum; an importer names it qualified (`geom.Point`); a bare type resolves in the current module (`canonical_type_name`), so an imported type must be qualified. `StructLit.name` is a `Path` (the parser detects a dotted `Path { ident :`). **Completed follow-ons:** qualified imported variant construction (`geom.Color.Red` / `geom.Color.Code(40)`), imported `pub` types in struct fields and enum payloads, and the unused-import warning are all shipped and test-pinned.
 
-**Qualified cross-module function values (DONE 2026-07-15).** `mod.fn` / `a.b.fn` may be used wherever a named function is accepted, not only called directly: every pipeline/reducer callable and a normal binding (`f := util.dbl`) resolves to the imported `pub` function's mangled target. `NamedFnRef` retains the optional dotted module prefix; checked resolution reuses the direct-call import/visibility contract, while quiet signature peeks constrain literal element and fold-accumulator types without duplicate diagnostics. A local that shadows the leftmost module segment remains a value receiver. Whole-program and per-unit paths share this sema code, including imported effect summaries at `par_map`.
+**Qualified cross-module function values (DONE 2026-07-15; mode extension required by L2).**
+`mod.fn` / `a.b.fn` may be used wherever a named function is accepted, not only called directly:
+every pipeline/reducer callable and a normal binding (`f := util.dbl`) resolves to the imported
+`pub` function's mangled target. `NamedFnRef` retains the optional dotted module prefix; checked
+resolution reuses the direct-call import/visibility contract, while quiet signature peeks constrain
+literal element and fold-accumulator types without duplicate diagnostics. A local that shadows the
+leftmost module segment remains a value receiver. Whole-program and per-unit paths share this sema
+code, including imported effect summaries at `par_map`. L2 extends each function-value parameter
+entry with `ParamMode`; binding and indirectly calling a borrow/out-mode function never erases its
+ABI or alias contract.
 
 ### Functions
 
@@ -167,9 +184,22 @@ fn inspect(borrow c: Conn) -> i64 = native_id(c)
 fn advance(borrow mut rows: Rows) -> Option<Row> = internal_next(rows)
 ```
 
+Parameter-mode lookahead is deterministic:
+
+```text
+out ident ":"          -> Out mode, then name
+borrow ident ":"       -> Borrow mode, then name
+borrow mut ident ":"   -> BorrowMut mode, then name
+contextual ":"         -> contextual word is the parameter name
+```
+
+Thus `out dst: slice<u8>` is an out parameter but `out: region` names a region capability.
+Likewise, `borrow: T` is a legal by-value parameter name. No whitespace heuristic is involved.
+
 `out`, `borrow`, and `borrow mut` are mutually exclusive parameter modes. They are preserved in
-the AST and exported function signature; a call has no mode marker. `borrow mut` is parsed as one
-mode, not as a mutable local declaration. The checking and return-provenance rules are in
+the AST, exported function signature, and function-value parameter entries; a call has no mode
+marker. `borrow mut` is parsed as one mode, not as a mutable local declaration. The checking and
+return-provenance rules are in
 `03-types.md` and `17-library-boundary-prerequisites.md` §2.
 
 ### Type declarations (keyword-less)
@@ -213,14 +243,20 @@ Shape {
 resource_decl = "resource" ident generics? "=" path END
 ```
 
+At item start, `resource ident ... "="` is a resource declaration; elsewhere `resource` is an
+ordinary identifier. A recognized resource intrinsic therefore uses the normal dotted-call grammar.
+
 ```align
 pub resource conn = internal.drop_conn
 pub resource stmt<P, R> = internal.drop_stmt
 ```
 
 This is an opaque nominal Move type declaration, not a third data-type body syntax. The right-hand
-path is the exactly-once Drop hook and must name an allowed function in the declaring package's
-`internal` subtree. Resource representation operations are compiler intrinsics restricted to the
+path is the exactly-once Drop hook and must name a `pub` function in the declaring package's
+`internal` subtree. The source hook is an ordinary function with an `unsafe {}` body; `unsafe fn`
+syntax is not added. Resource resolution records a producer-owned hidden support thunk so imported
+cleanup remains linkable without exposing the internal module. Resource representation operations
+are compiler intrinsics restricted to the
 declaring module's canonical descendant subtree and `unsafe`; they are not parsed as special
 resource syntax. The Drop hook accepts only `raw` and its module need not import the declaring root,
 so that privilege does not introduce a reverse module edge. Full type and lowering rules are in
@@ -248,6 +284,12 @@ resolution proves the callee is the recognized constructor, the producer unit re
 source file, and call span. A local named `db`, an unimported path, or a user function with the same
 spelling does not register an input.
 
+Sema accepts that call only when it is the complete single-expression body of a named
+zero-argument, non-generic descriptor function with a static Query/command return type. The body
+contains exactly one constructor; conditional, nested, repeated, helper-wrapped, block-bodied, and
+ordinary expression uses fail before static-input registration. The enclosing module/function
+identity is the unique Query/artifact identity.
+
 On a cold source/import identity, the driver runs import/name resolution first, resolves only those
 proven `StaticInputRef` paths under the project/package root, reads exact UTF-8 bytes, and adds their
 logical paths and hashes to the producer identity. Successful resolution may persist a versioned
@@ -266,8 +308,12 @@ byte spans. The artifact/cache split is specified in
 type      = path generic_args?
           | "(" ")"                       // unit
           | "(" type ("," type)+ ")"      // tuple (arity >= 2); "(" type ")" is grouping
+          | fn_type
 generic_args = "<" type_arg ("," type_arg)* ">"
 type_arg  = type | int_literal            // the N in vec<4, f32>
+fn_type   = "fn" "(" fn_type_params? ")" "->" type
+fn_type_params = fn_type_param ("," fn_type_param)* ","?
+fn_type_param  = param_mode? type
 ```
 
 Tuple values mirror the type: a literal `(a, b, ...)` (arity ≥ 2; `()` is unit, `(e)` is
@@ -285,7 +331,18 @@ array<User>   slice<f32>
 vec<4, f32>   mask<f32>
 ```
 
-`// OPEN:` function types (type notation when holding a closure in a variable). For now this depends on how it is handled at generics bounds.
+Function types preserve parameter modes:
+
+```align
+fn(i64) -> i64
+fn(borrow Conn) -> i64
+fn(borrow mut State, Row) -> Result<(), Error>
+fn(out slice<u8>, str) -> ()
+```
+
+Within a function-type parameter list, a contextual mode is recognized only when another type
+follows it. `fn(borrow) -> T` therefore uses a type named `borrow`; `fn(borrow Conn) -> T` has a
+shared-borrow parameter. Mode equality is exact. Effects remain inferred and are not written.
 
 ---
 
@@ -535,6 +592,8 @@ struct FnDecl {
 }
 enum ParamMode { ByValue, Out, Borrow, BorrowMut }
 struct Param { mode: ParamMode, name: Ident, ty: Type }
+struct FnTypeParam { mode: ParamMode, ty: Type }
+// Type::Fn stores Vec<FnTypeParam> plus its return Type.
 
 struct TypeDecl { vis: Vis, name: Ident, generics: Vec<GenericParam>, kind: TypeKind }
 enum TypeKind { Struct(Vec<Field>), Sum(Vec<Variant>) }

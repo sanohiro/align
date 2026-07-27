@@ -758,14 +758,21 @@ fn inspect(borrow c: Conn) -> i64
 fn advance(borrow mut rows: Rows) -> Option<Row>
 ```
 
-The borrow modes apply to Move types; Copy values already pass without consuming ownership.
-`borrow` leaves a Move argument owned by the caller. The callee cannot move, replace, or drop it; a
-view returned from the call is inferred to borrow the exact caller-side owner generation.
-`borrow mut` also leaves ownership with the caller, but has exclusive access for the call and ends
-the owner's previous storage generation. Older views become invalid; a returned view belongs to the
-fresh generation. Borrow modes are part of the function interface, while lifetime roots remain
-inferred — there are no written lifetime parameters. Passing the same owner through overlapping
-`borrow mut`, `borrow`, or `out` arguments is rejected.
+Shared `borrow` applies to Move types; Copy already passes without consuming ownership. `borrow`
+leaves a Move argument owned by the caller. The callee cannot move, replace, or drop it; a view
+returned from the call is inferred to borrow the exact caller-side owner generation. `borrow mut`
+accepts a writable Move or Copy place, has exclusive access for the call, and ends the previous
+storage generation. This is required for a Copy state aggregate whose field mutation must update the
+caller rather than a discarded copy. Older views become invalid; a returned view belongs to the
+fresh generation. Parameter modes are part of named-function and function-value signatures, while
+lifetime roots remain inferred — there are no written lifetime parameters. Passing the same owner
+through overlapping `borrow mut`, `borrow`, or `out` arguments is rejected.
+
+`borrow`, `out`, and `resource` are contextual rather than reserved words. Parameter lookahead
+recognizes `borrow name: T`, `borrow mut name: T`, and `out name: T` as modes, while `borrow: T` and
+`out: region` use those words as parameter names. At item position, only
+`resource Name = path` starts a resource declaration; dotted intrinsic paths such as
+`resource.borrow` parse normally.
 
 Mutation whose root is an explicit `borrow mut` parameter remains Pure if the function performs no
 other Impure operation. It is an exclusive input effect, like mutating an owned local/builder, not
@@ -979,6 +986,11 @@ or passed lambda: `fn x: i32 { … }`); a stage lambda still infers them from th
 fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)
 apply(fn n: i64 { n + base }, 5)   // a (capturing) closure passed as an argument
 ```
+
+Function types preserve parameter modes: `fn(borrow Conn) -> i64`,
+`fn(borrow mut State, Row) -> Result<(), Error>`, and `fn(out slice<u8>, str) -> ()`. Binding,
+passing, joining, or indirectly calling a named function retains the exact mode and direct-call
+ABI; there is no mode-erasing adapter. The inferred effect remains unwritten.
 
 A passed closure's captured environment lives in the caller's frame for the duration of the call, so
 no heap allocation is needed. A function value that *escapes* — returned from a function, stored
@@ -1727,13 +1739,18 @@ pub resource conn = internal.drop_conn
 pub resource stmt<P, R> = internal.drop_stmt
 ```
 
-The hook is an internal `unsafe fn(raw) -> ()`. A resource is one opaque pointer, always Move, and
-calls the hook exactly once on ordinary cleanup. Only the declaring module and its descendant module
-subtree may use
+The hook is a `pub` function in the package's allowed `internal` subtree, accepts only `raw`, returns
+unit, and performs native destruction inside an `unsafe {}` body; Align does not add `unsafe fn`
+syntax. Resolving the resource declaration synthesizes a non-user-callable hidden support thunk in
+the declaring producer. Resource type metadata carries that thunk's symbol and ABI fingerprint, so
+an importing unit can emit Drop and link the producer without importing the internal source module.
+A resource is one opaque pointer, always Move, and calls the thunk exactly once on ordinary
+cleanup. Only the declaring module and its descendant module subtree may use
 `resource.from_raw`, `resource.from_raw_borrowed`, `resource.view_from_raw`, `resource.raw`, and
 `resource.into_raw`; `unsafe` does not bypass this representation privilege. The Drop-hook module
-takes only `raw` and need not import the declaring module, so a root resource may name an internal
-raw Drop hook while driver descendants construct the root type without a module cycle.
+need not import the declaring module, so a root resource may name an internal raw Drop hook while
+driver descendants construct the root type without a module cycle. The `internal` import rule keeps
+the `pub` source hook outside consumer APIs.
 `resource.borrow(r)` returns a Copy `resource_ref<R>` tied to the owner's inferred generation.
 Owner move/Drop or a `borrow mut` call invalidates it. Resources and references are non-Send by
 default. This is the one mechanism used by native `std` handles and FFI-backed `pkg` libraries; safe

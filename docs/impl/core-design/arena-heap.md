@@ -23,6 +23,9 @@ b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
 ```
 
+`out` is contextual: `out: region` names the capability parameter, while `out dst: slice<T>` is an
+out-mode parameter. Parsing uses token lookahead, not whitespace.
+
 That is the entire box surface — no `.set()`, no deref operator.
 
 The named arena line is a settled prerequisite, not yet implemented. It does not widen `box<T>`:

@@ -252,14 +252,20 @@ active tag, while construction/extraction moves the payload and clears its old o
 owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
 ownership models. Arbitrary collections of Move elements remain a separate container capability.
 
-Move-typed function parameters may instead be `borrow x: T` or `borrow mut x: T`; Copy values
-already pass without consuming ownership. A shared borrow does not consume its owner and may return
-an inferred view of the current generation. A mutable borrow is exclusive for the call, ends the
-previous generation, and may return a view of the fresh generation. Borrow modes and inferred
-return-borrow summaries cross module interfaces; lifetimes are never written.
+Move-typed function parameters may instead be `borrow x: T`; a shared borrow does not consume its
+owner and may return an inferred view of the current generation. `borrow mut x: T` accepts a
+writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
+return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
+Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
+also retain every mode, so indirect and direct calls use the same ABI. Lifetimes are never written.
 Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the body has no other
 Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
 and database work remain Impure.
+
+`borrow`, `out`, and `resource` are contextual words. `borrow name: T`, `borrow mut name: T`, and
+`out name: T` select parameter modes; `borrow: T` and `out: region` use ordinary parameter names.
+`resource Name = path` is recognized only at item position, leaving `resource.from_raw` and
+`resource.borrow` parseable as dotted intrinsic calls.
 
 `arena name {}` binds a scope-local `region` capability. Ordinary functions may accept that value to
 allocate into the exact caller-selected arena; returned arena values remain tied to the lexical
@@ -498,11 +504,15 @@ An FFI wrapper may declare an opaque Move resource:
 pub resource conn = internal.drop_conn
 ```
 
-The internal `unsafe fn(raw) -> ()` hook runs exactly once on ordinary cleanup. Construction/raw
-extraction/ownership transfer are restricted to the declaring module's descendant subtree; a safe
-public API exposes neither `raw` nor manual destroy. The raw-only Drop-hook module need not import
-the declaring module, so the privilege does not create a module cycle. `resource_ref<R>` is a Copy
-view tied to the owner generation and is
+The hook is a `pub fn(raw) -> ()` in the package's allowed `internal` subtree and performs native
+destruction inside an `unsafe {}` body; there is no `unsafe fn` syntax. The resource-declaring
+producer synthesizes a non-user-callable hidden support thunk whose symbol/ABI fingerprint crosses
+interfaces, so imported cleanup remains linkable without importing the internal module. The thunk
+runs exactly once on ordinary cleanup. Construction/raw extraction/ownership transfer are
+restricted to the declaring module's descendant subtree; a safe public API exposes neither `raw`
+nor manual destroy. The raw-only Drop-hook module need not import the declaring module, so the
+privilege does not create a module cycle. `resource_ref<R>` is a Copy view tied to the owner
+generation and is
 invalidated by owner move/Drop or mutable borrow. Resources are non-Send by default.
 
 `resource.from_raw_borrowed(ptr, parent_ref)` creates a Move child resource tied to one parent
@@ -538,7 +548,9 @@ directory (nested `import util.math` → `util/math.align`). A cross-module refe
 `geom.area(...)` for a function, `geom.Point` for a type — reaching only `pub` members; a bare name
 resolves within the calling module (an imported type must be qualified). A qualified `pub` function
 may also be passed to a pipeline/reducer (`xs.map(geom.area)`) or bound as a function value
-(`f := geom.area`) under the same import and visibility rules. Each module has its own
+(`f := geom.area`) under the same import and visibility rules. Its function-value type retains
+`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter; indirect calls do not erase modes. Each
+module has its own
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,

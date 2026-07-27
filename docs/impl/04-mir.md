@@ -70,7 +70,7 @@ RegionBuilderNew/Push/Build { ... }          // visible region allocation/copy o
 StaticQueryDescriptor { artifact_id }        // producer-owned immutable descriptor
 ```
 
-Ordinary `Drop`/`DropValue` consults the resource definition's Drop hook; no
+Ordinary `Drop`/`DropValue` consults the resource definition's producer-owned Drop thunk; no
 `DbConnDrop`, `RegexDrop`, or sibling type family is added. `ResourceIntoRaw` leaves the source
 uninitialized on every continuing path, exactly like another Move transfer.
 
@@ -81,6 +81,16 @@ source. Neither mode emits cleanup for the pointee. `BorrowMut` carries non-alia
 checked HIR, but LLVM attributes are emitted only where their exact ABI meaning is sound.
 Owner-generation invalidation is complete in HIR before MIR construction and is retained in debug
 provenance; LLVM does not decide borrow legality.
+
+`Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`. A named function converted to a function
+value retains `Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical
+direct-call ABI and checked alias/provenance facts. Function-value joins require exact mode equality.
+No indirect-call shim copies a borrowed owner or changes a parameter mode.
+
+A resource Drop operation names the resource-declaring producer's generated hidden support thunk,
+whose symbol and ABI fingerprint come from the imported resource summary. The thunk calls the
+`pub` raw-only hook in the package's `internal` module. MIR never attempts to resolve or import that
+source hook from a consumer unit.
 
 ---
 

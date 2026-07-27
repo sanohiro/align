@@ -68,12 +68,15 @@ n := inspect(conn)       // conn is not moved
 row := advance(rows)     // rows is not moved; its previous borrow generation ends
 ```
 
-`borrow` and `borrow mut` are parameter modes, not types. They never appear in a type argument,
-binding annotation, return type, struct field, or user-written lifetime. A normal by-value
-parameter retains the existing rule: passing a Move value consumes it.
+`borrow` and `borrow mut` are contextual parameter-mode words, not types. They never appear in a
+type argument, binding annotation, return type, struct field, or user-written lifetime. In
+`borrow: T` the word is an ordinary parameter name; it is a mode only in `borrow name: T` or
+`borrow mut name: T`. A normal by-value parameter retains the existing rule: passing a Move value
+consumes it.
 
-Both modes require a Move parameter type. Copy values already pass without transferring ownership;
-allowing a borrowed Copy spelling would add a redundant ABI/source form with no semantic benefit.
+Shared `borrow` requires a Move parameter type because Copy already preserves caller ownership.
+`borrow mut` accepts either a Move type or a Copy type at a writable bound place: Copy preserves
+ownership but does not propagate mutation, so exclusive in-place state updates are not redundant.
 
 ### 2.2 Shared borrow
 
@@ -101,6 +104,11 @@ For `borrow mut x: T`:
 - a returned view belongs to the fresh post-call generation;
 - the call does not consume the owner.
 
+For a Copy aggregate, the same pointer-to-caller-storage ABI applies and field assignments remain
+visible to the caller. Its old recursively view-bearing field provenance ends before the call, just
+as for a Move owner. A scalar Copy value may use `borrow mut`, although an ordinary return is usually
+clearer; the language does not add a shape-specific exception.
+
 This deliberately uses one conservative rule. A mutable-borrow operation that happens not to
 reallocate still ends the old generation. That may reject retaining an otherwise-safe view across
 some mutations, but it cannot leave a package-defined mutation accidentally fail-open.
@@ -116,7 +124,18 @@ mechanism for these checks.
 
 ### 2.4 Effects and interfaces
 
-Borrow modes are part of a function signature and its interface hash.
+Parameter modes are part of named-function signatures, function-value types, and interface hashes:
+
+```text
+Fn([(ParamMode, Ty)], ReturnTy, Effect)
+ParamMode = ByValue | Out | Borrow | BorrowMut
+```
+
+Binding or passing a named function preserves every mode. Indirect-call checking requires an exact
+mode/type match and lowers `Borrow`/`BorrowMut` through the same pointer-to-caller-storage ABI as a
+direct call. Mode erasure, implicit adaptation, and treating a borrow-mode target as by-value are
+rejected. The inferred `Effect` remains excluded from source-level signature equality as already
+settled; parameter modes are not.
 
 The checked-HIR analysis infers canonical return lifetime summaries:
 
@@ -173,16 +192,34 @@ owner. The type is always Move, non-null, non-Copy, non-printable, and non-compa
 parameters are phantom compile-time identity and are monomorphized; they do not change the one-word
 runtime representation.
 
-The Drop hook must resolve in the declaring package's allowed `internal` subtree and have this
-shape:
+The Drop hook must resolve to a `pub` function in the declaring package's allowed `internal`
+subtree and have this source shape:
 
 ```align
-unsafe fn drop_conn(handle: raw) -> ()
+pub fn drop_conn(handle: raw) -> () {
+  unsafe {
+    native_conn_close(handle)
+  }
+}
 ```
 
-It cannot return `Result`, capture state, be generic, or be exported as the public destruction
-operation. Align does not unwind; ordinary exits, `?`, value-carrying control flow, reassignment,
-and scope cleanup call the hook exactly once. Process abort remains the existing no-cleanup path.
+Align has unsafe blocks, not unsafe-function declarations. The hook cannot return `Result`, capture
+state, be generic, or be exported from the package as the public destruction operation. `pub` makes
+it callable across modules only inside the package's `internal` import boundary.
+
+Resolving a public resource declaration synthesizes a non-user-callable resource-drop thunk in the
+resource-declaring producer. Its canonical symbol and ABI fingerprint are stored in resource type
+metadata and the producer object is a link dependency of every consumer that may Drop the resource.
+The thunk calls the internal hook; an importing consumer neither imports the internal module nor
+resolves its source path. The thunk has hidden support-symbol visibility but ordinary external
+linkability across compilation units. Align does not unwind; ordinary exits, `?`, value-carrying
+control flow, reassignment, and scope cleanup call it exactly once. Process abort remains the
+existing no-cleanup path.
+
+The public resource interface serializes nominal resource identity, generic arity, representation
+version, and thunk symbol/ABI fingerprint. It does not serialize the internal source path as an
+importable API. Changing only the hook body changes producer implementation identity; changing the
+thunk ABI/representation changes the public resource interface.
 
 ### 3.2 Native construction
 
@@ -211,10 +248,11 @@ Rules:
   public constructor. For a resource declared in `pkg.db`, `pkg.db.sqlite`,
   `pkg.db.postgres`, and `pkg.db.internal.*` are privileged descendants; an importing application or
   another package is not.
-- The Drop-hook module accepts only `raw` and need not import the resource-declaring module. The
-  root may therefore reference `pkg.db.internal.drop_conn`, while a driver descendant imports the
-  root type and constructs it directly from an expected `db.conn`; `internal` never imports the
-  root and the graph stays acyclic.
+- The `pub` Drop-hook module accepts only `raw` and need not import the resource-declaring module.
+  The root may therefore reference `pkg.db.internal.drop_conn`, while a driver descendant imports
+  the root type and constructs it directly from an expected `db.conn`; `internal` never imports the
+  root and the graph stays acyclic. Package `internal` visibility keeps the hook out of consumer
+  source APIs; the generated root thunk supplies separate-compilation linkage.
 - Module visibility is enforced even inside `unsafe`; unsafe does not bypass representation
   privilege.
 
@@ -438,10 +476,24 @@ participate.
 
 ### 6.1 Query identity
 
+A recognized static Query/command constructor is legal only as the complete single-expression body
+of a named, zero-argument, non-generic descriptor function:
+
+```align
+pub fn query() -> db.query<Params, Row> =
+  db.query_file("user_by_id.sql", [])
+```
+
+The body contains exactly one resolved recognized constructor call. It cannot be conditional,
+repeated, placed in a block/loop, nested in another expression, or wrapped by a user helper.
+Static constructors are rejected everywhere else. A descriptor may be private for same-module use;
+`pub` is required to expose it through a module interface. This restriction gives each constructor
+one stable item identity and prevents artifact/thunk slots from colliding.
+
 A Query ID is:
 
 ```text
-fully-qualified module path + exported descriptor function name
+fully-qualified module path + descriptor function name
 ```
 
 It never contains an absolute filesystem path. Renaming the module or descriptor creates a new
@@ -515,9 +567,9 @@ QueryStatic
 `P`; the decoder writes known offsets in `R`. There is no per-row field-name lookup, reflection,
 boxing, or map allocation.
 
-The producer's exported descriptor function returns the static pointer. Generated thunks stay in
-the producer object and are referenced by the static descriptor, so a consumer does not need the
-Query body to call it.
+The producer's descriptor function returns the static pointer. When the item is `pub`, its interface
+exports that descriptor contract. Generated thunks stay in the producer object and are referenced
+by the static descriptor, so a consumer does not need the Query body to call it.
 
 The runtime selects the already-generated wire entry after checking the connection's driver mask
 and sends those bytes exactly. A PostgreSQL rewrite never becomes the source/build identity. The
@@ -638,14 +690,17 @@ field, and Drop consults the tag before touching payload storage.
 The new semantics must be explicit before LLVM:
 
 - HIR/MIR types have one recursive tagged Move/Drop plan for struct/sum/Option/Result payloads.
-- HIR function parameters carry `ByValue | Borrow | BorrowMut`.
+- HIR function parameters and function-value parameter entries carry
+  `ByValue | Out | Borrow | BorrowMut`.
 - interface signatures carry the same mode plus `ReturnBorrowSummary`.
-- HIR resource types carry declaration identity and Drop hook.
+- HIR resource types carry declaration identity and the producer-owned Drop-thunk identity/ABI
+  fingerprint.
 - MIR locals keep the existing path-local cleanup bit for resources and Move aggregates.
 - MIR has generic resource construction, dependent construction, borrow, raw-view construction,
   raw extraction, ownership transfer, and Drop;
   there is no `DbConnDrop`/`HttpServerDrop` family.
 - a `BorrowMut` call ends the owner generation in checked-HIR borrow state before the call.
+- direct and indirect calls share the same parameter-mode ABI and alias/provenance checks.
 - named arena lowering reuses `ArenaBegin`/`ArenaEnd` and merely binds the handle as `region`.
 - static Query construction lowers to immutable data plus generated binder/decoder functions.
 - LLVM performs pure representation lowering and does not decide ownership, invalidation, or Query
@@ -741,7 +796,8 @@ error allocation on an `Ok` hot path.
 
 Scope:
 
-- parse/check `borrow` and `borrow mut` parameter modes;
+- contextual parse/check of `borrow`, `borrow mut`, and `out`, including function-type modes;
+- `BorrowMut` on writable Copy/Move places and exact function-value mode preservation;
 - local no-move/exclusive-alias rules;
 - effect inference that treats mutation rooted only in an explicit `borrow mut` parameter as Pure;
 - return-borrow inference;
@@ -754,6 +810,10 @@ Acceptance:
 - moving from a borrowed binding is rejected;
 - a returned view dies when the caller owner moves/drops;
 - `borrow mut` rejects later use of an older view;
+- mutable borrowing a writable Copy aggregate updates caller state; shared borrowing Copy is
+  rejected as redundant;
+- `borrow: T` and `out: region` remain legal parameter names through contextual lookahead;
+- function-value binding and indirect calls retain all four parameter modes exactly;
 - a deterministic exclusive-state shaper is Pure, while captured mutation and unsafe/I/O remain
   Impure;
 - imported and same-unit functions produce identical diagnostics;
@@ -764,7 +824,7 @@ Acceptance:
 Scope:
 
 - resource declarations and generic identity;
-- Drop-hook validation;
+- `pub` internal Drop-hook validation and producer-owned hidden thunk/interface linkage;
 - construction/dependent-construction/borrow/raw-view/raw/transfer intrinsics;
 - recursive resource/ref type classes;
 - exactly-once MIR cleanup.
@@ -772,6 +832,9 @@ Scope:
 Acceptance:
 
 - normal return, `?`, branch, loop, reassignment, and aggregate cleanup call Drop once;
+- the hook is a `pub` function with an `unsafe {}` body in an allowed `internal` module;
+- interface-only cleanup links through the generated hidden support thunk without importing the
+  hook module;
 - `into_raw` suppresses Drop;
 - null/native failure is handled before construction;
 - a ref cannot survive owner move/drop/mutable borrow;
@@ -804,6 +867,7 @@ Acceptance:
 Scope:
 
 - recognized-constructor discovery;
+- whole-body descriptor placement and unique item identity;
 - safe path resolution and SourceMap registration;
 - frontend/impl cache keys;
 - versioned query artifact and interface summary;
@@ -812,6 +876,9 @@ Scope:
 Acceptance:
 
 - changing only `.sql` misses the producer object cache;
+- a descriptor accepts exactly one whole-body static constructor; nested, conditional, multiple,
+  generic, argument-taking, and helper-wrapped forms fail before artifact creation;
+- two descriptor functions in one module receive distinct Query IDs and artifact/thunk slots;
 - unchanged consumers still hit when the public Query contract is unchanged;
 - public Params/Row/restriction changes invalidate consumers;
 - absolute/escaping/symlink paths fail;

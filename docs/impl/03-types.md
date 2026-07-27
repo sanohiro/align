@@ -38,7 +38,7 @@ Ty =
   ResourceRef(DefId, [Ty])  // Copy view of one resource owner generation
   RegionCap                 // scope-bound `region` allocation capability
   Tuple(TupleId)            // anonymous product `(T, U, ...)`; interned by element list
-  Fn([Ty], Ty, Effect)     // lambda / function value
+  Fn([(ParamMode, Ty)], Ty, Effect) // lambda / function value
   Var(id)                   // inference variable (during inference only)
 ```
 
@@ -256,7 +256,9 @@ For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned
 to that parameter's caller-side root and generation. For `BorrowMut`, the call site must provide a
 writable bound place, no overlapping borrow may be passed in the same call, and the owner's
 previous generation becomes dead before the call. Returned views belong to the new generation.
-An unbound Move temporary is rejected for either borrow mode.
+An unbound Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move
+types because Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so
+field mutation updates the caller instead of a discarded copy.
 
 Checked HIR infers `ReturnBorrowSummary::Params(indices)` by recursively walking every possible
 view in the return value. The exported signature carries the parameter modes and summary. Whole-
@@ -264,13 +266,20 @@ program and interface-only checking must produce identical borrow roots and diag
 the same `BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second
 reference type or a package-name table.
 
+The same `ParamMode` entries are retained in `Fn`/`FnTy`. Function-value assignment, joins,
+interface codecs, equality, direct/indirect call checking, and codegen must agree on modes; there is
+no mode-erasing adapter. The inferred effect bit remains outside source-signature equality, but
+parameter modes participate.
+
 ### Opaque resources
 
 A `Resource(DefId, args)` is always Move and owns one non-null native handle. Its declaration
-provides the Drop hook; module checking restricts representation intrinsics to the declaring
-module's canonical descendant subtree. The raw-only hook module need not import the resource root,
-so driver construction remains acyclic. `ResourceRef` is Copy but inherits the precise owner
-generation and is invalid after move, replacement, Drop, or `BorrowMut`.
+resolves a `pub` internal Drop hook and records a producer-owned hidden support thunk symbol/ABI
+fingerprint; imported cleanup calls the thunk without importing the hook module. Module checking
+restricts representation intrinsics to the declaring module's canonical descendant subtree. The
+raw-only hook module need not import the resource root, so driver construction remains acyclic.
+`ResourceRef` is Copy but inherits the precise owner generation and is invalid after move,
+replacement, Drop, or `BorrowMut`.
 
 A resource created from `from_raw_borrowed` also carries the parent `ResourceRef` provenance.
 The child is still an owner, but it recursively tracks a borrow: moving the child transfers that
@@ -360,7 +369,9 @@ users.par_map(fn u { total = total + u.score });  // error: modifies an outer mu
 total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 ```
 
-The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
+The `Fn` type carries parameter modes and an effect
+(`Fn([(ParamMode, Ty)], Ty, Effect)`), so both call ABI and purity can be checked through a function
+value.
 
 > **Implementation note (2026-07-15, #465):** the effect bit is implemented end to end. Concrete
 > named functions and lifted closures receive independent `FnTy` effects, mutable fn locals join
@@ -431,7 +442,7 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - owner-root/generation provenance for every recursively view-bearing value
 - marking of move points (consume positions) and dead bindings
 - `ByValue`/`Out`/`Borrow`/`BorrowMut` on parameters and calls
-- resource declaration identity, Drop hook, and path-local cleanup ownership
+- resource declaration identity, Drop-thunk summary, and path-local cleanup ownership
 - canonical recursive `DropPlan` for struct/sum/Option/Result ownership
 - `ReturnBorrowSummary` and `ReturnRegionSummary`
 - the no-alias flag of out arguments

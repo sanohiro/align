@@ -19,6 +19,9 @@ b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
 ```
 
+`out` はcontextualである。`out: region` はcapability parameter名、`out dst: slice<T>` は
+out-mode parameterで、whitespaceではなくtoken lookaheadで区別する。
+
 box の表面はこれで全部である — `.set()` も deref 演算子もない。
 
 名前付き arena の行は確定済みの前提機能であり、まだ実装されていない。これは

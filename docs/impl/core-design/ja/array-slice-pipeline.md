@@ -57,6 +57,8 @@ builder.build() -> array<T>
 - `array_builder<T>` は1つのmutable-local Move ownerである。L2後は同じownerを
   `borrow mut` parameter経由でhelperが変更できるが、builderをaggregate fieldやreturn
   valueにはできない。
+- `array_builder(out).build()` のarena-owned結果は同じfunction内でfinal aggregateへ
+  consumeし、通常call boundaryをby-valueでは通さない。
 - Slice は Copy のビューである。`mut slice<T>` の束縛（または `out` 引数）が、唯一の書き込み可能なビュー形式となる。
 - `.count()` は *パイプライン* の長さを表す（`where` と合成される）。一方 `.len()` は直接的な長さの読み取りである。これら 2 つは意図的に両方存在しており、統合してはならない。
 - `zip(a, b, ...)` はパイプライン専用の遅延評価ソースである。インデックスごとに SSA タプルを 1 つだけ作成し、ループの前にランタイムの長さをすべて検査するため、タプルの配列用メモリは確保しない。v1 では 2 つ以上の名前付きの array/slice、fixed literal、または Copy 可能なプリミティブスカラー要素を持つ sub-slice を受け取る。
