@@ -10655,7 +10655,19 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         return Operand::Const(Const::Unit);
     }
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
-    let scrut = lower_expr(b, scrutinee);
+    // A Copy-only binding borrows the sum value, including bound-place arms of a control-flow
+    // scrutinee. A Move binding transfers the selected payload, so a control join must own its
+    // selected source before extraction.
+    let binds_move_payload = arms.iter().flat_map(|arm| &arm.bindings).any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
+    let scrut = if binds_move_payload {
+        lower_expr(b, scrutinee)
+    } else {
+        lower_expr_for_borrow(b, scrutinee)
+    };
     if b.is_terminated() {
         return Operand::Const(Const::Unit);
     }

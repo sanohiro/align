@@ -667,6 +667,9 @@ fn copy_variant_binding_does_not_consume_a_direct_move_enum_field() {
 
 #[test]
 fn materialized_move_enum_scrutinee_transfers_each_control_source() {
+    if !backend_available() {
+        return;
+    }
     let src = concat!(
         "Content { Text(str), Nums(array<i64>) }\n",
         "Msg { c: Content }\n",
@@ -678,16 +681,38 @@ fn materialized_move_enum_scrutinee_transfers_each_control_source() {
         "  return (first * 10 + second) as i32\n",
         "}\n",
     );
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, "enum-control-source-transfer.align", src);
-    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-    assert!(
-        checked.diags.has_errors(),
-        "materializing a Move enum control result must transfer its field source"
+    assert_eq!(
+        build_and_run("enum-control-source-borrow", src)
+            .status
+            .code(),
+        Some(55),
+        "a borrowing control-result join must preserve each bound field source"
     );
-    assert!(
-        rendered.contains("use of moved field 'c' of 'm'"),
-        "diagnostic must identify the transferred control source:\n{rendered}"
+}
+
+#[test]
+fn move_binding_owns_a_materialized_enum_control_result() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  left := Msg { c: Content.Nums([3, 4, 5].to_array()) }\n",
+        "  right := Msg { c: Content.Nums([90].to_array()) }\n",
+        "  total := match if true { left.c } else { right.c } {\n",
+        "    Text(t) => t.len() as i64\n",
+        "    Nums(ns) => ns.sum()\n",
+        "  }\n",
+        "  return total as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-control-move-binding", src)
+            .status
+            .code(),
+        Some(12)
     );
 }
 
