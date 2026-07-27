@@ -566,8 +566,9 @@ are compiler-known builtins, monomorphic per element type.
   to the per-element call). A direct-source `par_map` with Copy captures uses the generated range
   kernel through an immutable call-scoped context; primitive-scalar length-preserving `map` stages
   use the same kernel, and callable primitive-scalar `where` stages use stable count/prefix/scatter
-  compaction. Projection, string, chunk, aggregate, and other unsupported forms remain sequential,
-  and Move captures are rejected. All three flow analyses (`MoveCheck`/`EscapeCheck`/
+  compaction. AoS projection, field filters, chunks, and the recognised invariant `str.contains`
+  filter use the range path; richer string-search, unsupported aggregate, and other unsupported forms
+  remain sequential, and Move captures are rejected. All three flow analyses (`MoveCheck`/`EscapeCheck`/
   `EffectScan`) walk stage and node captures. First-class function values remain a follow-up.
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
@@ -1022,7 +1023,9 @@ already lives in `docs/open-questions.md`.
   forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A
   primitive-scalar length-preserving `map` chains before `par_map` now use the same range kernel;
   callable primitive-scalar `where(p).par_map(f)` uses stable count/prefix/scatter compaction, while
-  projection, string, aggregate, and other unsupported filters retain the sequential collect loop;
+  AoS projection, field filters, and recognised invariant `str.contains` use that same range path;
+  richer string-search, unsupported aggregate, and other unsupported filters retain the sequential
+  collect loop;
   direct chunk sources use the same range kernel with borrowed `slice<T>` elements. Move captures
   remain rejected by ownership checks.
   Results are identical to the sequential lowering when the Pure premise holds.

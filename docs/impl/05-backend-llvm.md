@@ -276,8 +276,10 @@ plain wrapping addition, and stores one partial at the range output pointer; the
 partials and returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in
 the same ordered range kernel. Callable primitive-scalar `where` stages emit a count kernel and a
 scatter kernel; the runtime prefix-sums per-range survivor counts and passes each scatter range its
-stable output offset. The Pure chain is intentionally evaluated in both passes. Projection,
-`str.contains`, aggregate, and unsupported staged forms use the sequential pipeline fallback.
+stable output offset. The Pure chain is intentionally evaluated in both passes. AoS projection and
+field-filter stages, plus the compiler-recognised invariant `str.contains`
+filter, use the stable range path. Richer string-search expressions, unsupported aggregate layouts,
+and other unsupported staged forms use the sequential pipeline fallback.
 `work_weight` is a bounded MIR hint (`1`, `2`, or `4`) materialized as an `i64` argument; it is
 combined with the concrete input/output strides by the runtime and does not change the source or
 language ABI.

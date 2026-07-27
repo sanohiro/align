@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-27. `main` includes the shipped wave through #662.
+_Last updated: 2026-07-27. `main` includes the shipped wave through #664.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -14,8 +14,9 @@ aggregate-like stride probe without changing production behavior. #658 widens th
 compiler-generated AoS range path to field projection and `where(.field)` stages;
 #660 extends the same range path to `chunks` source slices and direct integer
 chunk transform-reduce. #662 records a bounded, measure-only probe for the retained
-`chunks` header allocation. SoA, string-search, and unsupported layouts remain
-sequential._
+`chunks` header allocation. #664 admits the already-recognised invariant
+`str.contains` filter to the stable range path; SoA, richer string-search, and
+unsupported layouts remain sequential._
 
 ## Start here
 
@@ -81,6 +82,7 @@ facts must live in this repository.
 #659  bounded pre-PR attestation, review watchdog, and focused verification policy
 #660  chunk-source range kernels and direct integer chunk transform-reduce
 #662  measure-only chunks header allocation probe
+#664  parallelize compiler-recognised invariant string filters
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -144,8 +146,9 @@ rerun by the two kernels.
 field projection and `where(.field)` stages, and ABI allocation-size validation for
 padded rows and JSON struct-array descriptors. #660 extends the typed range
 kernel to direct and materializing `chunks` maps and to direct integer chunk
-transform-reduce; Move aggregates, SoA, string-search, and unsupported layouts
-remain on their safe existing paths.
+transform-reduce; #664 admits the compiler-recognised invariant `str.contains`
+filter to the same stable count/scatter path. Move aggregates, SoA, richer
+string-search, and unsupported layouts remain on their safe existing paths.
 
 #659 establishes the operational rule that self-review and an adversarial
 preflight happen before a draft PR, review processes have a bounded watchdog,
@@ -189,6 +192,28 @@ to continue while the hard 15-minute bound has not been reached. At that bound,
 stop the review, record the elapsed time and last completed action, and then
 narrow or rerun it; never infer a verdict from elapsed time.
 
+#664's invariant string-filter slice was squash-merged as `f775889`. The recognised
+`where(fn s { s.contains(NEEDLE) })` form now lowers to a compiler-generated
+`FilterStrContains` stage and calls the existing `str_contains` ABI in both stable
+count/scatter passes. The focused `align_driver` `par_map` suite passed 49/49;
+the new driver test pins survivor order, MIR shape, both kernel names, and the
+ABI call, while the malformed-MIR codegen test pins a `CodegenError` for a
+callable-bearing string stage. Workspace build, `scripts/test-pr.sh`, and
+workspace all-target Clippy passed; required Linux x86_64/ARM64 and macOS CI
+also passed.
+
+The review record is intentionally explicit. The broad preflight reached the
+15-minute watchdog without a verdict, and bounded commit-scoped follow-ups also
+ended without a verdict after meaningful capture/ABI inspection; the final
+narrow independent preflight returned CLEAN. After opening #664, the broad
+host-native review reached its 900-second watchdog after inspecting the sema
+parallelizability boundary; a narrower host attempt also reached its bound after
+checking the LLVM branch, `AlignStr` ABI, HIR recognition, and stage matches. A
+final narrow host check returned no findings, and a fresh independent post-open
+review returned CLEAN. These are not elapsed-time verdicts: at each checkpoint
+the process/log/last action was inspected, meaningful work was allowed to
+continue, and only the hard bound caused a rerun or narrowing.
+
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-separated padded controls over the same registration ABI.
 The recorded native Apple Silicon command was `LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/llvm/lib TRIALS=30 REPS=7 bench/task_group/run.sh`;
@@ -219,8 +244,8 @@ measured packed-tight and padded controls without changing production behavior; 
 gate was not met. The scalar width/stride measure-first probe covers `i8`, `i32`, and `i64`
 fused/materializing maps around the runtime floor; #657 also records runtime-only aggregate-like
 16/32/64/128-byte record strides with full-output checksums, without changing production behavior.
-Compiler-generated aggregate layouts, projection/aggregate filters, other hosts, and any broader
-width/aggregate retune remain separate follow-ups. The merged #660 chunk-source
+Other-host aggregate cost sweeps and any broader width/aggregate retune remain
+separate follow-ups. The merged #660 chunk-source
 range path intentionally retains the `chunks` header allocation. The measure-only
 `bench/par_map/run.sh chunks` probe on Linux x86_64 used symmetric validation in both
 timed arms and showed 1.249x–1.336x versus the allocation-free cursor control across
@@ -229,8 +254,9 @@ artifact. This earns an end-to-end no-header design measurement, but not a produ
 allocation-removal change by itself. Review of the harness also found that a failed ABI
 assertion could leak the runtime-owned header buffer; the follow-up uses an RAII cleanup
 guard, explicit count bounds, checked pointer arithmetic, and reran the probe plus
-probe-feature Clippy clean. Compiler-generated aggregate layouts remain the next separate
-widening candidate; the no-header design remains consumer-gated.
+probe-feature Clippy clean. The no-header design remains consumer-gated, and no
+new compiler widening is justified until the cross-host/aggregate measurements
+earn a concrete consumer.
 
 Consumer-gated deferrals that remain intentional:
 
