@@ -2475,6 +2475,20 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
                 tail.unwrap_or(Operand::Const(Const::Unit))
             }
         }
+        hir::ExprKind::TaskGroup(block) => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::TgBegin));
+            b.task_groups.push(handle);
+            let tail = lower_block_for_borrow(b, block);
+            b.task_groups.pop();
+            if b.is_terminated() {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::TgWait(Operand::Value(handle)));
+                b.push(Stmt::TgEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
         _ => lower_expr(b, e),
     }
 }
