@@ -722,12 +722,18 @@ A DML statement with `RETURNING` is `db.query<P, R>`.
 The common operations are:
 
 ```text
-execute(exec, command, params)   -> Result<db.exec_result, db.Error>
-one(exec, query, params, out)    -> Result<R, db.Error>
-maybe_one(..., out)              -> Result<Option<R>, db.Error>
-all(..., out)                    -> Result<array<R>, db.Error>
-rows(...)                        -> Result<db.rows<R>, db.Error>
-prepare(...)                     -> Result<db.stmt<P,R>, db.Error>
+execute(exec, command, params, options: slice<db.ExecuteOption>)
+  -> Result<db.exec_result, db.Error>
+one(exec, query, params, out, options: slice<db.ExecuteOption>)
+  -> Result<R, db.Error>
+maybe_one(exec, query, params, out, options: slice<db.ExecuteOption>)
+  -> Result<Option<R>, db.Error>
+all(exec, query, params, out, options: slice<db.ExecuteOption>)
+  -> Result<array<R>, db.Error>
+rows(exec, query, params, options: slice<db.ExecuteOption>)
+  -> Result<db.rows<R>, db.Error>
+prepare(exec, query, options: slice<db.PrepareOption>)
+  -> Result<db.stmt<P,R>, db.Error>
 ```
 
 Semantics:
@@ -786,7 +792,7 @@ pub fn run(
     parent: None,
   }
   mut groups := array_builder(out)
-  rows := db.rows(exec, query(), params, [])?
+  mut rows := db.rows(exec, query(), params, [])?
   loop {
     row := db.next(rows)? else { break }
     step(state, groups, row, out)?
@@ -815,7 +821,7 @@ so the existing arena-owned call-boundary rule remains intact.
 Preparation is explicit:
 
 ```align
-stmt := db.prepare(exec, query(), [])?
+mut stmt := db.prepare(exec, query(), [])?
 rows := db.rows_stmt(stmt, params, [])?
 ```
 
@@ -830,9 +836,10 @@ A prepared statement:
 - does not imply a global cache.
 
 `prepare` returns a dependent resource tied to `exec`'s underlying connection.
-`rows_stmt(borrow mut stmt, params, options)` returns a row resource tied to the statement's fresh
-generation. The compiler therefore rejects reuse/finalization of the statement until that row
-resource drops; after Drop, another execution may borrow the statement again. Direct
+`fn rows_stmt(borrow mut stmt: db.stmt<P,R>, params: P,
+options: slice<db.ExecuteOption>) -> Result<db.rows<R>,db.Error>` returns a row resource tied to the
+statement's fresh generation. The compiler therefore rejects reuse/finalization of the statement
+until that row resource drops; after Drop, another execution may borrow the statement again. Direct
 `rows(exec, query, ...)` similarly returns a resource dependent on the underlying connection.
 
 A future cache is explicit and must expose its scope and capacity.
@@ -2405,7 +2412,8 @@ reported reason when it is unavailable. The direct-libpq comparison benchmark is
 - typed dependent `db.stmt<P,R>` resource;
 - connection binding and driver mismatch checks;
 - explicit prepare options;
-- `rows_stmt(borrow mut stmt, ...)` and repeated sequential execution after each rows Drop;
+- `rows_stmt` with a `borrow mut` statement parameter and repeated sequential execution after each
+  rows Drop;
 - finalize/close on Drop and errors;
 - no implicit global statement cache.
 
@@ -2519,10 +2527,11 @@ execution through a reflective dynamic engine.
 
 ### Initial release gate
 
-The first release presented as Align database support requires L1a–L6 and D1–D10 for both SQLite and
-PostgreSQL where the milestone is driver-relevant. D11–D14 remain committed roadmap work, not
-architectural deferrals, but migrations/catalog breadth/batch/native extensions do not block the
-first Query product.
+The first release presented as Align database support requires L1a–L6 and D1–D12 for both SQLite
+and PostgreSQL where the milestone is driver-relevant. D11 supplies SQL migration lifecycle and D12
+supplies the required category metadata and explicit Query-plan access; neither is omitted from the
+release whose earlier sections promise those surfaces. D13–D14 remain committed additive work for
+batch/SoA/native breadth, dynamic SQL, and proved callbacks.
 
 A release that handles only single-table model loading is incomplete even if CRUD works. At least one
 many-to-one/master projection and one one-to-many compound Output must be end-to-end,
@@ -2588,6 +2597,15 @@ The design is implemented correctly only if all are true:
 44. L1a admits only `Option<string>` field leaves; L1b alone admits `Option<MoveStruct>`.
 45. Dependent resource construction and checked owner-tied native views remain explicit typed MIR
     operations through lowering.
+46. `borrow mut` rejects every overlapping peer argument, including recursively provenance-bearing
+    by-value Copy/Move values.
+47. Every execute/result/prepare primitive has exactly one option-bearing signature; `[]` means no
+    options and no optionless overload exists.
+48. Canonical examples bind `rows`/`stmt` as `mut` when their callee parameter is `borrow mut`, and
+    never put a parameter mode at a call site.
+49. English and Japanese prepared-statement examples type-check against the same signature.
+50. The first public database release completes driver-relevant D1–D12; D13/D14 remain committed
+    additive work.
 
 ---
 

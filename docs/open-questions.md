@@ -3641,6 +3641,10 @@ lifetime parameters are not introduced. Mutation rooted only in an explicit
 `borrow mut` parameter remains Pure when there is no other Impure operation; it is an alias-checked
 exclusive input effect, not hidden captured mutation.
 
+Exclusivity is recursive across every call argument. A `borrow mut` input rejects any overlapping
+by-value view, `resource_ref`, dependent resource, or aggregate carrying the invalidated old
+generation; Copy arguments are not an exception and no package type name is special.
+
 `borrow`, `out`, and `resource` are contextual words, not globally reserved tokens. Exact lookahead
 distinguishes `borrow name: T`/`out name: T` modes from parameters named
 `borrow: T`/`out: region`; item-position lookahead distinguishes a resource declaration from

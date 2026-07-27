@@ -320,9 +320,11 @@ idea is rejected.
 - **Actual failure:** the first implementation PR becomes unreviewable and may validate neither
   Query artifacts nor lifecycle thoroughly.
 - **Recommendation:** D2 and D4 are exact scalar verticals; D10 proves compound Output. Schedule
-  migrations D11, metadata/EXPLAIN D12, batch/native paths D13, and dynamic SQL/callbacks D14.
-  These are scheduled prerequisites for their features, not vague “maybe later” items.
-- **v1 impact:** later additions; only D1–D10 block the initial Query product.
+  migrations D11 and metadata/EXPLAIN D12 in the first public database release; batch/native paths
+  D13 and dynamic SQL/callbacks D14 remain committed additive work. These are scheduled
+  prerequisites for their features, not vague “maybe later” items.
+- **v1 impact:** D1–D12 block the first public database release. D2/D4 remain the minimum driver
+  verticals used to validate architecture before that release is complete.
 
 ### F19 — reserved `resource`/`borrow` words make required intrinsics unparsable
 
@@ -526,6 +528,68 @@ idea is rejected.
   survive separate compilation.
 - **v1 impact:** soundness blocker for L3 and therefore for safe DB text/blob rows.
 
+### F34 — `borrow mut` did not reject overlapping by-value provenance
+
+- **Classification:** ownership or soundness risk; current Align conflict.
+- **Problematic design location:** L2's call-site alias matrix.
+- **Current Align constraint:** Copy views, `resource_ref`, Row, dependent resources, and aggregates
+  may carry the same owner generation even when their parameter mode is ordinary by-value.
+- **Actual failure:** a call could pass `borrow mut owner` beside an old by-value view of that owner.
+  Call entry invalidates the old generation, so the callee receives a dangling peer argument.
+- **Recommendation:** compare recursive provenance for every call argument. Reject any by-value
+  Copy/Move value overlapping a `BorrowMut` owner generation, just as overlapping borrow/out
+  arguments are rejected. Evaluation order does not repair the invalid delivery.
+- **v1 impact:** L2 soundness blocker.
+
+### F35 — result-mode signatures implied forbidden optionless overloads
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** `pkg-design/db.md` §6.2 versus §13.2.
+- **Current Align constraint:** Align has no default arguments, and the settled DB surface requires
+  exactly one option-bearing primitive form with `[]` for no options.
+- **Actual failure:** implementers could create optionless overloads from the normative list or make
+  examples with explicit `[]` disagree with the API.
+- **Recommendation:** include `slice<db.ExecuteOption>` on execute/result operations and
+  `slice<db.PrepareOption>` on prepare in every normative signature.
+- **v1 impact:** API blocker for D2/D4/D9; now resolved.
+
+### F36 — canonical mutable-borrow examples used immutable bindings
+
+- **Classification:** current Align conflict; implementation complexity.
+- **Problematic design location:** Query-local rows loop and prepared-statement examples.
+- **Current Align constraint:** a `borrow mut` parameter accepts only a writable bound place; call
+  syntax itself has no parameter-mode marker.
+- **Actual failure:** `rows := ...; db.next(rows)` and `stmt := ...; db.rows_stmt(stmt,...)` fail
+  checking once L2 is implemented.
+- **Recommendation:** bind `rows` and reusable `stmt` with `mut`; keep ordinary call syntax.
+- **v1 impact:** example/API conformance blocker for D6/D8; now resolved.
+
+### F37 — Japanese prepared-statement example put a mode at the call site
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** Japanese `pkg-design/db.md` §6.4.
+- **Current Align constraint:** `borrow mut` appears only in a parameter declaration; calls remain
+  unchanged.
+- **Actual failure:** the mirror's canonical `db.rows_stmt(borrow mut stmt, ...)` does not parse and
+  disagrees with the authoritative English contract.
+- **Recommendation:** use `mut stmt := ...` followed by `db.rows_stmt(stmt, ...)`, and keep the
+  English/Japanese mirrors synchronized.
+- **v1 impact:** documentation blocker, not a new implementation feature.
+
+### F38 — the initial release gate excluded surfaces promised as initial
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** initial release gate D1–D10 versus SQLite migration and
+  PostgreSQL/basic metadata-plan promises assigned to D11/D12.
+- **Current Align constraint:** a milestone must have one testable boundary; a capability cannot be
+  both required for that release and scheduled after its gate.
+- **Actual failure:** one implementation agent could release at D10 while another correctly waits
+  for migrations, category metadata, and explicit Query-plan access.
+- **Recommendation:** retain the small D2/D4 architecture verticals, but define the first public
+  database release as L1a–L6 plus driver-relevant D1–D12. D13/D14 remain committed additive work.
+- **v1 impact:** D11/D12 are required for the first public DB release; they do not block early
+  vertical development.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -577,13 +641,14 @@ idea is rejected.
     slices and no silent ignore.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b; prove fake
     Query artifacts before native code; put SQLite and PostgreSQL scalar verticals before
-    streaming/transactions/compound output; schedule broad surfaces D11–D14.
+    streaming/transactions/compound output; complete migrations and category metadata/EXPLAIN in
+    D11/D12 before the first public release; schedule D13/D14 as additive native/dynamic work.
 18. **Minimum SQLite vertical:** in-memory connection, one scalar command, one sibling-file scalar
     Query, `execute`/`one`, cardinality/error/cleanup/execution-count tests, no text views.
 19. **Minimum PostgreSQL vertical:** same common Query module, named-to-positional rewrite, scalar
     bind/decode, SQLSTATE error, driver restriction, explicit configured ephemeral/local server.
 20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
-    D10, then D11–D14. Each owns only the tests and benchmark rail listed below.
+    D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
 
 ## 4. Required specification revisions
 
@@ -623,6 +688,12 @@ documents:
 27. Assign `Option<MoveStruct>` exclusively to L1b while keeping L1a limited to
     `Option<string>` field leaves.
 28. Represent dependent construction and checked owner-tied raw views explicitly in MIR.
+29. Reject recursive by-value provenance aliases beside a `borrow mut` argument.
+30. Put the mandatory option slice in every normative execute/result/prepare signature.
+31. Bind every canonical mutable-borrow owner as `mut` while keeping call syntax mode-free.
+32. Keep the Japanese prepared-statement example identical in semantics to the English original.
+33. Make D11 SQL migrations and D12 category metadata/EXPLAIN part of the first public release
+    gate; retain D13/D14 as committed additive work.
 
 ## 5. Revised implementation roadmap
 
@@ -630,7 +701,7 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | joined-target direct/indirect and per-unit parity | borrowed-call and interface-size cost |
+| L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | recursive alias matrix, joined-target direct/indirect, per-unit parity | borrowed-call and interface-size cost |
 | L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact MIR, cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
 | L5 | tagged file/inline inputs, Query artifacts, descriptor skeleton | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
@@ -646,8 +717,8 @@ documents:
 | D8 | typed rows and row generations | old-view rejection, clone retention, physical delivery counts | row decode/iteration |
 | D9 | all option scopes, timeout, cancellation | applied/unsupported/conflict matrix | option/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
-| D11 | SQL migrations | checksum/order/transaction/status | migration startup/large history |
-| D12 | category metadata and EXPLAIN | category isolation; ANALYZE executes visibly | catalog query count/latency |
+| D11 | SQL migrations; initial-release gate | checksum/order/transaction/status | migration startup/large history |
+| D12 | category metadata and EXPLAIN; initial-release gate | category isolation; ANALYZE executes visibly | catalog query count/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | dynamic rows and proved callback surfaces | allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -712,8 +783,8 @@ Acceptance behavior:
 The delivery is not performance-complete without:
 
 - L1a/L1b tagged-Move branch, allocation, and Drop counts;
-- L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver, plus
-  joined return-summary/interface size/time;
+- L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver,
+  including recursive alias-check cost plus joined return-summary/interface size/time;
 - L3 resource construction/ref/dependent cross-unit Drop thunk/native-view checks versus direct
   current handle path, with exact MIR-operation counts;
 - L4 named/anonymous arena parity;
@@ -728,6 +799,7 @@ The delivery is not performance-complete without:
 - D6 prepare reuse versus reprepare;
 - D8 row iteration/decode, physical-delivery counts, and retained-copy costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
+- D11 migration startup/status cost and ordered history scaling at 10/100/1000 applied files;
 - D12 category metadata query count and EXPLAIN latency;
 - D13 batch/SoA/native throughput on each driver.
 

@@ -117,10 +117,15 @@ At one call site, aliases of the same owner may not appear as:
 
 - two `borrow mut` arguments;
 - one `borrow mut` and any overlapping `borrow`;
-- an `out` slice and an overlapping `borrow`/`borrow mut`.
+- one `borrow mut` and any by-value argument whose type recursively carries provenance rooted in
+  that owner's previous generation, including a Copy `str`, slice, `resource_ref`, or aggregate
+  containing one (a database Row is only one structural example);
+- an `out` slice and any overlapping argument, regardless of its parameter mode.
 
 The existing out-parameter no-alias proof and borrow-root analysis are the single implementation
-mechanism for these checks.
+mechanism for these checks. Argument expressions are evaluated before transfer, but generation
+invalidation at call entry must not make another delivered argument dangling; such a call is
+rejected rather than reordered or copied.
 
 ### 2.4 Effects and interfaces
 
@@ -871,6 +876,8 @@ Acceptance:
 - moving from a borrowed binding is rejected;
 - a returned view dies when the caller owner moves/drops;
 - `borrow mut` rejects later use of an older view;
+- a call rejects an overlapping by-value Copy view/resource reference or view-bearing aggregate
+  beside `borrow mut` of its owner;
 - mutable borrowing a writable Copy aggregate updates caller state; shared borrowing Copy is
   rejected as redundant;
 - `borrow: T` and `out: region` remain legal parameter names through contextual lookahead;

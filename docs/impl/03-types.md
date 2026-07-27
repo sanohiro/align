@@ -262,11 +262,14 @@ BorrowMut   exclusive access; caller retains ownership and the old generation en
 
 For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned view may be tied
 to that parameter's caller-side root and generation. For `BorrowMut`, the call site must provide a
-writable bound place, no overlapping borrow may be passed in the same call, and the owner's
-previous generation becomes dead before the call. Returned views belong to the new generation.
-An unbound Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move
-types because Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so
-field mutation updates the caller instead of a discarded copy.
+writable bound place. No other argument may overlap the invalidated owner generation: this includes
+another borrow and any by-value Copy/Move value recursively carrying a view, resource reference,
+dependent-resource parent, or aggregate provenance rooted there. The check is structural and never
+recognizes a package-specific Row name. The owner's previous
+generation becomes dead before the call; returned views belong to the new generation. An unbound
+Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move types because
+Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so field mutation
+updates the caller instead of a discarded copy.
 
 Checked HIR infers `ReturnBorrowSummary::Params(indices)` by recursively walking every possible
 view in the return value. The exported signature carries the parameter modes and summary. Whole-

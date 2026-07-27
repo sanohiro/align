@@ -493,8 +493,8 @@ genericな `db.fold` は提供しない。
 ### 6.4 prepared statement
 
 ```align
-stmt := db.prepare(exec, query(), [])?
-rows := db.rows_stmt(borrow mut stmt, params, [])?
+mut stmt := db.prepare(exec, query(), [])?
+rows := db.rows_stmt(stmt, params, [])?
 ```
 
 stmtはprepare元connectionへdependentである。rowsはstmtのfresh generationへdependentで、
@@ -1274,7 +1274,8 @@ runtime describe comparison。
 ### D6 — prepared statement lifecycle
 
 dependent `db.stmt<P,R>`、connection/driver check、prepare option、
-`rows_stmt(borrow mut stmt,...)`、rows Drop後のsequential reuse、全path finalize/close、
+`rows_stmt` の `borrow mut` statement parameter、rows Drop後のsequential reuse、
+全path finalize/close、
 implicit global cacheなし。prepared/common/reprepare costを別々に測る。
 
 ### D7 — transaction/common exec view
@@ -1327,8 +1328,10 @@ notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明
 
 ### 初期release gate
 
-L1a〜L6と、driver-relevantなD1〜D10をSQLite/PostgreSQL両方で満たす。D11〜D14も
-committed roadmapであり、曖昧な延期ではないが、最初のQuery productはblockしない。
+L1a〜L6と、driver-relevantなD1〜D12をSQLite/PostgreSQL両方で満たす。D11のSQL
+migration lifecycleとD12のcategory metadata/明示Query planも、それらを約束する初期
+release gateに含む。D13〜D14はbatch/SoA/native breadth、dynamic SQL、proved callbackの
+committed additive roadmapである。
 single-table CRUDだけでは不完全。many-to-oneとone-to-many compound Outputをそれぞれ
 execution-count付きで実証する。
 
@@ -1381,6 +1384,15 @@ execution-count付きで実証する。
 44. L1aは `Option<string>` field leafだけを許可し、`Option<MoveStruct>` はL1bだけが許可する。
 45. dependent resource constructionとchecked owner-tied native viewはloweringを通して明示的な
     typed MIR operationである。
+46. `borrow mut` はrecursiveにprovenanceを持つby-value Copy/Moveを含む全overlapping peer
+    argumentを拒否する。
+47. execute/result/prepare primitiveはoption-bearing signatureを正確に1つだけ持ち、`[]` が
+    no optionを表し、optionless overloadはない。
+48. canonical exampleはcallee parameterが `borrow mut` の `rows`/`stmt` を `mut` bindingにし、
+    call siteへparameter modeを書かない。
+49. English/Japaneseのprepared-statement exampleは同じsignatureに対してtype-checkする。
+50. 最初のpublic database releaseはdriver-relevantなD1〜D12を完了し、D13/D14はcommitted
+    additive workとして続く。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

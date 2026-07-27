@@ -771,7 +771,11 @@ joins union them; an unresolved higher-order parameter conservatively names ever
 input, including embedded provenance in a by-value Move aggregate/dependent resource. The call
 captures that provenance before moving/nulling the source and transfers it to the result; this does
 not permit a callee to return a bare view of an owner it destroys. Passing the same owner through
-overlapping `borrow mut`, `borrow`, or `out` arguments is rejected.
+overlapping `borrow mut`, `borrow`, or `out` arguments is rejected. A `borrow mut` argument also
+rejects any other by-value argument whose type recursively carries provenance rooted in the
+owner's old generation, including a Copy view, `resource_ref`, dependent resource, or aggregate;
+invalidation may not deliver a dangling peer argument to the callee. This is a structural
+provenance check, never a package/type-name exception.
 
 `borrow`, `out`, and `resource` are contextual rather than reserved words. Parameter lookahead
 recognizes `borrow name: T`, `borrow mut name: T`, and `out name: T` as modes, while `borrow: T` and

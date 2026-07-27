@@ -658,8 +658,10 @@ recursive types or arbitrary Move-element collections.
 or Copy place, updates caller storage, and ends the previous generation. They are not reference
 types and introduce no writable lifetime syntax. `BorrowState` tracks that generation beside the
 existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
-lexically in scope. All parameter modes are retained in function-value types; direct and indirect
-calls share one ABI and alias/provenance check. Concrete function values also retain
+lexically in scope. The call-site exclusivity check rejects any other argument whose recursively
+embedded provenance overlaps that old generation, including a by-value Copy view/resource reference
+or view-bearing aggregate. All parameter modes are retained in function-value types; direct and
+indirect calls share one ABI and alias/provenance check. Concrete function values also retain
 `ReturnBorrowSummary`/`ReturnRegionSummary`; joins union possible target inputs and unresolved
 higher-order parameters fail closed to every compatible input, including embedded provenance in
 by-value Move aggregates/dependent resources. Call transfer snapshots that provenance before

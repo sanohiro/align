@@ -3538,9 +3538,11 @@ verticals; their purpose is to connect the final Query-centered API to each nati
 inventing a temporary dynamic API. D10 is part of the initial database release rather than a
 future relationship feature.
 
-D11–D14 are committed additive database work, not an unspecified deferral. They must not delay the
-two driver verticals or weaken the Query/compound-output contract. Normal builds remain offline at
-every stage; only the explicit `alignc db prepare` tool action may contact a database.
+D11 SQL migrations and D12 category metadata/EXPLAIN are part of the first database release after
+the two driver verticals and compound-output proof. D13–D14 are committed additive database work,
+not an unspecified deferral. They must not weaken the Query/compound-output contract. Normal builds
+remain offline at every stage; only explicit database tooling may contact a database during build
+preparation.
 
 ## Design Issues to Settle in Parallel
 

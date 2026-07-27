@@ -266,6 +266,11 @@ Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the
 Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
 and database work remain Impure.
 
+Call-site exclusivity includes by-value aliases: beside `borrow mut owner`, no other argument may
+recursively carry a view, resource reference, dependent-resource parent, or aggregate
+provenance rooted in the owner's previous generation. Generation invalidation therefore never
+delivers a dangling peer argument to the callee. The rule is structural, not package-named.
+
 `borrow`, `out`, and `resource` are contextual words. `borrow name: T`, `borrow mut name: T`, and
 `out name: T` select parameter modes; `borrow: T` and `out: region` use ordinary parameter names.
 `resource Name = path` is recognized only at item position, leaving `resource.from_raw` and

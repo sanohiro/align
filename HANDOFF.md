@@ -248,7 +248,9 @@ region plain-struct builder. L2 includes contextual parameter parsing, mutable C
 function-value modes plus joined return provenance. L3 includes a producer-owned linkable Drop
 thunk. L5 permits exactly one whole-body static constructor per uniquely named descriptor item and
 uses tagged file/inline source identity. D3's migration-backed SQLite prepare uses the canonical
-validated numeric catalog. Native feasibility probes may run independently but create no public API.
+validated numeric catalog. The first public database release gate is driver-relevant D1–D12:
+D11 migrations and D12 category metadata/EXPLAIN are required, while D13/D14 remain committed
+additive work. Native feasibility probes may run independently but create no public API.
 
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are

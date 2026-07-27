@@ -326,3 +326,10 @@ The initial PostgreSQL Query vertical is explicitly `BufferedFull`: `one`/`maybe
 two delivered rows, but transport and native buffering may contain the complete result. Physical
 delivery is measured and labelled separately; later single-row/portal modes are selected
 capabilities, never silent substitutions.
+
+The same review closed a call-site aliasing hole: `borrow mut` rejects not only spelled borrows but
+every peer argument recursively carrying the invalidated generation, including by-value Copy views
+and Rows. DB primitives have one mandatory option-slice form, mutable-borrow examples use mutable
+bindings with unchanged call syntax, and both language mirrors agree. The first public database
+release gate includes D11 migrations and D12 category metadata/EXPLAIN; D13/D14 remain committed
+additive work.

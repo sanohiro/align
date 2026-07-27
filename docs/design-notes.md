@@ -260,7 +260,10 @@ public raw constructor. Shared `borrow` preserves Move ownership; invalidating `
 updates a writable Copy state aggregate in place. Parameter modes remain part of function values,
 and their inferred return provenance is conservatively joined, so indirect calls cannot erase the
 ownership ABI or lifetime roots. Inferred owner generations prevent a returned view from surviving
-replacement, mutation, or Drop. This generalizes the existing Move/Drop and
+replacement, mutation, or Drop. Exclusivity is checked across every call argument, not only
+parameters spelled `borrow`: a by-value Copy view/resource reference or view-bearing aggregate
+rooted in the generation invalidated by a peer `borrow mut` is rejected before the callee can
+receive a dangling view. This structural rule generalizes the existing Move/Drop and
 borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
 ownership model.
 

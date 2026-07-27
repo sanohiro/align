@@ -201,7 +201,9 @@ the AST, exported function signature, and function-value parameter entries; a ca
 marker. Concrete function values also retain inferred `ReturnBorrowSummary` and
 `ReturnRegionSummary`, unioning them at joins. `borrow mut` is parsed as one mode, not as a mutable
 local declaration. The checking and return-provenance rules are in
-`03-types.md` and `17-library-boundary-prerequisites.md` §2.
+`03-types.md` and `17-library-boundary-prerequisites.md` §2. Call checking compares recursive
+provenance for every argument, including by-value Copy/Move aggregates, so a `BorrowMut` operand
+cannot invalidate a peer argument delivered to the same call.
 
 ### Type declarations (keyword-less)
 
