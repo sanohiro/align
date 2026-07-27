@@ -251,7 +251,9 @@ An aggregate has one path-local cleanup bit, so its owned members must all be fr
 be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owned array is rejected.
 Replacing an owned field or element must preserve the existing mode. Borrowed members do not
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
-runtime mode, but mutation requires a definite mode.
+runtime mode, but mutation requires a definite mode. After generic substitution, a struct field may
+be Copy or recursively Move when its finite, non-recursive Drop plan is known; this does not make an
+otherwise unsupported container element legal.
 
 `Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
 known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the

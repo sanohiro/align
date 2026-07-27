@@ -115,6 +115,34 @@ Do not re-litigate these. Full rationale is in `docs/open-questions.md`:
 - Ship the ideal unified design or defer it. Do not land compromise
   implementations that add magic special cases or violate an invariant.
 
+## Large design authoring gate
+
+Before writing a broad cross-cutting design, create one public-contract ledger
+in its design or audit document. Keep that ledger authoritative while drafting.
+For every public surface, record the exact type or signature, inputs and
+defaults, errors, ownership and lifetime, allocation, compiler/runtime/package
+owner, artifact and cache identity, prerequisite milestone, acceptance test,
+benchmark, and every source-of-truth or language mirror that must agree.
+
+Complete one author-side ledger-to-prose consistency pass before requesting an
+independent review:
+
+- every normative prose promise appears in the exact public record, and every
+  public field has specified semantics;
+- every argument and result has a concrete type, ownership, lifetime, and
+  allocation rule;
+- every CLI and build input is explicit, deterministic, and free of ambient
+  configuration unless the contract names that configuration;
+- no milestone consumes a decision or capability scheduled for a later
+  milestone;
+- `draft.md`, `docs/language-spec.md`, implementation plans, package designs,
+  and required language mirrors agree; and
+- acceptance tests and benchmarks cover each ledger invariant.
+
+Do not use independent review as the primary completion loop for a design.
+When a finding changes a public surface, update the ledger first and propagate
+that one decision through all affected documents in one pass.
+
 ## Build and verification
 
 The workspace runs end to end from lexer through executable generation.

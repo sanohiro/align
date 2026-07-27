@@ -363,3 +363,13 @@ provenance when the call returns, SQLite v1 uses measured transient text/blob bi
 future asynchronous paths retain execution-owned bytes. Dynamic SQL carries an exact visible
 `db.Driver`; metadata category calls carry their `MetaOption` slice. Core ledgers list L4/L6 forms
 as required-but-unimplemented instead of calling them verified shipped signatures.
+
+The final contract-ledger pass made several underspecified surfaces exact. `resource.borrow` is
+public and safe while raw resource operations remain package-subtree privileged.
+`db.exec_result` is the allocation-free Copy affected-row record. Migration tooling requires an
+explicit entry, migration catalog, driver, and matching target on every live command. Metadata uses
+exact `SchemaRef`/`TableRef` inputs and complete flat Column/Key/Index/Query records. Query
+nullability is fail-closed: D0 records actual engine evidence, D3/D5 own the driver matrices,
+ambiguous evidence is `Unknown`, and catalog `NOT NULL` alone never removes runtime NULL checking.
+The repository's design process now requires one public-contract ledger and an author-side
+ledger-to-prose pass before independent review.

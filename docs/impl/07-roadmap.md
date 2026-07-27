@@ -3534,11 +3534,16 @@ D14 dynamic SQL + proved callback surfaces
 ```
 
 L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
-they are being built, but no probe API becomes public. D1 must prove Query/command
+they are being built, but no probe API becomes public. Its recorded SQLite/libpq evidence includes
+the exact engine/version origin and result-nullability information actually available; catalog
+`NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
-connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12. D9
-completes shared deadline enforcement/native cancellation cleanup and the cross-scope disposition
+connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
+The checked-metadata merge gates D3 and D5 each check in the corresponding conservative
+origin/nullability support matrix measured by D0; ambiguous evidence remains `Unknown`, and runtime
+NULL validation is never optimized away. D9 completes shared deadline enforcement/native
+cancellation cleanup and the cross-scope disposition
 audit; it does not add a public cancel resource or replace an
 interim surface. D2 and D4 deliberately remain scalar verticals; their purpose is to connect the
 final Query-centered API to each native library without inventing a temporary dynamic API. D4 merge
@@ -3546,7 +3551,9 @@ and every database release require a provisioned non-skippable PostgreSQL CI job
 local-only. D10 is part of the initial database release rather than a future relationship feature.
 
 D11 SQL migrations use the exact required-by-default/forbidden-one-statement policy and dirty-state
-repair contract. D12 returns exact flat metadata/plan records into an explicit region. Both are part
+repair contract. Every migrate/status/check/repair invocation explicitly names its entry,
+migration catalog, driver, and matching database target. D12 returns exact flat metadata/plan
+records into an explicit region. Both are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

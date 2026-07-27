@@ -48,6 +48,31 @@ work and part of the database delivery plan.
 resource, borrow-provenance, and owner-tied native-view machinery. Sharing that language foundation
 is desirable; importing the HTTP package or extracting an HTTP-flavored database abstraction is not.
 
+### 1.1 Public-contract ledger
+
+This ledger is the author-side completion gate for the design. A surface is ready for independent
+review only when its exact contract, implementation owner, acceptance/benchmark owner, and every
+listed source agree.
+
+| Surface | Exact invariant | Owner | Verification | Sources that must agree |
+|---|---|---|---|---|
+| Recursive aggregates | A finite resolved field is Copy or recursively Move with one ordinary Drop plan | L1a/L1b | tagged construct/move/drop/error cleanup and cost | draft, language spec, prerequisite plan |
+| Borrowed calls | `borrow`/`borrow mut` modes, all-peer alias rejection, return roots, and cleanup ABI are interface facts | L2 | direct/indirect/imported alias/provenance/cleanup matrix | draft, language spec, types/MIR plans, prerequisite plan |
+| Opaque resources | public safe `resource.borrow`; raw forms are declaring-subtree privileged; dependent child and view provenance is explicit | L3 | cross-unit Drop, escape/raw-transfer negatives, resource/view overhead | draft, language spec, frontend/types/MIR, prerequisite plan |
+| Region and builder | explicit `region`; closed `RegionPlain`; one measured builder compact pass | L4/L6/L7 | escape/bound/copy-count tests and push/freeze benchmark | draft, language spec, types/MIR, core builder, prerequisite plan |
+| Query/command descriptors | one whole-body item, exact `Params`/flat `Row`, unique identity, generated binder/decoder, no reflection | L5/D1 | descriptor/interface/cache matrix and thunk benchmark | frontend/types/MIR, DB EN/JA |
+| Static SQL inputs | tagged sibling/relative/inline identity; source and driver-wire hashes/spans are distinct deterministic inputs | L5/D1 | create/change/delete/path/span/incremental matrix | language docs, pipeline/cache plans, DB EN/JA |
+| Parameters | one dialect-aware source scan; stable first-occurrence ordinals; SQLite named and PostgreSQL `$n`; explicit retention/copy | D1/D4/D8 | scanner/rewrite/bind-lifetime matrix and bind benchmark | DB EN/JA |
+| Typed rows | generated ordinal decoder; runtime count/type/NULL guard; row generation invalidates views; retention uses `clone_in` | D1/D8 | stale-view/decode/retention negatives and row-loop benchmark | memory model, DB EN/JA |
+| Connection/transaction execution | closed `db.exec` resource-reference sum from both conn and tx; no public driver trait | D7 | alias/consume/rollback/dispatch tests and dispatch cost | prerequisite plan, DB EN/JA |
+| Shaping | one visible Query execution and rows loop; Pure one-pass step; no structural extra SQL | D10 | many-to-one/one-to-many execution-count tests and shaping benchmark | DB EN/JA, core builder |
+| Offline metadata artifacts | explicit prepare only; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/reproducible/offline/cache matrix and artifact time/size | pipeline/cache plans, DB EN/JA |
+| Options/errors/result | finite scope-specific sums; unsupported is error; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/error-buffer tests and zero-allocation result check | DB EN/JA |
+| Migrations | exact entry/catalog/driver/target CLI; SQL catalog identity; atomic default; one-statement dirty exceptional path | D11 | CLI-input/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
+| Metadata records | exact typed refs and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | field/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
+| Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
+| Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
+
 ## 2. Finding register
 
 Severity means whether the issue blocks the corresponding v1 capability, not whether the design
@@ -1008,6 +1033,120 @@ idea is rejected.
   EXPLAIN; use `None` only for truly Query-less operation/input validation.
 - **v1 impact:** D12 diagnostic-contract blocker.
 
+### F71 — the struct-field rule contradicted L1a
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** `draft.md`'s aggregate field restriction versus L1a's required
+  `Option<string>` field.
+- **Current Align constraint:** ownership is a property of the resolved type; a finite aggregate can
+  be Move when the compiler has one recursive Drop plan.
+- **Actual failure:** the literal “every struct field is Copy” rule made the first prerequisite's
+  only new field shape invalid and gave an implementation agent two incompatible specifications.
+- **Recommendation:** permit Copy or finite recursively Move fields after substitution when the
+  ordinary Drop plan is known; retain the explicit unsupported collection/recursive-shape errors.
+- **v1 impact:** L1a blocker; resolved in the language documents before implementation.
+
+### F72 — safe `resource.borrow` was grouped with privileged representation access
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** prerequisite §3.2 native-construction wording and example.
+- **Current Align constraint:** consumers must be able to obtain an owner-tied opaque
+  `resource_ref<R>` without seeing or extracting the native representation.
+- **Actual failure:** an agent could restrict `resource.borrow` to the declaring package, making
+  ordinary safe borrowed APIs unusable, or could treat unsafe as bypassing module visibility.
+- **Recommendation:** make `resource.borrow` public and safe wherever `R` is visible; privilege only
+  raw construction, extraction, transfer, and owner-tied raw-view operations.
+- **v1 impact:** L3 public API blocker; resolved in the prerequisite plan.
+
+### F73 — `db.exec_result` exposed an unspecified ownership choice
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** DB §6.1's affected-row/native-status result.
+- **Current Align constraint:** native command-status text often borrows a result buffer, while an
+  owned string needs a visible owner/destination and allocation.
+- **Actual failure:** a wrapper could return a dangling native view or silently allocate a string
+  despite the common result appearing Copy.
+- **Recommendation:** make the initial common result exactly the allocation-free Copy record
+  `{ rows_affected: Option<i64> }`; any later native status surface must expose ownership/storage.
+- **v1 impact:** D2/D4 soundness/API blocker; native status is additive.
+
+### F74 — migration commands omitted deterministic project and target inputs
+
+- **Classification:** specification ambiguity; implementation complexity.
+- **Problematic design location:** DB §§17.2/17.5 command forms.
+- **Current Align constraint:** normal and explicit tool inputs must be reproducible and may not
+  depend on ambient current-directory scans, inferred drivers, or secret defaults.
+- **Actual failure:** two implementations could select different entry graphs, migration catalogs,
+  drivers, or databases, and repair could target a different catalog from migrate.
+- **Recommendation:** require exact `--entry`, `--migrations`, `--driver`, and matching
+  SQLite-path/PostgreSQL-URL-environment inputs on every migrate/status/check/repair form.
+- **v1 impact:** D11 correctness/safety blocker.
+
+### F75 — metadata filters had no public input types
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §18.2 `schema_filter` and `table_ref` signatures.
+- **Current Align constraint:** public package generics/signatures require concrete types and cannot
+  rely on reflection, anonymous records, search paths, or a driver-selected default schema.
+- **Actual failure:** implementations could disagree on name qualification, lifetime, allocation,
+  escaping, or SQL interpolation.
+- **Recommendation:** define Copy `db.SchemaRef` and `db.TableRef` inputs, borrow them only for the
+  call, require exact schema/name lookup, and bind/escape rather than concatenate identifiers.
+- **v1 impact:** D12 public API/safety blocker.
+
+### F76 — `KeyMeta` did not contain the promised constraint semantics
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §§18.2/18.7.
+- **Current Align constraint:** metadata categories are explicit flat records; prose-only native
+  facts cannot be recovered by reflection or hidden nested objects.
+- **Actual failure:** foreign-key match/actions, deferrability, initial state, and validation could
+  be silently discarded despite the design promising faithful key/constraint metadata.
+- **Recommendation:** add exact optional match/action/deferral/validation fields and finite common
+  enums; use `None` only when unavailable.
+- **v1 impact:** D12 contract blocker.
+
+### F77 — `IndexMeta` did not contain the promised index semantics
+
+- **Classification:** specification ambiguity; performance risk.
+- **Problematic design location:** DB §§18.2/18.8.
+- **Current Align constraint:** one flat row per term must distinguish key from included terms and
+  preserve order without a hidden nested allocation.
+- **Actual failure:** callers could not reconstruct covering/partial/expression index shape,
+  primary backing, order/null placement, or validity/readiness, making introspection inaccurate and
+  performance decisions unreliable.
+- **Recommendation:** add exact term-kind, primary-backed, sort/null-order, valid/ready, and existing
+  native method/opclass fields; order key terms before included terms.
+- **v1 impact:** D12 correctness blocker.
+
+### F78 — `ColumnMeta` and `QueryMeta` omitted fields promised by their own sections
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB §18.2 exact records versus §§16.3/18.6/18.9.
+- **Current Align constraint:** separate compilation and offline inspection can consume only fields
+  serialized in the exact artifact/public record contract.
+- **Actual failure:** native type identity, column descriptive fields, source/wire hashes, rewrite
+  version, prepare/schema/server identity, and structured result origin could disappear or be
+  represented incompatibly.
+- **Recommendation:** add every promised field explicitly, with structured origin components and
+  `Option` only for genuinely unavailable evidence.
+- **v1 impact:** D3/D5/D12 artifact and public metadata blocker.
+
+### F79 — checked metadata consumed nullability policy before its owner milestone
+
+- **Classification:** prerequisite feature missing; specification ambiguity; ownership or
+  soundness risk.
+- **Problematic design location:** DB D3/D5 versus §25's former D12–D14 open decision.
+- **Current Align constraint:** a typed decoder must conservatively reject unexpected NULL at
+  runtime; neither SQLite nor PostgreSQL catalog nullability alone describes an arbitrary Query
+  result after joins and expressions.
+- **Actual failure:** D3/D5 could merge using an invented optimistic rule, and later policy changes
+  would invalidate checked artifacts or make non-`Option` decoding unsound.
+- **Recommendation:** D0 records actual engine/version evidence; D3/D5 own checked-in fail-closed
+  support matrices. Ambiguous evidence is `Unknown`, never proves non-null, and never removes the
+  runtime NULL guard.
+- **v1 impact:** D3/D5 merge blocker; resolved as a prerequisite policy rather than deferred.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1168,6 +1307,15 @@ documents:
 63. Represent Query-less contract failures without a fabricated Query ID.
 64. Remove deferred logical types from first-release executable examples.
 65. Preserve Query identity in metadata/EXPLAIN errors whenever the operation has a Query subject.
+66. Make finite recursively Move struct fields agree with L1a's ordinary Drop-plan rule.
+67. Separate public safe `resource.borrow` from declaring-subtree raw representation operations.
+68. Fix `db.exec_result` as one allocation-free Copy affected-row record.
+69. Give every migration/repair command exact entry, catalog, driver, and matching target inputs.
+70. Give metadata filters concrete exact-schema `SchemaRef`/`TableRef` types.
+71. Put every promised foreign-key/constraint field in the exact flat `KeyMeta` record.
+72. Put every promised key/include/order/state field in the exact flat `IndexMeta` record.
+73. Align the exact `ColumnMeta`/`QueryMeta` records with artifact and category promises.
+74. Move the nullability/origin evidence contract to D0/D3/D5 and keep runtime NULL guards.
 
 ## 5. Revised implementation roadmap
 
@@ -1181,19 +1329,19 @@ documents:
 | L5 | tagged file/inline/checked-metadata inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/metadata-create-change-delete/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |
-| D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
+| D0 | SQLite/libpq capability probes only | native lifecycle plus exact origin/nullability evidence observations | recorded driver/version evidence matrix |
 | D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
 | D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, NUL/PRAGMA validation, cleanup, execution count | package versus libsqlite3 |
-| D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
+| D3 | SQLite prepare/check metadata | stale/policy/offline, migration catalog/order, and fail-closed origin/nullability matrix | prepare/check time and artifact size |
 | D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, Text-hex/Binary bytea, NUL/query-less error, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
-| D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
+| D5 | PostgreSQL checked metadata | recreated-schema reproducibility plus expression/outer-join/catalog-nullability matrix | describe/prepare time |
 | D6 | dependent prepared statements + prepare option sums | sequential reuse, disposition, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
 | D7 | tx options plus common exec view | combination rejection, consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
 | D8 | typed rows and row generations | old-view rejection, Params-source invalidation, type matrix, busy-timeout lifetime, clone retention, delivery counts | row decode/iteration/bind copies |
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
-| D11 | exact-policy SQL migrations; initial-release gate | checksum/order/atomic/dirty/repair/status | migration startup/large history |
-| D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/latency |
+| D11 | exact-input exact-policy SQL migrations; initial-release gate | CLI selector, checksum/order/atomic/dirty/repair/status | migration startup/large history |
+| D12 | exact typed-ref/record, region-owned category metadata and EXPLAIN options; initial-release gate | field/lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -1244,6 +1392,8 @@ bench/owned_tagged_payload/run.sh
 
 Acceptance behavior:
 
+- resolved finite struct fields follow one rule: Copy, or recursively Move only when the canonical
+  Drop plan exists after substitution;
 - `None` never reads or drops uninitialized payload storage;
 - `Some` drops exactly once across return, `?`, branches, loops, and reassignment;
 - `Some(old) -> Some(new)` and `Some -> None` drop old before replacement;
@@ -1269,18 +1419,22 @@ The delivery is not performance-complete without:
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
 - L7 nested-generic inference/monomorph compile time, interface and mono-key size, emitted code size,
   cache reuse, and absence of runtime dictionary/indirect-call overhead;
+- D0 records the exact engine/version origin/nullability evidence matrix rather than timing a
+  production path;
 - D1 generated Query/command binder and Query decoder versus hand-written field/ordinal code;
-- D2 direct libsqlite3 comparison;
+- D2 direct libsqlite3 comparison, including zero-allocation `db.exec_result`;
 - D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
   files;
-- D4 direct libpq comparison with transported/buffered/decoded rows reported separately;
+- D4 direct libpq comparison with transported/buffered/decoded rows reported separately and
+  zero-allocation `db.exec_result`;
 - D6 prepare reuse versus reprepare;
 - D8 row iteration/decode, Params bind copied bytes/allocations, physical-delivery counts, and
   retained-row-copy costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
-- D11 migration startup/status cost and ordered history scaling at 10/100/1000 applied files;
-- D12 category metadata query count, region bytes/compact count, native-buffer copy bytes, and
-  EXPLAIN latency;
+- D11 migration CLI startup/status cost and ordered history scaling at 10/100/1000 applied files,
+  with target parsing separated from database-open time;
+- D12 category metadata query count, exact record bytes, region bytes/compact count, native-buffer
+  copy bytes, and EXPLAIN latency;
 - D13 batch/SoA/native throughput on each driver;
 - D14 dynamic dispatch/mismatch overhead versus direct driver-qualified execution.
 
@@ -1306,6 +1460,17 @@ type-scope area found F69. The fixes were again made from that checkpoint rather
 full document scan.
 The next two-minute continuation found one remaining wording ambiguity, F70, in Query-specific
 metadata error context; it did not restart the completed scan.
+After those corrections, a fresh independent post-open review still found F71–F79. Those findings
+were valid. Their common cause was not an obscure engine detail: the authoring process had no
+complete public-contract ledger before prose was declared ready. Consequently exact records,
+command inputs, milestone ownership, and one language rule were checked only when a reviewer
+compared each prose promise with its executable surface. Using review as that completion loop was
+unacceptably late and explains the repeated corrections.
+
+The public-contract ledger in §1.1 now closes those categories in one pass, and the canonical
+repository guidance requires the ledger before independent review. F71–F79 were propagated from
+that ledger through the authoritative language/package/roadmap documents and the Japanese mirror;
+the review was not restarted as another unconstrained whole-document search.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

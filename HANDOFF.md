@@ -256,7 +256,12 @@ binder. Checked metadata is per permitted driver. Option API ownership is D1/D2/
 D9 completing deadline enforcement/native cancellation cleanup without a v1 public cancel
 resource. PostgreSQL Text `bytea` uses exact hex while raw bytes are Binary-only; cancellation must
 resynchronize or close before connection reuse; and Query-less validation uses no fabricated Query
-identity. The first public database release gate is
+identity. `resource.borrow` is public safe ownership-only access while raw forms stay
+declaring-subtree privileged. `db.exec_result` is exactly the Copy affected-row record. Every D11
+live command has explicit entry/catalog/driver/target inputs. D12 uses exact `SchemaRef`/`TableRef`
+and complete flat Column/Key/Index/Query records. D0 records the actual engine/version
+origin/nullability evidence; D3/D5 own fail-closed driver matrices, ambiguous evidence remains
+`Unknown`, and runtime NULL guards remain mandatory. The first public database release gate is
 driver-relevant D1–D12: D4 merge/release requires non-skippable provisioned PostgreSQL CI; D11 uses
 the exact atomic-default/dirty-forbidden migration contract; and D12 returns flat metadata/plan
 records into an explicit region. D13/D14 remain committed additive work. Native feasibility probes

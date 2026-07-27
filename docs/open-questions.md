@@ -3529,7 +3529,9 @@ like `tuples`/`fn_types`), and a `Pair<i32>` type interns a concrete monomorph `
 `struct_templates` registry, kept out of codegen). Concrete struct ids get reserved slots so
 monomorphs (appended after) never shift them. A **generic struct literal** (`Pair { a: 1, b: 2 }`)
 infers its type arguments from the field values (`match_param`, no turbofish) then monomorphizes;
-`Pair<i32>` is also a parameter/annotation type. A field must be Copy after substitution.
+`Pair<i32>` is also a parameter/annotation type. At that shipped checkpoint a field had to be Copy
+after substitution; the normative recursive tagged-Move decision below supersedes that
+implementation restriction through L1a/L1b for finite types with a known Drop plan.
 
 **4c-6 (generic sum types) DONE.** `Opt<T> { Some(T), None }` works end to end — the enum analogue
 of generic structs: an `enum_templates` registry, the concrete `enums` table grows during resolution
@@ -3678,7 +3680,9 @@ with an exactly-once Drop hook. The source hook is a `pub fn(raw) -> ()` inside 
 The resource producer synthesizes a hidden support thunk whose symbol/ABI fingerprint crosses
 interfaces, so consumer cleanup links without importing the internal source module. Only the
 declaring module's canonical descendant subtree may construct or extract the `raw` representation,
-and only inside `unsafe`. The raw-only Drop-hook module need not import the declaring root, so a
+and only inside `unsafe`. `resource.borrow(owner)` itself is public and safe wherever the opaque
+type is visible: it exposes only an owner-tied `resource_ref<R>`, never raw representation. The
+raw-only Drop-hook module need not import the declaring root, so a
 driver descendant can construct the root resource without a root↔internal cycle. Safe code receives
 a non-owning
 `resource_ref<R>` through borrowing; it cannot close, transfer, or outlive the owner generation.

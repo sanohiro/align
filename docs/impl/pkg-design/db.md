@@ -327,7 +327,7 @@ Required meaning:
   connection that prepared it.
 - `db.rows<R>` is a Move, one-pass typed row stream for exactly one execution, carrying a dependency
   on its statement/connection while native buffers need it.
-- `db.exec_result` contains affected-row and available command-status information.
+- `db.exec_result` is the allocation-free Copy affected-row record from §6.1.
 - `db.Driver { SQLite, PostgreSQL }` is the exact public driver identity used in errors, metadata,
   delivery observations, and D14's explicit dynamic-SQL restriction; it has no `Any` variant.
 - `db.row` and `db.value` are explicit dynamic escape hatches.
@@ -766,9 +766,15 @@ Execution returns:
 
 ```text
 db.exec_result
-  rows_affected
-  native command status when available
+  rows_affected: Option<i64>
 ```
+
+`db.exec_result` is Copy and allocation-free. `rows_affected` is `Some(n)` only when the engine
+reports a non-negative affected-row count that fits `i64`; commands without such a count return
+`None`. The driver reads/converts it before releasing the native result. A native textual command
+tag/status is not part of the first-release common result because it would require owned or
+region-destined storage. Any later driver-qualified status API must expose that destination/owner
+and its allocation explicitly.
 
 A DML statement with `RETURNING` is `db.query<P, R>`.
 
@@ -2045,6 +2051,40 @@ alongside them.
 
 Secrets and connection URLs are never stored.
 
+#### 16.3.1 Nullability and origin evidence
+
+Nullability evidence is fail-closed and query-specific:
+
+```text
+Yes      the engine describes this exact result expression as nullable
+No       the engine describes this exact result expression as non-null
+Unknown  the engine supplies no authoritative query-level answer, or evidence is ambiguous
+```
+
+Catalog `NOT NULL`, a source column's declaration, or origin lookup alone never produces `No`.
+Outer joins, expressions, functions, and rewrites can change result nullability. Align v1 does not
+add a SQL nullability analyzer to compensate. Origin is recorded only when the engine reports an
+unambiguous schema/table/column identity for that exact result entry; it is never inferred from a
+name or search path.
+
+The initial support matrix is deliberately conservative:
+
+| Driver evidence | Origin | Nullability |
+|---|---|---|
+| SQLite result metadata plus optional origin APIs | record only an exact reported origin | `Unknown` unless a probed engine API gives query-level evidence |
+| PostgreSQL RowDescription plus catalog lookup | record only the reported table/attribute origin | `Unknown`; catalog nullability does not describe an arbitrary result expression |
+
+D0 records the exact API/version observations behind this matrix. D3 and D5 must check in their
+driver/version matrices and tests before either checked-metadata milestone merges; this is not a
+D12–D14 design decision.
+
+`Yes` requires `Option<T>` in the exact `Row` contract. `No` requires non-`Option<T>` in v1.
+`Unknown` permits either shape but proves neither: every decoded SQL NULL still becomes `None` for
+`Option<T>` or a structured decode error for non-`Option<T>`. The runtime NULL guard is mandatory
+for `Declared`, `DatabaseChecked`, and all three evidence states, and optimization may not remove it.
+`Unknown` does not prevent `DatabaseChecked` when the exact driver type, ordinal, and other required
+metadata agree.
+
 For each static Query-or-command/driver pair, the compiler derives the one metadata pathname from the
 descriptor ID hash. `StaticInputManifest` and the frontend action key record the exact logical path
 plus `Missing` or `Present(content_hash, format_version)` even under `CheckedOptional`.
@@ -2152,20 +2192,44 @@ Discovery, filename validity, contiguous version ordering, symlink rejection, ex
 and schema-input fingerprinting use §16.6's one canonical catalog rule in both prepare and D11
 migration commands.
 
-### 17.2 Commands
+### 17.2 Commands and exact inputs
 
-Proposed tooling:
+Every D11 live-database command requires an explicit entry graph, migration catalog, driver, and
+target:
 
-```sh
-alignc db migrate
-alignc db status
-alignc db check
-alignc db prepare
+```text
+alignc db migrate --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+alignc db status  --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+alignc db check   --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+
+alignc db migrate --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+alignc db status  --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+alignc db check   --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+
+alignc db repair  --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                  --version N (--accept-applied | --clear-dirty) --expect-checksum HASH
+alignc db repair  --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                  --version N (--accept-applied | --clear-dirty) --expect-checksum HASH
 ```
 
+`ENTRY` is the explicit `.align` entry used to discover the project/package root. `DIR` is a
+project-root-relative migration directory that must pass the §16.6 catalog/path/symlink rules.
+The target is exactly one of `--sqlite-path PATH` or `--postgres-url-env NAME`, matching `--driver`;
+every missing, duplicate, or mismatched selector fails before opening a database. The SQLite target
+opens read-write/create for `migrate`, read-only/no-create for `status` and `check`, and
+read-write/no-create for `repair`; a missing file therefore fails every operation except `migrate`.
+No command applies an implicit PRAGMA. The PostgreSQL form validates `NAME` as an
+environment-variable identifier and reads that one URL value only after command parsing; the
+environment-variable name is explicit while the secret value never enters argv, artifacts, logs,
+or normal builds. There is no default `DATABASE_URL`, config-file discovery, current-directory
+migration scan, or inferred driver.
+
 `migrate` applies pending migrations with driver-appropriate locking and a migration history table.
-`status` reports applied/pending/checksum state. `check` compares configured schema/migrations/live
-state as available. `prepare` produces Query metadata.
+`status` reports applied/pending/checksum/dirty state without applying. `check` compares the exact
+catalog with live history/state without applying or repairing. `repair` performs only the exact
+checksum-bound action in §17.5. `alignc db prepare` is the separate explicit metadata-generation
+workflow in §16.5–§16.7 and does not weaken these D11 target inputs. None of these commands runs
+during a normal build.
 
 ### 17.3 Checksums and history
 
@@ -2210,9 +2274,16 @@ whether the statement took effect and never automatically retries it.
 
 Recovery is deliberately visible:
 
-```sh
-alignc db repair --version N --accept-applied --expect-checksum HASH
-alignc db repair --version N --clear-dirty --expect-checksum HASH
+```text
+alignc db repair --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                --version N --accept-applied --expect-checksum HASH
+alignc db repair --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                --version N --clear-dirty --expect-checksum HASH
+
+alignc db repair --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                --version N --accept-applied --expect-checksum HASH
+alignc db repair --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                --version N --clear-dirty --expect-checksum HASH
 ```
 
 Both forms require an exact current-file checksum and a dirty row. `--accept-applied` marks the row
@@ -2249,10 +2320,21 @@ The common result records are flat `RegionPlain` values. Their first-release fie
 db.MetaTableKind      Table | View | MaterializedView | Native
 db.MetaNullability    Yes | No | Unknown
 db.MetaKeyKind        Primary | Unique | Foreign | Check | Exclusion | Native
+db.MetaForeignKeyMatch Simple | Full | Partial
+db.MetaReferentialAction NoAction | Restrict | Cascade | SetNull | SetDefault
+db.MetaIndexTermKind  Key | Included
+db.MetaSortOrder      Asc | Desc
+db.MetaNullOrder      First | Last
 db.MetaQueryState     Declared | DatabaseChecked
 db.MetaQueryEntry     Summary | Parameter | Column
 db.MetaStatementClass Select | Dml | Ddl | Native | Unknown
 db.PlanFormat         Text | Json | Native
+
+db.SchemaRef
+  name: str
+
+db.TableRef
+  schema, name: str
 
 db.DatabaseMeta
   driver: Driver
@@ -2275,20 +2357,29 @@ db.ColumnMeta
   schema, table, name: str
   ordinal: i64
   logical_type, native_type: Option<str>
+  native_type_id: Option<i64>
   nullable: MetaNullability
-  default_sql, generated_sql, origin_schema, origin_table, origin_column: Option<str>
+  default_sql, generated_sql, identity_kind, collation, comment: Option<str>
+  origin_schema, origin_table, origin_column: Option<str>
 
 db.KeyMeta
   schema, table, name: str
   kind: MetaKeyKind
   term_ordinal: i64
   local_column, referenced_schema, referenced_table, referenced_column, expression: Option<str>
+  match_policy: Option<MetaForeignKeyMatch>
+  on_update, on_delete: Option<MetaReferentialAction>
+  deferrable, initially_deferred, validated: Option<bool>
 
 db.IndexMeta
   schema, table, name: str
-  unique: Option<bool>
+  unique, primary_backed: Option<bool>
   term_ordinal: i64
+  term_kind: MetaIndexTermKind
   column, expression, predicate, native_method, native_opclass: Option<str>
+  sort_order: Option<MetaSortOrder>
+  null_order: Option<MetaNullOrder>
+  valid, ready: Option<bool>
 
 db.QueryMeta
   query_id: str
@@ -2298,9 +2389,14 @@ db.QueryMeta
   artifact_digest: str
   state: MetaQueryState
   metadata_fingerprint: Option<str>
+  source_sql_hash, driver_wire_sql_hash: str
+  rewrite_format_version: i64
+  prepare_identity, schema_identity, server_identity: Option<str>
   entry: MetaQueryEntry
   ordinal: Option<i64>
-  source_name, source_alias, logical_type, native_type, origin: Option<str>
+  source_name, source_alias, logical_type, native_type: Option<str>
+  native_type_id: Option<i64>
+  origin_schema, origin_table, origin_column: Option<str>
   nullable: MetaNullability
 
 db.QueryPlan
@@ -2311,10 +2407,14 @@ db.QueryPlan
 ```
 
 Keys/constraints and indexes with several terms are repeated flat rows sharing `name`, ordered by
-`term_ordinal`; a category result never hides a nested allocation. `db.QueryMeta` begins with one
-`Summary` row followed by ordered parameter and column rows. Optional fields are `None` when the
-requested detail level or engine evidence does not supply them; base identity fields are always
-present. Driver-native operations return corresponding driver-specific flat `RegionPlain` records
+`term_ordinal`; index key terms precede included terms and `term_kind` distinguishes them. A category
+result never hides a nested allocation. `db.QueryMeta` begins with one
+`Summary` row followed by ordered parameter and column rows. `source_sql_hash`,
+`driver_wire_sql_hash`, and `rewrite_format_version` are always present because D1 creates them for
+every static Query/driver even in `Declared` state. Other optional fields are `None` when the
+requested detail level, checked state, or engine evidence does not supply them; base identity fields
+are always present. Driver-native operations return corresponding driver-specific flat
+`RegionPlain` records
 and may add native fields, but use the same destination rule.
 
 The exact common signatures and calls are:
@@ -2325,15 +2425,15 @@ database: db.DatabaseMeta =
 schemas: array<db.SchemaMeta> =
   db.meta_schemas(exec, detail, out, [])?
 tables: array<db.TableMeta> =
-  db.meta_tables(exec, schema_filter, detail, out, [])?
+  db.meta_tables(exec, schema_filter: Option<db.SchemaRef>, detail, out, [])?
 table: db.TableMeta =
-  db.meta_table(exec, table_ref, detail, out, [])?
+  db.meta_table(exec, table_ref: db.TableRef, detail, out, [])?
 columns: array<db.ColumnMeta> =
-  db.meta_columns(exec, table_ref, detail, out, [])?
+  db.meta_columns(exec, table_ref: db.TableRef, detail, out, [])?
 keys: array<db.KeyMeta> =
-  db.meta_keys(exec, table_ref, detail, out, [])?
+  db.meta_keys(exec, table_ref: db.TableRef, detail, out, [])?
 indexes: array<db.IndexMeta> =
-  db.meta_indexes(exec, table_ref, detail, out, [])?
+  db.meta_indexes(exec, table_ref: db.TableRef, detail, out, [])?
 query_meta: array<db.QueryMeta> =
   db.meta_query(exec, query(), detail, out, [])?
 plan: db.QueryPlan =
@@ -2346,6 +2446,13 @@ argument is `slice<db.MetaOption>`; `[]` means no options. The corresponding
 driver-native option slice. `meta_table(Full)` does not automatically fetch columns, keys, indexes,
 or plans. `meta_table` returns `db.Error.NotFound` when absent; it does not return an optional
 partially initialized record.
+
+`SchemaRef` and `TableRef` are Copy view inputs borrowed only until the metadata call returns; the
+driver never stores them. `SchemaRef.name` selects one exact engine schema/attached-database name.
+`None` in `meta_tables` means all accessible non-system schemas, plus system schemas only when the
+explicit option requests them. `TableRef` always carries an exact schema and name, so lookup never
+depends on PostgreSQL search path or an inferred SQLite `main`. Names are bound/escaped through the
+driver metadata API and are never pasted into SQL.
 
 Every string byte and every result array is allocated in the explicit `out` region before the native
 metadata/result buffer is released. No returned value borrows a connection, result, statement, or
@@ -2771,6 +2878,8 @@ equivalent direct libsqlite3 loop.
 - explicit temporary/in-memory schema setup with canonical migration catalog/order/fingerprint
   tests;
 - Declared/CheckedOptional/CheckedRequired;
+- the §16.3.1 SQLite origin/nullability evidence matrix, with ambiguous and outer-join results
+  remaining `Unknown`;
 - stale SQL/options/type/schema diagnostics;
 - normal-build no-network test;
 - runtime SQLite storage-class and NULL validation.
@@ -2811,7 +2920,8 @@ release performance gate.
 - canonical `.align-db/postgres` artifact;
 - engine version, search path, extension, and schema fingerprints;
 - type names plus OID evidence;
-- conservative nullability/origin evidence;
+- the §16.3.1 PostgreSQL origin/nullability evidence matrix, including proof that catalog `NOT NULL`
+  alone remains `Unknown` through arbitrary result expressions and outer joins;
 - `--check` reproducibility across equivalent recreated schemas;
 - runtime describe comparison.
 
@@ -3106,6 +3216,25 @@ The design is implemented correctly only if all are true:
     deferred logical types require a later explicit contract before appearing in public examples.
 82. `ContractError.query_id` is `Some(id)` for every Query/command subject, including metadata and
     EXPLAIN, and `None` only when the operation has no Query/command subject.
+83. `db.exec_result` is the exact allocation-free Copy record
+    `{ rows_affected: Option<i64> }`; no native result-buffer view escapes through it.
+84. A resolved finite struct field may be Copy or recursively Move when one ordinary Drop plan is
+    known; L1a's `Option<string>` field does not contradict the aggregate field rule.
+85. `resource.borrow` is a public safe ownership operation wherever the resource type is visible,
+    while all raw construction, extraction, transfer, and owner-tied raw-view operations remain
+    declaring-subtree privileged.
+86. Every D11 live command, including both repair actions, receives explicit entry, migration
+    catalog, driver, and matching SQLite/PostgreSQL target inputs and uses no ambient default.
+87. Metadata filters use exact Copy `SchemaRef`/`TableRef` inputs with no search-path, `main`, or SQL
+    interpolation inference.
+88. `KeyMeta` preserves foreign-key match/update/delete, deferrability, initial deferral, and
+    validation evidence when available.
+89. `IndexMeta` preserves key/included position, uniqueness/primary backing, sort/null order,
+    predicate/expression/native method/opclass, and valid/ready evidence when available.
+90. `ColumnMeta` and `QueryMeta` contain the exact native identity, origin, checked-artifact,
+    rewrite, prepare/schema/server, and descriptive fields promised by §§16 and 18.
+91. D0 records engine/version nullability/origin evidence; D3 and D5 own fail-closed support
+    matrices before merge, `Unknown` never proves non-null, and every runtime NULL guard remains.
 
 ---
 
@@ -3117,12 +3246,13 @@ consumer-driven type/native-surface decisions are:
 
 1. Decimal precision/scale representation.
 2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
-3. The exact conservative nullability/origin evidence each supported engine/version exposes.
-4. The minimal safe dynamic `db.row`/`db.value` set.
-5. Native callback safety for SQLite functions/collations.
-6. Which COPY/pipeline/backup/blob operations have a measured consumer.
+3. The minimal safe dynamic `db.row`/`db.value` set.
+4. Native callback safety for SQLite functions/collations.
+5. Which COPY/pipeline/backup/blob operations have a measured consumer.
 
-These items have roadmap homes in D12–D14. They do not permit weakening Query identity,
+The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
+D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not
+permit weakening Query identity,
 one-execution semantics, ownership, static artifacts, runtime validation, or option rejection.
 “The driver library made the choice for us” is not a design rationale.
 

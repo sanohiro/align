@@ -246,7 +246,7 @@ db.value
 - `db.stmt<P,R>`: prepareしたconnectionへのdependencyを持つMove statement。
 - `db.rows<R>`: 1実行だけのone-pass typed stream。native bufferが必要な間、
   statement/connectionへdependencyを持つ。
-- `db.exec_result`: affected rowsと利用可能なcommand status。
+- `db.exec_result`: §6.1のallocation-freeなCopy affected-row record。
 - `db.Driver { SQLite, PostgreSQL }`: error/metadata/delivery observation/D14 dynamic SQL
   restrictionで使うexact public identity。`Any` variantはない。
 - `db.row` / `db.value`: 明示的dynamic escape hatch。
@@ -498,7 +498,12 @@ interface/implementation split、cache invalidationを持つ。`StaticCommandArt
 `CommandStatic` が省くのはRow contract、result-column metadata、decode thunkだけである。
 Params binderはgeneratedで、reflection/runtime field-name lookupへfallbackしない。
 
-`execute` は `db.exec_result` を返す。`RETURNING` を含むstatementはQueryとして定義する。
+`execute` はallocation-freeなCopy record
+`db.exec_result { rows_affected: Option<i64> }` を返す。engineがnon-negativeかつi64に収まる
+affected-row countを報告するときだけ `Some(n)`、それ以外は `None` とし、native result解放前に
+変換する。native textual command tag/statusはowner/destinationなしでviewを返せないため初期
+common resultに含めない。後続driver-qualified APIはowned storageまたは明示regionとallocationを
+surfaceへ出す。`RETURNING` を含むstatementはQueryとして定義する。
 
 ### 6.2 result mode
 
@@ -1150,6 +1155,33 @@ URLは指定environment variableからprepare toolだけが読む。search_path�
 extension/type OID evidence、schema fingerprintを記録する。equivalentに再作成したschemaで
 canonical outputが一致するようにする。
 
+### 16.3.1 nullability/origin evidence
+
+query固有のevidenceをfail-closedに扱う。
+
+```text
+Yes      engineがこのexact result expressionをnullableと記述した
+No       engineがこのexact result expressionをnon-nullと記述した
+Unknown  authoritativeなquery-level answerがない、またはambiguous
+```
+
+catalog `NOT NULL`、source column declaration、origin lookupだけでは `No` にしない。outer
+join、expression、function、rewriteでresult nullabilityは変わる。Align v1はSQL nullability
+analyzerを追加しない。originはengineがexact result entryについてunambiguousなschema/table/
+columnを返した場合だけ記録し、nameやsearch pathから推測しない。
+
+```text
+SQLite     exact reported originだけ記録し、probed APIにquery-level evidenceがなければ Unknown
+PostgreSQL RowDescriptionのtable/attribute originだけ記録し、catalog nullabilityは Unknown
+```
+
+D0がAPI/version evidenceを記録し、D3/D5は各driver/version matrixとtestをmerge gateにする。
+これはD12〜D14へ残す設計判断ではない。`Yes` はexact Rowに `Option<T>`、`No` はv1で
+non-`Option<T>` を要求する。`Unknown` はどちらも許すが何も証明せず、SQL NULLは必ず
+`Option<T>` の `None` またはnon-Optionのstructured decode errorになる。Declared/
+DatabaseChecked/evidence stateに関係なくruntime NULL guardを残し、optimizationで除去しない。
+type/ordinal等が一致すれば `Unknown` でもDatabaseCheckedになれる。
+
 ## 17. Migration
 
 ### 17.1 SQL file
@@ -1163,15 +1195,35 @@ migrations/
 順序、name、exact content hashがidentityである。structから生成しない。
 prepareとD11 migrateは§16.6の同じfilename/version/order/symlink/hash catalog ruleを使う。
 
-### 17.2 command
+### 17.2 commandとexact input
+
+D11 live-database commandはentry graph、migration catalog、driver、targetを全て明示する。
 
 ```text
-alignc db migrate ...
-alignc db status ...
-alignc db check ...
+alignc db migrate --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+alignc db status  --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+alignc db check   --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+
+alignc db migrate --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+alignc db status  --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+alignc db check   --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+
+alignc db repair  --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                  --version N (--accept-applied | --clear-dirty) --expect-checksum HASH
+alignc db repair  --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                  --version N (--accept-applied | --clear-dirty) --expect-checksum HASH
 ```
 
-実行対象、driver、connection inputを明示する。通常buildには組み込まない。
+ENTRYはproject/package rootを決めるexplicit `.align` entry、DIRは§16.6のpath/symlink/catalog
+ruleを満たすproject-root-relative directory。targetはdriverと一致する `--sqlite-path PATH`
+または `--postgres-url-env NAME` のexactly oneで、missing/duplicate/mismatchはDB open前に
+失敗する。SQLiteはmigrateでread-write/create、status/checkでread-only/no-create、
+repairでread-write/no-createとし、missing fileはmigrate以外で失敗する。implicit PRAGMAは
+ない。PostgreSQLはNAMEをenv identifierとして検証しcommand parse後にそのURL valueだけを
+読む。secret valueはargv/artifact/log/normal buildへ入れない。default `DATABASE_URL`、
+config discovery、cwd migration scan、driver推測はない。status/checkは適用・repairせず、
+repairは§17.5のchecksum-bound actionだけを行う。`alignc db prepare` は§16.5〜§16.7の別の
+explicit metadata workflowである。通常buildにはどのcommandも組み込まない。
 
 ### 17.3 checksum/history
 
@@ -1200,10 +1252,22 @@ forbiddenはtransaction外が必須なnative statement用で、v1はdatabase-aut
 Appliedへ更新する。errorはbest-effortでFailed、process lossはApplyingを残す。両方をdirty
 stateとして後続migrationをblockし、status/checkが報告し、自動retryしない。
 
-recoveryはexact checksumを要求する
-`alignc db repair --version N --accept-applied --expect-checksum HASH` または
-`--clear-dirty` だけである。前者はoperatorがnative stateを確認してAppliedにし、後者は
-safe retryを確認してdirty rowだけを削除する。DB effectをundoせず、Applied rowは対象外。
+recoveryは§17.2のentry/catalog/driver/target全入力に加えてexact checksumを要求する。
+
+```text
+alignc db repair --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                --version N --accept-applied --expect-checksum HASH
+alignc db repair --entry ENTRY --migrations DIR --driver sqlite --sqlite-path PATH
+                --version N --clear-dirty --expect-checksum HASH
+
+alignc db repair --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                --version N --accept-applied --expect-checksum HASH
+alignc db repair --entry ENTRY --migrations DIR --driver postgres --postgres-url-env NAME
+                --version N --clear-dirty --expect-checksum HASH
+```
+
+`--accept-applied` はoperatorがnative stateを確認してAppliedにし、`--clear-dirty` はsafe
+retryを確認してdirty rowだけを削除する。DB effectをundoせず、Applied rowは対象外。
 
 ## 18. Metadataとintrospection
 
@@ -1230,38 +1294,116 @@ request typeとoptionをcategoryごとに分け、1 category requestが無関係
 common結果はflatな `RegionPlain` recordで、型とfield contractは次で固定する。
 
 ```text
-MetaTableKind       Table | View | MaterializedView | Native
-MetaNullability     Yes | No | Unknown
-MetaKeyKind         Primary | Unique | Foreign | Check | Exclusion | Native
-MetaQueryState      Declared | DatabaseChecked
-MetaQueryEntry      Summary | Parameter | Column
-MetaStatementClass  Select | Dml | Ddl | Native | Unknown
-PlanFormat          Text | Json | Native
-DatabaseMeta  driver, name, engine_version, optional schema/encoding/collation/read_only/transactional_ddl
-SchemaMeta    name, optional owner, visible, system
-TableMeta     schema, name, kind, optional native_kind/owner/comment/estimated_rows
-ColumnMeta    schema/table/name, ordinal, optional logical/native type, nullable, optional default/generated/origin
-KeyMeta       schema/table/name/kind, term_ordinal, optional local/ref columns/expression
-IndexMeta     schema/table/name/optional unique, term_ordinal, optional column/expression/predicate/method/opclass
-QueryMeta     query_id/driver/restriction/statement class/artifact digest/state/metadata fingerprint/entry,
-              optional ordinal/name/alias/logical/native/origin, nullable
-QueryPlan     driver, format, analyzed, body
+db.MetaTableKind      Table | View | MaterializedView | Native
+db.MetaNullability    Yes | No | Unknown
+db.MetaKeyKind        Primary | Unique | Foreign | Check | Exclusion | Native
+db.MetaForeignKeyMatch Simple | Full | Partial
+db.MetaReferentialAction NoAction | Restrict | Cascade | SetNull | SetDefault
+db.MetaIndexTermKind  Key | Included
+db.MetaSortOrder      Asc | Desc
+db.MetaNullOrder      First | Last
+db.MetaQueryState     Declared | DatabaseChecked
+db.MetaQueryEntry     Summary | Parameter | Column
+db.MetaStatementClass Select | Dml | Ddl | Native | Unknown
+db.PlanFormat         Text | Json | Native
+
+db.SchemaRef
+  name: str
+
+db.TableRef
+  schema, name: str
+
+db.DatabaseMeta
+  driver: Driver
+  name, engine_version: str
+  default_schema, encoding, collation: Option<str>
+  read_only, transactional_ddl: Option<bool>
+
+db.SchemaMeta
+  name: str
+  owner: Option<str>
+  visible, system: bool
+
+db.TableMeta
+  schema, name: str
+  kind: MetaTableKind
+  native_kind, owner, comment: Option<str>
+  estimated_rows: Option<f64>
+
+db.ColumnMeta
+  schema, table, name: str
+  ordinal: i64
+  logical_type, native_type: Option<str>
+  native_type_id: Option<i64>
+  nullable: MetaNullability
+  default_sql, generated_sql, identity_kind, collation, comment: Option<str>
+  origin_schema, origin_table, origin_column: Option<str>
+
+db.KeyMeta
+  schema, table, name: str
+  kind: MetaKeyKind
+  term_ordinal: i64
+  local_column, referenced_schema, referenced_table, referenced_column, expression: Option<str>
+  match_policy: Option<MetaForeignKeyMatch>
+  on_update, on_delete: Option<MetaReferentialAction>
+  deferrable, initially_deferred, validated: Option<bool>
+
+db.IndexMeta
+  schema, table, name: str
+  unique, primary_backed: Option<bool>
+  term_ordinal: i64
+  term_kind: MetaIndexTermKind
+  column, expression, predicate, native_method, native_opclass: Option<str>
+  sort_order: Option<MetaSortOrder>
+  null_order: Option<MetaNullOrder>
+  valid, ready: Option<bool>
+
+db.QueryMeta
+  query_id: str
+  driver: Driver
+  driver_restriction: DriverRestriction
+  statement_class: MetaStatementClass
+  artifact_digest: str
+  state: MetaQueryState
+  metadata_fingerprint: Option<str>
+  source_sql_hash, driver_wire_sql_hash: str
+  rewrite_format_version: i64
+  prepare_identity, schema_identity, server_identity: Option<str>
+  entry: MetaQueryEntry
+  ordinal: Option<i64>
+  source_name, source_alias, logical_type, native_type: Option<str>
+  native_type_id: Option<i64>
+  origin_schema, origin_table, origin_column: Option<str>
+  nullable: MetaNullability
+
+db.QueryPlan
+  driver: Driver
+  format: PlanFormat
+  analyzed: bool
+  body: str
 ```
 
-multi-term key/indexは同じnameを持つordered flat rowとして返しnested allocationを作らない。
+multi-term key/indexは同じnameを持つordered flat rowとして返す。index key termはincluded
+termより前に置き、`term_kind` で区別し、nested allocationを作らない。
 QueryMetaはSummary 1行の後にparameter/column行をordinal順で返す。detail/engineにないfieldは
-Option.Noneだがbase identityは常に存在する。
+Option.Noneだがbase identityは常に存在する。`source_sql_hash`、`driver_wire_sql_hash`、
+`rewrite_format_version` はDeclaredでもD1が全static Query/driverに生成するため常に存在する。
 
 common callは全て明示destination `out: region` をoption sliceの直前に持つ。
 
 ```align
 database: db.DatabaseMeta = db.meta_database(exec, detail, out, [])?
 schemas: array<db.SchemaMeta> = db.meta_schemas(exec, detail, out, [])?
-tables: array<db.TableMeta> = db.meta_tables(exec, schema_filter, detail, out, [])?
-table: db.TableMeta = db.meta_table(exec, table_ref, detail, out, [])?
-columns: array<db.ColumnMeta> = db.meta_columns(exec, table_ref, detail, out, [])?
-keys: array<db.KeyMeta> = db.meta_keys(exec, table_ref, detail, out, [])?
-indexes: array<db.IndexMeta> = db.meta_indexes(exec, table_ref, detail, out, [])?
+tables: array<db.TableMeta> =
+  db.meta_tables(exec, schema_filter: Option<db.SchemaRef>, detail, out, [])?
+table: db.TableMeta =
+  db.meta_table(exec, table_ref: db.TableRef, detail, out, [])?
+columns: array<db.ColumnMeta> =
+  db.meta_columns(exec, table_ref: db.TableRef, detail, out, [])?
+keys: array<db.KeyMeta> =
+  db.meta_keys(exec, table_ref: db.TableRef, detail, out, [])?
+indexes: array<db.IndexMeta> =
+  db.meta_indexes(exec, table_ref: db.TableRef, detail, out, [])?
 query_meta: array<db.QueryMeta> = db.meta_query(exec, query(), detail, out, [])?
 plan: db.QueryPlan = db.explain(exec, query(), params, out, options)?
 ```
@@ -1271,6 +1413,13 @@ option sliceを別々に受け、同じoutを先に受ける。optionless/hidden
 全string/array/bodyをnative result解放前にoutへcopyし、connection/row bufferをborrowしない。
 arrayはL6 builderの1 compact passを使う。meta_tableの欠落はNotFoundでありpartial recordや
 Optionを返さない。
+
+`SchemaRef` と `TableRef` はmetadata callが返るまでだけborrowされるCopy view inputで、
+driverは保持しない。`SchemaRef.name` はexact engine schema/attached-database名を選ぶ。
+`meta_tables` の `None` はaccessibleなnon-system schema全てを意味し、system schemaは
+explicit optionが要求した場合だけ含む。`TableRef` は常にexact schema/nameを持つため、
+PostgreSQL search pathやSQLite `main`を推測しない。identifierはdriver metadata APIで
+bind/escapeし、SQLへ文字列連結しない。
 
 ### 18.3 database
 
@@ -1482,7 +1631,8 @@ breadthは含めない。direct libsqlite3 loopと比較する。
 `.align-db/sqlite` canonical artifact、`alignc db prepare`/`--check`、explicit temp/in-memory
 schema setupとcanonical migration catalog/order/fingerprint test、
 Declared/CheckedOptional/CheckedRequired、stale/missing診断、offline normal build、runtime
-storage-class/NULL validation。
+storage-class/NULL validation、§16.3.1のSQLite origin/nullability matrixを所有する。
+ambiguous/outer-join resultは `Unknown` のままにする。
 
 ### D4 — 最小PostgreSQL vertical
 
@@ -1504,8 +1654,9 @@ direct libpq benchmarkは通常PRではenvironment-gatedだがD4初回/release e
 ### D5 — PostgreSQL checked metadata
 
 `.align-db/postgres`、engine/search path/extension/schema fingerprint、type name/OID evidence、
-conservative nullability/origin、equivalent recreated schemaでreproducible `--check`、
-runtime describe comparison。
+§16.3.1のPostgreSQL origin/nullability matrix（catalog `NOT NULL`だけではarbitrary
+expression/outer joinをnon-nullにしない）、equivalent recreated schemaでreproducible
+`--check`、runtime describe comparison。
 
 ### D6 — prepared statement lifecycle
 
@@ -1706,6 +1857,24 @@ execution-count付きで実証する。
     logical typeは後続の明示contract前にpublic exampleへ出さない。
 82. `ContractError.query_id` はmetadata/EXPLAINを含めQuery/command subjectがあれば
     `Some(id)`、subject自体がないoperationだけ `None` にする。
+83. `db.exec_result` はallocation-freeなCopy record
+    `{ rows_affected: Option<i64> }` で、native result-buffer viewを残さない。
+84. resolve後にfiniteなstruct fieldはCopyまたはordinary Drop planを持つrecursive Moveでよく、
+    L1aの `Option<string>` fieldはaggregate field ruleと矛盾しない。
+85. `resource.borrow` はresource typeがvisibleならpublic safe ownership operationであり、
+    raw construction/extraction/transfer/owner-tied raw viewだけdeclaring subtree privilegeにする。
+86. repairを含むD11 live commandはentry/catalog/driver/matching targetを全て明示しambient
+    defaultを使わない。
+87. metadata filterはexact Copy `SchemaRef`/`TableRef` を使い、search path、`main`、SQL
+    interpolationで推測しない。
+88. `KeyMeta` はavailableなforeign-key match/update/delete、deferrability、initial deferral、
+    validation evidenceを保持する。
+89. `IndexMeta` はkey/include、unique/primary backing、sort/null order、predicate/expression、
+    native method/opclass、valid/ready evidenceを保持する。
+90. `ColumnMeta`/`QueryMeta` は§16/§18が約束するnative identity、origin、checked artifact、
+    rewrite、prepare/schema/server、descriptive fieldをexactに持つ。
+91. D0がengine/version nullability/origin evidenceを記録し、D3/D5がmerge前にfail-closed
+    support matrixを所有する。`Unknown` はnon-nullを証明せずruntime NULL guardを常に残す。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 
@@ -1713,12 +1882,12 @@ load-bearing shapeは確定済み。残るもの:
 
 1. decimal precision/scale表現。
 2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping。
-3. engine/versionごとのconservative nullability/origin evidence。
-4. minimal safe dynamic `db.row`/`db.value` variant。
-5. SQLite function/collation callback safety。
-6. measured consumerを持つCOPY/pipeline/backup/blob operation。
+3. minimal safe dynamic `db.row`/`db.value` variant。
+4. SQLite function/collation callback safety。
+5. measured consumerを持つCOPY/pipeline/backup/blob operation。
 
-これらはD12〜D14に担当を持つ。Query identity、one-execution、ownership、artifact、
+engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。
+残りはD12〜D14に担当を持つ。Query identity、one-execution、ownership、artifact、
 runtime validation、option rejectionを弱める理由にはならない。
 
 ## 26. 実装agentへの指示

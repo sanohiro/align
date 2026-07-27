@@ -256,8 +256,11 @@ module's unsafe descendant subtree. Its raw-only source hook is `pub` only insid
 `internal` boundary; the resource producer supplies a hidden linkable Drop thunk, so consumers
 neither import the hook nor lose separate-compilation cleanup. The hook module need not import the
 declaring root, so a driver submodule can construct the public root resource without a cycle or a
-public raw constructor. Shared `borrow` preserves Move ownership; invalidating `borrow mut` also
-updates a writable Copy state aggregate in place. Parameter modes remain part of function values,
+public raw constructor. `resource.borrow` is public and safe wherever the opaque type is visible
+because it reveals only owner-tied provenance; construction/extraction/transfer of raw
+representation remains subtree-privileged and unsafe. Shared `borrow` preserves Move ownership;
+invalidating `borrow mut` also updates a writable Copy state aggregate in place. Parameter modes
+remain part of function values,
 and their inferred return provenance includes target-relative capture roots, so indirect calls
 cannot erase the ownership ABI or lifetime roots. A recursively Move return also forwards its
 path-selected cleanup bit; lifetime summaries cannot reconstruct ownership after a branch.
@@ -316,9 +319,13 @@ replacing a provisional API.
 **Catalog output owns its destination, and exceptional migrations fail dirty.** Metadata and plans
 copy flat records and strings into a caller-named region before native buffers die; multi-term
 keys/indexes are repeated rows rather than nested hidden allocations. Migration SQL is atomic by
-default. A visibly transaction-forbidden one-statement file records Applying before native
-execution and blocks on ambiguous failure until checksum-bound operator repair. These choices expose
-the two costs that cannot be wished away: result retention and non-transactional side effects.
+default. Every live migration command names its entry graph, catalog, driver, and matching target;
+ambient configuration cannot redirect it. A visibly transaction-forbidden one-statement file
+records Applying before native execution and blocks on ambiguous failure until checksum-bound
+operator repair. Query nullability is similarly fail-closed: engine-reported query evidence is
+retained, ambiguous evidence remains `Unknown`, and catalog `NOT NULL` alone cannot remove runtime
+NULL checks after joins or expressions. These choices expose the costs that cannot be wished away:
+result retention, live-schema identity, and non-transactional side effects.
 
 **An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
 A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would

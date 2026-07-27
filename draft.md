@@ -698,8 +698,11 @@ MIR. This adds no runtime dictionary, reflection, turbofish, or definition neste
 function, and does not make a concrete container element legal when that container otherwise
 rejects it.
 
-A struct field must be a Copy type after substitution. A no-payload variant (`Opt.None`) has nothing
-to infer its type from, so it needs a payload-bearing sibling to fix the type at construction.
+After substitution, a struct field may be Copy or recursively Move when its finite, non-recursive
+Drop plan is known. Move fields participate in the aggregate's one-owner cleanup bit and allocation
+mode; an unsupported container element remains illegal merely because it appears behind a generic
+field. A no-payload variant (`Opt.None`) has nothing to infer its type from, so it needs a
+payload-bearing sibling to fix the type at construction.
 
 ---
 

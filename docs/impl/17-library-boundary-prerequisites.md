@@ -289,24 +289,29 @@ thunk ABI/representation changes the public resource interface.
 
 ### 3.2 Native construction
 
-Only the declaring module and its canonical descendant-module subtree may use the resource
-representation intrinsics:
+`resource.borrow(owner)` is a public safe ownership operation wherever the opaque resource type is
+visible. It returns a `resource_ref<R>` tied to the owner's current generation and exposes no native
+representation. It is not representation-privileged.
 
-```align
-unsafe {
-  c: conn := resource.from_raw(handle)
-  ref := resource.borrow(c)
-  handle2 := resource.raw(ref)
-  transferred := resource.into_raw(c)
-}
+Only the declaring module and its canonical descendant-module subtree may use
+`resource.from_raw`, `resource.from_raw_borrowed`, `resource.view_from_raw`, `resource.raw`, and
+`resource.into_raw`:
+
+```text
+resource.from_raw(handle) -> R
+resource.raw(resource_ref<R>) -> raw
+resource.into_raw(R) -> raw
 ```
+
+These are independent signature forms, not one executable sequence. Each call occurs in `unsafe`.
 
 Rules:
 
 - `resource.from_raw` takes ownership of one non-null native handle; the expected result type selects
   the resource type, so there is no turbofish.
 - `raw.is_null()` is the one check used before construction when a C API reports failure with null.
-- `resource.borrow` is safe and returns `resource_ref<R>`.
+- `resource.borrow` is safe, available to ordinary consumers, and returns `resource_ref<R>` without
+  granting representation access.
 - `resource.raw` is unsafe and accepts `resource_ref<R>`, never an owning value.
 - `resource.into_raw` is unsafe, consumes the resource, clears its cleanup flag, and transfers the
   native ownership to the caller.
