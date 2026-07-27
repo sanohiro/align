@@ -282,9 +282,9 @@ The design does not require:
 - a second compile-time language.
 
 The compiler recognizes static Query constructors such as `db.query_file([])` because they need the
-expected `Params` and `Row` types, the current source path, a SQL-content hash, and build-dependency
-tracking. This is a narrow builtin-driven static-data feature, analogous to other compiler-known
-formats, not general metaprogramming.
+expected `Params` and `Row` types, a tagged file/inline source identity, a SQL-content hash, and
+build-dependency tracking. This is a narrow builtin-driven static-data feature, analogous to other
+compiler-known formats, not general metaprogramming.
 
 ### 4.3 Common concrete handles
 
@@ -465,6 +465,12 @@ pub fn query() -> db.query<Params, User> =
 
 The expression must be static. A runtime `string` cannot become a typed Query.
 
+Inline SQL has `SqlSourceIdentity::Inline { query_id }`; it does not receive a fake `.sql` path.
+`source_sql` is the exact UTF-8 value after Align string-escape decoding. The artifact retains a
+decoded-byte-to-defining-literal span map, so scanner/prepare/runtime diagnostics point back into the
+`.align` literal. The defining `.align` source is already a unit input; the decoded bytes/hash and
+tagged inline identity enter the Query artifact and producer implementation identity.
+
 Complex SQL SHOULD use a `.sql` file because it is easier to review, format, run in database tools,
 EXPLAIN, and diff as SQL.
 
@@ -482,7 +488,8 @@ public interface
   static semantic options
 
 producer implementation / StaticQueryArtifact
-  SQL logical path and exact source bytes/hash
+  SQL source identity: File(logical path) | Inline(query_id)
+  exact source bytes/hash
   deterministic per-driver wire bytes/hash and source map
   parameter occurrence/source-span table
   checked-metadata policy/digest
@@ -1744,13 +1751,14 @@ alignc db prepare app.align --driver postgres --url-env ALIGN_DB_PREPARE_URL --c
 ```
 
 The entry `.align` path and one `--driver` are required in v1. Query discovery uses exactly the
-entry's reachable import graph; it never scans the project for `.sql` files. `--query
-<fully-qualified-id>` may repeat to restrict that set. The output root is the entry build's project
-root plus `.align-db/`. A later tool-only config file may shorten these flags, but it is not a
-compiler manifest and is not required by the first implementation.
+entry's reachable import graph; it never scans the project for Query `.sql` files. The explicit
+SQLite `--migrations <dir>` catalog is a separate tool input governed by §16.6. `--query
+<fully-qualified-id>` may repeat to restrict the Query set. The output root is the entry build's
+project root plus `.align-db/`. A later tool-only config file may shorten these flags, but it is not
+a compiler manifest and is not required by the first implementation.
 
 SQLite accepts exactly one schema environment: `--database <path>`, or `--memory` optionally
-initialized from the ordered SQL files in `--migrations <dir>`. PostgreSQL accepts `--url-env
+initialized from the canonical migration sequence in `--migrations <dir>` (§16.6). PostgreSQL accepts `--url-env
 <name>`; the environment variable's value is read only by this explicit command. Direct URL flags
 may exist for local use but must be warned as shell-history-visible. The command prints the selected
 driver, schema source, server/library version, and Query count before writing.
@@ -1794,6 +1802,7 @@ not semantic, and no JSON object whose iteration order affects identity. Every f
 ```text
 format_version
 query_id, module, item, driver
+SQL source identity: File(logical path) | Inline(query_id)
 source-SQL hash, driver-wire-SQL hash, rewrite-format version, static-options hash
 Params and Row fingerprints
 schema fingerprint
@@ -1858,7 +1867,30 @@ SQLite preparation may use:
 - a temporary database created by applying migrations/schema;
 - an in-memory database when the schema is reproducible there.
 
-The chosen source is explicit in project configuration/command output.
+The chosen source is explicit in command output. `--migrations <dir>` is an explicit tool action and
+the only directory enumeration in this workflow. It is not performed by normal build/check or
+static Query discovery. Version 1:
+
+- enumerates only immediate entries, never recursively;
+- rejects non-UTF-8 entry names and every symlink;
+- selects regular files whose names match exactly
+  `[0-9]{4}_[a-z][a-z0-9_]*[.]sql`;
+- rejects every other regular filename ending in `.sql`; unrelated non-SQL files and directories
+  are ignored;
+- requires at least one selected migration when `--migrations` is present;
+- parses the four digits as version `0001` through `9999`, rejects duplicate versions, and requires
+  a contiguous sequence beginning at `0001`;
+- sorts by numeric version ascending, independent of filesystem enumeration order;
+- requires each selected file to be UTF-8 and reads exact bytes without newline normalization;
+- applies each whole file as a migration script in that order; the one-statement Query rule does not
+  apply to migration scripts;
+- computes the schema-input fingerprint from the ordered tuples
+  `(version, exact UTF-8 filename, content hash)`.
+
+All name/version/gap/symlink/UTF-8 errors are reported before applying the first migration.
+`alignc db migrate` in D11 reuses this exact catalog rule rather than inventing another order.
+Declared PRAGMAs, attached databases, and extension availability also enter the recorded schema
+environment; undeclared ambient connection state is forbidden.
 
 ### 16.7 PostgreSQL preparation environment
 
@@ -1886,6 +1918,9 @@ db/
 ```
 
 Migrations remain SQL. There is no schema DSL and no struct-to-DDL generation.
+Discovery, filename validity, contiguous version ordering, symlink rejection, exact-byte hashing,
+and schema-input fingerprinting use §16.6's one canonical catalog rule in both prepare and D11
+migration commands.
 
 ### 17.2 Commands
 
@@ -2179,6 +2214,8 @@ The implementation roadmap must add benchmarks for at least:
 
 - SQLite parameter bind + one-row typed decode;
 - PostgreSQL parameter bind + one-row typed decode;
+- file/inline Query artifact generation and cold/warm rebuild;
+- SQLite canonical migration catalog/replay at 10/100/1000 files;
 - prepared repeated execution;
 - large streamed flat result;
 - one-to-many one-pass shaping;
@@ -2254,10 +2291,10 @@ Land the seven PRs specified in
 ```text
 L1a recursive DropPlan + Option<Move> fields
 L1b Move sum/Option/Result payload completion
-L2  contextual borrow modes + Copy mutation + Fn modes + interface return-borrow summaries
+L2  contextual borrow modes + Copy mutation + Fn modes/joined provenance + interface summaries
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
-L5  deterministic static inputs + one-item Query identity + StaticQueryArtifact/descriptor
+L5  deterministic tagged file/inline inputs + one-item Query identity + artifact/descriptor
 L6  region-backed PlainStruct array_builder
 ```
 
@@ -2318,7 +2355,8 @@ direct libsqlite3 loop.
 
 - canonical `.align-db/sqlite` artifact;
 - `alignc db prepare` and `--check`;
-- explicit temporary/in-memory schema setup;
+- explicit temporary/in-memory schema setup with canonical migration catalog/order/fingerprint
+  tests;
 - Declared/CheckedOptional/CheckedRequired;
 - stale SQL/options/type/schema diagnostics;
 - normal-build no-network test;
@@ -2527,6 +2565,9 @@ The design is implemented correctly only if all are true:
 35. Imported resource Drop links through the producer thunk and executes exactly once.
 36. Each descriptor contains one whole-body constructor and owns one unique artifact/thunk slot.
 37. Arena-built compound arrays enter Output inline and never cross an ordinary by-value call.
+38. Indirect borrow-returning calls conservatively retain every possible target owner/region.
+39. Inline SQL has an item-based tagged source identity and maps diagnostics to its `.align` literal.
+40. SQLite migration-backed prepare validates and fingerprints one numeric order before execution.
 
 ---
 

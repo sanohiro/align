@@ -103,7 +103,8 @@ executable
   default-on object cache (parallel by default), selects runtime capabilities, links, and atomically
   publishes the executable.
 - On a cold source/import identity, import/name resolution first proves recognized static-input
-  callees; only then does the driver resolve/read/hash their exact safe paths. A later pre-frontend
+  callees; only then does the driver resolve/read/hash exact safe `File` paths. An `Inline(query_id)`
+  entry uses decoded literal bytes from the unit and never causes a file read. A later pre-frontend
   lookup may reuse only a versioned static-input manifest bound to that exact resolution digest, so
   shadowed/same-spelled calls never cause a file read.
 - Emits versioned Query/command artifacts beside interfaces/objects. SQL bytes and generated thunks

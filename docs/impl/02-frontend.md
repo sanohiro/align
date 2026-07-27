@@ -156,8 +156,8 @@ resolution reuses the direct-call import/visibility contract, while quiet signat
 literal element and fold-accumulator types without duplicate diagnostics. A local that shadows the
 leftmost module segment remains a value receiver. Whole-program and per-unit paths share this sema
 code, including imported effect summaries at `par_map`. L2 extends each function-value parameter
-entry with `ParamMode`; binding and indirectly calling a borrow/out-mode function never erases its
-ABI or alias contract.
+entry with `ParamMode` and both return-provenance summaries; binding and indirectly calling a
+borrow/out-mode function never erases its ABI, alias contract, or result lifetime.
 
 ### Functions
 
@@ -198,8 +198,9 @@ Likewise, `borrow: T` is a legal by-value parameter name. No whitespace heuristi
 
 `out`, `borrow`, and `borrow mut` are mutually exclusive parameter modes. They are preserved in
 the AST, exported function signature, and function-value parameter entries; a call has no mode
-marker. `borrow mut` is parsed as one mode, not as a mutable local declaration. The checking and
-return-provenance rules are in
+marker. Concrete function values also retain inferred `ReturnBorrowSummary` and
+`ReturnRegionSummary`, unioning them at joins. `borrow mut` is parsed as one mode, not as a mutable
+local declaration. The checking and return-provenance rules are in
 `03-types.md` and `17-library-boundary-prerequisites.md` §2.
 
 ### Type declarations (keyword-less)
@@ -290,6 +291,11 @@ contains exactly one constructor; conditional, nested, repeated, helper-wrapped,
 ordinary expression uses fail before static-input registration. The enclosing module/function
 identity is the unique Query/artifact identity.
 
+The registered source is tagged. A file constructor records its root-relative SQL path. An inline
+constructor records `Inline { query_id }`, hashes the exact decoded UTF-8 literal value, and keeps a
+decoded-byte-to-defining-`.align` span map for diagnostics. Inline SQL never invents a filesystem
+path; its defining `.align` file already participates in the ordinary unit source identity.
+
 On a cold source/import identity, the driver runs import/name resolution first, resolves only those
 proven `StaticInputRef` paths under the project/package root, reads exact UTF-8 bytes, and adds their
 logical paths and hashes to the producer identity. Successful resolution may persist a versioned
@@ -342,7 +348,8 @@ fn(out slice<u8>, str) -> ()
 
 Within a function-type parameter list, a contextual mode is recognized only when another type
 follows it. `fn(borrow) -> T` therefore uses a type named `borrow`; `fn(borrow Conn) -> T` has a
-shared-borrow parameter. Mode equality is exact. Effects remain inferred and are not written.
+shared-borrow parameter. Mode equality is exact. Effects and return-provenance summaries remain
+inferred and are not written.
 
 ---
 

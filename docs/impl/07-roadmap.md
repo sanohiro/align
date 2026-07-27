@@ -3509,10 +3509,10 @@ SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptan
 ```text
 L1a recursive DropPlan + Option<Move> fields
 L1b Move sum/Option/Result payload completion
-L2  contextual parameter modes + function-value modes + interface-visible return provenance
+L2  contextual parameter modes + function-value modes/joined provenance + interface summaries
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent resource_ref views
 L4  named arena region capability + clone_in
-L5  deterministic static source inputs + static Query artifacts
+L5  deterministic tagged file/inline inputs + static Query artifacts
 L6  region-backed RegionPlain array_builder
  D0 native SQLite/libpq feasibility probes
  D1 generated Query plan over a fake driver

@@ -213,8 +213,8 @@ DB driverより先に次を実装する。
 - operator overloading、macro、第2のcompile-time言語。
 
 `db.query_file([])` などのstatic Query constructorだけは、expected Params/Row、
-source path、source SQL hash、build dependencyを必要とするためcompiler-knownである。これは
-一般metaprogrammingではなく、限定されたstatic-data機能である。
+tagged file/inline source identity、source SQL hash、build dependencyを必要とするため
+compiler-knownである。これは一般metaprogrammingではなく、限定されたstatic-data機能である。
 
 ### 4.3 共通の具体型
 
@@ -349,6 +349,11 @@ pub fn query() -> db.query<Params, User> =
 static expressionだけを許可し、runtime `string` からtyped Queryを作らない。複雑なSQLは
 review/tool/EXPLAIN/diffしやすい `.sql` を推奨する。
 
+inline SQLは `SqlSourceIdentity::Inline { query_id }` を使い、fake `.sql` pathを作らない。
+`source_sql` はAlign escape decode後のexact UTF-8 valueで、artifactはdecoded byteから
+defining `.align` literal spanへのmapを持つ。decoded bytes/hashとtagged identityが
+producer/artifact identityへ入り、diagnosticはliteralへ戻る。
+
 ### 5.4 descriptor、artifact、incremental identity
 
 `db.query<P,R>` はCopyのcompiler-known descriptorであり、runtime reflection object
@@ -357,6 +362,7 @@ review/tool/EXPLAIN/diffしやすい `.sql` を推奨する。
 ```text
 StaticQueryArtifact       producer implementation
   query id
+  source identity: File(logical path) | Inline(query_id)
   exact source SQL bytes/hash
   driver別wire SQL bytes/hashとsource map
   Params/Row identities
@@ -941,14 +947,17 @@ stale metadataをCheckedOptionalで黙って使ってはならない。使うな
 
 ```text
 alignc db prepare app.align --driver sqlite --database dev.sqlite
+alignc db prepare app.align --driver sqlite --memory --migrations db/migrations
 alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL
 alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --query app.user
 alignc db prepare app.align --driver postgres --url-env APP_DATABASE_URL --check
 ```
 
-entry moduleとdriverは必須。reachable static Query/command graphだけを対象にし、directoryを
-scanしない。`--query` は対象をさらに絞る。prepare regeneration modeだけがmissing/stale
-artifactを許し、`--check` は何も書かない。normal buildはenvironmentを読まずDBへ接続しない。
+entry moduleとdriverは必須。Query discoveryはreachable static Query/command graphだけを
+対象にし、directoryをscanしない。SQLiteで明示した `--migrations <dir>` だけは§16.6の
+catalogをtool action内で列挙する。`--query` は対象をさらに絞る。prepare regeneration
+modeだけがmissing/stale artifactを許し、`--check` は何も書かない。normal buildは
+environmentを読まずDBへ接続しない。
 
 ### 16.3 metadata location
 
@@ -958,8 +967,9 @@ artifactを許し、`--check` は何も書かない。normal buildはenvironment
   postgres/
 ```
 
-artifactはversioned canonical formatで、Query id、source SQL hash、driver wire SQL hash、
-rewrite-format version、option hash、Params/Row contract、driver/engine identity、
+artifactはversioned canonical formatで、Query id、File(logical path)|Inline(query_id) source
+identity、source SQL hash、driver wire SQL hash、rewrite-format version、option hash、
+Params/Row contract、driver/engine identity、
 schema/search-path/extension evidence、parameter/result metadata、
 nullability/origin confidence、生成時刻以外のreproducible identityを持つ。secret/URLを
 保存しない。
@@ -978,8 +988,22 @@ PostgreSQL parser/type checkerを作らない。
 
 ### 16.6 SQLite prepare environment
 
-明示DB fileを使うか、temporary/in-memory DBへ指定migrationを順に適用してprepareする。
-PRAGMA、attached DB、extension policyをartifactへ記録し、undeclared ambient stateを使わない。
+明示DB fileを使うか、temporary/in-memory DBへcanonical migration sequenceを適用して
+prepareする。`--migrations <dir>` は明示tool actionだけが行うdirectory列挙で、normal
+build/checkやQuery discoveryは行わない。v1 rule:
+
+- immediate entryだけを非recursiveに列挙し、non-UTF-8名と全symlinkを拒否;
+- exact `[0-9]{4}_[a-z][a-z0-9_]*[.]sql` のregular fileだけを選択し、他の`.sql`名はerror;
+- `--migrations` 指定時は1つ以上のmigrationを要求;
+- version `0001`〜`9999`、duplicateなし、`0001`開始のcontiguous sequenceを要求;
+- filesystem orderではなくnumeric version ascending;
+- fileはUTF-8 exact bytes、newline normalizationなし;
+- 各file全体をその順でmigration scriptとして適用（Queryの1-statement rule対象外）;
+- `(version, exact UTF-8 filename, content hash)` のordered tuple列をschema fingerprintへ入れる。
+
+name/version/gap/symlink/UTF-8 errorは1件目を適用する前に報告する。D11のmigrateも同じ
+catalog ruleを再利用する。PRAGMA、attached DB、extension policyをartifactへ記録し、
+undeclared ambient stateを使わない。
 
 ### 16.7 PostgreSQL prepare environment
 
@@ -998,6 +1022,7 @@ migrations/
 ```
 
 順序、name、exact content hashがidentityである。structから生成しない。
+prepareとD11 migrateは§16.6の同じfilename/version/order/symlink/hash catalog ruleを使う。
 
 ### 17.2 command
 
@@ -1137,6 +1162,8 @@ driver-qualified pathとして追加する。
 - generated binder/decoder対hand-written native loop;
 - SQLite package path対direct libsqlite3;
 - PostgreSQL package path対direct libpq;
+- file/inline Query artifact generationとcold/warm rebuild;
+- SQLite canonical migration catalog/replay（10/100/1000 files）;
 - prepare reuse対reprepare;
 - rows iteration/decode;
 - region builder push/freeze/copy count;
@@ -1180,10 +1207,10 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 ```text
 L1a recursive DropPlan + Option<Move> field
 L1b Move sum/Option/Result payload completion
-L2  contextual borrow mode + Copy mutation + Fn mode + interface return provenance
+L2  contextual borrow mode + Copy mutation + Fn mode/joined provenance + interface summary
 L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
 L4  named arena region + clone_in
-L5  deterministic static input + one-item Query identity/artifact
+L5  deterministic tagged file/inline input + one-item Query identity/artifact
 L6  RegionPlain region array_builder
 ```
 
@@ -1220,8 +1247,9 @@ text view、all、stream、transaction、migration、dynamic row、metadata cata
 ### D3 — checked metadata core + SQLite
 
 `.align-db/sqlite` canonical artifact、`alignc db prepare`/`--check`、explicit temp/in-memory
-schema setup、Declared/CheckedOptional/CheckedRequired、stale/missing診断、offline normal build、
-runtime storage-class/NULL validation。
+schema setupとcanonical migration catalog/order/fingerprint test、
+Declared/CheckedOptional/CheckedRequired、stale/missing診断、offline normal build、runtime
+storage-class/NULL validation。
 
 ### D4 — 最小PostgreSQL vertical
 
@@ -1336,6 +1364,9 @@ execution-count付きで実証する。
 35. imported resource Dropがproducer thunkへlinkしexactly once。
 36. 1 descriptorはwhole-body constructor 1個とunique artifact/thunk slotを持つ。
 37. arena-built compound arrayはinlineでOutputへ入り、通常by-value callを越えない。
+38. indirect borrow-returning callは全possible target owner/regionをconservativeに保持する。
+39. inline SQLはitem-based tagged identityを持ち、diagnosticを `.align` literalへ戻す。
+40. SQLite migration-backed prepareは実行前に1つのnumeric orderを検証/fingerprintする。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

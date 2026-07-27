@@ -659,7 +659,9 @@ or Copy place, updates caller storage, and ends the previous generation. They ar
 types and introduce no writable lifetime syntax. `BorrowState` tracks that generation beside the
 existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
 lexically in scope. All parameter modes are retained in function-value types; direct and indirect
-calls share one ABI and alias/provenance check.
+calls share one ABI and alias/provenance check. Concrete function values also retain
+`ReturnBorrowSummary`/`ReturnRegionSummary`; joins union possible target inputs and unresolved
+higher-order parameters fail closed to every compatible input.
 
 The conservative "return borrows every view argument" rule is replaced by an inferred,
 canonical `ReturnBorrowSummary::Params(indices)` exported with the function signature. A second

@@ -257,7 +257,9 @@ owner and may return an inferred view of the current generation. `borrow mut x: 
 writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
 return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
 Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
-also retain every mode, so indirect and direct calls use the same ABI. Lifetimes are never written.
+also retain every mode and both return-borrow/region summaries, so indirect and direct calls use the
+same ABI and result lifetime. Function-value joins union the possible target summaries; an
+unresolved higher-order parameter uses every compatible input. Lifetimes are never written.
 Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the body has no other
 Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
 and database work remain Impure.
@@ -549,8 +551,8 @@ directory (nested `import util.math` → `util/math.align`). A cross-module refe
 resolves within the calling module (an imported type must be qualified). A qualified `pub` function
 may also be passed to a pipeline/reducer (`xs.map(geom.area)`) or bound as a function value
 (`f := geom.area`) under the same import and visibility rules. Its function-value type retains
-`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter; indirect calls do not erase modes. Each
-module has its own
+`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter plus inferred return-borrow/region
+summaries; indirect calls do not erase modes or provenance. Each module has its own
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,

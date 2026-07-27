@@ -82,10 +82,13 @@ checked HIR, but LLVM attributes are emitted only where their exact ABI meaning 
 Owner-generation invalidation is complete in HIR before MIR construction and is retained in debug
 provenance; LLVM does not decide borrow legality.
 
-`Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`. A named function converted to a function
-value retains `Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical
-direct-call ABI and checked alias/provenance facts. Function-value joins require exact mode equality.
-No indirect-call shim copies a borrowed owner or changes a parameter mode.
+`Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
+`ReturnBorrowSummary`/`ReturnRegionSummary`. A named function converted to a function value retains
+`Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical direct-call
+ABI and applies the stored result provenance. Function-value joins require exact mode equality and
+union both summary sets. An unresolved higher-order parameter uses every compatible view/region
+input rather than `None`. No indirect-call shim copies a borrowed owner, changes a parameter mode,
+or drops result provenance.
 
 A resource Drop operation names the resource-declaring producer's generated hidden support thunk,
 whose symbol and ABI fingerprint come from the imported resource summary. The thunk calls the

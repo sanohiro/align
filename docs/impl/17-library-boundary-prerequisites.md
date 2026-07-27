@@ -124,18 +124,35 @@ mechanism for these checks.
 
 ### 2.4 Effects and interfaces
 
-Parameter modes are part of named-function signatures, function-value types, and interface hashes:
+Parameter modes are part of named-function signatures, function-value types, and interface hashes.
+Concrete function values also carry the inferred return provenance of their target:
 
 ```text
-Fn([(ParamMode, Ty)], ReturnTy, Effect)
+Fn(
+  [(ParamMode, Ty)],
+  ReturnTy,
+  Effect,
+  ReturnBorrowSummary,
+  ReturnRegionSummary,
+)
 ParamMode = ByValue | Out | Borrow | BorrowMut
 ```
 
 Binding or passing a named function preserves every mode. Indirect-call checking requires an exact
 mode/type match and lowers `Borrow`/`BorrowMut` through the same pointer-to-caller-storage ABI as a
 direct call. Mode erasure, implicit adaptation, and treating a borrow-mode target as by-value are
-rejected. The inferred `Effect` remains excluded from source-level signature equality as already
-settled; parameter modes are not.
+rejected. Binding preserves both return summaries; a mutable function local or control-flow join
+unions the sorted parameter-index sets, so the indirect result is tied to every owner/region that
+any reachable target may use. When its return type may carry borrow provenance, an unresolved
+function-typed parameter conservatively includes every `Borrow`/`BorrowMut` input plus every
+by-value/out Copy input whose type recursively carries a view or `resource_ref`; it does not make a
+consumed by-value Move owner returnable. When the return may carry region provenance, it includes
+every `region` input. Corrupt/out-of-range summaries fail closed.
+
+The inferred `Effect` and return summaries remain excluded from written source-level function-type
+equality; parameter modes are not. They are concrete checked-HIR/interface facts consumed by
+indirect calls. An outer public function that returns an indirect-call result exports its normally
+inferred outer `ReturnBorrowSummary`/`ReturnRegionSummary`, so consumers never need the target body.
 
 The checked-HIR analysis infers canonical return lifetime summaries:
 
@@ -387,14 +404,17 @@ allocate into its caller. The region argument is the visible allocation authorit
 
 The hermetic-build rule becomes:
 
-> `alignc` reads reachable `.align` units plus static source inputs explicitly registered by a
-> compiler-known constructor in those units. It never scans a directory, runs a script, reads a
-> manifest language, contacts a service, or consults an environment variable to discover inputs.
+> Normal `alignc build`/`check` reads reachable `.align` units plus static source inputs explicitly
+> registered by a compiler-known constructor in those units. It never scans a directory, runs a
+> script, reads a manifest language, contacts a service, or consults an environment variable to
+> discover inputs. Explicit `alignc db` tool actions may consume explicitly named migration/database
+> inputs under `pkg-design/db.md`; those are not normal-build discovery.
 
-`db.query_file([])` and `db.command_file([])` are the first registered constructor family; their inline
-siblings register static literal bytes rather than a file. Driver-qualified variants select the
-same mechanism plus a static driver restriction. This is compiler infrastructure, not a general
-compile-time evaluation language.
+`db.query_file([])` and `db.command_file([])` are the first registered constructor family. Their
+inline siblings register decoded static literal bytes with a tagged inline source identity rather
+than pretending that a file exists. Driver-qualified variants select the same mechanism plus a
+static driver restriction. This is compiler infrastructure, not a general compile-time evaluation
+language.
 
 The recognized arities are exact:
 
@@ -443,13 +463,28 @@ Rules:
   preserves every other byte;
 - the file is registered in `SourceMap` so SQL diagnostics carry file/byte spans.
 
+Inline `db.query(sql_literal, ...)`/`db.command(sql_literal, ...)` uses:
+
+```text
+SqlSourceIdentity
+  File { root_relative_logical_path }
+  Inline { query_id }
+```
+
+For `Inline`, `source_sql` is the exact UTF-8 string value after Align escape decoding. The artifact
+stores a decoded-SQL-byte to defining-`.align`-literal span map for diagnostics; that diagnostic map
+is not a filesystem identity. The defining `.align` file is already a normal unit input, while the
+decoded bytes/source hash and `Inline { query_id }` participate in the Query artifact and producer
+implementation identity. User-facing diagnostics name the Query item and its literal span, never a
+synthetic `.sql` path.
+
 ### 5.3 Unit identity and cache keys
 
 Each unit has a sorted static-input list:
 
 ```text
 StaticInput
-  logical_path
+  source = File(root_relative_logical_path) | Inline(query_id)
   content_hash
   consumer_kind
 ```
@@ -458,6 +493,11 @@ Registration is based on the resolved callee identity, never a textual path matc
 binding, an unimported path, or a user function with the same spelling registers nothing and cannot
 cause a file read or missing-file diagnostic.
 
+Only `File` entries are read before a frontend-cache lookup. `Inline` bytes come from the already
+parsed unit; they still use this tagged record for artifact/action-key canonicalization and can never
+request filesystem I/O. Canonical list order is source tag (`File = 0`, `Inline = 1`), then UTF-8
+payload bytes, then consumer kind; content hashes never decide ordering.
+
 The producer action identity includes the unit source/import digest plus this list. At the shipped
 cache boundary, name resolution/frontend still runs before the list is first produced, and
 `impl_hash` includes every static input that changes generated MIR/data. This forces a producer
@@ -465,12 +505,12 @@ object miss and relink even when no `.align` byte changed.
 
 To preserve an eventual pre-frontend no-op hit without guessing from syntax, the driver may persist
 a versioned `StaticInputManifest` emitted by successful import/name resolution. It is keyed by the
-exact source/import-resolution digest and records constructor identity, logical path, and kind. A
-matching manifest lets the driver validate/read/hash those exact paths before a frontend-cache
-lookup. A missing or mismatched manifest runs import/name resolution and regenerates it before any
-static file is treated as an input. The manifest is a cache index, not a build manifest, and is
-never accepted across a source/import/schema digest change. File and directory mtimes never
-participate.
+exact source/import-resolution digest and records constructor identity, tagged source identity, and
+kind. A matching manifest lets the driver validate/read/hash only its exact `File` paths before a
+frontend-cache lookup; `Inline` never causes a read. A missing or mismatched manifest runs
+import/name resolution and regenerates it before any static file is treated as an input. The
+manifest is a cache index, not a build manifest, and is never accepted across a
+source/import/schema digest change. File and directory mtimes never participate.
 
 ## 6. Static Query artifacts and separate compilation
 
@@ -513,7 +553,7 @@ StaticQueryArtifact
   Row canonical type
   driver restriction
   static semantic options
-  SQL logical path
+  SQL source identity: File(logical path) | Inline(query_id)
   source SQL exact bytes
   source SQL hash
   per-allowed-driver wire SQL exact bytes/hash
@@ -692,7 +732,9 @@ The new semantics must be explicit before LLVM:
 - HIR/MIR types have one recursive tagged Move/Drop plan for struct/sum/Option/Result payloads.
 - HIR function parameters and function-value parameter entries carry
   `ByValue | Out | Borrow | BorrowMut`.
-- interface signatures carry the same mode plus `ReturnBorrowSummary`.
+- named/interface signatures and concrete function values carry return-borrow/region summaries;
+  function-value joins union them and unresolved higher-order parameters use the fail-closed
+  all-compatible-input summary.
 - HIR resource types carry declaration identity and the producer-owned Drop-thunk identity/ABI
   fingerprint.
 - MIR locals keep the existing path-local cleanup bit for resources and Move aggregates.
@@ -700,7 +742,8 @@ The new semantics must be explicit before LLVM:
   raw extraction, ownership transfer, and Drop;
   there is no `DbConnDrop`/`HttpServerDrop` family.
 - a `BorrowMut` call ends the owner generation in checked-HIR borrow state before the call.
-- direct and indirect calls share the same parameter-mode ABI and alias/provenance checks.
+- direct and indirect calls share the same parameter-mode ABI and alias/provenance checks, including
+  the indirect target's joined return summaries.
 - named arena lowering reuses `ArenaBegin`/`ArenaEnd` and merely binds the handle as `region`.
 - static Query construction lowers to immutable data plus generated binder/decoder functions.
 - LLVM performs pure representation lowering and does not decide ownership, invalidation, or Query
@@ -814,6 +857,8 @@ Acceptance:
   rejected as redundant;
 - `borrow: T` and `out: region` remain legal parameter names through contextual lookahead;
 - function-value binding and indirect calls retain all four parameter modes exactly;
+- borrow-returning function-value joins union return-borrow/region summaries, and an unresolved
+  higher-order parameter uses the all-compatible-input summary;
 - a deterministic exclusive-state shaper is Pure, while captured mutation and unsafe/I/O remain
   Impure;
 - imported and same-unit functions produce identical diagnostics;
@@ -886,6 +931,8 @@ Acceptance:
 - a stale `StaticInputManifest` is rejected after source/import/schema identity changes;
 - source SQL hash stays stable across driver selection, while PostgreSQL wire hash/rewrite map
   changes deterministically with placeholder ordinals;
+- inline SQL uses `Inline { query_id }`, decoded literal bytes, and a decoded-byte-to-`.align` span
+  map; no fake filesystem path enters identity or diagnostics;
 - artifact bytes are reproducible across checkout roots and process runs.
 
 ### L6 — region plain-struct builder

@@ -38,7 +38,13 @@ Ty =
   ResourceRef(DefId, [Ty])  // Copy view of one resource owner generation
   RegionCap                 // scope-bound `region` allocation capability
   Tuple(TupleId)            // anonymous product `(T, U, ...)`; interned by element list
-  Fn([(ParamMode, Ty)], Ty, Effect) // lambda / function value
+  Fn(
+    [(ParamMode, Ty)],
+    Ty,
+    Effect,
+    ReturnBorrowSummary,
+    ReturnRegionSummary,
+  )                            // lambda / function value
   Var(id)                   // inference variable (during inference only)
 ```
 
@@ -161,10 +167,12 @@ users.where(.active).score.sum()
 A projection is fixed as a `Project(field)` node on the HIR and becomes a fusion target in MIR (`04-mir.md`). Ordinary access is `FieldAccess`.
 
 ### Field selector `.ident`
-A `.ident` at argument position is typed, from the receiver element type `E`, as a function value `Fn([E], type_of(E.ident), Pure)`.
+A `.ident` at argument position is typed, from the receiver element type `E`, as a function value
+`Fn([(ByValue, E)], type_of(E.ident), Pure, return_borrow, None)`, where `return_borrow` is `Params([0])`
+only when the projected field is a view backed by `E`; otherwise it is `None`.
 
 ```align
-users.where(.active)   // .active : Fn([User], bool, Pure)
+users.where(.active)   // .active : Fn([(ByValue, User)], bool, Pure, None, None)
 ```
 
 ---
@@ -266,10 +274,13 @@ program and interface-only checking must produce identical borrow roots and diag
 the same `BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second
 reference type or a package-name table.
 
-The same `ParamMode` entries are retained in `Fn`/`FnTy`. Function-value assignment, joins,
-interface codecs, equality, direct/indirect call checking, and codegen must agree on modes; there is
-no mode-erasing adapter. The inferred effect bit remains outside source-signature equality, but
-parameter modes participate.
+The same `ParamMode` entries are retained in `Fn`/`FnTy`. Concrete function values additionally
+carry `ReturnBorrowSummary` and `ReturnRegionSummary`. Function-value assignment and control-flow
+joins union both parameter-index sets; an unresolved higher-order parameter whose result may carry
+provenance conservatively names every compatible view/region input. Interface codecs,
+direct/indirect call checking, and codegen must agree on these facts; there is no mode- or
+provenance-erasing adapter. The inferred effect and return summaries remain outside written
+source-signature equality, but parameter modes participate.
 
 ### Opaque resources
 
@@ -369,9 +380,8 @@ users.par_map(fn u { total = total + u.score });  // error: modifies an outer mu
 total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 ```
 
-The `Fn` type carries parameter modes and an effect
-(`Fn([(ParamMode, Ty)], Ty, Effect)`), so both call ABI and purity can be checked through a function
-value.
+The `Fn` type carries parameter modes, an effect, and both return-provenance summaries, so call ABI,
+purity, and result lifetime can all be checked through a function value.
 
 > **Implementation note (2026-07-15, #465):** the effect bit is implemented end to end. Concrete
 > named functions and lifted closures receive independent `FnTy` effects, mutable fn locals join

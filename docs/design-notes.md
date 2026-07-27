@@ -258,8 +258,9 @@ neither import the hook nor lose separate-compilation cleanup. The hook module n
 declaring root, so a driver submodule can construct the public root resource without a cycle or a
 public raw constructor. Shared `borrow` preserves Move ownership; invalidating `borrow mut` also
 updates a writable Copy state aggregate in place. Parameter modes remain part of function values,
-so indirect calls cannot erase the ownership ABI. Inferred owner generations prevent a returned
-view from surviving replacement, mutation, or Drop. This generalizes the existing Move/Drop and
+and their inferred return provenance is conservatively joined, so indirect calls cannot erase the
+ownership ABI or lifetime roots. Inferred owner generations prevent a returned view from surviving
+replacement, mutation, or Drop. This generalizes the existing Move/Drop and
 borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
 ownership model.
 

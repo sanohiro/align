@@ -765,8 +765,11 @@ accepts a writable Move or Copy place, has exclusive access for the call, and en
 storage generation. This is required for a Copy state aggregate whose field mutation must update the
 caller rather than a discarded copy. Older views become invalid; a returned view belongs to the
 fresh generation. Parameter modes are part of named-function and function-value signatures, while
-lifetime roots remain inferred — there are no written lifetime parameters. Passing the same owner
-through overlapping `borrow mut`, `borrow`, or `out` arguments is rejected.
+lifetime roots remain inferred — there are no written lifetime parameters. A concrete function
+value retains inferred return-borrow and return-region parameter sets. Assignment/control-flow
+joins union them; an unresolved higher-order parameter conservatively names every compatible
+view/region input. Passing the same owner through overlapping `borrow mut`, `borrow`, or `out`
+arguments is rejected.
 
 `borrow`, `out`, and `resource` are contextual rather than reserved words. Parameter lookahead
 recognizes `borrow name: T`, `borrow mut name: T`, and `out name: T` as modes, while `borrow: T` and
@@ -990,7 +993,9 @@ apply(fn n: i64 { n + base }, 5)   // a (capturing) closure passed as an argumen
 Function types preserve parameter modes: `fn(borrow Conn) -> i64`,
 `fn(borrow mut State, Row) -> Result<(), Error>`, and `fn(out slice<u8>, str) -> ()`. Binding,
 passing, joining, or indirectly calling a named function retains the exact mode and direct-call
-ABI; there is no mode-erasing adapter. The inferred effect remains unwritten.
+ABI; there is no mode-erasing adapter. It also preserves and conservatively joins inferred
+return-borrow/region summaries, so an indirect result cannot outlive any possible target input. The
+inferred effect and provenance summaries remain unwritten.
 
 A passed closure's captured environment lives in the caller's frame for the duration of the call, so
 no heap allocation is needed. A function value that *escapes* — returned from a function, stored

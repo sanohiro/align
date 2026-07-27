@@ -370,8 +370,9 @@ idea is rejected.
   `ParamMode`.
 - **Actual failure:** binding `inspect` then indirectly calling it can select a by-value ABI, consume
   a Move owner, or miscompile a caller-storage pointer.
-- **Recommendation:** define `Fn([(ParamMode,Ty)],Ret,Effect)` end to end. Exact mode equality and the
-  direct-call ABI apply to bindings, joins, interfaces, indirect calls, and codegen.
+- **Recommendation:** define `Fn` with mode/type entries, effect, and both return-provenance
+  summaries end to end. Exact mode equality and the direct-call ABI apply to bindings, joins,
+  interfaces, indirect calls, and codegen; summary joins are detailed in F26.
 - **v1 impact:** blocker for sound L2; must ship in the L2 prerequisite PR.
 
 ### F23 — `out: region` conflicts with out-parameter parsing
@@ -409,6 +410,44 @@ idea is rejected.
   one named zero-argument non-generic descriptor function. Reject every other placement.
 - **v1 impact:** blocker for deterministic L5 artifacts; resolved in the revised descriptor rule.
 
+### F26 — function values must retain return provenance, not only parameter modes
+
+- **Classification:** ownership or soundness risk; prerequisite feature missing.
+- **Problematic design location:** L2 borrow-returning named functions used as first-class values.
+- **Current Align constraint:** a function value may join multiple named targets; written
+  parameter/return types do not say which input backs a returned view.
+- **Actual failure:** an indirect caller may release the true owner/region because its `Fn` fact
+  retains modes but loses `ReturnBorrowSummary`/`ReturnRegionSummary`.
+- **Recommendation:** concrete `Fn`/`FnTy` carries both summaries. Function-value joins union
+  parameter-index sets; unresolved higher-order parameters use every compatible view/region input.
+- **v1 impact:** soundness blocker for L2 and indirect calls; mandatory in the L2 PR.
+
+### F27 — inline SQL needs a deterministic non-file source identity
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** `db.query(sql_literal, ...)` versus an artifact schema requiring
+  an SQL logical file path.
+- **Current Align constraint:** an inline literal belongs to the defining `.align` SourceMap file,
+  not to a sibling SQL file.
+- **Actual failure:** cache/artifact encoding and diagnostics either invent unstable paths or cannot
+  identify the inline source.
+- **Recommendation:** use tagged `File(logical_path) | Inline(query_id)` identity. Hash exact
+  decoded literal bytes and retain a decoded-byte-to-`.align` literal span map.
+- **v1 impact:** blocker for the promised inline L5 form; sibling-file Queries could ship without it,
+  but the accepted unified design includes it in L5.
+
+### F28 — migration-backed SQLite preparation had no deterministic order
+
+- **Classification:** specification ambiguity; implementation complexity.
+- **Problematic design location:** `alignc db prepare --memory --migrations <dir>`.
+- **Current Align constraint:** filesystem enumeration order is not stable across hosts.
+- **Actual failure:** dependent migration scripts may execute in different orders and produce
+  different checked metadata/schema fingerprints.
+- **Recommendation:** one nonrecursive canonical catalog: exact four-digit snake-case filenames,
+  no symlinks/non-UTF-8, unique contiguous versions from `0001`, numeric order, exact UTF-8 bytes,
+  and an ordered tuple fingerprint. Validate the whole catalog before execution.
+- **v1 impact:** D3 blocker for migration-backed SQLite prepare; resolved in §§16.6/17.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -431,10 +470,12 @@ idea is rejected.
    unique artifact identity. It is not an object with reflection or a runtime SQL parser.
 7. **Sibling `.align`/`.sql`:** a path-free registered constructor maps the defining module's exact
    extension to `.sql`; exact source bytes, logical path, kind, and digest are deterministic inputs,
-   separate from deterministic driver wire bytes.
+   separate from deterministic driver wire bytes. Inline SQL instead uses `Inline(query_id)` and a
+   decoded-literal source map.
 8. **Module export:** `IStaticQuery` carries the public contract; `StaticQueryArtifact` carries SQL
    and implementation metadata. A private SQL-only edit rebuilds/relinks the producer without
-   invalidating unchanged consumers.
+   invalidating unchanged consumers. Function values similarly retain/join return provenance across
+   separate compilation.
 9. **Named parameters:** dialect-aware lexical occurrence table. SQLite uses native named
    parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
    ordinal for repeats.
@@ -452,7 +493,8 @@ idea is rejected.
     measured compacting pass. Builders stay separate mutable locals and are borrowed by the Pure
     step.
 15. **Offline checked metadata:** explicit prepare/check tooling invokes real database engines;
-    ordinary build consumes canonical artifacts and never connects.
+    ordinary build consumes canonical artifacts and never connects. Explicit SQLite migration
+    replay uses one canonical validated version order and ordered fingerprint.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
     slices and no silent ignore.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b; prove fake
@@ -492,6 +534,9 @@ documents:
 18. Restrict each static constructor to one whole-body descriptor item with a unique Query ID.
 19. Keep region builders as separate locals and construct arena-owned compound output inline.
 20. Separate exact source SQL identity from deterministic per-driver wire SQL identity.
+21. Carry and join return-borrow/region summaries in function values and indirect calls.
+22. Give inline SQL a tagged descriptor-item identity and decoded-literal diagnostic map.
+23. Define one validated numeric migration order/fingerprint for SQLite prepare and D11 migrate.
 
 ## 5. Revised implementation roadmap
 
@@ -499,15 +544,15 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan; `Option<Move>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | contextual borrow modes, Copy mutation, Fn modes, provenance | direct/indirect and same/per-unit parity | borrowed-call and interface-size cost |
+| L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | joined-target direct/indirect and per-unit parity | borrowed-call and interface-size cost |
 | L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
-| L5 | static inputs, Query/command artifacts, descriptor skeleton | cache matrix, path safety, reproducibility | cold/warm producer/consumer rebuild |
+| L5 | tagged file/inline inputs, Query artifacts, descriptor skeleton | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
 | D1 | fake-driver Query binder/decoder and scanner | artifact/cache/placeholder matrix | thunk overhead and warm cache |
 | D2 | scalar SQLite Query vertical | cardinality, cleanup, execution count | package versus libsqlite3 |
-| D3 | SQLite prepare/check metadata | stale/missing/policy/offline matrix | prepare/check time and artifact size |
+| D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
 | D4 | scalar PostgreSQL Query vertical | rewrite, SQLSTATE, mismatch, cleanup | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
 | D6 | dependent prepared statements | sequential reuse and child-before-parent Drop | prepare reuse/reprepare |
@@ -581,15 +626,17 @@ The delivery is not performance-complete without:
 
 - L1a/L1b tagged-Move branch, allocation, and Drop counts;
 - L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver, plus
-  interface summary size/time;
+  joined return-summary/interface size/time;
 - L3 resource construction/ref/dependent cross-unit Drop thunk/native-view checks versus direct
   current handle path;
 - L4 named/anonymous arena parity;
 - L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, and public
-  contract changes, plus descriptor-count scaling;
+  contract changes, plus file/inline and descriptor-count scaling;
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
 - D1 generated binder/decoder versus hand-written field/ordinal code;
 - D2 direct libsqlite3 comparison;
+- D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
+  files;
 - D4 direct libpq comparison;
 - D6 prepare reuse versus reprepare;
 - D8 row iteration/decode and retained-copy costs;

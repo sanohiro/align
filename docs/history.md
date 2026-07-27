@@ -25,7 +25,9 @@ Copy aggregate; parameter modes survive in function-value types; contextual `bor
 `resource` words keep intrinsic paths and `out: region` parseable; a resource producer emits a
 hidden linkable Drop thunk for its `pub` internal raw hook; and each static Query constructor is the
 single whole body of one uniquely named descriptor item. Arena-owned builder output is finalized
-inline rather than passed through a forbidden by-value call.
+inline rather than passed through a forbidden by-value call. A follow-up soundness pass required
+function values to retain and join return provenance, gave inline SQL a tagged item-based source
+identity, and fixed migration replay to one canonical filename/version order.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:
