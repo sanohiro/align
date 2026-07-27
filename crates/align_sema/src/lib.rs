@@ -26238,16 +26238,18 @@ mod tests {
             "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    mut p := Pair { left: make(), right: make() }\n    p.right = [2].to_array()\n    print(p.left.len())\n  }\n  return 0\n}\n";
         let (_p, d) = check(field_reassign);
         assert!(
-            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
-            "field assignment must not introduce mixed aggregate ownership"
+            d.iter()
+                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
+            "owned-array field replacement must fail closed before it can introduce mixed aggregate ownership"
         );
 
         let joined_field =
             "Wrap { xs: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn run(c: bool) -> i32 {\n  arena {\n    mut w := Wrap { xs: make() }\n    if c {\n      w = Wrap { xs: [2].to_array() }\n    }\n    w.xs = [3].to_array()\n    return 0\n  }\n}\nfn main() -> i32 = run(false)\n";
         let (_p, d) = check(joined_field);
         assert!(
-            d.iter().any(|e| e.message.contains("cannot change allocation mode through a field assignment")),
-            "a heap/arena path-dependent aggregate must reject field mutation"
+            d.iter()
+                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
+            "a heap/arena path-dependent aggregate must reject unsupported owned-field mutation"
         );
     }
 
