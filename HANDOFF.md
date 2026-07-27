@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-27. `main` includes the shipped wave through #660.
+_Last updated: 2026-07-27. `main` includes the shipped wave through #662.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -13,7 +13,8 @@ materializing maps without changing production behavior. #657 adds a runtime-onl
 aggregate-like stride probe without changing production behavior. #658 widens the
 compiler-generated AoS range path to field projection and `where(.field)` stages;
 #660 extends the same range path to `chunks` source slices and direct integer
-chunk transform-reduce. SoA, string-search, and unsupported layouts remain
+chunk transform-reduce. #662 records a bounded, measure-only probe for the retained
+`chunks` header allocation. SoA, string-search, and unsupported layouts remain
 sequential._
 
 ## Start here
@@ -79,6 +80,7 @@ facts must live in this repository.
 #658  compiler-generated AoS projection/field-filter par_map range stages
 #659  bounded pre-PR attestation, review watchdog, and focused verification policy
 #660  chunk-source range kernels and direct integer chunk transform-reduce
+#662  measure-only chunks header allocation probe
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -172,6 +174,20 @@ the `align_rt_chunks`/`ParPool::submit_many` runtime path. The required narrower
 host rerun and independent adversarial diff review found no actionable issues.
 The final SHA's preflight attestation, Linux x86_64/ARM64 and macOS CI, and
 post-open review status passed; #660 was squash-merged as `6153847`.
+
+#662's measure-only probe was squash-merged as `f8ef4c7`. Its broad host review
+did meaningful inspection for about five minutes but the wrapper emitted no
+machine-readable verdict, so elapsed time was not treated as a clean result.
+The review state and last useful inspection were checked, then a bounded narrow
+host rerun and a fresh independent adversarial review both returned CLEAN. The
+two SHA-bound logs were recorded before the `Post-open review` status was set;
+the initial attestation failure was only because that post-open marker was not
+yet present, and the rerun passed after the marker was recorded. This is the
+operational rule to retain: when a review interval elapses, inspect process
+state, log growth, and the last completed action first; allow meaningful work
+to continue while the hard 15-minute bound has not been reached. At that bound,
+stop the review, record the elapsed time and last completed action, and then
+narrow or rerun it; never infer a verdict from elapsed time.
 
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-separated padded controls over the same registration ABI.
