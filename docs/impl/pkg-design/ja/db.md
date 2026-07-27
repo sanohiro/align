@@ -1704,6 +1704,8 @@ execution-count付きで実証する。
 80. `ContractError` はQuery IDを捏造せずQueryなしoperation/input validationを表現できる。
 81. 初期releaseの例とmappingはinteger/float/bool/text/bytea/Optionだけを使い、deferred
     logical typeは後続の明示contract前にpublic exampleへ出さない。
+82. `ContractError.query_id` はmetadata/EXPLAINを含めQuery/command subjectがあれば
+    `Some(id)`、subject自体がないoperationだけ `None` にする。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

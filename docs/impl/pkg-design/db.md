@@ -1909,9 +1909,10 @@ acceptable substitutes.
 The semantics are:
 
 - stable categories for ordinary control flow;
-- `ContractError.query_id` is `Some(id)` for a Query/command contract and `None` for connection,
-  transaction, metadata, or other operation/input validation; `item` names the exact operation and
-  input in both cases;
+- `ContractError.query_id` is `Some(id)` whenever validation has a Query/command subject, including
+  `meta_query` and Query EXPLAIN. It is `None` only when no Query/command subject exists, such as
+  connection input, transaction-option, or category-metadata validation. `item` names the exact
+  operation and input in both cases;
 - driver code/message/detail retained where available;
 - SQLSTATE retained for PostgreSQL;
 - primary/extended result codes retained for SQLite;
@@ -2926,7 +2927,9 @@ Native detail:
 Tests prove that one requested category does not fetch unrelated categories; every returned string
 survives native-result cleanup until its destination arena ends; category arrays allocate only in
 that arena; multi-term keys/indexes remain flat ordered rows; and `meta_table` reports `NotFound`.
-`EXPLAIN ANALYZE` remains a visibly executing operation.
+Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
+category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
+operation.
 
 ### D13 — batch, SoA, and high-value native paths
 
@@ -3101,6 +3104,8 @@ The design is implemented correctly only if all are true:
 80. `ContractError` represents Query-less operation/input validation without fabricating a Query ID.
 81. First-release examples and mappings use only the exact integer/float/bool/text/bytea/Option set;
     deferred logical types require a later explicit contract before appearing in public examples.
+82. `ContractError.query_id` is `Some(id)` for every Query/command subject, including metadata and
+    EXPLAIN, and `None` only when the operation has no Query/command subject.
 
 ---
 

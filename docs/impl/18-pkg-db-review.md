@@ -995,6 +995,19 @@ idea is rejected.
   additional logical type appears only after its exact cross-driver contract is settled.
 - **v1 impact:** first-release scope blocker; those types remain additive.
 
+### F70 — metadata wording could discard an available Query identity
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** DB error semantics after making `ContractError.query_id`
+  optional.
+- **Current Align constraint:** `meta_query` and Query EXPLAIN are metadata operations but still have
+  a concrete Query subject and stable descriptor identity.
+- **Actual failure:** grouping all metadata validation under `None` would conflict with the
+  Query-contract rule and permit loss of useful identity.
+- **Recommendation:** use `Some(id)` whenever a Query/command subject exists, including metadata and
+  EXPLAIN; use `None` only for truly Query-less operation/input validation.
+- **v1 impact:** D12 diagnostic-contract blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1154,6 +1167,7 @@ documents:
 62. Require cancellation to resynchronize or poison/close a connection before reuse.
 63. Represent Query-less contract failures without a fabricated Query ID.
 64. Remove deferred logical types from first-release executable examples.
+65. Preserve Query identity in metadata/EXPLAIN errors whenever the operation has a Query subject.
 
 ## 5. Revised implementation roadmap
 
@@ -1179,7 +1193,7 @@ documents:
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-policy SQL migrations; initial-release gate | checksum/order/atomic/dirty/repair/status | migration startup/large history |
-| D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation; ANALYZE executes visibly | catalog query count/latency |
+| D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -1290,6 +1304,8 @@ The checkpoint continuation then reviewed only those corrections and their depen
 about eight minutes. It returned four further findings, F65–F68; direct validation of the same
 type-scope area found F69. The fixes were again made from that checkpoint rather than restarting the
 full document scan.
+The next two-minute continuation found one remaining wording ambiguity, F70, in Query-specific
+metadata error context; it did not restart the completed scan.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.
