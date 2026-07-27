@@ -658,19 +658,27 @@ recursive types or arbitrary Move-element collections.
 or Copy place, updates caller storage, and ends the previous generation. They are not reference
 types and introduce no writable lifetime syntax. `BorrowState` tracks that generation beside the
 existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
-lexically in scope. The call-site exclusivity check rejects any other argument whose recursively
-embedded provenance overlaps that old generation, including a by-value Copy view/resource reference
-or view-bearing aggregate. All parameter modes are retained in function-value types; direct and
-indirect calls share one ABI and alias/provenance check. Concrete function values also retain
-`ReturnBorrowSummary`/`ReturnRegionSummary`; joins union possible target inputs and unresolved
+lexically in scope. The call-site exclusivity check scans every peer mode and rejects direct overlap
+or recursively embedded provenance that overlaps the old generation, including distinct holder
+aggregates. All parameter modes are retained in function-value types; direct and indirect calls
+share one ABI and alias/provenance check. Concrete function values also retain
+`ReturnBorrowSummary`/`ReturnRegionSummary`, including target-relative capture roots; joins union
+possible parameter inputs while preserving the selected target's capture environment, and unresolved
 higher-order parameters fail closed to every compatible input, including embedded provenance in
 by-value Move aggregates/dependent resources. Call transfer snapshots that provenance before
 nulling the source and attaches it to the returned value.
 
 The conservative "return borrows every view argument" rule is replaced by an inferred,
-canonical `ReturnBorrowSummary::Params(indices)` exported with the function signature. A second
-`ReturnRegionSummary` identifies explicit `region` parameters that may own returned values.
+canonical parameter/capture-root summary. Named interfaces export parameter indices; concrete
+closure targets resolve capture slots through their selected environment. A second
+`ReturnRegionSummary` identifies explicit `region` parameters/captures that may own returned values.
 Imported and same-unit calls therefore apply the same provenance without loading the function body.
+
+Every recursively Move return additionally forwards one dynamic cleanup bit through direct,
+indirect, and imported ABIs. The caller stores the selected bit beside the returned value; neither
+return summary reconstructs ownership from lifetime provenance. A `borrow mut` replacement runs the
+ordinary old-value Drop plan before storing the replacement and updates the caller bit, while an
+unchanged borrowed pointee receives no function-exit cleanup in the callee.
 
 ### 14.3 Package-defined resources
 

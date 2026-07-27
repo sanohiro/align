@@ -226,11 +226,12 @@ every item below has since completed as recorded in the per-milestone sections, 
      `enums` table grows during resolution with reserved slots + `enum_mono` dedup, `Opt<i32>` interns
      a monomorph `EnumDef`, and `Opt.Some(7)` infers the type args from the payload then
      monomorphizes). `examples/generic_sum_type.align`. **→ 4c is CLOSED.** Minimal generics is
-     complete (functions + builtin bounds + generic structs + generic sum types); per the philosophy
-     it is deliberately *not* extended further. The leftovers are not generics: generic **containers**
-     (`Stack<T>`/`array<T>` fields) fold into #5 `group_by` if a consumer needs them; **`vec<N,T>`** is
-     M6; a generic-def-inside-a-generic-fn is an optional refinement. The "big three" (4a/4b/4c) are
-     done.
+     closed in scope (functions + builtin bounds + generic structs + generic sum types). The shipped
+     implementation still has a compositional hole for `array<R>`/`slice<R>` and top-level generic
+     type applications inside a generic function. The post-M15 L7 prerequisite below closes exactly
+     that hole and adds the closed `RegionPlain` bound, without user traits/runtime dictionaries or
+     new concrete container element capabilities. `vec<N,T>` remains M6; expected-type
+     decomposition for `Opt.None` remains optional. The "big three" (4a/4b/4c) are done.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
@@ -3499,7 +3500,7 @@ audit structural item is the explicit value-carrying-control-flow region/move/dr
 
 ## Post-M15 mandatory library-boundary prerequisites
 
-`pkg.db` establishes a concrete consumer for six language/compiler gaps that are general to
+`pkg.db` establishes a concrete consumer for seven language/compiler gaps that are general to
 ordinary native-backed packages. They are not optional database polish and must land before a
 SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptance matrix are
 `17-library-boundary-prerequisites.md`; the database sequence that follows is
@@ -3509,11 +3510,12 @@ SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptan
 ```text
 L1a recursive DropPlan framework + Option<string> fields
 L1b Move sum/Option/Result payload completion
-L2  contextual parameter modes + function-value modes/joined provenance + interface summaries
-L3  package-defined opaque Move resources + linkable Drop thunks + dependent resource_ref views
+L2  contextual parameter modes + all-peer aliases + capture provenance + Move-return cleanup ABI
+L3  package-defined opaque Move resources + linkable Drop thunks + dependent views + root transfer
 L4  named arena region capability + clone_in
-L5  deterministic tagged file/inline inputs + static Query/command artifacts
+L5  deterministic tagged file/inline/metadata inputs + static Query/command artifacts
 L6  region-backed RegionPlain array_builder
+L7  nested generic package APIs + closed structural RegionPlain bound
  D0 native SQLite/libpq feasibility probes
  D1 generated Query/command plans over a fake driver
  D2 minimal SQLite Query vertical
@@ -3531,7 +3533,7 @@ D13 batch/SoA/high-value native paths
 D14 dynamic SQL + proved callback surfaces
 ```
 
-L1a–L6 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
+L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
 they are being built, but no probe API becomes public. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL

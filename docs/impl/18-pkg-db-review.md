@@ -40,8 +40,8 @@ generics/package rules. The revised design resolves the API and compilation ques
 the missing general language facilities in
 [`17-library-boundary-prerequisites.md`](17-library-boundary-prerequisites.md).
 
-Database driver implementation remains **blocked on L1a–L6**. Prerequisite implementation may start
-with L1a. This is not a recommendation to defer the ideal design: L1a–L6 are mandatory scheduled
+Database driver implementation remains **blocked on L1a–L7**. Prerequisite implementation may start
+with L1a. This is not a recommendation to defer the ideal design: L1a–L7 are mandatory scheduled
 work and part of the database delivery plan.
 
 `pkg.db` has no dependency on `std.http`. Both should eventually use the same package-defined
@@ -421,7 +421,8 @@ idea is rejected.
 - **Actual failure:** an indirect caller may release the true owner/region because its `Fn` fact
   retains modes but loses `ReturnBorrowSummary`/`ReturnRegionSummary`.
 - **Recommendation:** concrete `Fn`/`FnTy` carries both summaries. Function-value joins union
-  parameter-index sets; unresolved higher-order parameters use every compatible view/region input.
+  compatible parameter-index sets and preserve target-relative capture roots as completed by F56;
+  unresolved higher-order parameters use every compatible view/region input.
 - **v1 impact:** soundness blocker for L2 and indirect calls; mandatory in the L2 PR.
 
 ### F27 — inline SQL needs a deterministic non-file source identity
@@ -586,7 +587,7 @@ idea is rejected.
 - **Actual failure:** one implementation agent could release at D10 while another correctly waits
   for migrations, category metadata, and explicit Query-plan access.
 - **Recommendation:** retain the small D2/D4 architecture verticals, but define the first public
-  database release as L1a–L6 plus driver-relevant D1–D12. D13/D14 remain committed additive work.
+  database release as L1a–L7 plus driver-relevant D1–D12. D13/D14 remain committed additive work.
 - **v1 impact:** D11/D12 are required for the first public DB release; they do not block early
   vertical development.
 
@@ -776,12 +777,104 @@ idea is rejected.
   failure there.
 - **v1 impact:** D4 merge and first-release verification blocker.
 
+### F53 — ordinary generic package APIs were not representable
+
+- **Classification:** current Align conflict; prerequisite feature gap.
+- **Problematic design location:** common `rows_stmt<P,R>`/`all<P,R>` APIs and the L1a–L7 release
+  gate.
+- **Current Align constraint:** the shipped generic checker rejects `array<T>`/`slice<T>` and a
+  generic `stmt<P,R>`/`rows<R>` application inside a generic function.
+- **Actual failure:** the compiler could generate static descriptors, but ordinary `pkg.db` code
+  could not define the common typed execution helpers without DB-specific builtin functions.
+- **Recommendation:** add mandatory L7 nested symbolic generic applications plus the closed
+  structural `RegionPlain` builtin bound, monomorphized before ownership/escape/MIR with no runtime
+  dictionaries or user traits.
+- **v1 impact:** blocks every safe common typed driver vertical.
+
+### F54 — Move-return ABI omitted the dynamic cleanup bit
+
+- **Classification:** ownership or soundness risk; current Align conflict.
+- **Problematic design location:** L2 return summaries and helpers returning
+  `Result<array<R>, db.Error>`.
+- **Current Align constraint:** ownership mode is a path-local runtime bit independent of the joined
+  region; a tagged return may select arena-owned `Ok` or individually owned `Err`.
+- **Actual failure:** an imported/direct/indirect caller could leak the error or free arena storage
+  if it inferred cleanup from static return-region provenance.
+- **Recommendation:** every recursively Move return ABI carries the selected cleanup bit beside the
+  value; `IFnSig`/`FnTy`/ABI fingerprints record its presence and callers store it.
+- **v1 impact:** soundness blocker for L1/L2 and all compound Query results.
+
+### F55 — mutable-borrow alias checking covered only selected peer modes
+
+- **Classification:** ownership or soundness risk.
+- **Problematic design location:** L2 call-site exclusivity wording.
+- **Current Align constraint:** generation invalidation happens at call entry and cannot leave any
+  already-evaluated peer argument dangling.
+- **Actual failure:** overlap hidden in another `BorrowMut`, `Out`, or distinct aggregate holder
+  could bypass a by-value-only recursive scan.
+- **Recommendation:** for every `BorrowMut`, recursively scan every peer mode
+  (`ByValue`/`Borrow`/`BorrowMut`/`Out`) for direct place or embedded provenance overlap.
+- **v1 impact:** L2 soundness blocker.
+
+### F56 — capturing closure return provenance had no capture roots
+
+- **Classification:** ownership or soundness risk; prerequisite feature gap.
+- **Problematic design location:** `ReturnBorrowSummary`/`ReturnRegionSummary` parameter-only model.
+- **Current Align constraint:** a zero-argument closure may return a captured `str`,
+  `resource_ref`, or region-owned value; parameter indices cannot name its environment owner.
+- **Actual failure:** an indirect result could outlive the closure environment or captured owner,
+  especially after a function-value join or move.
+- **Recommendation:** concrete closure targets carry sorted target-relative capture-slot roots;
+  indirect calls resolve them through the selected environment, and roots travel with moved
+  function values. Named interfaces export only resolved parameter roots.
+- **v1 impact:** L2 soundness blocker for Query-local shaping helpers and general closures.
+
+### F57 — mutable-borrow replacement wording suppressed required Drop
+
+- **Classification:** ownership or soundness risk; specification ambiguity.
+- **Problematic design location:** MIR statement that borrowed pointees receive no cleanup.
+- **Current Align constraint:** caller retains ownership, but replacing a live
+  string/array/resource must run the old Drop plan exactly once before the store.
+- **Actual failure:** treating all pointee cleanup as forbidden leaks the old value; emitting
+  function-exit cleanup double-drops unchanged storage.
+- **Recommendation:** prohibit only callee function-exit cleanup for an unchanged pointee; lower
+  replacement to guarded old-value Drop, store, and caller cleanup-bit update.
+- **v1 impact:** L2/L3 soundness blocker.
+
+### F58 — `resource.into_raw` implied field-level ownership state
+
+- **Classification:** ownership or soundness risk; implementation complexity.
+- **Problematic design location:** L3 `ResourceIntoRaw { owner_place }` accepted an unspecified
+  place while aggregates have one cleanup bit.
+- **Current Align constraint:** transferring only one resource field cannot be represented by the
+  aggregate's single path-local cleanup bit.
+- **Actual failure:** aggregate cleanup could double-destroy the transferred field or require a
+  second hidden per-field ownership system.
+- **Recommendation:** restrict v1 `resource.into_raw` to a standalone initialized local/by-value
+  resource parameter; reject fields, elements, projections, borrowed/out values, and temporaries.
+- **v1 impact:** L3 soundness/API blocker; projected transfer may be reconsidered only with a general
+  partial-move ownership design.
+
+### F59 — static manifests omitted derived checked-metadata state
+
+- **Classification:** current Align conflict; implementation complexity.
+- **Problematic design location:** L5 `StaticInputManifest` versus DB §16 metadata artifacts.
+- **Current Align constraint:** a pre-frontend cache hit must validate every exact deterministic
+  input without directory scans or online access.
+- **Actual failure:** running `alignc db prepare`, deleting metadata, or changing one driver's
+  artifact could reuse a stale producer object.
+- **Recommendation:** record each descriptor/permitted-driver exact metadata logical path and
+  `Missing | Present(content_hash, format_version)` in the manifest/action key; revalidate exact
+  paths before the hit.
+- **v1 impact:** L5/D3/D5 correctness blocker for CheckedOptional and CheckedRequired.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
    calls, function-value modes, imported return provenance, dependent native handles/linkable Drop,
-   contextual parameter parsing, named regions, current generics, and static non-Align inputs.
-   L1a–L6 are the required general repairs. Module/FFI/package rules are compatible after the
+   contextual parameter parsing, named regions, nested generic package types, Move-return cleanup,
+   closure capture roots, and static non-Align inputs. L1a–L7 are the required general repairs.
+   Module/FFI/package rules are compatible after the
    revised layering.
 2. **Package boundary:** `pkg.db`, `.sqlite`, and `.postgres` are appropriate public names only as
    three modules of one vendorable `pkg/db` subtree. They are not three independent versions.
@@ -790,22 +883,23 @@ idea is rejected.
    migration orchestration.
 4. **Runtime support:** generic checked owner-tied raw views, UTF-8 validation, and region-builder
    chunk/compact helpers. No DB-specific runtime Query engine or handle type.
-5. **Compiler/semantic support:** L1a–L6, recognized Query constructors, static-input tracking,
+5. **Compiler/semantic support:** L1a–L7, recognized Query constructors, static-input tracking,
    Query contract checking, placeholder scan/source maps, artifacts/hashes, and generated
    binder/decoder thunks.
 6. **Static `db.query<Params,Row>`:** a Copy immutable descriptor data record plus direct generated
    binder/decoder functions. Its function body is exactly one constructor, giving the item one
    unique artifact identity. The rowless `db.command<Params>` uses the same statement artifact,
    static ABI, binder, and cache rules minus Row/result/decode. Neither is an object with reflection
-   or a runtime SQL parser.
+   or a runtime SQL parser. L7 makes ordinary generic Query execution helpers representable.
 7. **Sibling `.align`/`.sql`:** a path-free registered constructor maps the defining module's exact
    extension to `.sql`; exact source bytes, logical path, kind, and digest are deterministic inputs,
    separate from deterministic driver wire bytes. Inline SQL instead uses `Inline(query_id)` and a
    decoded-literal source map.
 8. **Module export:** `IStaticQuery` carries the public contract; `StaticQueryArtifact` carries SQL
    and implementation metadata. A private SQL-only edit rebuilds/relinks the producer without
-   invalidating unchanged consumers. Function values similarly retain/join return provenance across
-   separate compilation.
+   invalidating unchanged consumers. Function values retain parameter/capture provenance and the
+   Move-return cleanup ABI across separate compilation. Static manifests also key every exact
+   per-driver checked-metadata missing/present state.
 9. **Named parameters:** dialect-aware lexical occurrence table. SQLite uses native named
     parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
     ordinal for repeats. Streaming APIs release source Params provenance at return by using
@@ -820,19 +914,21 @@ idea is rejected.
 13. **One-pass shaping:** Query-local visible rows loop plus Pure exclusive-state `step`; the step
     has no DB handle, and transitive effects reject hidden I/O. The orchestrator constructs its
     arena-owned Output inline after builder finalization.
-14. **Compound Output builders:** L6 region-backed `RegionPlain` builder with chunk growth and one
-    measured compacting pass. Builders stay separate mutable locals and are borrowed by the Pure
-    step.
+14. **Compound Output builders:** L6 supplies the region-backed builder with chunk growth and one
+    measured compacting pass; L7 supplies the structural `RegionPlain` bound and generic
+    `array<R>` package signature. Builders stay separate mutable locals and are borrowed by the
+    Pure step.
 15. **Offline checked metadata:** explicit prepare/check tooling invokes real database engines;
     ordinary build consumes canonical artifacts and never connects. Explicit SQLite migration
     replay uses one canonical validated version order and ordered fingerprint. Checked state is
     driver-indexed, so an unpinned CheckedRequired descriptor requires current artifacts for both
-    SQLite and PostgreSQL.
+    SQLite and PostgreSQL. The pre-frontend manifest keys exact Missing/Present metadata state.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
     slices and no silent ignore. The minimum constructors/defaults/conflicts are fixed in §§11–13;
     their owning milestones precede every consumer. Category metadata calls carry an explicit
     destination region and the mandatory `MetaOption` slice.
-17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b; prove fake
+17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b and add L7
+    nested generic package composition; prove fake
     Query/command artifacts before native code; assign each option sum to D1/D2/D4/D6/D7/D12 before
     its consumer and use D9 for shared deadline/cancellation completion; put SQLite and PostgreSQL
     scalar verticals before streaming/transactions/compound output; complete exact migration and
@@ -843,7 +939,7 @@ idea is rejected.
 19. **Minimum PostgreSQL vertical:** same common Query module, named-to-positional rewrite, scalar
     bind/decode, SQLSTATE error, driver restriction, explicit configured ephemeral/local server,
     and a non-skippable provisioned CI gate for merge/release.
-20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
+20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, L7, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
     D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
 
 ## 4. Required specification revisions
@@ -851,7 +947,7 @@ idea is rejected.
 The reviewed specification is acceptable only with these revisions, now incorporated in the design
 documents:
 
-1. Make L1a–L6 mandatory before a safe driver.
+1. Make L1a–L7 mandatory before a safe driver.
 2. Replace builtin-handle enumeration with general package-defined/dependent resources.
 3. Add contextual borrowed parameters, mutable Copy-state update, function-value parameter modes,
    imported return provenance, and the exclusive-input purity rule.
@@ -906,6 +1002,14 @@ documents:
 45. Keep `next_batch` solely in D13 in both language documents.
 46. Keep the Japanese many-parent design on the same parallel parent/child/offset representation.
 47. Make provisioned PostgreSQL integration non-skippable for D4 merge and database releases.
+48. Add L7 nested generic package applications and the closed structural `RegionPlain` bound.
+49. Carry a dynamic cleanup bit with every recursively Move return across all call/interface ABIs.
+50. Check every argument mode for direct or recursively embedded overlap beside `BorrowMut`.
+51. Carry target-relative capture roots in concrete closure return provenance.
+52. Distinguish no callee function-exit cleanup from required drop-old replacement through
+    `BorrowMut`.
+53. Restrict `resource.into_raw` to standalone owned resource roots in v1.
+54. Include exact per-driver checked-metadata Missing/Present state in static manifests/action keys.
 
 ## 5. Revised implementation roadmap
 
@@ -913,11 +1017,12 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | recursive alias matrix, joined-target direct/indirect, per-unit parity | borrowed-call and interface-size cost |
-| L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact MIR, cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
+| L2 | contextual borrow modes, Copy mutation/drop-old, Fn parameter/capture provenance, Move-return cleanup ABI | all-peer alias matrix, captured/joined direct/indirect, cleanup-bit per-unit parity | borrowed-call, return ABI, and interface-size cost |
+| L3 | resource/ref, linkable Drop thunk, dependent child/native view, root-only raw transfer | exact MIR, cross-unit Drop, invalid pointer/escape/projection | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
-| L5 | tagged file/inline inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
+| L5 | tagged file/inline/checked-metadata inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/metadata-create-change-delete/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
+| L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |
 | D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
 | D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
 | D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, cleanup, execution count | package versus libsqlite3 |
@@ -996,13 +1101,16 @@ The delivery is not performance-complete without:
 
 - L1a/L1b tagged-Move branch, allocation, and Drop counts;
 - L2 direct/indirect Move borrow and Copy-state mutable borrow versus current builtin receiver,
-  including recursive alias-check cost plus joined return-summary/interface size/time;
+  including all-peer recursive alias-check cost, capture-root join/transfer, dynamic return-bit
+  overhead, and return-summary/interface size/time;
 - L3 resource construction/ref/dependent cross-unit Drop thunk/native-view checks versus direct
   current handle path, with exact MIR-operation counts;
 - L4 named/anonymous arena parity;
-- L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, and public
-  contract changes, plus file/inline and descriptor-count scaling;
+- L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, public, and
+  checked-metadata create/change/delete states, plus file/inline and descriptor-count scaling;
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
+- L7 nested-generic inference/monomorph compile time, interface and mono-key size, emitted code size,
+  cache reuse, and absence of runtime dictionary/indirect-call overhead;
 - D1 generated Query/command binder and Query decoder versus hand-written field/ordinal code;
 - D2 direct libsqlite3 comparison;
 - D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
@@ -1028,10 +1136,13 @@ as one unit. It was still making useful progress after reading ownership, resour
 module, binding-retention, and option paths, but reached the repository's 15-minute bound after
 20,787 log lines without returning a verdict. It was recorded as a tool failure, never as CLEAN.
 The replacement three-document DB-contract pass completed in about ten minutes and returned ten
-actionable findings, F43–F52.
+actionable findings, F43–F52. The subsequent language-foundation pass completed its assigned scope
+and returned seven further findings, F53–F59.
 
-The complete pass was too broad for an efficient bounded verdict. Future design reviews of this size
-use this order:
+The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
+used as a substitute for inspecting whether the pass was still producing new, relevant analysis.
+Terminating a productive pass and restarting the same review from the beginning increased total
+time. Future design reviews of this size use this order:
 
 1. Build one invariant matrix before prose review: public signature, owner/region, static/runtime
    identity, driver restriction, failure state, owning milestone, acceptance test, and benchmark.
@@ -1042,8 +1153,11 @@ use this order:
 5. Make the authoritative English contract clean before synchronizing the Japanese mirror once.
 6. Run one final whole-diff consistency scan only after all grouped findings are fixed.
 
-During every bounded run, inspect process state and log growth at least once per minute. At the
-15-minute boundary, a missing verdict is a tool failure: record elapsed time and the last completed
-area, terminate it, and rerun only the unreviewed or contradictory scope. Timeout never implies
-cleanliness. This partitioning reduces repeated mirror/cross-document edits without weakening the
-required final whole-diff review.
+During every long-running review, inspect process state, log growth, the most recently completed
+area, and whether the output contains new findings rather than repeated analysis. Elapsed time alone
+is not a reason to abandon useful work. Stop or redirect a run only when output has stalled, repeats
+the same analysis, leaves the requested scope, or the review tool has actually failed. If a formal
+review invocation must be stopped at an automation bound, preserve its completed analysis and
+continue from the first unreviewed area; never restart the whole review merely because the invocation
+ended. A timeout never implies cleanliness. This progress-based monitoring and checkpointed
+partitioning reduce repeated work without weakening the required final whole-diff review.

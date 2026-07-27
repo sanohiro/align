@@ -279,7 +279,7 @@ source generationを保持するため、connのmove/dropやtxのcommit/rollback
 
 ### 4.4 実装境界
 
-L1a〜L6後に通常のファーストパーティーAlign package codeで実装するもの:
+L1a〜L7後に通常のファーストパーティーAlign package codeで実装するもの:
 
 - public handle/descriptor/option/error/metadata形状;
 - common/SQLite/PostgreSQL module API;
@@ -291,7 +291,7 @@ L1a〜L6後に通常のファーストパーティーAlign package codeで実装
 
 compiler/frontendが所有するもの:
 
-- L1a〜L6のlanguage/ownership/region/interface/MIR;
+- L1a〜L7のlanguage/ownership/region/generics/interface/MIR;
 - recognized static Query/command constructorと入力追跡;
 - expected Params/Rowによるdescriptor check;
 - dialect-aware placeholder occurrence/source mapとstatement screening;
@@ -502,7 +502,9 @@ rows       one-pass stream
 `one`/`maybe_one` はcardinality判定に最大2 delivered rowsをdecodeするが、§2.4の
 driver-specific transport/buffering costは別である。`all` はstructural
 `RegionPlain<R>` を要求し、region builderのchunk growthと1回のcompact passを使う。
-これはpublic traitではないcompile-time structural checkで、v1 static Rowはすべて満たす。
+exact package definitionは `P, R: RegionPlain` のgeneric functionである。`RegionPlain` は
+L7のclosed builtin structural boundであり、public/user-defined trait hierarchyではない。
+v1 static Rowはすべて満たす。
 bounded `next_batch` はD13の追加APIであり、D1〜D12の初期common operationには含めない。
 名前からmaterialize/streamが分からない
 convenience APIは作らない。
@@ -520,7 +522,8 @@ pub fn run(
 ```
 
 compound OutputではImpure `run` が1本のrowsを作り、可視な `loop` を1つ持つ。
-genericな `db.fold` は提供しない。
+genericな `db.fold` は提供しない。L7は通常package functionに必要なnested generic typeだけを
+提供し、higher-order DB execution modelは追加しない。
 
 ### 6.4 prepared statement
 
@@ -1079,8 +1082,10 @@ nullability/origin confidence、生成時刻以外のreproducible identityを持
 ### 16.4 stale判定
 
 SQL、static option、Params/Row、driver restriction、metadata policy、relevant schema
-fingerprintの変更でstaleになる。metadata pathの存在/不存在もaction keyへ
-`Missing` / `Present(hash)` として入れ、file作成/削除がdirectory scanなしでinvalidateする。
+fingerprintの変更でstaleになる。各descriptor/許可driverについて、exact metadata logical
+pathと存在状態を `StaticInputManifest` / action keyへ
+`Missing` / `Present(content_hash, format_version)` として入れる。file作成/変更/削除が
+directory scanなしでinvalidateする。
 
 ### 16.5 custom SQL engineを作らない
 
@@ -1377,7 +1382,7 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 
 ## 23. Roadmap
 
-### L1a〜L6 — 必須Align前提
+### L1a〜L7 — 必須Align前提
 
 詳細scope、file、acceptanceは
 [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)。
@@ -1390,9 +1395,11 @@ L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
 L4  named arena region + clone_in
 L5  deterministic tagged file/inline input + one-item Query/command identity/artifact
 L6  RegionPlain region array_builder
+L7  nested generic package API + closed structural RegionPlain bound
 ```
 
-この順で実装し、完了前にsafe DB driver APIを始めない。
+この順で実装し、完了前にsafe DB driver APIを始めない。L7により通常package codeで
+`rows_stmt<P,R>`、`all<P,R: RegionPlain>`、`query<P,R>`、`rows<R>`、`array<R>`を表現できる。
 
 ### D0 — native feasibility probe
 
@@ -1520,7 +1527,7 @@ notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明
 
 ### 初期release gate
 
-L1a〜L6と、driver-relevantなD1〜D12をSQLite/PostgreSQL両方で満たす。D11のSQL
+L1a〜L7と、driver-relevantなD1〜D12をSQLite/PostgreSQL両方で満たす。D11のSQL
 migration lifecycleとD12のcategory metadata/明示Query planも、それらを約束する初期
 release gateに含む。D13〜D14はbatch/SoA/native breadth、dynamic SQL、proved callbackの
 committed additive roadmapである。
@@ -1610,6 +1617,21 @@ execution-count付きで実証する。
     per-parent Outputをregion builderへpushしない。
 64. PostgreSQL skipはoptional local runだけで、D4 merge/releaseはprovisioned non-skippable
     db-postgres CIを必須とする。
+65. 通常package codeで `rows_stmt<P,R>` と `all<P,R: RegionPlain>` を定義でき、nested
+    generic typeはMIR前にconcreteとなり、DB builtin helperを必要としない。
+66. recursively Moveなreturnはdirect/indirect/imported ABIでdynamic cleanup bitを返し、
+    arena-owned `Ok` とindividually owned `Err` を正確にDropする。
+67. `borrow mut` は全peer modeのdirect/recursive overlapを、異なるaggregate holderと
+    `Out` を含めて拒否する。
+68. captured view/resource_refを返すfunction valueはdirect/indirect call、join、move後も
+    selected environment/captured ownerに拘束される。
+69. `borrow mut` によるowned replacementはold pointeeを正確に1回Dropしてcaller bitを更新し、
+    unchanged pointeeをcallee exitでDropしない。
+70. `resource.into_raw` はstandalone owned resource rootだけを受け、
+    field/element/projection/borrowed/out/temporaryを拒否する。
+71. static manifest/action keyはdriver別checked metadataのexact pathと
+    `Missing | Present(hash, format_version)` を含み、create/change/deleteでinvalidateし、
+    Anyはdirectory scanなしで両driverを追跡する。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 
@@ -1630,7 +1652,7 @@ runtime validation、option rejectionを弱める理由にはならない。
 1. この文書と
    [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
    を完全に読む。
-2. L1a〜L6を順番に実装し、gate前にsafe driver APIを始めない。
+2. L1a〜L7を順番に実装し、gate前にsafe driver APIを始めない。
 3. Rust compiler PRごとにAlign self-reviewを実行する。
 4. 1 PR = 1 roadmap sliceとし、指定negative/cleanup testを入れる。
 5. database keyword、ORM、Query DSL、reflection、public trait hierarchy、ambient allocator、

@@ -13,7 +13,7 @@ manual close functions through its safe public API.
 
 ## 1. Decisions
 
-Six prerequisites are accepted:
+Seven prerequisites are accepted:
 
 1. Recursive tagged Move payloads for ordinary structured `Option`/`Result`/sum errors and outputs.
 2. Borrowed function parameters, including an invalidating mutable-borrow mode.
@@ -21,6 +21,7 @@ Six prerequisites are accepted:
 4. Named arena bindings that expose a non-owning `region` capability to ordinary functions.
 5. Deterministic static source inputs and per-unit query artifacts.
 6. Region-backed `array_builder<PlainStruct>` with no hidden heap allocation.
+7. Nested generic package APIs over the existing monomorphization model.
 
 They preserve the existing model:
 
@@ -46,7 +47,10 @@ borrowed parameters + interface summaries
 deterministic static inputs
   -> static Query artifact
 
-all six
+nested generic package APIs
+  -> ordinary `db.query<P, R>` / `db.rows<P, R>` / `array<R>` package functions
+
+all seven
   -> pkg.db SQLite/PostgreSQL vertical slices
 ```
 
@@ -109,18 +113,23 @@ visible to the caller. Its old recursively view-bearing field provenance ends be
 as for a Move owner. A scalar Copy value may use `borrow mut`, although an ordinary return is usually
 clearer; the language does not add a shape-specific exception.
 
+A recursively Move pointee remains owned by the caller and receives no callee function-exit Drop.
+If the callee replaces it, the internal ABI also exposes the caller's cleanup-bit slot: the old
+value's ordinary Drop plan runs before the store, then the slot receives the replacement's bit.
+Leaving the pointee unchanged neither drops it nor changes that bit.
+
 This deliberately uses one conservative rule. A mutable-borrow operation that happens not to
 reallocate still ends the old generation. That may reject retaining an otherwise-safe view across
 some mutations, but it cannot leave a package-defined mutation accidentally fail-open.
 
-At one call site, aliases of the same owner may not appear as:
-
-- two `borrow mut` arguments;
-- one `borrow mut` and any overlapping `borrow`;
-- one `borrow mut` and any by-value argument whose type recursively carries provenance rooted in
-  that owner's previous generation, including a Copy `str`, slice, `resource_ref`, or aggregate
-  containing one (a database Row is only one structural example);
-- an `out` slice and any overlapping argument, regardless of its parameter mode.
+For every `borrow mut` argument, the checker recursively scans every other argument regardless of
+whether that peer is `ByValue`, `Borrow`, `BorrowMut`, or `Out`. The call is rejected when the peer
+place directly overlaps the mutable owner or when any provenance embedded in the peer value is
+rooted in the owner generation being invalidated. This includes a Copy `str`, slice,
+`resource_ref`, dependent resource, or either of two distinct aggregate holders containing such a
+view. Two `borrow mut` arguments to the same owner and `borrow mut` plus overlapping `borrow`/`out`
+are therefore ordinary cases of the same rule. Independently, an `out` slice may not overlap any
+peer argument under any parameter mode.
 
 The existing out-parameter no-alias proof and borrow-root analysis are the single implementation
 mechanism for these checks. Argument expressions are evaluated before transfer, but generation
@@ -139,16 +148,20 @@ Fn(
   Effect,
   ReturnBorrowSummary,
   ReturnRegionSummary,
+  ReturnCleanupAbi,
 )
 ParamMode = ByValue | Out | Borrow | BorrowMut
+ReturnCleanupAbi = None | DynamicBit
 ```
 
 Binding or passing a named function preserves every mode. Indirect-call checking requires an exact
 mode/type match and lowers `Borrow`/`BorrowMut` through the same pointer-to-caller-storage ABI as a
 direct call. Mode erasure, implicit adaptation, and treating a borrow-mode target as by-value are
-rejected. Binding preserves both return summaries; a mutable function local or control-flow join
-unions the sorted parameter-index sets, so the indirect result is tied to every owner/region that
-any reachable target may use. When its return type may carry borrow provenance, an unresolved
+rejected. Binding preserves both return summaries and the return cleanup ABI. A mutable function
+local or control-flow join unions the sorted parameter-index sets. Capture roots remain relative to
+the selected function target and travel with that function value's environment; they are not
+reinterpreted as slots in another target. The indirect result is tied to every owner/region that
+the selected target may use. When its return type may carry borrow provenance, an unresolved
 function-typed parameter conservatively includes every `Borrow`/`BorrowMut` input plus every
 by-value/out input whose type recursively may carry a view, `resource_ref`, dependent resource, or
 other embedded borrow — including Move inputs. Call transfer captures that embedded provenance
@@ -169,20 +182,44 @@ The checked-HIR analysis infers canonical return lifetime summaries:
 ```text
 ReturnBorrowSummary
   None
-  Params(sorted parameter indices)
+  Roots {
+    params: sorted parameter indices,
+    captures: sorted target capture-slot indices,
+  }
 
 ReturnRegionSummary
   None
-  Params(sorted `region` parameter indices)
+  Roots {
+    params: sorted `region` parameter indices,
+    captures: sorted target capture-slot indices,
+  }
 ```
 
-The summary records which parameters may back any view or dependent resource in the return value.
-It is computed from the same exhaustive provenance walk used by local borrow liveness. It is serialized in
-`IFnSig`, consumed during separate type checking, and included in `interface_hash`.
-`ReturnRegionSummary` records which explicit destination regions may own the returned value. A
-consumer therefore knows that `run(..., out)` cannot escape `out` without importing the producer
-body. When several borrowed/region parameters may contribute, the caller uses their inferred
-shortest region.
+The summaries record which parameters or captured environment slots may back any view, dependent
+resource, or region-owned value in the return. They are computed from the same exhaustive
+provenance walk used by local borrow liveness. A named function has no capture slots; its parameter
+sets are serialized in `IFnSig`, consumed during separate type checking, and included in
+`interface_hash`. A concrete closure target stores its sorted capture-slot sets beside the closure
+environment. An indirect call resolves those slots to the exact owner generations/regions held by
+that selected function value. Moving the function value moves those roots with its environment;
+the result may not outlive the environment or any captured owner. A join preserves the selected
+target-relative capture metadata while conservatively unioning compatible parameter sets. An outer
+named function that returns the result must resolve capture roots to its own parameters/captures or
+reject the escape; an exported interface never contains an unbound capture slot.
+
+`ReturnRegionSummary` records which explicit destination regions or captured regions may own the
+returned value. A consumer therefore knows that `run(..., out)` cannot escape `out` without
+importing the producer body. When several borrowed/region roots may contribute, the caller uses
+their inferred shortest region.
+
+Every recursively Move return has `ReturnCleanupAbi::DynamicBit`. Direct, indirect, and imported
+calls return the value together with its path-selected cleanup bit. The caller stores that bit in
+the result's path-local cleanup slot; tagged/aggregate Drop consults it. `Ok` may therefore return
+arena-owned data with a clear bit while `Err` returns individually owned strings with a set bit,
+without recomputing ownership from the joined region. `IFnSig`, `FnTy`, interface hashes, and ABI
+fingerprints record that the extra bit exists, never its runtime value. Copy returns use
+`ReturnCleanupAbi::None`. `ReturnRegionSummary` remains lifetime provenance and is not a substitute
+for this dynamic ownership result.
 
 The return-borrow summary is not limited to parameters spelled `borrow`. A by-value Copy view such
 as `str`, `slice<T>`, `resource_ref<R>`, or a recursively view-bearing `db.exec` may back the
@@ -273,6 +310,11 @@ Rules:
 - `resource.raw` is unsafe and accepts `resource_ref<R>`, never an owning value.
 - `resource.into_raw` is unsafe, consumes the resource, clears its cleanup flag, and transfers the
   native ownership to the caller.
+- In v1 the `resource.into_raw` operand must be a standalone initialized resource root: a local or
+  by-value resource parameter owned by the current function. A field, index, dereference,
+  borrowed/out parameter, aggregate projection, or temporary is rejected. The root restriction
+  keeps the existing one-cleanup-bit aggregate representation exact; raw transfer does not create
+  field-level ownership state.
 - Representation privilege is checked by canonical module-path prefix, not by an import cycle or a
   public constructor. For a resource declared in `pkg.db`, `pkg.db.sqlite`,
   `pkg.db.postgres`, and `pkg.db.internal.*` are privileged descendants; an importing application or
@@ -517,9 +559,23 @@ object miss and relink even when no `.align` byte changed.
 
 To preserve an eventual pre-frontend no-op hit without guessing from syntax, the driver may persist
 a versioned `StaticInputManifest` emitted by successful import/name resolution. It is keyed by the
-exact source/import-resolution digest and records constructor identity, tagged source identity, and
-kind. A matching manifest lets the driver validate/read/hash only its exact `File` paths before a
-frontend-cache lookup; `Inline` never causes a read. A missing or mismatched manifest runs
+exact source/import-resolution digest and records constructor identity, tagged source identity,
+kind, and every derived checked-metadata dependency. For each descriptor and each permitted driver
+the metadata entry is:
+
+```text
+CheckedMetadataInput {
+  driver,
+  logical_path,
+  state: Missing | Present { content_hash, format_version },
+}
+```
+
+The logical path is derived exactly from the descriptor/driver identity; no directory scan is
+allowed. Before a frontend-cache lookup, a matching manifest re-stats and, when present, reads and
+hashes each exact `File` and checked-metadata path. Creation, deletion, content change, or format
+version change therefore changes the action key. `Inline` SQL never causes a source-file read, but
+its derived checked-metadata entries are still validated. A missing or mismatched manifest runs
 import/name resolution and regenerates it before any static file is treated as an input. The
 manifest is a cache index, not a build manifest, and is never accepted across a
 source/import/schema digest change. File and directory mtimes never participate.
@@ -718,6 +774,45 @@ freeze. The existing heap form retains zero-copy freeze.
 The implementation may elide the compacting pass only when it proves the current region allocation
 is already the exact final contiguous buffer. This is an optimization, not a semantic branch.
 
+### 7.4 Nested generic package APIs
+
+Ordinary package code must be able to express the generic types used by its public functions:
+
+```align
+fn rows_stmt<P, R>(borrow c: conn, q: query<P, R>, p: P) -> Result<rows<R>, Error>
+fn all<P, R: RegionPlain>(
+  borrow c: conn,
+  q: query<P, R>,
+  p: P,
+  out: region,
+) -> Result<array<R>, Error>
+```
+
+L7 permits `Ty::Param` recursively beneath `Option`, `Result`, `array`, `slice`, and applications of
+top-level generic struct, sum, and resource definitions in a generic function's parameters, locals,
+and return type. It permits `query<P, R>`, `stmt<P, R>`, `rows<R>`, and comparable ordinary generic
+definition applications inside a generic function. It does not declare a generic definition inside
+another function, add written type arguments at calls, or admit a concrete container element that
+the container already rejects.
+
+`RegionPlain` is a closed builtin structural bound alongside the existing fixed bounds, not a
+user-defined trait or public trait hierarchy. It grants only operations whose implementation is
+defined for recursively `RegionPlain` values, including region-builder push/build and an
+`array<R>` result. A concrete instantiation recursively validates the exact substituted type.
+Resources, independently owned fields, raw values, functions, and builders fail the bound. The
+abstract template checker may use only the operations granted by the written builtin bound.
+
+Nested parameter matching and expected-type inference recurse through these type constructors.
+Generic struct/sum/resource applications containing `Ty::Param` remain symbolic in the template and
+are instantiated only after concrete arguments are known. Monomorphization still runs to a
+fixpoint before MoveCheck, EscapeCheck, MIR, and ABI lowering; there are no runtime dictionaries,
+virtual calls, user traits, turbofish, or runtime type reflection.
+
+Public generic interfaces serialize the canonical nested type expression, builtin bounds, and body
+template. A monomorphization key is the defining item identity plus the canonical fully substituted
+type-argument tuple and compiler schema version. Whole-program and interface-only instantiation
+must produce identical keys, `RegionPlain` decisions, Drop plans, diagnostics, and ABI.
+
 ## 8. Recursive tagged Move payloads
 
 ### 8.1 Required surface
@@ -786,8 +881,11 @@ The new semantics must be explicit before LLVM:
 - HIR function parameters and function-value parameter entries carry
   `ByValue | Out | Borrow | BorrowMut`.
 - named/interface signatures and concrete function values carry return-borrow/region summaries;
-  function-value joins union them and unresolved higher-order parameters use the fail-closed
-  all-compatible-input summary.
+  concrete closure targets additionally carry capture-slot roots, function-value joins preserve
+  selected target-relative capture metadata, and unresolved higher-order parameters use the
+  fail-closed all-compatible-input summary.
+- recursively Move returns use one dynamic cleanup-bit result in direct, indirect, and imported
+  ABIs; callers store the returned bit beside the value and never derive it from region provenance.
 - HIR resource types carry declaration identity and the producer-owned Drop-thunk identity/ABI
   fingerprint.
 - MIR locals keep the existing path-local cleanup bit for resources and Move aggregates.
@@ -799,11 +897,17 @@ The new semantics must be explicit before LLVM:
 - dependent construction carries the parent generation through HIR/MIR, while raw-view construction
   carries explicit checked size/null/alignment/UTF-8 validation and its successful owner
   generation; LLVM only lowers those facts.
-- a `BorrowMut` call ends the owner generation in checked-HIR borrow state before the call.
+- a `BorrowMut` call checks every peer parameter mode for direct or recursively embedded overlap,
+  then ends the owner generation in checked-HIR borrow state before the call.
+- borrowed pointees receive no function-exit cleanup in the callee, but replacement through
+  `BorrowMut` emits the ordinary old-value Drop plan before the store and updates the caller's
+  cleanup bit exactly once.
 - direct and indirect calls share the same parameter-mode ABI and alias/provenance checks, including
   the indirect target's joined return summaries.
 - named arena lowering reuses `ArenaBegin`/`ArenaEnd` and merely binds the handle as `region`.
 - static Query construction lowers to immutable data plus generated binder/decoder functions.
+- nested generic package types are monomorphized before this MIR is constructed; MIR never contains
+  an unsubstituted `Ty::Param` or a runtime generic dictionary.
 - LLVM performs pure representation lowering and does not decide ownership, invalidation, or Query
   semantics.
 
@@ -915,12 +1019,21 @@ Acceptance:
 - `borrow mut` rejects later use of an older view;
 - a call rejects an overlapping by-value Copy view/resource reference or view-bearing aggregate
   beside `borrow mut` of its owner;
+- the same recursive rejection covers every peer mode (`ByValue`, `Borrow`, `BorrowMut`, and
+  `Out`), including distinct aggregate holders rooted in the invalidated generation;
 - mutable borrowing a writable Copy aggregate updates caller state; shared borrowing Copy is
   rejected as redundant;
 - `borrow: T` and `out: region` remain legal parameter names through contextual lookahead;
 - function-value binding and indirect calls retain all four parameter modes exactly;
 - borrow-returning function-value joins union return-borrow/region summaries, and an unresolved
   higher-order parameter uses the all-compatible-input summary;
+- a zero-argument capturing closure may return a captured `str`, `resource_ref`, or region-owned
+  value only while its environment and captured owner live; direct/indirect calls, target joins,
+  and moved function values preserve those exact roots;
+- direct, indirect, and imported `Result<array<R>, Error>` returns preserve the selected dynamic
+  cleanup bit on both arena-owned `Ok` and individually owned `Err` paths;
+- replacing an owned pointee through `borrow mut` drops the old value exactly once and installs the
+  new cleanup bit; leaving an unchanged pointee does not drop it in the callee;
 - an indirect identity over a by-value dependent child/Move view aggregate transfers its embedded
   parent provenance to the result; the parent cannot drop early;
 - a deterministic exclusive-state shaper is Pure, while captured mutation and unsafe/I/O remain
@@ -944,7 +1057,8 @@ Acceptance:
 - the hook is a `pub` function with an `unsafe {}` body in an allowed `internal` module;
 - interface-only cleanup links through the generated hidden support thunk without importing the
   hook module;
-- `into_raw` suppresses Drop;
+- `into_raw` on a standalone resource root suppresses Drop; a field, element, projection,
+  borrowed/out parameter, or temporary is rejected;
 - null/native failure is handled before construction;
 - a ref cannot survive owner move/drop/mutable borrow;
 - a dependent resource prevents parent move/drop/mutable borrow until the child drops;
@@ -998,6 +1112,9 @@ Acceptance:
 - absolute/escaping/symlink paths fail;
 - a shadowing local or same-spelled user function does not read/register a file;
 - a stale `StaticInputManifest` is rejected after source/import/schema identity changes;
+- creating, changing, or deleting the exact per-driver checked-metadata path invalidates a matching
+  manifest/cache entry for both CheckedOptional and CheckedRequired; an Any descriptor tracks both
+  drivers without scanning a directory;
 - source SQL hash stays stable across driver selection, while PostgreSQL wire hash/rewrite map
   changes deterministically with placeholder ordinals;
 - inline SQL uses `Inline { query_id }`, decoded literal bytes, and a decoded-byte-to-`.align` span
@@ -1029,7 +1146,32 @@ Acceptance:
 - exactly one compacting element pass occurs;
 - resources/owned heap fields receive compile diagnostics.
 
-Only after L1a–L6 are shipped may the first SQLite runtime/Query vertical slice begin.
+### L7 — nested generic package APIs and `RegionPlain` bound
+
+Scope:
+
+- recursively represent/infer/substitute `Ty::Param` under `array`, `slice`, `Option`, `Result`,
+  and top-level generic struct/sum/resource applications;
+- permit those applications in generic function parameters, locals, and returns;
+- add the closed structural `RegionPlain` builtin bound and abstract operation gating;
+- canonical interface serialization and monomorphization keys for nested applications/bounds;
+- preserve monomorphization-before-analysis/MIR and reject unsupported concrete container elements.
+
+Acceptance:
+
+- the `rows_stmt<P, R>` and `all<P, R: RegionPlain>` signatures in §7.4 compile as ordinary package
+  functions without a compiler-known DB API;
+- `query<P, R>`, `stmt<P, R>`, `rows<R>`, `slice<R>`, and `array<R>` substitute to concrete types
+  before MoveCheck/EscapeCheck/MIR;
+- interface-only and whole-program instantiation produce byte-identical canonical mono keys and
+  equivalent diagnostics;
+- a recursively plain Row satisfies `RegionPlain`; a resource, owned heap field, function, raw
+  value, or builder fails with a bound diagnostic before codegen;
+- no runtime dictionary, reflection table, trait object, or extra indirect call is emitted;
+- generic recursion, declarations nested inside functions, explicit call-site type arguments, and
+  newly unsupported concrete collection elements remain rejected without compiler panic.
+
+Only after L1a–L7 are shipped may the first SQLite runtime/Query vertical slice begin.
 
 ## 11. Required verification
 
@@ -1039,12 +1181,16 @@ Each compiler PR runs its focused regression suite, `scripts/test-pr.sh`, Clippy
 Required benchmarks:
 
 - tagged Move payload Drop/propagation cost and no-allocation `Ok` path;
-- borrowed-call overhead versus the corresponding current builtin handle operation;
+- borrowed-call overhead versus the corresponding current builtin handle operation, including
+  all-peer alias scanning, captured-root transfer, and dynamic Move-return cleanup-bit cost;
 - resource construction/Drop overhead and generated LLVM shape;
-- compile-time and interface-size cost of return-borrow summaries;
-- warm-cache behavior for unchanged, private-SQL-only, and public-contract Query changes;
+- compile-time and interface-size cost of parameter/capture return summaries and cleanup ABI;
+- warm-cache behavior for unchanged, private-SQL-only, public-contract, and checked-metadata
+  create/change/delete Query changes;
 - region builder push/freeze throughput, bytes allocated, and exact copy count;
 - no hidden heap allocation in the region builder path.
+- nested-generic inference/monomorph compile time, interface/mono-key size, emitted code size, and
+  proof of no runtime dictionary/extra indirect call.
 
 The goal is not zero instructions for safety. It is one general, statically checked mechanism whose
 cost and invalidation behavior remain visible and predictable.

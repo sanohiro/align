@@ -44,6 +44,7 @@ Ty =
     Effect,
     ReturnBorrowSummary,
     ReturnRegionSummary,
+    ReturnCleanupAbi,
   )                            // lambda / function value
   Var(id)                   // inference variable (during inference only)
 ```
@@ -67,8 +68,9 @@ Region =
 
 An owner-root/generation fact is tracked alongside the region for views obtained from mutable
 storage or a resource. Ending that generation invalidates the view even when its lexical region
-would otherwise continue. A checked imported call receives the same fact through
-`ReturnBorrowSummary`; no producer body is required.
+would otherwise continue. A checked imported call receives the same parameter-root fact through
+`ReturnBorrowSummary`; a concrete closure target may additionally resolve target-relative capture
+slots through its selected environment. No producer body is required.
 
 ---
 
@@ -262,30 +264,39 @@ BorrowMut   exclusive access; caller retains ownership and the old generation en
 
 For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned view may be tied
 to that parameter's caller-side root and generation. For `BorrowMut`, the call site must provide a
-writable bound place. No other argument may overlap the invalidated owner generation: this includes
-another borrow and any by-value Copy/Move value recursively carrying a view, resource reference,
-dependent-resource parent, or aggregate provenance rooted there. The check is structural and never
-recognizes a package-specific Row name. The owner's previous
+writable bound place. Every other argument is checked, whether its mode is `ByValue`, `Borrow`,
+`BorrowMut`, or `Out`. Direct place overlap or any recursively embedded view, resource reference,
+dependent-resource parent, or aggregate provenance rooted in the invalidated generation rejects
+the call, including two distinct holder aggregates. The check is structural and never recognizes a
+package-specific Row name. The owner's previous
 generation becomes dead before the call; returned views belong to the new generation. An unbound
 Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move types because
 Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so field mutation
 updates the caller instead of a discarded copy.
 
-Checked HIR infers `ReturnBorrowSummary::Params(indices)` by recursively walking every possible
-view in the return value. The exported signature carries the parameter modes and summary. Whole-
-program and interface-only checking must produce identical borrow roots and diagnostics. This is
-the same `BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second
-reference type or a package-name table.
+Checked HIR infers `ReturnBorrowSummary::Roots { params, captures }` by recursively walking every
+possible view in the return value. Named exported functions have an empty capture set and serialize
+the parameter roots. A concrete closure target records sorted capture-slot roots and resolves them
+through its selected environment at an indirect call. Whole-program and interface-only checking
+must produce identical parameter roots and diagnostics. This is the same
+`BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second reference type
+or a package-name table.
 
 The same `ParamMode` entries are retained in `Fn`/`FnTy`. Concrete function values additionally
-carry `ReturnBorrowSummary` and `ReturnRegionSummary`. Function-value assignment and control-flow
-joins union both parameter-index sets; an unresolved higher-order parameter whose result may carry
+carry `ReturnBorrowSummary`, `ReturnRegionSummary`, and `ReturnCleanupAbi`. Function-value
+assignment and control-flow joins union parameter-index sets while the runtime-selected target
+retains its capture-slot metadata/environment; an unresolved higher-order parameter whose result may carry
 provenance conservatively names every compatible input, including a by-value Move value with an
 embedded view/dependent-resource root. Call checking snapshots embedded provenance before move/null
 and transfers it to the result; callee escape checking still rejects a bare view whose consumed
 owner dies there. Interface codecs, direct/indirect call checking, and codegen must agree on these
 facts; there is no mode- or provenance-erasing adapter. The inferred effect and return summaries
 remain outside written source-signature equality, but parameter modes participate.
+
+Every recursively Move return uses `ReturnCleanupAbi::DynamicBit`: the direct, indirect, or
+imported ABI returns a path-selected cleanup bit beside the value. The caller stores it in the
+result slot, and Drop consults it. Copy returns use `None`. This dynamic ownership result is
+separate from return region/borrow summaries and is included in function/interface ABI identity.
 
 ### Opaque resources
 
@@ -353,7 +364,7 @@ arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
 
 A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
 binding outside the arena, captured by a task, or passed to FFI. An interface signature with a
-`region` parameter carries `ReturnRegionSummary::Params(indices)`, allowing an imported caller to
+`region` parameter carries `ReturnRegionSummary::Roots { params, captures: [] }`, allowing an imported caller to
 tie returned owned data to the selected arena. `clone_in(out)` is the explicit copy from a
 shorter-lived view into that region; the checker never inserts it.
 
@@ -398,14 +409,15 @@ purity, and result lifetime can all be checked through a function value.
 
 ---
 
-## 9. Generics (minimal) — complete
+## 9. Generics (minimal) — shipped core; L7 composition pending
 
 Monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
 **Settled & built (4c-1, the unconstrained skeleton):**
 ```text
 - A function declares type parameters: `fn f<T, U>(...)`. `Ty::Param(i)` represents one inside a
-  template (Copy, var-free); it is substituted before the flow analyses / MIR run.
+  template (var-free; its Copy/Move class is fixed after substitution); it is substituted before
+  the flow analyses / MIR run.
 - Monomorphization unit = the function, specialized per concrete type-argument tuple, generated
   in sema AFTER type-checking and BEFORE MoveCheck/EscapeCheck/MIR (so those passes and codegen see
   only concrete types — answers the "before or after MIR" question: BEFORE). Mangled `name$arg$arg`.
@@ -422,7 +434,8 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   (template-only, like `Ty::Param`); deep `subst_param_ty`; structural inference `match_param`
   (binds `Param` bare or nested, seeds a return-only param from the expected type); a nested param
   is finalized eagerly at the call (a `Scalar` can't hold an inference var), a bare one deferred.
-  `box`/`slice`/`array`/tuple over `T` are rejected (`scalar_arg`'s `allow_param`).
+  The shipped compiler still rejects `box`/`slice`/`array`/tuple over `T`
+  (`scalar_arg`'s `allow_param`); L7 below replaces the `slice`/`array` part of this restriction.
 - 4c-5: generic structs `Pair<T>`. The resolver refactor — `resolve_type` takes a `TyCx` (bundling
   `struct_ids`/`enum_ids`/`struct_templates`/`structs`/`struct_mono`/`tuples`/`fn_types`); `structs`
   grows during resolution; a `Pair<i32>` type calls `instantiate_struct` to substitute the template
@@ -434,13 +447,26 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   `enums` table grows during resolution (reserved slots + `enum_mono` dedup); `resolve_type` interns
   a monomorph `EnumDef` for `Opt<i32>` (`instantiate_enum`); variant construction `Opt.Some(7)`
   infers the args from the payload (`match_param`) then monomorphizes.
+- L7 (required before `pkg.db`, not yet shipped): retain nested symbolic type applications in a
+  generic template, add recursive inference/substitution for `array`, `slice`, and top-level
+  generic struct/sum/resource applications, and add the closed structural `RegionPlain` bound.
 ```
 
-**Generics is CLOSED** (minimal by design — see `open-questions.md`). The implemented surface
-(functions + builtin bounds + generic structs + generic sum types) is the whole feature; it is not
-extended further. Not-generics leftovers moved to their tracks: generic **containers** → the
-`group_by` track (roadmap #5, if a consumer needs them); **`vecN<T>`** → M6; a generic-def-inside-a-
-generic-fn / `Opt.None` expected-type decomposition → optional refinements, revisit only on demand.
+**Generics remains closed and monomorphized** (see `open-questions.md`), but L7 completes one
+required compositional hole for ordinary package APIs. `Ty::Param` may appear recursively under
+`Option`, `Result`, `array`, `slice`, and applications of top-level generic struct, sum, and
+resource definitions in a generic function's parameters, locals, and return type. Such applications
+remain symbolic until concrete arguments are inferred, then monomorphize before MoveCheck,
+EscapeCheck, and MIR. This permits `query<P,R>`, `stmt<P,R>`, `rows<R>`, and `array<R>` in ordinary
+generic package functions; it does not declare definitions inside functions or add call-site
+turbofish.
+
+`RegionPlain` is an additional closed builtin structural bound. It grants only region-plain
+construction/builder operations, and concrete instantiation recursively rejects resources,
+independently owned fields, raw/function values, and builders. There are still no user traits,
+runtime dictionaries, reflection, or new concrete container element capabilities. Generic
+**containers beyond this symbolic composition** remain on their owning tracks; **`vecN<T>`** remains
+M6, and `Opt.None` expected-type decomposition remains an additive inference refinement.
 
 ---
 
@@ -460,6 +486,7 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - resource declaration identity, Drop-thunk summary, and path-local cleanup ownership
 - canonical recursive `DropPlan` for struct/sum/Option/Result ownership
 - `ReturnBorrowSummary` and `ReturnRegionSummary`
+- `ReturnCleanupAbi` and the dynamic result cleanup bit for recursively Move calls
 - the no-alias flag of out arguments
 - the Effect of each function/closure
 ```
@@ -485,9 +512,10 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - implement package-defined resources/resource references
 - implement named region parameters and destination substitution
 - implement recursive tagged Move payloads
+- implement nested generic package applications and the RegionPlain bound
 ```
 
 Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is
 field-derived; nested arena ordering is implemented; and minimal generics monomorphize before MIR.
 The library-boundary entries above are settled prerequisites, not open design questions; their
-implementation sequence is `17-library-boundary-prerequisites.md` L1a–L4.
+implementation sequence is `17-library-boundary-prerequisites.md` L1a–L7.

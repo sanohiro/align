@@ -72,7 +72,7 @@ ResourceViewFromRaw { resource_def, owner_ref, ptr, len, view_kind, validation_p
 ResourceRaw { resource_def, resource_ref }
   // unsafe; non-owning extraction
 ResourceIntoRaw { resource_def, owner_place }
-  // unsafe; consumes + clears Drop flag
+  // unsafe; standalone owned resource root only; consumes + clears Drop flag
 CloneIn { value, region_handle, plan }
   // explicit recursive region copy
 RegionBuilderNew/Push/Build { ... }
@@ -82,8 +82,11 @@ StaticQueryDescriptor { artifact_id }
 ```
 
 Ordinary `Drop`/`DropValue` consults the resource definition's producer-owned Drop thunk; no
-`DbConnDrop`, `RegexDrop`, or sibling type family is added. `ResourceIntoRaw` leaves the source
-uninitialized on every continuing path, exactly like another Move transfer.
+`DbConnDrop`, `RegexDrop`, or sibling type family is added. `ResourceIntoRaw` accepts only an
+initialized standalone resource local or by-value resource parameter owned by the function. HIR
+rejects fields, elements, projections, borrowed/out parameters, and temporaries, so MIR never needs
+field-level cleanup ownership. The operation leaves the accepted root uninitialized on every
+continuing path, exactly like another Move transfer.
 
 `ResourceFromRawBorrowed` carries the exact imported/local resource declaration identity, the raw
 handle, and a checked `ResourceRef` for the parent generation. The result is a Move resource whose
@@ -99,21 +102,36 @@ Failure returns `None` without creating a view. MIR-to-LLVM lowers these checks 
 fat-view representation mechanically; codegen may not invent, omit, or weaken them.
 
 `Borrow` and `BorrowMut` parameters use a non-null pointer to caller-owned storage in the internal
-ABI. They are never materialized as an owning copy in the callee. The callee may read through a
-shared borrow; a mutable borrow additionally permits replacement/mutation allowed by the checked
-source. Neither mode emits cleanup for the pointee. `BorrowMut` carries non-alias facts proven in
-checked HIR, but LLVM attributes are emitted only where their exact ABI meaning is sound.
+ABI. A recursively Move pointee also passes access to the caller's path-local cleanup bit. They are
+never materialized as an owning copy in the callee. The callee may read through a shared borrow; a
+mutable borrow additionally permits replacement/mutation allowed by the checked source. Neither
+mode emits function-exit cleanup for an unchanged pointee: ownership remains with the caller.
+Replacement is different. MIR emits the ordinary `DropValue(old_place, DropPlan)` guarded by the
+caller's current cleanup bit before storing the new value, then stores the new cleanup bit. Thus an
+old string/array/resource is dropped exactly once and a later caller cleanup sees only the
+replacement. `BorrowMut` carries non-alias facts proven by recursively scanning every peer
+parameter mode in checked HIR, but LLVM attributes are emitted only where their exact ABI meaning
+is sound.
 Owner-generation invalidation is complete in HIR before MIR construction and is retained in debug
 provenance; LLVM does not decide borrow legality.
 
 `Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
-`ReturnBorrowSummary`/`ReturnRegionSummary`. A named function converted to a function value retains
+`ReturnBorrowSummary`/`ReturnRegionSummary` and `ReturnCleanupAbi`. A named function converted to a function value retains
 `Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical direct-call
-ABI and applies the stored result provenance. Function-value joins require exact mode equality and
-union both summary sets. An unresolved higher-order parameter uses every compatible view/region
+ABI and applies the stored result provenance. Concrete closure targets resolve target-relative
+capture-slot summaries through the selected environment; those roots travel when the function
+value moves and constrain the result. Function-value joins require exact mode equality, union
+parameter sets, and preserve the selected target's capture metadata. An unresolved higher-order parameter uses every compatible view/region
 input rather than `None`, including embedded provenance in a by-value Move operand. The call
 snapshots that provenance before its ordinary move/null and attaches it to the result. No
 indirect-call shim copies a borrowed owner, changes a parameter mode, or drops result provenance.
+
+A recursively Move return lowers as the normal return value plus one dynamic cleanup bit.
+`ReturnCleanupAbi::DynamicBit` is part of direct/indirect/interface ABI identity. Every return edge
+forwards its selected path-local bit; callers store it beside the returned value. In particular an
+arena-owned `Ok` and an individually owned `Err` may return different values of that bit through
+the same `Result` ABI. `ReturnRegionSummary` supplies lifetime roots only and never reconstructs the
+ownership bit.
 
 A resource Drop operation names the resource-declaring producer's generated hidden support thunk,
 whose symbol and ABI fingerprint come from the imported resource summary. The thunk calls the

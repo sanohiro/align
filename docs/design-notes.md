@@ -258,14 +258,18 @@ neither import the hook nor lose separate-compilation cleanup. The hook module n
 declaring root, so a driver submodule can construct the public root resource without a cycle or a
 public raw constructor. Shared `borrow` preserves Move ownership; invalidating `borrow mut` also
 updates a writable Copy state aggregate in place. Parameter modes remain part of function values,
-and their inferred return provenance is conservatively joined, so indirect calls cannot erase the
-ownership ABI or lifetime roots. Inferred owner generations prevent a returned view from surviving
+and their inferred return provenance includes target-relative capture roots, so indirect calls
+cannot erase the ownership ABI or lifetime roots. A recursively Move return also forwards its
+path-selected cleanup bit; lifetime summaries cannot reconstruct ownership after a branch.
+Inferred owner generations prevent a returned view from surviving
 replacement, mutation, or Drop. Exclusivity is checked across every call argument, not only
 parameters spelled `borrow`: a by-value Copy view/resource reference or view-bearing aggregate
 rooted in the generation invalidated by a peer `borrow mut` is rejected before the callee can
 receive a dangling view. This structural rule generalizes the existing Move/Drop and
 borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
-ownership model.
+ownership model. Replacement through `borrow mut` uses the ordinary old-value Drop plan before
+storing a new value, while an unchanged pointee remains caller-owned. Raw ownership transfer is
+limited to a standalone resource root, avoiding hidden per-field cleanup state.
 
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
@@ -275,6 +279,13 @@ The proper completion is recursive tagged Move payloads: `Option`, `Result`, and
 the same Drop plan as structs, drop only the active payload, and move/null it through `match`,
 `else`, and `?`. The success path allocates nothing for an unused Move error. This is a general
 language completeness fix with the database as consumer, not database error magic.
+
+**Minimal generics must compose through ordinary package signatures.** Rejecting `array<R>` or a
+top-level `query<P,R>` application inside a generic function leaves a package unable to implement
+its own typed API and invites compiler-known DB entry points. L7 therefore permits nested symbolic
+applications of the existing generic/container types and adds one closed structural
+`RegionPlain` bound. Full substitution still precedes ownership/escape/MIR; there are no runtime
+dictionaries, user traits, reflection, or newly legal concrete element categories.
 
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned

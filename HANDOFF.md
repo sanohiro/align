@@ -241,13 +241,16 @@ The query-centered `pkg.db` design and its general library-boundary prerequisite
 review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). The next
 implementation slice is L1a only: the canonical recursive Drop plan and sound
 `Option<string>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L6 are complete. The required order is L1a recursive DropPlan/`Option<string>`
+variants before L1a–L7 are complete. The required order is L1a recursive DropPlan/`Option<string>`
 fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
-L6 the region plain-struct builder. L2 includes contextual parameter parsing, mutable Copy state, and
-function-value modes plus joined return provenance. L3 includes a producer-owned linkable Drop
-thunk. L5 permits exactly one whole-body static constructor per uniquely named descriptor item and
-uses tagged file/inline source identity. D3's migration-backed SQLite prepare uses the canonical
+L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
+`RegionPlain` bound. No safe driver begins before L1a–L7 are complete. L2 includes contextual
+parameter parsing, all-peer mutable-borrow alias checking, drop-old replacement, target-relative
+capture provenance, and the dynamic Move-return cleanup ABI. L3 includes a producer-owned linkable
+Drop thunk and root-only raw transfer. L5 permits exactly one whole-body static constructor per
+uniquely named descriptor item and uses tagged file/inline source identity plus exact per-driver
+checked-metadata Missing/Present manifest state. D3's migration-backed SQLite prepare uses the canonical
 validated numeric catalog. Query and command share the L5/D1 statement artifact and generated
 binder. Checked metadata is per permitted driver. Option API ownership is D1/D2/D4/D6/D7/D12, with
 D9 completing shared deadline/cancellation behavior. The first public database release gate is

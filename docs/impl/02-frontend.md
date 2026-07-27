@@ -199,11 +199,12 @@ Likewise, `borrow: T` is a legal by-value parameter name. No whitespace heuristi
 `out`, `borrow`, and `borrow mut` are mutually exclusive parameter modes. They are preserved in
 the AST, exported function signature, and function-value parameter entries; a call has no mode
 marker. Concrete function values also retain inferred `ReturnBorrowSummary` and
-`ReturnRegionSummary`, unioning them at joins. `borrow mut` is parsed as one mode, not as a mutable
-local declaration. The checking and return-provenance rules are in
+`ReturnRegionSummary` parameter/capture roots plus `ReturnCleanupAbi`. Joins union compatible
+parameter roots while preserving selected target-relative capture metadata. `borrow mut` is parsed
+as one mode, not as a mutable local declaration. The checking and return-provenance rules are in
 `03-types.md` and `17-library-boundary-prerequisites.md` §2. Call checking compares recursive
-provenance for every argument, including by-value Copy/Move aggregates, so a `BorrowMut` operand
-cannot invalidate a peer argument delivered to the same call.
+provenance for every argument mode, including distinct Copy/Move aggregate holders, so a
+`BorrowMut` operand cannot invalidate a peer argument delivered to the same call.
 
 ### Type declarations (keyword-less)
 
@@ -305,9 +306,12 @@ proven `StaticInputRef` paths under the project/package root, reads exact UTF-8 
 logical paths and hashes to the producer identity. Successful resolution may persist a versioned
 `StaticInputManifest` keyed by that exact source/import-resolution digest. Only a matching manifest
 may supply the paths before a later frontend-cache lookup; a source/import/schema mismatch discards
-it and resolves again. Thus no lexical candidate can cause a false file read or cache hit. The
-compiler does not scan sibling files. SQL diagnostics use the registered `SourceMap` file ID and
-byte spans. The artifact/cache split is specified in
+it and resolves again. The manifest also records each descriptor/permitted-driver checked-metadata
+logical path with `Missing` or `Present(content_hash, format_version)`. A matching manifest
+revalidates those exact paths before a cache hit, so creation, deletion, or change invalidates the
+action without a directory scan. Thus no lexical candidate can cause a false file read or cache
+hit. The compiler does not scan sibling files. SQL diagnostics use the registered `SourceMap` file
+ID and byte spans. The artifact/cache split is specified in
 `17-library-boundary-prerequisites.md` §§5–6.
 
 ---

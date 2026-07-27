@@ -364,7 +364,7 @@ transaction, invalidates every derived execution view.
 
 ### 4.4 Implementation boundary
 
-After L1a–L6, the following are ordinary first-party Align package code:
+After L1a–L7, the following are ordinary first-party Align package code:
 
 - public handles/descriptors/options/errors/metadata data shapes;
 - the closed common/SQLite/PostgreSQL module API;
@@ -376,7 +376,7 @@ After L1a–L6, the following are ordinary first-party Align package code:
 
 The compiler/frontend owns only work that cannot be expressed as runtime package code:
 
-- L1a–L6 language, ownership, region, interface, and MIR support;
+- L1a–L7 language, ownership, region, generics, interface, and MIR support;
 - recognized static Query/command constructors and exact input tracking;
 - descriptor/command type checking from expected `Params`/`Row`;
 - dialect-aware placeholder occurrence/source maps and statement screening;
@@ -787,9 +787,10 @@ Semantics:
   buffering cost;
 - `one`/`maybe_one`/`all`: clone view-bearing fields into the supplied `region`; their results are
   tied to that region.
-- `all`: requires structural `RegionPlain<R>`, grows region chunks, and performs the region
-  builder's one documented compacting pass. This is a compiler structural check, not a public trait
-  bound; every v1 static Query Row already satisfies it.
+- `all`: its exact package definition is generic over `P, R: RegionPlain`, grows region chunks, and
+  performs the region builder's one documented compacting pass. `RegionPlain` is the L7 closed
+  builtin structural bound, not a public/user-defined trait hierarchy; every v1 static Query Row
+  already satisfies it.
 - `rows`: one-pass stream; no implicit materialization.
 - `execute`: never decodes rows.
 
@@ -851,7 +852,8 @@ pub fn run(
 
 This keeps the SQL path and result mode inside the named Query module while preserving visible
 execution and allocation. The normal `loop` is intentional: it avoids adding a database-special
-generic callback ABI or extending Align's closed minimal-generics surface merely to hide a loop.
+callback ABI or higher-order database execution model merely to hide a loop. L7 supplies only the
+nested generic types required by these ordinary package functions.
 `borrow mut` gives the Pure step exclusive access without transferring the arena-owned Move state
 or builder across a by-value call. The builder remains one separate mutable local; L6 does not put
 builders in aggregate fields or add aggregate builder movement. Final validation that needs only
@@ -2024,8 +2026,8 @@ alongside them.
 Secrets and connection URLs are never stored.
 
 For each static Query-or-command/driver pair, the compiler derives the one metadata pathname from the
-descriptor ID hash. Its action key records `Missing` or `Present(content_hash)` even under
-`CheckedOptional`.
+descriptor ID hash. `StaticInputManifest` and the frontend action key record the exact logical path
+plus `Missing` or `Present(content_hash, format_version)` even under `CheckedOptional`.
 Creating, deleting, or editing the file therefore invalidates the producer without a directory
 scan. Exact current metadata contributes to the Query artifact/implementation hash; only its public
 semantic consequences contribute to the exported Query interface.
@@ -2644,9 +2646,9 @@ paper over a missing prerequisite with a package-name special case. Every execut
 an `.align` program end to end and tests execution count, decoded values, ownership/Drop, cleanup, and
 errors.
 
-### L1a–L6 — mandatory Align library-boundary prerequisites
+### L1a–L7 — mandatory Align library-boundary prerequisites
 
-Land the seven PRs specified in
+Land the eight PRs specified in
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md), in order:
 
 ```text
@@ -2657,11 +2659,14 @@ L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resou
 L4  named arena binding + region + clone_in
 L5  deterministic tagged file/inline inputs + one-item Query/command identity + artifacts/descriptors
 L6  region-backed PlainStruct array_builder
+L7  nested generic package APIs + closed structural RegionPlain bound
 ```
 
 All focused tests and benchmarks in that plan are gates. No SQLite or PostgreSQL safe public
 connection type lands before L3; no Query file support lands outside L5; no compound-output private
 vector lands before L6.
+
+The common generic `rows_stmt<P,R>`/`all<P,R>` implementation does not land before L7.
 
 ### D0 — native driver feasibility probes
 
@@ -2908,7 +2913,7 @@ execution through a reflective dynamic engine.
 
 ### Initial release gate
 
-The first release presented as Align database support requires L1a–L6 and D1–D12 for both SQLite
+The first release presented as Align database support requires L1a–L7 and D1–D12 for both SQLite
 and PostgreSQL where the milestone is driver-relevant. D11 supplies SQL migration lifecycle and D12
 supplies the required category metadata and explicit Query-plan access; neither is omitted from the
 release whose earlier sections promise those surfaces. D13–D14 remain committed additive work for
@@ -3013,6 +3018,22 @@ The design is implemented correctly only if all are true:
     array-bearing per-parent Output through a region builder.
 64. PostgreSQL may skip only in optional local runs; D4 merge and releases require the non-skippable
     provisioned `db-postgres` CI gate.
+65. Ordinary package code can define `rows_stmt<P,R>` and `all<P,R: RegionPlain>` with
+    `query<P,R>`, `rows<R>`, and `array<R>`; all nested types are concrete before MIR and no DB
+    builtin implements those helpers.
+66. Every recursively Move Query/helper return forwards one dynamic cleanup bit across
+    direct/indirect/imported ABIs; arena-owned `Ok` and individually owned `Err` paths Drop exactly.
+67. `borrow mut` rejects direct or recursively embedded overlap in every peer mode, including
+    distinct aggregate holders and `Out`.
+68. A capturing function value that returns a captured view/resource reference remains tied to the
+    selected environment and captured owner across direct/indirect calls, joins, and moves.
+69. Replacing an owned value through `borrow mut` drops the old pointee exactly once and updates the
+    caller bit; an unchanged pointee receives no callee function-exit Drop.
+70. `resource.into_raw` accepts only a standalone owned resource root and rejects every
+    field/element/projection/borrowed/out/temporary operand.
+71. Static manifests/action keys include exact per-driver checked-metadata
+    `Missing | Present(hash, format_version)` state; create/change/delete invalidates
+    CheckedOptional/CheckedRequired and Any tracks both drivers without directory scanning.
 
 ---
 
@@ -3038,7 +3059,7 @@ one-execution semantics, ownership, static artifacts, runtime validation, or opt
 ## 26. Instructions for implementation agents
 
 1. Read this document and `../17-library-boundary-prerequisites.md` completely.
-2. Implement L1a–L6 in order; do not start a safe driver API before their owning gate.
+2. Implement L1a–L7 in order; do not start a safe driver API before their owning gate.
 3. Run the Align compiler self-review for every Rust PR.
 4. Keep every PR at one roadmap slice and add its listed negative/cleanup tests.
 5. Do not introduce a database keyword, ORM, Query DSL, runtime reflection, public trait hierarchy,

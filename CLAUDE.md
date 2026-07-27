@@ -156,6 +156,28 @@ release: bump `Cargo.toml` and `Cargo.lock`, write matching release notes,
 commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z`.
 Never infer the publish flow from “build” or “release build.”
 
+## Long-running work and progress monitoring
+
+Elapsed time is not a stopping criterion by itself. For any long-running command,
+review, test, or investigation:
+
+- inspect actual progress at least once per minute while the tool is running;
+- check process state, new log output, the latest completed phase, and whether
+  the work is still producing new relevant results rather than repeating itself;
+- keep useful work running even when it takes longer than expected;
+- stop or redirect only after evidence of a stall, repeated analysis, scope
+  drift, or an actual tool failure;
+- preserve logs, findings, completed phases, and other checkpoints before
+  stopping; resume from the first unfinished area instead of restarting the
+  whole task;
+- report the current phase and evidence of progress during extended work, not
+  only elapsed time.
+
+An automation timeout ends that invocation only. It does not invalidate useful
+work already produced, imply a clean result, or justify rerunning the same broad
+scope from the beginning. Narrow a continuation only to unreviewed,
+contradictory, or changed areas.
+
 ## Review before merging
 
 The PR is not the first correctness pass. A coherent implementation must pass
@@ -189,10 +211,12 @@ before it is merged:
 5. Record both clean post-open reviews against the pushed SHA with
    `scripts/record-post-review.sh`. Wait for CI and only then merge.
 
-Review execution is bounded. A review process that has not returned a verdict
-within 15 minutes is a tool failure, not permission to wait indefinitely. Stop
-it, record the elapsed time and last completed action, then rerun a narrower
-review or ask for direction. Review automation must not launch
+Review execution follows the progress-monitoring rules above. If a review tool
+reaches its configured invocation bound without a verdict, record the elapsed
+time and last completed area, preserve its useful findings, and continue from
+the unfinished scope. Do not treat the missing verdict as CLEAN, and do not
+restart the complete review solely because the bound was reached. Review
+automation must not launch
 `cargo test --workspace` or `scripts/test-full.sh` for an ordinary PR unless
 the change scope explicitly requires that expanded verification.
 

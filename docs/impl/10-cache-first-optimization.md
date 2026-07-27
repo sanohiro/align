@@ -270,9 +270,12 @@ Static-input registration follows resolved constructor identity, not lexical can
 source/import digest, import/name resolution produces the exact list before any static file is
 read. A later no-op may reuse only a versioned `StaticInputManifest` bound to that exact
 source/import-resolution digest; any source/import/schema mismatch resolves again. Missing optional
-checked metadata is itself a keyed state, so creating/deleting its derived exact path cannot
-false-hit. Directory mtimes, file mtimes, absolute checkout paths, database connections, secrets,
-and environment values never enter the normal-build key.
+checked metadata is itself a keyed state. For every static descriptor and permitted driver, the
+manifest/action key records its exact derived logical path as
+`Missing | Present(content_hash, format_version)` and revalidates that path before a pre-frontend
+hit. Creating, deleting, or changing SQLite/PostgreSQL metadata therefore cannot false-hit, while
+directory scans remain forbidden. Directory mtimes, file mtimes, absolute checkout paths, database
+connections, secrets, and environment values never enter the normal-build key.
 
 Do not use the formatter's current "significant token texts" helper directly as a semantic cache
 key: it deliberately drops statement terminators and relies on reparsing as a second safety check.

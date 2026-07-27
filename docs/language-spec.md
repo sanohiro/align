@@ -195,13 +195,20 @@ own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities
 — in a fixed `Num ⊃ Ord ⊃ Eq` hierarchy: `Num` = arithmetic+ordering+equality (numbers), `Ord` =
 ordering+equality (numbers, `char`, `str`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
+`RegionPlain` is the separate closed structural bound for region-backed plain construction; it is
+not in the numeric hierarchy and grants no arithmetic/equality operation.
 
 A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
 position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. **Structs and sum types may
 be generic** — `Pair<T> { a: T, b: T }`, `Opt<T> { Some(T), None }` — monomorphized per
 instantiation, type arguments inferred from a struct literal's fields / a variant's payload
-(`Pair { a: 1, b: 2 }`, `Opt.Some(7)`) or written as a type (`Pair<i32>`). (Nested in
-`array<T>` / `box<T>` / a tuple, and using a generic def inside a generic function, are later slices.)
+(`Pair { a: 1, b: 2 }`, `Opt.Some(7)`) or written as a type (`Pair<i32>`). In a generic function,
+parameters may also occur under `array`, `slice`, and applications of top-level generic
+struct/sum/resource definitions. These symbolic applications are fully substituted before
+Move/escape analysis and MIR. `RegionPlain` is a closed builtin structural bound for region-backed
+plain construction; it is not a user trait. Definitions nested inside functions, call-site
+turbofish, runtime dictionaries/reflection, and new concrete container element capabilities remain
+absent.
 
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
@@ -257,8 +264,11 @@ owner and may return an inferred view of the current generation. `borrow mut x: 
 writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
 return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
 Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
-also retain every mode and both return-borrow/region summaries, so indirect and direct calls use the
-same ABI and result lifetime. Function-value joins union the possible target summaries; an
+also retain every mode, both return-borrow/region summaries, and the Move-return cleanup ABI, so
+indirect and direct calls use the same ABI and result lifetime. Named summaries record parameter
+roots; concrete closure targets additionally record capture slots resolved through the selected
+environment. Function-value joins preserve target-relative capture roots and union compatible
+parameter roots; an
 unresolved higher-order parameter uses every compatible input, including embedded borrow/region
 provenance in a by-value Move value. That provenance transfers with a returned Move result; a bare
 view of an owner destroyed inside the callee remains illegal. Lifetimes are never written.
@@ -266,10 +276,17 @@ Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the
 Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
 and database work remain Impure.
 
-Call-site exclusivity includes by-value aliases: beside `borrow mut owner`, no other argument may
-recursively carry a view, resource reference, dependent-resource parent, or aggregate
-provenance rooted in the owner's previous generation. Generation invalidation therefore never
-delivers a dangling peer argument to the callee. The rule is structural, not package-named.
+Call-site exclusivity checks every peer mode beside `borrow mut owner`: `ByValue`, `Borrow`,
+`BorrowMut`, and `Out`. Direct overlap or a recursively carried view, resource reference,
+dependent-resource parent, or aggregate provenance rooted in the owner's previous generation is
+rejected, including distinct holder aggregates. Generation invalidation therefore never delivers a
+dangling peer argument to the callee. The rule is structural, not package-named. Replacing an owned
+pointee through `borrow mut` drops the old value before the store and updates the caller's cleanup
+bit; an unchanged pointee receives no callee function-exit Drop.
+
+Every recursively Move return carries one dynamic path-selected cleanup bit through direct,
+indirect, and imported ABIs. The caller stores it beside the result. Return borrow/region summaries
+describe provenance and never reconstruct this ownership bit.
 
 `borrow`, `out`, and `resource` are contextual words. `borrow name: T`, `borrow mut name: T`, and
 `out name: T` select parameter modes; `borrow: T` and `out: region` use ordinary parameter names.
@@ -526,6 +543,10 @@ privilege does not create a module cycle. `resource_ref<R>` is a Copy view tied 
 generation and is
 invalidated by owner move/Drop or mutable borrow. Resources are non-Send by default.
 
+`resource.into_raw` accepts only a standalone initialized resource local or by-value resource
+parameter owned by the current function. Fields, elements, projections, borrowed/out parameters,
+and temporaries are rejected so raw transfer does not require per-field ownership bits.
+
 `resource.from_raw_borrowed(ptr, parent_ref)` creates a Move child resource tied to one parent
 generation, so the parent cannot move/drop before the child. The private unsafe
 `resource.view_from_raw(owner_ref, ptr, len)` returns an `Option<str>` or
@@ -560,8 +581,9 @@ directory (nested `import util.math` → `util/math.align`). A cross-module refe
 resolves within the calling module (an imported type must be qualified). A qualified `pub` function
 may also be passed to a pipeline/reducer (`xs.map(geom.area)`) or bound as a function value
 (`f := geom.area`) under the same import and visibility rules. Its function-value type retains
-`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter plus inferred return-borrow/region
-summaries; indirect calls do not erase modes or provenance. Each module has its own
+`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter plus inferred
+return-borrow/region/capture provenance and the Move-return cleanup ABI; indirect calls do not erase
+modes, provenance, or ownership. Each module has its own
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,

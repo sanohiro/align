@@ -18,6 +18,7 @@ owner-tied native views
 named arena region capabilities
 deterministic static source inputs and Query/command artifacts
 region-backed plain-struct builders
+nested generic package APIs with a closed RegionPlain bound
 ```
 
 The same review fixed the boundary details before implementation: `borrow mut` may update a writable
@@ -36,6 +37,13 @@ metadata/EXPLAIN copy exact flat records into a named region; migration SQL is a
 a one-statement dirty-state path for transaction-forbidden statements; and PostgreSQL is a
 non-skippable merge/release CI gate. The compound examples also reject both partial-NULL child
 shapes and keep many-parent output segmented.
+
+A subsequent language-foundation audit found seven remaining prerequisites and made them explicit
+rather than database-private work: generic package functions may compose `array<R>` and named
+generic resources; Move returns carry a dynamic cleanup bit; mutable-borrow alias scans cover every
+peer parameter mode; closure return provenance includes capture roots; replacement through
+`borrow mut` drops the old pointee; raw resource transfer is root-only; and static-input manifests
+key exact per-driver checked-metadata missing/present state.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:

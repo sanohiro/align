@@ -3467,11 +3467,13 @@ every arm's locals per frame, so one fat arm taxes every recursion level).
 Implementation slices: **A — builtin import validation — DONE (2026-06-25).** `collect_imports` validates every `import` against the `BUILTIN_MODULES` table (unknown / duplicate → error); the imported set threads into each `Checker`; `require_import` enforces `core.json` / `std.fs` / `std.io` at the `json.*` / `fs.read_file` / `io.stdout.write` dispatch sites (once per source function, skipped for monomorphs). Syntactic core needs no import. `tests/imports.rs` (7) + corpus updated (every existing json/fs/io program/example now carries its import). (Unused-import lint was deferred here until user modules existed — now **DONE**, see B-lint below.) **B — real multi-file user modules.** Resolution scheme decided (2026-06-25): **filename convention** — `import geom` → `geom.align` in the entry file's directory (its `module` decl must match the filename); chosen for simple+fast+predictable (no directory scan, only imported files are read) over scan-by-`module`-decl or a CLI file list. **B1 DONE (2026-06-25):** driver loads the entry + transitively-imported user modules (BFS, dedup, cycle-safe); sema's `check_file` → `check_program(&[Module])` checks them together; functions are **per-module mangled** (`module$fn`, entry module unmangled so single-file programs are byte-identical); bare calls resolve in the caller's module, `mod.fn(...)` resolves cross-module with **`pub` visibility**; the capability-import rule applies per file. `tests/modules.rs` (8), `examples/modules/`. **B2 (nested paths) DONE (2026-06-25):** `import util.math` → `util/math.align` (declaring `module util.math`), called `util.math.fn(...)`; the driver walks the directory tree, sema flattens the dotted receiver (`flatten_module_path`) to resolve the call. **B-types (cross-module type export) DONE (2026-06-26):** types are now **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry module unmangled, so single-file programs stay byte-identical), two modules may reuse a type name, and `type_table` (module → bare → canonical + `pub`) drives resolution. `pub` on a struct/enum exports it; an importer names it qualified (`geom.Point`, resolved with import + `pub` checks via `canonical_type_name`); a bare type resolves in the current module (so an imported type **must** be qualified). `StructLit.name` became a `Path` (the parser detects a dotted `Path { ident :`); `resolve_type` routes qualified paths through the table. **B-variant-ctor (qualified variant construction) DONE (2026-06-26):** an imported `pub` sum type's variant is constructed qualified — `pal.Color.Green` (tag-only, via `check_field_access`) and `pal.Color.Code(40)` (payload, via `check_call`). A unified `resolve_type_receiver` resolves a `Type.Variant` receiver as a bare type (current module) or `mod.Type` (imported `pub` type), used by both the tag-only and payload paths; a private cross-module type emits one clean error (3-state `Ok(Some)`/`Ok(None)`/`Err`, no cascade). So an exported sum type is now **fully** usable across modules (construct + hold + return + match). `tests/modules.rs` (now 19). **Still deferred:** cross-module **field/payload types** (a field `f: other.T`) — but note this is mostly blocked on **nested struct/enum fields not existing yet** (`is_field_ok` allows only scalar/str), not on module plumbing; the only live slice is an enum payload of an imported struct (passes 0b/0c resolve with `no_imports` — would need the import table built before the type passes). **B-lint (unused-import lint) DONE (2026-06-26):** an `import` never referenced in a file is a **warning** (tidiness, not a hard error — unlike unhandled `Result`, which is a correctness error). Detection is a syntactic AST walk (`collect_refs` → `walk_expr`/`walk_type`/`walk_block`) collecting every qualified reference's dotted prefix, independent of the resolution code so signatures / bodies / constants are covered uniformly; an import is used iff some prefix equals it or starts with it + "." (a builtin `core.json` matches its `json.*` namespace). The walk over-approximates "used" (a local shadowing a module name still counts), so the lint never wrongly fires. `tests/unused_import.rs` (7). Still deferred: project-root config (entry dir is the root). Record: `draft.md` §17, `impl/02-frontend.md`, `tests/modules.rs`, `tests/imports.rs`, `tests/unused_import.rs`.
 
 ### Generics (minimal system) — DONE / CLOSED (4c)
-**This feature is complete and closed.** Generics is deliberately a *minimal*, supporting feature
+**This feature is closed in scope; its shipped core is complete and L7 composition is scheduled.**
+Generics is deliberately a *minimal*, supporting feature
 (`CLAUDE.md`: "approach minimally", "no Rust-trait complexity", "AI-friendliness is a constraint —
 avoid complex generics"). Align is **data-oriented** — arrays/slices are the protagonist, not
 generics. The implemented surface below (generic functions + builtin bounds + generic structs +
-generic sum types) is the intended scope; **do not keep extending it.** The items once listed as
+generic sum types plus the L7 nested package composition below) is the intended scope; **do not
+keep extending it beyond that fixed requirement.** The items once listed as
 "later 4c slices" are not generics work and have moved to their real homes (see "Out of generics —
 moved to their own tracks" at the end of this entry).
 
@@ -3536,22 +3538,30 @@ and variant construction (`Opt.Some(7)`) infers the type arguments from the payl
 then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
 decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
 
-**Generics is closed — the surface above is the whole feature.** The minimal-generics goal is met:
+**L7 nested package composition — SETTLED 2026-07-27, required before `pkg.db`, not yet built.**
+Ordinary first-party packages need generic functions whose signatures and locals contain
+`array<R>`, `slice<R>`, and top-level generic struct/sum/resource applications such as
+`query<P,R>`, `stmt<P,R>`, and `rows<R>`. `Ty::Param` therefore composes recursively through those
+types and is fully substituted before MoveCheck/EscapeCheck/MIR. `RegionPlain` is one additional
+closed builtin structural bound for region-backed plain construction. Public template interfaces
+and monomorphization keys encode the canonical nested type applications and bound. Whole-program
+and interface-only instantiation must agree. No user traits, runtime dictionaries, reflection,
+turbofish, nested declarations, or newly legal concrete container element categories are added.
+
+**Generics is closed — the shipped surface plus L7 is the whole feature.** The minimal-generics goal is met:
 generic functions, builtin bounds (`Num`/`Ord`/`Eq`), generic structs, and generic sum types, all
 monomorphized, no turbofish, no user trait bounds. That covers ordinary generic code; further
 extension is explicitly **not** pursued, to keep generics minimal and Align data-oriented.
 
 **Out of generics — moved to their own tracks (NOT generics todo):**
-- **Generic containers** (`Stack<T>`, an `array<T>`/`slice<T>` field/param) belong to the
-  **data-oriented core / `group_by` track** (roadmap #5), not here. They need the fused-pipeline
-  machinery to carry a generic element (and `PrimScalar` to hold a `Param`) — a perf-core change,
-  pursued *if and when* a concrete consumer (e.g. `group_by`) needs it. Align already ships builtin
-  `array`/`slice`/`Option`/`Result`/`Error`/tuples, so the language is complete without generic
-  containers.
+- **User-defined generic container semantics beyond L7** (`Stack<T>` owning arbitrary elements or a
+  new concrete element capability) belong to the data-oriented core / owning container track. L7
+  only makes existing `array<T>`/`slice<T>` and named generic applications representable inside a
+  generic function and still applies every concrete container restriction after substitution.
 - **Value generics `vec<N, T>`** — part of **M6 (SIMD)**, not generics.
-- **A generic def used inside a generic function** (`fn mk<T> -> Pair<T>`) and expected-type
-  decomposition for `Opt.None` — small optional refinements, rejected cleanly today; only revisit
-  if real code demands them. Not required for the language to be complete.
+- **Expected-type decomposition for `Opt.None`** remains a small optional refinement. Applying a
+  top-level generic definition inside a generic function is owned by L7; declaring a definition
+  inside a function remains rejected.
 
 ### Error type design — Settled 2026-07-02 (built on sum types; the exit-code residual is now closed)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
@@ -3599,6 +3609,11 @@ Move. Drop switches on the tag; construction and extraction move/null the active
 normal, error, branch, loop, reassignment, `match`, `else`, `?`, and `map_err` paths preserve the
 one-owner rule. A struct field such as `Option<string>` uses the same conditional plan.
 
+Every recursively Move function return carries the selected path-local cleanup bit through direct,
+indirect, and imported ABIs. The caller stores it beside the returned value; return region/borrow
+summaries never reconstruct ownership. This is required when different paths of one
+`Result<array<R>, Error>` select arena-owned `Ok` data or an individually owned `Err`.
+
 This closes the current implementation restrictions that reject an owned Option field, a Move
 struct/sum payload, and a Move sum as a Result error. `pkg.db` is the concrete consumer:
 `NativeError` owns optional strings, `db.Error` is a Move sum, and Query helpers return compound
@@ -3632,18 +3647,24 @@ types: it preserves caller ownership and may return a view tied to the caller's 
 generation. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
 the previous generation, invalidates every older view, and returns any new view in the fresh
 generation. Parameter modes and inferred return-borrow summaries are part of the exported
-interface; `Fn`/`FnTy` also retains every mode so indirect calls use the direct-call ABI.
-Concrete function values additionally retain inferred return-borrow/region summaries; joins union
-their parameter sets, and unresolved higher-order parameters conservatively use every compatible
+interface; `Fn`/`FnTy` also retains every mode and the Move-return cleanup ABI so indirect calls use
+the direct-call ABI. Concrete function values additionally retain inferred
+return-borrow/region parameter and capture-slot summaries. Target-relative capture roots travel with
+the selected environment; joins union compatible parameter roots without reinterpreting another
+target's capture slots, and unresolved higher-order parameters conservatively use every compatible
 input, including embedded provenance in by-value Move aggregates/dependent resources. Call transfer
 snapshots that provenance before move/null and attaches it to the returned Move value. User-written
 lifetime parameters are not introduced. Mutation rooted only in an explicit
 `borrow mut` parameter remains Pure when there is no other Impure operation; it is an alias-checked
 exclusive input effect, not hidden captured mutation.
 
-Exclusivity is recursive across every call argument. A `borrow mut` input rejects any overlapping
-by-value view, `resource_ref`, dependent resource, or aggregate carrying the invalidated old
-generation; Copy arguments are not an exception and no package type name is special.
+Exclusivity is recursive across every call argument and every peer mode (`ByValue`, `Borrow`,
+`BorrowMut`, and `Out`). A `borrow mut` input rejects direct overlap or any view, `resource_ref`,
+dependent resource, or aggregate carrying the invalidated old generation, including distinct
+holder aggregates; Copy arguments are not an exception and no package type name is special.
+Borrowed storage remains caller-owned. Replacing an owned pointee through `borrow mut` runs its old
+Drop plan before the store and updates the caller cleanup bit; unchanged storage receives no callee
+function-exit Drop.
 
 `borrow`, `out`, and `resource` are contextual words, not globally reserved tokens. Exact lookahead
 distinguishes `borrow name: T`/`out name: T` modes from parameters named
@@ -3665,6 +3686,10 @@ a non-owning
 The unsafe internal `resource.view_from_raw` returns an owner-tied checked `Option<str>`/slice; no
 owner-free safe raw view exists. Resources are non-Copy, non-comparable, non-printable, and
 non-Send in the first implementation.
+
+`resource.into_raw` is restricted in v1 to a standalone initialized resource local or by-value
+resource parameter owned by the current function. A field, element, projection, borrowed/out
+parameter, or temporary is rejected, avoiding a second per-field cleanup-state model.
 
 These are the common library-boundary mechanisms for native stateful packages, including
 `std.http`, `std.net`, `std.process`, and `pkg.db`; they are not database-specific builtins.
@@ -3936,6 +3961,12 @@ File SQL uses a tagged root-relative logical-path identity. Inline SQL uses
 `Inline { fully-qualified descriptor id }`, exact decoded literal bytes, and a
 decoded-byte-to-`.align` source-span map; it never invents a file path. Both feed the same source
 hash, wire rewrite, artifact, and producer implementation identity.
+
+A versioned `StaticInputManifest` also records, for every descriptor and permitted driver, the
+exact derived checked-metadata logical path and `Missing` or
+`Present(content_hash, format_version)` state. A matching manifest revalidates only those exact
+paths before a frontend-cache hit. Creation, deletion, or change invalidates the action; directory
+scanning and mtime identity remain forbidden.
 
 Dependency *names* remain derivable from source (`grep 'import pkg\.'` — no manifest to drift,
 same argument as M15's unit graph). Only *sources/versions* need recording, and that record

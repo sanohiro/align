@@ -650,6 +650,9 @@ and `str`/`string` — byte-lexicographic, § Equality and Ordering); `Eq` grant
 satisfy a parameter's bound is a compile error at the call. There are **no user-defined
 trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 
+`RegionPlain` is the one separate closed structural bound used by region-backed construction. It is
+not part of the numeric hierarchy and grants no arithmetic or equality operation.
+
 The current compiler's concrete `Eq`/`Ord` bound satisfaction follows the implementation boundary
 above: `str` is accepted and owned `string` is rejected until its direct comparison lowering lands.
 
@@ -674,6 +677,26 @@ p := Pair { a: 1, b: 2 }          // Pair<i32>, inferred from the fields
 o := Opt.Some(7)                  // Opt<i32>, inferred from the payload
 fn sum(q: Pair<i32>) -> i32 = q.a + q.b
 ```
+
+Type parameters compose through the ordinary package types that use them. Inside a generic
+function, `T` may appear under `Option`, `Result`, `array`, `slice`, or an application of a
+top-level generic struct, sum, or resource definition:
+
+```align
+fn collect<P, R: RegionPlain>(
+  q: Query<P, R>,
+  p: P,
+  out: region,
+) -> Result<array<R>, Error>
+```
+
+`RegionPlain` is a closed builtin structural bound, not a user-defined trait. It admits recursively
+plain scalars/views/structs for region-backed construction and rejects resources, independently
+owned fields, raw/function values, and builders. Nested applications remain symbolic while the
+template is checked, then are fully substituted and monomorphized before Move/escape analysis and
+MIR. This adds no runtime dictionary, reflection, turbofish, or definition nested inside a
+function, and does not make a concrete container element legal when that container otherwise
+rejects it.
 
 A struct field must be a Copy type after substitution. A no-payload variant (`Opt.None`) has nothing
 to infer its type from, so it needs a payload-bearing sibling to fix the type at construction.
@@ -766,16 +789,24 @@ storage generation. This is required for a Copy state aggregate whose field muta
 caller rather than a discarded copy. Older views become invalid; a returned view belongs to the
 fresh generation. Parameter modes are part of named-function and function-value signatures, while
 lifetime roots remain inferred — there are no written lifetime parameters. A concrete function
-value retains inferred return-borrow and return-region parameter sets. Assignment/control-flow
-joins union them; an unresolved higher-order parameter conservatively names every compatible
+value retains inferred return-borrow and return-region parameter/capture sets. Target-relative
+capture roots travel with the selected closure environment; assignment/control-flow joins
+conservatively union parameter roots without reinterpreting another target's capture slots. An
+unresolved higher-order parameter conservatively names every compatible
 input, including embedded provenance in a by-value Move aggregate/dependent resource. The call
 captures that provenance before moving/nulling the source and transfers it to the result; this does
-not permit a callee to return a bare view of an owner it destroys. Passing the same owner through
-overlapping `borrow mut`, `borrow`, or `out` arguments is rejected. A `borrow mut` argument also
-rejects any other by-value argument whose type recursively carries provenance rooted in the
-owner's old generation, including a Copy view, `resource_ref`, dependent resource, or aggregate;
+not permit a callee to return a bare view of an owner it destroys. For every `borrow mut` input,
+every other argument mode (`ByValue`, `Borrow`, `BorrowMut`, and `Out`) is checked. Direct place
+overlap or recursively carried provenance rooted in the owner's old generation rejects the call,
+including a Copy view, `resource_ref`, dependent resource, or either of two distinct holder
+aggregates;
 invalidation may not deliver a dangling peer argument to the callee. This is a structural
 provenance check, never a package/type-name exception.
+
+A borrowed pointee remains caller-owned and receives no callee function-exit cleanup. If
+`borrow mut` replaces an owned value, however, the old value's ordinary Drop plan runs before the
+store and the caller's path-local cleanup bit is updated to the replacement's bit. The unchanged
+pointee is never dropped by the callee.
 
 `borrow`, `out`, and `resource` are contextual rather than reserved words. Parameter lookahead
 recognizes `borrow name: T`, `borrow mut name: T`, and `out name: T` as modes, while `borrow: T` and
@@ -804,6 +835,11 @@ payload out and clear the container. An `Ok` success path does not allocate mere
 error type owns strings. This supports structured owned errors and
 `Result<Option<MoveOutput>, MoveError>` without a second error model. It does not imply arbitrary
 arrays of Move elements; collection element layout/drop remains a separate explicit capability.
+
+Every recursively Move function return carries its selected path-local cleanup bit as part of the
+internal direct/indirect/module ABI. The caller stores that bit beside the returned value. Return
+region/borrow summaries describe lifetime provenance only: they cannot reconstruct whether, for
+example, the selected `Result` path returned arena-owned `Ok` data or an individually owned `Err`.
 
 ### 6.4 Arena
 
@@ -999,9 +1035,10 @@ apply(fn n: i64 { n + base }, 5)   // a (capturing) closure passed as an argumen
 Function types preserve parameter modes: `fn(borrow Conn) -> i64`,
 `fn(borrow mut State, Row) -> Result<(), Error>`, and `fn(out slice<u8>, str) -> ()`. Binding,
 passing, joining, or indirectly calling a named function retains the exact mode and direct-call
-ABI; there is no mode-erasing adapter. It also preserves and conservatively joins inferred
-return-borrow/region summaries, so an indirect result cannot outlive any possible target input. The
-inferred effect and provenance summaries remain unwritten.
+ABI; there is no mode-erasing adapter. It also preserves inferred return-borrow/region summaries
+for parameters and captured environment slots, so an indirect result cannot outlive any possible
+target input, closure environment, or captured owner. Target-relative capture roots move with the
+function value. The inferred effect and provenance summaries remain unwritten.
 
 A passed closure's captured environment lives in the caller's frame for the duration of the call, so
 no heap allocation is needed. A function value that *escapes* — returned from a function, stored
@@ -1768,6 +1805,11 @@ the `pub` source hook outside consumer APIs.
 Owner move/Drop or a `borrow mut` call invalidates it. Resources and references are non-Send by
 default. This is the one mechanism used by native `std` handles and FFI-backed `pkg` libraries; safe
 APIs never expose `raw` or manual destroy.
+
+In v1, `resource.into_raw` consumes only a standalone initialized resource local or by-value
+resource parameter owned by the current function. A field, element, projection, borrowed/out
+parameter, or temporary is rejected. This keeps one aggregate cleanup bit exact rather than adding
+hidden per-field ownership state.
 
 `resource.from_raw_borrowed(ptr, parent_ref)` creates an owned child resource tied to one parent
 resource generation; the compiler keeps the parent alive until the child drops.
