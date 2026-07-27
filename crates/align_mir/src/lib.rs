@@ -2459,6 +2459,22 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, true),
         hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, true),
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
+            lower_block_for_borrow(b, block).unwrap_or(Operand::Const(Const::Unit))
+        }
+        hir::ExprKind::Arena(block) => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.arenas.push(handle);
+            let tail = lower_block_for_borrow(b, block);
+            b.arenas.pop();
+            if b.is_terminated() {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
         _ => lower_expr(b, e),
     }
 }
@@ -2613,6 +2629,22 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
         // pipeline's source line into every instruction the value lowers.
         b.set_span(e.span);
         lower_expr(b, e)
+    })
+}
+
+/// Lower a borrow-transparent block while preserving borrowing semantics through its tail.
+/// Statements still use their ordinary ownership rules; only the value delivered by the block is
+/// borrowed by the enclosing expression.
+fn lower_block_for_borrow(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
+    for s in &block.stmts {
+        lower_stmt(b, s);
+        if b.is_terminated() {
+            return None;
+        }
+    }
+    block.value.as_ref().map(|e| {
+        b.set_span(e.span);
+        lower_expr_for_borrow(b, e)
     })
 }
 

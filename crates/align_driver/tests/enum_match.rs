@@ -691,6 +691,72 @@ fn materialized_move_enum_scrutinee_transfers_each_control_source() {
 }
 
 #[test]
+fn copy_only_match_borrows_control_sources_through_transparent_scopes() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        (
+            "enum-block-control-source-borrow",
+            "{ if true { m.c } else { other.c } }",
+        ),
+        (
+            "enum-unsafe-control-source-borrow",
+            "unsafe { if true { m.c } else { other.c } }",
+        ),
+        (
+            "enum-arena-control-source-borrow",
+            "arena { if true { m.c } else { other.c } }",
+        ),
+    ];
+    for (name, scrutinee) in cases {
+        let src = format!(
+            "Content {{ Text(str), Nums(array<i64>) }}\n\
+             Msg {{ c: Content }}\n\
+             fn main() -> i32 {{\n\
+               m := Msg {{ c: Content.Text(\"hello\") }}\n\
+               other := Msg {{ c: Content.Text(\"other\") }}\n\
+               first := match {scrutinee} {{ Text(t) => t.len(), _ => 0 }}\n\
+               second := match m.c {{ Text(t) => t.len(), _ => 0 }}\n\
+               return (first * 10 + second) as i32\n\
+             }}\n"
+        );
+        assert_eq!(
+            build_and_run(name, &src).status.code(),
+            Some(55),
+            "a transparent wrapper must preserve the selected Copy-only match source: {name}"
+        );
+    }
+}
+
+#[test]
+fn wrapped_copy_only_wildcard_preserves_an_owned_enum_source() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Content { Text(str), Nums(array<i64>) }\n",
+        "Msg { c: Content }\n",
+        "fn main() -> i32 {\n",
+        "  left := Msg { c: Content.Nums([3, 4, 5].to_array()) }\n",
+        "  right := Msg { c: Content.Nums([90].to_array()) }\n",
+        "  ignored := match { if true { left.c } else { right.c } } {\n",
+        "    Text(t) => t.len() as i64\n",
+        "    _ => 0\n",
+        "  }\n",
+        "  return match left.c { Text(t) => t.len() as i32, Nums(ns) => ns.sum() as i32 }\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("enum-wrapped-wildcard-borrow", src)
+            .status
+            .code(),
+        Some(12),
+        "a Copy-only wildcard must leave the owned variant in its original source"
+    );
+}
+
+#[test]
 fn move_binding_owns_a_materialized_enum_control_result() {
     if !backend_available() {
         return;
