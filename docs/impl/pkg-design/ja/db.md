@@ -448,9 +448,10 @@ exactly onceでconsume/dropする。
 初期PostgreSQL `BufferedFull` pathは同期libpq callのreturn前にparameter transmissionを完了
 する。将来のsingle-row/portal/pipeline/async pathはnative protocolが不要になるまで自身の
 parameter bytesを保持する。これはper-execution bind copyでありper-row copyではない。
-v1 PostgreSQL Text binderはNUL-terminated execution-owned copyを作り、embedded U+0000を
-SQL送信前に `db.Error.Encode` とする。binary byteaはexplicit lengthを使い、このtext制限を
-適用しない。
+v1 PostgreSQL Text binderはNUL-terminated execution-owned copyを作り、text/varchar/nameの
+embedded U+0000をSQL送信前に `db.Error.Encode` とする。Text formatのbyteaはPostgreSQL
+`\x` formへinput byteごとにlowercase hex 2桁でencodeし、raw byteをlibpq Text parameterへ
+渡さない。Binary formatのbyteaだけがraw byteとexplicit lengthを使う。
 test/benchmarkはtext/blob copy bytesとallocationをrow decodeと分けて報告する。zero-copy
 bindは明示driver-qualified surface、全source ownerへ結ぶreturn provenance、独立measurement
 を必要とし、黙ってborrowed bindへ切り替えない。generated driver binder planは各fieldの
@@ -790,7 +791,7 @@ host/port/database/user、application name、connect timeout、TLS/SSL mode、ta
 attributes、任意のsupported connection key/value、notice/error detailを扱える。
 secretはruntime valueでありstatic Query metadataへ入れない。URL、application name、
 parameter name/valueはUTF-8かつU+0000なしでなければならず、embedded NULはlibpq call前に
-`db.Error.Encode` として拒否し、truncateしない。
+Query identityなしの `db.Error.Encode` として拒否し、truncateしない。
 
 ### 12.2 parameter/result format
 
@@ -808,6 +809,9 @@ postgres.ExplainOption.Analyze
 postgres.ExplainOption.Format(Text|Json)
 postgres.ExplainOption.Verbose/Costs/Buffers/Timing/Settings/Wal(bool)
 ```
+
+Text formatのbyteaは§5.6.1のexact hex encodingを使い、Binary formatだけがraw byteと
+explicit libpq lengthを使う。未実装のbinary mapping要求はSQL送信前に `Unsupported` とする。
 
 初期実装がtext中心でもbinaryを閉ざさない。unknown/conflicting OIDをignored hintにせず
 errorにする。ParameterTypeはstatic artifact/public contractへ入りPostgreSQLへpinする。
@@ -915,8 +919,9 @@ EXPLAIN      db.explain(exec, query, params, out: region, slice<db.ExplainOption
 default argument、optionless overload、fluent builder、string-key map、process-global optionは
 ない。Query-local run helperはoptionをcallerから受けるか `[]` を渡すかsourceに書く。
 option ownershipはD1 static Query/command、D2 SQLite connection/execute、D4 PostgreSQL
-connection/execute、D6 prepare、D7 transaction、D9 common deadline/cancellationと全scope
-matrix、D12 metadata/EXPLAINである。D9までpreliminary APIを待たせず、別表現も作らない。
+connection/execute、D6 prepare、D7 transaction、D9 deadline enforcement/native cancellation
+cleanupと全scope matrix、D12 metadata/EXPLAINである。D9までpreliminary APIを待たせず、
+別表現も作らない。
 
 ### 13.3 silent ignore禁止
 
@@ -1022,7 +1027,7 @@ db.CardinalityError {
 }
 
 db.ContractError {
-  query_id: string,
+  query_id: Option<string>,
   item: string,
   message: string,
 }
@@ -1047,7 +1052,9 @@ db.Error {
 ```
 
 SQLite primary/extended code、PostgreSQL SQLSTATE/detailを所有して保持する。native buffer
-viewをerrorへ残さない。success hot pathはerror stringをallocateしない。
+viewをerrorへ残さない。`ContractError.query_id` はQuery/command contractなら `Some(id)`、
+connection/transaction/metadataなどQueryなしのoperation/input validationなら `None` とし、
+どちらも `item` がexact operation/inputを示す。success hot pathはerror stringをallocateしない。
 
 この形はL1a/L1bのrecursive tagged Move payloadを必須とする。compiler-known例外や
 opaque integerだけへ縮退しない。low-level builtin `Error` への変換が必要なら
@@ -1351,8 +1358,9 @@ L3 resource/refはnon-Sendで同期executionにsoundなconcurrent callerがな�
 v1にexternally shareable cancel resourceはない。user-triggered cancel handleにはgeneral
 Send/thread-safe-resource前提と専用roadmap sliceを先にscheduleする新しい具体的proposalが
 必要で、accepted v1 designやD9から暗黙には生えない。
-timeout後のconnection再利用可否をdriverが判定し、protocol/transaction state不明のconnectionを
-poolやcallerへ返さない。transparent retryはない。
+timeout/cancel後はrequired resultをdrainしてprotocol/transaction stateの同期を証明できた
+connectionだけを再利用可能とする。それ以外はpoison/closeし、state不明のconnectionをpoolや
+callerへ返さない。transparent retryはない。
 
 ## 21. Performance contract
 
@@ -1486,7 +1494,8 @@ local/ephemeral PostgreSQLでintegration testする。§12のexact PostgreSQL
 connection/baseline execute option sumと全conflict/unsupported branchも含む。
 §10.3のexact初期mappingを固定して未所有mappingを拒否するが、D4 executable verticalは
 `i64`に保ち、complete runtime type matrixはD8が所有する。SQL/Text Params/URL/connection
-option stringのU+0000をlibpq前に拒否する。
+option stringのU+0000をlibpq前に拒否する。Text-format byteaはexact lowercase hexへencodeし、
+raw byteaはBinary formatだけでexplicit length付きにする。
 local開発では未設定時に理由付きskipできるが、D4 merge/DB releaseでは
 `ALIGN_DB_POSTGRES_REQUIRED=1` のrequired `db-postgres` CIがpinned ephemeral serverを
 provisionし、skip/接続不能をfailureにする。同じjobでportable Queryを両driverに実行する。
@@ -1529,7 +1538,8 @@ D1/D2/D4/D6/D7で既に公開したoption API上へcommon deadline/native cancel
 完成させ、全scopeのapplied/unsupported/conflicting/precedence matrix、timeout/cancel後
 connection stateをauditする。SQLite common deadlineのpre-send Unsupported、
 PostgreSQL deadline/cancel、BusyTimeoutをcommon deadline扱いしないことをhidden SQLなしで
-固定する。v1 public external cancel resourceがないことも固定する。D9で
+固定する。v1 public external cancel resourceがないこと、cancel後にdrain/resynchronizeを
+証明できなければconnectionをpoison/closeすることも固定する。D9で
 preliminary APIや別表現を作らない。要求optionのsilent ignoreを全driverでnegative testする。
 
 ### D10 — compound Output
@@ -1678,13 +1688,22 @@ execution-count付きで実証する。
 72. synthetic field-selector/function-value factはnamed functionと同じcapture-root summaryと
     Move-return cleanup ABIを使う。
 73. static/dynamic/migration SQL、PostgreSQL Text Params、libpq connection/control stringは
-    native call前にU+0000を拒否し、binary byteaはlength-awareのままにする。
+    native call前にU+0000を拒否し、Binary-format byteaはlength-awareのままにする。
 74. PostgreSQL初期mappingはinteger/float/bool/text/bytea/Optionだけで、temporal/numeric/
     UUID/JSON/array/range/domainは後続の明示contractを必要とする。
 75. D9は全deadlineをenforceまたはpre-send rejectし、hidden SQLを発行せず、general
     Send/thread-safe-resource前提がscheduleされるまでexternal cancel resourceを公開しない。
 76. SQLite `BusyTimeoutNs` はstreamed `next` 中も有効で、exhaustion/error/Drop時に
     connection reuse前のpackage-tracked prior valueへrestoreする。
+77. synthetic field selectorはtop-level viewだけでなくnested view-bearing return typeの
+    receiver provenanceもrecursiveに保持する。
+78. PostgreSQL Text-format byteaはlowercase `\x` hexでraw byteを渡さず、Binary formatだけが
+    raw byteとexplicit lengthを使う。
+79. timeout/cancel後のPostgreSQL connectionはprotocol/transaction state同期を証明できる
+    場合だけ返し、それ以外はpoison/closeする。
+80. `ContractError` はQuery IDを捏造せずQueryなしoperation/input validationを表現できる。
+81. 初期releaseの例とmappingはinteger/float/bool/text/bytea/Optionだけを使い、deferred
+    logical typeは後続の明示contract前にpublic exampleへ出さない。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

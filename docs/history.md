@@ -49,6 +49,9 @@ The final consistency pass also closed native-boundary scope gaps. SQL and libpq
 strings reject embedded NUL before native calls; the first PostgreSQL release maps only the fixed
 integer/float/bool/text/bytea/Option set; and D9 provides enforced deadlines plus native
 cancellation cleanup without inventing a public non-Send cancel handle.
+The follow-up closes the recursive selector/root case, specifies Text `bytea` hex versus raw Binary
+binding, requires post-cancel resynchronization or close, permits truthful Query-less contract
+errors, and removes deferred logical types from first-release examples.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:

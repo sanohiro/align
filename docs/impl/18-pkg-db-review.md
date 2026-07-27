@@ -891,7 +891,7 @@ idea is rejected.
 - **Actual failure:** reviewed/hash input could differ from executed SQL, a text value could be
   truncated, or driver behavior could diverge.
 - **Recommendation:** reject U+0000 in static/dynamic/migration SQL before native calls; reject it in
-  libpq URL/options and v1 Text Params with `Encode`; keep binary bytea length-aware.
+  libpq URL/options and v1 Text Params with `Encode`; keep Binary-format bytea length-aware.
 - **v1 impact:** L5/D2/D4/D11 semantic-safety blocker.
 
 ### F62 — PostgreSQL first-release type mapping included undecided types
@@ -936,6 +936,65 @@ idea is rejected.
   releasing the dependency. Restore failure poisons/closes the connection.
 - **v1 impact:** D2/D8 option correctness blocker.
 
+### F65 — synthetic field selectors checked only a top-level view
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** `03-types.md` field-selector return-borrow rule.
+- **Current Align constraint:** return provenance walks recursively through every view-bearing
+  aggregate and sum payload; synthetic callables use the same rule as named functions.
+- **Actual failure:** projecting `Option<str>` or a struct containing a view could record no receiver
+  root, allowing an indirect selector result to outlive its owner.
+- **Recommendation:** derive the receiver root from the complete projected type recursively and add
+  a nested-view selector acceptance case to L2.
+- **v1 impact:** L2 soundness blocker.
+
+### F66 — raw `bytea` was treated as length-aware in libpq Text format
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** DB §5.6.1/§12.2 PostgreSQL bind formats.
+- **Current Align constraint:** libpq ignores parameter lengths for Text-format values; only Binary
+  format treats raw bytes as length-delimited.
+- **Actual failure:** a Text-format `bytea` containing `0x00` would truncate if the binder passed raw
+  bytes, despite the stated explicit-length guarantee.
+- **Recommendation:** encode Text `bytea` as exact lowercase PostgreSQL `\x` hex; pass raw bytes only
+  in Binary format with an explicit length.
+- **v1 impact:** D4/D8 data-correctness blocker.
+
+### F67 — authoritative cancellation text omitted uncertain-connection disposition
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** English DB §20/D9 versus the Japanese mirror.
+- **Current Align constraint:** an opaque connection resource may be reused only while its native
+  protocol and transaction state remain proved.
+- **Actual failure:** PostgreSQL cancellation can leave unread results or uncertain state, and an
+  implementation following only the English contract could return a desynchronized connection.
+- **Recommendation:** require drain-and-resynchronize proof or poison/close before any reuse.
+- **v1 impact:** D9 resource-safety blocker.
+
+### F68 — connection encoding errors required a fabricated Query identity
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** PostgreSQL connection NUL rejection versus
+  `ContractError.query_id: string`.
+- **Current Align constraint:** connection validation occurs before a Query exists and errors must
+  expose truthful data rather than sentinel identities.
+- **Actual failure:** the wrapper would invent a Query ID or use an unrelated error category.
+- **Recommendation:** make `query_id` optional; use `Some(id)` for Query/command contracts and
+  `None` plus an exact `item` for Query-less operation/input validation.
+- **v1 impact:** D2/D4 public error-contract blocker.
+
+### F69 — deferred PostgreSQL logical types remained in a first-release example
+
+- **Classification:** specification ambiguity; unnecessary broad scope.
+- **Problematic design location:** DB §5 Params example and §10.1 after narrowing §10.3.
+- **Current Align constraint:** temporal/decimal/UUID/JSON/container representations remain explicit
+  D12–D14 consumer decisions, while first-release examples are executable specification.
+- **Actual failure:** an implementation agent could invent `db.timestamp` early to make the example
+  compile, reopening the scope F62 closed.
+- **Recommendation:** use only an `i64` parameter in the initial example and state that every
+  additional logical type appears only after its exact cross-driver contract is settled.
+- **v1 impact:** first-release scope blocker; those types remain additive.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -972,7 +1031,8 @@ idea is rejected.
     parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
     ordinal for repeats. Streaming APIs release source Params provenance at return by using
     execution-owned/native bind storage; SQLite v1 uses transient-copy semantics. SQL source rejects
-    U+0000, and PostgreSQL Text values/options reject embedded NUL before native calls.
+    U+0000, PostgreSQL Text values/options reject embedded NUL, Text `bytea` is lowercase hex, and
+    raw `bytea` is Binary-only.
 10. **Typed Row decode:** monomorphized ordinal decoder thunk with direct field writes and runtime
     contract guards; no reflection or per-row name lookup. V1 static Row is `RegionPlain`; owned
     strings/arrays remain Params/Output forms rather than a hidden alternate Row materializer.
@@ -996,12 +1056,13 @@ idea is rejected.
     slices and no silent ignore. The minimum constructors/defaults/conflicts are fixed in §§11–13;
     their owning milestones precede every consumer. Category metadata calls carry an explicit
     destination region and the mandatory `MetaOption` slice. D9 enforces deadlines through
-    driver-owned cancellation cleanup; it does not expose an unsound non-Send cancel resource.
+    driver-owned cancellation cleanup; it does not expose an unsound non-Send cancel resource and
+    never reuses an unproved post-cancel connection.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b and add L7
     nested generic package composition; prove fake
     Query/command artifacts before native code; assign each option sum to D1/D2/D4/D6/D7/D12 before
-    its consumer and use D9 for shared deadline enforcement/native cancellation cleanup; put SQLite and PostgreSQL
-    scalar verticals before streaming/transactions/compound output; complete exact migration and
+    its consumer and use D9 for shared deadline enforcement/native cancellation cleanup; put SQLite
+    and PostgreSQL scalar verticals before streaming/transactions/compound output; complete exact migration and
     region-owned category metadata/EXPLAIN contracts in D11/D12 before the first public release;
     schedule D13/D14 as additive native/dynamic work.
 18. **Minimum SQLite vertical:** in-memory connection, one scalar command, one sibling-file scalar
@@ -1087,6 +1148,12 @@ documents:
 58. Define D9 as deadline enforcement/native cancellation cleanup and remove the unsupported v1
     public cancel resource.
 59. Keep SQLite execution-scoped busy timeout active for the complete streamed rows lifetime.
+60. Derive synthetic field-selector return roots recursively through nested view-bearing types.
+61. Encode PostgreSQL Text `bytea` as lowercase hex and reserve raw length-delimited bytes for
+    Binary format.
+62. Require cancellation to resynchronize or poison/close a connection before reuse.
+63. Represent Query-less contract failures without a fabricated Query ID.
+64. Remove deferred logical types from first-release executable examples.
 
 ## 5. Revised implementation roadmap
 
@@ -1094,7 +1161,7 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | contextual borrow modes, Copy mutation/drop-old, Fn parameter/capture provenance, Move-return cleanup ABI | all-peer alias matrix, captured/joined direct/indirect, cleanup-bit per-unit parity | borrowed-call, return ABI, and interface-size cost |
+| L2 | contextual borrow modes, Copy mutation/drop-old, Fn parameter/capture provenance, Move-return cleanup ABI | all-peer alias matrix, nested-view selectors, captured/joined direct/indirect, cleanup-bit per-unit parity | borrowed-call, return ABI, and interface-size cost |
 | L3 | resource/ref, linkable Drop thunk, dependent child/native view, root-only raw transfer | exact MIR, cross-unit Drop, invalid pointer/escape/projection | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
 | L5 | tagged file/inline/checked-metadata inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/metadata-create-change-delete/reproducibility matrix | cold/warm producer/consumer rebuild |
@@ -1104,12 +1171,12 @@ documents:
 | D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
 | D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, NUL/PRAGMA validation, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
-| D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, NUL rejection, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
+| D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, Text-hex/Binary bytea, NUL/query-less error, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
 | D6 | dependent prepared statements + prepare option sums | sequential reuse, disposition, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
 | D7 | tx options plus common exec view | combination rejection, consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
 | D8 | typed rows and row generations | old-view rejection, Params-source invalidation, type matrix, busy-timeout lifetime, clone retention, delivery counts | row decode/iteration/bind copies |
-| D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence | deadline/cancellation overhead |
+| D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-policy SQL migrations; initial-release gate | checksum/order/atomic/dirty/repair/status | migration startup/large history |
 | D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation; ANALYZE executes visibly | catalog query count/latency |
@@ -1219,6 +1286,10 @@ The final whole-diff consistency invocation read the complete document set and r
 validation but ended at its configured invocation bound before emitting a verdict. Its preserved
 log exposed five independently verified issues, F60–F64. Those exact areas were corrected and
 checked directly; the complete review was not restarted from the beginning.
+The checkpoint continuation then reviewed only those corrections and their dependent contracts in
+about eight minutes. It returned four further findings, F65–F68; direct validation of the same
+type-scope area found F69. The fixes were again made from that checkpoint rather than restarting the
+full document scan.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

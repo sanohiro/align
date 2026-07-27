@@ -171,9 +171,11 @@ A projection is fixed as a `Project(field)` node on the HIR and becomes a fusion
 ### Field selector `.ident`
 A `.ident` at argument position is typed, from the receiver element type `E`, as a function value
 `Fn([(ByValue, E)], type_of(E.ident), Pure, return_borrow, None, return_cleanup)`, where
-`return_borrow` is `Roots { params: [0], captures: [] }` only when the projected field is a view
-backed by `E`; otherwise it is `None`. `return_cleanup` is `DynamicBit` exactly when the projected
-field is recursively Move, otherwise `None`.
+`return_borrow` is `Roots { params: [0], captures: [] }` when the projected field recursively
+contains any view backed by `E`; otherwise it is `None`. This is the same recursive provenance walk
+used for named function returns, including views nested under structs, tuples, fixed arrays, and sum
+payloads. `return_cleanup` is `DynamicBit` exactly when the projected field is recursively Move,
+otherwise `None`.
 
 ```align
 users.where(.active)   // .active : Fn([(ByValue, User)], bool, Pure, None, None, None)

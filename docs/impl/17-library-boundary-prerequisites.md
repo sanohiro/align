@@ -1032,6 +1032,9 @@ Acceptance:
 - a zero-argument capturing closure may return a captured `str`, `resource_ref`, or region-owned
   value only while its environment and captured owner live; direct/indirect calls, target joins,
   and moved function values preserve those exact roots;
+- a synthetic field selector returning a struct, tuple, fixed array, or sum that contains a nested
+  view records its receiver parameter root recursively rather than treating the outer non-view type
+  as owner-free;
 - direct, indirect, and imported `Result<array<R>, Error>` returns preserve the selected dynamic
   cleanup bit on both arena-owned `Ok` and individually owned `Err` paths;
 - replacing an owned pointee through `borrow mut` drops the old value exactly once and installs the

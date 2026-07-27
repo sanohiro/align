@@ -567,13 +567,13 @@ Portable SQL uses named parameters in source:
 SELECT id, name
 FROM users
 WHERE active = :active
-  AND created_at >= :from_date
+  AND id >= :min_id
 ```
 
 ```align
 pub Params {
   active: bool,
-  from_date: db.timestamp,
+  min_id: i64,
 }
 ```
 
@@ -638,8 +638,10 @@ The baseline PostgreSQL `BufferedFull` path completes parameter transmission thr
 libpq call before returning its owned result. Any later single-row, portal, pipeline, or asynchronous
 path must retain its own parameter bytes until the native protocol no longer uses them.
 The v1 PostgreSQL Text binder materializes a NUL-terminated execution-owned copy and rejects an
-embedded U+0000 with `db.Error.Encode` before SQL send. Binary `bytea` uses its explicit length and
-does not apply the text restriction.
+embedded U+0000 in `text`/`varchar`/`name` with `db.Error.Encode` before SQL send. A `bytea`
+parameter in Text format is encoded as the PostgreSQL `\x` form with two lowercase hex digits per
+input byte; raw bytes are never passed as a libpq Text parameter. Binary-format `bytea` passes the
+raw bytes with their explicit length.
 
 These are per-execution bind copies, never per-row copies. Tests and benchmarks report text/blob
 bytes copied and allocations separately from row decode. The generated driver binder plan records
@@ -1354,18 +1356,10 @@ one tagged `Option` object per lane, while preserving `Option<T>` semantics at t
 
 ### 10.1 Common logical types
 
-The common package should define or settle logical types only where primitive Align types are
-insufficient:
-
-```text
-db.timestamp
-db.date
-db.time
-db.decimal
-db.uuid (only if a stable common representation is accepted)
-```
-
-No lossy implicit conversion is permitted.
+The first release uses bool, signed integers, floats, UTF-8 text, bytes, and nullable `Option<T>`.
+The common package adds temporal, decimal, UUID, JSON, array, range, or domain types only after an
+exact logical representation and both driver mappings are settled in the owning D12–D14 consumer
+decision. No lossy implicit conversion or placeholder wrapper is permitted.
 
 ### 10.2 SQLite mapping
 
@@ -1584,7 +1578,8 @@ in its public semantic contract and artifact. `ParameterOid` applies only to pre
 `ParameterFormat` names a Params field; `ResultFormat` applies to the complete result in libpq v1.
 Unknown fields/types/OIDs, duplicate field controls, and conflicting formats are errors, not ignored
 hints. The first implementation may support only `Text`; requesting an unavailable binary mapping
-returns `Unsupported` before sending SQL.
+returns `Unsupported` before sending SQL. Text-format `bytea` uses the exact hex encoding from
+§5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
 
 The first-release connection sum is:
 
@@ -1600,7 +1595,7 @@ The URL supplies host, port, database, user, and password. `[]` adds no libpq ke
 Duplicate semantic keys, including a URL/option conflict, are errors; secrets are runtime values and
 never enter Query artifacts. Durations must be positive. The URL, application name, and arbitrary
 parameter name/value must be valid UTF-8 without U+0000; the wrapper rejects an embedded NUL as
-`db.Error.Encode` before calling libpq, never truncates it.
+`db.Error.Encode` with no Query identity before calling libpq, never truncates it.
 
 `[]` transaction options mean `ReadCommitted`, `ReadWrite`, and non-deferrable. Each transaction
 dimension may occur at most once. PostgreSQL-invalid combinations such as deferrable without
@@ -1876,7 +1871,7 @@ db.CardinalityError {
 }
 
 db.ContractError {
-  query_id: string,
+  query_id: Option<string>,
   item: string,
   message: string,
 }
@@ -1914,6 +1909,9 @@ acceptable substitutes.
 The semantics are:
 
 - stable categories for ordinary control flow;
+- `ContractError.query_id` is `Some(id)` for a Query/command contract and `None` for connection,
+  transaction, metadata, or other operation/input validation; `item` names the exact operation and
+  input in both cases;
 - driver code/message/detail retained where available;
 - SQLSTATE retained for PostgreSQL;
 - primary/extended result codes retained for SQLite;
@@ -2569,6 +2567,9 @@ String concatenation of untrusted values into SQL is not a package-supported bin
   synchronous execution exposes no sound concurrent caller. A public user-triggered cancel handle
   is not part of the accepted v1 design. A future concrete proposal must first schedule a general
   Send/thread-safe-resource prerequisite and its own roadmap slice; D9 does not imply either.
+- After timeout or cancellation, the driver may return a connection for reuse only after it has
+  drained required results and proved protocol and transaction state synchronized. Otherwise it
+  poisons/closes the connection; uncertain state never returns to a caller or future pool.
 - A dropped row stream must release/finalize its driver result promptly.
 - A connection with an active unread result follows the driver’s documented rule; the package must not
   silently buffer an unbounded remainder to make reuse appear possible.
@@ -2787,6 +2788,8 @@ This milestone lands before promising that a typed Query is database-checked.
 - install the exact §10.3 first-release mapping table and reject every unowned mapping; the
   executable D4 vertical remains `i64`, while D8 owns the complete runtime type matrix;
 - reject U+0000 in SQL, Text Params, URL, and connection option strings before libpq;
+- encode Text-format `bytea` as exact lowercase PostgreSQL hex and pass raw `bytea` only in Binary
+  format with an explicit length;
 - SQLSTATE and owned native error detail;
 - the exact PostgreSQL connection and baseline execution option sums from §12, including every
   conflict/unsupported branch;
@@ -2863,7 +2866,8 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - SQLite pre-send Unsupported disposition for common deadlines, PostgreSQL deadline/cancel path,
   and proof that native BusyTimeout is not treated as a common deadline;
 - explicit proof that no public external cancel resource exists in v1;
-- statement/result cleanup under cancellation.
+- statement/result cleanup under cancellation, including drain-and-resynchronize or poison/close
+  before any connection reuse.
 
 ### D10 — compound Output
 
@@ -3050,8 +3054,9 @@ The design is implemented correctly only if all are true:
     rules and omit only Row/result/decode data.
 58. The common, SQLite, and PostgreSQL first-release option sums/defaults/conflicts are the mandatory
     finite sets in §§11–13, not implementation-selected examples.
-59. D1/D2/D4/D6/D7 own option APIs needed by their operations; D9 completes deadline/cancellation
-    and cross-scope disposition without creating an interim surface.
+59. D1/D2/D4/D6/D7 own option APIs needed by their operations; D9 completes deadline
+    enforcement/native cancellation cleanup and cross-scope disposition without creating an interim
+    surface.
 60. Migration transaction policy is the exact first-line required/forbidden directive; required is
     atomic by default, and forbidden uses one statement plus dirty-state/checksum-bound repair.
 61. A LEFT JOIN child is absent only when all child fields are NULL; either partial-NULL direction is
@@ -3080,13 +3085,22 @@ The design is implemented correctly only if all are true:
 72. Synthetic field-selector/function-value facts use the same capture-root summary and
     Move-return cleanup ABI as named functions.
 73. Static/dynamic/migration SQL, PostgreSQL Text Params, and libpq connection/control strings reject
-    U+0000 before the native call; binary bytea remains length-aware.
+    U+0000 before the native call; Binary-format bytea remains length-aware.
 74. The first-release PostgreSQL mapping is exactly integer/float/bool/text/bytea/Option; every
     temporal/numeric/UUID/JSON/array/range/domain mapping requires a later explicit contract.
 75. D9 enforces or pre-send rejects every deadline, issues no hidden SQL, and exposes no external
     cancel resource until a general Send/thread-safe-resource prerequisite is scheduled.
 76. SQLite `BusyTimeoutNs` remains active through streamed `next` calls and restores the
     package-tracked prior value on exhaustion/error/Drop before connection reuse.
+77. Synthetic field selectors recursively retain receiver provenance for nested view-bearing return
+    types, not only a top-level `str`/slice.
+78. PostgreSQL Text-format `bytea` is lowercase `\x` hex and never raw bytes; Binary format alone
+    uses raw bytes plus explicit length.
+79. Timeout/cancel returns a PostgreSQL connection only after proved protocol/transaction
+    resynchronization; otherwise the connection is poisoned/closed.
+80. `ContractError` represents Query-less operation/input validation without fabricating a Query ID.
+81. First-release examples and mappings use only the exact integer/float/bool/text/bytea/Option set;
+    deferred logical types require a later explicit contract before appearing in public examples.
 
 ---
 
