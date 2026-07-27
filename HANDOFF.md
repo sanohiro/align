@@ -241,11 +241,12 @@ The query-centered `pkg.db` design and its general library-boundary prerequisite
 review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). L1a is complete: the
 canonical recursive Drop plan and sound `Option<string>` struct fields are implemented with
 tag-tested Drop, move/null handling, focused analysis coverage, and an alloc-count benchmark.
-Fixed-array element-field replacement of `Option<string>` is explicitly deferred; replace the
-whole element until tagged partial collection writes gain typed conditional Drop. The next
-implementation slice is L1b only: Move tagged payloads through Option/Result/user sums. Do not begin
-a SQLite/PostgreSQL driver or add database-named compiler variants before L1a–L7 are complete. The
-remaining required order is L1b Move tagged payloads through Result, L2 borrow
+Partial Move-leaf replacement fails closed without an exact drop-old lowering, and fixed-array
+field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
+larger Move leaves. The next implementation slice is L1b only: Move tagged payloads through
+Option/Result/user sums. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+variants before L1a–L7 are complete. The remaining required order is L1b Move tagged payloads
+through Result, L2 borrow
 summaries, L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
 L6 the region plain-struct builder, then L7 nested generic package APIs and the closed

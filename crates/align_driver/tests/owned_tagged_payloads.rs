@@ -161,7 +161,7 @@ fn fixed_array_option_string_field_replacement_is_rejected() {
         );
         assert!(
             rendered.contains(
-                "element-field assignment of `Option<string>` into a fixed struct array is not supported yet"
+                "element-field assignment of Option<string> into a fixed struct array is not supported yet"
             ),
             "diagnostic must name the unsupported ownership shape in {name}:\n{rendered}"
         );

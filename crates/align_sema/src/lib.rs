@@ -11847,8 +11847,26 @@ impl<'a, 't> Checker<'a, 't> {
                         }
                     }
                     Place::Field { root, path, ty } => {
-                        let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignField { root, path, value: v });
+                        // Direct field replacement has typed drop-old lowering only for the two
+                        // L1a owned leaves. Gate the final leaf here (not while recursively
+                        // resolving the receiver), so `outer.inner.name = …` can still reach its
+                        // supported `string` leaf through an intermediate Move struct.
+                        if drop_plan(ty, self.structs, self.enums).needs_drop()
+                            && !matches!(ty, Ty::String | Ty::Option(Scalar::String))
+                        {
+                            self.diags.error(
+                                format!(
+                                    "field replacement of {} is not supported yet (owned field replacement currently supports only `string` and `Option<string>` leaves; replace the whole struct)",
+                                    self.ty_display(ty)
+                                ),
+                                place.span,
+                            );
+                            let v = self.check_expr(value, None);
+                            stmts.push(Stmt::Expr(v));
+                        } else {
+                            let v = self.check_expr(value, Some(ty));
+                            stmts.push(Stmt::AssignField { root, path, value: v });
+                        }
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));
@@ -12128,15 +12146,19 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return Place::Err;
                 }
-                // Fixed struct-array field replacement currently has one owned-leaf lowering:
-                // `string`, whose old `{ptr,len}` slot is dropped unconditionally. Reusing that
-                // operation for `Option<string>` would interpret the tag as a pointer and would
-                // neither conditionally drop the old payload nor transfer/null the new payload.
-                // Keep the tagged collection-partial-write shape explicit until its typed Drop
-                // lowering lands; whole-element replacement already uses the recursive Drop plan.
-                if !soa && !is_dyn && leaf_ty == Ty::Option(Scalar::String) {
+                // Fixed struct-array field replacement has one owned-leaf lowering: `string`.
+                // Any other recursive Drop plan needs a typed drop-old operation; the raw field
+                // store would leak the old value and would not null a bound RHS source.
+                if !soa
+                    && !is_dyn
+                    && leaf_ty != Ty::String
+                    && drop_plan(leaf_ty, self.structs, self.enums).needs_drop()
+                {
                     self.diags.error(
-                        "element-field assignment of `Option<string>` into a fixed struct array is not supported yet (tagged owned fields need conditional Drop handling; replace the whole element)",
+                        format!(
+                            "element-field assignment of {} into a fixed struct array is not supported yet (owned element-field replacement currently supports only `string`; replace the whole element)",
+                            self.ty_display(leaf_ty)
+                        ),
                         place.span,
                     );
                     return Place::Err;
@@ -18293,9 +18315,10 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 // An `Option<T>` field is optional (missing key / JSON `null` → `None`); its payload
-                // must itself be decodeable. `Option<Struct>` recurses into the payload struct. The
-                // owned-payload restriction (no `Option<string>`/`Option<Move-struct>`) is enforced at
-                // declaration (pass 0b-2), so a decodeable Option payload here is scalar/str/plain-struct.
+                // must itself be decodeable. `Option<Struct>` recurses into the payload struct.
+                // `Option<string>` is legal as a language field after L1a but remains outside the
+                // JSON descriptor boundary; `Option<Move-struct>` is still rejected by L1b's type
+                // gate. A decodeable Option payload here is therefore scalar/str/plain-struct.
                 Ty::Option(Scalar::Int(_)) | Ty::Option(Scalar::Float(_)) | Ty::Option(Scalar::Bool) | Ty::Option(Scalar::Str) => {}
                 // The one field shape the two directions disagree on. `json_payload_tag_sub` tags an
                 // `Option<enum>` payload as kind 6 with a real `JsonUnion` sub-pointer, so the runtime
@@ -21953,28 +21976,15 @@ impl<'a, 't> Checker<'a, 't> {
         if leaf_ty == Ty::String {
             leaf_ty = Ty::Str;
         }
-        // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
-        // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
-        // ownership-transfer double-free if that ever changes.
-        if matches!(
-            leaf_ty,
-            Ty::Box(_)
-                | Ty::DynArray(_)
-                | Ty::DynStructArray(..)
-                | Ty::Builder
-                | Ty::Reader
-                | Ty::Writer
-                | Ty::Buffer
-                | Ty::ArrayBuilder(_)
-                | Ty::TcpConn
-                | Ty::TcpListener
-                | Ty::UdpSocket
-                | Ty::Child
-        ) || (matches!(leaf_ty, Ty::Option(_) | Ty::Result(..))
-            && drop_plan(leaf_ty, self.structs, self.enums).needs_drop())
-        {
+        // Fail closed for every other Move leaf. A runtime element index cannot record which
+        // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
+        // both the result and the array owning the same payload.
+        if drop_plan(leaf_ty, self.structs, self.enums).needs_drop() {
             self.diags.error(
-                format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
+                format!(
+                    "reading a Move-type field {} out of an array element is not supported yet",
+                    self.ty_display(leaf_ty)
+                ),
                 span,
             );
             return err;

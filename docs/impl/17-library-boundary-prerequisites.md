@@ -1215,9 +1215,11 @@ borrow-bearing type are prohibited.
 - keep `Option<MoveStruct>`, Move sum/Result payloads, recursive types, nested partial moves not
   covered by the existing place machinery, and arbitrary Move collection elements rejected with
   explicit diagnostics until their owning slices;
-- keep fixed-array element-field replacement of `Option<string>` rejected explicitly; replacing
-  the whole element is supported, while a tagged partial collection write needs its own typed
-  conditional-Drop lowering;
+- keep partial replacement fail-closed unless its exact old-value Drop lowering exists: direct
+  struct fields support `string` and `Option<string>`, fixed-array element fields support `string`,
+  and larger Move leaves require whole-struct or whole-element replacement;
+- keep fixed-array element-field reads Copy-only except that `string` is exposed as a borrowed
+  `str`; every other Move leaf is an explicit diagnostic;
 - add no database, resource, borrow syntax, or runtime library dependency.
 
 Planned changed files:

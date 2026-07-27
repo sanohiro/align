@@ -120,7 +120,9 @@ scalar / `str` / ネスト構造体）であってよい。**null ポリシー:*
 `all_required_seen` の対象外で、共有の `write_value` が payload スロットに書いてから `Some` tag を立てる。
 encode は `Option` を含むオブジェクトを trailing-comma 方式に切替え、`}` の前で `align_rt_builder_pop_comma`
 を 1 回呼ぶ（必須のみのオブジェクトは静的レイアウトを維持）。**v1 境界:** Option payload は **非所有**
-（`Option<string>`/`Option<Move-struct>` は宣言時に拒否）。**`Option<struct>` encode（T1b, SHIPPED）:**
+でなければならない。L1a 以降、通常の言語構造体では `Option<string>` を許可するが、そのフィールドを含む
+target は JSON descriptor consumer が未実装のため `json.decode` / `json.encode` で拒否する。
+`Option<Move-struct>` は引き続き L1b の型ゲートで拒否する。**`Option<struct>` encode（T1b, SHIPPED）:**
 `Some` は runtime の descriptor 駆動エンコーダ（新 `OptionStructField` テンプレートピース →
 `align_rt_json_encode_object`、descriptor テーブルで単一 struct を出力）でネストオブジェクトを描画し、
 `None` はフィールドを省略（同じ trailing-comma + `PopComma` 方式）。再帰的に合成する（ネスト plain struct と

@@ -129,9 +129,11 @@ omits a `None` field entirely** (never `"k":null`), so `decode(encode(x))` round
 optional field is exempt from `all_required_seen`, and the shared `write_value` writes the payload at
 the payload slot then sets the `Some` tag. Encode switches an `Option`-bearing object to a
 trailing-comma layout with one `align_rt_builder_pop_comma` before `}` (a pure-required object keeps
-the static layout). **v1 boundary:** an Option payload must be **non-owned** (`Option<string>` /
-`Option<Move-struct>` rejected at declaration — no consumer, and owned-Option-drop-as-a-field is
-deferred). **`Option<struct>` encode (T1b, SHIPPED):** `Some` renders the nested object via the runtime
+the static layout). **v1 boundary:** an Option payload used at the JSON boundary must be
+**non-owned**. L1a permits `Option<string>` in ordinary language structs, but `json.decode` and
+`json.encode` reject a target containing that field because the JSON descriptor consumer remains
+deferred; `Option<Move-struct>` remains rejected by the L1b type gate. **`Option<struct>` encode
+(T1b, SHIPPED):** `Some` renders the nested object via the runtime
 descriptor-driven encoder (a new `OptionStructField` template piece → `align_rt_json_encode_object`, a
 single struct by its descriptor table), `None` omits the field (the same trailing-comma + `PopComma`
 scheme); composes recursively (a payload with a nested plain struct + a nested `Option<str>` omits its
