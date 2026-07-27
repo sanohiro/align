@@ -5,11 +5,12 @@ the `filter` mode measures stable count/prefix/scatter compaction separately. Th
 a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate] # headline or threshold probe
+bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate|chunks] # headline or threshold probe
 bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 bench/par_map/run.sh width                  # input/output width and stride probe
 bench/par_map/run.sh aggregate              # runtime aggregate-like record-stride probe
+bench/par_map/run.sh chunks                 # runtime chunk-header allocation probe
 ```
 
 The runtime is linked as a cdylib and the harness supplies runtime-generated input. The Align and
@@ -185,6 +186,38 @@ The floor follows the two-record byte volume: 32,768, 16,384, 8,192, and 4,096 e
 medium records and is 1.088x at the 128-byte boundary; the 128-byte pool is slightly faster at
 the exact floor in this run because the caller control is memory-bound. The boundary jump and
 the varied ratios are useful scheduler evidence, not a general aggregate performance claim.
+
+## Chunk header allocation probe
+
+`run.sh chunks` is a runtime-only measure-first probe for the explicit producer allocation retained
+by `chunks`. It creates one million `i64` source elements, asks `align_rt_chunks` to allocate/fill/
+free the `{ptr,len}` header array, and compares it with an allocation-free control that performs
+the same chunk pointer/length cursor work. Both paths produce and validate the same checksum. The
+control does not model a shipped no-header parallel implementation; it isolates the producer's
+allocation and header-write cost before any production lowering change is considered.
+Both timed arms use the same non-inlined pointer/alignment/order/length checksum helper, so ABI
+validation does not become a one-sided timing cost. A pre-timing pass checks a fresh materialized
+header buffer; both arms also perform the same checked header-span arithmetic (the cursor uses a
+virtual span). The probe uses an RAII cleanup guard for the runtime-owned buffer so a failed ABI
+assertion cannot leak it.
+
+Representative Linux x86_64 run on 2026-07-27 (32 runtime workers, 15 alternating samples, second
+of two invocations with symmetric validation in both timed arms):
+
+```
+ chunk   headers   materialize ms   cursor ms   materialize/cursor
+      1   1000000            2.781       2.167               1.283x
+      2    500000            2.766       2.214               1.249x
+      8    125000            2.742       2.125               1.290x
+     64     15625            2.691       2.081               1.293x
+    256      3907            2.692       2.054               1.311x
+   1024       977            2.716       2.071               1.311x
+```
+
+The producer was consistently slower in the symmetric probe: the two final invocations ranged from
+1.249x to 1.336x of the cursor control. This earns an end-to-end no-header chunk-range design
+measurement, but not a production allocation-removal change by itself: chunk-body cost, scheduler
+cost, consumer layout, and the ownership contract still need to be measured together.
 
 ## Stable filter compaction probe
 

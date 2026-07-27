@@ -559,6 +559,18 @@ allocation, loads its borrowed slice elements in the range kernel, and routes an
 dropped after the synchronous call. Do not reassociate floating operations or combine results in
 completion order. Floating, staged, and arbitrary-reducer terminals remain separate follow-ups.
 
+The measure-only `bench/par_map/run.sh chunks` probe ran on Linux x86_64 on 2026-07-27 with 32
+runtime workers. For one million `i64` source elements and chunk widths 1/2/8/64/256/1024, an
+early one-sided-validation run was rejected as a timing artifact. The corrected probe uses the same
+non-inlined pointer/alignment/order/length checksum helper in both timed arms, with a fresh
+materialized-buffer validation before each timing series and the same checked header-span arithmetic
+in both arms; its two final invocations ranged from 1.249x to 1.336x of the allocation-free cursor
+control. The producer is consistently slower in
+this isolated runtime probe, which earns an end-to-end no-header design measurement, but not a
+production allocation-removal change by itself. Any such design must preserve the borrowed-slice
+ownership and synchronous cleanup contract and measure chunk-body, scheduler, and consumer costs
+together.
+
 ---
 
 ## 8. Low-lock runtime direction
@@ -912,8 +924,14 @@ nested progress remain pinned.
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence
   for the bounded slice and threshold, not a blanket claim for other predicates or selectivities.
-- Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
-  chunk-source range path has a baseline.
+- ~~Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
+  chunk-source range path has a baseline.~~ **MEASURED 2026-07-27** with the runtime-only
+  `bench/par_map/run.sh chunks` probe; an early one-sided-validation result was rejected as a timing
+  artifact, then symmetric pointer/alignment/order/length validation in both timed arms produced
+  1.249x–1.336x across two final Linux x86_64 invocations. This earns an end-to-end no-header
+  design measurement, but not a production allocation-removal change by itself. Its runtime-owned
+  header buffer is held by an RAII cleanup guard, so validation failures are covered by the same
+  cleanup contract as the timed path.
 
 ### Slice P4 — resource policy, only if earned
 
