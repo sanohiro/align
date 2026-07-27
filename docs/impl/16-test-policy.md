@@ -70,10 +70,14 @@ malformed-input, ABI, and cross-stage omissions out of the external review cycle
 After the draft is opened, run the required host-native and independent reviews
 on the final pushed diff. Batch related review fixes into one follow-up commit
 where possible; do not create one commit per finding. A review command has a
-15-minute watchdog implemented by `scripts/review-bounded.sh`. If it has not
-produced a verdict, the wrapper terminates the whole review process group and
-reports a timeout rather than waiting without a stopping point or repeatedly
-starting the full review. Ordinary review automation must not promote `cargo test
+15-minute watchdog implemented by `scripts/review-bounded.sh`. At elapsed
+checkpoints, inspect the process group, log growth, and last completed action
+before deciding whether to continue. Time alone is not a verdict: meaningful
+review work may continue while the process is making progress, but the hard
+15-minute bound still applies. If no verdict exists at the bound, terminate the
+process group, record the elapsed time and last completed action, then rerun a
+narrower review or ask for direction; never manufacture `CLEAN` from elapsed
+time or repeatedly restart the same broad review. Ordinary review automation must not promote `cargo test
 --workspace` or `scripts/test-full.sh` into the PR path without an explicit
 scope justification.
 

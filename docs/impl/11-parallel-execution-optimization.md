@@ -531,6 +531,13 @@ implementation is pinned by:
 - empty input, signed/unsigned wraparound, and threshold-adjacent caller/pool execution;
 - direct range-kernel IR with a typed loop, direct body call, and plain integer addition.
 
+The 2026-07-27 verification record has 48/48 `align_driver` `par_map` tests passing. It includes
+65,537-element worker-range tests for materializing chunks and direct chunk reduction, a chunk
+filter, a cross-worker `i8` wrapping fold, backend-independent MIR-shape assertions, and the
+arena/header-drop path. `align_codegen_llvm` also passes malformed chunk `ParMap`,
+`ParMapReduce`, and filter-stage tests. These cases are regression floors for the shipped range
+path, not a claim that header-allocation removal or broader aggregate layouts are complete.
+
 Peak-RSS, memory-bandwidth, LLC-miss, and heavy-body crossover measurements remain a follow-up
 before any grain or partial-slot layout retune.
 

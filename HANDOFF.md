@@ -5,14 +5,16 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-26. `main` includes the shipped wave through #658.
+_Last updated: 2026-07-27. `main` includes the shipped wave through #659.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
 materializing maps without changing production behavior. #657 adds a runtime-only
 aggregate-like stride probe without changing production behavior. #658 widens the
 compiler-generated AoS range path to field projection and `where(.field)` stages;
-SoA, string-search, and chunks remain sequential._
+PR #660 extends the same range path to `chunks` source slices and direct integer
+chunk transform-reduce. SoA, string-search, and unsupported layouts remain
+sequential._
 
 ## Start here
 
@@ -136,13 +138,31 @@ rerun by the two kernels.
 
 #658 extends that path to direct and dynamic AoS struct inputs, compiler-generated
 field projection and `where(.field)` stages, and ABI allocation-size validation for
-padded rows and JSON struct-array descriptors. Move aggregates, SoA, string-search,
-chunks, and unsupported layouts remain on their safe existing paths.
+padded rows and JSON struct-array descriptors. PR #660 extends the typed range
+kernel to direct and materializing `chunks` maps and to direct integer chunk
+transform-reduce; Move aggregates, SoA, string-search, and unsupported layouts
+remain on their safe existing paths.
 
 #659 establishes the operational rule that self-review and an adversarial
 preflight happen before a draft PR, review processes have a bounded watchdog,
 and related review fixes are batched instead of committed one finding at a time;
 see `CLAUDE.md` and `docs/impl/16-test-policy.md`.
+
+PR #660's final verification records 48/48 `align_driver` `par_map` tests,
+including 65,537-element worker-range tests for both materializing chunks and
+direct chunk reduction, a chunk filter, a cross-worker i8 wrapping fold, and
+backend-independent MIR-shape assertions. Codegen also has malformed chunk
+`ParMap`, `ParMapReduce`, and filter-stage tests; the full bounded preflight,
+workspace build, `scripts/test-pr.sh`, and locked all-target Clippy passed.
+Review attempts are part of the record: a broad host review produced no verdict
+within the 15-minute bound, and a narrower input attempt was stopped after its
+process/log showed no useful progress. A compact diff review then found missing
+worker-range materialization, filter-type, wrapping, backend-independent, and
+malformed-MIR coverage; those findings were fixed and the final adversarial
+review was CLEAN. At elapsed review checkpoints, inspect the process, log growth,
+and last completed action first. Meaningful review work may continue until the
+hard 15-minute watchdog; otherwise record the elapsed time and last action,
+then narrow or rerun the review rather than treating elapsed time as a verdict.
 
 The task-group record probe in `bench/task_group/` compares the shipped split env/result/error
 allocations with one-record tight and cache-line-separated padded controls over the same registration ABI.
@@ -175,7 +195,9 @@ gate was not met. The scalar width/stride measure-first probe covers `i8`, `i32`
 fused/materializing maps around the runtime floor; #657 also records runtime-only aggregate-like
 16/32/64/128-byte record strides with full-output checksums, without changing production behavior.
 Compiler-generated aggregate layouts, projection/aggregate filters, other hosts, and any broader
-width/aggregate retune remain separate follow-ups.
+width/aggregate retune remain separate follow-ups. PR #660 intentionally retains
+the `chunks` header allocation; measure whether removing that producer allocation
+is worthwhile only after this range-path baseline is merged.
 
 Consumer-gated deferrals that remain intentional:
 
