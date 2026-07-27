@@ -162,6 +162,33 @@ Do not use independent review as the primary completion loop for a design.
 When a finding changes a public surface, update the ledger first and propagate
 that one decision through all affected documents in one pass.
 
+### Broad-design completion discipline
+
+Before calling a broad design “final”, “ready”, or “done”, keep one finite
+closure checklist beside the contract ledger. It must include every requested
+deliverable, affected source of truth and mirror, prerequisite, acceptance
+test, benchmark, implementation slice, and publication step. Report the actual
+remaining checklist items; absence of a current finding is not evidence of
+completion.
+
+When review finds one missing contract:
+
+- classify the missing invariant axis and inspect every sibling surface and
+  Cartesian-product cell before editing;
+- update the ledger, authoritative English contract, dependent plans, and
+  mirrors as one decision batch instead of fixing only the reported sentence;
+- preserve a coverage checkpoint containing the reviewed HEAD, completed
+  areas, findings, and first unreviewed area; and
+- do not start another unconstrained whole-diff review merely to regain
+  confidence. Validate the changed invariant and its dependents, then run one
+  end-state whole-diff review only after the author closure checklist is clean.
+
+Keep verification proportional while authoring. Use focused documentation,
+syntax, and consistency checks at stable decision batches. Run the complete PR
+gate on the frozen candidate and again only when a later change can affect that
+gate's evidence. Repeating an unchanged broad review or full verification after
+every wording correction is not progress.
+
 ## Build and verification
 
 The workspace runs end to end from lexer through executable generation.
