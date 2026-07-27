@@ -5,11 +5,12 @@ the `filter` mode measures stable count/prefix/scatter compaction separately. Th
 a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate] # headline or threshold probe
+bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate|chunks] # headline or threshold probe
 bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 bench/par_map/run.sh width                  # input/output width and stride probe
 bench/par_map/run.sh aggregate              # runtime aggregate-like record-stride probe
+bench/par_map/run.sh chunks                 # runtime chunk-header allocation probe
 ```
 
 The runtime is linked as a cdylib and the harness supplies runtime-generated input. The Align and
@@ -185,6 +186,34 @@ The floor follows the two-record byte volume: 32,768, 16,384, 8,192, and 4,096 e
 medium records and is 1.088x at the 128-byte boundary; the 128-byte pool is slightly faster at
 the exact floor in this run because the caller control is memory-bound. The boundary jump and
 the varied ratios are useful scheduler evidence, not a general aggregate performance claim.
+
+## Chunk header allocation probe
+
+`run.sh chunks` is a runtime-only measure-first probe for the explicit producer allocation retained
+by `chunks`. It creates one million `i64` source elements, asks `align_rt_chunks` to allocate/fill/
+free the `{ptr,len}` header array, and compares it with an allocation-free control that performs
+the same chunk pointer/length cursor work. Both paths produce and validate the same checksum. The
+control does not model a shipped no-header parallel implementation; it isolates the producer's
+allocation and header-write cost before any production lowering change is considered.
+
+Representative Linux x86_64 run on 2026-07-27 (32 runtime workers, 15 alternating samples, second
+of two invocations after moving validation outside the timed loop):
+
+```
+ chunk   headers   materialize ms   cursor ms   materialize/cursor
+      1   1000000            0.914       0.933               0.979x
+      2    500000            0.887       0.943               0.940x
+      8    125000            0.888       0.939               0.946x
+     64     15625            0.871       0.949               0.918x
+    256      3907            0.878       0.941               0.934x
+   1024       977            0.893       0.935               0.955x
+```
+
+The producer is not a consistently slower path in this isolated probe: the two final invocations
+ranged from 0.918x to 1.024x of the cursor control after validation was moved outside the timed
+loop. This does not earn a production allocation-removal change. Keep the probe as a baseline and
+revisit only if an end-to-end no-header chunk range design has a consumer-level benefit to measure;
+chunk-body cost, scheduler cost, and the ownership contract still need to be measured together.
 
 ## Stable filter compaction probe
 

@@ -559,6 +559,15 @@ allocation, loads its borrowed slice elements in the range kernel, and routes an
 dropped after the synchronous call. Do not reassociate floating operations or combine results in
 completion order. Floating, staged, and arbitrary-reducer terminals remain separate follow-ups.
 
+The measure-only `bench/par_map/run.sh chunks` probe ran on Linux x86_64 on 2026-07-27 with 32
+runtime workers. For one million `i64` source elements and chunk widths 1/2/8/64/256/1024, the
+`align_rt_chunks` allocate/fill/free path measured 1.166x–1.271x of an allocation-free cursor
+control in an early run; after moving validation outside the timed loop, the two final invocations
+ranged from 0.918x to 1.024x. The producer is therefore not a consistently slower path in this
+isolated probe, and no production allocation-removal change is earned. Keep the result as a
+baseline; a future end-to-end no-header design still needs a consumer-level benefit and must
+preserve the borrowed-slice ownership and synchronous cleanup contract.
+
 ---
 
 ## 8. Low-lock runtime direction
@@ -912,8 +921,12 @@ nested progress remain pinned.
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence
   for the bounded slice and threshold, not a blanket claim for other predicates or selectivities.
-- Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
-  chunk-source range path has a baseline.
+- ~~Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
+  chunk-source range path has a baseline.~~ **MEASURED 2026-07-27** with the runtime-only
+  `bench/par_map/run.sh chunks` probe; after moving validation outside the timed loop, the two
+  final Linux x86_64 invocations ranged from 0.918x to 1.024x of the allocation-free cursor
+  control. No production allocation-removal change is earned; an end-to-end no-header design and
+  its ownership/cleanup proof remain deferred unless a consumer-level benefit appears.
 
 ### Slice P4 — resource policy, only if earned
 

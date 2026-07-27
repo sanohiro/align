@@ -205,9 +205,13 @@ fused/materializing maps around the runtime floor; #657 also records runtime-onl
 16/32/64/128-byte record strides with full-output checksums, without changing production behavior.
 Compiler-generated aggregate layouts, projection/aggregate filters, other hosts, and any broader
 width/aggregate retune remain separate follow-ups. The merged #660 chunk-source
-range path intentionally retains the `chunks` header allocation; measure whether
-removing that producer allocation is worthwhile now that the range-path baseline
-is merged.
+range path intentionally retains the `chunks` header allocation. The measure-only
+`bench/par_map/run.sh chunks` probe on Linux x86_64 showed 0.918x–1.024x versus
+the allocation-free cursor control across two final invocations after moving
+validation outside the timed loop; no production allocation-removal change is
+earned. Revisit only if an end-to-end no-header design shows a consumer-level
+benefit. Compiler-generated aggregate layouts remain the next separate widening
+candidate.
 
 Consumer-gated deferrals that remain intentional:
 
