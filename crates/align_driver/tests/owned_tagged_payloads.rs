@@ -292,6 +292,75 @@ fn matching_an_owned_field_marks_that_field_moved() {
 }
 
 #[test]
+fn matching_a_block_wrapped_owned_field_marks_that_field_moved() {
+    let src = concat!(
+        "Item { detail: Option<string>, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  v := Item { detail: Some(\"owned\".clone()), n: 4 }\n",
+        "  n := match { v.detail } { Some(s) => s.len(), None => 0 }\n",
+        "  again := v.detail\n",
+        "  return (n + v.n) as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "matched-block-owned-field-move.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "matching a wrapped Some(string) must consume the source field"
+    );
+    assert!(
+        rendered.contains("use of moved field 'detail' of 'v'"),
+        "diagnostic must identify the wrapped consumed field:\n{rendered}"
+    );
+}
+
+#[test]
+fn matching_wrapped_owned_sources_tracks_local_and_conditional_moves() {
+    let cases = [
+        (
+            "matched-block-owned-local-move.align",
+            concat!(
+                "fn main() -> i32 {\n",
+                "  detail := Some(\"owned\".clone())\n",
+                "  n := match { detail } { Some(s) => s.len(), None => 0 }\n",
+                "  again := detail\n",
+                "  return n as i32\n",
+                "}\n",
+            ),
+            "use of moved value 'detail'",
+        ),
+        (
+            "matched-conditional-owned-field-move.align",
+            concat!(
+                "Item { detail: Option<string>, n: i64 }\n",
+                "fn no_detail() -> Option<string> = None\n",
+                "fn main() -> i32 {\n",
+                "  v := Item { detail: Some(\"owned\".clone()), n: 4 }\n",
+                "  n := match if v.n > 0 { v.detail } else { no_detail() } { Some(s) => s.len(), None => 0 }\n",
+                "  again := v.detail\n",
+                "  return n as i32\n",
+                "}\n",
+            ),
+            "use of moved field 'detail' of 'v'",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, src);
+        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert!(
+            checked.diags.has_errors(),
+            "matching a wrapped owned source must consume it: {name}"
+        );
+        assert!(
+            rendered.contains(expected),
+            "diagnostic must identify the wrapped consumed source in {name}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn nested_outer_struct_uses_the_same_recursive_plan() {
     if !backend_available() {
         return;

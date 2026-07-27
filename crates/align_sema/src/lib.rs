@@ -7,7 +7,7 @@
 //! to a concrete width by context; if still unconstrained at the end, default to `i64`
 //! (`03-types.md` §2). Move/arena/effect checking is M3+.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use align_ast::{self as ast, BinOp, UnOp};
 use align_diag::Diagnostics;
@@ -944,10 +944,15 @@ impl DropPlan {
 /// finite for every valid Align type; inline recursive definitions produce [`DropPlan::Invalid`]
 /// rather than recursing or panicking.
 pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropPlan {
-    let mut struct_cache = vec![None; structs.len()];
-    let mut enum_cache = vec![None; enums.len()];
-    let mut struct_active = vec![false; structs.len()];
-    let mut enum_active = vec![false; enums.len()];
+    // Keep traversal state sparse. `drop_plan` is queried from per-expression analyses, and most
+    // roots are primitive or touch only a small nominal subgraph; zeroing four vectors sized to
+    // every definition on every query made those common classifications quadratic in program
+    // size. ID-keyed sets/maps retain constant-time cycle/cache checks while allocating only for
+    // nominal nodes reachable from this root.
+    let mut struct_cache = HashMap::new();
+    let mut enum_cache = HashMap::new();
+    let mut struct_active = HashSet::new();
+    let mut enum_active = HashSet::new();
     drop_plan_rec(
         ty,
         structs,
@@ -965,26 +970,23 @@ fn drop_plan_rec(
     ty: Ty,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
-    struct_active: &mut [bool],
-    enum_active: &mut [bool],
-    struct_cache: &mut [Option<std::sync::Arc<DropPlan>>],
-    enum_cache: &mut [Option<std::sync::Arc<DropPlan>>],
+    struct_active: &mut HashSet<u32>,
+    enum_active: &mut HashSet<u32>,
+    struct_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
+    enum_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
 ) -> std::sync::Arc<DropPlan> {
     match ty {
         Ty::Struct(id) => {
-            if let Some(plan) = struct_cache.get(id as usize).and_then(Clone::clone) {
-                return plan;
+            if let Some(plan) = struct_cache.get(&id) {
+                return plan.clone();
             }
-            let Some(active) = struct_active.get(id as usize).copied() else {
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            if active {
+            if !struct_active.insert(id) {
                 return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = structs.get(id as usize) else {
+                struct_active.remove(&id);
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
-            struct_active[id as usize] = true;
             let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
                 .fields
                 .iter()
@@ -1004,7 +1006,7 @@ fn drop_plan_rec(
                     )
                 })
                 .collect();
-            struct_active[id as usize] = false;
+            struct_active.remove(&id);
             let needs_drop = fields
                 .iter()
                 .any(|(_, plan)| plan.needs_drop());
@@ -1013,7 +1015,7 @@ fn drop_plan_rec(
                 fields,
                 needs_drop,
             });
-            struct_cache[id as usize] = Some(plan.clone());
+            struct_cache.insert(id, plan.clone());
             plan
         }
         Ty::Option(payload) => std::sync::Arc::new(DropPlan::Option(drop_plan_rec(
@@ -1046,19 +1048,16 @@ fn drop_plan_rec(
             ),
         }),
         Ty::Enum(id) => {
-            if let Some(plan) = enum_cache.get(id as usize).and_then(Clone::clone) {
-                return plan;
+            if let Some(plan) = enum_cache.get(&id) {
+                return plan.clone();
             }
-            let Some(active) = enum_active.get(id as usize).copied() else {
-                return std::sync::Arc::new(DropPlan::Invalid);
-            };
-            if active {
+            if !enum_active.insert(id) {
                 return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = enums.get(id as usize) else {
+                enum_active.remove(&id);
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
-            enum_active[id as usize] = true;
             let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
                 .variants
                 .iter()
@@ -1080,7 +1079,7 @@ fn drop_plan_rec(
                         .collect()
                 })
                 .collect();
-            enum_active[id as usize] = false;
+            enum_active.remove(&id);
             let needs_drop = variants
                 .iter()
                 .flatten()
@@ -1090,7 +1089,7 @@ fn drop_plan_rec(
                 variants,
                 needs_drop,
             });
-            enum_cache[id as usize] = Some(plan.clone());
+            enum_cache.insert(id, plan.clone());
             plan
         }
         // These types have an existing, non-recursive cleanup leaf. Aggregate layout is not
@@ -10393,7 +10392,6 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.expr(scrutinee, moved, false, false);
                 // Arms are mutually exclusive, so each is checked in the *same* incoming state:
                 // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
                 // Without this the arms share one set, so a value consumed in arm A is wrongly seen
@@ -10402,18 +10400,43 @@ impl<'a> MoveCheck<'a> {
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
                 let scrutinee_roots = self.borrow_sources(scrutinee);
-                let scrutinee_move = match &scrutinee.kind {
-                    ExprKind::Local(id) => Some(MovedKey::Whole(*id)),
-                    ExprKind::Field { root, path } if path.len() == 1 => {
-                        Some(MovedKey::Field(*root, path[0]))
-                    }
-                    _ => None,
+                // Extracting a Move payload consumes the scrutinee on precisely those arms that
+                // bind one. Walk that consuming form once through the ordinary expression
+                // dataflow, so blocks and control-flow values cannot drift from MIR's recursive,
+                // path-local `null_moved_source`. Non-binding/Copy arms retain the incoming state.
+                // This single walk also emits any use-after-move or unsupported conditional-move
+                // diagnostic once rather than once per arm.
+                let has_move_binding = arms
+                    .iter()
+                    .flat_map(|arm| &arm.bindings)
+                    .any(|binding| self.is_move(*binding));
+                let (consumed, consumed_borrows) = if has_move_binding {
+                    let mut state = moved.clone();
+                    self.borrows = incoming_borrows.clone();
+                    self.expr(scrutinee, &mut state, true, true);
+                    (Some(state), Some(self.borrows.clone()))
+                } else {
+                    self.borrows = incoming_borrows.clone();
+                    self.expr(scrutinee, moved, false, false);
+                    (None, None)
                 };
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
-                    let mut m = moved.clone();
-                    self.borrows = incoming_borrows.clone();
+                    let arm_moves_payload = a.bindings.iter().any(|binding| self.is_move(*binding));
+                    let mut m = if arm_moves_payload {
+                        consumed.as_ref().expect("Move binding has consumed state").clone()
+                    } else {
+                        moved.clone()
+                    };
+                    self.borrows = if arm_moves_payload {
+                        consumed_borrows
+                            .as_ref()
+                            .expect("Move binding has consumed borrow state")
+                            .clone()
+                    } else {
+                        incoming_borrows.clone()
+                    };
                     for binding in &a.bindings {
                         let roots = if self.local_may_borrow(*binding) {
                             scrutinee_roots.clone()
@@ -10427,25 +10450,6 @@ impl<'a> MoveCheck<'a> {
                         // fixpoint, and the next iteration's freshly bound value is rejected as
                         // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
                         clear_moved(&mut m, *binding);
-                        // And extracting a MOVE payload moves it OUT of the scrutinee: MIR nulls
-                        // the scrutinee's payload slot at arm entry (the binding owns the buffer
-                        // now), so a Local scrutinee becomes whole-moved and a depth-1 field
-                        // scrutinee becomes partially moved in this arm's state. Using or
-                        // re-matching either would read the nulled payload as a silent wrong
-                        // result. Tag-only / Copy-payload arms extract nothing owned and leave it
-                        // live; the arm join then makes the post-match state "moved iff some
-                        // taken arm extracted", the standard may-analysis. (Found by the #593
-                        // adversarial review: the arm-entry `clear_moved` above had unshielded
-                        // this pre-existing hole's loop form.)
-                        if let Some(key) = scrutinee_move
-                            && self.is_move(*binding)
-                        {
-                            let owner = match key {
-                                MovedKey::Whole(id) | MovedKey::Field(id, _) => id,
-                            };
-                            self.invalidate_owner(owner);
-                            m.insert(key);
-                        }
                     }
                     self.expr(&a.body, &mut m, consuming, direct);
                     if hir_expr_diverges(&a.body) {
