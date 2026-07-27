@@ -125,6 +125,7 @@ pub struct Function {
 /// byte width when choosing its caller-only floor and range grain.
 pub const PAR_MAP_DEFAULT_WORK_WEIGHT: u8 = 1;
 const PAR_MAP_MAX_WORK_WEIGHT: u8 = 4;
+const PAR_MAP_STRING_CONTAINS_WORK_WEIGHT: u8 = 2;
 
 fn par_map_function_work_units(f: &Function) -> u16 {
     let mut units = 0u16;
@@ -152,10 +153,18 @@ fn par_map_function_work_weight(f: &Function) -> u8 {
     }
 }
 
-fn combined_par_map_work_weight(names: impl IntoIterator<Item = String>, weights: &std::collections::HashMap<String, u8>) -> u8 {
-    let total = names
-        .into_iter()
-        .map(|name| u16::from(weights.get(&name).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)))
+fn combined_par_map_stage_work_weight(stages: &[ParMapStage], terminal: &str, weights: &std::collections::HashMap<String, u8>) -> u8 {
+    let stage_weights = stages.iter().map(|stage| match stage.kind {
+        ParMapStageKind::FilterStrContains => PAR_MAP_STRING_CONTAINS_WORK_WEIGHT,
+        _ => stage
+            .func
+            .as_ref()
+            .map(|name| weights.get(name).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT))
+            .unwrap_or(0),
+    });
+    let total = stage_weights
+        .chain(std::iter::once(weights.get(terminal).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)))
+        .map(u16::from)
         .fold(0u16, u16::saturating_add);
     total.min(u16::from(PAR_MAP_MAX_WORK_WEIGHT)) as u8
 }
@@ -174,11 +183,7 @@ fn annotate_par_map_work(fns: &mut [Function]) {
                 let Stmt::Let(_, rv) = stmt else { continue };
                 match rv {
                     Rvalue::ParMapParallel { func, stages, work_weight, .. } => {
-                        let names = stages
-                            .iter()
-                            .filter_map(|stage| stage.func.clone())
-                            .chain(std::iter::once(func.clone()));
-                        *work_weight = combined_par_map_work_weight(names, &weights);
+                        *work_weight = combined_par_map_stage_work_weight(stages, func, &weights);
                     }
                     Rvalue::ParMapReduce { func, work_weight, .. } => {
                         *work_weight = weights.get(func).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT);
@@ -308,14 +313,17 @@ pub enum Stmt {
 }
 
 /// A length-preserving stage in a fused staged `par_map` range kernel. Captures are flattened into
-/// the surrounding [`Rvalue::ParMapParallel`] context in stage order. `Filter` and `FilterField`
-/// stages keep the current element only when their predicate is true; the runtime uses a stable
-/// two-pass compaction for those nodes. `Project` extracts one logical field from the current AoS
-/// struct value using the backend's logical-to-physical layout map.
+/// the surrounding [`Rvalue::ParMapParallel`] context in stage order. `Filter`, `FilterField`, and
+/// `FilterStrContains` stages keep the current element only when their predicate is true; the
+/// runtime uses a stable two-pass compaction for those nodes. `Project` extracts one logical field
+/// from the current AoS struct value using the backend's logical-to-physical layout map.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParMapStageKind {
     Map,
     Filter,
+    /// Compiler-generated pure `str.contains` filter. It carries one `str` needle capture and
+    /// preserves the current `str` element for the stable count/prefix/scatter path.
+    FilterStrContains,
     Project { field: u32 },
     FilterField { field: u32 },
 }
@@ -323,7 +331,7 @@ pub enum ParMapStageKind {
 #[derive(Clone, Debug)]
 pub struct ParMapStage {
     pub kind: ParMapStageKind,
-    /// A callable name for `Map`/`Filter`; `None` for compiler-generated field stages.
+    /// A callable name for `Map`/`Filter`; `None` for compiler-generated field and string stages.
     pub func: Option<String>,
     pub captures: Vec<Operand>,
     pub capture_tys: Vec<Ty>,
@@ -563,10 +571,11 @@ pub enum Rvalue {
     /// owned `array<elem_out>` `{ out_buf, count }`. A chunk source is an `array<slice<T>>` view;
     /// its borrowed slice headers are loaded as range elements and the chunk header buffer is
     /// released after the synchronous runtime call. `stages` holds prior admitted scalar/AoS
-    /// map, filter, projection, and field-filter stages that are fused into the same kernel; it
-    /// is empty for a direct source. `Filter` and `FilterField` stages preserve the current
-    /// element and use a stable two-pass compaction in the runtime. `Project` extracts an AoS
-    /// field. `elem_in` is the source element type and `elem_out` is `func`'s return. All callable
+    /// map, filter, projection, field-filter, and invariant string-filter stages that are fused
+    /// into the same kernel; it is empty for a direct source. `Filter`, `FilterField`, and
+    /// `FilterStrContains` stages preserve the current element and use a stable two-pass
+    /// compaction in the runtime. `Project` extracts an AoS field. `elem_in` is the source element
+    /// type and `elem_out` is `func`'s return. All callable
     /// captures are Copy values passed through one call-scoped immutable context record; compiler-
     /// generated field stages carry no captures. The runtime never retains that record; the
     /// generated kernel loads and forwards each stage and terminal value. `work_weight` is a
@@ -4095,10 +4104,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With a direct scalar/AoS source, a chunk source, or a length-preserving scalar/AoS
-            // map/filter/projection chain, run in parallel via one range kernel. Copy captures are
-            // lowered once into the call-scoped context record; callable and field filters use
-            // stable two-pass compaction. SoA, string-search, and unsupported aggregate layouts
-            // retain the sequential collect loop.
+            // map/filter/projection chain, including a recognised invariant string filter, run in
+            // parallel via one range kernel. Copy captures are lowered once into the call-scoped
+            // context record; callable, field, and string filters use stable two-pass compaction.
+            // SoA and unsupported aggregate layouts retain the sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
                 Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
@@ -4125,11 +4134,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             hir::StageKind::Where { func, captures } => (ParMapStageKind::Filter, Some(func.clone()), captures.as_slice()),
                             hir::StageKind::Project { field } => (ParMapStageKind::Project { field: *field }, None, &[][..]),
                             hir::StageKind::WhereField { field } => (ParMapStageKind::FilterField { field: *field }, None, &[][..]),
-                            hir::StageKind::WhereStrContains { .. } => {
-                                // Keep malformed or future HIR fail-closed. The guard above makes
-                                // this arm unreachable for checked programs, but a sequential
-                                // fallback is safer than letting a user-shaped stage panic MIR.
-                                return lower_array_collect(b, source, stages, *elem, CollectKind::Collect);
+                            hir::StageKind::WhereStrContains { needle } => {
+                                (ParMapStageKind::FilterStrContains, None, std::slice::from_ref(needle))
                             }
                         };
                         let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();

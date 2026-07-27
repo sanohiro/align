@@ -253,6 +253,8 @@ direct chunk source.chunks(n).par_map(f)
                                 → Rvalue::ParMapParallel { src: array<slice<T>>, func, stages: [], captures, capture_tys, elem_in: slice<T>, elem_out, work_weight }
 staged scalar/AoS map/filter/project chain
                                 → Rvalue::ParMapParallel { src, func, stages, captures, capture_tys, elem_in, elem_out, work_weight }
+recognised invariant `str.contains` filter chain
+                                → Rvalue::ParMapParallel { stages: [..., FilterStrContains], captures, ... }
 direct stage-free integer par_map(f).sum()
                                 → Rvalue::ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight }
 direct stage-free integer chunks(n).par_map(f).sum()
@@ -268,14 +270,17 @@ into a call-scoped immutable context; the kernel loads them and passes them as d
 arguments. The kernel contains the typed counted loop and direct calls for primitive scalar, `str`,
 or Copy-struct map/filter values plus the terminal body. AoS projection stages extract the logical
 field after the backend layout permutation; `where(.field)` stages use the same count/prefix/
-scatter pair as callable filters, so output order stays source order. The runtime schedules
+scatter pair as callable filters, so output order stays source order. The recognised invariant
+`where(fn s { s.contains(NEEDLE) })` form over `str` elements is represented by a
+compiler-generated `FilterStrContains` stage with one literal/free-variable `str` capture; codegen
+calls the existing `str_contains` ABI in both stable-filter passes. The runtime schedules
 disjoint `[start,end)` ranges. A chunk source loads each borrowed `slice<T>` header as one range
 element; the owned chunk-header buffer remains materialized by `Rvalue::Chunks` and is dropped after
 the synchronous consumer. The specialized `ParMapReduce` node covers direct, stage-free integer
 `par_map(f).sum()` for scalar and chunk sources; its generated kernel folds each range with plain
 wrapping integer addition and publishes one partial result per range, so no transformed result
-array is materialized. SoA projections, `str.contains` filters, floating-point sums, and arbitrary
-reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
+array is materialized. SoA projections, richer string-search expressions, floating-point sums, and
+arbitrary reducers remain on their existing paths. This does not add a generic `ParLoop(reduce=…)` node or silently
 parallelize ordinary reductions.
 
 Each parallel node also carries a compiler-generated `work_weight` in `{1, 2, 4}`. The post-lowering

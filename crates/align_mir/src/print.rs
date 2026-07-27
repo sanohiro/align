@@ -379,6 +379,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     .map(|stage| match stage.kind {
                         ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "<missing-map>".to_string()),
                         ParMapStageKind::Filter => format!("where {}", stage.func.as_deref().unwrap_or("<missing-filter>")),
+                        ParMapStageKind::FilterStrContains => "where str.contains".to_string(),
                         ParMapStageKind::Project { field } => format!("field#{field}"),
                         ParMapStageKind::FilterField { field } => format!("where field#{field}"),
                     })
