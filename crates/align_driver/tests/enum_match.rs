@@ -679,10 +679,10 @@ fn array_string_and_move_struct_enum_payloads_rejected() {
 
 #[test]
 fn move_enum_option_result_payload_rejected() {
-    // A Move sum type as an `Option`/`Result` payload is deferred (the drop machinery frees a flat
-    // `{ptr,len}` for a payload, not a tag-switched enum drop; `payload_is_move` is table-free and
-    // cannot see the Move enum, so admitting it would leak). Rejected at the `Some`/`Ok`/`Err` wrap
-    // site — the sole origin of such a value. (A scalar-only enum payload stays allowed.)
+    // A Move sum type as an `Option`/`Result` payload is deferred. The recursive DropPlan sees the
+    // owned enum shape, but nested tagged lowering and move-out/null-container semantics land in
+    // L1b. Rejected at the `Some`/`Ok`/`Err` wrap site — the sole origin of such a value. (A
+    // scalar-only enum payload stays allowed.)
     assert!(check_errs(
         "moveenum-some",
         "Content { Text(str), Nums(array<i64>) }\n\

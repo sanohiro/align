@@ -9760,32 +9760,22 @@ impl<'a> MoveCheck<'a> {
                 // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
                 // check below (same diagnostic; the field write has no index expr to span, so it
                 // points at the RHS instead).
-                Stmt::AssignField {
-                    root,
-                    path,
-                    value,
-                    drop_old,
-                } => {
+                Stmt::AssignField { root, path, value } => {
                     self.check_borrow_use(*root, value.span);
                     if whole_moved(moved, *root) {
                         let name = &self.f.locals[*root as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), value.span);
                     }
-                    let was_moved = path
-                        .first()
-                        .is_some_and(|field| field_moved(moved, *root, *field));
                     let self_assign = matches!(
                         &value.kind,
                         ExprKind::Field { root: source, path: source_path }
                             if source == root && source_path == path
                     );
                     self.expr(value, moved, true, true);
-                    let consumed_by_rhs = path.first().is_some_and(|field| {
-                        field_moved(moved, *root, *field) && !was_moved
-                    });
-                    drop_old.set(self.is_move_ty(value.ty) && !consumed_by_rhs);
                     // The assignment installs a live replacement even when its RHS moved out of
-                    // this same field through a transparent wrapper or consuming call.
+                    // this same field through a transparent wrapper, consuming call, or one arm of
+                    // a control-flow expression. MIR zeros the source on precisely the paths that
+                    // moved it before dropping the path-local old destination.
                     if let [field] = path.as_slice() {
                         moved.remove(&MovedKey::Field(*root, *field));
                     }
@@ -11598,12 +11588,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                     Place::Field { root, path, ty } => {
                         let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignField {
-                            root,
-                            path,
-                            value: v,
-                            drop_old: std::cell::Cell::new(false),
-                        });
+                        stmts.push(Stmt::AssignField { root, path, value: v });
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));

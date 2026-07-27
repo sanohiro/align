@@ -144,14 +144,45 @@ fn field_self_assignment_preserves_value_and_ownership() {
     let mir = mir_text(&src);
     assert_eq!(
         mir.matches("drop_value").count(),
-        0,
-        "direct and wrapped field ownership transfers must not drop the destination:\n{mir}"
+        2,
+        "wrapped transfers must path-locally zero then drop the old destination:\n{mir}"
     );
     assert_eq!(
         build_and_run("owned-option-field-self-assign", &src)
             .status
             .code(),
         Some(12)
+    );
+}
+
+#[test]
+fn conditional_field_replacement_drops_old_only_on_live_paths() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!(
+        "{DECL}\
+         fn main() -> i32 {{\n\
+           mut a := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           a.detail = if true {{ a.detail }} else {{ Some(\"new\".clone()) }}\n\
+           mut b := Item {{ detail: Some(\"hello\".clone()), n: 0 }}\n\
+           b.detail = if false {{ b.detail }} else {{ Some(\"new\".clone()) }}\n\
+           x := a.detail else {{ return 90 }}\n\
+           y := b.detail else {{ return 91 }}\n\
+           return (x.len() + y.len()) as i32\n\
+         }}\n"
+    );
+    let mir = mir_text(&src);
+    assert_eq!(
+        mir.matches("drop_value").count(),
+        2,
+        "each joined replacement must drop its path-local old destination:\n{mir}"
+    );
+    assert_eq!(
+        build_and_run("owned-option-field-conditional-replace", &src)
+            .status
+            .code(),
+        Some(8)
     );
 }
 

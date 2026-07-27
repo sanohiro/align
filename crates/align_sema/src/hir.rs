@@ -9,7 +9,6 @@
 use crate::Ty;
 use align_ast::{BinOp, UnOp};
 use align_span::Span;
-use std::cell::Cell;
 
 /// Identifier of a local variable (and its memory slot) within a function body.
 pub type LocalId = u32;
@@ -282,14 +281,7 @@ pub enum Stmt {
     AssignVecLane { local: LocalId, lane: u32, value: Expr },
     /// `root.f0.f1.… = value` — store into a (possibly nested) field of a struct local. `path` is
     /// the chain of field indices (length ≥ 1).
-    AssignField {
-        root: LocalId,
-        path: Vec<u32>,
-        value: Expr,
-        /// Whether MIR must drop the previous field value after evaluating `value`. Move analysis
-        /// clears this when the RHS consumed that same field, transferring its ownership.
-        drop_old: Cell<bool>,
-    },
+    AssignField { root: LocalId, path: Vec<u32>, value: Expr },
     /// `base[index].f0.f1.… = value` — store the leaf field reached by `path` (length ≥ 1) of
     /// element `index` of a struct-array or soa local (the write counterpart of the
     /// `base[index].f0.f1.…` read). `soa` picks the lowering: a column store (`StoreColumn`) for a

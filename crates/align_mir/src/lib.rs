@@ -2725,12 +2725,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 None => b.set_drop_flag(*local, drop_new.get()),
             }
         }
-        hir::Stmt::AssignField {
-            root,
-            path,
-            value,
-            drop_old,
-        } => {
+        hir::Stmt::AssignField { root, path, value } => {
             // Like whole-local `s = s`, exact field self-assignment preserves the value and its
             // ownership. Dropping the destination before reloading the identical RHS would read
             // freed storage; storing and then nulling the identical source would erase it.
@@ -2766,15 +2761,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if b.is_terminated() {
                 return;
             }
-            if drop_old.get() {
-                let old = b.fresh_value(leaf_ty);
-                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
-                b.push(Stmt::DropValue(Operand::Value(old)));
-            }
             // The replacement is already captured, so clear its old source before the store. This
-            // ordering is essential when source and destination are the same place through a
-            // transparent wrapper: clearing after the store would erase the replacement.
+            // is path-local for control-flow RHSs: an arm that transfers the destination zeros it,
+            // while a fresh-value arm leaves the old value live. Dropping the destination
+            // afterwards therefore frees exactly the paths that still own the old payload.
             null_moved_source(b, value);
+            let old = b.fresh_value(leaf_ty);
+            b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
+            b.push(Stmt::DropValue(Operand::Value(old)));
             b.push(Stmt::StoreField(*root, path.clone(), replacement));
         }
         hir::Stmt::AssignIndex { base, index, value } => {

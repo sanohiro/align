@@ -9,6 +9,7 @@ extern "C" {
     fn tagged_some(reps: i64) -> i64;
     fn tagged_sparse(reps: i64) -> i64;
     fn tagged_replace(reps: i64) -> i64;
+    fn tagged_conditional_replace(reps: i64) -> i64;
     fn tagged_early_try(reps: i64) -> i64;
     fn align_rt_alloc_count() -> i64;
     fn align_rt_free_count() -> i64;
@@ -25,12 +26,18 @@ fn measure(kernel: Kernel, reps: i64) -> (i64, i64, Duration, i64) {
 
 fn main() {
     let reps = 1_000_000;
-    let rows: [(&str, Kernel, i64, Option<i64>); 6] = [
+    let rows: [(&str, Kernel, i64, Option<i64>); 7] = [
         ("scalar", scalar_rows, 0, None),
         ("none", tagged_none, 0, None),
         ("some", tagged_some, reps, None),
         ("sparse-1pct", tagged_sparse, (reps + 99) / 100, None),
         ("replace", tagged_replace, reps * 3, None),
+        (
+            "conditional",
+            tagged_conditional_replace,
+            reps + reps / 2,
+            None,
+        ),
         ("early-try", tagged_early_try, reps, Some(0)),
     ];
     let mut failed = false;

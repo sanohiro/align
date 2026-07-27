@@ -65,6 +65,18 @@ pub fn tagged_replace(reps: i64) -> i64 {
   }
 }
 
+pub fn tagged_conditional_replace(reps: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  return loop {
+    if i >= reps { break total }
+    mut row := TaggedRow { detail: Some("old".clone()), n: i % 17 }
+    row.detail = if i % 2 == 0 { row.detail } else { Some("new".clone()) }
+    total = total + row.n
+    i = i + 1
+  }
+}
+
 fn fail_string() -> Result<string, Error> = Err(error(17))
 
 fn construct_then_fail() -> Result<i64, Error> {
