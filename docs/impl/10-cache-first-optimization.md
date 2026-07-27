@@ -19,7 +19,8 @@ items below remain proposals, not descriptions of a missing CAS. Audit baseline:
 > **Static-input extension settled 2026-07-27 (not yet implemented):** a producer unit may declare
 > exact static inputs only through a compiler-known constructor. Its sorted
 > `(logical_path, content_hash, consumer_kind)` list joins source in the unit action identity.
-> Query SQL/metadata/generated thunks affect `impl_hash` and producer object/link identity; the
+> Query source SQL plus deterministic per-driver wire SQL/rewrite maps, metadata, and generated
+> thunks affect `impl_hash` and producer object/link identity; the
 > exported Params/Row/driver/static-option contract alone affects `interface_hash`. A SQL-only edit
 > therefore misses the producer while unchanged consumers remain hot. Full contract:
 > `17-library-boundary-prerequisites.md` §§5–6.

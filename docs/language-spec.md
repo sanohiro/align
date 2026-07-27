@@ -499,8 +499,10 @@ pub resource conn = internal.drop_conn
 ```
 
 The internal `unsafe fn(raw) -> ()` hook runs exactly once on ordinary cleanup. Construction/raw
-extraction/ownership transfer are private resource intrinsics; a safe public API exposes neither
-`raw` nor manual destroy. `resource_ref<R>` is a Copy view tied to the owner generation and is
+extraction/ownership transfer are restricted to the declaring module's descendant subtree; a safe
+public API exposes neither `raw` nor manual destroy. The raw-only Drop-hook module need not import
+the declaring module, so the privilege does not create a module cycle. `resource_ref<R>` is a Copy
+view tied to the owner generation and is
 invalidated by owner move/Drop or mutable borrow. Resources are non-Send by default.
 
 `resource.from_raw_borrowed(ptr, parent_ref)` creates a Move child resource tied to one parent
@@ -589,7 +591,9 @@ core.arena
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 `array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
 arena chunks with no hidden heap allocation and performs one documented compacting pass at
-`build()`. Shorter-lived views must first use `clone_in(out)`.
+`build()`. Shorter-lived views must first use `clone_in(out)`. Both forms remain one mutable-local
+Move owner; a helper may push through a `borrow mut` parameter but cannot store, return, or consume
+that borrowed builder.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-

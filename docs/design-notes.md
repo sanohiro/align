@@ -252,7 +252,9 @@ exactly once. Encoding each one as a new compiler-known type makes `std` privile
 prevents ordinary `pkg` code from providing equally safe wrappers; exposing `raw` plus `close`
 instead makes the safety invariant a caller convention. The common answer is a
 package-defined opaque `resource` whose representation and Drop hook are accessible only to the
-declaring package's `internal` unsafe code. Shared `borrow` and invalidating `borrow mut`
+declaring module's unsafe descendant subtree. Its raw-only Drop-hook module need not import the
+declaring root, so a driver submodule can construct the public root resource without a cycle or a
+public raw constructor. Shared `borrow` and invalidating `borrow mut`
 parameters preserve caller ownership, while inferred owner generations prevent a returned view
 from surviving replacement, mutation, or Drop. This generalizes the existing Move/Drop and
 borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second

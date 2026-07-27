@@ -112,7 +112,9 @@ idea is rejected.
   use-after-finalize, or native double cleanup.
 - **Recommendation:** L3 package-defined resources plus
   `resource.from_raw_borrowed(native,parent_ref)`. A live dependent child freezes the required parent
-  generation until child Drop.
+  generation until child Drop. Representation intrinsics are available to the declaring module's
+  descendant subtree; raw-only Drop-hook modules never import the root type, keeping driver
+  construction acyclic without a public raw constructor.
 - **v1 impact:** blocker for safe prepare and streaming. D2 may avoid prepared statements but still
   needs the general connection resource.
 
@@ -169,8 +171,9 @@ idea is rejected.
 - **Actual failure:** the API is not expressible today, and a database-specific callback rule would
   hide the row loop and encourage special compiler treatment.
 - **Recommendation:** remove `db.fold`. Query-local Impure `run` creates one rows resource and has
-  one visible `loop`; a Pure `step(borrow mut state,row,out)` receives no DB handle. Effect checking
-  structurally prevents additional SQL from the shaper.
+  one visible `loop`; a Pure step receives `borrow mut state`, zero or more separate
+  `borrow mut` builders, `row`, and `out`, but no DB handle. Effect checking structurally prevents
+  additional SQL from the shaper.
 - **v1 impact:** original design blocker; resolved in the revised specification without adding
   general higher-order generics.
 
@@ -185,6 +188,9 @@ idea is rejected.
   unbounded pre-count/two-pass algorithm. Retaining current-row views is unsound.
 - **Recommendation:** L6 `array_builder<T>(out)` for recursive `RegionPlain` elements, chunked
   growth, and exactly one disclosed compacting pass. Require `clone_in(out)` for short row views.
+  Keep each builder as its own mutable local; a Pure step may receive it through `borrow mut`, but
+  no builder enters the shaping-state aggregate. `all<R>` is structurally restricted to
+  `RegionPlain<R>`, which every v1 static Row must satisfy.
 - **v1 impact:** blocker for D10 and the initial release's required one-to-many example; later than
   the scalar D2/D4 probes.
 
@@ -229,8 +235,9 @@ idea is rejected.
 - **Recommendation:** a small dialect-aware scanner recognizes code/comment/string/quoted
   identifier/dollar-quote states. Produce an occurrence table plus source spans. SQLite binds its
   named token/index; PostgreSQL rewrites first source occurrence to `$1`, reuses that ordinal for
-  repeats, and binds Params in declared-field order mapped through the table. Reject mixed named and
-  positional forms.
+  repeats, and binds Params in declared-field order mapped through the table. Keep exact source SQL
+  hash separate from deterministic per-driver wire SQL/hash and retain a source-to-wire map. Reject
+  mixed named and positional forms.
 - **v1 impact:** blocker for D4 PostgreSQL; D1 must prove the scanner before libpq.
 
 ### F13 — runtime reflection is unnecessary and off-design
@@ -344,7 +351,8 @@ idea is rejected.
    parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
    ordinal for repeats.
 10. **Typed Row decode:** monomorphized ordinal decoder thunk with direct field writes and runtime
-    contract guards; no reflection or per-row name lookup.
+    contract guards; no reflection or per-row name lookup. V1 static Row is `RegionPlain`; owned
+    strings/arrays remain Params/Output forms rather than a hidden alternate Row materializer.
 11. **Row view lifetime:** resource generations. `next(borrow mut rows)` invalidates the previous
     generation; `clone_in(out)` is required to retain data.
 12. **Conn/tx execution:** two concrete constructors produce one `db.exec` Copy sum of resource
@@ -352,7 +360,8 @@ idea is rejected.
 13. **One-pass shaping:** Query-local visible rows loop plus Pure exclusive-state `step`; the step
     has no DB handle, and transitive effects reject hidden I/O.
 14. **Compound Output builders:** L6 region-backed `RegionPlain` builder with chunk growth and one
-    measured compacting pass.
+    measured compacting pass. Builders stay separate mutable locals and are borrowed by the Pure
+    step.
 15. **Offline checked metadata:** explicit prepare/check tooling invokes real database engines;
     ordinary build consumes canonical artifacts and never connects.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native

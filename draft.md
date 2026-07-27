@@ -1728,9 +1728,12 @@ pub resource stmt<P, R> = internal.drop_stmt
 ```
 
 The hook is an internal `unsafe fn(raw) -> ()`. A resource is one opaque pointer, always Move, and
-calls the hook exactly once on ordinary cleanup. Only the declaring module/internal subtree may use
+calls the hook exactly once on ordinary cleanup. Only the declaring module and its descendant module
+subtree may use
 `resource.from_raw`, `resource.from_raw_borrowed`, `resource.view_from_raw`, `resource.raw`, and
-`resource.into_raw`; `unsafe` does not bypass visibility.
+`resource.into_raw`; `unsafe` does not bypass this representation privilege. The Drop-hook module
+takes only `raw` and need not import the declaring module, so a root resource may name an internal
+raw Drop hook while driver descendants construct the root type without a module cycle.
 `resource.borrow(r)` returns a Copy `resource_ref<R>` tied to the owner's inferred generation.
 Owner move/Drop or a `borrow mut` call invalidates it. Resources and references are non-Send by
 default. This is the one mechanism used by native `std` handles and FFI-backed `pkg` libraries; safe
@@ -2063,7 +2066,10 @@ squares := b.build()          // owned array<i64>, fed to the pipeline
 total := squares.sum()
 ```
 
-It is an owned **Move** handle bound to one `mut` local (like `buffer`/`builder`):
+It is an owned **Move** handle bound to one `mut` local (like `buffer`/`builder`).
+An ordinary helper may temporarily receive that same bound owner through a `borrow mut`
+parameter, mutate it, and return without consuming it; the builder still never becomes an
+aggregate field:
 it never rides an `Option`/`Result`/array/tuple, is not `print`/`==`-able, and
 cannot be captured into a `par_map`/`spawn` closure. `push`/`append` grow it in
 place (amortized doubling) and are **Pure** (in-memory growth, no I/O); `build`
@@ -2072,7 +2078,7 @@ the builder's storage is heap memory grown in place, and `build` is a pointer+le
 retype into the `array<T>` — no element copy, and the array's own `Drop` frees the
 whole buffer (a deep free for `array<string>`).
 
-Crucially, an `array_builder` holds **no views** — nothing a growth reallocation
+Crucially, the individually owned heap `array_builder` holds **no views** — nothing a growth reallocation
 could invalidate — which is exactly why a directly growable `array<T>` was rejected:
 a live element/slice borrow would dangle across a `push`. The builder confines
 growth to a phase with no outstanding borrows, then freezes to the immutable,
@@ -2091,7 +2097,9 @@ The region form is the required generalization for ordinary libraries. `out: reg
 region-valid `str`/bytes views; resources, raw values, functions, and independently owned fields are
 rejected. It grows in arena chunks with no hidden heap allocation, then `build()` performs one
 documented compacting pass into the exact contiguous arena result. A short-lived view must be copied
-first with `clone_in(out)`. The heap form above retains zero-copy freeze.
+first with `clone_in(out)`. It remains one mutable local, though a `borrow mut` helper may push
+through it; it is not storable in a shaping-state struct. The heap form above retains zero-copy
+freeze.
 
 ### core.json
 

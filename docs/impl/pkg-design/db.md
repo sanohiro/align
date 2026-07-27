@@ -311,7 +311,7 @@ Required meaning:
 - `db.exec` is a short-lived borrowed execution view produced from either a connection or a
   transaction. This lets a Query be reused inside and outside a transaction without a public trait.
 - `db.query<P, R>` is a Copy static descriptor containing SQL identity, parameter contract, row
-  contract, driver restriction, SQL hash, and static options.
+  contract, driver restriction, exact source hash, selected wire hash, and static options.
 - `db.command<P>` is the non-row descriptor. A statement with `RETURNING` is a Query.
 - `db.stmt<P, R>` is a prepared Move statement carrying an inferred dependency on the physical
   connection that prepared it.
@@ -320,12 +320,22 @@ Required meaning:
 - `db.exec_result` contains affected-row and available command-status information.
 - `db.row` and `db.value` are explicit dynamic escape hatches.
 
-The common package declares the resource types. `pkg.db.internal` owns a tagged native state and the
-FFI declarations/drop/operation dispatch for the two first-party drivers; public driver constructors
-call into that internal module. The root/common module therefore does not import its driver
-submodules and no module cycle is created. Adding a first-party driver deliberately extends this
-closed internal dispatch. There is no public driver trait, trait object, or driver-provided resource
-ABI.
+The common root declares the resource types and names raw-only Drop hooks in
+`pkg.db.internal.resource`. Resource representation privilege applies to the declaring module's
+descendant subtree. A public driver descendant imports `pkg.db`, obtains tagged raw native state
+from raw-only internal FFI helpers, checks failure, and calls `resource.from_raw` with expected type
+`db.conn`; no public raw constructor exists. The internal Drop-hook module accepts only `raw` and
+does not import `pkg.db`. The dependency direction is therefore:
+
+```text
+pkg.db                    -> pkg.db.internal.resource   (raw Drop/dispatch)
+pkg.db.sqlite/postgres    -> pkg.db + pkg.db.internal  (construct root resource)
+pkg.db.internal.*         -X-> pkg.db                   (no reverse import)
+```
+
+The root/common module never imports its public driver submodules. Adding a first-party driver
+deliberately extends the closed tagged internal dispatch. There is no public driver trait, trait
+object, or driver-provided resource ABI.
 
 Execution views use the required borrowed-parameter surface:
 
@@ -469,7 +479,8 @@ public interface
   static semantic options
 
 producer implementation / StaticQueryArtifact
-  SQL logical path and exact bytes/hash
+  SQL logical path and exact source bytes/hash
+  deterministic per-driver wire bytes/hash and source map
   parameter occurrence/source-span table
   checked-metadata policy/digest
   generated bind and decode thunks
@@ -544,6 +555,14 @@ The prepare step lowers named parameters to the driver protocol:
   later occurrences of the same name;
 - both retain original byte spans and names in diagnostics and metadata.
 
+Source SQL and wire SQL are distinct identities. `source_sql` is the exact reviewed file/inline
+bytes and owns the static-input hash. SQLite's `wire_sql` is byte-identical to it. PostgreSQL's
+`wire_sql` replaces only recognized placeholder token spans with the assigned `$n` bytes and
+preserves every other source byte; it has its own hash and rewrite-format version. The artifact
+stores both plus a source-to-wire span map. Prepare/runtime metadata is keyed by driver, source
+hash, wire hash, rewrite version, and static options. Runtime sends the selected wire bytes exactly,
+while diagnostics map engine positions back to source spans where possible.
+
 The scanner is dialect-aware lexical analysis, not a regular expression and not a SQL resolver. It
 recognizes quoted strings/identifiers, line/block comments, PostgreSQL dollar-quoted strings, and
 the PostgreSQL `::` cast token. Portable Query source accepts only `:identifier` placeholders outside
@@ -596,6 +615,14 @@ Rules:
 - a `LEFT JOIN` may make an otherwise non-null column nullable;
 - casts are explicit in SQL when the database result type is ambiguous;
 - decoding is generated/statically described, not reflection-based.
+
+Version 1 static `Row` is structurally `RegionPlain`: scalar fields, `str`/`slice<u8>` views, and
+one-column logical/`Option`/fixed-array forms recursively composed from them, with no independently owned
+`string`, dynamic `array`, resource, raw, function, or builder field. This gives one representation
+that can be streamed as current-row views or explicitly cloned into a caller region. Owned
+`string`/`array<u8>` remain valid Params/Output data, but are not alternate generated Row storage
+forms in v1. A later owned-Row collection requires a separate measured materializer contract; a
+driver must not silently choose it.
 
 The generated decoder writes directly to known `Row` field offsets. At prepare/execution setup, the
 driver builds one column-ordinal plan and checks count, names, and available native types. The hot
@@ -685,7 +712,9 @@ Semantics:
 - `maybe_one`: zero -> `None`; one -> `Some`; more than one -> `Cardinality`.
 - `one`/`maybe_one`/`all`: clone view-bearing fields into the supplied `region`; their results are
   tied to that region.
-- `all`: grows region chunks and performs the region builder's one documented compacting pass.
+- `all`: requires structural `RegionPlain<R>`, grows region chunks, and performs the region
+  builder's one documented compacting pass. This is a compiler structural check, not a public trait
+  bound; every v1 static Query Row already satisfies it.
 - `rows`: one-pass stream; no implicit materialization.
 - `execute`: never decodes rows.
 
@@ -710,11 +739,11 @@ For a compound result:
 ```align
 State {
   parent: Option<User>,
-  groups: array_builder<Group>,
 }
 
 fn step(
   borrow mut state: State,
+  borrow mut groups: array_builder<Group>,
   row: Row,
   out: region,
 ) -> Result<(), db.Error> {
@@ -729,14 +758,14 @@ pub fn run(
 ) -> Result<Option<Output>, db.Error> {
   mut state := State {
     parent: None,
-    groups: array_builder(out),
   }
+  mut groups := array_builder(out)
   rows := db.rows(exec, query(), params, [])?
   loop {
     row := db.next(rows)? else { break }
-    step(state, row, out)?
+    step(state, groups, row, out)?
   }
-  return finish(state)
+  return finish(state, groups.build())
 }
 ```
 
@@ -744,7 +773,8 @@ This keeps the SQL path and result mode inside the named Query module while pres
 execution and allocation. The normal `loop` is intentional: it avoids adding a database-special
 generic callback ABI or extending Align's closed minimal-generics surface merely to hide a loop.
 `borrow mut` gives the Pure step exclusive access without transferring the arena-owned Move state
-across a by-value call.
+or builder across a by-value call. The builder remains one separate mutable local; L6 does not put
+builders in aggregate fields or add aggregate builder movement.
 
 ### 6.4 Prepared statements
 
@@ -873,11 +903,11 @@ State {
   seen: bool,
   user_id: i64,
   user_name: str,
-  groups: array_builder<Group>,
 }
 
 fn step(
   borrow mut state: State,
+  borrow mut groups: array_builder<Group>,
   row: Row,
   out: region,
 ) -> Result<(), db.Error> {
@@ -896,7 +926,7 @@ fn step(
 
   group_id := row.group_id else return Ok(())
   group_name := row.group_name else return Err(partial_child())
-  state.groups.push(Group {
+  groups.push(Group {
     id: group_id,
     name: group_name.clone_in(out),
   })
@@ -904,9 +934,10 @@ fn step(
 }
 ```
 
-`run` initializes `user_name` to the static empty view while `seen == false`, constructs exactly one
-`db.rows` stream, advances it in a normal `loop`, calls `step(state, row, out)` once per row, and
-freezes the builder in `finish`. The helper error constructors above return fully populated
+`run` initializes `user_name` to the static empty view while `seen == false`, binds a separate
+`mut groups := array_builder(out)` local, constructs exactly one `db.rows` stream, advances it in a
+normal `loop`, calls `step(state, groups, row, out)` once per row, and passes `groups.build()` to
+`finish`. The helper error constructors above return fully populated
 `db.Error` values for this Query identity. The recursive tagged-Move, builder, and region support
 are mandatory prerequisites, not decisions left to the driver. The semantics are:
 
@@ -1052,8 +1083,16 @@ and tests can count two executions.
 The canonical Query shaper is a Pure row-to-state function:
 
 ```text
-step(borrow mut state: State, row: Row, out: region) -> Result<(), db.Error>
+step(
+  borrow mut state: State,
+  borrow mut output_builder: array_builder<Item>,  // zero or more separate builders
+  row: Row,
+  out: region,
+) -> Result<(), db.Error>
 ```
+
+A shaper with no collection omits the builder parameter. Every builder remains a separate caller
+local; it is never hidden inside `State`.
 
 It does not receive:
 
@@ -1232,8 +1271,8 @@ Initial SQLite mapping:
 ```text
 INTEGER         signed integer widths, checked on decode
 REAL            f64 (f32 only by explicit expected conversion policy)
-TEXT            str/string
-BLOB            bytes/array<u8>
+TEXT            Params: str/string; Row: str
+BLOB            Params: slice<u8>/array<u8>; Row: slice<u8>
 NULL            Option<T>
 ```
 
@@ -1251,12 +1290,12 @@ Initial PostgreSQL mapping should include:
 int2/int4/int8          i16/i32/i64
 float4/float8           f32/f64
 bool                    bool
-text/varchar/name       str/string
-bytea                   bytes/array<u8>
+text/varchar/name       Params: str/string; Row: str
+bytea                   Params: slice<u8>/array<u8>; Row: slice<u8>
 date/time/timestamp     db logical temporal types
 numeric                 db.decimal or explicit text/native representation
 uuid                    stable db/native UUID type
-json/jsonb              bytes/str view or explicit typed JSON decode
+json/jsonb              Row str/bytes view or explicit typed JSON decode
 arrays                  native PostgreSQL array support when declared
 ```
 
@@ -1702,7 +1741,8 @@ This is the only workflow allowed to contact a database. It:
 3. asks SQLite or PostgreSQL to prepare/describe every selected static Query;
 4. records parameter/result/native type information and nullability where available;
 5. records driver/version/schema identity;
-6. records the SQL hash and relevant option hash;
+6. records the source SQL hash, selected driver wire SQL hash/rewrite version, and relevant option
+   hash;
 7. writes deterministic repository metadata;
 8. supports `--check`, which fails when regeneration would change repository metadata.
 
@@ -1733,7 +1773,7 @@ not semantic, and no JSON object whose iteration order affects identity. Every f
 ```text
 format_version
 query_id, module, item, driver
-SQL hash, static-options hash
+source-SQL hash, driver-wire-SQL hash, rewrite-format version, static-options hash
 Params and Row fingerprints
 schema fingerprint
 engine/driver version
@@ -1987,7 +2027,8 @@ what is not portable.
 
 ```text
 Query identity
-SQL hash
+source SQL hash
+driver wire SQL hash and rewrite-format version
 driver restriction
 verification state
 parameter names/order/common types/native types/native ids
@@ -2164,7 +2205,7 @@ query db.queries.customer_totals:
 
 ```text
 checked metadata is stale:
-  SQL hash changed for db/queries/user_by_id.sql
+  source SQL hash changed for db/queries/user_by_id.sql
   run: alignc db prepare
 ```
 
@@ -2223,6 +2264,8 @@ Before a native database:
 
 - construct `db.query<P,R>` from inline and sibling SQL;
 - emit/load `StaticQueryArtifact`;
+- preserve exact source SQL identity while generating deterministic SQLite/source and
+  PostgreSQL/`$n` wire entries plus reverse span maps;
 - generate binder/decoder thunks;
 - exercise named-parameter occurrence tables;
 - decode a fake flat scalar row;
@@ -2380,6 +2423,8 @@ remains a visibly executing operation.
 - PostgreSQL binary parameter/result formats;
 - segmented child buffers and nullable validity bitmaps;
 - direct eligible `soa<Row>` decode with no intermediate AoS;
+- a separately specified owned-Row/owned-collection materializer only if a measured consumer needs
+  `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
 - PostgreSQL COPY/pipeline/single-row/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
 - explicit pool package;
@@ -2448,8 +2493,9 @@ The design is implemented correctly only if all are true:
 27. Caller-selected materialization uses `arena name {}` and `region`, with no ambient allocator.
 28. SQL-only edits invalidate the producer/query artifact without needlessly recompiling unchanged
     consumers.
-29. Canonical compound shaping uses a Pure `borrow mut` state transition, so transitive database
-    I/O is rejected; its Query-local orchestrator contains one visible rows loop.
+29. Canonical compound shaping uses Pure `borrow mut` state and separate-builder transitions, so
+    transitive database I/O is rejected; its Query-local orchestrator contains one visible rows
+    loop.
 30. Region builder allocation and its single compacting pass are measured and visible.
 31. Structured owned `db.Error` and Move Output use ordinary recursive `Option`/`Result`/sum Drop;
     the successful path allocates no error storage.

@@ -153,6 +153,10 @@ mutating an owned local or builder; it lets a deterministic row shaper update ca
 without transferring an arena-owned Move value across a by-value call. Unsafe/FFI/database calls
 remain Impure regardless of parameter mode.
 
+A bound `array_builder<T>` may be passed to a `borrow mut` parameter and used as a mutable receiver
+inside that call. The callee cannot consume it with `build()` or store/return it; ownership returns
+to the same caller local. This does not make builders legal aggregate fields.
+
 ## 3. Package-defined opaque Move resources
 
 ### 3.1 Declaration
@@ -182,7 +186,8 @@ and scope cleanup call the hook exactly once. Process abort remains the existing
 
 ### 3.2 Native construction
 
-Only the declaring module or its `internal` subtree may use the resource representation intrinsics:
+Only the declaring module and its canonical descendant-module subtree may use the resource
+representation intrinsics:
 
 ```align
 unsafe {
@@ -202,7 +207,16 @@ Rules:
 - `resource.raw` is unsafe and accepts `resource_ref<R>`, never an owning value.
 - `resource.into_raw` is unsafe, consumes the resource, clears its cleanup flag, and transfers the
   native ownership to the caller.
-- Module visibility is enforced even inside `unsafe`; unsafe does not bypass a private constructor.
+- Representation privilege is checked by canonical module-path prefix, not by an import cycle or a
+  public constructor. For a resource declared in `pkg.db`, `pkg.db.sqlite`,
+  `pkg.db.postgres`, and `pkg.db.internal.*` are privileged descendants; an importing application or
+  another package is not.
+- The Drop-hook module accepts only `raw` and need not import the resource-declaring module. The
+  root may therefore reference `pkg.db.internal.drop_conn`, while a driver descendant imports the
+  root type and constructs it directly from an expected `db.conn`; `internal` never imports the
+  root and the graph stays acyclic.
+- Module visibility is enforced even inside `unsafe`; unsafe does not bypass representation
+  privilege.
 
 `resource.from_raw` on null is an unsafe-precondition violation. Safe driver constructors must test
 the native result and return a structured error before calling it.
@@ -258,7 +272,7 @@ The expected payload type selects `Option<str>` or `Option<slice<FFIScalar>>`. T
 UTF-8 when `str` is requested. `len == 0` produces a valid empty view even when the native pointer
 is null. The call remains `unsafe` because only the wrapper can prove that the foreign allocation
 really covers the reported range and stays alive. It is restricted to the resource's declaring
-package/internal subtree and ties `Some(view)` to the supplied owner generation. There is no
+declaring module subtree and ties `Some(view)` to the supplied owner generation. There is no
 owner-free `raw.as_str`/`raw.as_slice` safe escape hatch.
 
 These two operations are required general FFI boundary primitives. They are not SQLite/PostgreSQL
@@ -384,7 +398,11 @@ Rules:
   rejected;
 - the logical path stored in artifacts is root-relative with `/` separators;
 - the file must be valid UTF-8;
-- the exact bytes passed to the database are the hashed bytes; no newline normalization occurs;
+- the exact source bytes are the static-input bytes and receive a `source_sql_hash`; no newline
+  normalization occurs;
+- database wire bytes are a separate deterministic artifact field: SQLite uses the exact source
+  bytes, while PostgreSQL replaces only recognized named-parameter token spans with `$n` and
+  preserves every other byte;
 - the file is registered in `SourceMap` so SQL diagnostics carry file/byte spans.
 
 ### 5.3 Unit identity and cache keys
@@ -444,8 +462,10 @@ StaticQueryArtifact
   driver restriction
   static semantic options
   SQL logical path
-  SQL exact bytes
-  SQL hash
+  source SQL exact bytes
+  source SQL hash
+  per-allowed-driver wire SQL exact bytes/hash
+  source-to-wire rewrite map and rewrite-format version
   parameter occurrence table
   source-span map
   checked-metadata policy and digest
@@ -467,10 +487,10 @@ IStaticQuery
 
 The corresponding `IStaticCommand` omits Row. Both use the same interface/implementation split.
 
-These facts participate in `interface_hash`. SQL bytes/hash, occurrence tables, checked metadata,
-and generated bind/decode thunks participate in the producer's `impl_hash` and query artifact, not
-the consumer interface hash. Editing SQL without changing its public typed contract recompiles and
-relinks the producer but does not recompile consumers.
+These facts participate in `interface_hash`. Source/wire SQL bytes and hashes, rewrite maps,
+occurrence tables, checked metadata, and generated bind/decode thunks participate in the producer's
+`impl_hash` and query artifact, not the consumer interface hash. Editing SQL without changing its
+public typed contract recompiles and relinks the producer but does not recompile consumers.
 
 Compiled-library distribution bundles query artifacts as a separate CAS-addressed part. It does not
 smuggle SQL through generic function bodies or require source-path reconstruction.
@@ -484,7 +504,7 @@ data owned by the producer unit:
 QueryStatic
   query ID/hash
   driver mask
-  SQL pointer/length
+  per-driver wire-SQL pointer/length/hash
   static-option pointer
   generated bind thunk
   generated decode thunk
@@ -498,6 +518,13 @@ boxing, or map allocation.
 The producer's exported descriptor function returns the static pointer. Generated thunks stay in
 the producer object and are referenced by the static descriptor, so a consumer does not need the
 Query body to call it.
+
+The runtime selects the already-generated wire entry after checking the connection's driver mask
+and sends those bytes exactly. A PostgreSQL rewrite never becomes the source/build identity. The
+artifact maps each rewritten byte range back to its source parameter span so prepare/runtime
+diagnostics can report the `.sql` source; positions the engine cannot map are reported at the Query
+item. Checked metadata keys include driver, source hash, wire hash, rewrite-format version, and
+static options.
 
 ## 7. Region-backed plain-struct builder
 
@@ -513,6 +540,9 @@ build() -> array<T>
 ```
 
 The argument count makes the allocation home visible. There is no database-private vector.
+Both forms remain one-owner mutable locals. A helper may push through a `borrow mut` builder
+parameter, but a builder is not a `RegionPlain` value, cannot be stored in the shaping state, and is
+consumed only by the caller's final `build()`.
 
 ### 7.2 Plain element class
 
@@ -749,6 +779,8 @@ Acceptance:
 - a raw-derived `str`/slice cannot outlive the supplied resource generation;
 - invalid native pointer/length pairs never become safe views;
 - another package cannot construct or extract the resource, including in `unsafe`;
+- a root resource, raw-only internal Drop hook, and driver descendant type-check with an acyclic
+  import graph; the internal hook module cannot import the root;
 - no resource enters `spawn`.
 
 ### L4 — named region capability
@@ -785,6 +817,8 @@ Acceptance:
 - absolute/escaping/symlink paths fail;
 - a shadowing local or same-spelled user function does not read/register a file;
 - a stale `StaticInputManifest` is rejected after source/import/schema identity changes;
+- source SQL hash stays stable across driver selection, while PostgreSQL wire hash/rewrite map
+  changes deterministically with placeholder ordinals;
 - artifact bytes are reproducible across checkout roots and process runs.
 
 ### L6 — region plain-struct builder
@@ -800,8 +834,10 @@ Scope:
 Acceptance:
 
 - scalar/Option/plain-struct arrays build correctly;
+- `all<R>` rejects non-`RegionPlain` Row contracts before execution;
 - current-row views cannot be retained across `next`;
 - `clone_in` values can be retained;
+- a Pure helper may push through `borrow mut builder`, but cannot build/store/return it;
 - no heap allocation occurs in the region form;
 - exactly one compacting element pass occurs;
 - resources/owned heap fields receive compile diagnostics.

@@ -213,7 +213,7 @@ DB driverより先に次を実装する。
 - operator overloading、macro、第2のcompile-time言語。
 
 `db.query_file([])` などのstatic Query constructorだけは、expected Params/Row、
-source path、SQL hash、build dependencyを必要とするためcompiler-knownである。これは
+source path、source SQL hash、build dependencyを必要とするためcompiler-knownである。これは
 一般metaprogrammingではなく、限定されたstatic-data機能である。
 
 ### 4.3 共通の具体型
@@ -244,9 +244,20 @@ db.value
 - `db.exec_result`: affected rowsと利用可能なcommand status。
 - `db.row` / `db.value`: 明示的dynamic escape hatch。
 
-common packageがresource typeを宣言する。`pkg.db.internal` が2 driverのtagged native
-state、private FFI、Drop、operation dispatchを所有する。public trait/trait objectや
-外部driver resource ABIはない。
+common rootがresource typeを宣言し、rawだけを受けるDrop hookを
+`pkg.db.internal.resource` に置く。resource表現intrinsicは宣言moduleのdescendant subtree
+だけが使える。public driver descendantは `pkg.db` をimportし、raw-only internal FFI
+helperの結果を検査して、expected `db.conn` として `resource.from_raw` を直接呼ぶ。
+internal Drop-hook moduleは `pkg.db` をimportしない。
+
+```text
+pkg.db                    -> pkg.db.internal.resource
+pkg.db.sqlite/postgres    -> pkg.db + pkg.db.internal
+pkg.db.internal.*         -X-> pkg.db
+```
+
+したがってpublic raw constructorもmodule cycleもない。public trait/trait objectや外部driver
+resource ABIもない。
 
 ```align
 pub fn exec_conn(borrow c: db.conn) -> db.exec
@@ -343,7 +354,8 @@ review/tool/EXPLAIN/diffしやすい `.sql` を推奨する。
 ```text
 StaticQueryArtifact       producer implementation
   query id
-  exact SQL bytes/hash
+  exact source SQL bytes/hash
+  driver別wire SQL bytes/hashとsource map
   Params/Row identities
   driver restriction
   canonical static options
@@ -381,11 +393,24 @@ SQLiteはnative named token/indexへbindする。PostgreSQLはsource上の初出
 string literal、quoted identifier、line/block comment、dollar quote、`::` castを
 parameterと誤認しない。named/positionalの混在は拒否する。
 
+source SQLとwire SQLは別identityである。`source_sql` はreview対象のexact file/inline bytes
+とstatic-input hashを持つ。SQLite wireはsourceと同一。PostgreSQL wireは認識済みparameter
+token spanだけを `$n` へ置換し、それ以外のbyteを保存する。artifactは両hash、
+rewrite-format version、source-to-wire span mapを持つ。metadata keyはdriver/source hash/
+wire hash/rewrite version/static optionを含み、runtimeは選択したwire bytesを正確に送り、
+engine位置を可能な範囲でsource spanへ戻す。
+
 ### 5.7 Row
 
 RowはDBが返す正確でflatな列契約である。compilerがordinal decoder thunkを生成し、
 1行ごとのname lookup/reflectionは行わない。column count、type/storage class、
 NULL/non-NULLをruntimeでも検証してからRowを構築する。
+
+v1のstatic Rowは構造的に `RegionPlain` とする。scalar、`str`/`slice<u8>` view、
+それらから再帰的に作るOption/fixed array/plain fieldだけを許可し、独立owned `string`、
+dynamic `array`、resource、raw、function、builder fieldを拒否する。owned
+`string`/`array<u8>` はParams/Outputでは使えるが、v1 generated Rowの別storage formには
+しない。
 
 Rowにnested relationshipやlazy collectionを入れない。SQL aliasとRow fieldの対応は
 checked metadataで強化する。Declared modeでもexact ordinal契約をruntimeで守る。
@@ -423,8 +448,10 @@ rows       one-pass stream
 next_batch bounded batch
 ```
 
-`one`/`maybe_one` はcardinalityを証明するのに必要な行まで読み、`all` はregion builderの
-chunk growthと1回のcompact passを使う。名前からmaterialize/streamが分からない
+`one`/`maybe_one` はcardinalityを証明するのに必要な行まで読む。`all` はstructural
+`RegionPlain<R>` を要求し、region builderのchunk growthと1回のcompact passを使う。
+これはpublic traitではないcompile-time structural checkで、v1 static Rowはすべて満たす。
+名前からmaterialize/streamが分からない
 convenience APIは作らない。
 
 ### 6.3 Query-local run helper
@@ -474,11 +501,11 @@ State {
   seen_parent: bool,
   parent_id: i64,
   parent_name: str,
-  groups: array_builder<Group>,
 }
 
 pub fn step(
   borrow mut state: State,
+  borrow mut groups: array_builder<Group>,
   row: Row,
   out: region,
 ) -> Result<(), db.Error> {
@@ -487,8 +514,10 @@ pub fn step(
 }
 ```
 
-`step` はPureでDB handleを受けない。stateへのmutationは明示的 `borrow mut` inputだけに
-rootedする。runのrows loopがSQLを1回だけ実行する。
+`step` はPureでDB handleを受けない。stateとbuilderへのmutationは明示的 `borrow mut`
+inputだけにrootedする。builderはstruct fieldへ入れず、runの独立した
+`mut groups := array_builder(out)` localとして保持し、最後に `groups.build()` をconsumeする。
+runのrows loopがSQLを1回だけ実行する。
 
 ### 7.3 一対多: 複数parent
 
@@ -584,18 +613,22 @@ compactする。hidden heapは使わない。heap builderのzero-copy freezeは�
 ### 10.1 common logical type
 
 初期共通型はbool、符号付き整数、float、UTF-8 text、bytes、nullable `Option<T>` を中心に
-する。decimal、UUID、temporal、JSON、array/range/domainは明示型mappingを設計してから
-追加する。曖昧なimplicit conversionを避ける。
+する。Paramsではtext/bytesのowned formも使えるが、Rowは `str` / `slice<u8>` viewを使う。
+decimal、UUID、temporal、JSON、array/range/domainは明示型mappingを設計してから追加する。
+曖昧なimplicit conversionを避ける。
 
 ### 10.2 SQLite
 
 SQLite storage classとdeclared affinity/STRICT情報を区別する。runtime値の
 INTEGER/REAL/TEXT/BLOB/NULLを必ず検証し、lossy conversionを暗黙に行わない。
+TEXT/BLOBはParamsで `str|string` / `slice<u8>|array<u8>`、Rowで `str` /
+`slice<u8>` にmappingする。
 
 ### 10.3 PostgreSQL
 
 checked metadataはtype name、OID evidence、format、nullability/origin evidenceを持つ。
 text formatで開始してもbinary pathをsurfaceから閉ざさない。
+text系/byteaはParamsでviewまたはowned、Rowで `str` / `slice<u8>` viewにmappingする。
 
 ### 10.4 NULL
 
@@ -914,8 +947,9 @@ artifactを許し、`--check` は何も書かない。normal buildはenvironment
   postgres/
 ```
 
-artifactはversioned canonical formatで、Query id、SQL hash、option hash、Params/Row contract、
-driver/engine identity、schema/search-path/extension evidence、parameter/result metadata、
+artifactはversioned canonical formatで、Query id、source SQL hash、driver wire SQL hash、
+rewrite-format version、option hash、Params/Row contract、driver/engine identity、
+schema/search-path/extension evidence、parameter/result metadata、
 nullability/origin confidence、生成時刻以外のreproducible identityを持つ。secret/URLを
 保存しない。
 
@@ -1152,9 +1186,10 @@ protocolの1 statement性、parameter/result metadata、nullability evidence、c
 
 ### D1 — fake driver上のgenerated Query
 
-inline/sibling SQLからdescriptor/artifactを作り、named occurrence table、binder/decoder thunk、
-flat scalar Row、interface/implementation/cache invalidationをDBなしで証明する。reflectionと
-per-row name lookupがないことをbenchmark/IRで確認する。
+inline/sibling SQLからdescriptor/artifactを作り、exact source identityと
+SQLite source/PostgreSQL `$n` wire entry・reverse span map、named occurrence table、
+binder/decoder thunk、flat scalar Row、interface/implementation/cache invalidationをDBなしで
+証明する。reflectionとper-row name lookupがないことをbenchmark/IRで確認する。
 
 ### D2 — 最小SQLite vertical
 
@@ -1217,8 +1252,9 @@ static artifact identity、timeout/cancel後connection state。要求optionのsi
 ### D10 — compound Output
 
 many-to-one/master projectionと一対多Outputをend-to-endで実装する。Query-local visible loop、
-Pure `step(borrow mut state, row, out)`、region builder、1 execution、hidden SQL 0、copy/allocation
-countを固定する。初期DB releaseの必須項目。
+Pure step（`borrow mut state`、0個以上の独立した `borrow mut` builder、row、out）、
+1 execution、hidden SQL 0、copy/allocation countを固定する。builderはState fieldにしない。
+初期DB releaseの必須項目。
 
 ### D11 — SQL migration
 
@@ -1280,7 +1316,7 @@ execution-count付きで実証する。
 26. handleはgeneral resource/borrowを使い、compilerにpkg.db名のruleがない。
 27. caller materializationはnamed arena/region、ambient allocatorなし。
 28. SQL-only editはproducer/artifactをinvalidateし、unchanged consumerを不要にrecompileしない。
-29. compound shapingはPure `borrow mut` stepとvisible rows loop。
+29. compound shapingはPureな `borrow mut` state/独立builder stepとvisible rows loop。
 30. region builder allocationと1 compact passを測る。
 31. structured Move error/Outputはordinary recursive tagged Drop、Ok path error allocationなし。
 32. 3 moduleは1つの `pkg/db` subtreeでacyclic。

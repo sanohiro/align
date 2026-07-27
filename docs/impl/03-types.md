@@ -268,8 +268,9 @@ reference type or a package-name table.
 
 A `Resource(DefId, args)` is always Move and owns one non-null native handle. Its declaration
 provides the Drop hook; module checking restricts representation intrinsics to the declaring
-package's `internal` subtree. `ResourceRef` is Copy but inherits the precise owner generation and
-is invalid after move, replacement, Drop, or `BorrowMut`.
+module's canonical descendant subtree. The raw-only hook module need not import the resource root,
+so driver construction remains acyclic. `ResourceRef` is Copy but inherits the precise owner
+generation and is invalid after move, replacement, Drop, or `BorrowMut`.
 
 A resource created from `from_raw_borrowed` also carries the parent `ResourceRef` provenance.
 The child is still an owner, but it recursively tracks a borrow: moving the child transfers that

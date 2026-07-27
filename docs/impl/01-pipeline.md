@@ -100,9 +100,10 @@ executable
 - CLI. Discovers the import DAG, builds/verifies unit interfaces, runs per-unit codegen through the
   default-on object cache (parallel by default), selects runtime capabilities, links, and atomically
   publishes the executable.
-- Before cache lookup, conservatively discovers recognized static-input candidates in reachable
-  units, resolves their safe module-relative paths, reads exact bytes, and keys the producer on the
-  sorted logical-path/content-hash list. Sema must confirm the recognized callee or fail closed.
+- On a cold source/import identity, import/name resolution first proves recognized static-input
+  callees; only then does the driver resolve/read/hash their exact safe paths. A later pre-frontend
+  lookup may reuse only a versioned static-input manifest bound to that exact resolution digest, so
+  shadowed/same-spelled calls never cause a file read.
 - Emits versioned Query/command artifacts beside interfaces/objects. SQL bytes and generated thunks
   affect the producer implementation and link; only Params/Row/restriction/static semantics affect
   consumer interfaces.

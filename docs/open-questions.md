@@ -3387,9 +3387,11 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    allocator-boundary mismatch with the C-free that frees `array<T>`). The shipped heap form
    accepts Copy scalars + `string`; Move handles remain excluded.
    **Region form SETTLED 2026-07-27 (required before `pkg.db`):**
-   `array_builder<T>(out: region)` accepts recursively `RegionPlain` structs as well as the
-   shipped scalar/string shapes. Growth uses chunks allocated in `out`; `.build()` performs
-   exactly one documented compacting pass into `out` and never allocates on the heap. A
+   `array_builder<T>(out: region)` accepts recursively `RegionPlain` scalars/views/structs. It
+   deliberately rejects the heap form's independently owned `string` element (copy it to a
+   region-valid `str` with `clone_in(out)` instead). Growth uses chunks allocated in `out`;
+   `.build()` performs exactly one documented compacting pass into `out` and never allocates on the
+   heap. A
    borrowed field from a shorter row generation must be made owned with `clone_in(out)` before
    insertion. This is the common compound-output mechanism, not a database-private builder.
    Full contract and implementation order: `impl/17-library-boundary-prerequisites.md` §7.
@@ -3630,8 +3632,10 @@ in an explicit `borrow mut` parameter remains Pure when there is no other Impure
 an alias-checked exclusive input effect, not hidden captured mutation.
 
 `pub resource name = internal.drop_name` declares a package-defined opaque one-word Move owner
-with an exactly-once Drop hook. Only the declaring package's `internal` subtree may construct or
-extract its `raw` representation, and only inside `unsafe`. Safe code receives a non-owning
+with an exactly-once Drop hook. Only the declaring module's canonical descendant subtree may
+construct or extract its `raw` representation, and only inside `unsafe`. The raw-only Drop-hook
+module need not import the declaring root, so a driver descendant can construct the root resource
+without a root↔internal cycle. Safe code receives a non-owning
 `resource_ref<R>` through borrowing; it cannot close, transfer, or outlive the owner generation.
 `resource.from_raw_borrowed` lets a child resource retain one parent generation until child Drop.
 The unsafe internal `resource.view_from_raw` returns an owner-tied checked `Option<str>`/slice; no

@@ -54,6 +54,9 @@ builder.build() -> array<T>
 
 - Fixed array は Copy 値である。**Move 要素** を持つ fixed array（所有権付きフィールドを持つ `[User{name}]` など）は、要素ごとの drop が実装されるまで拒否される。
 - Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（str 要素の配列は deep-free される。#339 の前例を参照）。
+- `array_builder<T>` は1つのmutable-local Move ownerである。L2後は同じownerを
+  `borrow mut` parameter経由でhelperが変更できるが、builderをaggregate fieldやreturn
+  valueにはできない。
 - Slice は Copy のビューである。`mut slice<T>` の束縛（または `out` 引数）が、唯一の書き込み可能なビュー形式となる。
 - `.count()` は *パイプライン* の長さを表す（`where` と合成される）。一方 `.len()` は直接的な長さの読み取りである。これら 2 つは意図的に両方存在しており、統合してはならない。
 - `zip(a, b, ...)` はパイプライン専用の遅延評価ソースである。インデックスごとに SSA タプルを 1 つだけ作成し、ループの前にランタイムの長さをすべて検査するため、タプルの配列用メモリは確保しない。v1 では 2 つ以上の名前付きの array/slice、fixed literal、または Copy 可能なプリミティブスカラー要素を持つ sub-slice を受け取る。

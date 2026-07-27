@@ -220,9 +220,11 @@ pub resource stmt<P, R> = internal.drop_stmt
 
 This is an opaque nominal Move type declaration, not a third data-type body syntax. The right-hand
 path is the exactly-once Drop hook and must name an allowed function in the declaring package's
-`internal` subtree. Resource representation operations are compiler intrinsics restricted by
-module visibility and `unsafe`; they are not parsed as special resource syntax. Full type and
-lowering rules are in `17-library-boundary-prerequisites.md` §3.
+`internal` subtree. Resource representation operations are compiler intrinsics restricted to the
+declaring module's canonical descendant subtree and `unsafe`; they are not parsed as special
+resource syntax. The Drop hook accepts only `raw` and its module need not import the declaring root,
+so that privilege does not introduce a reverse module edge. Full type and lowering rules are in
+`17-library-boundary-prerequisites.md` §3.
 
 ### Global constants
 
