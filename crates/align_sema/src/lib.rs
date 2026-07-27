@@ -910,16 +910,16 @@ pub enum DropPlan {
     Leaf(Ty),
     Struct {
         id: u32,
-        fields: Vec<(u32, DropPlan)>,
+        fields: Vec<(u32, std::sync::Arc<DropPlan>)>,
     },
-    Option(Box<DropPlan>),
+    Option(std::sync::Arc<DropPlan>),
     Result {
-        ok: Box<DropPlan>,
-        err: Box<DropPlan>,
+        ok: std::sync::Arc<DropPlan>,
+        err: std::sync::Arc<DropPlan>,
     },
     Enum {
         id: u32,
-        variants: Vec<Vec<DropPlan>>,
+        variants: Vec<Vec<std::sync::Arc<DropPlan>>>,
     },
     /// A malformed or cyclic resolved definition. Sema diagnoses the definition separately; the
     /// classifier remains fail-closed so a later analysis cannot accidentally call it Copy.
@@ -934,7 +934,9 @@ impl DropPlan {
             DropPlan::Struct { fields, .. } => fields.iter().any(|(_, plan)| plan.needs_drop()),
             DropPlan::Option(payload) => payload.needs_drop(),
             DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
-            DropPlan::Enum { variants, .. } => variants.iter().flatten().any(DropPlan::needs_drop),
+            DropPlan::Enum { variants, .. } => {
+                variants.iter().flatten().any(|plan| plan.needs_drop())
+            }
         }
     }
 }
@@ -943,7 +945,19 @@ impl DropPlan {
 /// finite for every valid Align type; inline recursive definitions produce [`DropPlan::Invalid`]
 /// rather than recursing or panicking.
 pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropPlan {
-    drop_plan_rec(ty, structs, enums, &mut Vec::new(), &mut Vec::new())
+    let mut struct_cache = vec![None; structs.len()];
+    let mut enum_cache = vec![None; enums.len()];
+    drop_plan_rec(
+        ty,
+        structs,
+        enums,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut struct_cache,
+        &mut enum_cache,
+    )
+    .as_ref()
+    .clone()
 }
 
 fn drop_plan_rec(
@@ -952,14 +966,19 @@ fn drop_plan_rec(
     enums: &[hir::EnumDef],
     struct_path: &mut Vec<u32>,
     enum_path: &mut Vec<u32>,
-) -> DropPlan {
+    struct_cache: &mut [Option<std::sync::Arc<DropPlan>>],
+    enum_cache: &mut [Option<std::sync::Arc<DropPlan>>],
+) -> std::sync::Arc<DropPlan> {
     match ty {
         Ty::Struct(id) => {
+            if let Some(plan) = struct_cache.get(id as usize).and_then(Clone::clone) {
+                return plan;
+            }
             if struct_path.contains(&id) {
-                return DropPlan::Invalid;
+                return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = structs.get(id as usize) else {
-                return DropPlan::Invalid;
+                return std::sync::Arc::new(DropPlan::Invalid);
             };
             struct_path.push(id);
             let fields = def
@@ -969,42 +988,61 @@ fn drop_plan_rec(
                 .map(|(index, field)| {
                     (
                         index as u32,
-                        drop_plan_rec(field.ty, structs, enums, struct_path, enum_path),
+                        drop_plan_rec(
+                            field.ty,
+                            structs,
+                            enums,
+                            struct_path,
+                            enum_path,
+                            struct_cache,
+                            enum_cache,
+                        ),
                     )
                 })
                 .collect();
             struct_path.pop();
-            DropPlan::Struct { id, fields }
+            let plan = std::sync::Arc::new(DropPlan::Struct { id, fields });
+            struct_cache[id as usize] = Some(plan.clone());
+            plan
         }
-        Ty::Option(payload) => DropPlan::Option(Box::new(drop_plan_rec(
+        Ty::Option(payload) => std::sync::Arc::new(DropPlan::Option(drop_plan_rec(
             scalar_to_ty(payload),
             structs,
             enums,
             struct_path,
             enum_path,
+            struct_cache,
+            enum_cache,
         ))),
-        Ty::Result(ok, err) => DropPlan::Result {
-            ok: Box::new(drop_plan_rec(
+        Ty::Result(ok, err) => std::sync::Arc::new(DropPlan::Result {
+            ok: drop_plan_rec(
                 scalar_to_ty(ok),
                 structs,
                 enums,
                 struct_path,
                 enum_path,
-            )),
-            err: Box::new(drop_plan_rec(
+                struct_cache,
+                enum_cache,
+            ),
+            err: drop_plan_rec(
                 scalar_to_ty(err),
                 structs,
                 enums,
                 struct_path,
                 enum_path,
-            )),
-        },
+                struct_cache,
+                enum_cache,
+            ),
+        }),
         Ty::Enum(id) => {
+            if let Some(plan) = enum_cache.get(id as usize).and_then(Clone::clone) {
+                return plan;
+            }
             if enum_path.contains(&id) {
-                return DropPlan::Invalid;
+                return std::sync::Arc::new(DropPlan::Invalid);
             }
             let Some(def) = enums.get(id as usize) else {
-                return DropPlan::Invalid;
+                return std::sync::Arc::new(DropPlan::Invalid);
             };
             enum_path.push(id);
             let variants = def
@@ -1021,13 +1059,17 @@ fn drop_plan_rec(
                                 enums,
                                 struct_path,
                                 enum_path,
+                                struct_cache,
+                                enum_cache,
                             )
                         })
                         .collect()
                 })
                 .collect();
             enum_path.pop();
-            DropPlan::Enum { id, variants }
+            let plan = std::sync::Arc::new(DropPlan::Enum { id, variants });
+            enum_cache[id as usize] = Some(plan.clone());
+            plan
         }
         // These types have an existing, non-recursive cleanup leaf. Aggregate layout is not
         // encoded here: codegen's leaf lowering remains the representation source of truth.
@@ -1067,9 +1109,9 @@ fn drop_plan_rec(
                 | Ty::DictEncoded(..)
         ) =>
         {
-            DropPlan::Leaf(ty)
+            std::sync::Arc::new(DropPlan::Leaf(ty))
         }
-        _ => DropPlan::None,
+        _ => std::sync::Arc::new(DropPlan::None),
     }
 }
 
@@ -26526,12 +26568,12 @@ mod tests {
         let DropPlan::Struct {
             fields: inner_fields,
             ..
-        } = &fields[0].1
+        } = fields[0].1.as_ref()
         else {
             panic!("nested plan must be a struct");
         };
         assert!(matches!(
-            &inner_fields[0].1,
+            inner_fields[0].1.as_ref(),
             DropPlan::Option(payload) if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
         ));
     }
@@ -26549,5 +26591,45 @@ mod tests {
         }];
         assert!(drop_plan(Ty::Struct(0), &cyclic, &[]).needs_drop());
         assert_eq!(drop_plan(Ty::Struct(99), &cyclic, &[]), DropPlan::Invalid);
+    }
+
+    #[test]
+    fn drop_plan_shares_repeated_subgraphs() {
+        let mut structs = vec![StructDef {
+            name: "S0".to_string(),
+            fields: vec![FieldDef {
+                name: "owned".to_string(),
+                ty: Ty::String,
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        for depth in 1..40 {
+            let child = (depth - 1) as u32;
+            structs.push(StructDef {
+                name: format!("S{depth}"),
+                fields: vec![
+                    FieldDef {
+                        name: "left".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                    FieldDef {
+                        name: "right".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            });
+        }
+        let plan = drop_plan(Ty::Struct(39), &structs, &[]);
+        assert!(plan.needs_drop());
+        let DropPlan::Struct { fields, .. } = plan else {
+            panic!("root plan must be a struct");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&fields[0].1, &fields[1].1),
+            "repeated nominal children must share one memoized DropPlan node"
+        );
     }
 }
