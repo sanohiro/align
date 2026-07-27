@@ -930,8 +930,8 @@ nested progress remain pinned.
   compiler shapes are now covered by the kernel, while other hosts and any more aggressive
   body-driven retune remain deferred.
 - ~~Probe stable parallel compaction for callable scalar `where`.~~ **SHIPPED 2026-07-26** with
-  count/prefix/scatter range kernels; AoS field filters now share that path, while SoA/string forms
-  remain deferred.
+  count/prefix/scatter range kernels; AoS field filters and the recognised invariant `str.contains`
+  filter now share that path, while SoA and richer string forms remain deferred.
   The focused `bench/par_map/run.sh filter` probe measured the 50% scalar case on native Apple
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence

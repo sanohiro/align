@@ -148,8 +148,11 @@ i64 align_rt_par_map_reduce(
   `where` stages. Its count kernel writes one survivor count per range; the runtime prefix-sums those
   counts in input order, allocates the exact result, and invokes the scatter kernel with one stable
   byte offset per range. The map/filter chain is Pure and is intentionally evaluated in both passes;
-  the result is `{null,0}` when no element survives. SoA projections, `str.contains`, aggregate
-  stages, and other unsupported layouts remain on the sequential path. A `chunks` source uses the
+  the result is `{null,0}` when no element survives. SoA projections, richer string-search
+  expressions, unsupported aggregate layouts, and other unsupported layouts remain on the sequential
+  path. A
+  compiler-recognised invariant `str.contains` filter uses the same stable count/scatter path. A
+  `chunks` source uses the
   ordinary range kernel with `slice<T>` element headers; the chunk-header allocation is still
   materialized by `align_rt_chunks` and freed by the synchronous consumer.
 - `align_rt_par_map_reduce` is the specialized direct, stage-free integer
