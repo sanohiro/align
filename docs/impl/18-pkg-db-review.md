@@ -69,7 +69,7 @@ listed source agree.
 | Offline metadata artifacts | explicit prepare only; per-driver Missing/Present identity; normal build has no DB/network access | L5/D3/D5 | stale/reproducible/offline/cache matrix and artifact time/size | pipeline/cache plans, DB EN/JA |
 | Options/errors/result | finite scope-specific sums; unsupported is error; owned structured error; `exec_result` is Copy `{ rows_affected: Option<i64> }` | D1/D2/D4/D6/D7/D9/D12 | disposition/error-buffer tests and zero-allocation result check | DB EN/JA |
 | Migrations | exact entry/catalog/driver/target CLI; SQL catalog identity; atomic default; one-statement dirty exceptional path | D11 | CLI-input/checksum/crash/repair/status matrix and history scaling | roadmap, DB EN/JA |
-| Metadata records | exact typed refs and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | field/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
+| Metadata records | exact typed refs, pre-native identifier validation, detail/discriminator projection, ordinals/digest, and flat Column/Key/Index/Query fields; explicit region; no native-buffer borrow | D12 | input/detail/entry/field/flatness/lifetime/category/query-count matrix and catalog benchmark | DB EN/JA |
 | Nullability/origin | engine-reported query evidence only; ambiguous is `Unknown`; D0 evidence and D3/D5 support matrices precede checked metadata | D0/D3/D5 | outer-join/expression/catalog/runtime-NULL matrix | roadmap, DB EN/JA |
 | Delivery order | L1a–L7, D0–D12 release gate, D13–D14 additive; no consumer precedes its prerequisite | all | per-PR gates in §5 and §7 | roadmap, HANDOFF, prerequisite plan, DB EN/JA |
 
@@ -1147,6 +1147,31 @@ idea is rejected.
   runtime NULL guard.
 - **v1 impact:** D3/D5 merge blocker; resolved as a prerequisite policy rather than deferred.
 
+### F80 — metadata detail/discriminator projection was not executable
+
+- **Classification:** specification ambiguity; implementation complexity.
+- **Problematic design location:** DB §18.1/§18.2 record lists before §18.2.1.
+- **Current Align constraint:** flat `RegionPlain` metadata has no runtime reflection or tagged
+  property bag that can recover unspecified presence, ordering, or ordinal semantics.
+- **Actual failure:** D12 implementations could return different row counts at `Names`, duplicate
+  summary-only fields, choose different ordinal bases, or hash different artifact inputs while all
+  claiming to implement the listed record types.
+- **Recommendation:** define the exhaustive category/detail and `MetaQueryEntry` matrices, exact
+  ordering/ordinal bases, inapplicable/unavailable `Option` behavior, and exact artifact digest.
+- **v1 impact:** D12 public compatibility blocker.
+
+### F81 — metadata identifier views lacked native-boundary encoding rejection
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** DB §18.2 `SchemaRef`/`TableRef` input semantics.
+- **Current Align constraint:** `str` is length-delimited and can contain U+0000, while native SQL
+  and catalog control paths may be NUL-terminated.
+- **Actual failure:** a safe metadata lookup could truncate a schema/table name or behave
+  differently between SQLite and PostgreSQL before the package notices.
+- **Recommendation:** reject U+0000 in each ref component before native/catalog access with exact
+  Query-less `db.Error.Encode` items and negative tests on both drivers.
+- **v1 impact:** D12 input-safety blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1316,6 +1341,8 @@ documents:
 72. Put every promised key/include/order/state field in the exact flat `IndexMeta` record.
 73. Align the exact `ColumnMeta`/`QueryMeta` records with artifact and category promises.
 74. Move the nullability/origin evidence contract to D0/D3/D5 and keep runtime NULL guards.
+75. Define exact metadata detail/discriminator projections, ordinals, ordering, and artifact digest.
+76. Reject U+0000 in every metadata schema/table reference before a native/catalog request.
 
 ## 5. Revised implementation roadmap
 
@@ -1341,7 +1368,7 @@ documents:
 | D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence, resynchronize-or-close | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-input exact-policy SQL migrations; initial-release gate | CLI selector, checksum/order/atomic/dirty/repair/status | migration startup/large history |
-| D12 | exact typed-ref/record, region-owned category metadata and EXPLAIN options; initial-release gate | field/lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/latency |
+| D12 | exact validated typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options; initial-release gate | identifier/detail/entry/field/ordinal/digest/lifetime/allocation/flatness/category isolation, Query-ID context; ANALYZE executes visibly | catalog query count/record bytes/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -1471,6 +1498,10 @@ The public-contract ledger in §1.1 now closes those categories in one pass, and
 repository guidance requires the ledger before independent review. F71–F79 were propagated from
 that ledger through the authoritative language/package/roadmap documents and the Japanese mirror;
 the review was not restarted as another unconstrained whole-document search.
+The final ledger closeout then found F80–F81 in the one metadata row: the row named exact record
+types but had not expanded detail/discriminator presence or input encoding. The stale-HEAD host
+review was stopped immediately rather than allowed to consume its remaining bound. The metadata
+ledger row was expanded first, then propagated as §18.2.1 plus the two-driver negative-test gate.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

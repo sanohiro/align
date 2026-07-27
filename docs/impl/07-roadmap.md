@@ -3553,7 +3553,9 @@ local-only. D10 is part of the initial database release rather than a future rel
 D11 SQL migrations use the exact required-by-default/forbidden-one-statement policy and dirty-state
 repair contract. Every migrate/status/check/repair invocation explicitly names its entry,
 migration catalog, driver, and matching database target. D12 returns exact flat metadata/plan
-records into an explicit region. Both are part
+records into an explicit region. Its gate includes the complete category/detail/discriminator
+projection and ordinal/digest matrix plus pre-native U+0000 rejection for every schema/table
+reference component on both drivers. Both are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

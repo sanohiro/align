@@ -371,5 +371,7 @@ explicit entry, migration catalog, driver, and matching target on every live com
 exact `SchemaRef`/`TableRef` inputs and complete flat Column/Key/Index/Query records. Query
 nullability is fail-closed: D0 records actual engine evidence, D3/D5 own the driver matrices,
 ambiguous evidence is `Unknown`, and catalog `NOT NULL` alone never removes runtime NULL checking.
+Metadata `Names`/`Summary`/`Full` and Query entry rows have one exact presence/order/ordinal/digest
+matrix, and schema/table reference components reject U+0000 before native access.
 The repository's design process now requires one public-contract ledger and an author-side
 ledger-to-prose pass before independent review.

@@ -129,8 +129,12 @@ independent review:
 
 - every normative prose promise appears in the exact public record, and every
   public field has specified semantics;
+- every detail level, discriminator, and option state has an exhaustive
+  field-presence, row-order, ordinal, and unavailable-value rule;
 - every argument and result has a concrete type, ownership, lifetime, and
   allocation rule;
+- every text/view input crossing a native or wire boundary has explicit
+  encoding, embedded-NUL, validation-error, and pre-side-effect semantics;
 - every CLI and build input is explicit, deterministic, and free of ambient
   configuration unless the contract names that configuration;
 - no milestone consumes a decision or capability scheduled for a later

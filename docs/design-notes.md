@@ -324,8 +324,10 @@ ambient configuration cannot redirect it. A visibly transaction-forbidden one-st
 records Applying before native execution and blocks on ambiguous failure until checksum-bound
 operator repair. Query nullability is similarly fail-closed: engine-reported query evidence is
 retained, ambiguous evidence remains `Unknown`, and catalog `NOT NULL` alone cannot remove runtime
-NULL checks after joins or expressions. These choices expose the costs that cannot be wished away:
-result retention, live-schema identity, and non-transactional side effects.
+NULL checks after joins or expressions. Metadata detail is a finite projection matrix, not a
+best-effort property bag; identifiers are validated before native access. These choices expose the
+costs that cannot be wished away: result retention, live-schema identity, and non-transactional
+side effects.
 
 **An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
 A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would

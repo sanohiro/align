@@ -2406,6 +2406,49 @@ db.QueryPlan
   body: str
 ```
 
+#### 18.2.1 Detail projection, rows, and ordinals
+
+Every optional field outside the selected detail is `None`. At the selected detail, unavailable
+engine evidence is also `None`; empty text, zero, and `false` are real reported values and never
+stand for absence. A field that is not applicable to that record discriminator is `None` even at
+`Full`. Required identity fields are present at every detail. Results use byte-lexicographic `str`
+ordering after the category keys below, so engine/catalog iteration order is never observable.
+
+| Category | Rows and required fields at every detail | `Names` | `Summary` | `Full` |
+|---|---|---|---|---|
+| `DatabaseMeta` | exactly one; `driver`, `name`, `engine_version` | all optional fields `None` | request `default_schema`, `read_only`, `transactional_ddl` | Summary plus `encoding`, `collation` |
+| `SchemaMeta` | one per selected schema, ordered by `name`; `name`, `visible`, `system` | `owner = None` | request `owner` | same common fields as Summary |
+| `TableMeta` | one per selected table/view, ordered by `(schema, name)`; `schema`, `name`, `kind` | all optional fields `None` | request `native_kind`, `owner`, `estimated_rows` | Summary plus `comment` |
+| `ColumnMeta` | one per column, physical/result order; `ordinal` is zero-based; `schema`, `table`, `name`, `ordinal` | optional fields `None`; `nullable = Unknown` | request `logical_type`, `native_type`, and catalog-column `nullable` | Summary plus `native_type_id`, default/generated/identity/collation/comment, and view-origin fields |
+| `KeyMeta` | one row per key/constraint term, ordered by `(name, term_ordinal)`; `term_ordinal` is zero-based; identity, `kind`, ordinal required | all optional fields `None` | request local/referenced names and `expression` | Summary plus match/update/delete, deferral, and validation evidence |
+| `IndexMeta` | one row per term, ordered by `(name, term_ordinal)` with key terms before included terms; `term_ordinal` is zero-based across that order; identity, ordinal, `term_kind` required | all optional fields `None` | request unique/primary backing, column/expression/predicate, and sort/null order | Summary plus native method/opclass and valid/ready evidence |
+| `QueryMeta` | ordering and discriminator rules below; Query/driver identity, class, artifact/state, source/wire hashes, rewrite version, and `entry` required on every row | one `Summary` row only | Summary then all Parameter and Column rows with source names/aliases and logical types | same rows plus checked native/origin/nullability and prepare/schema/server evidence |
+
+`ColumnMeta.nullable` describes the catalog column declaration when requested; it does not prove
+the nullability of a Query result. `QueryMeta.nullable` follows §16.3.1.
+
+`QueryMeta` has these exact discriminator rules:
+
+| `entry` | Row presence and order | `ordinal` | Applicable optional fields |
+|---|---|---|---|
+| `Summary` | exactly one first | `None` | `metadata_fingerprint` at Summary/Full when checked; `prepare_identity`, `schema_identity`, and `server_identity` only at Full when checked |
+| `Parameter` | absent at Names; one per distinct source parameter at Summary/Full, ordered by protocol ordinal | one-based protocol ordinal (`$1` is 1) | `source_name`, `logical_type`; plus checked `native_type`/`native_type_id` at Full |
+| `Column` | absent at Names; one per Row field at Summary/Full, ordered by decoder position | zero-based decoder ordinal | `source_alias`, `logical_type`; plus checked `native_type`/`native_type_id`, structured origin, and §16.3.1 `nullable` at Full |
+
+On `Summary` and `Parameter` entries, `nullable` is `Unknown`. `source_alias` is inapplicable to
+Parameter, `source_name` is inapplicable to Column, and every origin field is inapplicable to
+Parameter. The `metadata_fingerprint` and prepare/schema/server identities occur only on the
+`Summary` entry; they are not duplicated on Parameter/Column rows. A `Declared` Query has no
+checked-only fields at any detail.
+
+`artifact_digest` is the 32-character lowercase hexadecimal `Hash128::of` value of the exact
+versioned D1 `StaticQueryArtifact` bytes emitted for this Query descriptor (the digest is not
+embedded in those bytes). The bytes cover Query identity, driver restriction, source SQL, static
+Query options, Params/Row fingerprints, binder/decoder ABI versions, and every permitted driver's
+wire SQL/rewrite/binding/checked-metadata entry in `Driver` enum order. The same digest is repeated
+on each driver-specific `QueryMeta` row for that descriptor. Runtime options, connection/secret
+data, requested `MetaDetail`, and metadata output ordering are excluded.
+
 Keys/constraints and indexes with several terms are repeated flat rows sharing `name`, ordered by
 `term_ordinal`; index key terms precede included terms and `term_kind` distinguishes them. A category
 result never hides a nested allocation. `db.QueryMeta` begins with one
@@ -2453,6 +2496,12 @@ driver never stores them. `SchemaRef.name` selects one exact engine schema/attac
 explicit option requests them. `TableRef` always carries an exact schema and name, so lookup never
 depends on PostgreSQL search path or an inferred SQLite `main`. Names are bound/escaped through the
 driver metadata API and are never pasted into SQL.
+
+Every `SchemaRef.name`, `TableRef.schema`, and `TableRef.name` is checked for U+0000 before any
+driver/native metadata call. Rejection returns `db.Error.Encode(db.ContractError { query_id: None,
+item, message: "metadata identifier contains U+0000" })`. `item` is exactly
+`"metadata.schema"`, `"metadata.table.schema"`, or `"metadata.table.name"` for the corresponding
+component. No SQL/catalog request is sent on this error.
 
 Every string byte and every result array is allocated in the explicit `out` region before the native
 metadata/result buffer is released. No returned value borrows a connection, result, statement, or
@@ -3036,7 +3085,10 @@ Native detail:
 
 Tests prove that one requested category does not fetch unrelated categories; every returned string
 survives native-result cleanup until its destination arena ends; category arrays allocate only in
-that arena; multi-term keys/indexes remain flat ordered rows; and `meta_table` reports `NotFound`.
+that arena; every §18.2.1 category/detail/entry projection, ordering, ordinal base, unavailable
+field, and artifact digest is exact; multi-term keys/indexes remain flat ordered rows; and
+`meta_table` reports `NotFound`. Both drivers reject U+0000 in every `SchemaRef`/`TableRef`
+component with the exact Query-less Encode item before any native/catalog request.
 Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
 category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
 operation.
@@ -3235,6 +3287,10 @@ The design is implemented correctly only if all are true:
     rewrite, prepare/schema/server, and descriptive fields promised by §§16 and 18.
 91. D0 records engine/version nullability/origin evidence; D3 and D5 own fail-closed support
     matrices before merge, `Unknown` never proves non-null, and every runtime NULL guard remains.
+92. Every metadata category/detail and `MetaQueryEntry` discriminator follows §18.2.1's exact row,
+    field-presence, ordering, ordinal, and `artifact_digest` contract.
+93. Metadata schema/table inputs reject U+0000 as the exact Query-less `db.Error.Encode` before any
+    native/catalog request on both drivers.
 
 ---
 

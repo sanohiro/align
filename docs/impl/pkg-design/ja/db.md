@@ -1383,6 +1383,48 @@ db.QueryPlan
   body: str
 ```
 
+#### 18.2.1 detail projection、row、ordinal
+
+selected detailの外にあるoptional fieldは `None`。selected detailでもengine evidenceが
+unavailableなら `None`。empty text、zero、`false` は実際のreported valueでabsence sentinelに
+しない。record discriminatorにinapplicableなfieldはFullでも `None`。required identityは
+全detailで存在する。結果は下記category keyの順に `str` byte-lexicographic orderを使い、
+engine/catalog iteration orderを外へ出さない。
+
+| Category | 全detailのrowとrequired field | `Names` | `Summary` | `Full` |
+|---|---|---|---|---|
+| `DatabaseMeta` | exactly one; `driver`, `name`, `engine_version` | optionalは全て `None` | `default_schema`, `read_only`, `transactional_ddl` を要求 | Summaryに `encoding`, `collation` を追加 |
+| `SchemaMeta` | selected schemaごとに1行、`name`順; `name`, `visible`, `system` | `owner = None` | `owner` を要求 | common fieldはSummaryと同じ |
+| `TableMeta` | table/viewごとに1行、`(schema, name)`順; `schema`, `name`, `kind` | optionalは全て `None` | `native_kind`, `owner`, `estimated_rows` を要求 | Summaryに `comment` を追加 |
+| `ColumnMeta` | columnごとにphysical/result順; `ordinal`はzero-based; `schema`, `table`, `name`, `ordinal` | optionalは全て `None`; `nullable = Unknown` | `logical_type`, `native_type`, catalog-column `nullable` を要求 | Summaryに `native_type_id`、default/generated/identity/collation/comment、view-originを追加 |
+| `KeyMeta` | key/constraint termごとに1行、`(name, term_ordinal)`順; `term_ordinal`はzero-based; identity, `kind`, ordinal必須 | optionalは全て `None` | local/referenced nameと `expression` を要求 | Summaryにmatch/update/delete、deferral、validation evidenceを追加 |
+| `IndexMeta` | termごとに1行、key termをinclude termより前にして`(name, term_ordinal)`順; 全体の`term_ordinal`はzero-based; identity, ordinal, `term_kind`必須 | optionalは全て `None` | unique/primary backing、column/expression/predicate、sort/null orderを要求 | Summaryにnative method/opclass、valid/ready evidenceを追加 |
+| `QueryMeta` | 下記ordering/discriminator rule; Query/driver identity、class、artifact/state、source/wire hash、rewrite version、`entry`は全行必須 | `Summary` 1行だけ | Summaryの後に全Parameter/Column行、source name/aliasとlogical type | 同じ行にchecked native/origin/nullabilityとprepare/schema/server evidenceを追加 |
+
+`ColumnMeta.nullable` は要求時のcatalog column declarationで、Query result nullabilityを
+証明しない。`QueryMeta.nullable` は§16.3.1に従う。
+
+`QueryMeta` discriminatorは次で固定する。
+
+| `entry` | row presence/order | `ordinal` | applicable optional field |
+|---|---|---|---|
+| `Summary` | exactly one、常に先頭 | `None` | checkedならSummary/Fullで `metadata_fingerprint`; checkedかつFullだけ `prepare_identity`, `schema_identity`, `server_identity` |
+| `Parameter` | Namesではabsent; Summary/Fullでdistinct source parameterごとに1行、protocol ordinal順 | one-based protocol ordinal（`$1` は1） | `source_name`, `logical_type`; Fullでchecked `native_type`/`native_type_id` |
+| `Column` | Namesではabsent; Summary/FullでRow fieldごとに1行、decoder position順 | zero-based decoder ordinal | `source_alias`, `logical_type`; Fullでchecked `native_type`/`native_type_id`、structured origin、§16.3.1 `nullable` |
+
+Summary/Parameter entryの `nullable` は `Unknown`。Parameterに `source_alias`、Columnに
+`source_name`、Parameterにorigin fieldはinapplicable。`metadata_fingerprint` と
+prepare/schema/server identityはSummary entryだけに置き、Parameter/Columnへ複製しない。
+Declared Queryはどのdetailでもchecked-only fieldを持たない。
+
+`artifact_digest` はこのQuery descriptor用にemitしたexact versioned D1
+`StaticQueryArtifact` bytes（digest自体はbytesに含めない）に対する `Hash128::of` の32文字
+lowercase hexadecimal値。bytesはQuery identity、driver restriction、source SQL、static
+Query option、Params/Row fingerprint、binder/decoder ABI version、全permitted driverの
+wire SQL/rewrite/binding/checked-metadata entryを `Driver` enum順で含む。同じdescriptorの
+driver-specific `QueryMeta` rowは同じdigestを繰り返す。runtime option、connection/secret、
+requested `MetaDetail`、metadata output orderingは含めない。
+
 multi-term key/indexは同じnameを持つordered flat rowとして返す。index key termはincluded
 termより前に置き、`term_kind` で区別し、nested allocationを作らない。
 QueryMetaはSummary 1行の後にparameter/column行をordinal順で返す。detail/engineにないfieldは
@@ -1420,6 +1462,13 @@ driverは保持しない。`SchemaRef.name` はexact engine schema/attached-data
 explicit optionが要求した場合だけ含む。`TableRef` は常にexact schema/nameを持つため、
 PostgreSQL search pathやSQLite `main`を推測しない。identifierはdriver metadata APIで
 bind/escapeし、SQLへ文字列連結しない。
+
+`SchemaRef.name`、`TableRef.schema`、`TableRef.name` はdriver/native metadata call前に
+U+0000を検査する。rejectは
+`db.Error.Encode(db.ContractError { query_id: None, item, message:
+"metadata identifier contains U+0000" })` を返す。対応する `item` はexactに
+`"metadata.schema"`、`"metadata.table.schema"`、`"metadata.table.name"` とする。このerror
+ではSQL/catalog requestを送らない。
 
 ### 18.3 database
 
@@ -1713,7 +1762,10 @@ database/schema/table/column/key/constraint/index/Query/planの分離、各commo
 明示region、exact flat result shape、`MetaOption` slice、native formの追加native option
 slice、§11〜§13のexact metadata/EXPLAIN option sum、PostgreSQL native detail、
 SQLite native detail、1 categoryが無関係categoryをfetchしないtest。native result解放後も
-out arenaまでstringが有効、hidden heapなし、multi-term flat ordering、NotFoundも固定する。
+out arenaまでstringが有効、hidden heapなし、§18.2.1の全category/detail/entry projection、
+ordering、ordinal base、unavailable field、artifact digest、multi-term flat ordering、NotFoundを
+固定する。両driverで全 `SchemaRef`/`TableRef` componentのU+0000をnative/catalog request前に
+exact Query-less Encode itemとしてrejectする。
 `EXPLAIN ANALYZE` は実行を明示する。
 
 ### D13 — batch、SoA、高価値native path
@@ -1875,6 +1927,10 @@ execution-count付きで実証する。
     rewrite、prepare/schema/server、descriptive fieldをexactに持つ。
 91. D0がengine/version nullability/origin evidenceを記録し、D3/D5がmerge前にfail-closed
     support matrixを所有する。`Unknown` はnon-nullを証明せずruntime NULL guardを常に残す。
+92. 全metadata category/detailと `MetaQueryEntry` discriminatorは§18.2.1のexact row、
+    field presence、ordering、ordinal、`artifact_digest` contractに従う。
+93. metadata schema/table inputのU+0000は両driverでnative/catalog request前にexact
+    Query-less `db.Error.Encode` としてrejectする。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 
