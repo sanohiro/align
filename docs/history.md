@@ -58,7 +58,8 @@ all Full-detail common fields rather than from the reported name or catalog orde
 The final whole-diff gate additionally makes type fingerprints structural, gives runtime
 `QueryMeta` a producer-owned plan/thunk, fixes the checked-metadata and migration/schema binary
 identities with independent goldens, serializes SQLite connection-global execution through one
-explicit lease, and syntax-checks the exact metadata declarations and positional calls. Mutable
+explicit lease, and checks exact metadata signature notation against the owning API table while
+syntax-checking positional calls. Mutable
 prepare targets carry an explicit non-secret schema ID; normal builds remain offline.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional

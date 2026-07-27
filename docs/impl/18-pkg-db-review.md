@@ -1713,7 +1713,8 @@ The required final whole-diff host review then found six older cross-surface omi
 which the intentionally narrow F87–F89 closeout did not cover. They were not handled by another
 open-ended author/reviewer loop: one ledger pass added structural type identity, the runtime
 QueryMeta source, exact checked-metadata and migration codecs, SQLite connection-state exclusion,
-and syntax-checked metadata declarations/calls, then propagated those six decisions together.
+and metadata signature-table parity plus syntax-checked positional calls, then propagated those six
+decisions together.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.
