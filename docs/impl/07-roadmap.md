@@ -1004,7 +1004,9 @@ already lives in `docs/open-questions.md`.
   `chunks` result (`array<slice<T>>`) is now a valid pipeline source whose element is `slice<T>`,
   so `par_map(f)` with `f: (slice<T>) -> R` reduces each chunk; the per-chunk results materialize
   into `array<R>` (which a further reduction can fold). The Pure requirement still applies.
-  Lowers via the existing collect loop (sequential). (`examples/chunk_parallel.align`.)
+  Direct chunk sources lower through the typed range kernel; direct stage-free integer
+  `chunks(n).par_map(f).sum()` reuses the partial reducer and does not materialize `array<R>`, while
+  the chunk-header array remains an explicit producer allocation. (`examples/chunk_parallel.align`.)
 - [done] **thread-parallel execution of `par_map`** — the perf widening of the sequential
   skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
   `Rvalue::ParMapParallel`: codegen emits a per-function
@@ -1020,8 +1022,9 @@ already lives in `docs/open-questions.md`.
   forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A
   primitive-scalar length-preserving `map` chains before `par_map` now use the same range kernel;
   callable primitive-scalar `where(p).par_map(f)` uses stable count/prefix/scatter compaction, while
-  projection, string, chunk, aggregate, and other unsupported filters retain the sequential collect
-  loop. Move captures remain rejected by ownership checks.
+  projection, string, aggregate, and other unsupported filters retain the sequential collect loop;
+  direct chunk sources use the same range kernel with borrowed `slice<T>` elements. Move captures
+  remain rejected by ownership checks.
   Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
   function values + indirect call (①), a lambda as a first-class value with typed parameters (②a),

@@ -269,18 +269,21 @@ ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight 
 The range kernel loops over typed input/output GEPs, loads Copy captures once from the immutable
 call-scoped context, calls the Pure Align function directly, and stores each output. LLVM can inline
 and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
-element. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses plain wrapping
-addition, and stores one partial at the range output pointer; the runtime combines the partials and
-returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in the same
-ordered range kernel. Callable primitive-scalar `where` stages emit a count kernel and a scatter
-kernel; the runtime prefix-sums per-range survivor counts and passes each scatter range its stable
-output offset. The Pure chain is intentionally evaluated in both passes. Projection, `str.contains`,
-aggregate, and unsupported staged forms use the sequential pipeline fallback.
+element. A chunk source is an owned array of borrowed `{ptr,len}` slice headers, so the same typed
+loop passes one `slice<T>` value to the chunk function and the caller drops the header buffer after
+the synchronous runtime call. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses
+plain wrapping addition, and stores one partial at the range output pointer; the runtime combines the
+partials and returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in
+the same ordered range kernel. Callable primitive-scalar `where` stages emit a count kernel and a
+scatter kernel; the runtime prefix-sums per-range survivor counts and passes each scatter range its
+stable output offset. The Pure chain is intentionally evaluated in both passes. Projection,
+`str.contains`, aggregate, and unsupported staged forms use the sequential pipeline fallback.
 `work_weight` is a bounded MIR hint (`1`, `2`, or `4`) materialized as an `i64` argument; it is
 combined with the concrete input/output strides by the runtime and does not change the source or
 language ABI.
-The fused node excludes `chunks`, floating-point sums, and arbitrary reducers. There is no
-generic parallel-reduce lowering in the current surface. The ABI is in `06`.
+The fused node covers a direct stage-free integer map from either a scalar/AoS source or a chunk
+source. It still excludes floating-point sums, staged reductions, and arbitrary reducers. There is
+no generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---
 

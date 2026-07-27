@@ -43,14 +43,15 @@ Do the work in this order:
 5. ~~Replace `task_group`'s per-task mutex/wake path with batched claims and a low-lock completion
    latch; batch queue submission too.~~ **SHIPPED 2026-07-26** in #648 and #650.
 6. ~~Fuse integer `par_map(...).sum()` so the parallel operation never writes and rereads its full
-   intermediate array.~~ **SHIPPED 2026-07-26.** Direct, stage-free scalar maps now use a reduction
-   range kernel with one wrapping partial per claimed range; staged reduction and `chunks` forms
-   remain on their existing paths.
+   intermediate array.~~ **SHIPPED 2026-07-26; expanded 2026-07-27.** Direct, stage-free scalar
+   and `chunks` maps now use a reduction range kernel with one wrapping partial per claimed range;
+   staged reduction remains on its existing path.
 7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (map, callable-
    filter, and AoS field slices);** primitive-scalar `map` stages before `par_map` execute in one
    ordered range kernel. Callable primitive-scalar `where` and AoS `where(.field)` use stable
    count/prefix/scatter compaction, with every callable stage and terminal callable checked Pure;
-   SoA, `chunks`, string-search, and other unsupported layouts remain sequential.
+   SoA, string-search, and other unsupported layouts remain sequential; a `chunks` source now
+   supplies borrowed `slice<T>` range values to the same kernel.
 8. Choose grain from bytes and estimated body work, not a fixed element count alone. Evaluate
    separate CPU and blocking-I/O execution domains only after the common work-first fix.
 
@@ -120,7 +121,9 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
   captures;
 - callable primitive-scalar `where(...).par_map(...)` chains use the stable count/prefix/scatter
   range path and preserve source order;
-- SoA projections, `str.contains`, `chunks`, and unsupported aggregate layouts are sequential.
+- SoA projections, `str.contains`, and unsupported aggregate layouts are sequential. A `chunks`
+  source is admitted as an `array<slice<T>>` range source; its header buffer remains an explicit
+  producer allocation and is released after the synchronous consumer.
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That node carries a source, terminal
@@ -470,8 +473,9 @@ projection, and `where(.field)` in the same typed range kernel. The generated ke
 record using its target-data stride, extracts the logical field after applying the backend's
 physical field permutation, and passes the resulting value or whole record to the known terminal
 call. Field filters use the same stable two-pass algorithm and preserve source order. SoA
-projections, `str.contains`, `chunks`, and other unsupported layouts remain sequential; do not
-infer AoS support for them.
+projections, `str.contains`, and other unsupported layouts remain sequential; do not infer AoS
+support for them. Chunk sources are a separate borrowed-slice input shape and do not imply support
+for those layouts.
 
 `where(...).par_map(...)` is a separate gate because output length is unknown. Two viable stable
 algorithms are:
@@ -486,7 +490,7 @@ Selectivity, predicate cost, scratch bytes, extra reads, and memory bandwidth de
 the current slice intentionally chooses the scratch-free two-pass form and keeps any wider filter
 families on the sequential path until a scalar-vs-SIMD/materialization crossover is measured.
 
-### 7.4 Transform-reduce fusion — SHIPPED 2026-07-26
+### 7.4 Transform-reduce fusion — SHIPPED 2026-07-26; chunk sources expanded 2026-07-27
 
 The current shape:
 
@@ -502,9 +506,10 @@ small indexed partial array.
 The shipped slice covers wrapping `i8`–`i64` and `u8`–`u64` `sum`. Align defines integer overflow
 as two's-complement wrap, so addition is associative modulo the integer width and regrouping across
 worker/range counts is bit-exact. The MIR rewrite applies only when the `par_map` is directly
-consumed, has no prior stages, and its scalar source is not the `chunks` producer. Floating sum,
-arbitrary reducers, and staged/`chunks` shapes remain excluded. Generated partial additions are
-plain wrapping IR operations — never `nsw`/`nuw`.
+consumed and has no prior stages. Its source may be a scalar array/slice or the `array<slice<T>>`
+header array produced by `chunks`; the latter passes each borrowed chunk view to the same generated
+range kernel. Floating sum, arbitrary reducers, and staged shapes remain excluded. Generated partial
+additions are plain wrapping IR operations — never `nsw`/`nuw`.
 
 This is distinct from silently parallelizing ordinary reduction:
 
@@ -526,13 +531,20 @@ implementation is pinned by:
 - empty input, signed/unsigned wraparound, and threshold-adjacent caller/pool execution;
 - direct range-kernel IR with a typed loop, direct body call, and plain integer addition.
 
+The 2026-07-27 verification record has 48/48 `align_driver` `par_map` tests passing. It includes
+65,537-element worker-range tests for materializing chunks and direct chunk reduction, a chunk
+filter, a cross-worker `i8` wrapping fold, backend-independent MIR-shape assertions, and the
+arena/header-drop path. `align_codegen_llvm` also passes malformed chunk `ParMap`,
+`ParMapReduce`, and filter-stage tests. These cases are regression floors for the shipped range
+path, not a claim that header-allocation removal or broader aggregate layouts are complete.
+
 Peak-RSS, memory-bandwidth, LLC-miss, and heavy-body crossover measurements remain a follow-up
 before any grain or partial-slot layout retune.
 
 Use cache-separated per-runner/range partials only after checking the target/cache-line tradeoff;
 there are only `O(ranges)` of them, so isolation is much cheaper than padding every task result.
 
-### 7.5 Explicit-parallel producer materialization elision — later
+### 7.5 Explicit-parallel producer reduction — SHIPPED 2026-07-27
 
 Recognize shapes such as:
 
@@ -541,10 +553,11 @@ xs.chunks(n).par_map(chunk_summary).sum()
 ```
 
 without turning ordinary `sum`/`reduce` into a hidden parallel operation. The producer is already
-explicitly parallel. A later MIR pass may keep per-chunk results in indexed slots and perform the
-same serial, index-ordered terminal fold, eliminating a general owned intermediate and its drop
-path. Do not reassociate floating operations or combine results in completion order. A truly
-parallel final reduction remains the separate, already-recorded language-semantics question.
+explicitly parallel. The shipped first cut keeps the `chunks` header array as the explicit producer
+allocation, loads its borrowed slice elements in the range kernel, and routes an integer terminal
+`sum` through `ParMapReduce`; no owned per-chunk result array is created, and the header array is
+dropped after the synchronous call. Do not reassociate floating operations or combine results in
+completion order. Floating, staged, and arbitrary-reducer terminals remain separate follow-ups.
 
 ---
 
@@ -881,11 +894,13 @@ nested progress remain pinned.
 ### Slice P3 — widening and cost model
 
 - ~~Fuse wrapping-integer `par_map(...).sum()` and eliminate its full intermediate array.~~
-  **SHIPPED 2026-07-26;** staged and `chunks` producer materialization remain later slices.
+  **SHIPPED 2026-07-26; expanded to direct `chunks` sources 2026-07-27;** staged reductions and
+  elimination of the producer's own chunk-header allocation remain later slices.
 - ~~Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
   length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (primitive-scalar and AoS map,
   projection, and filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar
-  `where` and AoS `where(.field)`; SoA, string, and chunks forms remain sequential.
+  `where` and AoS `where(.field)`; SoA and string forms remain sequential, while `chunks` is now
+  accepted as a borrowed-slice source for the range kernel.
 - ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in #652
   2026-07-26;** scalar width and runtime aggregate-like stride measurements are recorded; AoS
   compiler shapes are now covered by the kernel, while other hosts and any more aggressive
@@ -897,7 +912,8 @@ nested progress remain pinned.
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence
   for the bounded slice and threshold, not a blanket claim for other predicates or selectivities.
-- Probe explicit-parallel producer/ordered-terminal materialization elision.
+- Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
+  chunk-source range path has a baseline.
 
 ### Slice P4 — resource policy, only if earned
 
