@@ -10739,7 +10739,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         // A consuming match transferred every fresh/materialized source into this owner. A
         // task-group result is also fresh to its caller even when backed by a bound tail local.
         // Copy-only ordinary scopes keep bound sources borrowed (their temporary bit is false).
-        if binds_move_payload || matches!(scrutinee.kind, hir::ExprKind::TaskGroup(_)) {
+        if binds_move_payload || match_scrutinee_transfers_source_to_owner(scrutinee) {
             null_moved_source(b, scrutinee);
         }
         owner
@@ -10787,6 +10787,28 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     }
     b.cur = join_bb;
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
+}
+
+/// Whether a fresh match scrutinee structurally consumes a bound source into the hidden owner.
+/// Control-flow joins handle this path-by-path in `store_control_result`; direct bound places remain
+/// borrowed. Constructor wrappers consume their payload, including through transparent scopes.
+/// A task-group result is always fresh to its caller, even when its tail is a bound local.
+fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::OptionSome(_)
+        | hir::ExprKind::ResultOk(_)
+        | hir::ExprKind::ResultErr(_)
+        | hir::ExprKind::EnumValue { .. }
+        | hir::ExprKind::TaskGet(_)
+        | hir::ExprKind::TaskGroup(_) => true,
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) => {
+            block
+                .value
+                .as_deref()
+                .is_some_and(match_scrutinee_transfers_source_to_owner)
+        }
+        _ => false,
+    }
 }
 
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,

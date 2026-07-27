@@ -235,6 +235,27 @@ fn match_on_option() {
 }
 
 #[test]
+fn wildcard_match_owns_a_bound_payload_consumed_by_a_fresh_wrapper() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  s := \"hello\".clone()\n",
+        "  x := match Some(s) { _ => 7 }\n",
+        "  return x\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("option-bound-wildcard-owner", src)
+            .status
+            .code(),
+        Some(7),
+        "the fresh Option owner must take the bound string exactly once"
+    );
+}
+
+#[test]
 fn match_on_result_arm_order_and_wildcard() {
     if !backend_available() {
         return;
