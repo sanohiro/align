@@ -44,6 +44,16 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
+
+array_builder<T>()                 // shipped heap grow/freeze form
+builder.push(value)
+builder.build() -> array<T>
+```
+
+Required L6 signature, **not implemented yet**:
+
+```text
+array_builder<T>(out: region)      // region/plain-struct form
 ```
 
 Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { … }`, or the
@@ -56,6 +66,10 @@ removed outright (no alias survives, per the no-backward-compat rule).
   are rejected pending per-element drop.
 - Dynamic `array<T>` is a Move type with recursive Drop (str-element arrays deep-free, #339
   precedent).
+- `array_builder<T>` is one mutable-local Move owner. A helper may mutate the same owner through a
+  `borrow mut` parameter after L2, but the builder is never an aggregate field or return value.
+- An arena-owned result of `array_builder(out).build()` is consumed into its final aggregate in the
+  same function; it is not passed by value through an ordinary call boundary.
 - Slices are Copy views; a `mut slice<T>` binding (or `out` param) is the one writable-view form.
 - `.count()` is the *pipeline* length (composes with `where`); `.len()` is the direct read. Both
   exist on purpose — do not merge them.
@@ -90,6 +104,12 @@ For `zip(...).map_into(dst)`, the proof covers **every** source. Runtime source 
 input-vs-output scope; sources are allowed to alias one another and are never declared disjoint.
 
 ## Spec'd but not implemented
+
+- **Region-backed plain-struct builder (required L6):** `array_builder<T>(out)` grows in chunks in
+  the explicit region, accepts recursive `RegionPlain` elements, and performs one documented final
+  compacting pass. A short-lived view must use `clone_in(out)` before insertion. It has no hidden
+  heap allocation and does not change the shipped heap builder's zero-copy freeze. Design:
+  [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §7.
 
 - Slicing/indexing **Move-element** collections ("slicing a collection of the Move type … not
   supported yet"). Fixed arrays of Move structs and owned struct-array fields already have

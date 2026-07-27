@@ -34,8 +34,18 @@ Ty =
   Option(Ty)
   Result(Ty, Ty)
   Named(DefId, [Ty])        // struct / sum type. Generic actual arguments
+  Resource(DefId, [Ty])     // opaque package-defined Move owner
+  ResourceRef(DefId, [Ty])  // Copy view of one resource owner generation
+  RegionCap                 // scope-bound `region` allocation capability
   Tuple(TupleId)            // anonymous product `(T, U, ...)`; interned by element list
-  Fn([Ty], Ty, Effect)     // lambda / function value
+  Fn(
+    [(ParamMode, Ty)],
+    Ty,
+    Effect,
+    ReturnBorrowSummary,
+    ReturnRegionSummary,
+    ReturnCleanupAbi,
+  )                            // lambda / function value
   Var(id)                   // inference variable (during inference only)
 ```
 
@@ -43,16 +53,24 @@ Ty =
 
 `Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements: primitive scalars (Copy / `Static`), `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, the struct-with-`str`-field rule), and owned `string`/`array<T>` (which make the tuple **Move**). An owned tuple is restricted to a **temporary** — returned or destructured, not bound to a variable or passed as a parameter — so it never occupies a drop slot; building `(a, b)` from owned locals nulls those source slots (move-out), and the destructure targets are ordinary owned locals freed by the normal drop set. `partition`/`chunks` and their tuple/view machinery have shipped; lifting the owned-tuple binding/parameter cut remains an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 
-### Region (lifetime tag)
-Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.
+### Region and owner-generation provenance
+
+View-bearing values (`Slice`, `Str`, recursively view-bearing aggregates, and `ResourceRef`) carry
+inferred provenance. Users never write a lifetime. It appears only in diagnostics and exported
+function summaries.
 
 ```text
 Region =
   Static        // string literal / const pool
-  Heap          // from explicit heap
-  Value         // inside an owned value (shares the value's lifetime)
+  Frame(root)   // view into a caller/local owner generation
   Arena(id)     // from a specific arena block
 ```
+
+An owner-root/generation fact is tracked alongside the region for views obtained from mutable
+storage or a resource. Ending that generation invalidates the view even when its lexical region
+would otherwise continue. A checked imported call receives the same parameter-root fact through
+`ReturnBorrowSummary`; a concrete closure target may additionally resolve target-relative capture
+slots through its selected environment. No producer body is required.
 
 ---
 
@@ -151,10 +169,16 @@ users.where(.active).score.sum()
 A projection is fixed as a `Project(field)` node on the HIR and becomes a fusion target in MIR (`04-mir.md`). Ordinary access is `FieldAccess`.
 
 ### Field selector `.ident`
-A `.ident` at argument position is typed, from the receiver element type `E`, as a function value `Fn([E], type_of(E.ident), Pure)`.
+A `.ident` at argument position is typed, from the receiver element type `E`, as a function value
+`Fn([(ByValue, E)], type_of(E.ident), Pure, return_borrow, None, return_cleanup)`, where
+`return_borrow` is `Roots { params: [0], captures: [] }` when the projected field recursively
+contains any view backed by `E`; otherwise it is `None`. This is the same recursive provenance walk
+used for named function returns, including views nested under structs, tuples, fixed arrays, and sum
+payloads. `return_cleanup` is `DynamicBit` exactly when the projected field is recursively Move,
+otherwise `None`.
 
 ```align
-users.where(.active)   // .active : Fn([User], bool, Pure)
+users.where(.active)   // .active : Fn([(ByValue, User)], bool, Pure, None, None, None)
 ```
 
 ---
@@ -189,16 +213,36 @@ Copy (value, safe to bit-copy)
   Vec / Mask / Bitset
   structs whose fields are all Copy
   Slice (copying the view; the pointed-to data is not copied. Region constraints handled separately)
+  ResourceRef (copying the view; owner generation constraints handled separately)
+  RegionCap (copying the scope capability; escape/storage restrictions handled separately)
 
 Move (owning, linear)
   Array / String / Buffer / Builder
   Heap box
+  Resource
   structs containing a Move type
 ```
 
 Copy/Move is field-derived, not controlled by an ABI-size threshold. A large all-Copy struct remains
 Copy; passing it by value may be diagnosed as a performance lint without changing ownership
 semantics (`draft.md` §6.2).
+
+`Option`, `Result`, structs, and user sums share one recursive `DropPlan` derived after nominal type
+resolution and generic monomorphization:
+
+```text
+DropPlan =
+  None
+  Leaf(kind)
+  Struct(fields with non-None plans)
+  Tagged(tag offset, variant payload plans)
+```
+
+A composite is Move iff its plan is not `None`. `Tagged` covers `Option`, `Result`, and user sums;
+only the active payload is dropped. The same plan drives move/null-source and drop-old
+classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
+plans are rejected with the existing recursive-type diagnostic. Collection element eligibility is
+separate and does not follow merely from having a Drop plan.
 
 ### Checking
 Flow analysis over the CFG. When a Move-type value is consumed (assigned as a value / passed as a value argument / returned by value), the original binding becomes dead. Using a dead binding is a **compile error**.
@@ -210,6 +254,75 @@ print(data);          // error: data has already been moved
 ```
 
 Copying is explicit via `clone()`. This constraint does not apply to `Copy` types.
+
+### Borrowed parameters
+
+Each named-function parameter has one mode:
+
+```text
+ByValue     existing rule; a Move argument is consumed
+Out         writable non-alias slice destination
+Borrow      shared access; caller retains ownership
+BorrowMut   exclusive access; caller retains ownership and the old generation ends
+```
+
+For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned view may be tied
+to that parameter's caller-side root and generation. For `BorrowMut`, the call site must provide a
+writable bound place. Every other argument is checked, whether its mode is `ByValue`, `Borrow`,
+`BorrowMut`, or `Out`. Direct place overlap or any recursively embedded view, resource reference,
+dependent-resource parent, or aggregate provenance rooted in the invalidated generation rejects
+the call, including two distinct holder aggregates. The check is structural and never recognizes a
+package-specific Row name. The owner's previous
+generation becomes dead before the call; returned views belong to the new generation. An unbound
+Move temporary is rejected for either borrow mode. Shared `Borrow` is limited to Move types because
+Copy already preserves ownership; `BorrowMut` also accepts a writable Copy place so field mutation
+updates the caller instead of a discarded copy.
+
+Checked HIR infers `ReturnBorrowSummary::Roots { params, captures }` by recursively walking every
+possible view in the return value. Named exported functions have an empty capture set and serialize
+the parameter roots. A concrete closure target records sorted capture-slot roots and resolves them
+through its selected environment at an indirect call. Whole-program and interface-only checking
+must produce identical parameter roots and diagnostics. This is the same
+`BorrowState`/owner-root mechanism used for intra-frame view liveness, not a second reference type
+or a package-name table.
+
+The same `ParamMode` entries are retained in `Fn`/`FnTy`. Concrete function values additionally
+carry `ReturnBorrowSummary`, `ReturnRegionSummary`, and `ReturnCleanupAbi`. Function-value
+assignment and control-flow joins union parameter-index sets while the runtime-selected target
+retains its capture-slot metadata/environment; an unresolved higher-order parameter whose result may carry
+provenance conservatively names every compatible input, including a by-value Move value with an
+embedded view/dependent-resource root. Call checking snapshots embedded provenance before move/null
+and transfers it to the result; callee escape checking still rejects a bare view whose consumed
+owner dies there. Interface codecs, direct/indirect call checking, and codegen must agree on these
+facts; there is no mode- or provenance-erasing adapter. The inferred effect and return summaries
+remain outside written source-signature equality, but parameter modes participate.
+
+Every recursively Move return uses `ReturnCleanupAbi::DynamicBit`: the direct, indirect, or
+imported ABI returns a path-selected cleanup bit beside the value. The caller stores it in the
+result slot, and Drop consults it. Copy returns use `None`. This dynamic ownership result is
+separate from return region/borrow summaries and is included in function/interface ABI identity.
+
+### Opaque resources
+
+A `Resource(DefId, args)` is always Move and owns one non-null native handle. Its declaration
+resolves a `pub` internal Drop hook and records a producer-owned hidden support thunk symbol/ABI
+fingerprint; imported cleanup calls the thunk without importing the hook module. Module checking
+restricts representation intrinsics to the declaring module's canonical descendant subtree. The
+raw-only hook module need not import the resource root, so driver construction remains acyclic.
+`ResourceRef` is Copy but inherits the precise owner generation and is invalid after move,
+replacement, Drop, or `BorrowMut`.
+
+A resource created from `from_raw_borrowed` also carries the parent `ResourceRef` provenance.
+The child is still an owner, but it recursively tracks a borrow: moving the child transfers that
+fact, dropping it releases the fact, and any attempted parent invalidation while the child lives is
+rejected. A view built by `resource.view_from_raw` carries the supplied resource root/generation
+through its `Option` and any later aggregate wrapper.
+
+Resources and resource references fail the task-capture/Send check. A resource may occur in a
+one-owner Move aggregate and uses the existing recursive Drop and path-local cleanup flag.
+Resources are excluded from Copy arrays, pipeline elements, region builders, equality, printing,
+and safe FFI signatures. The exhaustive type-class checks are structural; they must not inspect
+resource names.
 
 ### out arguments and no-alias
 `out dst: slice<T>` means "`dst` is a region distinct from the other inputs". Recorded on the HIR as both a check (that `dst` does not alias other arguments at the call site) and optimization info (no-alias), then passed to MIR/codegen (`draft.md` §7).
@@ -225,7 +338,10 @@ Copying is explicit via `clone()`. This constraint does not apply to `Copy` type
 > `array<Struct>`/`builder`) are freed by per-binding MIR `Drop` outside an arena and bulk-freed
 > inside one. The authoritative model + per-slice ledger is `08-memory-model-v2.md`.
 
-`arena {}` introduces an `Arena(id)` region into the block. Views derived from allocations inside the block bear this region.
+`arena {}` introduces an `Arena(id)` region into the block. `arena out {}` introduces the same
+region and additionally binds `out: region`. Passing that capability to an ordinary function
+substitutes the exact caller arena for the callee's region parameter; allocations through it and
+returned owned values receive `Arena(id)`.
 
 **Escape rule**: a value bearing `Arena(id)` must not outlive its arena block. Concretely, the following are made **compile errors**.
 
@@ -246,10 +362,15 @@ arena {
 }
 ```
 
-Region propagation is inferred by flow analysis; users write nothing. Only on violation does the
-error message surface a region (for example, "this view is bound to an arena block"). Nested arenas
-use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`; named/explicit allocator syntax is a
-separate possible language extension, not an unsettled part of this checker.
+Region propagation is inferred by flow analysis; users write no lifetime. Only on violation does
+the error message surface a region (for example, "this view is bound to an arena block"). Nested
+arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
+
+A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
+binding outside the arena, captured by a task, or passed to FFI. An interface signature with a
+`region` parameter carries `ReturnRegionSummary::Roots { params, captures: [] }`, allowing an imported caller to
+tie returned owned data to the selected arena. `clone_in(out)` is the explicit copy from a
+shorter-lived view into that region; the checker never inserts it.
 
 ---
 
@@ -263,6 +384,7 @@ exact guarded source order (`draft.md` §8).
 Effect = Pure | Impure(reason)
 A function/lambda has its effect inferred from its body:
   modifying an outer mut binding   → Impure
+  modifying storage rooted only in a `borrow mut` parameter → Pure (explicit exclusive input)
   writing through a `slice`/`soa` view (including `map_into` and `vec.store`) → Impure
   calling a side-effecting std fn (I/O etc.)  → Impure
   if none of the above             → Pure
@@ -278,7 +400,8 @@ users.par_map(fn u { total = total + u.score });  // error: modifies an outer mu
 total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 ```
 
-The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
+The `Fn` type carries parameter modes, an effect, and both return-provenance summaries, so call ABI,
+purity, and result lifetime can all be checked through a function value.
 
 > **Implementation note (2026-07-15, #465):** the effect bit is implemented end to end. Concrete
 > named functions and lifted closures receive independent `FnTy` effects, mutable fn locals join
@@ -290,14 +413,15 @@ The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked e
 
 ---
 
-## 9. Generics (minimal) — complete
+## 9. Generics (minimal) — shipped core; L7 composition pending
 
 Monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
 **Settled & built (4c-1, the unconstrained skeleton):**
 ```text
 - A function declares type parameters: `fn f<T, U>(...)`. `Ty::Param(i)` represents one inside a
-  template (Copy, var-free); it is substituted before the flow analyses / MIR run.
+  template (var-free; its Copy/Move class is fixed after substitution); it is substituted before
+  the flow analyses / MIR run.
 - Monomorphization unit = the function, specialized per concrete type-argument tuple, generated
   in sema AFTER type-checking and BEFORE MoveCheck/EscapeCheck/MIR (so those passes and codegen see
   only concrete types — answers the "before or after MIR" question: BEFORE). Mangled `name$arg$arg`.
@@ -314,7 +438,8 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   (template-only, like `Ty::Param`); deep `subst_param_ty`; structural inference `match_param`
   (binds `Param` bare or nested, seeds a return-only param from the expected type); a nested param
   is finalized eagerly at the call (a `Scalar` can't hold an inference var), a bare one deferred.
-  `box`/`slice`/`array`/tuple over `T` are rejected (`scalar_arg`'s `allow_param`).
+  The shipped compiler still rejects `box`/`slice`/`array`/tuple over `T`
+  (`scalar_arg`'s `allow_param`); L7 below replaces the `slice`/`array` part of this restriction.
 - 4c-5: generic structs `Pair<T>`. The resolver refactor — `resolve_type` takes a `TyCx` (bundling
   `struct_ids`/`enum_ids`/`struct_templates`/`structs`/`struct_mono`/`tuples`/`fn_types`); `structs`
   grows during resolution; a `Pair<i32>` type calls `instantiate_struct` to substitute the template
@@ -326,13 +451,26 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   `enums` table grows during resolution (reserved slots + `enum_mono` dedup); `resolve_type` interns
   a monomorph `EnumDef` for `Opt<i32>` (`instantiate_enum`); variant construction `Opt.Some(7)`
   infers the args from the payload (`match_param`) then monomorphizes.
+- L7 (required before `pkg.db`, not yet shipped): retain nested symbolic type applications in a
+  generic template, add recursive inference/substitution for `array`, `slice`, and top-level
+  generic struct/sum/resource applications, and add the closed structural `RegionPlain` bound.
 ```
 
-**Generics is CLOSED** (minimal by design — see `open-questions.md`). The implemented surface
-(functions + builtin bounds + generic structs + generic sum types) is the whole feature; it is not
-extended further. Not-generics leftovers moved to their tracks: generic **containers** → the
-`group_by` track (roadmap #5, if a consumer needs them); **`vecN<T>`** → M6; a generic-def-inside-a-
-generic-fn / `Opt.None` expected-type decomposition → optional refinements, revisit only on demand.
+**Generics remains closed and monomorphized** (see `open-questions.md`), but L7 completes one
+required compositional hole for ordinary package APIs. `Ty::Param` may appear recursively under
+`Option`, `Result`, `array`, `slice`, and applications of top-level generic struct, sum, and
+resource definitions in a generic function's parameters, locals, and return type. Such applications
+remain symbolic until concrete arguments are inferred, then monomorphize before MoveCheck,
+EscapeCheck, and MIR. This permits `query<P,R>`, `stmt<P,R>`, `rows<R>`, and `array<R>` in ordinary
+generic package functions; it does not declare definitions inside functions or add call-site
+turbofish.
+
+`RegionPlain` is an additional closed builtin structural bound. It grants only region-plain
+construction/builder operations, and concrete instantiation recursively rejects resources,
+independently owned fields, raw/function values, and builders. There are still no user traits,
+runtime dictionaries, reflection, or new concrete container element capabilities. Generic
+**containers beyond this symbolic composition** remain on their owning tracks; **`vecN<T>`** remains
+M6, and `Opt.None` expected-type decomposition remains an additive inference refinement.
 
 ---
 
@@ -346,7 +484,13 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - .field fixed to either FieldAccess or Project(field)
 - field selectors made into concretized closures
 - Region of view types
+- owner-root/generation provenance for every recursively view-bearing value
 - marking of move points (consume positions) and dead bindings
+- `ByValue`/`Out`/`Borrow`/`BorrowMut` on parameters and calls
+- resource declaration identity, Drop-thunk summary, and path-local cleanup ownership
+- canonical recursive `DropPlan` for struct/sum/Option/Result ownership
+- `ReturnBorrowSummary` and `ReturnRegionSummary`
+- `ReturnCleanupAbi` and the dynamic result cleanup bit for recursively Move calls
 - the no-alias flag of out arguments
 - the Effect of each function/closure
 ```
@@ -364,14 +508,18 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 
 ---
 
-## 12. Remaining refinements
+## 12. Required next refinements
 
 ```text
 - lint for the numeric default type (when i64 is excessive in large arrays)
-- precise per-function return-borrow summaries, so a call result is tied only to the argument
-  it actually borrows rather than to a conservative aggregate region
+- implement borrowed parameter modes and precise return summaries
+- implement package-defined resources/resource references
+- implement named region parameters and destination substitution
+- implement recursive tagged Move payloads
+- implement nested generic package applications and the RegionPlain bound
 ```
 
 Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is
 field-derived; nested arena ordering is implemented; and minimal generics monomorphize before MIR.
-Those are settled rules, not open design questions.
+The library-boundary entries above are settled prerequisites, not open design questions; their
+implementation sequence is `17-library-boundary-prerequisites.md` L1a–L7.

@@ -115,6 +115,53 @@ Do not re-litigate these. Full rationale is in `docs/open-questions.md`:
 - Ship the ideal unified design or defer it. Do not land compromise
   implementations that add magic special cases or violate an invariant.
 
+## Large design authoring gate
+
+Before writing a broad cross-cutting design, create one public-contract ledger
+in its design or audit document. Keep that ledger authoritative while drafting.
+For every public surface, record the exact type or signature, inputs and
+defaults, errors, ownership and lifetime, allocation, compiler/runtime/package
+owner, artifact and cache identity, prerequisite milestone, acceptance test,
+benchmark, and every source-of-truth or language mirror that must agree.
+
+Complete one author-side ledger-to-prose consistency pass before requesting an
+independent review:
+
+- every normative prose promise appears in the exact public record, and every
+  public field has specified semantics;
+- the Cartesian product of every detail level, discriminator, verification
+  state, and option state has an exhaustive field-presence, row-order,
+  ordinal, and unavailable-value rule;
+- every argument and result has a concrete type, ownership, lifetime, and
+  allocation rule;
+- every text/view input crossing a native or wire boundary has explicit
+  encoding, embedded-NUL, validation-error, and pre-side-effect semantics;
+- every multi-invalid input has a deterministic validation order and error
+  precedence;
+- every CLI and build input is explicit, deterministic, and free of ambient
+  configuration unless the contract names that configuration;
+- every canonical persisted or exchanged format fixes all scalar widths and
+  tags, every nested record and sequence order, malformed-input rejection, and
+  independently checked semantic-to-byte and byte-to-semantic golden vectors;
+- every type/cache fingerprint states whether it is nominal or structural; a
+  structural contract includes the complete reachable definition graph;
+- every promised runtime inspection field names the producer-owned table or
+  thunk that supplies it without reflection or artifact/source I/O;
+- every operation that changes connection-global or process-global native
+  state defines overlap exclusion, failed-second-operation behavior, and
+  exhaustion/error/Drop restoration order;
+- every normative code example is syntax-checked, and declarations are shown
+  separately from positional call expressions;
+- no milestone consumes a decision or capability scheduled for a later
+  milestone;
+- `draft.md`, `docs/language-spec.md`, implementation plans, package designs,
+  and required language mirrors agree; and
+- acceptance tests and benchmarks cover each ledger invariant.
+
+Do not use independent review as the primary completion loop for a design.
+When a finding changes a public surface, update the ledger first and propagate
+that one decision through all affected documents in one pass.
+
 ## Build and verification
 
 The workspace runs end to end from lexer through executable generation.
@@ -156,6 +203,28 @@ release: bump `Cargo.toml` and `Cargo.lock`, write matching release notes,
 commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z`.
 Never infer the publish flow from “build” or “release build.”
 
+## Long-running work and progress monitoring
+
+Elapsed time is not a stopping criterion by itself. For any long-running command,
+review, test, or investigation:
+
+- inspect actual progress at least once per minute while the tool is running;
+- check process state, new log output, the latest completed phase, and whether
+  the work is still producing new relevant results rather than repeating itself;
+- keep useful work running even when it takes longer than expected;
+- stop or redirect only after evidence of a stall, repeated analysis, scope
+  drift, or an actual tool failure;
+- preserve logs, findings, completed phases, and other checkpoints before
+  stopping; resume from the first unfinished area instead of restarting the
+  whole task;
+- report the current phase and evidence of progress during extended work, not
+  only elapsed time.
+
+An automation timeout ends that invocation only. It does not invalidate useful
+work already produced, imply a clean result, or justify rerunning the same broad
+scope from the beginning. Narrow a continuation only to unreviewed,
+contradictory, or changed areas.
+
 ## Review before merging
 
 The PR is not the first correctness pass. A coherent implementation must pass
@@ -189,10 +258,12 @@ before it is merged:
 5. Record both clean post-open reviews against the pushed SHA with
    `scripts/record-post-review.sh`. Wait for CI and only then merge.
 
-Review execution is bounded. A review process that has not returned a verdict
-within 15 minutes is a tool failure, not permission to wait indefinitely. Stop
-it, record the elapsed time and last completed action, then rerun a narrower
-review or ask for direction. Review automation must not launch
+Review execution follows the progress-monitoring rules above. If a review tool
+reaches its configured invocation bound without a verdict, record the elapsed
+time and last completed area, preserve its useful findings, and continue from
+the unfinished scope. Do not treat the missing verdict as CLEAN, and do not
+restart the complete review solely because the bound was reached. Review
+automation must not launch
 `cargo test --workspace` or `scripts/test-full.sh` for an ordinary PR unless
 the change scope explicitly requires that expanded verification.
 

@@ -245,6 +245,99 @@ hardware-aligned choice: predictable allocation beats convenience, and an in-are
 bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
 reason exceptions and GC were — it hides cost.)
 
+**Native state belongs behind one package-defined resource boundary.** A database connection,
+compiled regular expression, socket, process, and compression context are the same language
+problem: a native owner is Move, its safe operations borrow it, and its destructor must run
+exactly once. Encoding each one as a new compiler-known type makes `std` privileged forever and
+prevents ordinary `pkg` code from providing equally safe wrappers; exposing `raw` plus `close`
+instead makes the safety invariant a caller convention. The common answer is a
+package-defined opaque `resource` whose representation is accessible only to the declaring
+module's unsafe descendant subtree. Its raw-only source hook is `pub` only inside the package's
+`internal` boundary; the resource producer supplies a hidden linkable Drop thunk, so consumers
+neither import the hook nor lose separate-compilation cleanup. The hook module need not import the
+declaring root, so a driver submodule can construct the public root resource without a cycle or a
+public raw constructor. `resource.borrow` is public and safe wherever the opaque type is visible
+because it reveals only owner-tied provenance; construction/extraction/transfer of raw
+representation remains subtree-privileged and unsafe. Shared `borrow` preserves Move ownership;
+invalidating `borrow mut` also updates a writable Copy state aggregate in place. Parameter modes
+remain part of function values,
+and their inferred return provenance includes target-relative capture roots, so indirect calls
+cannot erase the ownership ABI or lifetime roots. A recursively Move return also forwards its
+path-selected cleanup bit; lifetime summaries cannot reconstruct ownership after a branch.
+Inferred owner generations prevent a returned view from surviving
+replacement, mutation, or Drop. Exclusivity is checked across every call argument, not only
+parameters spelled `borrow`: a by-value Copy view/resource reference or view-bearing aggregate
+rooted in the generation invalidated by a peer `borrow mut` is rejected before the callee can
+receive a dangling view. This structural rule generalizes the existing Move/Drop and
+borrow-liveness machinery without adding lifetime syntax, traits, reference types, or a second
+ownership model. Replacement through `borrow mut` uses the ordinary old-value Drop plan before
+storing a new value, while an unchanged pointee remains caller-owned. Raw ownership transfer is
+limited to a standalone resource root, avoiding hidden per-field cleanup state.
+
+**Structured owned errors complete the existing tagged-value model.** A native library error
+needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
+compound operation may return a Move output through the same `Result`. Replacing that with numeric
+codes, empty-string sentinels, or an opaque boxed error would create a second weaker error model.
+The proper completion is recursive tagged Move payloads: `Option`, `Result`, and user sums derive
+the same Drop plan as structs, drop only the active payload, and move/null it through `match`,
+`else`, and `?`. The success path allocates nothing for an unused Move error. This is a general
+language completeness fix with the database as consumer, not database error magic.
+
+**Minimal generics must compose through ordinary package signatures.** Rejecting `array<R>` or a
+top-level `query<P,R>` application inside a generic function leaves a package unable to implement
+its own typed API and invites compiler-known DB entry points. L7 therefore permits nested symbolic
+applications of the existing generic/container types and adds one closed structural
+`RegionPlain` bound. Full substitution still precedes ownership/escape/MIR; there are no runtime
+dictionaries, user traits, reflection, or newly legal concrete element categories.
+
+**A named `region` is a destination capability, not an allocator abstraction.** Compound
+database reads and streaming decoders need ordinary library functions to construct caller-owned
+arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only
+the existing arena's allocation destination as a scope-limited capability. Passing `out:
+region` neither transfers the arena nor makes allocation implicit: the destination remains
+visible at the call site and the result remains bounded by the same inferred region lattice.
+There is no allocator trait, lifetime parameter, cross-arena sharing, or automatic copy. An
+explicit `clone_in(out)` marks the unavoidable transition from a short-lived input view to
+owned output.
+
+**Static SQL is one statement-artifact mechanism, not a Query-only exception.** A row-returning
+Query and a rowless command differ only in Row/result/decode data. Both use the same item identity,
+source/wire SQL split, generated Params binder, retention plan, per-driver checked state, producer
+implementation hash, and exported typed contract. This keeps the minimal SQLite insert vertical
+from inventing a second compiler path. A portable CheckedRequired descriptor means checked on every
+permitted driver; mixed SQLite/PostgreSQL evidence remains visible instead of collapsing to a
+misleading boolean.
+The artifact fingerprints the complete reachable structural Params/Row definitions, not only their
+names. A Query additionally owns a static metadata plan and generated materialization thunk, so
+runtime inspection remains possible across separate compilation without reflection or reading
+source/metadata files. Checked metadata and migration/schema identities have versioned exact codecs
+and independent goldens; “canonical” is never an agreement between two copies of the same encoder.
+
+**Database configuration is closed, scoped data.** Connection, static statement, prepare, execute,
+transaction, metadata, and EXPLAIN options have distinct finite sums and separate common/native
+slices. Their first-release variants, defaults, and conflicts are part of the API contract, not
+driver-selected examples. A requested variant is applied or rejected before SQL send; it is never
+stored in a reflection bag or ignored for portability. Each milestone lands the option type its
+operation consumes, while the later cancellation milestone completes shared machinery rather than
+replacing a provisional API.
+Connection-global native state also has an explicit owner: SQLite v1 permits one active execution
+lease per physical connection. A second Copy execution view cannot overlap timeout/statement state;
+it fails before mutation or native access, and the owning stream alone restores state on
+exhaustion, error, or Drop.
+
+**Catalog output owns its destination, and exceptional migrations fail dirty.** Metadata and plans
+copy flat records and strings into a caller-named region before native buffers die; multi-term
+keys/indexes are repeated rows rather than nested hidden allocations. Migration SQL is atomic by
+default. Every live migration command names its entry graph, catalog, driver, and matching target;
+ambient configuration cannot redirect it. A visibly transaction-forbidden one-statement file
+records Applying before native execution and blocks on ambiguous failure until checksum-bound
+operator repair. Query nullability is similarly fail-closed: engine-reported query evidence is
+retained, ambiguous evidence remains `Unknown`, and catalog `NOT NULL` alone cannot remove runtime
+NULL checks after joins or expressions. Metadata detail is a finite projection matrix, not a
+best-effort property bag; identifiers are validated before native access. These choices expose the
+costs that cannot be wished away: result retention, live-schema identity, and non-transactional
+side effects.
+
 **An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
 A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would
 contradict the model: ownership is decided by the *type*, and a compile-time table owns nothing. It is

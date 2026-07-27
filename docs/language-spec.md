@@ -195,13 +195,20 @@ own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities
 — in a fixed `Num ⊃ Ord ⊃ Eq` hierarchy: `Num` = arithmetic+ordering+equality (numbers), `Ord` =
 ordering+equality (numbers, `char`, `str`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
+`RegionPlain` is the separate closed structural bound for region-backed plain construction; it is
+not in the numeric hierarchy and grants no arithmetic/equality operation.
 
 A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
 position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. **Structs and sum types may
 be generic** — `Pair<T> { a: T, b: T }`, `Opt<T> { Some(T), None }` — monomorphized per
 instantiation, type arguments inferred from a struct literal's fields / a variant's payload
-(`Pair { a: 1, b: 2 }`, `Opt.Some(7)`) or written as a type (`Pair<i32>`). (Nested in
-`array<T>` / `box<T>` / a tuple, and using a generic def inside a generic function, are later slices.)
+(`Pair { a: 1, b: 2 }`, `Opt.Some(7)`) or written as a type (`Pair<i32>`). In a generic function,
+parameters may also occur under `array`, `slice`, and applications of top-level generic
+struct/sum/resource definitions. These symbolic applications are fully substituted before
+Move/escape analysis and MIR. `RegionPlain` is a closed builtin structural bound for region-backed
+plain construction; it is not a user trait. Definitions nested inside functions, call-site
+turbofish, runtime dictionaries/reflection, and new concrete container element capabilities remain
+absent.
 
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
@@ -244,7 +251,54 @@ An aggregate has one path-local cleanup bit, so its owned members must all be fr
 be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owned array is rejected.
 Replacing an owned field or element must preserve the existing mode. Borrowed members do not
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
-runtime mode, but mutation requires a definite mode.
+runtime mode, but mutation requires a definite mode. After generic substitution, a struct field may
+be Copy or recursively Move when its finite, non-recursive Drop plan is known; this does not make an
+otherwise unsupported container element legal.
+
+`Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
+known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the
+active tag, while construction/extraction moves the payload and clears its old owner. Structured
+owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
+ownership models. Arbitrary collections of Move elements remain a separate container capability.
+
+Move-typed function parameters may instead be `borrow x: T`; a shared borrow does not consume its
+owner and may return an inferred view of the current generation. `borrow mut x: T` accepts a
+writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
+return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
+Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
+also retain every mode, both return-borrow/region summaries, and the Move-return cleanup ABI, so
+indirect and direct calls use the same ABI and result lifetime. Named summaries record parameter
+roots; concrete closure targets additionally record capture slots resolved through the selected
+environment. Function-value joins preserve target-relative capture roots and union compatible
+parameter roots; an
+unresolved higher-order parameter uses every compatible input, including embedded borrow/region
+provenance in a by-value Move value. That provenance transfers with a returned Move result; a bare
+view of an owner destroyed inside the callee remains illegal. Lifetimes are never written.
+Mutation rooted only in an explicit `borrow mut` parameter remains Pure when the body has no other
+Impure operation; alias checking proves the input exclusive. Captured mutation, unsafe/FFI, I/O,
+and database work remain Impure.
+
+Call-site exclusivity checks every peer mode beside `borrow mut owner`: `ByValue`, `Borrow`,
+`BorrowMut`, and `Out`. Direct overlap or a recursively carried view, resource reference,
+dependent-resource parent, or aggregate provenance rooted in the owner's previous generation is
+rejected, including distinct holder aggregates. Generation invalidation therefore never delivers a
+dangling peer argument to the callee. The rule is structural, not package-named. Replacing an owned
+pointee through `borrow mut` drops the old value before the store and updates the caller's cleanup
+bit; an unchanged pointee receives no callee function-exit Drop.
+
+Every recursively Move return carries one dynamic path-selected cleanup bit through direct,
+indirect, and imported ABIs. The caller stores it beside the result. Return borrow/region summaries
+describe provenance and never reconstruct this ownership bit.
+
+`borrow`, `out`, and `resource` are contextual words. `borrow name: T`, `borrow mut name: T`, and
+`out name: T` select parameter modes; `borrow: T` and `out: region` use ordinary parameter names.
+`resource Name = path` is recognized only at item position, leaving `resource.from_raw` and
+`resource.borrow` parseable as dotted intrinsic calls.
+
+`arena name {}` binds a scope-local `region` capability. Ordinary functions may accept that value to
+allocate into the exact caller-selected arena; returned arena values remain tied to the lexical
+block. The capability is Copy but cannot escape, enter aggregates/tasks/FFI, or be constructed by
+users. Anonymous `arena {}` is the same mechanism without a bound capability.
 
 ### Error handling
 
@@ -472,6 +526,35 @@ An `extern "C" link("name")` clause names an external library to link (`-lname`)
 always-linked libc/libm — the visible dependency the `std`/`pkg` C-engine wrappers ride on. A block
 names one library; a repeated name links once.
 
+An FFI wrapper may declare an opaque Move resource:
+
+```align
+import pkg.db.internal.resource
+
+pub resource conn = pkg.db.internal.resource.drop_conn
+```
+
+The hook is a `pub fn(raw) -> ()` in the package's allowed `internal` subtree and performs native
+destruction inside an `unsafe {}` body; there is no `unsafe fn` syntax. The resource-declaring
+producer synthesizes a non-user-callable hidden support thunk whose symbol/ABI fingerprint crosses
+interfaces, so imported cleanup remains linkable without importing the internal module. The thunk
+runs exactly once on ordinary cleanup. Construction/raw extraction/ownership transfer are
+restricted to the declaring module's descendant subtree; a safe public API exposes neither `raw`
+nor manual destroy. The raw-only Drop-hook module need not import the declaring module, so the
+privilege does not create a module cycle. `resource_ref<R>` is a Copy view tied to the owner
+generation and is
+invalidated by owner move/Drop or mutable borrow. Resources are non-Send by default.
+
+`resource.into_raw` accepts only a standalone initialized resource local or by-value resource
+parameter owned by the current function. Fields, elements, projections, borrowed/out parameters,
+and temporaries are rejected so raw transfer does not require per-field ownership bits.
+
+`resource.from_raw_borrowed(ptr, parent_ref)` creates a Move child resource tied to one parent
+generation, so the parent cannot move/drop before the child. The private unsafe
+`resource.view_from_raw(owner_ref, ptr, len)` returns an `Option<str>` or
+`Option<slice<FFIScalar>>` tied to that generation after shape/alignment/UTF-8 checks; foreign range
+validity remains the wrapper's unsafe obligation. No owner-free safe raw-to-view conversion exists.
+
 Deliberately out of FFI v1 (draft §15): MEMORY-class or larger-than-16-byte structs by value, and
 all by-value struct ABIs other than x86-64 SysV (struct-by-pointer covers the portable case);
 `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
@@ -499,7 +582,10 @@ directory (nested `import util.math` → `util/math.align`). A cross-module refe
 `geom.area(...)` for a function, `geom.Point` for a type — reaching only `pub` members; a bare name
 resolves within the calling module (an imported type must be qualified). A qualified `pub` function
 may also be passed to a pipeline/reducer (`xs.map(geom.area)`) or bound as a function value
-(`f := geom.area`) under the same import and visibility rules. Each module has its own
+(`f := geom.area`) under the same import and visibility rules. Its function-value type retains
+`ByValue`/`Out`/`Borrow`/`BorrowMut` for every parameter plus inferred
+return-borrow/region/capture provenance and the Move-return cleanup ABI; indirect calls do not erase
+modes, provenance, or ownership. Each module has its own
 function and type namespace, so two modules may reuse a name. A `pub` item's signature may name only
 `pub` types (a `pub` fn's params/return, a `pub` struct's fields, a `pub` sum type's payloads;
 transitively, through arrays/tuples/generics) — a private type cannot leak through a public interface,
@@ -508,6 +594,11 @@ interface (its template is instantiated in importers), so it may reference only 
 items — a private same-module fn/type/const in a generic `pub` body is rejected. The import graph must be a DAG —
 cyclic imports are a compile error. An imported sum type's variant is constructed with the fully
 qualified type receiver: `geom.Color.Red` or `geom.Color.Code(40)`. (`draft.md` §17.)
+
+Hermetic input discovery includes reachable `.align` units and exact static files explicitly
+registered by compiler-known constructors. Such a constructor cannot scan directories, run code,
+read environment state, or contact the network. Static file content hashes participate in the owning
+unit's cache/implementation identity.
 
 **Packages (the `pkg` layer).** A *package* is a distribution-layer subtree under `pkg/<name>/` (root
 `pkg/<name>.align` + optional submodules), discovered from imports + the filesystem with no manifest —
@@ -527,6 +618,7 @@ core.result
 
 core.array
 core.slice
+core.array_builder
 
 core.vec
 core.mask
@@ -542,6 +634,13 @@ core.math
 
 core.arena
 ```
+
+`array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
+`array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
+arena chunks with no hidden heap allocation and performs one documented compacting pass at
+`build()`. Shorter-lived views must first use `clone_in(out)`. Both forms remain one mutable-local
+Move owner; a helper may push through a `borrow mut` parameter but cannot store, return, or consume
+that borrowed builder.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-

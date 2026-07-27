@@ -5,7 +5,7 @@ Defines the stages from `source.align` to executable, and the boundaries of the 
 ## Overall Diagram
 
 ```text
-source (.align)
+reachable source (.align) + exact registered static inputs
   │  align_lexer
   ▼
 Tokens                      positioned token stream
@@ -20,7 +20,8 @@ Resolved AST                references bound to definitions
 Typed HIR                   high-level IR with types on every expression
   │  align_sema (3) move checking / arena escape checking
   ▼
-Checked HIR                 safety-verified. If it passes here it is safe
+Checked HIR + static contracts
+                            safety-verified; Query/command static artifacts fixed
   │  align_mir  lowering (desugaring) + target-independent transforms
   ▼
 MIR                         backend-agnostic core. ownership, fused pipelines,
@@ -30,7 +31,8 @@ MIR                         backend-agnostic core. ownership, fused pipelines,
 LLVM IR → object
   │  align_driver  content-addressed object cache / parallel unit codegen
   ▼
-per-unit objects             interfaces checked; deterministic DAG order
+per-unit objects + static artifacts
+                            interfaces checked; deterministic DAG order
   │  align_driver  link (+ capability-selected align_runtime components)
   ▼
 executable
@@ -51,6 +53,10 @@ executable
 ### Sema (1) Name Resolution (`align_sema`)
 - Resolution of `module` / `import`, symbol table construction, binding references → definitions.
 - Visibility (`pub`) checking.
+- Resolution of compiler-known static constructors. Only a resolved recognized callee with literal
+  definition-time input may register a static file; a same-spelled local/user function cannot. A
+  Query/command constructor must be the single whole expression body of a named zero-argument
+  non-generic descriptor function, making module+item one unique artifact identity.
 
 ### Sema (2) Type Inference / Type Checking (`align_sema`)
 - Local type inference (deciding the type of `x := 10`) and reconciliation with annotations.
@@ -64,6 +70,9 @@ executable
 - Check that a function passed to `par_map` does not mutate external mutable state (§11).
 - Check the no-alias constraint on `out` arguments (§7).
 - **No lifetime annotations are required.** Lifetime violations are detected by flow analysis (`03-types.md`).
+- Borrowed parameter modes, owner-generation invalidation, dependent resources, recursive tagged
+  Drop plans, and named `region` substitution follow
+  `17-library-boundary-prerequisites.md`; none dispatches on a database/std package name.
 
 ### MIR Generation (`align_mir`)
 - This is where **desugaring** first happens. Details in `04-mir.md`.
@@ -86,11 +95,21 @@ executable
 ### Codegen (`align_codegen_llvm`)
 - MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM's vector type / select and emits vector instructions deterministically.
 - Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
+- Package resources become generic producer-owned Drop-thunk calls. Generated Query bind/decode thunks and immutable
+  descriptors lower from MIR/static artifacts without runtime reflection.
 
 ### Driver (`align_driver`)
 - CLI. Discovers the import DAG, builds/verifies unit interfaces, runs per-unit codegen through the
   default-on object cache (parallel by default), selects runtime capabilities, links, and atomically
   publishes the executable.
+- On a cold source/import identity, import/name resolution first proves recognized static-input
+  callees; only then does the driver resolve/read/hash exact safe `File` paths. An `Inline(query_id)`
+  entry uses decoded literal bytes from the unit and never causes a file read. A later pre-frontend
+  lookup may reuse only a versioned static-input manifest bound to that exact resolution digest, so
+  shadowed/same-spelled calls never cause a file read.
+- Emits versioned Query/command artifacts beside interfaces/objects. SQL bytes and generated thunks
+  affect the producer implementation and link; only Params/Row/restriction/static semantics affect
+  consumer interfaces.
 - Shipped subcommands: `check`, `check-per-unit`, `emit-interface`, `emit-mir`, `emit-llvm`,
   `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
   profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, and instrumented PGO.

@@ -2045,7 +2045,7 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 
 **Structural follow-ups (design-level, from audit §6):**
 - ~~Move escape/region checking off recursive per-`ExprKind` re-evaluation onto a **flow-sensitive sema CFG pass**~~ **DONE through #461–#464 (2026-07-15).** The dependency audit corrected the older "MIR pass" placement: safety diagnostics and cleanup provenance stay at the checked-HIR boundary. #461 made expression/type provenance classification exhaustive; #462 introduced the finite joined `EscapeState`; #463 added path-local MIR ownership flags; #464 now lowers the exhaustive HIR walk into compact basic blocks and explicit `if`/`match`/`else`/loop/`break` edges. One shared worklist owns all joins and fixpoints, while diagnostics replay once in syntax order from fixed block inputs. New control-flow syntax must choose its CFG edges in the exhaustive match and cannot silently inherit a recursive fallback.
-- ~~Record purity as an **effect bit on the function type**, not a name-based propagation result, so fn-value / closure / FFI-pointer indirection can't dodge it (keeps "purity is inferred"; only stores the result in the type).~~ **DONE in #465 (2026-07-15).** Concrete `FnTy` entries carry `Pure` / `Impure` / `Unknown`; a least fixpoint refines named functions, lifted closures, mutable local joins, imported summaries, and FFI pointers. Indirect calls and `map_err` consume the type bit, unresolved HOF parameters stay fail-closed, and signature equality excludes the inferred mutable fact.
+- ~~Record purity as an **effect bit on the function type**, not a name-based propagation result, so fn-value / closure / FFI-pointer indirection can't dodge it (keeps "purity is inferred"; only stores the result in the type).~~ **DONE in #465 (2026-07-15).** Concrete `FnTy` entries carry `Pure` / `Impure` / `Unknown`; a least fixpoint refines named functions, lifted closures, mutable local joins, imported summaries, and FFI pointers. Indirect calls and `map_err` consume the type bit, unresolved HOF parameters stay fail-closed, and signature equality excludes the inferred mutable fact. The planned L2 library-boundary extension adds parameter modes and joined return-borrow/region summaries to the same concrete `FnTy`; it does not replace the shipped effect cell.
 - ~~A spec table of **value-carrying control structures** (block / `if` / `match` / `else`-unwrap / `?`): for each, how the region is composed and how an owned value moves/drops — with 1:1 tests.~~ **DONE as #466, 2026-07-15.** `draft.md` §6.3 is the exhaustive 5×2 table and `tests/value_control_flow.rs` pins one region cell plus one owned-cleanup cell per form. The audit found four real cleanup gaps: `if`, `match`, `else`-unwrap, and `?` selected the value but lost its runtime individual-vs-arena bit at the join, so a heap-owned selected path could leak when another path was arena-owned. Checked HIR now records static allocation provenance per expression, and MIR carries a parallel bit through the same result CFG slot; direct local moves still load their path-local flag. `block` and all five region cells were already correct.
 - ~~Stand up **fuzzing** (parser / JSON / fmt, with a depth cap) and a **negative-test corpus**~~ **(DONE, #286–#290)** — dependency-free fuzz + property suite in `crates/align_driver/tests/` (SplitMix64 + `catch_unwind`, seeds printed, runs as `cargo test`): `fuzz_frontend.rs` (lexer/parser/sema never panic, incl. non-ASCII), `fuzz_fmt.rs` (formatter never panics + idempotent + parse-preserving on all examples), and `fuzz_differential.rs` — a **generate-program-with-its-oracle** differential fuzzer that catches *miscompiles* (the array-garbage class) across scalars, all integer widths + cross-width casts, the call ABI, struct/array aggregates, and (wave 2, #326 → this wave) `map`/`where`/reduce pipelines, `vecN<T>` lane arithmetic, **Option `else`-unwrap + Result `?`-propagation chains** (both the Some/Ok and None/Err arms forced across the seed range), **enum + exhaustive `match`** (mixed tag-only / scalar-payload variants, per-variant base so a mis-tag or mis-read payload both surface), and **nested-struct read/write chains** (depth-2..3 towers with a randomly-positioned nested field, exercising #307 field reordering at every nesting level). A single `wrap(v, ITy)` models both arithmetic wrapping and integer casts; a per-test mutation check (deliberately `+1` the oracle) proves the harness isn't a vacuous pass. No miscompile found. The negative-test corpus is `tests/analysis_coverage.rs` + the audit repros. The value-carrying-control-flow matrix above is now complete.
 
@@ -3384,8 +3384,17 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    array<T>` — the third grow-then-freeze member (no views until freeze → realloc-safe by
    construction; growable `array<T>` itself rejected on exactly that view-invalidation
    ground). Zero-copy freeze via a new `align_rt_realloc` (a Rust-`Vec` store was rejected —
-   allocator-boundary mismatch with the C-free that frees `array<T>`). Elements v1 = Copy
-   scalars + `string`; Copy structs deferred; Move handles excluded.
+   allocator-boundary mismatch with the C-free that frees `array<T>`). The shipped heap form
+   accepts Copy scalars + `string`; Move handles remain excluded.
+   **Region form SETTLED 2026-07-27 (required before `pkg.db`):**
+   `array_builder<T>(out: region)` accepts recursively `RegionPlain` scalars/views/structs. It
+   deliberately rejects the heap form's independently owned `string` element (copy it to a
+   region-valid `str` with `clone_in(out)` instead). Growth uses chunks allocated in `out`;
+   `.build()` performs exactly one documented compacting pass into `out` and never allocates on the
+   heap. A
+   borrowed field from a shorter row generation must be made owned with `clone_in(out)` before
+   insertion. This is the common compound-output mechanism, not a database-private builder.
+   Full contract and implementation order: `impl/17-library-boundary-prerequisites.md` §7.
 7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
    a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded
    post-M9 "streaming×pipeline integration" backlog item.
@@ -3458,11 +3467,13 @@ every arm's locals per frame, so one fat arm taxes every recursion level).
 Implementation slices: **A — builtin import validation — DONE (2026-06-25).** `collect_imports` validates every `import` against the `BUILTIN_MODULES` table (unknown / duplicate → error); the imported set threads into each `Checker`; `require_import` enforces `core.json` / `std.fs` / `std.io` at the `json.*` / `fs.read_file` / `io.stdout.write` dispatch sites (once per source function, skipped for monomorphs). Syntactic core needs no import. `tests/imports.rs` (7) + corpus updated (every existing json/fs/io program/example now carries its import). (Unused-import lint was deferred here until user modules existed — now **DONE**, see B-lint below.) **B — real multi-file user modules.** Resolution scheme decided (2026-06-25): **filename convention** — `import geom` → `geom.align` in the entry file's directory (its `module` decl must match the filename); chosen for simple+fast+predictable (no directory scan, only imported files are read) over scan-by-`module`-decl or a CLI file list. **B1 DONE (2026-06-25):** driver loads the entry + transitively-imported user modules (BFS, dedup, cycle-safe); sema's `check_file` → `check_program(&[Module])` checks them together; functions are **per-module mangled** (`module$fn`, entry module unmangled so single-file programs are byte-identical); bare calls resolve in the caller's module, `mod.fn(...)` resolves cross-module with **`pub` visibility**; the capability-import rule applies per file. `tests/modules.rs` (8), `examples/modules/`. **B2 (nested paths) DONE (2026-06-25):** `import util.math` → `util/math.align` (declaring `module util.math`), called `util.math.fn(...)`; the driver walks the directory tree, sema flattens the dotted receiver (`flatten_module_path`) to resolve the call. **B-types (cross-module type export) DONE (2026-06-26):** types are now **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry module unmangled, so single-file programs stay byte-identical), two modules may reuse a type name, and `type_table` (module → bare → canonical + `pub`) drives resolution. `pub` on a struct/enum exports it; an importer names it qualified (`geom.Point`, resolved with import + `pub` checks via `canonical_type_name`); a bare type resolves in the current module (so an imported type **must** be qualified). `StructLit.name` became a `Path` (the parser detects a dotted `Path { ident :`); `resolve_type` routes qualified paths through the table. **B-variant-ctor (qualified variant construction) DONE (2026-06-26):** an imported `pub` sum type's variant is constructed qualified — `pal.Color.Green` (tag-only, via `check_field_access`) and `pal.Color.Code(40)` (payload, via `check_call`). A unified `resolve_type_receiver` resolves a `Type.Variant` receiver as a bare type (current module) or `mod.Type` (imported `pub` type), used by both the tag-only and payload paths; a private cross-module type emits one clean error (3-state `Ok(Some)`/`Ok(None)`/`Err`, no cascade). So an exported sum type is now **fully** usable across modules (construct + hold + return + match). `tests/modules.rs` (now 19). **Still deferred:** cross-module **field/payload types** (a field `f: other.T`) — but note this is mostly blocked on **nested struct/enum fields not existing yet** (`is_field_ok` allows only scalar/str), not on module plumbing; the only live slice is an enum payload of an imported struct (passes 0b/0c resolve with `no_imports` — would need the import table built before the type passes). **B-lint (unused-import lint) DONE (2026-06-26):** an `import` never referenced in a file is a **warning** (tidiness, not a hard error — unlike unhandled `Result`, which is a correctness error). Detection is a syntactic AST walk (`collect_refs` → `walk_expr`/`walk_type`/`walk_block`) collecting every qualified reference's dotted prefix, independent of the resolution code so signatures / bodies / constants are covered uniformly; an import is used iff some prefix equals it or starts with it + "." (a builtin `core.json` matches its `json.*` namespace). The walk over-approximates "used" (a local shadowing a module name still counts), so the lint never wrongly fires. `tests/unused_import.rs` (7). Still deferred: project-root config (entry dir is the root). Record: `draft.md` §17, `impl/02-frontend.md`, `tests/modules.rs`, `tests/imports.rs`, `tests/unused_import.rs`.
 
 ### Generics (minimal system) — DONE / CLOSED (4c)
-**This feature is complete and closed.** Generics is deliberately a *minimal*, supporting feature
+**This feature is closed in scope; its shipped core is complete and L7 composition is scheduled.**
+Generics is deliberately a *minimal*, supporting feature
 (`CLAUDE.md`: "approach minimally", "no Rust-trait complexity", "AI-friendliness is a constraint —
 avoid complex generics"). Align is **data-oriented** — arrays/slices are the protagonist, not
 generics. The implemented surface below (generic functions + builtin bounds + generic structs +
-generic sum types) is the intended scope; **do not keep extending it.** The items once listed as
+generic sum types plus the L7 nested package composition below) is the intended scope; **do not
+keep extending it beyond that fixed requirement.** The items once listed as
 "later 4c slices" are not generics work and have moved to their real homes (see "Out of generics —
 moved to their own tracks" at the end of this entry).
 
@@ -3518,7 +3529,9 @@ like `tuples`/`fn_types`), and a `Pair<i32>` type interns a concrete monomorph `
 `struct_templates` registry, kept out of codegen). Concrete struct ids get reserved slots so
 monomorphs (appended after) never shift them. A **generic struct literal** (`Pair { a: 1, b: 2 }`)
 infers its type arguments from the field values (`match_param`, no turbofish) then monomorphizes;
-`Pair<i32>` is also a parameter/annotation type. A field must be Copy after substitution.
+`Pair<i32>` is also a parameter/annotation type. At that shipped checkpoint a field had to be Copy
+after substitution; the normative recursive tagged-Move decision below supersedes that
+implementation restriction through L1a/L1b for finite types with a known Drop plan.
 
 **4c-6 (generic sum types) DONE.** `Opt<T> { Some(T), None }` works end to end — the enum analogue
 of generic structs: an `enum_templates` registry, the concrete `enums` table grows during resolution
@@ -3527,28 +3540,45 @@ and variant construction (`Opt.Some(7)`) infers the type arguments from the payl
 then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
 decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
 
-**Generics is closed — the surface above is the whole feature.** The minimal-generics goal is met:
+**L7 nested package composition — SETTLED 2026-07-27, required before `pkg.db`, not yet built.**
+Ordinary first-party packages need generic functions whose signatures and locals contain
+`array<R>`, `slice<R>`, and top-level generic struct/sum/resource applications such as
+`query<P,R>`, `stmt<P,R>`, and `rows<R>`. `Ty::Param` therefore composes recursively through those
+types and is fully substituted before MoveCheck/EscapeCheck/MIR. `RegionPlain` is one additional
+closed builtin structural bound for region-backed plain construction. Public template interfaces
+and monomorphization keys encode the canonical nested type applications and bound. Whole-program
+and interface-only instantiation must agree. No user traits, runtime dictionaries, reflection,
+turbofish, nested declarations, or newly legal concrete container element categories are added.
+
+**Generics is closed — the shipped surface plus L7 is the whole feature.** The minimal-generics goal is met:
 generic functions, builtin bounds (`Num`/`Ord`/`Eq`), generic structs, and generic sum types, all
 monomorphized, no turbofish, no user trait bounds. That covers ordinary generic code; further
 extension is explicitly **not** pursued, to keep generics minimal and Align data-oriented.
 
 **Out of generics — moved to their own tracks (NOT generics todo):**
-- **Generic containers** (`Stack<T>`, an `array<T>`/`slice<T>` field/param) belong to the
-  **data-oriented core / `group_by` track** (roadmap #5), not here. They need the fused-pipeline
-  machinery to carry a generic element (and `PrimScalar` to hold a `Param`) — a perf-core change,
-  pursued *if and when* a concrete consumer (e.g. `group_by`) needs it. Align already ships builtin
-  `array`/`slice`/`Option`/`Result`/`Error`/tuples, so the language is complete without generic
-  containers.
+- **User-defined generic container semantics beyond L7** (`Stack<T>` owning arbitrary elements or a
+  new concrete element capability) belong to the data-oriented core / owning container track. L7
+  only makes existing `array<T>`/`slice<T>` and named generic applications representable inside a
+  generic function and still applies every concrete container restriction after substitution.
 - **Value generics `vec<N, T>`** — part of **M6 (SIMD)**, not generics.
-- **A generic def used inside a generic function** (`fn mk<T> -> Pair<T>`) and expected-type
-  decomposition for `Opt.None` — small optional refinements, rejected cleanly today; only revisit
-  if real code demands them. Not required for the language to be complete.
+- **Expected-type decomposition for `Opt.None`** remains a small optional refinement. Applying a
+  top-level generic definition inside a generic function is owned by L7; declaring a definition
+  inside a function remains rejected.
 
 ### Error type design — Settled 2026-07-02 (built on sum types; the exit-code residual is now closed)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
 - **An explicit value, nothing hidden:** no exceptions, no unwinding, no implicit stack-trace allocation. (The cold-`Err`-edge treatment stays.)
 - **No implicit `?` conversion — explicit `map_err` instead (4b-3 DONE).** `?` requires the same `E` (an implicit `E → E'` coercion would be *hidden* — Align has no `From`-trait to point at, unlike Rust). To change a result's error type, use `result.map_err(f)` (`f: fn(E) -> E'`), then `?`: `inner().map_err(to_error)?`. Explicit, visible, closure-based; lowers to a branch over the `Result` reusing the existing unwrap rvalues + an indirect call.
-- **Context is structured, not free-form (revised 2026-06-25, see 4b-4):** the Align way of attaching context to an error is **structured data in a sum-type payload** — a variant that carries the relevant fields (a `Pos`, a code, a name) — not a free-form appended string. Free-form `.with_context("…")` string-chaining is the dynamic / allocating / unstructured anti-pattern (Rust `anyhow`-style); it cuts against the data-oriented + AI-friendly grain and would force either `str`/owned-`string` payloads in the error (making `Error` Move, rippling through `?`/drop) or recursive `box<Error>` wrapping (deferred with recursive enums). So **`.with_context` is not adopted**; structured errors are the mechanism. (Reconsider only if a concrete need appears *and* `str`-in-error-payload region tracking lands — the same deferral as S2's `str`-field struct payloads.)
+- **Context is structured, not free-form (revised 2026-06-25; ownership prerequisite settled
+  2026-07-27):** the Align way of attaching context to an error is **structured data in a sum-type
+  payload** — a variant that carries the relevant fields — not a free-form appended string.
+  Recursive tagged Move payloads now deliberately allow an owned structured library error such as
+  `db.Error` to carry native message/detail fields through `Result`/`?`. That removes the former
+  cleanup limitation; it does not justify `.with_context("…")` string-chaining. The latter remains
+  a dynamic, allocating, unstructured second context model, so it is **not adopted**. Domain/library
+  error variants own the exact fields their contract promises; callers use `map_err` for explicit
+  category conversion. Recursive `box<Error>` wrapping remains outside the finite non-recursive
+  payload rule.
 - **Structured errors carry position — DONE (4b-4):** a user error enum whose variant carries a plain-data struct payload models a parse/validation error that carries its position (`ParseError { BadToken(Pos), Eof }` with `Pos { line, col }`), constructed, `?`-propagated, and read back with `match` — end to end. No new mechanism: it falls out of user error enums (4b-1) + plain-struct variant payloads (S2). (Tests: `structured_error.rs`; example: `examples/structured_error.align`.)
 - **Exit-code mapping** at the `main` boundary stays as today (`clamp(1,255)`).
 So this entry **waits on sum types** (4a) and then defines `Error` as a concrete sum type + the `?` conversion + exit mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
@@ -3573,11 +3603,102 @@ revisited when the general enum→exit-code mapping is designed** (the deferred 
 index + 1 for any sum type at that position); that is the only remaining piece of the broader Error
 type design (see the section body above), so this section is otherwise complete.
 
-### Arena with explicit allocator — partially settled (M3)
-**M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
-depth; a box's region is the depth at which it was allocated, and escape = reaching a
-shallower depth (`impl/03-types.md` §7, `impl/07-roadmap.md` M3). Still **open**: a
-named/explicit-allocator form like `arena a {}` and cross-arena chunk sharing.
+### Recursive tagged Move payloads — Settled 2026-07-27 (required before `pkg.db`)
+
+`Option<T>`, `Result<T,E>`, and user sum variants accept any finite, non-recursive payload with a
+compiler-known recursive Drop plan. The tagged container is Move if any possible live payload is
+Move. Drop switches on the tag; construction and extraction move/null the active payload; all
+normal, error, branch, loop, reassignment, `match`, `else`, `?`, and `map_err` paths preserve the
+one-owner rule. A struct field such as `Option<string>` uses the same conditional plan.
+
+Every recursively Move function return carries the selected path-local cleanup bit through direct,
+indirect, and imported ABIs. The caller stores it beside the returned value; return region/borrow
+summaries never reconstruct ownership. This is required when different paths of one
+`Result<array<R>, Error>` select arena-owned `Ok` data or an individually owned `Err`.
+
+This closes the current implementation restrictions that reject an owned Option field, a Move
+struct/sum payload, and a Move sum as a Result error. `pkg.db` is the concrete consumer:
+`NativeError` owns optional strings, `db.Error` is a Move sum, and Query helpers return compound
+Move output through Result. Codes, empty-string sentinels, opaque boxed errors, and a database-only
+Result are rejected alternatives. The feature does not admit recursive types or arbitrary
+collections of Move elements. Design and the L1a/L1b PR split:
+`impl/17-library-boundary-prerequisites.md` §8/§10.
+
+The split is normative: L1a establishes the recursive plan and admits `Option<string>` as a struct
+field while still rejecting `Option<MoveStruct>`; L1b admits Move structs/sums as
+Option/Result/user-sum payloads and completes `match`/`else`/`?`/join behavior.
+
+### Named arena region capability — Settled 2026-07-27 (required before `pkg.db`)
+
+The anonymous `arena {}` form remains. `arena out { ... }` additionally binds a Copy,
+scope-limited `region` capability. Ordinary functions may accept `out: region` and allocate
+returned owned values into that exact arena. The capability cannot escape its lexical arena,
+be stored, be sent to a task, or cross FFI. Values allocated through it carry the named arena's
+inferred region; no lifetime or allocator type parameter is written by the user.
+
+This is not a second allocator model. It exposes the existing arena destination to ordinary
+library code so a package can construct compound output without a hidden heap. Cross-arena
+chunk sharing is not adopted: a value moves between regions only through an explicit copy such
+as `clone_in(out)`. The complete surface, interface summary, MIR requirements, and implementation
+order are in `impl/17-library-boundary-prerequisites.md` §§2, 4, and 7.
+
+### Borrowed parameters and package-defined opaque resources — Settled 2026-07-27
+
+Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow is for Move
+types: it preserves caller ownership and may return a view tied to the caller's exact owner
+generation. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
+the previous generation, invalidates every older view, and returns any new view in the fresh
+generation. Parameter modes and inferred return-borrow summaries are part of the exported
+interface; `Fn`/`FnTy` also retains every mode and the Move-return cleanup ABI so indirect calls use
+the direct-call ABI. Concrete function values additionally retain inferred
+return-borrow/region parameter and capture-slot summaries. Target-relative capture roots travel with
+the selected environment; joins union compatible parameter roots without reinterpreting another
+target's capture slots, and unresolved higher-order parameters conservatively use every compatible
+input, including embedded provenance in by-value Move aggregates/dependent resources. Call transfer
+snapshots that provenance before move/null and attaches it to the returned Move value. User-written
+lifetime parameters are not introduced. Mutation rooted only in an explicit
+`borrow mut` parameter remains Pure when there is no other Impure operation; it is an alias-checked
+exclusive input effect, not hidden captured mutation.
+
+Exclusivity is recursive across every call argument and every peer mode (`ByValue`, `Borrow`,
+`BorrowMut`, and `Out`). A `borrow mut` input rejects direct overlap or any view, `resource_ref`,
+dependent resource, or aggregate carrying the invalidated old generation, including distinct
+holder aggregates; Copy arguments are not an exception and no package type name is special.
+Borrowed storage remains caller-owned. Replacing an owned pointee through `borrow mut` runs its old
+Drop plan before the store and updates the caller cleanup bit; unchanged storage receives no callee
+function-exit Drop.
+
+`borrow`, `out`, and `resource` are contextual words, not globally reserved tokens. Exact lookahead
+distinguishes `borrow name: T`/`out name: T` modes from parameters named
+`borrow: T`/`out: region`; item-position lookahead distinguishes a resource declaration from
+ordinary `resource.*` intrinsic paths.
+
+`pub resource name = pkg.native.internal.resource.drop_name` declares a package-defined opaque
+one-word Move owner
+with an exactly-once Drop hook. The source hook is a `pub fn(raw) -> ()` inside the allowed
+`internal` subtree and performs destruction in an `unsafe {}` body; there is no `unsafe fn` syntax.
+The resource producer synthesizes a hidden support thunk whose symbol/ABI fingerprint crosses
+interfaces, so consumer cleanup links without importing the internal source module. Only the
+declaring module's canonical descendant subtree may construct or extract the `raw` representation,
+and only inside `unsafe`. `resource.borrow(owner)` itself is public and safe wherever the opaque
+type is visible: it exposes only an owner-tied `resource_ref<R>`, never raw representation. The
+raw-only Drop-hook module need not import the declaring root, so a
+driver descendant can construct the root resource without a root↔internal cycle. Safe code receives
+a non-owning
+`resource_ref<R>` through borrowing; it cannot close, transfer, or outlive the owner generation.
+`resource.from_raw_borrowed` lets a child resource retain one parent generation until child Drop.
+The unsafe internal `resource.view_from_raw` returns an owner-tied checked `Option<str>`/slice; no
+owner-free safe raw view exists. Resources are non-Copy, non-comparable, non-printable, and
+non-Send in the first implementation.
+
+`resource.into_raw` is restricted in v1 to a standalone initialized resource local or by-value
+resource parameter owned by the current function. A field, element, projection, borrowed/out
+parameter, or temporary is rejected, avoiding a second per-field cleanup-state model.
+
+These are the common library-boundary mechanisms for native stateful packages, including
+`std.http`, `std.net`, `std.process`, and `pkg.db`; they are not database-specific builtins.
+The exact surface and compiler contract are in
+`impl/17-library-boundary-prerequisites.md` §§2–3.
 
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).
@@ -3826,13 +3947,49 @@ version is a **new name at publish time** (`pkg.router2`) — the Go `/v2` conve
 special-cased path segment. No semver resolver, no MVS, no lockfile-driven builds: version
 *selection* is a fetch-tool/human concern that ends before the compiler starts.
 
-**D6 — the compiler stays manifest-free; hermetic builds.** `alignc build` reads `.align` files,
-full stop. Dependency *names* are derivable from source (`grep 'import pkg\.'` — no manifest to
-drift, same argument as M15's unit graph). Only *sources/versions* need recording, and that record
+**D6 — the compiler stays manifest-free; hermetic builds.** `alignc build` reads the transitive
+`.align` closure plus exact source files registered by compiler-known static constructors. A
+registered input has a literal module-relative path, deterministic exact bytes, and a recorded
+content hash; the compiler never scans a directory, consults an environment variable, runs a
+script, or contacts a service to discover it. This narrow rule lets a named Query own
+same-basename SQL while preserving the original hermetic-build invariant. It is not a general
+compile-time file API.
+
+For Query/command artifacts, the recognized constructor is legal only as the complete
+single-expression body of one named zero-argument non-generic descriptor function. Conditional,
+multiple, nested, helper-wrapped, block-bodied, and ordinary expression uses are rejected. The
+fully qualified module/function identity is therefore a unique artifact/thunk slot and remains
+stable under line movement.
+
+File SQL uses a tagged root-relative logical-path identity. Inline SQL uses
+`Inline { fully-qualified descriptor id }`, exact decoded literal bytes, and a
+decoded-byte-to-`.align` source-span map; it never invents a file path. Both feed the same source
+hash, wire rewrite, artifact, and producer implementation identity.
+
+A versioned `StaticInputManifest` also records, for every descriptor and permitted driver, the
+exact derived checked-metadata logical path and `Missing` or
+`Present(content_hash, format_version)` state. A matching manifest revalidates only those exact
+paths before a frontend-cache hit. Creation, deletion, or change invalidates the action; directory
+scanning and mtime identity remain forbidden.
+
+The Query/command artifact contract is structural and executable: Params/Row fingerprints include
+the complete reachable instantiated definition graph; Query carries a producer-owned metadata
+plan/materialization thunk for runtime inspection; checked metadata uses the exact
+`.align-db/<driver>/<Hash128(descriptor_id)>.json` canonical codec; and migration/schema identities use
+the versioned `ALIGNMIG`/`ALIGNSID` streams. All have independent byte/digest goldens. Mutable
+prepare targets require an explicit non-secret schema ID because an offline normal build cannot
+rediscover ambient database state. SQLite connection-global execution/timeout state is serialized
+by one package-tracked active-execution lease; a second Copy execution view fails before native
+state change.
+
+Dependency *names* remain derivable from source (`grep 'import pkg\.'` — no manifest to drift,
+same argument as M15's unit graph). Only *sources/versions* need recording, and that record
 (`align.lock` at the project root: name → URL + rev + content hash, written and read **only** by
 the future fetch tool) is a tool artifact invisible to the compiler. There is deliberately **no
-build-configuration language** — `alignc build <entry>` + the M15 cache IS the build system; a
-multi-binary workspace is one entry file per binary sharing the project root.
+build-configuration language** — `alignc build <entry>` + the M15 cache is the build system; a
+multi-binary workspace is one entry file per binary sharing the project root. Static-input
+identity and interface/implementation hashing are specified in
+`impl/17-library-boundary-prerequisites.md` §5.
 
 **D7 — `internal` path rule (the one new visibility rule).** An import whose path contains a
 segment `internal` is legal only if the importer's module path starts with the path prefix up to
@@ -3903,19 +4060,21 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 
 **FFI v1 — COMPLETE (2026-07-01).** The shipped surface: `extern "C"` decls + `unsafe`-gated calls; scalar/`raw`/`()` signatures; `layout(C)` struct-by-pointer (`raw.load`/`store`); `str`/`slice`/`bytes` views (data-pointer + separate length); `link("name")` external libraries. That is a coherent, tested v1 — the `std`/`pkg` C-engine wrapper strategy (zstd/sqlite/…) can be built on it (own the memory wrappers, borrow the engines, pass buffers by pointer+len).
 
-**Measured optimization follow-up (2026-07-14) — recommended, consumer-gated.** The direct call and
-view ABI are already at the useful floor; retain three generic additions rather than inventing a
-second FFI ABI: (1) extend the guarded, per-symbol `--rt-lto` mechanism to optional pkg-provided
-matching bitcode only after a real fine-grained foreign call clears the ~1.15x wall-time gate;
-(2) make a loop-contained extern that actually blocks vectorization/fusion visible in `explain-opt`,
-with shaped-op/batch/LTO suggestions rather than a blanket warning; (3) when the first backend pkg
-needs a persistent context/buffer, design one pkg-definable opaque Move resource with exactly-once
-Drop so `raw` and explicit destroy do not leak through the safe API. Foreign `readonly`/`noalias`/
-`nounwind`/Pure contracts remain deferred behind a concrete missed-optimization IR: a false contract
-is a miscompile or race, so visible-body inference or an audited generated wrapper is preferred over
-casual user annotations. Whole-backend LTO, automatic batching, an FFI fastcall, and LLM-specific
-surface are not adopted. Full rationale, gates, and the measured 2.95x-positive/0.72x-negative LTO
-evidence: `impl/14-llm-inference-focus-audit.md` §7.
+**Measured optimization follow-up (2026-07-14; updated 2026-07-27).** The direct call and view ABI
+are already at the useful floor; retain two measured additions rather than inventing a second FFI
+ABI: (1) extend the guarded, per-symbol `--rt-lto` mechanism to optional pkg-provided matching
+bitcode only after a real fine-grained foreign call clears the ~1.15x wall-time gate; (2) make a
+loop-contained extern that actually blocks vectorization/fusion visible in `explain-opt`, with
+shaped-op/batch/LTO suggestions rather than a blanket warning. The former third item is no longer
+open: `pkg.db` supplied the consumer and the package-defined opaque Move resource with exactly-once
+Drop is settled in `impl/17-library-boundary-prerequisites.md` §3.
+
+Foreign `readonly`/`noalias`/`nounwind`/Pure contracts remain deferred behind a concrete
+missed-optimization IR: a false contract is a miscompile or race, so visible-body inference or an
+audited generated wrapper is preferred over casual user annotations. Whole-backend LTO, automatic
+batching, an FFI fastcall, and LLM-specific surface are not adopted. Full rationale, gates, and the
+measured 2.95x-positive/0.72x-negative LTO evidence:
+`impl/14-llm-inference-focus-audit.md` §7.
 
 **Deliberately out of FFI v1** (draft §15 "Not in FFI v1", decided 2026-07-01 — defer over ship-half-right):
 - **A struct by value** — SHIPPED for **x86-64 SysV (Linux) only** (`feat/ffi-byvalue-sysv`). A `layout(C)` struct ≤ 16 bytes is passed/returned in registers via the SysV AMD64 classification (each eightbyte INTEGER→`i64` slot / SSE→`double` slot; a two-register value returns as an `{T0,T1}` aggregate). The compiler emits exactly clang's coerced IR, so a call is binary-compatible with a real C callee — proven by a compiled-C-helper harness (`crates/align_driver/tests/ffi_byval.rs`) that links a `cc`-built by-value callee and round-trips every eightbyte pattern ({i32,i32}/{i64,i64}/{f64,f64}/{f32,f32} packed/{i32,f32} merge/mixed {i64,f64} return). This is the one FFI corner a wrong per-target rule *silently miscompiles*, so it is structurally fenced: **codegen refuses on any non-SysV target** (diagnostic: pass by pointer instead) rather than guessing; a **> 16-byte MEMORY-class struct is rejected** (redundant with struct-by-pointer); and — the subtle one — a struct argument that would **fall to memory under register pressure** is rejected too. SysV's all-or-nothing rule passes a struct in registers only if every eightbyte fits in the class registers left after preceding args, else the whole struct goes `byval` on the stack; clang implements that reclassification in its frontend, and a flattened `{i64,i64}` at the exhaustion boundary makes LLVM split the struct across the last register and the stack (verified round-trip corruption vs a clang `byval` callee), so those signatures are refused rather than miscompiled (reorder the struct earlier, or pass by pointer). In every accepted case the struct fits in registers and per-eightbyte flattening is byte-identical to clang's own flattened parameter form. Still deferred: AAPCS64 (other arches), and the MEMORY-class `byval`/`sret` path (added only when a concrete wrapper needs a large by-value struct).

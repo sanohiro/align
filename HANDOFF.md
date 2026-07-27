@@ -236,6 +236,46 @@ was rerun after #636. #637-#644 passed their focused and PR CI gates.
 
 ## Next work
 
+The query-centered `pkg.db` design and its general library-boundary prerequisites are specified in
+`docs/impl/pkg-design/db.md` and `docs/impl/17-library-boundary-prerequisites.md`; the feasibility
+review and revised delivery gates are `docs/impl/18-pkg-db-review.md` (#666). The next
+implementation slice is L1a only: the canonical recursive Drop plan and sound
+`Option<string>` struct fields. Do not begin a SQLite/PostgreSQL driver or add database-named compiler
+variants before L1a–L7 are complete. The required order is L1a recursive DropPlan/`Option<string>`
+fields, L1b Move tagged payloads through Result, L2 borrow summaries, L3 package-defined/dependent
+resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
+L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
+`RegionPlain` bound. No safe driver begins before L1a–L7 are complete. L2 includes contextual
+parameter parsing, all-peer mutable-borrow alias checking, drop-old replacement, target-relative
+capture provenance, and the dynamic Move-return cleanup ABI. L3 includes a producer-owned linkable
+Drop thunk and root-only raw transfer. L5 permits exactly one whole-body static constructor per
+uniquely named descriptor item and uses tagged file/inline source identity plus exact per-driver
+checked-metadata Missing/Present manifest state. D3's migration-backed SQLite prepare uses the canonical
+validated numeric catalog. Query and command share the L5/D1 statement artifact and generated
+binder. Checked metadata is per permitted driver. Option API ownership is D1/D2/D4/D6/D7/D12, with
+D9 completing deadline enforcement/native cancellation cleanup without a v1 public cancel
+resource. PostgreSQL Text `bytea` uses exact hex while raw bytes are Binary-only; cancellation must
+resynchronize or close before connection reuse; and Query-less validation uses no fabricated Query
+identity. `resource.borrow` is public safe ownership-only access while raw forms stay
+declaring-subtree privileged. `db.exec_result` is exactly the Copy affected-row record. Every D11
+live command has explicit entry/catalog/driver/target inputs. D12 uses exact `SchemaRef`/`TableRef`
+and complete flat Column/Key/Index/Query records, with exact detail/discriminator projection,
+Unknown-state and Summary→Parameter→Column ordering, ordinal/digest semantics, and declaration-order
+U+0000 rejection precedence for identifier components. Duplicate constraint names use a canonical
+`key_ordinal`; its complete key signature includes action/deferral/validation fields. The L5/D1
+artifact has an exact top-level/nested canonical codec, checked-in Query/command byte+digest
+goldens, structural reachable-definition Params/Row fingerprints, every binder/decoder ABI version,
+and a producer-owned QueryMeta plan/thunk. D2 owns SQLite's single active-execution lease. D3/D5 use
+the exact derived metadata path, fail-closed canonical JSON/identity codec, explicit schema ID for
+mutable targets, and independent goldens; D3/D11 share the versioned migration/schema-identity
+codec. D0 records the actual
+engine/version origin/nullability evidence; D3/D5 own fail-closed driver matrices, ambiguous evidence
+remains `Unknown`, and runtime NULL guards remain mandatory. The first public database release gate is
+driver-relevant D1–D12: D4 merge/release requires non-skippable provisioned PostgreSQL CI; D11 uses
+the exact atomic-default/dirty-forbidden migration contract; and D12 returns flat metadata/plan
+records into an explicit region. D13/D14 remain committed additive work. Native feasibility probes
+may run independently but create no public API.
+
 The capture-context, threshold, test-policy, direct integer transform-reduce, queue-publication,
 focused-verification, low-lock task-group, staged-map, and body/byte-aware grain slices are
 shipped in #643, #644, #646, #647, #648, #649, #650, #651, and #652. #653 shipped stable
@@ -319,6 +359,9 @@ Language semantics and surface       draft.md
 Current decisions and open items     docs/open-questions.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
+Current pkg.db contract              docs/impl/pkg-design/db.md
+Native library boundary prerequisites docs/impl/17-library-boundary-prerequisites.md
+pkg.db feasibility review            docs/impl/18-pkg-db-review.md
 Cache architecture and parity resolution    docs/impl/10-cache-first-optimization.md
 Test execution policy                docs/impl/16-test-policy.md
 Closure/memory/I/O/SIMD audit        docs/impl/12-pipeline-closure-memory-io-simd-audit.md

@@ -226,11 +226,12 @@ every item below has since completed as recorded in the per-milestone sections, 
      `enums` table grows during resolution with reserved slots + `enum_mono` dedup, `Opt<i32>` interns
      a monomorph `EnumDef`, and `Opt.Some(7)` infers the type args from the payload then
      monomorphizes). `examples/generic_sum_type.align`. **→ 4c is CLOSED.** Minimal generics is
-     complete (functions + builtin bounds + generic structs + generic sum types); per the philosophy
-     it is deliberately *not* extended further. The leftovers are not generics: generic **containers**
-     (`Stack<T>`/`array<T>` fields) fold into #5 `group_by` if a consumer needs them; **`vec<N,T>`** is
-     M6; a generic-def-inside-a-generic-fn is an optional refinement. The "big three" (4a/4b/4c) are
-     done.
+     closed in scope (functions + builtin bounds + generic structs + generic sum types). The shipped
+     implementation still has a compositional hole for `array<R>`/`slice<R>` and top-level generic
+     type applications inside a generic function. The post-M15 L7 prerequisite below closes exactly
+     that hole and adds the closed `RegionPlain` bound, without user traits/runtime dictionaries or
+     new concrete container element capabilities. `vec<N,T>` remains M6; expected-type
+     decomposition for `Opt.None` remains optional. The "big three" (4a/4b/4c) are done.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
@@ -3497,31 +3498,112 @@ answered and resolved, and the English validation summary was posted before squa
 audit structural item is the explicit value-carrying-control-flow region/move/drop matrix and its
 1:1 tests.
 
+## Post-M15 mandatory library-boundary prerequisites
+
+`pkg.db` establishes a concrete consumer for seven language/compiler gaps that are general to
+ordinary native-backed packages. They are not optional database polish and must land before a
+SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptance matrix are
+`17-library-boundary-prerequisites.md`; the database sequence that follows is
+`pkg-design/db.md` §23. The feasibility findings and revision rationale are
+`18-pkg-db-review.md`.
+
+```text
+L1a recursive DropPlan framework + Option<string> fields
+L1b Move sum/Option/Result payload completion
+L2  contextual parameter modes + all-peer aliases + capture provenance + Move-return cleanup ABI
+L3  package-defined opaque Move resources + linkable Drop thunks + dependent views + root transfer
+L4  named arena region capability + clone_in
+L5  deterministic tagged file/inline/metadata inputs + static Query/command artifacts
+L6  region-backed RegionPlain array_builder
+L7  nested generic package APIs + closed structural RegionPlain bound
+ D0 native SQLite/libpq feasibility probes
+ D1 generated Query/command plans over a fake driver
+ D2 minimal SQLite Query vertical
+ D3 SQLite checked metadata
+ D4 minimal PostgreSQL Query vertical
+ D5 PostgreSQL checked metadata
+ D6 prepared statements
+ D7 transactions/common execution view
+ D8 typed streaming rows
+ D9 scoped options/deadline enforcement/native cancellation cleanup
+D10 one-pass compound Output
+D11 exact-policy SQL migrations
+D12 region-owned category metadata + EXPLAIN
+D13 batch/SoA/high-value native paths
+D14 dynamic SQL + proved callback surfaces
+```
+
+L1a–L7 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
+they are being built, but no probe API becomes public. Its recorded SQLite/libpq evidence includes
+the exact engine/version origin and result-nullability information actually available; catalog
+`NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
+source/artifact/binder, Query decoder, and separate-compilation behavior without a database,
+including the exact top-level/nested codec, checked-in Query/command byte+digest goldens,
+structural reachable-definition Params/Row fingerprints, a producer-owned QueryMeta plan/thunk, and
+binder/decoder ABI versions. Option
+APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
+connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
+The checked-metadata merge gates D3 and D5 each pin the exact derived path, canonical JSON and
+identity streams, independent byte/digest goldens, and corresponding conservative
+origin/nullability support matrix measured by D0; ambiguous evidence remains `Unknown`, and runtime
+NULL validation is never optimized away. D2 owns SQLite's one active-execution lease and overlap
+cleanup matrix. D9 completes shared deadline enforcement/native
+cancellation cleanup and the cross-scope disposition
+audit; it does not add a public cancel resource or replace an
+interim surface. D2 and D4 deliberately remain scalar verticals; their purpose is to connect the
+final Query-centered API to each native library without inventing a temporary dynamic API. D4 merge
+and every database release require a provisioned non-skippable PostgreSQL CI job; reported skips are
+local-only. D10 is part of the initial database release rather than a future relationship feature.
+
+D11 SQL migrations use the versioned `ALIGNMIG`/`ALIGNSID` codec/goldens plus the exact
+required-by-default/forbidden-one-statement policy and dirty-state repair contract. Every
+migrate/status/check/repair invocation explicitly names its entry,
+migration catalog, driver, and matching database target. D12 returns exact flat metadata/plan
+records into an explicit region. Its gate includes the complete category/detail/discriminator
+projection and ordinal/digest matrix plus pre-native U+0000 rejection for every schema/table
+reference component on both drivers. The matrix includes every Declared/checked/Unknown cell,
+Summary→Parameter→Column group order, canonical duplicate-constraint `key_ordinal`, and
+same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
+multi-invalid error precedence. The D12 gate compares exact signature notation with the owning API
+table, syntax-checks positional examples, and requires separately compiled Query metadata to come
+from the producer-owned plan/thunk without runtime artifact I/O. D11 and D12 are part
+of the first database release after the two driver verticals and compound-output proof. D13–D14 are
+committed additive database work, not an unspecified deferral. They must not weaken the
+Query/compound-output contract. Normal builds remain offline at every stage; only explicit database
+tooling may contact a database during build preparation.
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).
 
 ```text
-error type design          → finalized in M2
-ownership syntax           → finalized in M3
-arena API (explicit allocator) → finalized in M3
-minimal generics system    → finalized before starting M4 (array operations require generics)
-out params + noalias       → right after Memory Model v2 (extends EscapeCheck/MoveCheck)
-arena checkpoint/rollback  → std arena API, after Memory Model v2
-SoA layout + align(N)      → finalized in M6 (keep array lowering layout-parametric before then)
-string SSO                 → settled: NOT adopted (open-questions Settled)
-panic / unwinding          → settled: no unwind, plain-call CFG (open-questions Settled)
-purity inference           → finalized in M7 (integral with par_map checking)
-presence of SIMD intrinsics → finalized in M6
-reflection                 → out of v1 scope
-FFI                        → out of v1 *language* core; design before std.compress / pkg DB
-                             drivers (they wrap C engines via FFI). Reconsider after M8.
-backend/runtime perf       → deferrable backlog (VLA/SVE, nontemporal, fast-math, LTO,
-                             -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
-                             io_uring) — open-questions Future "Hardware & backend optimization
-                             backlog". No front-end change; add after the core + std.
+error type design             → settled and shipped in M2
+ownership syntax              → settled and shipped in M3
+named arena destination       → settled for L4; not an allocator trait
+minimal generics system       → settled and shipped before M4; remains closed
+recursive tagged Move payloads → settled; mandatory L1a/L1b
+borrowed parameters           → settled; mandatory L2
+opaque native resources       → settled; mandatory L3
+out params + noalias          → settled existing mechanism; shared with L2 alias checks
+arena checkpoint/rollback     → rejected after measurement; scoped arenas remain
+SoA layout + align(N)         → settled in M6; later DB batch path reuses it
+string SSO                    → settled: NOT adopted
+panic / unwinding             → settled: no unwind, plain-call CFG
+purity inference              → settled and shipped; D10 shapers require Pure callbacks
+presence of SIMD intrinsics   → settled in M6
+reflection                    → not used by Query bind/decode; out of v1 scope
+FFI                           → v1 shipped; L3 supplies its general persistent-resource boundary
+static source inputs          → settled narrow constructor registration; mandatory L5
+region plain-struct builder   → settled; mandatory L6
+backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-math, LTO,
+                                -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
+                                io_uring); no DB-specific frontend shortcut
 ```
 
 ## Out of v1 Scope (intentional)
 
-As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, incremental compilation, and self-hosting are outside v1. However, keeping MIR backend-agnostic does not obstruct future additions (`00-overview.md`).
+As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, whole-frontend
+incremental compilation, and self-hosting are outside v1. The shipped per-unit interface/object
+cache still gives separate-compilation invalidation; L5 extends that existing identity to static
+Query inputs and artifacts without promising a new incremental frontend. Keeping MIR
+backend-agnostic does not obstruct future additions (`00-overview.md`).

@@ -55,7 +55,8 @@ A Rust workspace. Split crates per stage, matching IR boundaries to crate bounda
 ```text
 alignc/                  workspace root
   crates/
-    align_span/          source positions / file management (depended on by all stages)
+    align_span/          source positions / file management, including registered static inputs
+                        (depended on by all stages)
     align_diag/          shared foundation for diagnostics (errors/warnings)
     align_ast/           syntax tree shared by parser, sema, and formatter
     align_lexer/         source → tokens
@@ -64,7 +65,8 @@ alignc/                  workspace root
     align_mir/           HIR → MIR conversion + MIR optimization (fusion etc.)
     align_codegen_llvm/  MIR → LLVM IR → object
     align_runtime/       minimal runtime (arena allocator etc.). Linked into output
-    align_interface/     canonical per-unit public interfaces + hashes/codecs
+    align_interface/     canonical per-unit public interfaces + hashes/codecs, including
+                        public static-Query contracts
     align_hash/          canonical hashing shared by language/runtime/cache identity
     align_fmt/           token-preserving source formatter
     align_driver/        CLI, import DAG, object cache, parallel codegen, link
@@ -80,6 +82,34 @@ rules:
 
 - Direct owned-`string` comparison is specified but not lowered; compare through `str`-typed helper
   parameters for now (`draft.md` §5).
+
+## Required native-library boundary (settled 2026-07-27)
+
+Ordinary Align packages must be able to wrap persistent native state without receiving a
+compiler-known handle type for every library. The design of record is
+`17-library-boundary-prerequisites.md`:
+
+```text
+recursive tagged Move payloads
+borrowed parameters + inferred return provenance
+package-defined opaque Move resources + exactly-once Drop
+named arena region capabilities
+deterministic compiler-registered static source inputs
+region-backed plain-struct builders
+```
+
+These are general language/compiler mechanisms. `pkg.db` is their first complete consumer, but
+neither ownership checking nor MIR lowering may dispatch on a `pkg.db`, `std.http`, or other
+package name. Existing compiler-known std handles migrate only when their owning package is
+implemented in ordinary Align; this work does not create an `std.http` dependency for `pkg.db`.
+
+Static inputs are a narrow extension of the source pipeline. The driver discovers exact files
+referenced by recognized static constructors, registers them in `align_span`, and incorporates
+their hashes into the producer action and implementation identities. The public semantic contract
+is encoded by `align_interface`; producer-only bytes and generated thunks stay in the object and
+a separate versioned artifact. No build script, manifest language, directory scan, environment
+read, or build-time database connection is introduced.
+
 ## Document Index
 
 ```text
@@ -100,6 +130,9 @@ rules:
 12-pipeline-closure-memory-io-simd-audit.md  pipeline legality, closure ABI/lifetime, allocation, I/O, and SIMD audit
 13-string-array-allocation-short-input-audit.md  text/array ownership, copy counts, and short-input audit
 14-llm-inference-focus-audit.md  measured model-loading/layout/routing/profiling priorities
+16-test-policy.md     ordinary PR gate and focused/full/performance test policy
+17-library-boundary-prerequisites.md  borrow/resource/region/static-input/builder prerequisites
+18-pkg-db-review.md   database design feasibility review, findings, and revised delivery gates
 source-correctness-fixes-2026-07-13.md  implemented correctness fixes and their permanent regression gates
 ```
 

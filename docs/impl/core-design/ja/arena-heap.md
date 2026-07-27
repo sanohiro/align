@@ -18,7 +18,23 @@ b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
 ```
 
+`out` はcontextualである。`out: region` はcapability parameter名、`out dst: slice<T>` は
+out-mode parameterで、whitespaceではなくtoken lookaheadで区別する。
+
 box の表面はこれで全部である — `.set()` も deref 演算子もない。
+
+必須L4 signature（**未実装**）:
+
+```text
+arena out { … }             // 同じ arena を `out: region` として束縛する
+```
+
+名前付き arena formは確定済みの前提機能である。これは
+`box<T>` を拡張するものではない。`out` は通常のライブラリ関数へ渡せる、
+スコープ限定のアロケーション先 capability である。匿名 arena と名前付き arena
+は同じ begin/end と一括 cleanup を使う。完全な契約は
+[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) §4
+にある。
 
 ## Type & ownership classification
 
@@ -44,6 +60,7 @@ region モデルの参照実装である: `region_of(box) = Arena(depth)`、`reg
 - box における **struct / sum 型 / 所有権付きペイロード**、また box を param/return/field にすること。M3 でのスコープはスカラーかつ arena ローカルに限定されている。ペイロードの対象を広げるのは実際の設計作業であり（boxed な所有値の drop、Move との region 相互作用の考慮）、機械的な拡張では済まない。
 - box の `.set()` や変更操作の表面 — 現在のところそれを要求するユースケースがない。今日の box は「一度計算してローカルに読む」ためのものである。これを汎用的なヒープのセルに拡張するには、すでにパターンをカバーしている `mut` ローカルや arena 値との競合を避けるための「One-way（一方向）」レビューが必要になる。
 - escape する box（arena の寿命を越えて生き延びる box / グローバルな heap 層）— 意図的に提供していない。所有権モデルにおける「より長生きする値」への答えは Move 型であり、box のライフタイムで解決するべきではない。
+- **名前付き `region` の実装（必須 L4）**: `arena out {}` を parse/bind し、通常の関数呼び出しを通してその正確な arena を伝播し、escape / storage / task / FFI を禁止し、`clone_in(out)` を追加する。設計は確定済みで、残っているのは実装だけである。
 
 ## Pitfalls
 

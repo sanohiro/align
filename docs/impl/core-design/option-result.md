@@ -31,11 +31,18 @@ error(c)                            // sugar: constructs the Code-carrying Error
 
 ## Type & ownership classification
 
-`Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). Payloads follow the
-sum-type payload rules: scalars and plain-data structs; **owned Move payloads are rejected** at
-the `scalar_arg` choke point — with the deliberate std exceptions (`reader`/`writer`/`buffer`/
-`parsed` in the `Ok` position, per the std-design docs). `Option` payloads being scalar-only is
-also why niche optimization was evaluated and deferred (#312 — no expressible target type today).
+`Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). The current implementation
+still rejects several owned Move payload shapes at `scalar_arg`, with compiler-known std-handle
+exceptions. The replacement is settled and mandatory before `pkg.db`: one recursive tagged
+`DropPlan` admits any finite non-recursive Move payload, makes the tagged container Move, drops only
+the active payload, and moves/nulls it through construction/`match`/`else`/`?`. L1a/L1b in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) owns that
+implementation. Until those slices land, the existing diagnostics remain the honest compiler
+boundary; new library handles must not add another exception.
+
+The PR boundary is exact: L1a admits only `Option<string>` as an owned struct-field leaf and leaves
+`Option<MoveStruct>` rejected; L1b admits Move structs/sums as Option/Result/user-sum payloads and
+completes their tagged control flow.
 
 ## Effects
 
@@ -63,10 +70,11 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
   *stance*, not a gap-by-accident: `match` + `else` + `?` cover the uses without growing a
   second, combinator-flavored control-flow dialect. Adding any of them is a design decision
   (One-way review) — record in `open-questions.md` before implementing.
-- **Move-error `else`**: `else` on a `Result` whose error is a *Move* type (`Result<T, string>`)
-  is rejected for now — the discarded buffer would leak (enum/Result Move payloads have no
-  discard-drop yet). Every `Result` error today is a Copy enum (`Error` / a user error enum), so
-  the common case is fully supported; this lifts when Move payloads gain their discard-drop.
+- **Recursive tagged Move payload implementation (required L1a/L1b):** `else` on a Move error must
+  drop the discarded `Err`; `?` must move/propagate it; `match` must move/null a bound live payload;
+  `Option<Move>` fields and Move sums inside `Result` must use the same plan. This is settled work,
+  not a remaining API decision. Arrays of arbitrary Move elements and recursive types remain
+  separate.
 
 ## Pitfalls
 

@@ -22,7 +22,21 @@ b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
 ```
 
+`out` is contextual: `out: region` names the capability parameter, while `out dst: slice<T>` is an
+out-mode parameter. Parsing uses token lookahead, not whitespace.
+
 That is the entire box surface — no `.set()`, no deref operator.
+
+Required L4 signature, **not implemented yet**:
+
+```text
+arena out { … }             // binds the same arena as `out: region`
+```
+
+The named arena form is a settled prerequisite. It does not widen `box<T>`:
+`out` is a scope-limited allocation-destination capability for ordinary library functions, and
+anonymous/named arenas share the same begin/end and bulk cleanup. Full contract:
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §4.
 
 ## Type & ownership classification
 
@@ -61,6 +75,9 @@ The reference implementation of the region model: `region_of(box) = Arena(depth)
   against `mut` locals and arena values, which already cover the patterns.
 - Escaping boxes (a box that outlives its arena / a global heap tier) — deliberately absent;
   the ownership model's answer to "longer-lived" is Move types, not box lifetimes.
+- **Named `region` implementation (required L4):** parse/bind `arena out {}`, substitute the exact
+  arena through ordinary calls, enforce no escape/storage/task/FFI, and add `clone_in(out)`. The
+  design is settled; only the implementation is outstanding.
 
 ## Pitfalls
 

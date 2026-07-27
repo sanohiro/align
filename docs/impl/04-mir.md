@@ -29,7 +29,7 @@ shows what a program actually lowered to. Historical optimization proposals are 
 A CFG (a set of basic blocks) per function. Each block is a sequence of statements + a trailing terminator. Close to SSA form (each value defined once; reassignment yields a new value), but assignment to a `mut` place is an explicit store.
 
 ```text
-Function { name, params, ret, slots, blocks[] }
+Function { name, params: [(value, Ty, ParamMode)], ret, slots, blocks[] }
 Block    { params, stmts[], term }
 
 stmt =
@@ -38,6 +38,7 @@ stmt =
   StoreField / StoreIndex / PtrStore   // explicit aggregate or buffer writes
   ArenaEnd / TgWait / TgEnd            // explicit lifetime and join points
   Drop / DropValue / DropElem…         // explicit ownership release
+  ClearDropFlag                         // ownership transferred to native/raw
 
 term =
   Goto(bb)
@@ -54,6 +55,88 @@ while preserving allocations, drops, task boundaries, and parallel materializati
 operations for codegen and inspection.
 
 Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **does not recompute** types (anti-rewrite).
+
+### 1.1 Borrow and resource operations
+
+The library boundary adds generic MIR operations, never package-specific variants:
+
+```text
+ResourceFromRaw { resource_def, raw }
+  // unsafe; establishes independent ownership
+ResourceFromRawBorrowed { resource_def, raw, parent_ref }
+  // unsafe; establishes Move child plus parent-generation dependency
+ResourceBorrow { resource_def, owner_place }
+  // Copy ResourceRef
+ResourceViewFromRaw { resource_def, owner_ref, ptr, len, view_kind, validation_plan }
+  // unsafe boundary; checked owner-tied str/slice view result
+ResourceRaw { resource_def, resource_ref }
+  // unsafe; non-owning extraction
+ResourceIntoRaw { resource_def, owner_place }
+  // unsafe; standalone owned resource root only; consumes + clears Drop flag
+CloneIn { value, region_handle, plan }
+  // explicit recursive region copy
+RegionBuilderNew/Push/Build { ... }
+  // visible region allocation/copy operations
+StaticQueryDescriptor { artifact_id }
+  // producer-owned immutable descriptor
+```
+
+Ordinary `Drop`/`DropValue` consults the resource definition's producer-owned Drop thunk; no
+`DbConnDrop`, `RegexDrop`, or sibling type family is added. `ResourceIntoRaw` accepts only an
+initialized standalone resource local or by-value resource parameter owned by the function. HIR
+rejects fields, elements, projections, borrowed/out parameters, and temporaries, so MIR never needs
+field-level cleanup ownership. The operation leaves the accepted root uninitialized on every
+continuing path, exactly like another Move transfer.
+
+`ResourceFromRawBorrowed` carries the exact imported/local resource declaration identity, the raw
+handle, and a checked `ResourceRef` for the parent generation. The result is a Move resource whose
+cleanup must precede any invalidating move, mutable borrow, or Drop of that parent generation.
+That dependency is a typed HIR/MIR fact and is preserved through moves, aggregates, calls, and
+interfaces; it is not reconstructed from raw values in LLVM.
+
+`ResourceViewFromRaw` is the explicit unsafe-to-safe boundary for package-owned native buffers.
+Its `validation_plan` performs checked signed-to-size conversion, size arithmetic, null/zero-length
+handling, alignment for non-byte views, and UTF-8 validation for `str` before the operation returns
+a safe `Option<str>`/`Option<slice<T>>`. A successful view carries the exact `owner_ref` generation.
+Failure returns `None` without creating a view. MIR-to-LLVM lowers these checks and the resulting
+fat-view representation mechanically; codegen may not invent, omit, or weaken them.
+
+`Borrow` and `BorrowMut` parameters use a non-null pointer to caller-owned storage in the internal
+ABI. A recursively Move pointee also passes access to the caller's path-local cleanup bit. They are
+never materialized as an owning copy in the callee. The callee may read through a shared borrow; a
+mutable borrow additionally permits replacement/mutation allowed by the checked source. Neither
+mode emits function-exit cleanup for an unchanged pointee: ownership remains with the caller.
+Replacement is different. MIR emits the ordinary `DropValue(old_place, DropPlan)` guarded by the
+caller's current cleanup bit before storing the new value, then stores the new cleanup bit. Thus an
+old string/array/resource is dropped exactly once and a later caller cleanup sees only the
+replacement. `BorrowMut` carries non-alias facts proven by recursively scanning every peer
+parameter mode in checked HIR, but LLVM attributes are emitted only where their exact ABI meaning
+is sound.
+Owner-generation invalidation is complete in HIR before MIR construction and is retained in debug
+provenance; LLVM does not decide borrow legality.
+
+`Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
+`ReturnBorrowSummary`/`ReturnRegionSummary` and `ReturnCleanupAbi`. A named function converted to a function value retains
+`Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical direct-call
+ABI and applies the stored result provenance. Concrete closure targets resolve target-relative
+capture-slot summaries through the selected environment; those roots travel when the function
+value moves and constrain the result. Function-value joins require exact mode equality, union
+parameter sets, and preserve the selected target's capture metadata. An unresolved higher-order parameter uses every compatible view/region
+input rather than `None`, including embedded provenance in a by-value Move operand. The call
+snapshots that provenance before its ordinary move/null and attaches it to the result. No
+indirect-call shim copies a borrowed owner, changes a parameter mode, or drops result provenance.
+
+A recursively Move return lowers as the normal return value plus one dynamic cleanup bit.
+`ReturnCleanupAbi::DynamicBit` is part of direct/indirect/interface ABI identity. Every return edge
+forwards its selected path-local bit; callers store it beside the returned value. In particular an
+arena-owned `Ok` and an individually owned `Err` may return different values of that bit through
+the same `Result` ABI. `ReturnRegionSummary` supplies lifetime roots only and never reconstructs the
+ownership bit.
+
+A resource Drop operation names the resource-declaring producer's generated hidden support thunk,
+whose symbol and ABI fingerprint come from the imported resource summary. The thunk calls the
+`pub` raw-only hook in the package's `internal` module. MIR never attempts to resolve or import that
+source hook from a consumer unit.
 
 ---
 
@@ -225,6 +308,7 @@ The region checked in `03 §7` is converted into actual allocation/release here.
 ```text
 arena {}        →  group of Alloc(.., Arena(id)) + a bulk release at the block exit
                    no individual Drops emitted (arena is bump + bulk reset)
+arena out {}    →  the same ArenaBegin/ArenaEnd; `out` is the existing handle as `region`
 Heap            →  Alloc(.., Heap). Drop at the release point derived from the move check
 Stack/Value     →  on the stack. Drop at scope end
 ```
@@ -239,6 +323,13 @@ arena {
 ```
 
 Because the `Alloc` node carries a region, lints like "allocation inside a loop" and "unnecessary heap" (`draft.md` §16) detect them by scanning this MIR. Escapes are already rejected in HIR (`03 §7`), so MIR can assume safety.
+
+An imported function with a `region` parameter receives the caller's arena handle as an ordinary
+internal ABI operand. Its allocations remain `ArenaAlloc { handle, ... }`, and its returned
+ownership/region fact is already fixed by `ReturnRegionSummary`. There is no ambient current-arena
+lookup. Region-builder chunk allocations and the final compacting allocation are distinct MIR
+operations so `emit-mir`, allocation lints, and benchmarks can observe the documented one-pass
+cost.
 
 ---
 
@@ -328,3 +419,6 @@ explicit ownership/parallel operation in the emitted MIR.
 
 Monomorphization is already settled: it happens before MIR construction (`03 §9`). A parallel
 reduction is a possible future feature, not an unimplemented branch of the current MIR.
+Borrow/resource/region/static-Query lowering is also settled but not yet implemented; its
+mandatory sequence and exhaustive-pass verification are in
+`17-library-boundary-prerequisites.md` §§8–10.

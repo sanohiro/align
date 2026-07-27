@@ -41,6 +41,16 @@ xs.chunks(n)                       xs.map_into(dst)        // write into caller 
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
                                    xs.sort() / .sort_by_key(f)   // materializing
                                    (evens, odds) := xs.partition(p)
+
+array_builder<T>()                 // 実装済みの heap grow/freeze 形式
+builder.push(value)
+builder.build() -> array<T>
+```
+
+必須L6 signature（**未実装**）:
+
+```text
+array_builder<T>(out: region)      // region/plain-struct 形式
 ```
 
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。
@@ -49,6 +59,11 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 
 - Fixed array は Copy 値である。**Move 要素** を持つ fixed array（所有権付きフィールドを持つ `[User{name}]` など）は、要素ごとの drop が実装されるまで拒否される。
 - Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（str 要素の配列は deep-free される。#339 の前例を参照）。
+- `array_builder<T>` は1つのmutable-local Move ownerである。L2後は同じownerを
+  `borrow mut` parameter経由でhelperが変更できるが、builderをaggregate fieldやreturn
+  valueにはできない。
+- `array_builder(out).build()` のarena-owned結果は同じfunction内でfinal aggregateへ
+  consumeし、通常call boundaryをby-valueでは通さない。
 - Slice は Copy のビューである。`mut slice<T>` の束縛（または `out` 引数）が、唯一の書き込み可能なビュー形式となる。
 - `.count()` は *パイプライン* の長さを表す（`where` と合成される）。一方 `.len()` は直接的な長さの読み取りである。これら 2 つは意図的に両方存在しており、統合してはならない。
 - `zip(a, b, ...)` はパイプライン専用の遅延評価ソースである。インデックスごとに SSA タプルを 1 つだけ作成し、ループの前にランタイムの長さをすべて検査するため、タプルの配列用メモリは確保しない。v1 では 2 つ以上の名前付きの array/slice、fixed literal、または Copy 可能なプリミティブスカラー要素を持つ sub-slice を受け取る。
@@ -69,6 +84,13 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 `zip(...).map_into(dst)` では、すべての source と `dst` が重複しないことが証明される。ランタイムの source 読み込みは 1 つの input-vs-output スコープを共有し、source 同士のエイリアスは許可されており、互いに disjoint であるとは宣言されない。
 
 ## 仕様先行(未実装)
+
+- **region-backed plain-struct builder（必須 L6）**: `array_builder<T>(out)` は明示された
+  region 内でchunk単位に成長し、再帰的な `RegionPlain` 要素を受け入れ、最後に文書化された
+  1回のcompact passを行う。短命なviewは挿入前に `clone_in(out)` しなければならない。
+  hidden heap allocationはなく、実装済みheap builderのzero-copy freezeも変更しない。
+  設計は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
+  §7にある。
 
 - **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、読み出しを借用とするか所有権移動とするかという規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。

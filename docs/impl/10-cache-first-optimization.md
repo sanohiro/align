@@ -16,6 +16,17 @@ items below remain proposals, not descriptions of a missing CAS. Audit baseline:
 > only; the former copied schema summaries are gone. `ALIGNC_CACHE=off` remains useful to request a
 > deliberately cold run, but is no longer a correctness-audit workaround.
 
+> **Static-input extension settled 2026-07-27 (not yet implemented):** a producer unit may declare
+> exact static inputs only through a compiler-known constructor used as the single whole body of a
+> named zero-argument non-generic descriptor function. Its sorted
+> `(File(logical_path)|Inline(query_id), content_hash, consumer_kind)` list joins source in the unit
+> action identity; only the `File` form performs pre-frontend I/O.
+> Query source SQL plus deterministic per-driver wire SQL/rewrite maps, metadata, and generated
+> thunks affect `impl_hash` and producer object/link identity; the
+> exported Params/Row/driver/static-option contract alone affects `interface_hash`. A SQL-only edit
+> therefore misses the producer while unchanged consumers remain hot. Full contract:
+> `17-library-boundary-prerequisites.md` §§5–6.
+
 The status labels in this document are deliberate:
 
 - **CONFIRMED** — reproduced against the baseline, or directly proven from the implementation.
@@ -241,7 +252,7 @@ bytes:
 
 | Stage | Action identity | Result |
 |---|---|---|
-| Frontend | source/import graph digests + frontend schema/options | checked HIR/MIR digest + diagnostics |
+| Frontend | source/import graph digests + registered static-input logical paths/content hashes + frontend schema/options | checked HIR/MIR + static-artifact digest + diagnostics |
 | Codegen | canonical location-free MIR digest + exact codegen/toolchain identity | object or bitcode digest |
 | Link | ordered input-object digests + runtime/link environment identity | executable digest |
 
@@ -254,6 +265,17 @@ This separation matters:
 - `check`, normal build, and located `explain-opt` do not accidentally share incompatible results.
 - Object caching remains useful even where non-hermetic system linking makes executable caching
   unsafe.
+
+Static-input registration follows resolved constructor identity, not lexical candidates. On a cold
+source/import digest, import/name resolution produces the exact list before any static file is
+read. A later no-op may reuse only a versioned `StaticInputManifest` bound to that exact
+source/import-resolution digest; any source/import/schema mismatch resolves again. Missing optional
+checked metadata is itself a keyed state. For every static descriptor and permitted driver, the
+manifest/action key records its exact derived logical path as
+`Missing | Present(content_hash, format_version)` and revalidates that path before a pre-frontend
+hit. Creating, deleting, or changing SQLite/PostgreSQL metadata therefore cannot false-hit, while
+directory scans remain forbidden. Directory mtimes, file mtimes, absolute checkout paths, database
+connections, secrets, and environment values never enter the normal-build key.
 
 Do not use the formatter's current "significant token texts" helper directly as a semantic cache
 key: it deliberately drops statement terminators and relies on reparsing as a second safety check.
@@ -749,6 +771,11 @@ are byte-identical on the supported object formats.
 **Completion status:** reuse, source-revert, key-separation, observability, and cold/cache
 success-parity gates shipped. The object key covers the complete structural per-unit MIR consumed by
 codegen; function-only MIR remains a human inspection format, not a cache identity.
+
+The L5 static-input slice extends that same key rather than adding a parallel Query cache. Required
+gates: SQL-only producer miss/consumer hit, metadata Missing↔Present invalidation, public
+Params/Row/restriction invalidation, checkout-root reproducibility, and corrupted artifact
+fail-closed behavior.
 
 ### Slice C2 — M15 unit summaries and incremental invalidation
 
