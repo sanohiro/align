@@ -46,12 +46,13 @@ Do the work in this order:
    intermediate array.~~ **SHIPPED 2026-07-26; expanded 2026-07-27.** Direct, stage-free scalar
    and `chunks` maps now use a reduction range kernel with one wrapping partial per claimed range;
    staged reduction remains on its existing path.
-7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-26 (map, callable-
-   filter, and AoS field slices);** primitive-scalar `map` stages before `par_map` execute in one
-   ordered range kernel. Callable primitive-scalar `where` and AoS `where(.field)` use stable
+7. ~~Parallelize length-preserving staged pipelines first.~~ **SHIPPED 2026-07-27 (map, callable-
+   filter, AoS field slices, and recognised invariant string filters);** primitive-scalar `map`
+   stages before `par_map` execute in one ordered range kernel. Callable primitive-scalar `where`,
+   AoS `where(.field)`, and compiler-recognised `str.contains` filters use stable
    count/prefix/scatter compaction, with every callable stage and terminal callable checked Pure;
-   SoA, string-search, and other unsupported layouts remain sequential; a `chunks` source now
-   supplies borrowed `slice<T>` range values to the same kernel.
+   SoA, richer string-search expressions, and other unsupported layouts remain sequential; a
+   `chunks` source now supplies borrowed `slice<T>` range values to the same kernel.
 8. Choose grain from bytes and estimated body work, not a fixed element count alone. Evaluate
    separate CPU and blocking-I/O execution domains only after the common work-first fix.
 
@@ -121,9 +122,11 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
   captures;
 - callable primitive-scalar `where(...).par_map(...)` chains use the stable count/prefix/scatter
   range path and preserve source order;
-- SoA projections, `str.contains`, and unsupported aggregate layouts are sequential. A `chunks`
-  source is admitted as an `array<slice<T>>` range source; its header buffer remains an explicit
-  producer allocation and is released after the synchronous consumer.
+- SoA projections, richer string-search expressions, and unsupported aggregate layouts are
+  sequential. A compiler-recognised invariant `str.contains` filter over a `str` element is an
+  admitted stable filter stage; its literal or single free-variable `str` needle is a read-only
+  context capture. A `chunks` source is admitted as an `array<slice<T>>` range source; its header
+  buffer remains an explicit producer allocation and is released after the synchronous consumer.
 
 The parallel case is a single `Rvalue::ParMapParallel`, as recorded in `04-mir.md`
 ([MIR node](../../crates/align_mir/src/lib.rs#L446-L449)). That node carries a source, terminal
@@ -473,9 +476,16 @@ projection, and `where(.field)` in the same typed range kernel. The generated ke
 record using its target-data stride, extracts the logical field after applying the backend's
 physical field permutation, and passes the resulting value or whole record to the known terminal
 call. Field filters use the same stable two-pass algorithm and preserve source order. SoA
-projections, `str.contains`, and other unsupported layouts remain sequential; do not infer AoS
-support for them. Chunk sources are a separate borrowed-slice input shape and do not imply support
-for those layouts.
+projections, richer string-search expressions, and other unsupported layouts remain sequential; do
+not infer AoS support for them. Chunk sources are a separate borrowed-slice input shape and do not
+imply support for those layouts.
+
+The 2026-07-27 string-filter slice admits only the HIR-recognised form
+`where(fn s { s.contains(NEEDLE) })` when `NEEDLE` is a string literal or one free-variable `str`
+atom. MIR records it as a compiler-generated `FilterStrContains` stage with one `str` capture;
+LLVM calls the existing `str_contains` ABI in both the count and scatter kernels. This preserves
+source order, keeps the needle evaluation outside the element loop, and avoids adding a second
+callable/effect boundary. Richer needles continue through the ordinary per-element path.
 
 `where(...).par_map(...)` is a separate gate because output length is unknown. Two viable stable
 algorithms are:
@@ -888,7 +898,8 @@ with zero idle pool workers.
 **Current:** direct scalar/slice/chunk maps, including Copy-capturing forms, and primitive-scalar
 length-preserving `map`/callable-`where` stages use the range path with no indirect call inside the
 hot loop. Callable filters use a stable count/prefix/scatter pair; AoS projection and `where(.field)`
-share the typed range path, while `str.contains` and unsupported aggregate forms remain sequential.
+share the typed range path, and the recognised invariant `str.contains` filter now uses the same
+typed stable path. SoA, richer string-search, and unsupported aggregate forms remain sequential.
 
 ### Slice P2 — low-lock task execution
 
@@ -909,9 +920,10 @@ nested progress remain pinned.
   **SHIPPED 2026-07-26; expanded to direct `chunks` sources 2026-07-27;** staged reductions and
   elimination of the producer's own chunk-header allocation remain later slices.
 - ~~Require every callable prior stage in a parallelized `ArrayParMap` to be Pure, then parallelize
-  length-preserving staged pipelines.~~ **SHIPPED 2026-07-26 (primitive-scalar and AoS map,
-  projection, and filter slices).** Count/prefix/scatter compaction covers callable primitive-scalar
-  `where` and AoS `where(.field)`; SoA and string forms remain sequential, while `chunks` is now
+  length-preserving staged pipelines.~~ **SHIPPED 2026-07-27 (primitive-scalar and AoS map,
+  projection, filter, and recognised invariant string-filter slices).** Count/prefix/scatter
+  compaction covers callable primitive-scalar `where`, AoS `where(.field)`, and recognised
+  invariant `str.contains`; SoA and richer string forms remain sequential, while `chunks` is now
   accepted as a borrowed-slice source for the range kernel.
 - ~~Add the first body/byte-aware grain floor and compiler hint.~~ **SHIPPED in #652
   2026-07-26;** scalar width and runtime aggregate-like stride measurements are recorded; AoS
@@ -924,6 +936,11 @@ nested progress remain pinned.
   Silicon across the 65,536/65,537 boundary: caller-only sizes stayed within about 5% of a Rust
   materializing sequential control, while 65,537 and larger reached 1.78x–3.96x. This is evidence
   for the bounded slice and threshold, not a blanket claim for other predicates or selectivities.
+- ~~Admit compiler-recognised invariant `str.contains` filters to stable compaction.~~ **SHIPPED
+  2026-07-27.** The focused driver test checks survivor order and values, the MIR marker, both
+  count/scatter kernel names, and the existing `str_contains` ABI call. A malformed-MIR codegen
+  test checks that the compiler-generated stage cannot carry a callable name; richer needles and
+  unsupported layouts retain their existing paths.
 - ~~Measure whether removing the explicit `chunks` header allocation is worthwhile after the current
   chunk-source range path has a baseline.~~ **MEASURED 2026-07-27** with the runtime-only
   `bench/par_map/run.sh chunks` probe; an early one-sided-validation result was rejected as a timing

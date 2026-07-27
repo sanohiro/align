@@ -4678,7 +4678,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::Struct(id) => id.to_string(),
                     _ => "invalid".to_string(),
                 }),
-                ParMapStageKind::Map | ParMapStageKind::Filter => None,
+                ParMapStageKind::Map | ParMapStageKind::Filter | ParMapStageKind::FilterStrContains => None,
             })
             .collect();
         if ids.is_empty() { String::new() } else { format!("$struct{}", ids.join("_")) }
@@ -4696,6 +4696,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let (kind, field) = match stage.kind {
                     ParMapStageKind::Map => ("m", "-".to_string()),
                     ParMapStageKind::Filter => ("f", "-".to_string()),
+                    ParMapStageKind::FilterStrContains => ("s", "-".to_string()),
                     ParMapStageKind::Project { field } => ("p", field.to_string()),
                     ParMapStageKind::FilterField { field } => ("w", field.to_string()),
                 };
@@ -5219,11 +5220,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if reduce && !stages.is_empty() {
             return Err(self.err("par_map reduction kernels cannot contain prior stages"));
         }
-        if filter && !stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. })) {
+        if filter
+            && !stages
+                .iter()
+                .any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }))
+        {
             return Err(self.err("par_map filter kernels require a filter stage"));
         }
         if mode == ParMapKernelMode::Materialize
-            && stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }))
+            && stages
+                .iter()
+                .any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }))
         {
             return Err(self.err("par_map materialize kernels cannot contain filter stages"));
         }
@@ -5240,7 +5247,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let mut terminal_capture_start = 0usize;
         for stage in stages {
             self.validate_par_map_input_type(stage.elem_in)?;
-            if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }) {
+            if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }) {
                 if stage.elem_out != stage.elem_in {
                     return Err(self.err("par_map filter stage must preserve its element type"));
                 }
@@ -5265,6 +5272,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         return Err(self.err("par_map field stages cannot carry callable captures"));
                     }
                     self.par_map_stage_field_info(stage)?;
+                }
+                ParMapStageKind::FilterStrContains => {
+                    if stage.func.is_some() || stage.elem_in != Ty::Str || stage.elem_out != Ty::Str || stage.capture_tys != [Ty::Str] {
+                        return Err(self.err("par_map string filter must preserve str and carry one str needle capture"));
+                    }
                 }
                 ParMapStageKind::Map | ParMapStageKind::Filter => {
                     let Some(stage_func) = stage.func.as_deref() else {
@@ -5328,6 +5340,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map(|stage| match stage.kind {
                         ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
                         ParMapStageKind::Filter => stage.func.clone().unwrap_or_else(|| "where".to_string()),
+                        ParMapStageKind::FilterStrContains => "wherecontains".to_string(),
                         ParMapStageKind::Project { field } => format!("field${field}"),
                         ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
                     })
@@ -5346,6 +5359,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map(|stage| match stage.kind {
                         ParMapStageKind::Map => stage.func.clone().unwrap_or_else(|| "map".to_string()),
                         ParMapStageKind::Filter => format!("where${}", stage.func.as_deref().unwrap_or("filter")),
+                        ParMapStageKind::FilterStrContains => "wherecontains".to_string(),
                         ParMapStageKind::Project { field } => format!("field${field}"),
                         ParMapStageKind::FilterField { field } => format!("wherefield${field}"),
                     })
@@ -5556,6 +5570,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     self.builder.position_at_end(pass);
                     current = current_struct.into();
+                }
+                ParMapStageKind::FilterStrContains => {
+                    let current_str = match current {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map string filter needs a str current value")),
+                    };
+                    let needle = capture_values
+                        .get(capture_start)
+                        .copied()
+                        .ok_or_else(|| self.err("par_map string filter is missing its needle capture"))?;
+                    let needle_str = match needle {
+                        BasicValueEnum::StructValue(value) => value,
+                        _ => return Err(self.err("par_map string filter needle is not a str value")),
+                    };
+                    let hp = self.builder.build_extract_value(current_str, 0, "contains.hay.ptr").map_err(|e| self.err(e))?;
+                    let hl = self.builder.build_extract_value(current_str, 1, "contains.hay.len").map_err(|e| self.err(e))?;
+                    let np = self.builder.build_extract_value(needle_str, 0, "contains.needle.ptr").map_err(|e| self.err(e))?;
+                    let nl = self.builder.build_extract_value(needle_str, 1, "contains.needle.len").map_err(|e| self.err(e))?;
+                    let contains_fn = self
+                        .funcs
+                        .get("str_contains")
+                        .copied()
+                        .ok_or_else(|| self.err("par_map string filter is missing the str_contains runtime declaration"))?;
+                    let contains_value = self
+                        .builder
+                        .build_call(contains_fn, &[hp.into(), hl.into(), np.into(), nl.into()], "contains")
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| self.err("str_contains returned no value"))?;
+                    let BasicValueEnum::IntValue(contains) = contains_value else {
+                        return Err(self.err("str_contains returned a non-integer predicate"));
+                    };
+                    let predicate = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, contains, self.ctx.i32_type().const_zero(), "contains.pred")
+                        .map_err(|e| self.err(e))?;
+                    let pass = self.ctx.append_basic_block(kernel, &format!("filter.pass.{stage_idx}"));
+                    self.builder
+                        .build_conditional_branch(predicate, pass, reject.expect("filter reject block"))
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(pass);
+                    current = current_str.into();
                 }
             }
             capture_start = capture_end;
@@ -7431,8 +7488,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     match stage.kind {
                         ParMapStageKind::Map | ParMapStageKind::Project { .. } => stage_input = stage.elem_out,
-                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } if stage.elem_out == stage.elem_in => {}
-                        ParMapStageKind::Filter | ParMapStageKind::FilterField { .. } => {
+                        ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }
+                            if stage.elem_out == stage.elem_in => {}
+                        ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. } => {
                             return Err(self.err("par_map filter stage must preserve its element type"));
                         }
                     }
@@ -7456,7 +7514,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         )));
                     }
                     self.validate_par_map_input_type(stage.elem_in)?;
-                    if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }) {
+                    if matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }) {
                         if stage.elem_out != stage.elem_in {
                             return Err(self.err("par_map filter stage must preserve its element type"));
                         }
@@ -7515,7 +7573,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     context
                 };
-                let has_filter = stages.iter().any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterField { .. }));
+                let has_filter = stages
+                    .iter()
+                    .any(|stage| matches!(stage.kind, ParMapStageKind::Filter | ParMapStageKind::FilterStrContains | ParMapStageKind::FilterField { .. }));
                 let sty = slice_struct_type(self.ctx);
                 if has_filter {
                     let count_kernel = self.par_map_range_kernel(
@@ -12183,6 +12243,62 @@ mod tests {
         )
         .expect_err("a chunk filter that changes its slice type must fail before kernel lowering");
         assert!(err.to_string().contains("filter stage must preserve"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_string_filter_callable_is_an_error_not_a_panic() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let str_ty = Ty::Str;
+        let source_ty = Ty::Slice(Scalar::Str);
+        let finish = Function {
+            name: "finish".to_string(),
+            params: vec![0],
+            ret: i64_ty,
+            slots: vec![str_ty],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let err = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(1, Rvalue::StrLit("needle".to_string())),
+                Stmt::Let(
+                    2,
+                    Rvalue::ParMapParallel {
+                        src: Operand::Value(0),
+                        func: "finish".to_string(),
+                        stages: vec![ParMapStage {
+                            kind: ParMapStageKind::FilterStrContains,
+                            func: Some("not-compiler-generated".to_string()),
+                            captures: vec![Operand::Value(1)],
+                            capture_tys: vec![str_ty],
+                            elem_in: str_ty,
+                            elem_out: str_ty,
+                        }],
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: str_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![source_ty, str_ty, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))],
+            vec![source_ty],
+            vec![],
+            vec![],
+            vec![finish],
+        )
+        .expect_err("a compiler-generated string filter must not accept a callable name");
+        assert!(err.to_string().contains("string filter"), "got: {err}");
     }
 
     #[test]

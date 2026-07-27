@@ -749,8 +749,9 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
 /// a borrowed `slice`, or a Copy struct). A borrowed `slice` is an input-only range value for
 /// `array<slice<T>>` (`chunks`); it may be passed to the terminal or a callable `where`, but a
 /// map still has to produce a plain range-kernel output. AoS struct fields may be projected in the
-/// kernel, and `where(.field)` uses the same extracted value for stable compaction. `SoA`,
-/// string-search, and other layouts stay sequential. Keep this predicate shared by effect
+/// kernel, and `where(.field)` uses the same extracted value for stable compaction. A recognised
+/// invariant `str.contains` stage also preserves its `str` element for stable compaction. `SoA`
+/// and other layouts stay sequential. Keep this predicate shared by effect
 /// checking and MIR lowering so a stage is never admitted to the parallel kernel without the
 /// matching Pure and ownership boundaries.
 fn par_map_kernel_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
@@ -799,7 +800,14 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs:
                     return false;
                 }
             }
-            hir::StageKind::WhereStrContains { .. } => return false,
+            hir::StageKind::WhereStrContains { .. } => {
+                // HIR recognition already restricts this to `str.contains` over a `str` element
+                // with a loop-invariant `str` needle. Keep the type/preservation check here too so
+                // malformed or future HIR cannot enter an unaudited string ABI.
+                if elem != Ty::Str || stage.out_ty != elem {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -807,8 +815,10 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs:
 
 /// Whether a `par_map` result is produced by the malloc-backed range-kernel path. The parallel
 /// materializer accepts direct primitive/AoS sources, `array<slice<T>>` chunk sources, and the
-/// admitted length-preserving staged forms; SoA, string-search, and other layouts deliberately
-/// stay on the arena-aware sequential collector. Keep this predicate shared with MIR and
+/// admitted length-preserving staged forms; SoA and other layouts deliberately stay on the
+/// arena-aware sequential collector. Compiler-recognised invariant string-search filters are an
+/// admitted staged form, while richer string-search expressions continue through the normal
+/// callable path. Keep this predicate shared with MIR and
 /// ownership analysis so the runtime's individually allocated output is never mistaken for arena
 /// storage (or vice versa).
 pub fn par_map_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
@@ -4945,8 +4955,9 @@ impl EffectScan<'_> {
                 // A staged chain is only a parallel candidate when MIR/codegen can keep the whole
                 // length-preserving scalar/AoS chain inside one range kernel. Its prior callables
                 // then cross the same Pure boundary as the terminal function. Compiler-generated
-                // AoS projection and field-filter stages add no callable effect; the filtered form
-                // uses stable compaction. SoA, aggregate layouts, and `chunks` remain sequential.
+                // AoS projection, field-filter, and recognised invariant string-filter stages add
+                // no callable effect; filtered forms use stable compaction. SoA and aggregate
+                // layouts remain sequential, while `chunks` is a borrowed-slice source shape.
                 if par_map_staged_parallelizable(source.ty, stages, self.structs, self.enums) {
                     for stage in stages {
                         if let StageKind::Map { func, .. } | StageKind::Where { func, .. } = &stage.kind {
@@ -16510,9 +16521,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
     /// whole call graph) and return a primitive scalar. Lowering selects the parallel range kernel
     /// for direct scalar/slice/AoS/chunk sources and admitted length-preserving scalar/AoS stages
-    /// with Copy captures; filtered field stages use stable compaction. SoA, string-search, and
-    /// unsupported aggregate forms retain their sequential paths, while Move values are rejected
-    /// by ownership checks.
+    /// with Copy captures; filtered field and recognised invariant string stages use stable
+    /// compaction. SoA and unsupported aggregate forms retain their sequential paths, while Move
+    /// values are rejected by ownership checks.
     fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [fn_arg] = args else {

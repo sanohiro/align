@@ -3,8 +3,9 @@
 //! lowers to a generated whole-range kernel scheduled across the process-resident worker pool;
 //! Copy-capturing forms use the same range kernel through an immutable call-scoped context;
 //! primitive-scalar/AoS length-preserving map/filter/projection stages are fused into that range
-//! kernel; `chunks` supplies borrowed `slice` range values to the same kernel; unsupported layouts
-//! such as SoA and string-search retain the sequential fallback. Move captures are rejected by
+//! kernel; `chunks` supplies borrowed `slice` range values to the same kernel; recognised invariant
+//! `str.contains` filters use the same stable count/scatter path, while unsupported layouts such
+//! as SoA retain the sequential fallback. Move captures are rejected by
 //! ownership checks.
 
 
@@ -679,6 +680,27 @@ fn par_map_after_multiple_filters_uses_one_stable_parallel_node() {
     let ir = emit_llvm(src);
     assert!(ir.contains("$parfilter$count$"), "filter count kernel should be emitted:\n{ir}");
     assert!(ir.contains("$parfilter$scatter$"), "filter scatter kernel should be emitted:\n{ir}");
+}
+
+#[test]
+fn par_map_after_string_contains_filter_uses_stable_compaction() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  out := [\"alpha\", \"beta\", \"alphabet\", \"gamma\"].where(fn s { s.contains(\"alpha\") }).par_map(fn s { s.len() })\n  print(out.len())\n  print(out[0])\n  print(out[1])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-string-contains", src);
+    assert_eq!(out.status.code(), Some(0), "stdout={} stderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n5\n8\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-string-contains", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map[where str.contains -> main$lambda"), "string filter should be a generated staged parallel node:\n{text}");
+
+    let ir = emit_llvm(src);
+    assert!(ir.contains("$parfilter$count$wherecontains"), "string filter count kernel should be emitted:\n{ir}");
+    assert!(ir.contains("$parfilter$scatter$wherecontains"), "string filter scatter kernel should be emitted:\n{ir}");
+    assert!(ir.contains("call i32 @align_rt_str_contains"), "string filter kernel should use the existing str_contains ABI:\n{ir}");
 }
 
 #[test]
