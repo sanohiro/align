@@ -195,27 +195,28 @@ free the `{ptr,len}` header array, and compares it with an allocation-free contr
 the same chunk pointer/length cursor work. Both paths produce and validate the same checksum. The
 control does not model a shipped no-header parallel implementation; it isolates the producer's
 allocation and header-write cost before any production lowering change is considered.
-Validation runs outside the timed region, and the probe uses an RAII cleanup guard for the
-runtime-owned header buffer so a failed ABI assertion cannot leak it.
+Both timed arms use the same non-inlined pointer/alignment/order/length checksum helper, so ABI
+validation does not become a one-sided timing cost. A pre-timing pass checks a fresh materialized
+header buffer, and the probe uses an RAII cleanup guard for the runtime-owned buffer so a failed ABI
+assertion cannot leak it.
 
 Representative Linux x86_64 run on 2026-07-27 (32 runtime workers, 15 alternating samples, second
-of two invocations after moving validation outside the timed loop):
+of two invocations with symmetric validation in both timed arms):
 
 ```
  chunk   headers   materialize ms   cursor ms   materialize/cursor
-      1   1000000            0.914       0.933               0.979x
-      2    500000            0.887       0.943               0.940x
-      8    125000            0.888       0.939               0.946x
-     64     15625            0.871       0.949               0.918x
-    256      3907            0.878       0.941               0.934x
-   1024       977            0.893       0.935               0.955x
+      1   1000000            2.572       2.041               1.260x
+      2    500000            2.530       2.104               1.202x
+      8    125000            2.550       2.103               1.212x
+     64     15625            2.498       1.956               1.277x
+    256      3907            2.511       2.097               1.197x
+   1024       977            2.529       1.945               1.300x
 ```
 
-The producer is not a consistently slower path in this isolated probe: the two final invocations
-ranged from 0.918x to 1.024x of the cursor control after validation was moved outside the timed
-loop. This does not earn a production allocation-removal change. Keep the probe as a baseline and
-revisit only if an end-to-end no-header chunk range design has a consumer-level benefit to measure;
-chunk-body cost, scheduler cost, and the ownership contract still need to be measured together.
+The producer was consistently slower in the symmetric probe: the two final invocations ranged from
+1.183x to 1.304x of the cursor control. This earns an end-to-end no-header chunk-range design
+measurement, but not a production allocation-removal change by itself: chunk-body cost, scheduler
+cost, consumer layout, and the ownership contract still need to be measured together.
 
 ## Stable filter compaction probe
 

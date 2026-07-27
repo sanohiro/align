@@ -447,18 +447,48 @@ fn aggregate_runtime_checksum<const WORDS: usize>(
 }
 
 #[cfg(feature = "probe")]
+#[inline(never)]
+fn checked_chunk_entry_checksum(
+    data: &[i64],
+    ptr: *const u8,
+    len: i64,
+    start: usize,
+    expected_len: usize,
+) -> u64 {
+    let byte_offset = std::hint::black_box(ptr as usize)
+        .checked_sub(std::hint::black_box(data.as_ptr() as usize))
+        .expect("chunk pointer precedes the source");
+    assert_eq!(
+        byte_offset % std::mem::size_of::<i64>(),
+        0,
+        "chunk pointer is not element-aligned"
+    );
+    let offset = byte_offset / std::mem::size_of::<i64>();
+    assert!(offset < data.len(), "chunk pointer is outside the source");
+    assert_eq!(offset, start, "chunk pointer is out of source order");
+    let len =
+        usize::try_from(std::hint::black_box(len)).expect("chunk length must be non-negative");
+    assert!(len <= data.len(), "chunk length is outside the source");
+    assert_eq!(
+        len, expected_len,
+        "chunk length does not match the source layout"
+    );
+    (offset as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(len as u64)
+}
+
+#[cfg(feature = "probe")]
 fn chunk_cursor_checksum(data: &[i64], chunk: usize) -> u64 {
     assert!(chunk > 0);
-    let base_address = data.as_ptr() as usize;
     let mut start = 0usize;
     let mut checksum = 0u64;
     while start < data.len() {
         let len = chunk.min(data.len() - start);
-        let pointer_address = unsafe { data.as_ptr().add(start) } as usize;
-        let offset = (pointer_address - base_address) / std::mem::size_of::<i64>();
-        checksum = checksum
-            .wrapping_add((offset as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .wrapping_add(len as u64);
+        let ptr = unsafe { data.as_ptr().add(start).cast() };
+        checksum = checksum.wrapping_add(checked_chunk_entry_checksum(
+            data, ptr, len as i64, start, len,
+        ));
         start += len;
     }
     std::hint::black_box(checksum)
@@ -481,19 +511,30 @@ fn materialized_chunk_checksum(data: &[i64], chunk: usize) -> u64 {
         "chunks producer returned no header buffer"
     );
     let expected_count = data.len().div_ceil(chunk);
+    let expected_count = i64::try_from(expected_count).expect("chunks count must fit the ABI");
+    assert!(
+        headers.len >= 0 && headers.len <= expected_count,
+        "chunks producer returned an out-of-range header count"
+    );
     assert_eq!(
-        headers.len,
-        i64::try_from(expected_count).expect("chunks count must fit the ABI")
+        headers.len, expected_count,
+        "chunks producer returned an unexpected header count"
     );
     let count = usize::try_from(headers.len).expect("chunks producer returned a valid count");
     let entries = unsafe { std::slice::from_raw_parts(headers.ptr.cast::<ChunkHeader>(), count) };
-    let base_address = data.as_ptr() as usize;
     let mut checksum = 0u64;
-    for entry in entries {
-        let offset = ((entry.ptr as usize) - base_address) / std::mem::size_of::<i64>();
-        checksum = checksum
-            .wrapping_add((offset as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .wrapping_add(entry.len as u64);
+    for (index, entry) in entries.iter().enumerate() {
+        let start = index
+            .checked_mul(chunk)
+            .expect("chunk start offset must fit usize");
+        let expected_len = chunk.min(data.len() - start);
+        checksum = checksum.wrapping_add(checked_chunk_entry_checksum(
+            data,
+            entry.ptr,
+            entry.len,
+            start,
+            expected_len,
+        ));
     }
     std::hint::black_box(checksum)
 }
@@ -514,28 +555,24 @@ fn validate_materialized_chunks(data: &[i64], chunk: usize) {
         "chunks producer returned no header buffer"
     );
     let expected_count = data.len().div_ceil(chunk);
-    let count = usize::try_from(headers.len).expect("chunks producer returned a valid count");
+    let expected_count = i64::try_from(expected_count).expect("chunks count must fit the ABI");
+    assert!(
+        headers.len >= 0 && headers.len <= expected_count,
+        "chunks producer returned an out-of-range header count"
+    );
     assert_eq!(
-        count, expected_count,
+        headers.len, expected_count,
         "chunks producer returned an unexpected header count"
     );
+    let count = usize::try_from(headers.len).expect("chunks producer returned a valid count");
     let entries = unsafe { std::slice::from_raw_parts(headers.ptr.cast::<ChunkHeader>(), count) };
-    let base = data.as_ptr();
-    let mut start = 0usize;
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
+        let start = index
+            .checked_mul(chunk)
+            .expect("chunk start offset must fit usize");
         let expected_len = chunk.min(data.len() - start);
-        assert!(
-            !entry.ptr.is_null(),
-            "chunks producer returned a null element pointer"
-        );
-        assert_eq!(entry.ptr, unsafe { base.add(start).cast() });
-        assert_eq!(
-            entry.len,
-            i64::try_from(expected_len).expect("chunk length must fit the ABI")
-        );
-        start += expected_len;
+        checked_chunk_entry_checksum(data, entry.ptr, entry.len, start, expected_len);
     }
-    assert_eq!(start, data.len(), "chunks headers did not cover the source");
 }
 
 #[cfg(feature = "probe")]
@@ -582,6 +619,8 @@ fn run_chunks() {
     for &chunk in &[1usize, 2, 8, 64, 256, 1024] {
         let headers = SOURCE_LEN.div_ceil(chunk);
         let reps = (TARGET_HEADERS / headers).max(1);
+        // Validate a fresh producer result before timing. Both timed arms use the same helper, so
+        // their validation and checksum work remains symmetric.
         validate_materialized_chunks(&data, chunk);
         let expected = chunk_cursor_checksum(&data, chunk);
         assert_eq!(materialized_chunk_checksum(&data, chunk), expected);
