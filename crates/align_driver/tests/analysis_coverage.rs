@@ -31,6 +31,20 @@ fn main() -> i32 = 0
     );
 }
 
+#[test]
+fn move_struct_enum_payload_is_rejected_independent_of_declaration_order() {
+    let src = "\
+Inner { content: Content }
+Wrapper { Wrapped(Inner) }
+Content { Empty, Data(array<i64>) }
+fn main() -> i32 = 0
+";
+    assert!(
+        check_errs("late-enum-move-struct-payload", src),
+        "a later-resolved enum must not let a Move struct bypass the sum-type payload gate"
+    );
+}
+
 // --- 1-2: an arena value escaping through a `match` arm (region_of lacked `Match`) ---
 #[test]
 fn arena_value_escaping_via_match_arm_is_rejected() {

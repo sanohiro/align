@@ -350,6 +350,27 @@ fn option_move_struct_remains_an_l1b_diagnostic() {
 }
 
 #[test]
+fn option_struct_that_is_move_through_enum_remains_an_l1b_diagnostic() {
+    let src = concat!(
+        "Inner { content: Content }\n",
+        "Content { Empty, Data(array<i64>) }\n",
+        "Outer { value: Option<Inner> }\n",
+        "fn main() -> i32 = 0\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "option-enum-move-struct.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "Option<Struct> must not bypass L1b when only a resolved enum field makes the payload Move"
+    );
+    assert!(
+        rendered.contains("Option<MoveStruct> is implemented in L1b"),
+        "diagnostic must report the unsupported cleanup shape:\n{rendered}"
+    );
+}
+
+#[test]
 fn llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation() {
     let src = concat!(
         "Item { detail: Option<string> }\n",
