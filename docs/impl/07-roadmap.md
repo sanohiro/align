@@ -3538,7 +3538,8 @@ they are being built, but no probe API becomes public. Its recorded SQLite/libpq
 the exact engine/version origin and result-nullability information actually available; catalog
 `NOT NULL` alone never proves arbitrary Query-result non-nullability. D1 must prove Query/command
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database,
-including serialized Params/Row fingerprints and binder/decoder ABI versions. Option
+including the exact top-level/nested codec, checked-in Query/command byte+digest goldens,
+serialized Params/Row fingerprints, and binder/decoder ABI versions. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
 connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12.
 The checked-metadata merge gates D3 and D5 each check in the corresponding conservative
@@ -3558,7 +3559,8 @@ records into an explicit region. Its gate includes the complete category/detail/
 projection and ordinal/digest matrix plus pre-native U+0000 rejection for every schema/table
 reference component on both drivers. The matrix includes every Declared/checked/Unknown cell,
 Summary→Parameter→Column group order, canonical duplicate-constraint `key_ordinal`, and
-declaration-order multi-invalid error precedence. Both are part
+same-term/different-policy key ordering, contradictory-policy rejection, and declaration-order
+multi-invalid error precedence. Both are part
 of the first database release after the two driver verticals and compound-output proof. D13–D14 are
 committed additive database work, not an unspecified deferral. They must not weaken the
 Query/compound-output contract. Normal builds remain offline at every stage; only explicit database

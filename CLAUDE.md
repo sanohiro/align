@@ -140,6 +140,9 @@ independent review:
   precedence;
 - every CLI and build input is explicit, deterministic, and free of ambient
   configuration unless the contract names that configuration;
+- every canonical persisted or exchanged format fixes all scalar widths and
+  tags, every nested record and sequence order, malformed-input rejection, and
+  independently checked semantic-to-byte and byte-to-semantic golden vectors;
 - no milestone consumes a decision or capability scheduled for a later
   milestone;
 - `draft.md`, `docs/language-spec.md`, implementation plans, package designs,

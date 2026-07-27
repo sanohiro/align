@@ -60,7 +60,7 @@ listed source agree.
 | Borrowed calls | `borrow`/`borrow mut` modes, all-peer alias rejection, return roots, and cleanup ABI are interface facts | L2 | direct/indirect/imported alias/provenance/cleanup matrix | draft, language spec, types/MIR plans, prerequisite plan |
 | Opaque resources | public safe `resource.borrow`; raw forms are declaring-subtree privileged; dependent child and view provenance is explicit | L3 | cross-unit Drop, escape/raw-transfer negatives, resource/view overhead | draft, language spec, frontend/types/MIR, prerequisite plan |
 | Region and builder | explicit `region`; closed `RegionPlain`; one measured builder compact pass | L4/L6/L7 | escape/bound/copy-count tests and push/freeze benchmark | draft, language spec, types/MIR, core builder, prerequisite plan |
-| Query/command descriptors | one whole-body item, exact `Params`/flat `Row`, unique identity, generated binder/decoder, no reflection | L5/D1 | descriptor/interface/cache matrix and thunk benchmark | frontend/types/MIR, DB EN/JA |
+| Query/command descriptors | one whole-body item, exact `Params`/flat `Row`, unique identity, generated binder/decoder, no reflection; canonical top-level/nested artifact codec with Params/Row fingerprints and binder/decoder ABI versions | L5/D1 | descriptor/interface/cache matrix, checked-in Query/command byte+digest goldens, and thunk benchmark | frontend/types/MIR, prerequisite plan, DB EN/JA |
 | Static SQL inputs | tagged sibling/relative/inline identity; source and driver-wire hashes/spans are distinct deterministic inputs | L5/D1 | create/change/delete/path/span/incremental matrix | language docs, pipeline/cache plans, DB EN/JA |
 | Parameters | one dialect-aware source scan; stable first-occurrence ordinals; SQLite named and PostgreSQL `$n`; explicit retention/copy | D1/D4/D8 | scanner/rewrite/bind-lifetime matrix and bind benchmark | DB EN/JA |
 | Typed rows | generated ordinal decoder; runtime count/type/NULL guard; row generation invalidates views; retention uses `clone_in` | D1/D8 | stale-view/decode/retention negatives and row-loop benchmark | memory model, DB EN/JA |
@@ -1235,6 +1235,44 @@ idea is rejected.
   names.
 - **v1 impact:** D12 metadata identity/determinism blocker.
 
+### F87 — the canonical key-group signature omitted Full-detail policy fields
+
+- **Classification:** specification ambiguity; performance risk.
+- **Problematic design location:** DB §18.2.1 `KeyMeta` canonical grouping.
+- **Current Align constraint:** deterministic flat metadata cannot use hidden catalog row order as a
+  final tie-breaker.
+- **Actual failure:** two same-named constraints with identical terms but different match/action,
+  deferral, or validation fields compared equal without being byte-identical, so drivers could
+  assign different `key_ordinal` values.
+- **Recommendation:** sort by every Full-detail common field, require one normalized group-level
+  value for repeated policy/evidence fields, and reject contradictory native rows.
+- **v1 impact:** D12 cross-driver determinism blocker.
+
+### F88 — the canonical Query artifact named fields without a complete codec
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** prerequisite §6.2 artifact codec.
+- **Current Align constraint:** separate and incremental compilation require independently
+  reproducible bytes, not a producer/consumer pair that merely agrees with itself.
+- **Actual failure:** integer widths, nested rewrite/span/occurrence/binding records, sequence order,
+  and option/state payloads were unspecified; two correct-looking implementations could emit
+  different artifact bytes and digests.
+- **Recommendation:** fix every scalar/tag, nested record, top-level field order, canonical sequence,
+  decoder invariant, and Query/command byte+digest golden vector.
+- **v1 impact:** L5/D1 separate-compilation/cache blocker.
+
+### F89 — the author-side ledger omitted the strengthened descriptor artifact contract
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** §1.1 Query/command descriptor ledger row.
+- **Current Align constraint:** the ledger is the author-side propagation gate and must name every
+  public/cache identity invariant it owns.
+- **Actual failure:** F84's fingerprints and ABI versions plus F88's codec/goldens were present only
+  in prose, allowing later author passes to report the surface complete without checking them.
+- **Recommendation:** put the canonical codec, fingerprints, ABI versions, golden tests, and
+  prerequisite source in the ledger row.
+- **v1 impact:** design-completion blocker before L5 implementation starts.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -1578,6 +1616,11 @@ multi-invalid precedence. Each stale review was stopped at the finding rather th
 allowed to run to its bound.
 The stopped host checkpoint also demonstrated that SQLite accepts duplicate constraint names. F86
 therefore replaces name-based grouping with the canonical `key_ordinal` before the next closeout.
+The focused closeout of that correction found F87–F89 without reopening unrelated surfaces: the
+key signature still omitted policy/evidence fields, the artifact codec still named nested values
+without fixing their bytes, and the ledger had not absorbed the strengthened descriptor contract.
+The key signature now contains every Full-detail common field, §6.2 fixes the complete top-level and
+nested codec plus independent Query/command goldens, and the ledger owns those exact requirements.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

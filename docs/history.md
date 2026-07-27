@@ -52,6 +52,9 @@ cancellation cleanup without inventing a public non-Send cancel handle.
 The follow-up closes the recursive selector/root case, specifies Text `bytea` hex versus raw Binary
 binding, requires post-cancel resynchronization or close, permits truthful Query-less contract
 errors, and removes deferred logical types from first-release examples.
+A final artifact/metadata closeout fixes the complete Query/command binary schema and independent
+byte/digest goldens, and gives duplicate or unnamed constraints a canonical ordinal derived from
+all Full-detail common fields rather than from the reported name or catalog order.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:

@@ -262,8 +262,10 @@ live command has explicit entry/catalog/driver/target inputs. D12 uses exact `Sc
 and complete flat Column/Key/Index/Query records, with exact detail/discriminator projection,
 Unknown-state and Summary→Parameter→Column ordering, ordinal/digest semantics, and declaration-order
 U+0000 rejection precedence for identifier components. Duplicate constraint names use a canonical
-`key_ordinal`. The L5/D1 artifact has an exact canonical codec and serializes every Params/Row
-fingerprint and binder/decoder ABI version named by that digest. D0 records the actual
+`key_ordinal`; its complete key signature includes action/deferral/validation fields. The L5/D1
+artifact has an exact top-level/nested canonical codec, checked-in Query/command byte+digest
+goldens, and every Params/Row fingerprint and binder/decoder ABI version named by that digest. D0
+records the actual
 engine/version origin/nullability evidence; D3/D5 own fail-closed driver matrices, ambiguous evidence
 remains `Unknown`, and runtime NULL guards remain mandatory. The first public database release gate is
 driver-relevant D1–D12: D4 merge/release requires non-skippable provisioned PostgreSQL CI; D11 uses

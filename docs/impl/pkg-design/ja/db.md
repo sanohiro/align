@@ -1411,10 +1411,15 @@ required identityは全detailで存在する。matrixでexplicitに指定したo
 
 constraint nameはoptionalかつuniqueと仮定しない。`None` はengineがnameを公開しない意味で
 synthetic nameを作らない。tableごとにcomplete common key groupを作り、
-`(kind tag, name Option tag/bytes, ordered local/reference/expression term signature)` で
-canonical sortしてzeroから `key_ordinal` を付ける。同じsignatureならcommon groupは
-byte-identicalなのでphysical orderはcommon outputへ影響しない。groupの全termが同じ
-`key_ordinal` を繰り返し、`term_ordinal` はgroup内でzeroから始める。Names/Summaryの
+`(kind declaration tag, name Option tag/UTF-8 bytes, ordered term sequenceの全
+local/reference/expression field, match_policy, on_update, on_delete, deferrable,
+initially_deferred, validated)` からなるFull-detailの完全なsignatureでcanonical sortする。
+enum/Option tagはdeclaration order、stringはbyte-lexicographic order、boolはfalseを先に
+する。driverはsort前にgroup-level policy/evidenceを1値へnormalizeし、矛盾するengine
+rowをrejectする。同順位になれるのはbyte-identicalな完全common groupだけなので、
+physical orderはcommon outputへ影響しない。sort後にzeroから`key_ordinal`を付け、
+groupの全termが同じ`key_ordinal`を繰り返し、`term_ordinal`はgroup内でzeroから始める。
+Names/Summaryの
 non-identity field suppressionはこのidentity/order計算後に行う。
 
 `QueryMeta` discriminatorは次で固定する。
@@ -1791,7 +1796,9 @@ ordering、ordinal base、unavailable field、artifact digest、multi-term flat 
 固定する。両driverで全 `SchemaRef`/`TableRef` componentのU+0000をnative/catalog request前に
 exact Query-less Encode itemとしてrejectする。matrixはDeclared/checked/unknown-nullability
 cell、ParameterとColumnを両方持つQuery、schema/nameが両方invalidなTableRef、同名constraint
-2個のcanonical `key_ordinal` groupを含む。unnamed constraintは `name = None` を返す。
+2個についてtermが同一でaction/deferral policyだけが異なる場合もcanonical
+`key_ordinal` groupを固定する。矛盾するnative policy rowはordinalを与えずfailする。
+unnamed constraintは `name = None` を返す。
 `EXPLAIN ANALYZE` は実行を明示する。
 
 ### D13 — batch、SoA、高価値native path

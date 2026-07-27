@@ -649,7 +649,6 @@ exact differences:
 ```text
 StaticCommandArtifact
   format_version
-  statement_kind = Command
   unit, item, command_id
   Params canonical type
   Params canonical fingerprint
@@ -669,21 +668,189 @@ The canonical artifact codec is:
 ```text
 magic                ASCII "ALIGNQRY" | "ALIGNCMD" (8 bytes)
 format_version       u32 little-endian
-integer/ABI version  fixed-width little-endian
-enum/bool/tag         u8 using the declaration order
+integer/ABI version  u32 little-endian unless a field below says u64
+enum/bool/tag         u8 using the explicit tags below
 Hash128               lo u64 then hi u64, little-endian
-string/byte field     u64 little-endian length, then exact bytes
+string/byte field     u32 little-endian length, then exact bytes
 Option                u8 0 | 1, then payload when 1
-sequence              u64 little-endian count, then elements in semantic order
+sequence              u32 little-endian count, then elements in semantic order
 ```
 
-Fields follow the artifact listings above. Maps are never encoded by map iteration: permitted-driver
-entries use `SQLite`, then `PostgreSQL`; parameter occurrences use source-byte order; every other
-sequence names its order in the field contract. Params/Row canonical fingerprints are `Hash128::of`
-the same fully substituted canonical type bytes used by `IStaticQuery`/`IStaticCommand`.
+The complete v1 tags are:
+
+```text
+Driver                  SQLite = 0 | PostgreSQL = 1
+DriverRestriction       AnySupportedDriver = 0 | SQLiteOnly = 1 | PostgreSQLOnly = 2
+SqlSourceIdentity       File = 0 | Inline = 1
+CheckPolicy             DeclaredOnly = 0 | CheckedOptional = 1 | CheckedRequired = 2
+VerificationState       Declared = 0 | DatabaseChecked = 1
+BindRetention           BindValue = 0 | BindCopy = 1
+StaticOptionOwner       Common = 0 | SQLite = 1 | PostgreSQL = 2
+CanonicalType           Named = 0 | Tuple = 1 | Fn = 2
+```
+
+`CanonicalType` is the existing `align_interface` type subencoding: `Named` is
+`tag, path: string, args: sequence<CanonicalType>`; `Tuple` is
+`tag, elems: sequence<CanonicalType>`; and `Fn` is
+`tag, params: sequence<CanonicalType>, result: CanonicalType`. Params and Row entries are fully
+substituted and contain no type parameter. Their fingerprints are `Hash128::of` over exactly that
+stored subencoding. The owning interface's ordinary reachable-type definitions and
+`interface_hash` remain responsible for changes to a named struct's field definitions.
+
+The exact nested records are:
+
+```text
+Span
+  start: u32                         # inclusive UTF-8 byte offset
+  end: u32                           # exclusive UTF-8 byte offset
+
+SqlSourceIdentity
+  tag: u8
+  File   => logical_path: string
+  Inline => query_or_command_id: string
+
+StaticOption
+  owner: u8
+  variant: u8
+  payload:
+    Common/0     => policy: CheckPolicy
+    SQLite/0     => major: u32, minor: u32, patch: u32
+    PostgreSQL/0 => parameter_name: string, canonical_type_name: string
+
+ParameterOccurrence
+  source_name: string
+  source_span: Span
+  protocol_ordinal: u32              # one-based
+
+RewriteEntry
+  source_span: Span
+  wire_span: Span
+
+BindingEntry
+  params_field_ordinal: u32          # zero-based declaration order
+  source_name: string
+  protocol_ordinal: u32              # one-based
+  field_type_fingerprint: Hash128
+  retention: BindRetention
+
+DecodedSpanEntry
+  decoded_span: Span
+  defining_file_span: Span
+
+CheckedMetadata
+  policy: CheckPolicy
+  state: VerificationState
+  Declared        => no further fields
+  DatabaseChecked => metadata_format_version: u32, metadata_digest: Hash128
+
+DriverEntry
+  driver: Driver
+  wire_sql: bytes
+  wire_sql_hash: Hash128
+  rewrite_format_version: u32
+  rewrites: sequence<RewriteEntry>
+  bindings: sequence<BindingEntry>
+  checked_metadata: CheckedMetadata
+```
+
+The static option variants correspond exactly to `db.QueryOption.Check`/
+`db.CommandOption.Check`, `sqlite.*Option.RequireVersionAtLeast`, and
+`postgres.*Option.ParameterType`. A new static option variant is an artifact format change. Before
+encoding, duplicates/conflicts are rejected and options are sorted by
+`(owner, variant, complete payload bytes)`. `[]` is encoded as the single effective
+`Common/0/DeclaredOnly` option, so an omitted default and its explicit spelling have one artifact
+identity.
+
+There is one `ParameterOccurrence` for every placeholder occurrence, ordered by
+`source_span.start`; equal or overlapping source spans are invalid. Repeated source names repeat in
+this table with the same `protocol_ordinal`. There is one `BindingEntry` for every Params field,
+ordered by `params_field_ordinal`; the ordinals must be dense from zero, source names unique, and
+protocol ordinals dense from one in first-source-occurrence order. The occurrence-name set and
+binding-name set must be equal; an unused Params field or placeholder without a field is rejected
+before encoding. `field_type_fingerprint` hashes the exact fully substituted `CanonicalType`
+subencoding of that Params field.
+
+There is one `RewriteEntry` for every placeholder occurrence, including identity rewrites, in the
+same order as `occurrences`. Each pair names the complete source and wire placeholder spans.
+Non-placeholder positions are translated by the cumulative length delta of preceding entries; a
+position inside a replacement maps to its complete peer span. Source and wire spans must be
+monotone, non-overlapping, and within their respective SQL byte lengths. This is the complete v1
+source-to-wire map; an implementation may not invent an additional unstored mapping rule.
+
+`DecodedSpanEntry` is empty for `File`. For `Inline`, entries are the maximal coalesced runs having
+one affine decoded-to-file byte mapping, ordered by `decoded_span.start`; they are non-overlapping
+and cover every decoded SQL byte exactly once. Escape expansions therefore form their own entries.
+All strings, SQL, and mapped source bytes are UTF-8. Any byte length, element count, or offset above
+`u32::MAX` is a compile error before artifact creation.
+
+The top-level byte order is exact:
+
+```text
+StaticQueryArtifact
+  magic = "ALIGNQRY"
+  format_version: u32
+  unit: string
+  item: string
+  query_id: string
+  params_type: CanonicalType
+  row_type: CanonicalType
+  params_fingerprint: Hash128
+  row_fingerprint: Hash128
+  binder_abi_version: u32
+  decoder_abi_version: u32
+  driver_restriction: DriverRestriction
+  static_options: sequence<StaticOption>
+  source_identity: SqlSourceIdentity
+  source_sql: bytes
+  source_sql_hash: Hash128
+  occurrences: sequence<ParameterOccurrence>
+  driver_entries: sequence<DriverEntry>
+  decoded_span_map: sequence<DecodedSpanEntry>
+
+StaticCommandArtifact
+  magic = "ALIGNCMD"
+  format_version: u32
+  unit: string
+  item: string
+  command_id: string
+  params_type: CanonicalType
+  params_fingerprint: Hash128
+  binder_abi_version: u32
+  driver_restriction: DriverRestriction
+  static_options: sequence<StaticOption>
+  source_identity: SqlSourceIdentity
+  source_sql: bytes
+  source_sql_hash: Hash128
+  occurrences: sequence<ParameterOccurrence>
+  driver_entries: sequence<DriverEntry>
+  decoded_span_map: sequence<DecodedSpanEntry>
+```
+
+Version 1 encodes `format_version = 1`. `unit` is the canonical fully-qualified module path and
+`item` is the unqualified descriptor function identifier. `query_id`/`command_id` is the exact
+`unit + "." + item` byte string; an Inline source identity repeats that same ID.
+Maps are never encoded by map iteration. `driver_entries` contains exactly the restriction's
+permitted set in `SQLite`, then `PostgreSQL` order. `CheckedMetadata.policy` must equal the effective
+common static `Check` option for every entry. Hash fields must equal `Hash128::of` over their named
+exact byte field. IDs must equal the fully-qualified `unit + item` identity rule. A decoder rejects
+an unknown tag/version, duplicate or out-of-order element, invalid span, fingerprint/hash mismatch,
+restriction/driver mismatch, policy mismatch, ID mismatch, trailing byte, or truncated field.
+
 Binder/decoder ABI versions are `u32`; changing a generated thunk calling/layout contract increments
 the corresponding version even when the logical type is unchanged. The artifact digest is
 `Hash128::of` over the complete bytes beginning at `magic`.
+
+L5 checks in one Query and one command semantic fixture plus their exact
+`crates/align_driver/tests/golden/static_{query,command}_v1.hex` bytes and sibling `.digest` files
+containing 32-lowercase-hex `Hash128::to_hex()` values. The Query fixture is portable, uses repeated
+named parameters, an inline escape, both retention classes, mixed Declared/DatabaseChecked driver
+state, and non-empty rewrite/span maps. The command fixture is PostgreSQL-pinned, file-backed, has
+`ParameterType` and `CheckedRequired`, and proves the omitted Row/decoder fields. A standalone
+test-only reference encoder implements the table above without calling the production artifact
+codec and produces the reviewed goldens. Tests decode each golden, compare every semantic field,
+re-encode byte-for-byte, and separately encode the semantic fixture and compare the checked-in
+bytes and digest. Updating a golden requires an intentional `format_version` change or a
+test-reviewed correction to this contract; round-trip success alone is not acceptance.
 
 It has the same generated Params binder and source/wire/cache invalidation rules as a Query. It has
 no Row contract, result-column metadata, or decode thunk. `command_id` uses the same fully-qualified
@@ -1145,8 +1312,9 @@ Acceptance:
 - a descriptor accepts exactly one whole-body static constructor; nested, conditional, multiple,
   generic, argument-taking, and helper-wrapped forms fail before artifact creation;
 - two descriptor functions in one module receive distinct Query/command IDs and artifact/thunk slots;
-- Query/command artifacts round-trip byte-identically with the exact magic, endian, field order,
-  fingerprints, ABI versions, and permitted-driver order from §6.2;
+- Query/command semantic fixtures match checked-in byte and digest goldens, and those artifacts
+  decode and round-trip byte-identically with the exact magic, endian, top-level/nested field order,
+  fingerprints, ABI versions, option payloads, spans, and permitted-driver order from §6.2;
 - unchanged consumers still hit when the public Query/command contract is unchanged;
 - public Params/Row/restriction changes invalidate Query consumers, and public
   Params/restriction changes invalidate command consumers;

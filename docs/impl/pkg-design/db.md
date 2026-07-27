@@ -2435,10 +2435,15 @@ unavailable at Summary/Full. `QueryMeta.nullable` follows §16.3.1.
 
 Constraint names are optional and are not assumed unique; `None` means the engine exposes no name
 and no synthetic name is fabricated. For each table, the driver builds each complete common key
-group, canonically sorts groups by `(kind tag, name Option tag/bytes, ordered
-local/reference/expression term signature)`, then assigns `key_ordinal` from zero. Tied signatures
-produce byte-identical common groups, so their physical order cannot affect common output. Every
-term of a group repeats that `key_ordinal`; `term_ordinal` starts at zero within the group.
+group, then canonically sorts groups by the complete Full-detail signature: `kind` declaration tag;
+`name` Option tag/UTF-8 bytes; the ordered term sequence including every local/reference/expression
+field; `match_policy`; `on_update`; `on_delete`; `deferrable`; `initially_deferred`; and
+`validated`. Enum and Option tags use declaration order, strings use byte-lexicographic order, and
+booleans use `false` before `true`. A driver must normalize group-level policy/evidence to one value
+before sorting and reject contradictory engine rows. Only byte-identical complete common groups can
+tie, so their physical order cannot affect common output. The driver assigns `key_ordinal` from zero
+after sorting. Every term of a group repeats that `key_ordinal`; `term_ordinal` starts at zero within
+the group.
 Names/Summary may suppress non-identity fields after this identity/order computation, never before
 it.
 
@@ -3118,7 +3123,9 @@ field, and artifact digest is exact; multi-term keys/indexes remain flat ordered
 component with the exact Query-less Encode item before any native/catalog request. The matrix
 includes Declared/checked/unknown-nullability cells, a Query with both Parameters and Columns, a
 TableRef whose schema and name are both invalid, and two same-named constraints whose canonical
-`key_ordinal` groups are pinned. An unnamed constraint returns `name = None`.
+`key_ordinal` groups are pinned even when their terms match and only their action/deferral policy
+differs. Contradictory native policy rows fail instead of acquiring an ordinal. An unnamed
+constraint returns `name = None`.
 Query-specific metadata/EXPLAIN contract errors preserve `Some(query_id)`, while Query-less
 category/operation validation records `None`. `EXPLAIN ANALYZE` remains a visibly executing
 operation.
