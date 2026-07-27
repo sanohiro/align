@@ -242,9 +242,10 @@ A composite is Move iff its plan is not `None`. `Tagged` covers `Option`, `Resul
 only the active payload is dropped. The same plan drives move/null-source and drop-old
 classification, so a table-free helper cannot accidentally call a Move enum/struct Copy. Cyclic
 plans are rejected with the existing recursive-type diagnostic. Nominal struct and sum nodes are
-memoized by type ID and shared, so a repeated acyclic subgraph remains linear in the resolved type
-graph rather than expanding as a tree. Collection element eligibility is separate and does not
-follow merely from having a Drop plan.
+memoized by type ID, shared, and carry their computed Move bit, so both construction and
+classification of a repeated acyclic subgraph remain linear in the resolved type graph rather than
+expanding as a tree. Collection element eligibility is separate and does not follow merely from
+having a Drop plan.
 
 ### Checking
 Flow analysis over the CFG. When a Move-type value is consumed (assigned as a value / passed as a value argument / returned by value), the original binding becomes dead. Using a dead binding is a **compile error**.

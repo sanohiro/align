@@ -911,6 +911,7 @@ pub enum DropPlan {
     Struct {
         id: u32,
         fields: Vec<(u32, std::sync::Arc<DropPlan>)>,
+        needs_drop: bool,
     },
     Option(std::sync::Arc<DropPlan>),
     Result {
@@ -920,6 +921,7 @@ pub enum DropPlan {
     Enum {
         id: u32,
         variants: Vec<Vec<std::sync::Arc<DropPlan>>>,
+        needs_drop: bool,
     },
     /// A malformed or cyclic resolved definition. Sema diagnoses the definition separately; the
     /// classifier remains fail-closed so a later analysis cannot accidentally call it Copy.
@@ -931,12 +933,9 @@ impl DropPlan {
         match self {
             DropPlan::None => false,
             DropPlan::Leaf(_) | DropPlan::Invalid => true,
-            DropPlan::Struct { fields, .. } => fields.iter().any(|(_, plan)| plan.needs_drop()),
+            DropPlan::Struct { needs_drop, .. } | DropPlan::Enum { needs_drop, .. } => *needs_drop,
             DropPlan::Option(payload) => payload.needs_drop(),
             DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
-            DropPlan::Enum { variants, .. } => {
-                variants.iter().flatten().any(|plan| plan.needs_drop())
-            }
         }
     }
 }
@@ -981,7 +980,7 @@ fn drop_plan_rec(
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
             struct_path.push(id);
-            let fields = def
+            let fields: Vec<(u32, std::sync::Arc<DropPlan>)> = def
                 .fields
                 .iter()
                 .enumerate()
@@ -1001,7 +1000,14 @@ fn drop_plan_rec(
                 })
                 .collect();
             struct_path.pop();
-            let plan = std::sync::Arc::new(DropPlan::Struct { id, fields });
+            let needs_drop = fields
+                .iter()
+                .any(|(_, plan)| plan.needs_drop());
+            let plan = std::sync::Arc::new(DropPlan::Struct {
+                id,
+                fields,
+                needs_drop,
+            });
             struct_cache[id as usize] = Some(plan.clone());
             plan
         }
@@ -1045,7 +1051,7 @@ fn drop_plan_rec(
                 return std::sync::Arc::new(DropPlan::Invalid);
             };
             enum_path.push(id);
-            let variants = def
+            let variants: Vec<Vec<std::sync::Arc<DropPlan>>> = def
                 .variants
                 .iter()
                 .map(|variant| {
@@ -1067,7 +1073,15 @@ fn drop_plan_rec(
                 })
                 .collect();
             enum_path.pop();
-            let plan = std::sync::Arc::new(DropPlan::Enum { id, variants });
+            let needs_drop = variants
+                .iter()
+                .flatten()
+                .any(|plan| plan.needs_drop());
+            let plan = std::sync::Arc::new(DropPlan::Enum {
+                id,
+                variants,
+                needs_drop,
+            });
             enum_cache[id as usize] = Some(plan.clone());
             plan
         }
@@ -4028,10 +4042,13 @@ pub fn check_program_with_effects(
                     .expect("an invalid owned Option field belongs to a generic struct monomorph")
             };
             if let Scalar::Struct(nid) = payload {
+                let name = structs
+                    .get(nid as usize)
+                    .map_or("<invalid struct>", |nested| nested.name.as_str());
                 diags.error(
                     format!(
                         "an `Option` struct field cannot contain the Move struct '{}' yet — Option<MoveStruct> is implemented in L1b",
-                        structs[nid as usize].name
+                        name
                     ),
                     span,
                 );
@@ -4071,18 +4088,24 @@ pub fn check_program_with_effects(
                     }
                 });
                 if array {
+                    let name = structs
+                        .get(struct_id as usize)
+                        .map_or("<invalid struct>", |nested| nested.name.as_str());
                     diags.error(
                         format!(
                             "an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
-                            structs[struct_id as usize].name
+                            name
                         ),
                         source_span,
                     );
                 } else {
+                    let name = structs
+                        .get(struct_id as usize)
+                        .map_or("<invalid struct>", |nested| nested.name.as_str());
                     diags.error(
                         format!(
                             "a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)",
-                            structs[struct_id as usize].name
+                            name
                         ),
                         source_span,
                     );
@@ -26591,6 +26614,32 @@ mod tests {
         }];
         assert!(drop_plan(Ty::Struct(0), &cyclic, &[]).needs_drop());
         assert_eq!(drop_plan(Ty::Struct(99), &cyclic, &[]), DropPlan::Invalid);
+
+        let missing_nested = vec![StructDef {
+            name: "Broken".to_string(),
+            fields: vec![FieldDef {
+                name: "value".to_string(),
+                ty: Ty::Option(Scalar::Struct(99)),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        assert!(
+            drop_plan(Ty::Struct(0), &missing_nested, &[]).needs_drop(),
+            "a missing nested struct ID must fail closed without panicking"
+        );
+        let missing_enum_payload = vec![hir::EnumDef {
+            name: "BrokenEnum".to_string(),
+            variants: vec![hir::EnumVariant {
+                name: "Value".to_string(),
+                payload: vec![Scalar::Struct(99)],
+                field_base: 1,
+            }],
+        }];
+        assert!(
+            drop_plan(Ty::Enum(0), &[], &missing_enum_payload).needs_drop(),
+            "a missing enum payload struct ID must fail closed without panicking"
+        );
     }
 
     #[test]
@@ -26598,8 +26647,11 @@ mod tests {
         let mut structs = vec![StructDef {
             name: "S0".to_string(),
             fields: vec![FieldDef {
-                name: "owned".to_string(),
-                ty: Ty::String,
+                name: "copy".to_string(),
+                ty: Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
             }],
             align: None,
             c_repr: false,
@@ -26623,7 +26675,10 @@ mod tests {
             });
         }
         let plan = drop_plan(Ty::Struct(39), &structs, &[]);
-        assert!(plan.needs_drop());
+        assert!(
+            !plan.needs_drop(),
+            "Copy repeated subgraphs must use the cached nominal classification"
+        );
         let DropPlan::Struct { fields, .. } = plan else {
             panic!("root plan must be a struct");
         };
