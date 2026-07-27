@@ -3264,23 +3264,6 @@ pub fn check_program_with_effects(
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
             let fty = structs[i].fields[fi].ty;
-            // L1a admits the first conditional owned field leaf: `Option<string>`. The canonical
-            // recursive Drop plan classifies its enclosing struct as Move, and codegen tests the
-            // tag before freeing the payload. Other owned payloads remain assigned to L1b. A
-            // struct payload is validated after enum resolution below because an enum field may be
-            // the only reason that struct is Move.
-            if let Ty::Option(sc) = fty
-                && sc.is_move()
-                && sc != Scalar::String
-            {
-                diags.error(
-                    format!(
-                        "an `Option` struct field cannot contain owned payload Option<{}> yet — only Option<string> is implemented in L1a",
-                        ty_name(scalar_to_ty(sc))
-                    ),
-                    f.span,
-                );
-            }
             // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
             // struct's `Drop` (`drop_struct_fields`). Its **element** must be non-owned in v1 so that
             // buffer is a single flat free: a scalar / `str` view / plain-data (non-Move) struct.
@@ -3327,10 +3310,6 @@ pub fn check_program_with_effects(
     // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads are
     // primitive scalars (S1b) or a plain-data struct (S2). Monomorph instances of generic sum types
     // append after the reserved slots, so a concrete enum's id stays valid.
-    // Struct ownership checks are deferred until every enum payload is populated: a struct may be
-    // Move only through an enum field, so declaration-order inspection here would fail open.
-    let mut enum_struct_payloads = Vec::new();
-    let mut enum_struct_array_payloads = Vec::new();
     for (i, (module, _is_entry, e)) in enum_decls.iter().enumerate() {
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
@@ -3352,7 +3331,6 @@ pub fn check_program_with_effects(
                     // A plain-data struct payload — `str`-bearing is now allowed (J1: the enum is
                     // region-tracked through it). Move-ness is checked after all enums resolve.
                     Ty::Struct(id) => {
-                        enum_struct_payloads.push((id, t.span()));
                         payload.push(Scalar::Struct(id));
                     }
                     // An owned `array<T>` payload (J2) — the union `Parts(array<Part>)` shape. The
@@ -3365,7 +3343,6 @@ pub fn check_program_with_effects(
                         t.span(),
                     ),
                     Ty::DynStructArray(eid, _) => {
-                        enum_struct_array_payloads.push((eid, t.span()));
                         payload.push(Scalar::DynStructArray(eid));
                     }
                     // Every other owned `array<T>` — a scalar / `str` / plain-data-struct element (one
@@ -3407,29 +3384,6 @@ pub fn check_program_with_effects(
         enums[i] = hir::EnumDef { name: mangle_fn(module, *_is_entry, &e.name.name), variants };
     }
 
-    for (id, span) in enum_struct_payloads {
-        if struct_is_move(id, &structs, &enums) {
-            diags.error(
-                format!(
-                    "a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)",
-                    structs[id as usize].name
-                ),
-                span,
-            );
-        }
-    }
-    for (id, span) in enum_struct_array_payloads {
-        if struct_is_move(id, &structs, &enums) {
-            diags.error(
-                format!(
-                    "an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
-                    structs[id as usize].name
-                ),
-                span,
-            );
-        }
-    }
-
     // Pass 0c-2: enum-field acyclicity. A struct field may now be a sum type (J1b), and an enum embeds
     // its payloads inline, so a cycle can run through it (`Node { c: E }`, `E { V(Node) }`) — an
     // infinite layout, like a direct self-referential struct field. This is checked here (not in pass
@@ -3450,29 +3404,6 @@ pub fn check_program_with_effects(
         // canonical recursive DropPlan makes the enclosing struct Move, and
         // `drop_struct_fields`'s `Ty::Enum` arm frees the live variant via the tag-switched
         // `drop_enum`. No rejection here — a Move enum field is as legal as a `string`/owned-array field.
-    }
-
-    // L1a does not lower Drop for `Option<MoveStruct>` fields. This validation must run only after
-    // every enum payload is resolved: a struct may become Move solely through a Move enum field,
-    // and checking it in pass 0b-2 would see the reserved-but-empty enum definition and fail open.
-    for (i, (_, _, decl)) in struct_decls.iter().enumerate() {
-        for (fi, field) in decl.fields.iter().enumerate() {
-            let Ty::Option(Scalar::Struct(nid)) = structs[i].fields[fi].ty else {
-                continue;
-            };
-            if struct_is_move(nid, &structs, &enums) {
-                let name = structs
-                    .get(nid as usize)
-                    .map_or("<invalid struct>", |def| def.name.as_str());
-                diags.error(
-                    format!(
-                        "an `Option` struct field cannot contain the Move struct '{}' yet — Option<MoveStruct> is implemented in L1b",
-                        name
-                    ),
-                    field.span,
-                );
-            }
-        }
     }
 
     // `array<Move-struct>` struct fields (`Chat { messages: array<Message> }`, J3b) are now supported:
@@ -4015,6 +3946,109 @@ pub fn check_program_with_effects(
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
     }
+
+    // Final resolved-type safety gate. It deliberately runs after the generic-function worklist:
+    // struct and enum monomorphs can be created while resolving declarations or function bodies,
+    // and their ownership may depend on a concrete enum whose reserved slot was still empty at the
+    // creation site. No graph-dependent payload decision is allowed to stay cached from that phase.
+    let generic_struct_span = |name: &str| {
+        generic_struct_decls.iter().find_map(|(module, is_entry, decl)| {
+            let mut prefix = mangle_fn(module, *is_entry, &decl.name.name);
+            prefix.push('$');
+            name.starts_with(&prefix).then_some(decl.span)
+        })
+    };
+    let generic_enum_span = |name: &str| {
+        generic_enum_decls.iter().find_map(|(module, is_entry, decl)| {
+            let mut prefix = mangle_fn(module, *is_entry, &decl.name.name);
+            prefix.push('$');
+            name.starts_with(&prefix).then_some(decl.span)
+        })
+    };
+
+    // L1a lowers conditional field cleanup only for `Option<string>`. Revalidate every concrete
+    // and monomorph struct against the complete DropPlan graph, including Move enums and structs
+    // that become Move transitively through an enum.
+    for (sid, def) in structs.iter().enumerate() {
+        for (fi, field) in def.fields.iter().enumerate() {
+            let Ty::Option(payload) = field.ty else {
+                continue;
+            };
+            if payload == Scalar::String
+                || !drop_plan(scalar_to_ty(payload), &structs, &enums).needs_drop()
+            {
+                continue;
+            }
+            let span = if sid < struct_decls.len() {
+                struct_decls[sid].2.fields[fi].span
+            } else {
+                generic_struct_span(&def.name)
+                    .expect("an invalid owned Option field belongs to a generic struct monomorph")
+            };
+            if let Scalar::Struct(nid) = payload {
+                diags.error(
+                    format!(
+                        "an `Option` struct field cannot contain the Move struct '{}' yet — Option<MoveStruct> is implemented in L1b",
+                        structs[nid as usize].name
+                    ),
+                    span,
+                );
+            } else {
+                diags.error(
+                    format!(
+                        "an `Option` struct field cannot contain owned payload Option<{}> yet — only Option<string> is implemented in L1a",
+                        ty_name(scalar_to_ty(payload))
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    // Sum-type Drop does not recurse into struct payloads or array elements yet. Check every
+    // concrete and monomorph enum only now, so declaration order and early monomorph caching cannot
+    // turn a Move struct into an accepted Copy payload.
+    for (eid, def) in enums.iter().enumerate() {
+        let mut span = None;
+        for variant in &def.variants {
+            for payload in &variant.payload {
+                let (struct_id, array) = match payload {
+                    Scalar::Struct(id) => (*id, false),
+                    Scalar::DynStructArray(id) => (*id, true),
+                    _ => continue,
+                };
+                if !struct_is_move(struct_id, &structs, &enums) {
+                    continue;
+                }
+                let source_span = *span.get_or_insert_with(|| {
+                    if eid < enum_decls.len() {
+                        enum_decls[eid].2.span
+                    } else {
+                        generic_enum_span(&def.name)
+                            .expect("an invalid Move struct payload belongs to a generic enum monomorph")
+                    }
+                });
+                if array {
+                    diags.error(
+                        format!(
+                            "an `array<{}>` sum-type payload needs a non-owned (plain-data / `str`-view) element struct for now — an owned-element array's deep free is a later slice",
+                            structs[struct_id as usize].name
+                        ),
+                        source_span,
+                    );
+                } else {
+                    diags.error(
+                        format!(
+                            "a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)",
+                            structs[struct_id as usize].name
+                        ),
+                        source_span,
+                    );
+                }
+            }
+        }
+    }
+
     let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types, imported_fns };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
@@ -24688,7 +24722,12 @@ fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx,
             // Without this, `Opt<string>` / `Opt<StructWithStrField>` would slip through, putting a
             // Move/region-tracked value in an enum that is neither dropped nor region-tracked
             // (use-after-free / leak).
-            if !enum_payload_ok(p, cx.structs, cx.enums) {
+            // Struct ownership can depend on an enum definition that is still a reserved empty
+            // slot while an early monomorph is cached. Validate those graph-dependent shapes once
+            // all type and function-driven monomorphization is complete.
+            if !matches!(p, Scalar::Struct(_) | Scalar::DynStructArray(_))
+                && !enum_payload_ok(p, cx.structs, cx.enums)
+            {
                 diags.error(
                     format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
                     span,
