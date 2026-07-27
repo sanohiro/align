@@ -10718,6 +10718,22 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         return Operand::Const(Const::Unit);
     }
     let scrut_flag = lowered_drop_flag(b, scrutinee, &scrut);
+    // A fresh/materialized scrutinee has no bound place left to drop it on an arm that binds no
+    // Move payload. Give the whole sum a hidden owner before branching. A Move-binding arm clears
+    // this owner after transferring the active payload; every other arm drops it before evaluating
+    // its body. Direct bound places remain path-local and are nulled only on a transferring arm.
+    let scrut_owner = (binds_move_payload && may_need_synthetic_owner(scrutinee)).then(|| {
+        let owner = b.new_synthetic_owner(scrutinee.ty);
+        b.push(Stmt::Store(owner, scrut.clone()));
+        b.set_drop_flag_operand(
+            owner,
+            scrut_flag
+                .clone()
+                .unwrap_or(Operand::Const(Const::Bool(false))),
+        );
+        null_moved_source(b, scrutinee);
+        owner
+    });
     let join_bb = b.new_block();
     match scrutinee.ty {
         Ty::Enum(enum_id) => {
@@ -10726,7 +10742,14 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 enum_id,
                 arms,
                 &scrut,
-                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                (
+                    result_slot,
+                    result_flag,
+                    result_temp_flag,
+                    join_bb,
+                    borrow_result,
+                    scrut_owner,
+                ),
                 scrutinee,
                 scrut_flag,
             )
@@ -10737,7 +10760,14 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 scrutinee.ty,
                 arms,
                 &scrut,
-                (result_slot, result_flag, result_temp_flag, join_bb, borrow_result),
+                (
+                    result_slot,
+                    result_flag,
+                    result_temp_flag,
+                    join_bb,
+                    borrow_result,
+                    scrut_owner,
+                ),
                 scrutinee,
                 scrut_flag,
             )
@@ -10756,11 +10786,18 @@ fn lower_match_enum(
     enum_id: u32,
     arms: &[hir::MatchArm],
     scrut: &Operand,
-    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+        Option<Slot>,
+    ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -10794,27 +10831,33 @@ fn lower_match_enum(
         }
         b.cur = arm_bb;
         bind_payload(b, arm);
-        // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
-        // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
-        if arm.bindings.iter().any(|local| {
+        let transfers_payload = arm.bindings.iter().any(|local| {
             b.slots
                 .get(*local as usize)
                 .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
-        }) {
+        });
+        // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
+        // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
+        if transfers_payload {
             null_moved_source(b, scrutinee);
         }
+        let active_may_own = enum_match_arm_may_own(b, enum_id, arm);
+        discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
         finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
     bind_payload(b, d);
-    if d.bindings.iter().any(|local| {
+    let transfers_payload = d.bindings.iter().any(|local| {
         b.slots
             .get(*local as usize)
             .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
-    }) {
+    });
+    if transfers_payload {
         null_moved_source(b, scrutinee);
     }
+    let active_may_own = enum_match_arm_may_own(b, enum_id, d);
+    discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
     finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
 }
 
@@ -10826,11 +10869,18 @@ fn lower_match_binary(
     ty: Ty,
     arms: &[hir::MatchArm],
     scrut: &Operand,
-    target: (Option<Slot>, Option<Slot>, Option<Slot>, BlockId, bool),
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+        Option<Slot>,
+    ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
@@ -10850,18 +10900,95 @@ fn lower_match_binary(
     b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
     b.cur = pos_bb;
     bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
+    let pos_transfers = pos.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
     // Binding an owned payload (Ok/Some) moves it out of the scrutinee; null the scrutinee so its
     // exit `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
-    if !pos.bindings.is_empty() {
+    if pos_transfers {
         null_moved_source(b, scrutinee);
     }
+    let pos_may_own = binary_match_arm_may_own(b, ty, true);
+    discharge_match_scrutinee(b, scrut_owner, pos_transfers, pos_may_own);
     finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
-    if !neg.bindings.is_empty() {
+    let neg_transfers = neg.bindings.iter().any(|local| {
+        b.slots
+            .get(*local as usize)
+            .is_some_and(|ty| needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums))
+    });
+    if neg_transfers {
         null_moved_source(b, scrutinee);
     }
+    let neg_may_own = binary_match_arm_may_own(b, ty, false);
+    discharge_match_scrutinee(b, scrut_owner, neg_transfers, neg_may_own);
     finish_arm(b, &neg.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+}
+
+/// Discharge the hidden owner of a fresh/materialized match scrutinee on the selected arm.
+/// A Move binding inherits the scrutinee's ownership bit and becomes the sole owner; an arm without
+/// such a binding consumes the whole sum by dropping its active variant before the body can diverge.
+fn discharge_match_scrutinee(
+    b: &mut Builder,
+    owner: Option<Slot>,
+    transfers_payload: bool,
+    active_may_own: bool,
+) {
+    let Some(owner) = owner else {
+        return;
+    };
+    if transfers_payload || !active_may_own {
+        b.set_drop_flag(owner, false);
+    } else {
+        b.emit_drop_if_live(owner);
+    }
+}
+
+/// Whether an enum arm can select a variant with an owned payload. A wildcard is conservatively
+/// the whole enum; the tag-switched destructor remains precise for its selected variant.
+fn enum_match_arm_may_own(b: &Builder, enum_id: u32, arm: &hir::MatchArm) -> bool {
+    let Some(def) = b.enums.get(enum_id as usize) else {
+        return true;
+    };
+    let variant_may_own = |variant: &align_sema::hir::EnumVariant| {
+        variant.payload.iter().any(|payload| {
+            needs_drop_flag(
+                align_sema::scalar_to_ty(*payload),
+                &b.structs,
+                &b.tuples,
+                &b.enums,
+            )
+        })
+    };
+    if arm.variants.is_empty() {
+        def.variants.iter().any(variant_may_own)
+    } else {
+        arm.variants
+            .iter()
+            .filter_map(|variant| def.variants.get(*variant as usize))
+            .any(variant_may_own)
+    }
+}
+
+/// Whether the selected half of an Option/Result can own a payload. This avoids emitting a known
+/// null destructor on `None` or a Copy `Err` merely because the opposite arm moves an owned value.
+fn binary_match_arm_may_own(b: &Builder, ty: Ty, positive: bool) -> bool {
+    let payload = match (ty, positive) {
+        (Ty::Option(payload), true) | (Ty::Result(payload, _), true) => Some(payload),
+        (Ty::Result(_, payload), false) => Some(payload),
+        _ => None,
+    };
+    payload.is_some_and(|payload| {
+        needs_drop_flag(
+            align_sema::scalar_to_ty(payload),
+            &b.structs,
+            &b.tuples,
+            &b.enums,
+        )
+    })
 }
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
@@ -11402,6 +11529,34 @@ mod tests {
             ),
             "a consumed task_group value must forward its runtime ownership bit:\n{}",
             print::function_to_string(call)
+        );
+    }
+
+    #[test]
+    fn mixed_move_binding_match_drops_a_materialized_wildcard_scrutinee() {
+        let p = lower(
+            "Content { First(array<i64>), Second(array<i64>) }\n\
+             Msg { c: Content }\n\
+             fn mixed() -> i64 {\n\
+               left := Msg { c: Content.Second([1, 2].to_array()) }\n\
+               right := Msg { c: Content.Second([9].to_array()) }\n\
+               return match if true { left.c } else { right.c } {\n\
+                 First(xs) => xs.sum()\n\
+                 _ => 0\n\
+               }\n\
+             }\n\
+             fn main() -> i32 = mixed() as i32\n",
+        );
+        let f = p.fns.iter().find(|f| f.name == "mixed").expect("mixed match MIR");
+        assert!(
+            f.blocks.iter().flat_map(|block| &block.stmts).any(
+                |stmt| matches!(
+                    stmt,
+                    Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Enum(_))
+                )
+            ),
+            "the wildcard arm must drop the hidden owner of the materialized Move enum:\n{}",
+            print::function_to_string(f)
         );
     }
 
