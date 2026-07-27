@@ -268,6 +268,30 @@ fn if_match_and_loop_edges_keep_one_live_payload() {
 }
 
 #[test]
+fn matching_an_owned_field_marks_that_field_moved() {
+    let src = concat!(
+        "Item { detail: Option<string>, n: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  v := Item { detail: Some(\"owned\".clone()), n: 4 }\n",
+        "  n := match v.detail { Some(s) => s.len(), None => 0 }\n",
+        "  again := v.detail\n",
+        "  return (n + v.n) as i32\n",
+        "}\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "matched-owned-field-move.align", src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "matching Some(string) must consume the field"
+    );
+    assert!(
+        rendered.contains("use of moved field 'detail' of 'v'"),
+        "diagnostic must identify the consumed field:\n{rendered}"
+    );
+}
+
+#[test]
 fn nested_outer_struct_uses_the_same_recursive_plan() {
     if !backend_available() {
         return;

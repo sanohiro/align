@@ -10402,8 +10402,11 @@ impl<'a> MoveCheck<'a> {
                 // poison the post-state; if every arm diverges the code after is unreachable.
                 let incoming_borrows = self.borrows.clone();
                 let scrutinee_roots = self.borrow_sources(scrutinee);
-                let scrutinee_local = match &scrutinee.kind {
-                    ExprKind::Local(id) => Some(*id),
+                let scrutinee_move = match &scrutinee.kind {
+                    ExprKind::Local(id) => Some(MovedKey::Whole(*id)),
+                    ExprKind::Field { root, path } if path.len() == 1 => {
+                        Some(MovedKey::Field(*root, path[0]))
+                    }
                     _ => None,
                 };
                 let mut joined: Option<MovedSet> = None;
@@ -10426,17 +10429,22 @@ impl<'a> MoveCheck<'a> {
                         clear_moved(&mut m, *binding);
                         // And extracting a MOVE payload moves it OUT of the scrutinee: MIR nulls
                         // the scrutinee's payload slot at arm entry (the binding owns the buffer
-                        // now), so a Local scrutinee becomes whole-moved in this arm's state —
-                        // using or re-matching it would read the nulled payload as a silent wrong
+                        // now), so a Local scrutinee becomes whole-moved and a depth-1 field
+                        // scrutinee becomes partially moved in this arm's state. Using or
+                        // re-matching either would read the nulled payload as a silent wrong
                         // result. Tag-only / Copy-payload arms extract nothing owned and leave it
                         // live; the arm join then makes the post-match state "moved iff some
                         // taken arm extracted", the standard may-analysis. (Found by the #593
                         // adversarial review: the arm-entry `clear_moved` above had unshielded
                         // this pre-existing hole's loop form.)
-                        if let Some(sl) = scrutinee_local
+                        if let Some(key) = scrutinee_move
                             && self.is_move(*binding)
                         {
-                            m.insert(MovedKey::Whole(sl));
+                            let owner = match key {
+                                MovedKey::Whole(id) | MovedKey::Field(id, _) => id,
+                            };
+                            self.invalidate_owner(owner);
+                            m.insert(key);
                         }
                     }
                     self.expr(&a.body, &mut m, consuming, direct);
