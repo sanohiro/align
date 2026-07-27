@@ -10722,16 +10722,26 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     // Move payload. Give the whole sum a hidden owner before branching. A Move-binding arm clears
     // this owner after transferring the active payload; every other arm drops it before evaluating
     // its body. Direct bound places remain path-local and are nulled only on a transferring arm.
-    let scrut_owner = (binds_move_payload && may_need_synthetic_owner(scrutinee)).then(|| {
+    let scrut_owner = (needs_drop_flag(scrutinee.ty, &b.structs, &b.tuples, &b.enums)
+        && may_need_synthetic_owner(scrutinee))
+    .then(|| {
         let owner = b.new_synthetic_owner(scrutinee.ty);
         b.push(Stmt::Store(owner, scrut.clone()));
-        b.set_drop_flag_operand(
-            owner,
+        let live = if binds_move_payload {
             scrut_flag
                 .clone()
-                .unwrap_or(Operand::Const(Const::Bool(false))),
-        );
-        null_moved_source(b, scrutinee);
+                .unwrap_or(Operand::Const(Const::Bool(false)))
+        } else {
+            temporary_drop_flag(b, scrutinee, &scrut)
+                .unwrap_or(Operand::Const(Const::Bool(false)))
+        };
+        b.set_drop_flag_operand(owner, live);
+        // A consuming match transferred every fresh/materialized source into this owner. A
+        // task-group result is also fresh to its caller even when backed by a bound tail local.
+        // Copy-only ordinary scopes keep bound sources borrowed (their temporary bit is false).
+        if binds_move_payload || matches!(scrutinee.kind, hir::ExprKind::TaskGroup(_)) {
+            null_moved_source(b, scrutinee);
+        }
         owner
     });
     let join_bb = b.new_block();
@@ -10886,6 +10896,8 @@ fn lower_match_binary(
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
+        let active_may_own = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums);
+        discharge_match_scrutinee(b, scrut_owner, false, active_may_own);
         finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
         return;
     }
@@ -11556,6 +11568,29 @@ mod tests {
                 )
             ),
             "the wildcard arm must drop the hidden owner of the materialized Move enum:\n{}",
+            print::function_to_string(f)
+        );
+    }
+
+    #[test]
+    fn wildcard_match_drops_a_fresh_owned_sum_without_move_bindings() {
+        let p = lower(
+            "fn wildcard() -> i64 {\n\
+               return match Some(\"x\".clone()) {\n\
+                 _ => 0\n\
+               }\n\
+             }\n\
+             fn main() -> i32 = wildcard() as i32\n",
+        );
+        let f = p.fns.iter().find(|f| f.name == "wildcard").expect("wildcard match MIR");
+        assert!(
+            f.blocks.iter().flat_map(|block| &block.stmts).any(
+                |stmt| matches!(
+                    stmt,
+                    Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Option(_))
+                )
+            ),
+            "a lone wildcard must drop its fresh owned Option scrutinee:\n{}",
             print::function_to_string(f)
         );
     }
