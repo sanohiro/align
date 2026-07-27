@@ -3512,10 +3512,10 @@ L1b Move sum/Option/Result payload completion
 L2  contextual parameter modes + function-value modes/joined provenance + interface summaries
 L3  package-defined opaque Move resources + linkable Drop thunks + dependent resource_ref views
 L4  named arena region capability + clone_in
-L5  deterministic tagged file/inline inputs + static Query artifacts
+L5  deterministic tagged file/inline inputs + static Query/command artifacts
 L6  region-backed RegionPlain array_builder
  D0 native SQLite/libpq feasibility probes
- D1 generated Query plan over a fake driver
+ D1 generated Query/command plans over a fake driver
  D2 minimal SQLite Query vertical
  D3 SQLite checked metadata
  D4 minimal PostgreSQL Query vertical
@@ -3525,24 +3525,29 @@ L6  region-backed RegionPlain array_builder
  D8 typed streaming rows
  D9 scoped options/cancellation
 D10 one-pass compound Output
-D11 SQL migrations
-D12 category metadata + EXPLAIN
+D11 exact-policy SQL migrations
+D12 region-owned category metadata + EXPLAIN
 D13 batch/SoA/high-value native paths
 D14 dynamic SQL + proved callback surfaces
 ```
 
 L1a–L6 are ordered implementation prerequisites. D0 is a disposable ABI probe and may run while
-they are being built, but no probe API becomes public. D1 must prove source/artifact/binder/
-decoder/separate-compilation behavior without a database. D2 and D4 deliberately remain scalar
-verticals; their purpose is to connect the final Query-centered API to each native library without
-inventing a temporary dynamic API. D10 is part of the initial database release rather than a
-future relationship feature.
+they are being built, but no probe API becomes public. D1 must prove Query/command
+source/artifact/binder, Query decoder, and separate-compilation behavior without a database. Option
+APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
+connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12. D9
+completes shared deadline/cancellation and the cross-scope disposition audit; it does not replace an
+interim surface. D2 and D4 deliberately remain scalar verticals; their purpose is to connect the
+final Query-centered API to each native library without inventing a temporary dynamic API. D4 merge
+and every database release require a provisioned non-skippable PostgreSQL CI job; reported skips are
+local-only. D10 is part of the initial database release rather than a future relationship feature.
 
-D11 SQL migrations and D12 category metadata/EXPLAIN are part of the first database release after
-the two driver verticals and compound-output proof. D13–D14 are committed additive database work,
-not an unspecified deferral. They must not weaken the Query/compound-output contract. Normal builds
-remain offline at every stage; only explicit database tooling may contact a database during build
-preparation.
+D11 SQL migrations use the exact required-by-default/forbidden-one-statement policy and dirty-state
+repair contract. D12 returns exact flat metadata/plan records into an explicit region. Both are part
+of the first database release after the two driver verticals and compound-output proof. D13–D14 are
+committed additive database work, not an unspecified deferral. They must not weaken the
+Query/compound-output contract. Normal builds remain offline at every stage; only explicit database
+tooling may contact a database during build preparation.
 
 ## Design Issues to Settle in Parallel
 

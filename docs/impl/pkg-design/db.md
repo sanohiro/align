@@ -271,7 +271,7 @@ The following must ship before a database driver:
 - package-defined opaque/dependent Move resources with exactly-once Drop, `resource_ref<R>`, and
   owner-tied native views;
 - `arena name {}` and its scope-bound `region` capability;
-- deterministic compiler-registered static source inputs and Query artifacts;
+- deterministic compiler-registered static source inputs and Query/command artifacts;
 - region-backed `array_builder<PlainStruct>`.
 
 The same machinery is available to `std.http`, `std.net`, `std.process`, and other native libraries.
@@ -504,8 +504,8 @@ producer implementation / StaticQueryArtifact
   exact source bytes/hash
   deterministic per-driver wire bytes/hash and source map
   parameter occurrence/source-span table
-  per-driver parameter retention classes
-  checked-metadata policy/digest
+  per-driver binding plan and parameter retention classes
+  per-driver checked-metadata policy/state/digest
   generated bind and decode thunks
 ```
 
@@ -520,9 +520,9 @@ metadata, but it does not recompile consumers when `Params`, `Row`, driver restr
 semantic options are unchanged. A public-contract change updates `interface_hash` and invalidates
 consumers.
 
-The runtime descriptor points to immutable producer-owned static data and generated binder/decoder
-thunks. `P` and `R` are compile-time contracts; there is no runtime reflection, per-row field-name
-lookup, or consumer-side Query-body instantiation.
+The runtime descriptor points to immutable producer-owned static data, per-driver wire/binding/
+checked entries, and generated binder/decoder thunks. `P` and `R` are compile-time contracts; there
+is no runtime reflection, per-row field-name lookup, or consumer-side Query-body instantiation.
 
 ### 5.5 One descriptor, one statement
 
@@ -742,6 +742,13 @@ pub Params {
 
 pub fn command() -> db.command<Params> = db.command_file([])
 ```
+
+The command constructor has the same whole-body item restriction, static source identity,
+source/wire hashes, parameter occurrence/source maps, per-driver binding/retention plan,
+checked-policy map, interface/implementation split, and cache invalidation rules as a Query.
+`StaticCommandArtifact` and `CommandStatic` omit only the Row contract, result-column metadata, and
+decode thunk. The generated binder is mandatory; command execution never falls back to reflection or
+runtime field-name lookup.
 
 Execution returns:
 
@@ -1001,7 +1008,10 @@ fn step(
     state.user_name = row.user_name.clone_in(out)
   }
 
-  group_id := row.group_id else return Ok(())
+  group_id := row.group_id else {
+    _ := row.group_name else return Ok(())
+    return Err(partial_child())
+  }
   group_name := row.group_name else return Err(partial_child())
   groups.push(Group {
     id: group_id,
@@ -1406,7 +1416,7 @@ conn := sqlite.connect("app.db", [
 ])?
 ```
 
-The driver must expose:
+The native design must retain explicit extension points for:
 
 - open flags;
 - URI mode;
@@ -1416,21 +1426,62 @@ The driver must expose:
 - thread/open mode;
 - extension loading policy (disabled by default; explicit if ever supported).
 
-No requested option may be silently ignored.
+The first-release finite connection sum is the exact subset in §11.2. Busy-handler callbacks and
+extension loading require the later proved callback work and are not constructors in v1. No
+requested option may be silently ignored.
 
 ### 11.2 Query/prepare/execute options
 
-Examples of required extension points:
+The first-release SQLite sums are fixed:
 
 ```text
-sqlite.QueryOption
+sqlite.QueryOption.RequireVersionAtLeast(major, minor, patch)
+sqlite.CommandOption.RequireVersionAtLeast(major, minor, patch)
+
 sqlite.PrepareOption.Persistent
 sqlite.PrepareOption.Normalize
-sqlite.ExecuteOption
+
+sqlite.ExecuteOption.BusyTimeoutNs(ns)
+
+sqlite.TxOption.Deferred
+sqlite.TxOption.Immediate
+sqlite.TxOption.Exclusive
+
+sqlite.MetaOption.IncludeInternalObjects
+sqlite.MetaOption.IncludeHiddenColumns
+
+sqlite.ExplainOption.QueryPlan
+sqlite.ExplainOption.Bytecode
 ```
 
-The exact option set follows libsqlite3 capabilities and measured consumers. The type system should
-prevent a SQLite option from being passed to PostgreSQL.
+`RequireVersionAtLeast` is static, pins the descriptor to SQLite, and participates in its public
+semantic contract and artifact. `Persistent`/`Normalize` apply only to preparation.
+`BusyTimeoutNs` temporarily replaces the connection busy timeout for that execution and restores it
+before return/rows exposure; it conflicts with another busy-timeout value. Exactly zero or one
+transaction mode is accepted, with `Deferred` as the `[]` default. `IncludeInternalObjects` and
+`IncludeHiddenColumns` apply only to metadata categories for which SQLite exposes those objects.
+Exactly one EXPLAIN mode is accepted; `[]` means `QueryPlan`.
+
+The first-release connection sum is also finite:
+
+```text
+sqlite.ConnectOption.OpenReadOnly
+sqlite.ConnectOption.OpenReadWrite
+sqlite.ConnectOption.Create
+sqlite.ConnectOption.Uri
+sqlite.ConnectOption.PrivateCache
+sqlite.ConnectOption.SharedCache
+sqlite.ConnectOption.NoMutex
+sqlite.ConnectOption.FullMutex
+sqlite.ConnectOption.BusyTimeoutNs(ns)
+sqlite.ConnectOption.Pragma(name, value)
+```
+
+`[]` means `OpenReadWrite` without create, URI, cache, mutex override, busy override, or PRAGMA.
+Read-only conflicts with read-write/create; private conflicts with shared; no-mutex conflicts with
+full-mutex; a duplicate PRAGMA name or busy timeout conflicts. Durations must be positive. A
+compile-time or linked-library capability miss returns `Unsupported`; no variant degrades to a
+different libsqlite3 flag. Extension loading is not exposed in v1 and remains disabled.
 
 ### 11.3 Native features
 
@@ -1480,17 +1531,60 @@ Secrets remain runtime values and never enter static Query metadata.
 
 ### 12.2 Parameter and result formats
 
-The driver must permit explicit native parameter type and format controls:
+The first-release PostgreSQL sums are fixed:
 
 ```text
-postgres.QueryOption.ParameterType(name, native_type)
+postgres.QueryOption.ParameterType(name, canonical_type_name)
+postgres.CommandOption.ParameterType(name, canonical_type_name)
+
 postgres.PrepareOption.ParameterOid(name, oid)
+
 postgres.ExecuteOption.ParameterFormat(name, Text|Binary)
 postgres.ExecuteOption.ResultFormat(Text|Binary)
+
+postgres.TxOption.Isolation(ReadCommitted|RepeatableRead|Serializable)
+postgres.TxOption.Access(ReadOnly|ReadWrite)
+postgres.TxOption.Deferrable(bool)
+
+postgres.MetaOption.SearchPathOnly
+postgres.MetaOption.IncludeSystemCatalogs
+
+postgres.ExplainOption.Analyze
+postgres.ExplainOption.Format(Text|Json)
+postgres.ExplainOption.Verbose(bool)
+postgres.ExplainOption.Costs(bool)
+postgres.ExplainOption.Buffers(bool)
+postgres.ExplainOption.Timing(bool)
+postgres.ExplainOption.Settings(bool)
+postgres.ExplainOption.Wal(bool)
 ```
 
-The first implementation may use text format for broad correctness, but the surface must not prevent
-binary parameters/results. Unknown or conflicting OIDs are errors, not ignored hints.
+`ParameterType` is static, pins the descriptor to PostgreSQL, names a Params field, and participates
+in its public semantic contract and artifact. `ParameterOid` applies only to preparation.
+`ParameterFormat` names a Params field; `ResultFormat` applies to the complete result in libpq v1.
+Unknown fields/types/OIDs, duplicate field controls, and conflicting formats are errors, not ignored
+hints. The first implementation may support only `Text`; requesting an unavailable binary mapping
+returns `Unsupported` before sending SQL.
+
+The first-release connection sum is:
+
+```text
+postgres.ConnectOption.ApplicationName(value)
+postgres.ConnectOption.ConnectTimeoutNs(ns)
+postgres.ConnectOption.SslMode(Disable|Prefer|Require|VerifyCa|VerifyFull)
+postgres.ConnectOption.TargetSessionAttrs(Any|ReadWrite|ReadOnly|Primary|Standby)
+postgres.ConnectOption.Parameter(name, value)
+```
+
+The URL supplies host, port, database, user, and password. `[]` adds no libpq keyword override.
+Duplicate semantic keys, including a URL/option conflict, are errors; secrets are runtime values and
+never enter Query artifacts. Durations must be positive.
+
+`[]` transaction options mean `ReadCommitted`, `ReadWrite`, and non-deferrable. Each transaction
+dimension may occur at most once. PostgreSQL-invalid combinations such as deferrable without
+serializable read-only are rejected before `BEGIN`. `SearchPathOnly` conflicts with
+`IncludeSystemCatalogs`. EXPLAIN defaults to text with PostgreSQL defaults; `Buffers`, `Timing`, or
+`Wal` requires native `Analyze` and otherwise conflicts before execution.
 
 ### 12.3 Native features
 
@@ -1567,6 +1661,32 @@ Every `*Option` above is a finite public sum type. Operation arguments are
 runtime string it retains after the call. An option list is not stored as an untyped map and is
 never inspected through reflection.
 
+The common first-release variants and defaults are exact:
+
+```text
+db.QueryOption.Check(DeclaredOnly|CheckedOptional|CheckedRequired)
+db.CommandOption.Check(DeclaredOnly|CheckedOptional|CheckedRequired)
+db.PrepareOption.TimeoutNs(ns)
+db.ExecuteOption.TimeoutNs(ns)
+db.TxOption.BeginTimeoutNs(ns)
+db.MetaOption.TimeoutNs(ns)
+db.MetaOption.IncludeSystem
+db.ExplainOption.TimeoutNs(ns)
+```
+
+`[]` selects `DeclaredOnly` for a static Query/command, no client deadline for a runtime operation,
+and excludes system metadata. Common `db.explain` is inspection-only; only the driver-qualified
+PostgreSQL native option `Analyze` executes the named Query. A duration must be positive. A scope
+accepts at most one timeout and at most one check policy. Duplicate tags, two check policies, or a
+driver-native option that conflicts with a common option return `db.Error.Unsupported` or
+`db.Error.InvalidQuery` as appropriate before SQL is sent. Native `Analyze` visibly changes EXPLAIN
+from an inspection into one execution of the named Query; execution-count instrumentation includes
+it. SQLite has no v1 ANALYZE option and rejects any attempt to reinterpret a PostgreSQL option.
+
+These are the mandatory minimums, not examples. Adding a later variant is an ordinary source/API
+change to the owning finite sum and its disposition matrix. It cannot be implemented as an unknown
+tag or silently ignored extension.
+
 Static Query/command option arguments are more restricted: a recognized constructor accepts only a
 fixed literal list of option constructors whose payloads are literals, type identities, or other
 compiler-known constants. A runtime local, environment read, FFI result, or arbitrary function call
@@ -1585,8 +1705,8 @@ command      db.command_file(slice<db.CommandOption>)
 prepare      db.prepare(exec, query, slice<db.PrepareOption>)
 execution    db.execute/one/maybe_one/all/rows(..., slice<db.ExecuteOption>)
 transaction  db.begin(conn, slice<db.TxOption>)
-metadata     db.meta_database/meta_schemas/...(..., slice<db.MetaOption>)
-EXPLAIN      db.explain(exec, query, params, slice<db.ExplainOption>)
+metadata     db.meta_database/meta_schemas/...(..., out: region, slice<db.MetaOption>)
+EXPLAIN      db.explain(exec, query, params, out: region, slice<db.ExplainOption>)
 ```
 
 The corresponding `driver.*_native` form receives the common option slice and one additional
@@ -1596,8 +1716,22 @@ process-global option state. Query-local `run` helpers decide visibly whether to
 slice from their caller or pass `[]`.
 
 Connection, Query, prepare, execution, transaction, metadata, and EXPLAIN therefore have distinct
-static types even when two variants happen to carry the same scalar. D9 may add variants to these
-settled containers; it must not invent another representation.
+static types even when two variants happen to carry the same scalar. Their implementation ownership
+is deliberately earlier than D9:
+
+```text
+D1  common + driver Query/Command option sums and artifact encoding
+D2  SQLite connection and baseline execution variants
+D4  PostgreSQL connection and baseline execution variants
+D6  prepare variants
+D7  transaction variants
+D9  common deadline/cancellation machinery and the cross-scope disposition matrix
+D12 metadata and EXPLAIN variants
+```
+
+D9 completes timeout/cancellation behavior and the combined precedence matrix; it does not create
+preliminary option APIs that D1/D2/D4/D6/D7 already require, and it must not invent another
+representation.
 
 ### 13.3 No silent ignore
 
@@ -1624,7 +1758,7 @@ recommended rule:
 
 ### 13.5 Driver restriction
 
-A Query descriptor records:
+A Query/command descriptor records the public finite sum `db.DriverRestriction`:
 
 ```text
 AnySupportedDriver
@@ -1774,10 +1908,16 @@ and retry.
 
 ### 16.1 Three check levels
 
-A Query has an observed verification state and a static policy:
+A Query or command has one observed verification state per permitted driver and one static policy:
 
 ```text
-state
+driver state
+DriverVerification {
+  driver
+  state: Declared | DatabaseChecked
+  metadata_fingerprint: Option<hash>
+}
+
 Declared
   static SQL source exists; Params/Row are valid Align types; hash is known
 
@@ -1790,9 +1930,21 @@ CheckedOptional
 CheckedRequired
 ```
 
-`CheckedRequired` makes missing or stale metadata a compile error. `CheckedOptional` uses current
-matching metadata when present and otherwise remains honestly `Declared`. The package/compiler must
-not describe a merely Declared Query as fully database-type-checked.
+The descriptor's driver restriction determines the required state set:
+
+```text
+SQLiteOnly          {SQLite}
+PostgreSQLOnly      {PostgreSQL}
+AnySupportedDriver  {SQLite, PostgreSQL}
+```
+
+`CheckedRequired` makes missing or stale metadata a compile error for **every** member of that set.
+Preparing only SQLite metadata for an `AnySupportedDriver` descriptor does not satisfy the policy;
+the developer must also prepare PostgreSQL or explicitly pin the descriptor to SQLite.
+`CheckedOptional` uses exact current metadata independently per driver and leaves only the missing or
+stale driver honestly `Declared`. Query inspection reports the complete map and runtime inspection
+reports the selected connection entry. Neither the package nor compiler may collapse a mixed map to
+one “checked” boolean or describe a Declared driver as database-type-checked.
 
 ### 16.2 Explicit preparation command
 
@@ -1857,12 +2009,12 @@ format_version
 query_id, module, item, driver
 SQL source identity: File(logical path) | Inline(query_id)
 source-SQL hash, driver-wire-SQL hash, rewrite-format version, static-options hash
-Params and Row fingerprints
+Params fingerprint and, for Query only, Row fingerprint
 schema fingerprint
 engine/driver version
 PostgreSQL search_path and extension assumptions, when applicable
 parameters: source name, protocol ordinal, logical/native type
-columns: ordinal, source alias, logical/native type, nullable/origin evidence
+columns for Query only: ordinal, source alias, logical/native type, nullable/origin evidence
 ```
 
 Native PostgreSQL OIDs may be recorded as environment evidence, but volatile OIDs are not the sole
@@ -1871,8 +2023,9 @@ alongside them.
 
 Secrets and connection URLs are never stored.
 
-For each static Query/driver pair, the compiler derives the one metadata pathname from the Query ID
-hash. Its action key records `Missing` or `Present(content_hash)` even under `CheckedOptional`.
+For each static Query-or-command/driver pair, the compiler derives the one metadata pathname from the
+descriptor ID hash. Its action key records `Missing` or `Present(content_hash)` even under
+`CheckedOptional`.
 Creating, deleting, or editing the file therefore invalidates the producer without a directory
 scan. Exact current metadata contributes to the Query artifact/implementation hash; only its public
 semantic consequences contribute to the exported Query interface.
@@ -1891,8 +2044,9 @@ CheckedRequired   compilation/CI error
 
 No stale metadata may be silently treated as current.
 
-`CheckedOptional` with missing/stale metadata emits the same honest Declared descriptor as if no
-metadata existed; it never embeds stale evidence. `CheckedRequired` fails before object-cache reuse.
+`CheckedOptional` with missing/stale metadata emits the same honest Declared per-driver entry as if
+no metadata existed; it never embeds stale evidence. `CheckedRequired` checks every permitted driver
+and fails before object-cache reuse if any entry is missing or stale.
 The explicit preparation regeneration mode in §16.2 is the sole exception needed to create the
 missing artifact.
 
@@ -1997,9 +2151,52 @@ content changed is an error unless an explicit repair workflow is invoked.
 
 ### 17.4 Transaction behavior
 
-The tool must not claim all migrations are transactional. PostgreSQL and SQLite differ, and some
-native statements cannot be wrapped as ordinary transactions. The migration file or driver policy
-makes this visible.
+Every migration has exactly one transaction policy. The optional directive is the first physical
+line, is ASCII and case-sensitive, and remains an ordinary SQL line comment:
+
+```sql
+-- align:migration transaction=required
+-- align:migration transaction=forbidden
+```
+
+At most one is present. No directive means `required`. The exact directive bytes participate in the
+migration checksum; there is no command-line or ambient configuration override.
+Migration files may not contain `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, or equivalent native
+transaction-control statements; the runner owns the boundary. The driver-authoritative script
+preparation/screening rejects them before any migration mutates the database.
+
+`required` has one all-or-nothing algorithm on both drivers:
+
+1. acquire the driver migration lock;
+2. begin one transaction;
+3. execute every statement in file order;
+4. insert the applied history row in the same transaction;
+5. commit, or roll back the whole file on any error.
+
+If the engine rejects a statement in that transaction, the migration fails and records no applied
+row. The tool never retries it outside the transaction.
+
+`forbidden` is the explicit exceptional path for a native statement that must run outside an
+ordinary transaction. Version 1 accepts exactly one database-authoritative statement in such a
+file. Before execution, under the migration lock, the tool inserts a history row with
+`state = Applying`, version/name/checksum, and zero completed statements. It then executes the one
+statement outside a transaction and changes the row to `Applied` only after success. An error is
+best-effort recorded as `Failed`; process loss leaves `Applying`. Either non-final state is
+**dirty**, blocks all later migrations, and is reported by `status`/`check`. The tool never assumes
+whether the statement took effect and never automatically retries it.
+
+Recovery is deliberately visible:
+
+```sh
+alignc db repair --version N --accept-applied --expect-checksum HASH
+alignc db repair --version N --clear-dirty --expect-checksum HASH
+```
+
+Both forms require an exact current-file checksum and a dirty row. `--accept-applied` marks the row
+applied after the operator verifies native state. `--clear-dirty` removes only the dirty history
+row after the operator verifies that retry is safe; it does not undo database effects. Applied rows
+cannot be repaired by these commands. D11 tests crash/error boundaries before the statement, after
+native success but before the history update, and during error recording on SQLite and PostgreSQL.
 
 Down migrations are optional and are not automatically generated.
 
@@ -2023,25 +2220,115 @@ category.
 
 ### 18.2 Separate operations
 
-Conceptual common calls:
+The common result records are flat `RegionPlain` values. Their first-release field contract is:
+
+```text
+db.MetaTableKind      Table | View | MaterializedView | Native
+db.MetaNullability    Yes | No | Unknown
+db.MetaKeyKind        Primary | Unique | Foreign | Check | Exclusion | Native
+db.MetaQueryState     Declared | DatabaseChecked
+db.MetaQueryEntry     Summary | Parameter | Column
+db.MetaStatementClass Select | Dml | Ddl | Native | Unknown
+db.PlanFormat         Text | Json | Native
+
+db.DatabaseMeta
+  driver: Driver
+  name, engine_version: str
+  default_schema, encoding, collation: Option<str>
+  read_only, transactional_ddl: Option<bool>
+
+db.SchemaMeta
+  name: str
+  owner: Option<str>
+  visible, system: bool
+
+db.TableMeta
+  schema, name: str
+  kind: MetaTableKind
+  native_kind, owner, comment: Option<str>
+  estimated_rows: Option<f64>
+
+db.ColumnMeta
+  schema, table, name: str
+  ordinal: i64
+  logical_type, native_type: Option<str>
+  nullable: MetaNullability
+  default_sql, generated_sql, origin_schema, origin_table, origin_column: Option<str>
+
+db.KeyMeta
+  schema, table, name: str
+  kind: MetaKeyKind
+  term_ordinal: i64
+  local_column, referenced_schema, referenced_table, referenced_column, expression: Option<str>
+
+db.IndexMeta
+  schema, table, name: str
+  unique: Option<bool>
+  term_ordinal: i64
+  column, expression, predicate, native_method, native_opclass: Option<str>
+
+db.QueryMeta
+  query_id: str
+  driver: Driver
+  driver_restriction: DriverRestriction
+  statement_class: MetaStatementClass
+  artifact_digest: str
+  state: MetaQueryState
+  metadata_fingerprint: Option<str>
+  entry: MetaQueryEntry
+  ordinal: Option<i64>
+  source_name, source_alias, logical_type, native_type, origin: Option<str>
+  nullable: MetaNullability
+
+db.QueryPlan
+  driver: Driver
+  format: PlanFormat
+  analyzed: bool
+  body: str
+```
+
+Keys/constraints and indexes with several terms are repeated flat rows sharing `name`, ordered by
+`term_ordinal`; a category result never hides a nested allocation. `db.QueryMeta` begins with one
+`Summary` row followed by ordered parameter and column rows. Optional fields are `None` when the
+requested detail level or engine evidence does not supply them; base identity fields are always
+present. Driver-native operations return corresponding driver-specific flat `RegionPlain` records
+and may add native fields, but use the same destination rule.
+
+The exact common signatures and calls are:
 
 ```align
-database := db.meta_database(exec, detail, [])?
-schemas := db.meta_schemas(exec, detail, [])?
-tables := db.meta_tables(exec, schema_filter, detail, [])?
-table := db.meta_table(exec, table_ref, detail, [])?
-columns := db.meta_columns(exec, table_ref, detail, [])?
-keys := db.meta_keys(exec, table_ref, detail, [])?
-indexes := db.meta_indexes(exec, table_ref, detail, [])?
-query_meta := db.meta_query(exec, query(), detail, [])?
-plan := db.explain(exec, query(), params, options)?
+database: db.DatabaseMeta =
+  db.meta_database(exec, detail, out, [])?
+schemas: array<db.SchemaMeta> =
+  db.meta_schemas(exec, detail, out, [])?
+tables: array<db.TableMeta> =
+  db.meta_tables(exec, schema_filter, detail, out, [])?
+table: db.TableMeta =
+  db.meta_table(exec, table_ref, detail, out, [])?
+columns: array<db.ColumnMeta> =
+  db.meta_columns(exec, table_ref, detail, out, [])?
+keys: array<db.KeyMeta> =
+  db.meta_keys(exec, table_ref, detail, out, [])?
+indexes: array<db.IndexMeta> =
+  db.meta_indexes(exec, table_ref, detail, out, [])?
+query_meta: array<db.QueryMeta> =
+  db.meta_query(exec, query(), detail, out, [])?
+plan: db.QueryPlan =
+  db.explain(exec, query(), params, out, options)?
 ```
 
 These are distinct public primitives. Each metadata category has exactly one form whose final
 argument is `slice<db.MetaOption>`; `[]` means no options. The corresponding
 `sqlite.meta_*_native`/`postgres.meta_*_native` form receives that common slice plus one
 driver-native option slice. `meta_table(Full)` does not automatically fetch columns, keys, indexes,
-or plans.
+or plans. `meta_table` returns `db.Error.NotFound` when absent; it does not return an optional
+partially initialized record.
+
+Every string byte and every result array is allocated in the explicit `out` region before the native
+metadata/result buffer is released. No returned value borrows a connection, result, statement, or
+temporary catalog row, and no metadata primitive chooses the heap. Array construction uses L6's
+region builder and its one measured compacting pass. Native forms take the same `out` immediately
+before the common/native option slices. EXPLAIN follows the same rule for `QueryPlan.body`.
 
 ### 18.3 Database metadata
 
@@ -2151,15 +2438,17 @@ prepare/schema/server identity
 
 ### 18.10 Query plans
 
-Plan retrieval is explicit because it may be expensive and may execute the Query under ANALYZE.
+Plan retrieval is explicit because it may be expensive. Common `db.explain` is inspection-only.
+PostgreSQL execution analysis is selected only by
+`postgres.explain_native(..., [postgres.ExplainOption.Analyze, ...])`.
 
 ```text
 EXPLAIN only        plan without running user statement where supported
-EXPLAIN ANALYZE     explicitly executes; must be separately named/confirmed in API
+EXPLAIN ANALYZE     PostgreSQL-native Analyze option explicitly executes
 ```
 
-The API must make “executes the statement” visible. It may return text, JSON/native structured plan,
-or both.
+The native API makes “executes the statement” visible and counts it. SQLite exposes no v1 Analyze
+option. Plan output may be text, JSON/native structured plan, or both.
 
 ### 18.11 PostgreSQL native metadata
 
@@ -2286,7 +2575,7 @@ The implementation roadmap must add benchmarks for at least:
 - SQLite parameter bind + one-row typed decode;
 - SQLite streamed text/blob bind with transient-copy bytes and allocations separated;
 - PostgreSQL parameter bind + one-row typed decode;
-- file/inline Query artifact generation and cold/warm rebuild;
+- file/inline Query/command artifact generation and cold/warm rebuild;
 - SQLite canonical migration catalog/replay at 10/100/1000 files;
 - prepared repeated execution;
 - large streamed flat result;
@@ -2294,7 +2583,7 @@ The implementation roadmap must add benchmarks for at least:
 - segmented parent/child output;
 - text vs PostgreSQL binary result where supported;
 - direct SoA/batch decode when implemented;
-- metadata request granularity;
+- metadata request granularity, destination region bytes/compact count, and native-buffer copy bytes;
 - package overhead compared with direct libsqlite3/libpq code.
 
 The common layer should be within measurement noise of an equivalent direct driver loop after
@@ -2366,7 +2655,7 @@ L1b Move sum/Option/Result payload completion
 L2  contextual borrow modes + Copy mutation + Fn modes/joined provenance + interface summaries
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
-L5  deterministic tagged file/inline inputs + one-item Query identity + artifact/descriptor
+L5  deterministic tagged file/inline inputs + one-item Query/command identity + artifacts/descriptors
 L6  region-backed PlainStruct array_builder
 ```
 
@@ -2388,23 +2677,30 @@ Read-only/throwaway probes establish:
 
 The deliverable is recorded evidence in this document or a focused audit, not production raw handles.
 
-### D1 — generated Query plan over a fake driver
+### D1 — generated Query/command plans over a fake driver
 
 Before a native database:
 
 - construct `db.query<P,R>` from inline and sibling SQL;
-- emit/load `StaticQueryArtifact`;
+- construct `db.command<P>` from inline and sibling SQL;
+- emit/load `StaticQueryArtifact` and `StaticCommandArtifact`;
 - preserve exact source SQL identity while generating deterministic SQLite/source and
   PostgreSQL/`$n` wire entries plus reverse span maps;
-- generate binder/decoder thunks;
+- generate the shared Params binder for both kinds and a Query-only decoder thunk;
 - record per-driver `BindValue`/`BindCopy` retention classes for every Params field;
 - exercise named-parameter occurrence tables;
 - decode a fake flat scalar row;
-- prove interface/implementation/cache invalidation boundaries;
+- prove Query and command interface/implementation/cache invalidation boundaries;
+- prove command identity, checked-policy state, source/wire/static-option hashes, and binder
+  retention use the same versioned statement-artifact schema without a result contract;
+- define/encode `db.QueryOption`, `db.CommandOption`, `sqlite.QueryOption`/
+  `sqlite.CommandOption`, and `postgres.QueryOption`/`postgres.CommandOption` exactly as §11–§13;
 - prove no runtime reflection or per-row name lookup.
 
-Tests mutate SQL-only, private Query, public Params/Row, driver restriction, and metadata digest
-independently. Benchmark generated binder/decoder calls and warm-cache behavior.
+Tests mutate SQL-only, private Query/command, public Params/Row, driver restriction, and per-driver
+metadata digests independently. They compile-fail a command with a Row/decode contract and prove an
+unchanged public command consumer is not recompiled by a SQL-only producer edit. Benchmark generated
+Query/command binders, the Query decoder, and warm-cache behavior.
 
 ### D2 — minimal SQLite Query vertical
 
@@ -2417,12 +2713,14 @@ The first native vertical is deliberately exact:
 - `execute` and `one`;
 - zero/one/more-than-one cardinality behavior;
 - structured SQLite primary/extended errors;
+- the exact SQLite connection and baseline execution option sums from §11, including every
+  conflict/unsupported branch;
 - one execution-count hook;
 - close/finalize exactly once on success and every error exit.
 
 It does not include text views, `all`, streaming, transactions, migrations, dynamic rows, metadata
-catalogs, or native options. The benchmark compares prepared bind + one-row decode with an equivalent
-direct libsqlite3 loop.
+catalogs, or later native breadth. The benchmark compares prepared bind + one-row decode with an
+equivalent direct libsqlite3 loop.
 
 ### D3 — checked Query metadata core + SQLite
 
@@ -2447,12 +2745,19 @@ This milestone lands before promising that a typed Query is database-checked.
 - repeated source name reuses one ordinal;
 - scalar bind/decode;
 - SQLSTATE and owned native error detail;
+- the exact PostgreSQL connection and baseline execution option sums from §12, including every
+  conflict/unsupported branch;
 - driver restriction before SQL send;
 - portable `CAST(:value AS BIGINT)` Query exercised on both drivers;
 - execution-count hook and cleanup tests.
 
-Integration tests use an explicitly configured local/ephemeral PostgreSQL instance and skip with a
-reported reason when it is unavailable. The direct-libpq comparison benchmark is environment-gated.
+Local developer runs may skip with a reported reason when no PostgreSQL URL is configured. D4 cannot
+merge, and no database release can pass its gate, on such a skip: a required `db-postgres` CI job
+provisions a pinned ephemeral PostgreSQL version, sets `ALIGN_DB_POSTGRES_REQUIRED=1`, and turns
+missing/unreachable configuration into test failure. The same non-skippable job runs the portable
+common Query against SQLite and PostgreSQL. The direct-libpq comparison benchmark is
+environment-gated for ordinary PRs but is mandatory evidence when D4 first lands and at a database
+release performance gate.
 
 ### D5 — PostgreSQL checked metadata
 
@@ -2467,7 +2772,7 @@ reported reason when it is unavailable. The direct-libpq comparison benchmark is
 
 - typed dependent `db.stmt<P,R>` resource;
 - connection binding and driver mismatch checks;
-- explicit prepare options;
+- the exact common/SQLite/PostgreSQL prepare option sums from §11–§13 and their disposition tests;
 - `rows_stmt` with a `borrow mut` statement parameter and repeated sequential execution after each
   rows Drop;
 - text/blob rebind replaces the previous transient native copy only after the prior rows Drop;
@@ -2483,8 +2788,9 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - `db.exec_conn` and `db.exec_tx` return the same borrowed type;
 - `db.commit`/`db.rollback` consume `db.tx` and return `db.conn`;
 - Drop rollback closes the connection;
+- the exact common/SQLite/PostgreSQL transaction option sums from §11–§14;
 - SQLite begin modes;
-- PostgreSQL isolation/read-only/deferrable combinations;
+- PostgreSQL isolation/read-only/deferrable combinations and pre-BEGIN conflict rejection;
 - use-after-end and conn/tx alias rejection.
 
 ### D8 — typed row streaming
@@ -2503,9 +2809,11 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 
 ### D9 — scoped native options, timeout, and cancellation
 
-- common versus driver-qualified option entry points;
-- connection/Query/prepare/execute/transaction scopes;
-- applied/unsupported/conflicting outcomes;
+- complete the common deadline/cancellation machinery over the already-owned D1/D2/D4/D6/D7
+  option APIs;
+- audit common versus driver-qualified entry points across connection/Query/prepare/execute/
+  transaction scopes;
+- complete the cross-scope applied/unsupported/conflicting and precedence matrix;
 - no-silent-ignore tests;
 - SQLite busy/locking controls;
 - PostgreSQL timeout/cancel path;
@@ -2531,8 +2839,10 @@ Compound Query support is part of the first product contract, not a later ORM en
 - SQL migration discovery/order;
 - driver-specific multi-statement execution rules;
 - checksums/history/status/check;
-- transaction policy and partial-failure reporting;
-- explicit `alignc db migrate/status/check`.
+- exact first-line `transaction=required|forbidden` policy;
+- required-by-default atomic behavior;
+- one-statement forbidden files, dirty `Applying`/`Failed` states, and checksum-bound repair;
+- explicit `alignc db migrate/status/check/repair`.
 
 Migration implementation reuses connections/resources but does not change typed Query semantics.
 
@@ -2549,16 +2859,23 @@ Common categories:
 - static Query parameters/results;
 - explicit EXPLAIN.
 
-Each common category operation has one `MetaOption` slice. Each driver-native form has that common
-slice plus one separate native option slice; neither has an optionless overload.
+D12 owns the exact common/SQLite/PostgreSQL metadata and EXPLAIN option sums from §11–§13.
+
+Each common category operation has one explicit destination `region` and one `MetaOption` slice.
+Each driver-native form has the same destination, that common slice, and one separate native option
+slice; neither has an optionless or hidden-heap overload. Common strings and flat arrays use the
+exact `DatabaseMeta`/`SchemaMeta`/`TableMeta`/`ColumnMeta`/`KeyMeta`/`IndexMeta`/`QueryMeta`/
+`QueryPlan` shapes in §18.
 
 Native detail:
 
 - PostgreSQL OIDs/types/opclasses/index details/JSON plans;
 - SQLite STRICT/WITHOUT ROWID/hidden columns/index origin/query-plan details.
 
-Tests prove that one requested category does not fetch unrelated categories. `EXPLAIN ANALYZE`
-remains a visibly executing operation.
+Tests prove that one requested category does not fetch unrelated categories; every returned string
+survives native-result cleanup until its destination arena ends; category arrays allocate only in
+that arena; multi-term keys/indexes remain flat ordered rows; and `meta_table` reports `NotFound`.
+`EXPLAIN ANALYZE` remains a visibly executing operation.
 
 ### D13 — batch, SoA, and high-value native paths
 
@@ -2677,6 +2994,25 @@ The design is implemented correctly only if all are true:
     unimplemented until their owning PRs land.
 54. Every category metadata primitive has one `MetaOption` slice, and native forms add one separate
     native option slice.
+55. Metadata and EXPLAIN results use the exact flat `RegionPlain` shapes and explicit destination
+    region in §18; they neither borrow native buffers nor allocate on a hidden heap.
+56. Checked state is per permitted driver; `CheckedRequired` for `AnySupportedDriver` requires
+    current SQLite and PostgreSQL artifacts.
+57. `StaticCommandArtifact`/`CommandStatic` share Query source/wire/binder/retention/checked/cache
+    rules and omit only Row/result/decode data.
+58. The common, SQLite, and PostgreSQL first-release option sums/defaults/conflicts are the mandatory
+    finite sets in §§11–13, not implementation-selected examples.
+59. D1/D2/D4/D6/D7 own option APIs needed by their operations; D9 completes deadline/cancellation
+    and cross-scope disposition without creating an interim surface.
+60. Migration transaction policy is the exact first-line required/forbidden directive; required is
+    atomic by default, and forbidden uses one statement plus dirty-state/checksum-bound repair.
+61. A LEFT JOIN child is absent only when all child fields are NULL; either partial-NULL direction is
+    a contract error.
+62. `next_batch` is absent from the D1–D12 common surface and lands only in D13.
+63. Canonical many-parent shaping builds parallel parent/child/offset arrays and does not push an
+    array-bearing per-parent Output through a region builder.
+64. PostgreSQL may skip only in optional local runs; D4 merge and releases require the non-skippable
+    provisioned `db-postgres` CI gate.
 
 ---
 

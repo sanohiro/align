@@ -203,7 +203,7 @@ DB driverより先に次を実装する。
 - package-defined opaque/dependent Move resource、exactly-once Drop、`resource_ref<R>`、
   owner-tied native view;
 - `arena name {}` とscope-bound `region`;
-- deterministic static source inputとQuery artifact;
+- deterministic static source inputとQuery/command artifact;
 - region-backed `array_builder<PlainStruct>`。
 
 同じ機構は `std.http`、`std.net`、`std.process` などでも使える。`pkg.db` は
@@ -376,8 +376,8 @@ StaticQueryArtifact       producer implementation
   driver restriction
   canonical static options
   named-parameter occurrence/source maps
-  driver別parameter retention class
-  checked metadata reference/digest
+  driver別binding plan/parameter retention class
+  driver別checked metadata policy/state/reference/digest
   generated binder/decoder bodies
 
 IStaticQuery              public interface contract
@@ -481,6 +481,12 @@ pub Params {
 pub fn command() -> db.command<Params> = db.command_file([])
 ```
 
+commandはQueryと同じwhole-body item制限、static source identity、source/wire hash、
+parameter occurrence/source map、driver別bind/retention plan、checked-policy map、
+interface/implementation split、cache invalidationを持つ。`StaticCommandArtifact` /
+`CommandStatic` が省くのはRow contract、result-column metadata、decode thunkだけである。
+Params binderはgeneratedで、reflection/runtime field-name lookupへfallbackしない。
+
 `execute` は `db.exec_result` を返す。`RETURNING` を含むstatementはQueryとして定義する。
 
 ### 6.2 result mode
@@ -491,13 +497,13 @@ one        正確に1行。0/2+はerror
 maybe_one  0または1行。2+はerror
 all        supplied regionへ全行materialize
 rows       one-pass stream
-next_batch bounded batch
 ```
 
 `one`/`maybe_one` はcardinality判定に最大2 delivered rowsをdecodeするが、§2.4の
 driver-specific transport/buffering costは別である。`all` はstructural
 `RegionPlain<R>` を要求し、region builderのchunk growthと1回のcompact passを使う。
 これはpublic traitではないcompile-time structural checkで、v1 static Rowはすべて満たす。
+bounded `next_batch` はD13の追加APIであり、D1〜D12の初期common operationには含めない。
 名前からmaterialize/streamが分からない
 convenience APIは作らない。
 
@@ -569,8 +575,12 @@ arena-owned arrayを通常functionへby-valueで渡さない。runのrows loop�
 
 ### 7.3 一対多: 複数parent
 
-SQLのORDER BY contractによりparent key単位でgroupを閉じ、完成したOutputをouter builderへ
-pushする。hash groupingを選ぶ場合はそのallocation/costを通常Alignコードに見せる。
+SQLのORDER BY contractによりparent key単位でgroupを閉じる。canonicalな多数parent表現は
+並行する `users: array<User>`、`groups: array<Group>`、`group_offsets: array<i64>` の3本を
+独立したregion builderで作るsegmented表現である。各parentを閉じるときuserと次の
+group offsetだけをpushし、childは1本のgroups builderへ連続してpushする。parentごとの
+`array<Group>` を持つOutputをouter builderへby-valueで渡さない。hash groupingを選ぶ場合は
+そのallocation/costを通常Alignコードに見せる。
 
 ### 7.4 複数child collection
 
@@ -698,22 +708,40 @@ conn := sqlite.connect("app.db", [
 ])?
 ```
 
-open flag、URI mode、busy timeout/handler policy、安全に表現できる任意の明示PRAGMA、
-shared/private cache、thread/open mode、extension loading policyをnative optionとして
-提供する。extension loadingは既定disabledで、将来提供する場合も明示的にする。
+native designはopen flag、URI mode、busy timeout/handler policy、安全に表現できる任意の
+明示PRAGMA、shared/private cache、thread/open mode、extension loading policyの明示extension
+pointを保持する。初期releaseのfinite subsetは§11.2で固定し、callback busy handlerと
+extension loadingはproved callback後でv1 constructorではない。extension loadingはdisabled。
 要求optionを黙って無視しない。
 
 ### 11.2 Query/prepare/execute option
 
 ```text
-sqlite.QueryOption
+sqlite.QueryOption.RequireVersionAtLeast(major, minor, patch)
+sqlite.CommandOption.RequireVersionAtLeast(major, minor, patch)
 sqlite.PrepareOption.Persistent
 sqlite.PrepareOption.Normalize
-sqlite.ExecuteOption
+sqlite.ExecuteOption.BusyTimeoutNs(ns)
+sqlite.TxOption.Deferred | Immediate | Exclusive
+sqlite.MetaOption.IncludeInternalObjects | IncludeHiddenColumns
+sqlite.ExplainOption.QueryPlan | Bytecode
 ```
 
-libsqlite3 capabilityと測定済みconsumerに応じてvariantを追加するが、D9で確定済みの
-scope別sum/slice表現を変えない。SQLite optionをPostgreSQLへ渡すことは型エラーである。
+初期releaseのconnection sumも次で固定する。
+
+```text
+OpenReadOnly | OpenReadWrite | Create | Uri
+PrivateCache | SharedCache | NoMutex | FullMutex
+BusyTimeoutNs(ns) | Pragma(name, value)
+```
+
+`[]` はcreate/URI/cache/mutex/busy/PRAGMA指定なしのread-write openと、transactionの
+Deferred、EXPLAINのQueryPlanを意味する。read-onlyとread-write/create、privateとshared、
+no-mutexとfull-mutex、重複busy timeout/PRAGMA名はconflict。durationは正でなければならない。
+`RequireVersionAtLeast` はstatic artifact/public contractへ入りSQLiteへpinする。
+Persistent/Normalizeはprepareだけ、execution BusyTimeoutはそのexecution中だけ適用して
+restoreする。capability不足はUnsupportedでありfallback/ignoreしない。extension loadingは
+v1で公開せずdisabledのまま。SQLite optionをPostgreSQLへ渡すことは型エラーである。
 
 ### 11.3 native feature
 
@@ -742,13 +770,29 @@ secretはruntime valueでありstatic Query metadataへ入れない。
 
 ```text
 postgres.QueryOption.ParameterType(name, native_type)
+postgres.CommandOption.ParameterType(name, native_type)
 postgres.PrepareOption.ParameterOid(name, oid)
 postgres.ExecuteOption.ParameterFormat(name, Text|Binary)
 postgres.ExecuteOption.ResultFormat(Text|Binary)
+postgres.TxOption.Isolation(ReadCommitted|RepeatableRead|Serializable)
+postgres.TxOption.Access(ReadOnly|ReadWrite)
+postgres.TxOption.Deferrable(bool)
+postgres.MetaOption.SearchPathOnly | IncludeSystemCatalogs
+postgres.ExplainOption.Analyze
+postgres.ExplainOption.Format(Text|Json)
+postgres.ExplainOption.Verbose/Costs/Buffers/Timing/Settings/Wal(bool)
 ```
 
 初期実装がtext中心でもbinaryを閉ざさない。unknown/conflicting OIDをignored hintにせず
-errorにする。
+errorにする。ParameterTypeはstatic artifact/public contractへ入りPostgreSQLへpinする。
+field別controlのunknown/duplicateもerror。binary mapping未実装ならSQL送信前にUnsupported。
+
+connection sumは `ApplicationName`、`ConnectTimeoutNs`、`SslMode`、
+`TargetSessionAttrs`、`Parameter(name,value)` で固定する。URLとoptionのsemantic key重複は
+conflict、secretはartifactへ入れない。transactionの `[]` はReadCommitted/ReadWrite/
+non-deferrableで、deferrableはserializable read-only以外ではBEGIN前にrejectする。
+SearchPathOnlyとIncludeSystemCatalogsはconflict。Buffers/Timing/Walはnative Analyzeが
+なければ実行前にconflictする。
 
 ### 12.3 native feature
 
@@ -803,6 +847,24 @@ runtime connection/prepare/execution optionはstatic Query identityを変えな�
 call中だけ消費する `str` view、static type/Query identityに限定する。driverがcall後も
 runtime stringを保持するならcopyする。untyped map/reflectionは使わない。
 
+common初期variantは次で固定する。
+
+```text
+db.QueryOption.Check(DeclaredOnly|CheckedOptional|CheckedRequired)
+db.CommandOption.Check(DeclaredOnly|CheckedOptional|CheckedRequired)
+db.PrepareOption.TimeoutNs(ns)
+db.ExecuteOption.TimeoutNs(ns)
+db.TxOption.BeginTimeoutNs(ns)
+db.MetaOption.TimeoutNs(ns) | IncludeSystem
+db.ExplainOption.TimeoutNs(ns)
+```
+
+`[]` はstatic descriptorのDeclaredOnly、runtime deadlineなし、system metadata除外を
+意味する。common db.explainはinspection-onlyで、PostgreSQL native AnalyzeだけがQueryを
+実行してexecution-countへ入る。SQLiteはv1 Analyze optionを持たず、PostgreSQL optionを
+reinterpretしない。durationは正。重複tag/check policyやcommon/native conflictはSQL送信前の
+error。これは例ではなく必須minimumで、unknown tagやsilent extensionは禁止する。
+
 static Query/command optionはさらに限定する。recognized constructorへ渡せるのは、literal、
 type identity、compiler-known constantをpayloadとする固定literal option listだけである。
 runtime local、environment read、FFI result、任意function callはcompile error。
@@ -820,13 +882,15 @@ command      db.command_file(slice<db.CommandOption>)
 prepare      db.prepare(exec, query, slice<db.PrepareOption>)
 execution    db.execute/one/maybe_one/all/rows(..., slice<db.ExecuteOption>)
 transaction  db.begin(conn, slice<db.TxOption>)
-metadata     db.meta_database/meta_schemas/...(..., slice<db.MetaOption>)
-EXPLAIN      db.explain(exec, query, params, slice<db.ExplainOption>)
+metadata     db.meta_database/meta_schemas/...(..., out: region, slice<db.MetaOption>)
+EXPLAIN      db.explain(exec, query, params, out: region, slice<db.ExplainOption>)
 ```
 
 default argument、optionless overload、fluent builder、string-key map、process-global optionは
 ない。Query-local run helperはoptionをcallerから受けるか `[]` を渡すかsourceに書く。
-D9はvariantを追加してよいが、この表現を変えてはならない。
+option ownershipはD1 static Query/command、D2 SQLite connection/execute、D4 PostgreSQL
+connection/execute、D6 prepare、D7 transaction、D9 common deadline/cancellationと全scope
+matrix、D12 metadata/EXPLAINである。D9までpreliminary APIを待たせず、別表現も作らない。
 
 ### 13.3 silent ignore禁止
 
@@ -966,13 +1030,20 @@ opaque integerだけへ縮退しない。low-level builtin `Error` への変換�
 
 ### 16.1 check level
 
+Query/commandは許可driverごとに
+`DriverVerification { driver, Declared|DatabaseChecked, metadata_fingerprint }` を持つ。
+SQLiteOnlyはSQLite、PostgreSQLOnlyはPostgreSQL、AnySupportedDriverは両方がstate setになる。
+
 ```text
-Declared         Align Params/Rowとruntime contractだけ
-CheckedOptional  matching metadataがあれば使い、missing/staleなら明示policyに従う
-CheckedRequired  matching checked metadataなしではbuild失敗
+Declared         Align Params/Row（commandはParams）とruntime contractだけ
+CheckedOptional  driverごとにmatching metadataを使い、missing/stale driverはDeclared
+CheckedRequired  許可driver全てにmatching metadataがなければbuild失敗
 ```
 
-stale metadataをCheckedOptionalで黙って使ってはならない。使うならdigest一致したものだけ。
+AnySupportedDriverをSQLiteだけprepareしてもCheckedRequiredは満たさない。PostgreSQLも
+prepareするかdescriptorをSQLiteへpinする。mixed stateを1つのchecked boolへ畳まない。
+inspectionは全driver map、runtimeは選択connectionのentryを報告する。stale metadataを
+CheckedOptionalで黙って使ってはならず、使うのはdigest一致したdriver entryだけ。
 
 ### 16.2 明示prepare command
 
@@ -1072,8 +1143,30 @@ alignc db check ...
 
 ### 17.4 transaction
 
-engine/statementがtransactional DDLをsupportする範囲を明示する。自動transactionが
-不可能なstatementを黙って部分適用しない。
+各fileは先頭physical lineに0個または1個のexact ASCII directiveを持つ。
+
+```sql
+-- align:migration transaction=required
+-- align:migration transaction=forbidden
+```
+
+省略時はrequired。directive byteはchecksumに入り、CLI/ambient overrideはない。
+BEGIN/COMMIT/ROLLBACK/SAVEPOINTなどnative transaction-control statementは禁止し、runnerが
+boundaryを所有する。driver-authoritativeなscript preparation/screeningで最初のmutation前に
+rejectする。
+requiredはmigration lock取得後、全statementとApplied history insertを1 transactionで
+行い、どのerrorでも全体rollbackする。transaction内で拒否されたstatementを外へ出して
+retryしない。
+
+forbiddenはtransaction外が必須なnative statement用で、v1はdatabase-authoritativeに
+正確に1 statementのfileだけ許可する。実行前にApplying history rowを入れ、成功後だけ
+Appliedへ更新する。errorはbest-effortでFailed、process lossはApplyingを残す。両方をdirty
+stateとして後続migrationをblockし、status/checkが報告し、自動retryしない。
+
+recoveryはexact checksumを要求する
+`alignc db repair --version N --accept-applied --expect-checksum HASH` または
+`--clear-dirty` だけである。前者はoperatorがnative stateを確認してAppliedにし、後者は
+safe retryを確認してdirty rowだけを削除する。DB effectをundoせず、Applied rowは対象外。
 
 ## 18. Metadataとintrospection
 
@@ -1097,22 +1190,50 @@ query plan
 request typeとoptionをcategoryごとに分け、1 category requestが無関係なcatalogをfetch
 しないことをquery-count testで固定する。
 
-conceptual common callは全て末尾に `slice<db.MetaOption>` を1つ持ち、`[]` がno optionを
-表す。
+common結果はflatな `RegionPlain` recordで、型とfield contractは次で固定する。
+
+```text
+MetaTableKind       Table | View | MaterializedView | Native
+MetaNullability     Yes | No | Unknown
+MetaKeyKind         Primary | Unique | Foreign | Check | Exclusion | Native
+MetaQueryState      Declared | DatabaseChecked
+MetaQueryEntry      Summary | Parameter | Column
+MetaStatementClass  Select | Dml | Ddl | Native | Unknown
+PlanFormat          Text | Json | Native
+DatabaseMeta  driver, name, engine_version, optional schema/encoding/collation/read_only/transactional_ddl
+SchemaMeta    name, optional owner, visible, system
+TableMeta     schema, name, kind, optional native_kind/owner/comment/estimated_rows
+ColumnMeta    schema/table/name, ordinal, optional logical/native type, nullable, optional default/generated/origin
+KeyMeta       schema/table/name/kind, term_ordinal, optional local/ref columns/expression
+IndexMeta     schema/table/name/optional unique, term_ordinal, optional column/expression/predicate/method/opclass
+QueryMeta     query_id/driver/restriction/statement class/artifact digest/state/metadata fingerprint/entry,
+              optional ordinal/name/alias/logical/native/origin, nullable
+QueryPlan     driver, format, analyzed, body
+```
+
+multi-term key/indexは同じnameを持つordered flat rowとして返しnested allocationを作らない。
+QueryMetaはSummary 1行の後にparameter/column行をordinal順で返す。detail/engineにないfieldは
+Option.Noneだがbase identityは常に存在する。
+
+common callは全て明示destination `out: region` をoption sliceの直前に持つ。
 
 ```align
-database := db.meta_database(exec, detail, [])?
-schemas := db.meta_schemas(exec, detail, [])?
-tables := db.meta_tables(exec, schema_filter, detail, [])?
-table := db.meta_table(exec, table_ref, detail, [])?
-columns := db.meta_columns(exec, table_ref, detail, [])?
-keys := db.meta_keys(exec, table_ref, detail, [])?
-indexes := db.meta_indexes(exec, table_ref, detail, [])?
-query_meta := db.meta_query(exec, query(), detail, [])?
+database: db.DatabaseMeta = db.meta_database(exec, detail, out, [])?
+schemas: array<db.SchemaMeta> = db.meta_schemas(exec, detail, out, [])?
+tables: array<db.TableMeta> = db.meta_tables(exec, schema_filter, detail, out, [])?
+table: db.TableMeta = db.meta_table(exec, table_ref, detail, out, [])?
+columns: array<db.ColumnMeta> = db.meta_columns(exec, table_ref, detail, out, [])?
+keys: array<db.KeyMeta> = db.meta_keys(exec, table_ref, detail, out, [])?
+indexes: array<db.IndexMeta> = db.meta_indexes(exec, table_ref, detail, out, [])?
+query_meta: array<db.QueryMeta> = db.meta_query(exec, query(), detail, out, [])?
+plan: db.QueryPlan = db.explain(exec, query(), params, out, options)?
 ```
 
 対応する `sqlite.meta_*_native` / `postgres.meta_*_native` はcommon sliceとdriver-native
-option sliceを別々に受ける。optionless overloadはない。
+option sliceを別々に受け、同じoutを先に受ける。optionless/hidden-heap overloadはない。
+全string/array/bodyをnative result解放前にoutへcopyし、connection/row bufferをborrowしない。
+arrayはL6 builderの1 compact passを使う。meta_tableの欠落はNotFoundでありpartial recordや
+Optionを返さない。
 
 ### 18.3 database
 
@@ -1148,8 +1269,9 @@ statement classificationを返す。runtime SQL reflection結果と混同しな�
 
 ### 18.10 query plan
 
-`db.explain(exec, query(), params, options)?` は明示操作。`EXPLAIN ANALYZE` はstatementを実行する
-別の明示APIであり、read-only plan取得のように見せない。
+`db.explain(exec, query(), params, out, options)?` は明示のinspection-only操作。
+`postgres.explain_native(..., [postgres.ExplainOption.Analyze, ...])` はstatementを実行し
+execution-countへ入る。read-only plan取得のように見せない。
 
 ### 18.11 PostgreSQL native metadata
 
@@ -1217,13 +1339,14 @@ driver-qualified pathとして追加する。
 - SQLite package path対direct libsqlite3;
 - SQLite streamed text/blob transient bindのcopy bytes/allocation;
 - PostgreSQL package path対direct libpq;
-- file/inline Query artifact generationとcold/warm rebuild;
+- file/inline Query/command artifact generationとcold/warm rebuild;
 - SQLite canonical migration catalog/replay（10/100/1000 files）;
 - prepare reuse対reprepare;
 - rows iteration/decode;
 - region builder push/freeze/copy count;
 - one-to-many one-pass shaping;
-- metadata categoryごとのquery count/latency;
+- metadata categoryごとのquery count/latency、destination region bytes/compact count、
+  native-buffer copy bytes;
 - batch/SoA/native path。
 
 ### 21.4 execution-count test
@@ -1265,7 +1388,7 @@ L1b Move sum/Option/Result payload completion
 L2  contextual borrow mode + Copy mutation + Fn mode/joined provenance + interface summary
 L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
 L4  named arena region + clone_in
-L5  deterministic tagged file/inline input + one-item Query identity/artifact
+L5  deterministic tagged file/inline input + one-item Query/command identity/artifact
 L6  RegionPlain region array_builder
 ```
 
@@ -1277,13 +1400,15 @@ production APIを作らず、SQLite pointer validity、libpq full/single-row res
 protocolの1 statement性、parameter/result metadata、nullability evidence、cancel/cleanupを
 実測して記録する。
 
-### D1 — fake driver上のgenerated Query
+### D1 — fake driver上のgenerated Query/command
 
-inline/sibling SQLからdescriptor/artifactを作り、exact source identityと
+inline/sibling SQLからQueryとcommandのdescriptor/artifactを作り、exact source identityと
 SQLite source/PostgreSQL `$n` wire entry・reverse span map、named occurrence table、
-binder/decoder thunk、driver別 `BindValue` / `BindCopy`、flat scalar Row、
-interface/implementation/cache invalidationをDBなしで
-証明する。reflectionとper-row name lookupがないことをbenchmark/IRで確認する。
+両kindのbinder/Queryだけのdecoder thunk、driver別 `BindValue` / `BindCopy`、flat scalar Row、
+Query/command別interface/implementation/cache invalidationをDBなしで証明する。commandは
+Row/decodeを持たず、それ以外のidentity/hash/checked/binding schemaを共有する。static
+common/native Query/Command option sumもここで実装する。reflectionとper-row name lookupが
+ないことをbenchmark/IRで確認する。
 
 ### D2 — 最小SQLite vertical
 
@@ -1294,11 +1419,12 @@ interface/implementation/cache invalidationをDBなしで
 - `execute` と `one`;
 - 0/1/2+ cardinality;
 - structured SQLite primary/extended error;
+- §11のexact SQLite connection/baseline execute option sumと全conflict/unsupported branch;
 - execution-count hook;
 - 全pathでclose/finalize exactly once。
 
-text view、all、stream、transaction、migration、dynamic row、metadata catalog、native optionは
-含めない。direct libsqlite3 loopと比較する。
+text view、all、stream、transaction、migration、dynamic row、metadata catalog、追加native
+breadthは含めない。direct libsqlite3 loopと比較する。
 
 ### D3 — checked metadata core + SQLite
 
@@ -1313,8 +1439,12 @@ D2と同じcommon Query module形状、libpq connection、dialect-aware named sc
 同名ordinal reuse、scalar bind/decode、SQLSTATE/owned detail、send前driver mismatch、
 初期 `BufferedFull` delivery（`one` decodeは最大2行でもtransportは全result）、
 両driverでportable `CAST(:value AS BIGINT)`、execution count/cleanup。明示設定された
-local/ephemeral PostgreSQLでintegration testし、未設定時は理由付きskip。direct libpq
-benchmarkはenvironment-gated。
+local/ephemeral PostgreSQLでintegration testする。§12のexact PostgreSQL
+connection/baseline execute option sumと全conflict/unsupported branchも含む。
+local開発では未設定時に理由付きskipできるが、D4 merge/DB releaseでは
+`ALIGN_DB_POSTGRES_REQUIRED=1` のrequired `db-postgres` CIがpinned ephemeral serverを
+provisionし、skip/接続不能をfailureにする。同じjobでportable Queryを両driverに実行する。
+direct libpq benchmarkは通常PRではenvironment-gatedだがD4初回/release evidenceでは必須。
 
 ### D5 — PostgreSQL checked metadata
 
@@ -1324,7 +1454,8 @@ runtime describe comparison。
 
 ### D6 — prepared statement lifecycle
 
-dependent `db.stmt<P,R>`、connection/driver check、prepare option、
+dependent `db.stmt<P,R>`、connection/driver check、§11〜§13のexact common/両driver prepare
+option sumとdisposition test、
 `rows_stmt` の `borrow mut` statement parameter、rows Drop後のsequential reuse、
 text/blob rebind時の旧transient copy解放、partial-bind failureの全binding/Params cleanup、
 全path finalize/close、
@@ -1334,7 +1465,8 @@ implicit global cacheなし。prepared/common/reprepare costを別々に測る�
 
 `db.begin` がconnをconsumeし、`exec_conn`/`exec_tx` が同じ `db.exec` を返す。
 commit/rollback consume、Drop rollback+close、success/error/panic相当exitのexact cleanup、
-public traitなし。
+public traitなし。§11〜§14のexact common/両driver transaction option sum、SQLite begin
+mode、PostgreSQL isolation/access/deferrableのBEGIN前conflict rejectionもここで実装する。
 
 ### D8 — typed row streaming
 
@@ -1346,8 +1478,9 @@ PostgreSQL初期pathは `BufferedFull` 上のone-pass decodeで、single-row/por
 
 ### D9 — scoped native option、timeout、cancellation
 
-7 scopeのcommon/native sum typeとslice、applied/unsupported/conflicting matrix、precedence、
-static artifact identity、timeout/cancel後connection state。要求optionのsilent ignoreを
+D1/D2/D4/D6/D7で既に公開したoption API上へcommon deadline/cancellation machineryを完成
+させ、全scopeのapplied/unsupported/conflicting/precedence matrix、timeout/cancel後connection
+stateをauditする。D9でpreliminary APIや別表現を作らない。要求optionのsilent ignoreを
 全driverでnegative testする。
 
 ### D10 — compound Output
@@ -1359,14 +1492,17 @@ Pure step（`borrow mut state`、0個以上の独立した `borrow mut` builder�
 
 ### D11 — SQL migration
 
-ordered SQL file、checksum/history、transaction capability、status/check、明示
-`alignc db migrate/status/check`。
+ordered SQL file、checksum/history、先頭lineのexact required/forbidden policy、
+required default atomicity、forbidden 1-statement制限、Applying/Failed dirty state、
+checksum-bound repair、明示 `alignc db migrate/status/check/repair`。
 
 ### D12 — category metadataとEXPLAIN
 
 database/schema/table/column/key/constraint/index/Query/planの分離、各common categoryの
-`MetaOption` slice、native formの追加native option slice、PostgreSQL native detail、
-SQLite native detail、1 categoryが無関係categoryをfetchしないtest。
+明示region、exact flat result shape、`MetaOption` slice、native formの追加native option
+slice、§11〜§13のexact metadata/EXPLAIN option sum、PostgreSQL native detail、
+SQLite native detail、1 categoryが無関係categoryをfetchしないtest。native result解放後も
+out arenaまでstringが有効、hidden heapなし、multi-term flat ordering、NotFoundも固定する。
 `EXPLAIN ANALYZE` は実行を明示する。
 
 ### D13 — batch、SoA、高価値native path
@@ -1457,6 +1593,23 @@ execution-count付きで実証する。
     required-but-unimplementedと明記する。
 54. 全category metadata primitiveは1つの `MetaOption` sliceを持ち、native formは別の
     native option sliceを1つ追加する。
+55. metadata/EXPLAIN結果は§18のexact flat `RegionPlain` shapeと明示regionを使い、
+    native bufferをborrowせずhidden heapも使わない。
+56. checked stateは許可driverごとで、AnySupportedDriverのCheckedRequiredはSQLite/
+    PostgreSQL両artifactを要求する。
+57. StaticCommandArtifact/CommandStaticはQueryのsource/wire/binder/retention/checked/cache
+    ruleを共有し、Row/result/decodeだけを省く。
+58. §§11〜13のcommon/SQLite/PostgreSQL option sum/default/conflictは実装例でなく必須finite set。
+59. D1/D2/D4/D6/D7が必要option APIを所有し、D9はinterim surfaceなしにdeadline/cancellationと
+    cross-scope dispositionを完成する。
+60. migration transaction policyは先頭lineのrequired/forbiddenだけで、requiredは既定atomic、
+    forbiddenは1 statementとdirty state/checksum-bound repairを使う。
+61. LEFT JOIN childなしは全child fieldがNULLのときだけで、どちら向きのpartial NULLもerror。
+62. next_batchはD1〜D12 common surfaceになくD13だけで追加する。
+63. many-parent canonical shapingはparent/child/offsetの並行arrayを作り、array-bearingな
+    per-parent Outputをregion builderへpushしない。
+64. PostgreSQL skipはoptional local runだけで、D4 merge/releaseはprovisioned non-skippable
+    db-postgres CIを必須とする。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

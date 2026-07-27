@@ -642,6 +642,140 @@ idea is rejected.
   take that common slice plus a separate native option slice. Show `[]` in every conceptual call.
 - **v1 impact:** D12 API blocker and therefore first-public-release blocker.
 
+### F43 — metadata results had no destination ownership
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** `pkg-design/db.md` §18 category calls and result descriptions.
+- **Current Align constraint:** strings/slices are views, dynamic arrays are Move, and allocation
+  destination cannot be chosen implicitly; L4/L6 exist specifically to make result ownership
+  explicit.
+- **Actual failure:** a driver could return dangling catalog-buffer views or silently heap-allocate
+  strings/nested collections. Separate implementations would invent incompatible result shapes.
+- **Recommendation:** fix flat `RegionPlain` metadata/plan records, add `out: region` to every
+  category and EXPLAIN operation, copy strings before native cleanup, represent multi-term
+  keys/indexes as repeated flat rows, and make `meta_table` use `NotFound`.
+- **v1 impact:** ownership/API blocker for D12 and therefore the first public release.
+
+### F44 — checked policy was not defined per permitted driver
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** `pkg-design/db.md` §16.1/§16.4 `AnySupportedDriver` plus
+  `CheckedRequired`.
+- **Current Align constraint:** a descriptor has an exact closed driver restriction and normal build
+  must decide from deterministic per-driver artifacts without contacting either database.
+- **Actual failure:** with only SQLite metadata, one implementation could accept a portable
+  CheckedRequired Query while another rejects it; the former could execute unverified PostgreSQL.
+- **Recommendation:** store `DriverVerification` independently for every permitted driver.
+  CheckedRequired requires all entries; CheckedOptional may be mixed and inspection must report the
+  map. Pinning is the explicit way to reduce the set.
+- **v1 impact:** D3/D5 artifact-policy blocker and first-release blocker.
+
+### F45 — command artifacts were not executable at the D2 boundary
+
+- **Classification:** prerequisite feature gap; implementation complexity.
+- **Problematic design location:** L5/D1 Query-only detail versus D2's required
+  `db.command<Params>` insert.
+- **Current Align constraint:** command static input, binder thunk, interface, object symbol, and
+  cache identity need the same producer-owned machinery as Query; reflection fallback is forbidden.
+- **Actual failure:** D2 would have to invent command IDs, bind retention, checked metadata, hashes,
+  and invalidation behavior.
+- **Recommendation:** specify `StaticCommandArtifact`, `IStaticCommand`, and `CommandStatic` as the
+  shared statement envelope minus Row/result/decode; make D1 generate and test it before D2.
+- **v1 impact:** L5/D1/D2 implementation blocker.
+
+### F46 — required native option variants were left to implementers
+
+- **Classification:** specification ambiguity; unnecessary broad scope.
+- **Problematic design location:** `pkg-design/db.md` §§11–13 described option scopes but called the
+  variants examples or future consumer choices.
+- **Current Align constraint:** public sum types are closed finite APIs; unknown option tags,
+  reflection bags, and silent ignore are unavailable and contrary to One Way.
+- **Actual failure:** another model cannot implement the public API or the required
+  applied/unsupported/conflicting matrix without inventing variants and defaults.
+- **Recommendation:** settle the minimum common/SQLite/PostgreSQL constructors, defaults,
+  applicability, duplicate/conflict rules, positive-duration rule, and unsupported behavior.
+- **v1 impact:** API blocker across D1–D12.
+
+### F47 — option ownership was scheduled after its consumers
+
+- **Classification:** implementation complexity; specification ambiguity.
+- **Problematic design location:** D6 prepare and D7 transactions required options while D9 claimed
+  ownership of all option scopes.
+- **Current Align constraint:** one PR cannot call an undeclared future public sum, and pre-release
+  code must not introduce a disposable compatibility surface.
+- **Actual failure:** D6/D7 are impossible in order or must create preliminary APIs that D9 later
+  replaces.
+- **Recommendation:** assign static options to D1, SQLite/PostgreSQL connection/execution variants to
+  D2/D4, prepare to D6, transaction to D7, and metadata/EXPLAIN to D12. D9 completes common
+  deadlines/cancellation and the cross-scope disposition audit.
+- **v1 impact:** roadmap blocker, not a reason to postpone the final option design.
+
+### F48 — migration transaction and partial-failure behavior was unspecified
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** `pkg-design/db.md` §17.4 and D11.
+- **Current Align constraint:** migrations are visible SQL and failures are explicit Results; a tool
+  may not silently retry outside a transaction or guess that partially applied native state is safe.
+- **Actual failure:** transaction-forbidden statements could be partially applied, unrecorded, or
+  automatically retried under incompatible policies.
+- **Recommendation:** use an exact first-line SQL comment directive, required-by-default atomic
+  execution/history, a one-statement forbidden mode with Applying/Failed dirty rows, blocked
+  continuation, and checksum-bound explicit repair.
+- **v1 impact:** D11 and first-release safety blocker.
+
+### F49 — the one-parent shaper accepted one partial-NULL direction
+
+- **Classification:** specification ambiguity; ownership or soundness risk.
+- **Problematic design location:** `pkg-design/db.md` §7.2 returned success immediately when
+  `group_id` was NULL without checking `group_name`.
+- **Current Align constraint:** the Row contract uses independent `Option` fields and no implicit
+  aggregate-null invariant exists.
+- **Actual failure:** `(group_id = NULL, group_name = non-NULL)` was silently discarded while the
+  reverse shape correctly failed, contradicting the all-NULL absence rule.
+- **Recommendation:** when ID is absent, require name to be absent before returning no child; reject
+  either partial shape with the same contract error.
+- **v1 impact:** D10 correctness blocker; no new language feature.
+
+### F50 — the Japanese mirror exposed future `next_batch`
+
+- **Classification:** specification ambiguity.
+- **Problematic design location:** Japanese `pkg-design/db.md` §6.2 listed `next_batch` as a current
+  result mode while English and the roadmap assign it to D13.
+- **Current Align constraint:** English is authoritative, but the mirror must not publish a second
+  executable API.
+- **Actual failure:** an implementation consumer could depend on a batch surface absent from the
+  D1–D12 release.
+- **Recommendation:** remove it from the initial operation list and explicitly label D13 as its only
+  owner.
+- **v1 impact:** documentation/release-contract blocker.
+
+### F51 — the Japanese many-parent shaper contradicted the segmented design
+
+- **Classification:** current Align conflict; performance risk.
+- **Problematic design location:** Japanese `pkg-design/db.md` §7.3 instructed pushing a completed
+  per-parent Output into an outer builder.
+- **Current Align constraint:** a region builder accepts `RegionPlain`; dynamic `array` fields are not
+  RegionPlain and an arena array cannot cross an ordinary by-value call.
+- **Actual failure:** the mirror either fails type checking or creates one child allocation per
+  parent, defeating the required segmented representation.
+- **Recommendation:** build parallel parent, child, and offset arrays with independent region
+  builders; do not push array-bearing parent Outputs.
+- **v1 impact:** D10 soundness/performance/documentation blocker.
+
+### F52 — PostgreSQL could remain untested at the release gate
+
+- **Classification:** specification ambiguity; performance risk.
+- **Problematic design location:** D4 allowed PostgreSQL integration to skip whenever configuration
+  was unavailable.
+- **Current Align constraint:** the first release promises both drivers and requires measured native
+  behavior; an optional local environment cannot establish that gate.
+- **Actual failure:** all ordinary commands could report success while libpq bind/decode/error/
+  cleanup paths never ran.
+- **Recommendation:** retain reported local skips, but require a provisioned `db-postgres` CI job
+  with a required-mode environment flag for D4 merge and every database release; skip becomes
+  failure there.
+- **v1 impact:** D4 merge and first-release verification blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -661,7 +795,9 @@ idea is rejected.
    binder/decoder thunks.
 6. **Static `db.query<Params,Row>`:** a Copy immutable descriptor data record plus direct generated
    binder/decoder functions. Its function body is exactly one constructor, giving the item one
-   unique artifact identity. It is not an object with reflection or a runtime SQL parser.
+   unique artifact identity. The rowless `db.command<Params>` uses the same statement artifact,
+   static ABI, binder, and cache rules minus Row/result/decode. Neither is an object with reflection
+   or a runtime SQL parser.
 7. **Sibling `.align`/`.sql`:** a path-free registered constructor maps the defining module's exact
    extension to `.sql`; exact source bytes, logical path, kind, and digest are deterministic inputs,
    separate from deterministic driver wire bytes. Inline SQL instead uses `Inline(query_id)` and a
@@ -689,18 +825,24 @@ idea is rejected.
     step.
 15. **Offline checked metadata:** explicit prepare/check tooling invokes real database engines;
     ordinary build consumes canonical artifacts and never connects. Explicit SQLite migration
-    replay uses one canonical validated version order and ordered fingerprint.
+    replay uses one canonical validated version order and ordered fingerprint. Checked state is
+    driver-indexed, so an unpinned CheckedRequired descriptor requires current artifacts for both
+    SQLite and PostgreSQL.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
-    slices and no silent ignore. Category metadata calls each carry the mandatory `MetaOption`
-    slice.
+    slices and no silent ignore. The minimum constructors/defaults/conflicts are fixed in §§11–13;
+    their owning milestones precede every consumer. Category metadata calls carry an explicit
+    destination region and the mandatory `MetaOption` slice.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b; prove fake
-    Query artifacts before native code; put SQLite and PostgreSQL scalar verticals before
-    streaming/transactions/compound output; complete migrations and category metadata/EXPLAIN in
-    D11/D12 before the first public release; schedule D13/D14 as additive native/dynamic work.
+    Query/command artifacts before native code; assign each option sum to D1/D2/D4/D6/D7/D12 before
+    its consumer and use D9 for shared deadline/cancellation completion; put SQLite and PostgreSQL
+    scalar verticals before streaming/transactions/compound output; complete exact migration and
+    region-owned category metadata/EXPLAIN contracts in D11/D12 before the first public release;
+    schedule D13/D14 as additive native/dynamic work.
 18. **Minimum SQLite vertical:** in-memory connection, one scalar command, one sibling-file scalar
     Query, `execute`/`one`, cardinality/error/cleanup/execution-count tests, no text views.
 19. **Minimum PostgreSQL vertical:** same common Query module, named-to-positional rewrite, scalar
-    bind/decode, SQLSTATE error, driver restriction, explicit configured ephemeral/local server.
+    bind/decode, SQLSTATE error, driver restriction, explicit configured ephemeral/local server,
+    and a non-skippable provisioned CI gate for merge/release.
 20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
     D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
 
@@ -753,6 +895,17 @@ documents:
 36. Separate shipped verified signatures from required-but-unimplemented L4/L6 signatures.
 37. Add `slice<db.MetaOption>` to every category metadata primitive and a separate native slice to
     driver-native forms.
+38. Give metadata/EXPLAIN exact flat `RegionPlain` result shapes and an explicit destination region.
+39. Track checked metadata per permitted driver and require every entry under CheckedRequired.
+40. Complete the command artifact/static ABI/binder/cache contract in L5/D1 before D2.
+41. Fix the mandatory first-release common/SQLite/PostgreSQL option variants, defaults, and conflicts.
+42. Assign option API ownership to D1/D2/D4/D6/D7/D12 before D9's shared completion audit.
+43. Define required-by-default and forbidden migration transaction algorithms, dirty state, and
+    checksum-bound repair.
+44. Reject either partial-NULL child shape in the canonical one-to-many shaper.
+45. Keep `next_batch` solely in D13 in both language documents.
+46. Keep the Japanese many-parent design on the same parallel parent/child/offset representation.
+47. Make provisioned PostgreSQL integration non-skippable for D4 merge and database releases.
 
 ## 5. Revised implementation roadmap
 
@@ -763,21 +916,21 @@ documents:
 | L2 | contextual borrow modes, Copy mutation, Fn modes/provenance | recursive alias matrix, joined-target direct/indirect, per-unit parity | borrowed-call and interface-size cost |
 | L3 | resource/ref, linkable Drop thunk, dependent child/native view | exact MIR, cross-unit Drop, invalid pointer/escape | resource/ref/view overhead and IR |
 | L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
-| L5 | tagged file/inline inputs, Query artifacts, descriptor skeleton | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
+| L5 | tagged file/inline inputs, Query/command artifacts, descriptor skeletons | cache/path/inline-span/reproducibility matrix | cold/warm producer/consumer rebuild |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
-| D1 | fake-driver Query binder/decoder and scanner | artifact/cache/placeholder/retention matrix | thunk overhead and warm cache |
-| D2 | scalar SQLite Query vertical | cardinality, cleanup, execution count | package versus libsqlite3 |
+| D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
+| D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
-| D4 | scalar PostgreSQL Query vertical (`BufferedFull`) | rewrite, SQLSTATE, mismatch, cleanup, delivery counts | package versus libpq |
+| D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
-| D6 | dependent prepared statements | sequential reuse, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
-| D7 | tx plus common exec view | consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
+| D6 | dependent prepared statements + prepare option sums | sequential reuse, disposition, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
+| D7 | tx options plus common exec view | combination rejection, consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
 | D8 | typed rows and row generations | old-view rejection, Params-source invalidation, clone retention, delivery counts | row decode/iteration/bind copies |
-| D9 | all option scopes, timeout, cancellation | applied/unsupported/conflict matrix | option/cancellation overhead |
+| D9 | shared deadline/cancellation + all-scope audit | applied/unsupported/conflict/precedence matrix | option/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
-| D11 | SQL migrations; initial-release gate | checksum/order/transaction/status | migration startup/large history |
-| D12 | category metadata and EXPLAIN; initial-release gate | option/native-slice and category isolation; ANALYZE executes visibly | catalog query count/latency |
+| D11 | exact-policy SQL migrations; initial-release gate | checksum/order/atomic/dirty/repair/status | migration startup/large history |
+| D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation; ANALYZE executes visibly | catalog query count/latency |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
 | D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
 
@@ -850,7 +1003,7 @@ The delivery is not performance-complete without:
 - L5 cold/warm rebuild matrix for unchanged, source-SQL-only, wire-rewrite, private, and public
   contract changes, plus file/inline and descriptor-count scaling;
 - L6 exact heap bytes, region bytes, push throughput, and one compacting pass;
-- D1 generated binder/decoder versus hand-written field/ordinal code;
+- D1 generated Query/command binder and Query decoder versus hand-written field/ordinal code;
 - D2 direct libsqlite3 comparison;
 - D3 prepare/check artifact time/size and canonical migration catalog/replay scaling at 10/100/1000
   files;
@@ -860,9 +1013,37 @@ The delivery is not performance-complete without:
   retained-row-copy costs;
 - D10 one-pass one-to-many shaping, allocation/copy count, and exact one SQL execution;
 - D11 migration startup/status cost and ordered history scaling at 10/100/1000 applied files;
-- D12 category metadata query count and EXPLAIN latency;
+- D12 category metadata query count, region bytes/compact count, native-buffer copy bytes, and
+  EXPLAIN latency;
 - D13 batch/SoA/native throughput on each driver;
 - D14 dynamic dispatch/mismatch overhead versus direct driver-qualified execution.
 
 Benchmark results are evidence and regression anchors. They may not justify removing ownership,
 runtime contract validation, explicit options, or one-statement semantics.
+
+## 8. Review execution record
+
+The first final adversarial pass reviewed the complete 24-file, roughly 7,200-added-line design diff
+as one unit. It was still making useful progress after reading ownership, resource, byte-view,
+module, binding-retention, and option paths, but reached the repository's 15-minute bound after
+20,787 log lines without returning a verdict. It was recorded as a tool failure, never as CLEAN.
+The replacement three-document DB-contract pass completed in about ten minutes and returned ten
+actionable findings, F43–F52.
+
+The complete pass was too broad for an efficient bounded verdict. Future design reviews of this size
+use this order:
+
+1. Build one invariant matrix before prose review: public signature, owner/region, static/runtime
+   identity, driver restriction, failure state, owning milestone, acceptance test, and benchmark.
+2. Review language foundations (`ownership/region/Move/FFI/artifact`) as one bounded group.
+3. Review the authoritative English package contract
+   (`Query/command/options/metadata/migrations/drivers`) as a second bounded group.
+4. Review roadmap, acceptance, cache/separate-compilation integration, and mirrors as a third group.
+5. Make the authoritative English contract clean before synchronizing the Japanese mirror once.
+6. Run one final whole-diff consistency scan only after all grouped findings are fixed.
+
+During every bounded run, inspect process state and log growth at least once per minute. At the
+15-minute boundary, a missing verdict is a tool failure: record elapsed time and the last completed
+area, terminate it, and rerun only the unreviewed or contradictory scope. Timeout never implies
+cleanliness. This partitioning reduces repeated mirror/cross-document edits without weakening the
+required final whole-diff review.

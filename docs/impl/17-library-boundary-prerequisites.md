@@ -571,12 +571,34 @@ StaticQueryArtifact
   per-allowed-driver wire SQL exact bytes/hash
   source-to-wire rewrite map and rewrite-format version
   parameter occurrence table
+  per-driver binding plan and retention classes
   source-span map
-  checked-metadata policy and digest
+  per-driver checked-metadata policy/state/digest
 ```
 
-`StaticCommandArtifact` is the same versioned envelope with `statement_kind = Command`, a Params
-type, and no Row/decode thunk. It is not a second discovery/cache mechanism.
+`StaticCommandArtifact` uses the same versioned envelope and discovery/cache mechanism, with these
+exact differences:
+
+```text
+StaticCommandArtifact
+  format_version
+  statement_kind = Command
+  unit, item, command_id
+  Params canonical type
+  driver restriction
+  static semantic options
+  SQL source identity and exact bytes/hash
+  per-allowed-driver wire SQL exact bytes/hash
+  source-to-wire rewrite map and rewrite-format version
+  parameter occurrence table and source-span map
+  per-driver binding plan and retention classes
+  per-driver checked-metadata policy/state/digest
+```
+
+It has the same generated Params binder and source/wire/cache invalidation rules as a Query. It has
+no Row contract, result-column metadata, or decode thunk. `command_id` uses the same fully-qualified
+descriptor-item identity rule as `query_id`. A command SQL-only edit changes the producer
+implementation/artifact and relink input without changing an unchanged `IStaticCommand`.
 
 The public interface carries only facts needed to type-check a consumer:
 
@@ -610,18 +632,33 @@ QueryStatic
   driver mask
   per-driver wire-SQL pointer/length/hash
   static-option pointer
+  per-driver binding-plan pointer/retention classes
   generated bind thunk
   generated decode thunk
-  checked-metadata fingerprint
+  per-driver checked-metadata state/fingerprint
 ```
 
-`P` and `R` are compile-time phantom contracts. The generated binder reads known field offsets from
-`P`; the decoder writes known offsets in `R`. There is no per-row field-name lookup, reflection,
-boxing, or map allocation.
+The command sibling is:
 
-The producer's descriptor function returns the static pointer. When the item is `pub`, its interface
-exports that descriptor contract. Generated thunks stay in the producer object and are referenced
-by the static descriptor, so a consumer does not need the Query body to call it.
+```text
+CommandStatic
+  command ID/hash
+  driver mask
+  per-driver wire-SQL pointer/length/hash
+  static-option pointer
+  per-driver binding-plan pointer/retention classes
+  generated bind thunk
+  per-driver checked-metadata state/fingerprint
+```
+
+For Query, `P` and `R` are compile-time phantom contracts; for command, only `P` exists. The generated
+binder reads known field offsets from `P`; the Query decoder writes known offsets in `R`. There is no
+per-row field-name lookup, reflection, boxing, or map allocation.
+
+The producer's descriptor function returns the corresponding static pointer. When the item is
+`pub`, its interface exports that descriptor contract. Generated thunks stay in the producer object
+and are referenced by the static descriptor, so a consumer does not need the Query/command body to
+call it.
 
 The runtime selects the already-generated wire entry after checking the connection's driver mask
 and sends those bytes exactly. A PostgreSQL rewrite never becomes the source/build identity. The
@@ -937,7 +974,7 @@ Acceptance:
 - anonymous and named arena cleanup are byte-identical except for the bound handle;
 - no thread-local ambient allocator is introduced.
 
-### L5 — deterministic static inputs and Query artifacts
+### L5 — deterministic static inputs and Query/command artifacts
 
 Scope:
 
@@ -945,17 +982,19 @@ Scope:
 - whole-body descriptor placement and unique item identity;
 - safe path resolution and SourceMap registration;
 - frontend/impl cache keys;
-- versioned query artifact and interface summary;
-- generated descriptor data skeleton.
+- versioned Query/command artifacts and interface summaries;
+- generated `QueryStatic`/`CommandStatic` data skeletons, including per-driver bind plans and checked
+  state.
 
 Acceptance:
 
 - changing only `.sql` misses the producer object cache;
 - a descriptor accepts exactly one whole-body static constructor; nested, conditional, multiple,
   generic, argument-taking, and helper-wrapped forms fail before artifact creation;
-- two descriptor functions in one module receive distinct Query IDs and artifact/thunk slots;
-- unchanged consumers still hit when the public Query contract is unchanged;
-- public Params/Row/restriction changes invalidate consumers;
+- two descriptor functions in one module receive distinct Query/command IDs and artifact/thunk slots;
+- unchanged consumers still hit when the public Query/command contract is unchanged;
+- public Params/Row/restriction changes invalidate Query consumers, and public
+  Params/restriction changes invalidate command consumers;
 - absolute/escaping/symlink paths fail;
 - a shadowing local or same-spelled user function does not read/register a file;
 - a stale `StaticInputManifest` is rejected after source/import/schema identity changes;
@@ -963,6 +1002,10 @@ Acceptance:
   changes deterministically with placeholder ordinals;
 - inline SQL uses `Inline { query_id }`, decoded literal bytes, and a decoded-byte-to-`.align` span
   map; no fake filesystem path enters identity or diagnostics;
+- Query and command both retain source/wire/occurrence/bind/checked/cache identity; command omits
+  only Row/result/decode, and command bind never uses reflection;
+- CheckedRequired validates every permitted driver, while CheckedOptional preserves an explicit
+  mixed per-driver state;
 - artifact bytes are reproducible across checkout roots and process runs.
 
 ### L6 — region plain-struct builder

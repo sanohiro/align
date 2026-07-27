@@ -286,6 +286,29 @@ There is no allocator trait, lifetime parameter, cross-arena sharing, or automat
 explicit `clone_in(out)` marks the unavoidable transition from a short-lived input view to
 owned output.
 
+**Static SQL is one statement-artifact mechanism, not a Query-only exception.** A row-returning
+Query and a rowless command differ only in Row/result/decode data. Both use the same item identity,
+source/wire SQL split, generated Params binder, retention plan, per-driver checked state, producer
+implementation hash, and exported typed contract. This keeps the minimal SQLite insert vertical
+from inventing a second compiler path. A portable CheckedRequired descriptor means checked on every
+permitted driver; mixed SQLite/PostgreSQL evidence remains visible instead of collapsing to a
+misleading boolean.
+
+**Database configuration is closed, scoped data.** Connection, static statement, prepare, execute,
+transaction, metadata, and EXPLAIN options have distinct finite sums and separate common/native
+slices. Their first-release variants, defaults, and conflicts are part of the API contract, not
+driver-selected examples. A requested variant is applied or rejected before SQL send; it is never
+stored in a reflection bag or ignored for portability. Each milestone lands the option type its
+operation consumes, while the later cancellation milestone completes shared machinery rather than
+replacing a provisional API.
+
+**Catalog output owns its destination, and exceptional migrations fail dirty.** Metadata and plans
+copy flat records and strings into a caller-named region before native buffers die; multi-term
+keys/indexes are repeated rows rather than nested hidden allocations. Migration SQL is atomic by
+default. A visibly transaction-forbidden one-statement file records Applying before native
+execution and blocks on ambiguous failure until checksum-bound operator repair. These choices expose
+the two costs that cannot be wished away: result retention and non-transactional side effects.
+
 **An aggregate constant is a `slice<T>`, not an `array<T>` — ownership is a property of the type.**
 A top-level array constant (`PRIMES := [2, 3, 5]`) could have been an owned `array<T>`, but that would
 contradict the model: ownership is decided by the *type*, and a compile-time table owns nothing. It is

@@ -16,7 +16,7 @@ borrow / borrow mut parameter modes with interface summaries
 package-defined opaque and dependent resources
 owner-tied native views
 named arena region capabilities
-deterministic static source inputs and Query artifacts
+deterministic static source inputs and Query/command artifacts
 region-backed plain-struct builders
 ```
 
@@ -28,6 +28,14 @@ single whole body of one uniquely named descriptor item. Arena-owned builder out
 inline rather than passed through a forbidden by-value call. A follow-up soundness pass required
 function values to retain and join return provenance, gave inline SQL a tagged item-based source
 identity, and fixed migration replay to one canonical filename/version order.
+
+The final database-contract review then closed the remaining implementation choices. Query and
+command now share one statement-artifact/binder/cache mechanism; checked state is recorded per
+permitted driver; the first-release option sums and milestone ownership are finite and explicit;
+metadata/EXPLAIN copy exact flat records into a named region; migration SQL is atomic by default with
+a one-statement dirty-state path for transaction-forbidden statements; and PostgreSQL is a
+non-skippable merge/release CI gate. The compound examples also reject both partial-NULL child
+shapes and keep many-parent output segmented.
 
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:
