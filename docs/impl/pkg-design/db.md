@@ -591,6 +591,8 @@ preserves every other source byte; it has its own hash and rewrite-format versio
 stores both plus a source-to-wire span map. Prepare/runtime metadata is keyed by driver, source
 hash, wire hash, rewrite version, and static options. Runtime sends the selected wire bytes exactly,
 while diagnostics map engine positions back to source spans where possible.
+For a NUL-terminated native entry point, generated storage appends one sentinel byte outside the
+recorded pointer/length/hash domain; it is transport storage, not part of source or wire SQL.
 
 The scanner is dialect-aware lexical analysis, not a regular expression and not a SQL resolver. It
 recognizes quoted strings/identifiers, line/block comments, PostgreSQL dollar-quoted strings, and
@@ -607,6 +609,11 @@ The compiler/preparer reports:
 - a parameter requiring an explicit native type declaration.
 
 Values are always bound parameters. Value interpolation into SQL text is not a typed-Query feature.
+
+SQL source bytes may not contain U+0000. Static Query/command screening reports the exact source
+span before artifact generation; dynamic SQL and migration tooling reject it before the first
+native call. SQLite and libpq expose different C string/length boundaries, so accepting an embedded
+NUL would make statement count, source identity, and sent SQL disagree across drivers.
 
 #### 5.6.1 Binding retention
 
@@ -630,6 +637,9 @@ Version 1 SQLite binding is exact:
 The baseline PostgreSQL `BufferedFull` path completes parameter transmission through the synchronous
 libpq call before returning its owned result. Any later single-row, portal, pipeline, or asynchronous
 path must retain its own parameter bytes until the native protocol no longer uses them.
+The v1 PostgreSQL Text binder materializes a NUL-terminated execution-owned copy and rejects an
+embedded U+0000 with `db.Error.Encode` before SQL send. Binary `bytea` uses its explicit length and
+does not apply the text restriction.
 
 These are per-execution bind copies, never per-row copies. Tests and benchmarks report text/blob
 bytes copied and allocations separately from row decode. The generated driver binder plan records
@@ -1377,7 +1387,7 @@ SQLite `STRICT` tables and declared column affinities should strengthen checking
 
 ### 10.3 PostgreSQL mapping
 
-Initial PostgreSQL mapping should include:
+The exact common first-release PostgreSQL mapping is:
 
 ```text
 int2/int4/int8          i16/i32/i64
@@ -1385,14 +1395,13 @@ float4/float8           f32/f64
 bool                    bool
 text/varchar/name       Params: str/string; Row: str
 bytea                   Params: slice<u8>/array<u8>; Row: slice<u8>
-date/time/timestamp     db logical temporal types
-numeric                 db.decimal or explicit text/native representation
-uuid                    stable db/native UUID type
-json/jsonb              Row str/bytes view or explicit typed JSON decode
-arrays                  native PostgreSQL array support when declared
+NULL                    Option<T>
 ```
 
-Parameter/result OIDs are retained in checked metadata. Unknown/user-defined types require a visible
+`date`/`time`/`timestamp`, `numeric`, UUID, JSON/JSONB, arrays, ranges, domains, and user-defined
+types are not silently coerced into this set. Their exact logical/native representations are owned
+by D12–D14 consumer decisions and become explicit driver-qualified mappings before use.
+Parameter/result OIDs are retained in checked metadata. An unavailable type requires such a visible
 native mapping or an explicit dynamic value.
 
 ### 10.4 NULL
@@ -1459,8 +1468,13 @@ sqlite.ExplainOption.Bytecode
 `RequireVersionAtLeast` is static, pins the descriptor to SQLite, and participates in its public
 semantic contract and artifact. `Persistent`/`Normalize` apply only to preparation.
 `BusyTimeoutNs` temporarily replaces the connection busy timeout for that execution and restores it
-before return/rows exposure; it conflicts with another busy-timeout value. Exactly zero or one
-transaction mode is accepted, with `Deferred` as the `[]` default. `IncludeInternalObjects` and
+when that execution actually ends; it conflicts with another busy-timeout value. For
+`execute`/`one`/`maybe_one`/`all`, restoration precedes return. For `rows`/`rows_stmt`, the rows
+resource retains the override and the connection's package-tracked prior value, then restores it on
+exhaustion, terminal step error, or Drop before releasing the connection/statement dependency.
+Restoration failure poisons/closes the connection rather than returning it with unknown policy.
+Exactly zero or one transaction mode is accepted, with `Deferred` as the `[]` default.
+`IncludeInternalObjects` and
 `IncludeHiddenColumns` apply only to metadata categories for which SQLite exposes those objects.
 Exactly one EXPLAIN mode is accepted; `[]` means `QueryPlan`.
 
@@ -1480,6 +1494,10 @@ sqlite.ConnectOption.Pragma(name, value)
 ```
 
 `[]` means `OpenReadWrite` without create, URI, cache, mutex override, busy override, or PRAGMA.
+The database path must contain no U+0000. A `Pragma` name must match ASCII
+`[A-Za-z_][A-Za-z0-9_]*`; its UTF-8 value must contain no U+0000 and is passed with deterministic
+SQLite string-literal quoting, never pasted as raw SQL. Invalid names/values fail before open/setup,
+and an unsupported PRAGMA returns an error rather than being ignored.
 Read-only conflicts with read-write/create; private conflicts with shared; no-mutex conflicts with
 full-mutex; a duplicate PRAGMA name or busy timeout conflicts. Durations must be positive. A
 compile-time or linked-library capability miss returns `Unsupported`; no variant degrades to a
@@ -1580,7 +1598,9 @@ postgres.ConnectOption.Parameter(name, value)
 
 The URL supplies host, port, database, user, and password. `[]` adds no libpq keyword override.
 Duplicate semantic keys, including a URL/option conflict, are errors; secrets are runtime values and
-never enter Query artifacts. Durations must be positive.
+never enter Query artifacts. Durations must be positive. The URL, application name, and arbitrary
+parameter name/value must be valid UTF-8 without U+0000; the wrapper rejects an embedded NUL as
+`db.Error.Encode` before calling libpq, never truncates it.
 
 `[]` transaction options mean `ReadCommitted`, `ReadWrite`, and non-deferrable. Each transaction
 dimension may occur at most once. PostgreSQL-invalid combinations such as deferrable without
@@ -1727,13 +1747,13 @@ D2  SQLite connection and baseline execution variants
 D4  PostgreSQL connection and baseline execution variants
 D6  prepare variants
 D7  transaction variants
-D9  common deadline/cancellation machinery and the cross-scope disposition matrix
+D9  common deadline enforcement/native cancellation cleanup and the cross-scope disposition matrix
 D12 metadata and EXPLAIN variants
 ```
 
-D9 completes timeout/cancellation behavior and the combined precedence matrix; it does not create
+D9 completes deadline enforcement/native cancellation cleanup and the combined precedence matrix; it does not create
 preliminary option APIs that D1/D2/D4/D6/D7 already require, and it must not invent another
-representation.
+representation or a v1 public cancel resource.
 
 ### 13.3 No silent ignore
 
@@ -1873,6 +1893,7 @@ db.Error {
   SchemaMismatch(db.ContractError),
   DriverMismatch(db.ContractError),
   Decode(db.ContractError),
+  Encode(db.ContractError),
   InvalidQuery(db.ContractError),
   Unsupported(db.ContractError),
   Native(db.NativeError),
@@ -2091,6 +2112,7 @@ static Query discovery. Version 1:
   a contiguous sequence beginning at `0001`;
 - sorts by numeric version ascending, independent of filesystem enumeration order;
 - requires each selected file to be UTF-8 and reads exact bytes without newline normalization;
+- rejects U+0000 in every selected file before applying the first migration;
 - applies each whole file as a migration script in that order; the one-statement Query rule does not
   apply to migration scripts;
 - computes the schema-input fingerprint from the ordered tuples
@@ -2531,9 +2553,22 @@ String concatenation of untrusted values into SQL is not a package-supported bin
 - A connection/transaction/statement is not assumed thread-safe unless the driver contract explicitly
   says so.
 - Concurrent work normally uses separate physical connections.
-- A timeout is an explicit option/deadline, not an implicit default.
-- Cancellation maps to a stable error category and retains native detail.
-- Cancelling a PostgreSQL Query may use libpq cancellation; SQLite may use interrupt support.
+- A timeout is the exact operation-scoped `TimeoutNs`/`BeginTimeoutNs` option, not an implicit
+  default.
+- D9 must enforce a requested deadline or reject it before SQL send; it may not start an operation
+  and then ignore the timeout.
+- An applied deadline uses driver-owned native interruption/cancellation machinery and maps expiry to the
+  stable `Timeout` category with native detail. An engine-reported cancellation not caused by the
+  local deadline maps to `Cancelled`. Neither path issues a hidden SQL statement.
+- PostgreSQL v1 uses nonblocking libpq wait plus native cancellation. SQLite v1 returns
+  `Unsupported` for the common operation deadline before SQL send; its native `BusyTimeoutNs`
+  controls lock waits only and must not masquerade as a whole-query deadline. Applying a later
+  SQLite deadline requires the general noncapturing C-callback boundary (or another separately
+  proved native mechanism), not a database-specific compiler exception.
+- V1 has no externally shareable cancel resource: L3 resources/resource references are non-Send and
+  synchronous execution exposes no sound concurrent caller. A public user-triggered cancel handle
+  is not part of the accepted v1 design. A future concrete proposal must first schedule a general
+  Send/thread-safe-resource prerequisite and its own roadmap slice; D9 does not imply either.
 - A dropped row stream must release/finalize its driver result promptly.
 - A connection with an active unread result follows the driver’s documented rule; the package must not
   silently buffer an unbounded remainder to make reuse appear possible.
@@ -2749,6 +2784,9 @@ This milestone lands before promising that a typed Query is database-checked.
 - dialect-aware named-source scan and `$n` rewrite;
 - repeated source name reuses one ordinal;
 - scalar bind/decode;
+- install the exact §10.3 first-release mapping table and reject every unowned mapping; the
+  executable D4 vertical remains `i64`, while D8 owns the complete runtime type matrix;
+- reject U+0000 in SQL, Text Params, URL, and connection option strings before libpq;
 - SQLSTATE and owned native error detail;
 - the exact PostgreSQL connection and baseline execution option sums from §12, including every
   conflict/unsupported branch;
@@ -2805,6 +2843,7 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - owner-tied `resource.view_from_raw` with invalid pointer/length/UTF-8 rejection;
 - SQLite text/blob Params source Drop/mutation after `rows` returns and before first `next`;
 - transient bind copied-byte/allocation/partial-error cleanup counts, with no per-row parameter copy;
+- complete runtime bind/decode/nullability tests for every exact first-release common type mapping;
 - SQLite current-row views;
 - PostgreSQL `BufferedFull` path first; `rows` is one-pass decode over that owned result, while
   explicitly selected single-row/portal delivery is D13;
@@ -2812,7 +2851,7 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - one-million-row scalar and borrowed-text benchmarks;
 - compile-fail tests for use-after-next, storage in a longer-lived builder, return, branch, and loop.
 
-### D9 — scoped native options, timeout, and cancellation
+### D9 — scoped native options, deadline enforcement, and cancellation cleanup
 
 - complete the common deadline/cancellation machinery over the already-owned D1/D2/D4/D6/D7
   option APIs;
@@ -2821,7 +2860,9 @@ Benchmark direct prepared execution, common-layer execution, and re-prepare cost
 - complete the cross-scope applied/unsupported/conflicting and precedence matrix;
 - no-silent-ignore tests;
 - SQLite busy/locking controls;
-- PostgreSQL timeout/cancel path;
+- SQLite pre-send Unsupported disposition for common deadlines, PostgreSQL deadline/cancel path,
+  and proof that native BusyTimeout is not treated as a common deadline;
+- explicit proof that no public external cancel resource exists in v1;
 - statement/result cleanup under cancellation.
 
 ### D10 — compound Output
@@ -2847,6 +2888,7 @@ Compound Query support is part of the first product contract, not a later ORM en
 - exact first-line `transaction=required|forbidden` policy;
 - required-by-default atomic behavior;
 - one-statement forbidden files, dirty `Applying`/`Failed` states, and checksum-bound repair;
+- reject U+0000 in every migration before applying the first file;
 - explicit `alignc db migrate/status/check/repair`.
 
 Migration implementation reuses connections/resources but does not change typed Query semantics.
@@ -2902,6 +2944,7 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
 - settle and implement the minimal owned `db.value` sum and indexed `db.row`;
 - require a visible dynamic SQL string, explicit value slice, exact `db.Driver` restriction, and
   execute-option slice; reject driver mismatch before SQL send;
+- reject U+0000 in dynamic SQL before SQL send;
 - keep dynamic execution separate from typed Query descriptors and checked artifacts;
 - decode dynamic rows by indexed access only, with no struct reflection or name-based field writes;
 - add SQLite function/collation and PostgreSQL notice/COPY callback surfaces only after the
@@ -3034,6 +3077,16 @@ The design is implemented correctly only if all are true:
 71. Static manifests/action keys include exact per-driver checked-metadata
     `Missing | Present(hash, format_version)` state; create/change/delete invalidates
     CheckedOptional/CheckedRequired and Any tracks both drivers without directory scanning.
+72. Synthetic field-selector/function-value facts use the same capture-root summary and
+    Move-return cleanup ABI as named functions.
+73. Static/dynamic/migration SQL, PostgreSQL Text Params, and libpq connection/control strings reject
+    U+0000 before the native call; binary bytea remains length-aware.
+74. The first-release PostgreSQL mapping is exactly integer/float/bool/text/bytea/Option; every
+    temporal/numeric/UUID/JSON/array/range/domain mapping requires a later explicit contract.
+75. D9 enforces or pre-send rejects every deadline, issues no hidden SQL, and exposes no external
+    cancel resource until a general Send/thread-safe-resource prerequisite is scheduled.
+76. SQLite `BusyTimeoutNs` remains active through streamed `next` calls and restores the
+    package-tracked prior value on exhaustion/error/Drop before connection reuse.
 
 ---
 

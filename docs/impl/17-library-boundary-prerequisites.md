@@ -510,6 +510,8 @@ Rules:
   rejected;
 - the logical path stored in artifacts is root-relative with `/` separators;
 - the file must be valid UTF-8;
+- Query/command SQL must contain no U+0000; screening reports its exact span before artifact
+  generation so a length-aware source identity can never disagree with a NUL-terminated native API;
 - the exact source bytes are the static-input bytes and receive a `source_sql_hash`; no newline
   normalization occurs;
 - database wire bytes are a separate deterministic artifact field: SQLite uses the exact source
@@ -1110,6 +1112,7 @@ Acceptance:
 - public Params/Row/restriction changes invalidate Query consumers, and public
   Params/restriction changes invalidate command consumers;
 - absolute/escaping/symlink paths fail;
+- a U+0000 byte in file or inline SQL fails at its exact source span before artifact generation;
 - a shadowing local or same-spelled user function does not read/register a file;
 - a stale `StaticInputManifest` is rejected after source/import/schema identity changes;
 - creating, changing, or deleting the exact per-driver checked-metadata path invalidates a matching

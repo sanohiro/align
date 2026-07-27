@@ -253,7 +253,8 @@ uniquely named descriptor item and uses tagged file/inline source identity plus 
 checked-metadata Missing/Present manifest state. D3's migration-backed SQLite prepare uses the canonical
 validated numeric catalog. Query and command share the L5/D1 statement artifact and generated
 binder. Checked metadata is per permitted driver. Option API ownership is D1/D2/D4/D6/D7/D12, with
-D9 completing shared deadline/cancellation behavior. The first public database release gate is
+D9 completing deadline enforcement/native cancellation cleanup without a v1 public cancel
+resource. The first public database release gate is
 driver-relevant D1–D12: D4 merge/release requires non-skippable provisioned PostgreSQL CI; D11 uses
 the exact atomic-default/dirty-forbidden migration contract; and D12 returns flat metadata/plan
 records into an explicit region. D13/D14 remain committed additive work. Native feasibility probes

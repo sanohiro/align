@@ -45,6 +45,11 @@ peer parameter mode; closure return provenance includes capture roots; replaceme
 `borrow mut` drops the old pointee; raw resource transfer is root-only; and static-input manifests
 key exact per-driver checked-metadata missing/present state.
 
+The final consistency pass also closed native-boundary scope gaps. SQL and libpq Text/control
+strings reject embedded NUL before native calls; the first PostgreSQL release maps only the fixed
+integer/float/bool/text/bytea/Option set; and D9 provides enforced deadlines plus native
+cancellation cleanup without inventing a public non-Send cancel handle.
+
 These are mandatory library-boundary prerequisites, not private database builtins and not optional
 cleanup. `pkg.db` remains ordinary first-party package code above them. Its design stays SQL-native:
 one named Query owns one visible statement, typed Params and exact flat Row, and ordinary Pure Align

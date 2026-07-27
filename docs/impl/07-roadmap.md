@@ -3525,7 +3525,7 @@ L7  nested generic package APIs + closed structural RegionPlain bound
  D6 prepared statements
  D7 transactions/common execution view
  D8 typed streaming rows
- D9 scoped options/cancellation
+ D9 scoped options/deadline enforcement/native cancellation cleanup
 D10 one-pass compound Output
 D11 exact-policy SQL migrations
 D12 region-owned category metadata + EXPLAIN
@@ -3538,7 +3538,8 @@ they are being built, but no probe API becomes public. D1 must prove Query/comma
 source/artifact/binder, Query decoder, and separate-compilation behavior without a database. Option
 APIs land before their consumers: static Query/command in D1, SQLite and PostgreSQL
 connection/execution in D2/D4, prepare in D6, transaction in D7, and metadata/EXPLAIN in D12. D9
-completes shared deadline/cancellation and the cross-scope disposition audit; it does not replace an
+completes shared deadline enforcement/native cancellation cleanup and the cross-scope disposition
+audit; it does not add a public cancel resource or replace an
 interim surface. D2 and D4 deliberately remain scalar verticals; their purpose is to connect the
 final Query-centered API to each native library without inventing a temporary dynamic API. D4 merge
 and every database release require a provisioned non-skippable PostgreSQL CI job; reported skips are

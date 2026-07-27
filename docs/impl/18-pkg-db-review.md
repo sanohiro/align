@@ -868,6 +868,74 @@ idea is rejected.
   paths before the hit.
 - **v1 impact:** L5/D3/D5 correctness blocker for CheckedOptional and CheckedRequired.
 
+### F60 — field-selector function-type examples retained the old ABI shape
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** `03-types.md` field-selector examples after adding
+  `ReturnCleanupAbi` and capture-root summaries.
+- **Current Align constraint:** `Fn` now has six semantic fields and the canonical return summary is
+  `Roots { params, captures }`, not `Params`.
+- **Actual failure:** an implementation agent could update the primary type definition but preserve
+  the obsolete arity/codec at synthetic field selectors.
+- **Recommendation:** spell the complete six-field Fn value and canonical empty-capture root in
+  every example; derive cleanup ABI from the projected return type.
+- **v1 impact:** L2 ABI/documentation blocker.
+
+### F61 — NUL-bearing strings were not reconciled with native C APIs
+
+- **Classification:** current Align conflict; ownership or soundness risk.
+- **Problematic design location:** exact SQL bytes, PostgreSQL Text Params, and libpq connection
+  options.
+- **Current Align constraint:** Align `str` may contain U+0000, while libpq SQL/options/text
+  parameters use NUL-terminated C representations and SQLite has different length-aware behavior.
+- **Actual failure:** reviewed/hash input could differ from executed SQL, a text value could be
+  truncated, or driver behavior could diverge.
+- **Recommendation:** reject U+0000 in static/dynamic/migration SQL before native calls; reject it in
+  libpq URL/options and v1 Text Params with `Encode`; keep binary bytea length-aware.
+- **v1 impact:** L5/D2/D4/D11 semantic-safety blocker.
+
+### F62 — PostgreSQL first-release type mapping included undecided types
+
+- **Classification:** specification ambiguity; unnecessary broad scope.
+- **Problematic design location:** DB §10.3 listed temporal/numeric/UUID/JSON/array mappings while
+  §25 left their representations open.
+- **Current Align constraint:** public logical/native types must be explicit finite contracts; an
+  implementation model may not invent them.
+- **Actual failure:** different drivers/agents could silently choose strings, custom structs, or
+  native wrappers and call each choice first-release behavior.
+- **Recommendation:** fix the first-release mapping to integer/float/bool/text/bytea/Option only and
+  require explicit D12–D14 mapping decisions before each additional type.
+- **v1 impact:** D4/first-release scope blocker; additional types remain additive.
+
+### F63 — cancellation promised an unimplementable public resource
+
+- **Classification:** specification ambiguity; current Align conflict.
+- **Problematic design location:** English §20/D9 versus the Japanese mirror's “explicit cancel
+  resource.”
+- **Current Align constraint:** L3 resources/references are non-Send, and synchronous execution has
+  no sound concurrent caller that can invoke a shared cancel handle.
+- **Actual failure:** an agent would have to invent a Send escape hatch, unsafe shared raw pointer,
+  hidden worker, or a second concurrency model.
+- **Recommendation:** D9 owns exact deadline enforcement and driver-owned native
+  interruption/cancellation cleanup with no hidden SQL. State explicitly that v1 has no external
+  cancel resource; a public handle needs a later general Send/thread-safe-resource prerequisite and
+  named roadmap slice.
+- **v1 impact:** D9 API/soundness blocker; external user-triggered cancellation is additive.
+
+### F64 — SQLite execution busy timeout ended before streamed execution
+
+- **Classification:** specification ambiguity; performance risk.
+- **Problematic design location:** SQLite `ExecuteOption.BusyTimeoutNs` restored “before rows
+  exposure.”
+- **Current Align constraint:** `rows`/`rows_stmt` defer native stepping until later `next` calls;
+  the returned dependent resource, not the constructor call, owns the active execution lifetime.
+- **Actual failure:** lock waits during `next` would use the connection's old timeout, silently
+  ignoring the requested execution option.
+- **Recommendation:** materialized operations restore before return; streaming rows retain the
+  override/prior package-tracked value and restore on exhaustion, terminal error, or Drop before
+  releasing the dependency. Restore failure poisons/closes the connection.
+- **v1 impact:** D2/D8 option correctness blocker.
+
 ## 3. Answers to the requested feasibility checks
 
 1. **Language compatibility:** the original proposal conflicts at Move payloads, borrowed Move/Copy
@@ -903,7 +971,8 @@ idea is rejected.
 9. **Named parameters:** dialect-aware lexical occurrence table. SQLite uses native named
     parameter indices; PostgreSQL rewrites unique names to stable `$n` positions and reuses an
     ordinal for repeats. Streaming APIs release source Params provenance at return by using
-    execution-owned/native bind storage; SQLite v1 uses transient-copy semantics.
+    execution-owned/native bind storage; SQLite v1 uses transient-copy semantics. SQL source rejects
+    U+0000, and PostgreSQL Text values/options reject embedded NUL before native calls.
 10. **Typed Row decode:** monomorphized ordinal decoder thunk with direct field writes and runtime
     contract guards; no reflection or per-row name lookup. V1 static Row is `RegionPlain`; owned
     strings/arrays remain Params/Output forms rather than a hidden alternate Row materializer.
@@ -926,18 +995,20 @@ idea is rejected.
 16. **Native options:** distinct typed finite sums at all seven scopes, with separate common/native
     slices and no silent ignore. The minimum constructors/defaults/conflicts are fixed in §§11–13;
     their owning milestones precede every consumer. Category metadata calls carry an explicit
-    destination region and the mandatory `MetaOption` slice.
+    destination region and the mandatory `MetaOption` slice. D9 enforces deadlines through
+    driver-owned cancellation cleanup; it does not expose an unsound non-Send cancel resource.
 17. **Roadmap:** move all language work before drivers; split Move work into L1a/L1b and add L7
     nested generic package composition; prove fake
     Query/command artifacts before native code; assign each option sum to D1/D2/D4/D6/D7/D12 before
-    its consumer and use D9 for shared deadline/cancellation completion; put SQLite and PostgreSQL
+    its consumer and use D9 for shared deadline enforcement/native cancellation cleanup; put SQLite and PostgreSQL
     scalar verticals before streaming/transactions/compound output; complete exact migration and
     region-owned category metadata/EXPLAIN contracts in D11/D12 before the first public release;
     schedule D13/D14 as additive native/dynamic work.
 18. **Minimum SQLite vertical:** in-memory connection, one scalar command, one sibling-file scalar
     Query, `execute`/`one`, cardinality/error/cleanup/execution-count tests, no text views.
 19. **Minimum PostgreSQL vertical:** same common Query module, named-to-positional rewrite, scalar
-    bind/decode, SQLSTATE error, driver restriction, explicit configured ephemeral/local server,
+    bind/decode from the fixed integer/float/bool/text/bytea subset, SQLSTATE error, driver
+    restriction, explicit configured ephemeral/local server,
     and a non-skippable provisioned CI gate for merge/release.
 20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, L7, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
     D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
@@ -1010,6 +1081,12 @@ documents:
     `BorrowMut`.
 53. Restrict `resource.into_raw` to standalone owned resource roots in v1.
 54. Include exact per-driver checked-metadata Missing/Present state in static manifests/action keys.
+55. Update every synthetic/function-value example to the capture-root and Move-return cleanup ABI.
+56. Reject U+0000 at every NUL-terminated native boundary before SQL send or connection setup.
+57. Make the first-release PostgreSQL type mapping exact and leave undecided native types out.
+58. Define D9 as deadline enforcement/native cancellation cleanup and remove the unsupported v1
+    public cancel resource.
+59. Keep SQLite execution-scoped busy timeout active for the complete streamed rows lifetime.
 
 ## 5. Revised implementation roadmap
 
@@ -1025,14 +1102,14 @@ documents:
 | L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |
 | D0 | SQLite/libpq capability probes only | native lifecycle/metadata observations | recorded driver evidence |
 | D1 | fake-driver Query/command binder, Query decoder, scanner, static options | both artifact/cache/placeholder/retention matrices | thunk overhead and warm cache |
-| D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, cleanup, execution count | package versus libsqlite3 |
+| D2 | scalar SQLite Query/command + connection/execution options | cardinality, option disposition, NUL/PRAGMA validation, cleanup, execution count | package versus libsqlite3 |
 | D3 | SQLite prepare/check metadata | stale/policy/offline plus migration catalog/order matrix | prepare/check time and artifact size |
-| D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
+| D4 | scalar PostgreSQL Query vertical + connection/execution options (`BufferedFull`) | rewrite, fixed type map, NUL rejection, option disposition, SQLSTATE, mismatch, cleanup, required CI | package versus libpq |
 | D5 | PostgreSQL checked metadata | recreated-schema reproducibility | describe/prepare time |
 | D6 | dependent prepared statements + prepare option sums | sequential reuse, disposition, bind-storage cleanup, child-before-parent Drop | prepare reuse/rebind |
 | D7 | tx options plus common exec view | combination rejection, consume/commit/rollback/fail-safe Drop | tx/common-dispatch overhead |
-| D8 | typed rows and row generations | old-view rejection, Params-source invalidation, clone retention, delivery counts | row decode/iteration/bind copies |
-| D9 | shared deadline/cancellation + all-scope audit | applied/unsupported/conflict/precedence matrix | option/cancellation overhead |
+| D8 | typed rows and row generations | old-view rejection, Params-source invalidation, type matrix, busy-timeout lifetime, clone retention, delivery counts | row decode/iteration/bind copies |
+| D9 | deadline enforcement/native cancellation cleanup + all-scope audit | applied/unsupported/conflict/precedence, hidden-SQL/public-cancel absence | deadline/cancellation overhead |
 | D10 | one-pass compound Output | many-to-one/one-to-many, exactly one SQL | shaping allocation/copy/throughput |
 | D11 | exact-policy SQL migrations; initial-release gate | checksum/order/atomic/dirty/repair/status | migration startup/large history |
 | D12 | region-owned category metadata and EXPLAIN options; initial-release gate | lifetime/allocation/flatness/category isolation; ANALYZE executes visibly | catalog query count/latency |
@@ -1138,6 +1215,10 @@ module, binding-retention, and option paths, but reached the repository's 15-min
 The replacement three-document DB-contract pass completed in about ten minutes and returned ten
 actionable findings, F43–F52. The subsequent language-foundation pass completed its assigned scope
 and returned seven further findings, F53–F59.
+The final whole-diff consistency invocation read the complete document set and reached candidate
+validation but ended at its configured invocation bound before emitting a verdict. Its preserved
+log exposed five independently verified issues, F60–F64. Those exact areas were corrected and
+checked directly; the complete review was not restarted from the beginning.
 
 The mistake was not that the complete pass consumed fifteen minutes. It was that elapsed time was
 used as a substitute for inspecting whether the pass was still producing new, relevant analysis.

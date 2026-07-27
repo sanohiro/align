@@ -170,11 +170,13 @@ A projection is fixed as a `Project(field)` node on the HIR and becomes a fusion
 
 ### Field selector `.ident`
 A `.ident` at argument position is typed, from the receiver element type `E`, as a function value
-`Fn([(ByValue, E)], type_of(E.ident), Pure, return_borrow, None)`, where `return_borrow` is `Params([0])`
-only when the projected field is a view backed by `E`; otherwise it is `None`.
+`Fn([(ByValue, E)], type_of(E.ident), Pure, return_borrow, None, return_cleanup)`, where
+`return_borrow` is `Roots { params: [0], captures: [] }` only when the projected field is a view
+backed by `E`; otherwise it is `None`. `return_cleanup` is `DynamicBit` exactly when the projected
+field is recursively Move, otherwise `None`.
 
 ```align
-users.where(.active)   // .active : Fn([(ByValue, User)], bool, Pure, None, None)
+users.where(.active)   // .active : Fn([(ByValue, User)], bool, Pure, None, None, None)
 ```
 
 ---

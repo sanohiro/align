@@ -423,6 +423,13 @@ token spanだけを `$n` へ置換し、それ以外のbyteを保存する。art
 rewrite-format version、source-to-wire span mapを持つ。metadata keyはdriver/source hash/
 wire hash/rewrite version/static optionを含み、runtimeは選択したwire bytesを正確に送り、
 engine位置を可能な範囲でsource spanへ戻す。
+NUL-terminated native entry point用storageはrecorded pointer/length/hash domain外にsentinelを
+1 byte追加する。これはtransport storageでありsource/wire SQLの一部ではない。
+
+SQL source byteにU+0000を許可しない。static Query/commandはartifact生成前にexact spanへ
+diagnosticし、dynamic SQL/migration toolは最初のnative call前に拒否する。SQLiteとlibpqで
+C string/length boundaryが異なるため、NULを受け入れてstatement count/source identity/
+送信SQLをdriver間で不一致にしない。
 
 #### 5.6.1 bind storageの保持
 
@@ -441,6 +448,9 @@ exactly onceでconsume/dropする。
 初期PostgreSQL `BufferedFull` pathは同期libpq callのreturn前にparameter transmissionを完了
 する。将来のsingle-row/portal/pipeline/async pathはnative protocolが不要になるまで自身の
 parameter bytesを保持する。これはper-execution bind copyでありper-row copyではない。
+v1 PostgreSQL Text binderはNUL-terminated execution-owned copyを作り、embedded U+0000を
+SQL送信前に `db.Error.Encode` とする。binary byteaはexplicit lengthを使い、このtext制限を
+適用しない。
 test/benchmarkはtext/blob copy bytesとallocationをrow decodeと分けて報告する。zero-copy
 bindは明示driver-qualified surface、全source ownerへ結ぶreturn provenance、独立measurement
 を必要とし、黙ってborrowed bindへ切り替えない。generated driver binder planは各fieldの
@@ -689,7 +699,12 @@ TEXT/BLOBはParamsで `str|string` / `slice<u8>|array<u8>`、Rowで `str` /
 
 checked metadataはtype name、OID evidence、format、nullability/origin evidenceを持つ。
 text formatで開始してもbinary pathをsurfaceから閉ざさない。
-text系/byteaはParamsでviewまたはowned、Rowで `str` / `slice<u8>` viewにmappingする。
+初期releaseのexact common mappingは
+`int2/int4/int8 -> i16/i32/i64`、`float4/float8 -> f32/f64`、`bool -> bool`、
+`text/varchar/name -> Params str|string / Row str`、`bytea -> Params slice<u8>|array<u8> /
+Row slice<u8>`、`NULL -> Option<T>` である。date/time/timestamp、numeric、UUID、
+JSON/JSONB、array/range/domain/user-defined typeはこのsetへ黙ってcoerceしない。D12〜D14の
+consumer decisionでexact logical/native representationを確定し、使用前に明示mappingを追加する。
 
 ### 10.4 NULL
 
@@ -741,9 +756,15 @@ BusyTimeoutNs(ns) | Pragma(name, value)
 `[]` はcreate/URI/cache/mutex/busy/PRAGMA指定なしのread-write openと、transactionの
 Deferred、EXPLAINのQueryPlanを意味する。read-onlyとread-write/create、privateとshared、
 no-mutexとfull-mutex、重複busy timeout/PRAGMA名はconflict。durationは正でなければならない。
+DB pathはU+0000を含めない。Pragma nameはASCII `[A-Za-z_][A-Za-z0-9_]*`、valueはUTF-8かつ
+U+0000なしで、raw SQL pasteではなくdeterministic SQLite string-literal quotingを使う。
+invalid/unsupported PRAGMAをopen/setup前errorまたはnative errorにし、ignoreしない。
 `RequireVersionAtLeast` はstatic artifact/public contractへ入りSQLiteへpinする。
 Persistent/Normalizeはprepareだけ、execution BusyTimeoutはそのexecution中だけ適用して
-restoreする。capability不足はUnsupportedでありfallback/ignoreしない。extension loadingは
+restoreする。`execute`/`one`/`maybe_one`/`all` はreturn前、`rows`/`rows_stmt` はrows resourceが
+prior package-tracked valueを保持し、exhaustion/terminal step error/Drop時にconnection/
+statement dependency解放前にrestoreする。restore失敗はunknown policyのconnectionを返さず
+poison/closeする。capability不足はUnsupportedでありfallback/ignoreしない。extension loadingは
 v1で公開せずdisabledのまま。SQLite optionをPostgreSQLへ渡すことは型エラーである。
 
 ### 11.3 native feature
@@ -767,7 +788,9 @@ conn := postgres.connect(url, [
 
 host/port/database/user、application name、connect timeout、TLS/SSL mode、target session
 attributes、任意のsupported connection key/value、notice/error detailを扱える。
-secretはruntime valueでありstatic Query metadataへ入れない。
+secretはruntime valueでありstatic Query metadataへ入れない。URL、application name、
+parameter name/valueはUTF-8かつU+0000なしでなければならず、embedded NULはlibpq call前に
+`db.Error.Encode` として拒否し、truncateしない。
 
 ### 12.2 parameter/result format
 
@@ -1016,6 +1039,7 @@ db.Error {
   SchemaMismatch(ContractError),
   DriverMismatch(ContractError),
   Decode(ContractError),
+  Encode(ContractError),
   InvalidQuery(ContractError),
   Unsupported(ContractError),
   Native(NativeError),
@@ -1105,6 +1129,7 @@ build/checkやQuery discoveryは行わない。v1 rule:
 - version `0001`〜`9999`、duplicateなし、`0001`開始のcontiguous sequenceを要求;
 - filesystem orderではなくnumeric version ascending;
 - fileはUTF-8 exact bytes、newline normalizationなし;
+- 全selected fileのU+0000を最初のmigration適用前に拒否;
 - 各file全体をその順でmigration scriptとして適用（Queryの1-statement rule対象外）;
 - `(version, exact UTF-8 filename, content hash)` のordered tuple列をschema fingerprintへ入れる。
 
@@ -1314,9 +1339,20 @@ engine経由で実装してはならない。
 connection/tx/stmt/rows resourceは既定でtask間共有しない。driverのthread ruleをresourceの
 sendabilityへ正確に反映し、`spawn` へ入れない型をlintではなくtype/ownershipで拒否する。
 
-cancellation/timeoutはD9のoperation-scoped optionと明示cancel resourceで扱う。driverが
-supportしないoptionはunsupported error。timeout後のconnection再利用可否をdriverが判定し、
-protocol/transaction state不明のconnectionをpoolやcallerへ返さない。transparent retryはない。
+timeoutはD9のexact operation-scoped `TimeoutNs` / `BeginTimeoutNs` optionで扱う。要求deadlineは
+enforceするかSQL送信前にrejectし、silent ignoreしない。expiryはdriver-owned native
+interrupt/cancel machineryを使い、hidden SQLを発行せず `Timeout` へnative detail付きで
+mappingする。local deadline以外のengine-reported cancelだけを `Cancelled` とする。
+PostgreSQL v1はnonblocking libpq waitとnative cancelを使う。SQLite v1はcommon operation
+deadlineをSQL送信前に `Unsupported` とし、native `BusyTimeoutNs` はlock waitだけを制御して
+whole-query deadlineを装わない。後続SQLite deadlineにはgeneral noncapturing C-callback
+boundaryまたは別途証明したnative mechanismが必要で、DB-specific compiler例外を作らない。
+L3 resource/refはnon-Sendで同期executionにsoundなconcurrent callerがないため、
+v1にexternally shareable cancel resourceはない。user-triggered cancel handleにはgeneral
+Send/thread-safe-resource前提と専用roadmap sliceを先にscheduleする新しい具体的proposalが
+必要で、accepted v1 designやD9から暗黙には生えない。
+timeout後のconnection再利用可否をdriverが判定し、protocol/transaction state不明のconnectionを
+poolやcallerへ返さない。transparent retryはない。
 
 ## 21. Performance contract
 
@@ -1448,6 +1484,9 @@ D2と同じcommon Query module形状、libpq connection、dialect-aware named sc
 両driverでportable `CAST(:value AS BIGINT)`、execution count/cleanup。明示設定された
 local/ephemeral PostgreSQLでintegration testする。§12のexact PostgreSQL
 connection/baseline execute option sumと全conflict/unsupported branchも含む。
+§10.3のexact初期mappingを固定して未所有mappingを拒否するが、D4 executable verticalは
+`i64`に保ち、complete runtime type matrixはD8が所有する。SQL/Text Params/URL/connection
+option stringのU+0000をlibpq前に拒否する。
 local開発では未設定時に理由付きskipできるが、D4 merge/DB releaseでは
 `ALIGN_DB_POSTGRES_REQUIRED=1` のrequired `db-postgres` CIがpinned ephemeral serverを
 provisionし、skip/接続不能をfailureにする。同じjobでportable Queryを両driverに実行する。
@@ -1481,14 +1520,17 @@ mode、PostgreSQL isolation/access/deferrableのBEGIN前conflict rejectionもこ
 `clone_in` retention、bounded batchの前提、SQLite/libpq両driverのpointer-validity test。
 SQLite text/blob Params sourceを`rows` return後/最初の`next`前にdrop/mutateするtest、
 transient bind copy bytes/allocation/partial-error cleanup、per-row parameter copy 0を固定する。
+exact初期common type mapping全てのruntime bind/decode/nullability matrixもここで完成する。
 PostgreSQL初期pathは `BufferedFull` 上のone-pass decodeで、single-row/portal deliveryはD13。
 
-### D9 — scoped native option、timeout、cancellation
+### D9 — scoped native option、deadline enforcement、cancellation cleanup
 
-D1/D2/D4/D6/D7で既に公開したoption API上へcommon deadline/cancellation machineryを完成
-させ、全scopeのapplied/unsupported/conflicting/precedence matrix、timeout/cancel後connection
-stateをauditする。D9でpreliminary APIや別表現を作らない。要求optionのsilent ignoreを
-全driverでnegative testする。
+D1/D2/D4/D6/D7で既に公開したoption API上へcommon deadline/native cancellation machineryを
+完成させ、全scopeのapplied/unsupported/conflicting/precedence matrix、timeout/cancel後
+connection stateをauditする。SQLite common deadlineのpre-send Unsupported、
+PostgreSQL deadline/cancel、BusyTimeoutをcommon deadline扱いしないことをhidden SQLなしで
+固定する。v1 public external cancel resourceがないことも固定する。D9で
+preliminary APIや別表現を作らない。要求optionのsilent ignoreを全driverでnegative testする。
 
 ### D10 — compound Output
 
@@ -1501,7 +1543,8 @@ Pure step（`borrow mut state`、0個以上の独立した `borrow mut` builder�
 
 ordered SQL file、checksum/history、先頭lineのexact required/forbidden policy、
 required default atomicity、forbidden 1-statement制限、Applying/Failed dirty state、
-checksum-bound repair、明示 `alignc db migrate/status/check/repair`。
+checksum-bound repair、全file適用前のU+0000拒否、
+明示 `alignc db migrate/status/check/repair`。
 
 ### D12 — category metadataとEXPLAIN
 
@@ -1521,7 +1564,7 @@ explicit pool、common contract実証後の追加driver。
 ### D14 — dynamic SQLとnative callback
 
 minimal owned `db.value` とindexed `db.row`、visible dynamic SQL/value slice/exact
-`db.Driver` restriction/execute option、pre-send mismatch rejection、
+`db.Driver` restriction/execute option、pre-send mismatch/U+0000 rejection、
 typed Queryと別artifact path、reflectionなし。SQLite function/collationやPostgreSQL
 notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明してから追加する。
 
@@ -1632,6 +1675,16 @@ execution-count付きで実証する。
 71. static manifest/action keyはdriver別checked metadataのexact pathと
     `Missing | Present(hash, format_version)` を含み、create/change/deleteでinvalidateし、
     Anyはdirectory scanなしで両driverを追跡する。
+72. synthetic field-selector/function-value factはnamed functionと同じcapture-root summaryと
+    Move-return cleanup ABIを使う。
+73. static/dynamic/migration SQL、PostgreSQL Text Params、libpq connection/control stringは
+    native call前にU+0000を拒否し、binary byteaはlength-awareのままにする。
+74. PostgreSQL初期mappingはinteger/float/bool/text/bytea/Optionだけで、temporal/numeric/
+    UUID/JSON/array/range/domainは後続の明示contractを必要とする。
+75. D9は全deadlineをenforceまたはpre-send rejectし、hidden SQLを発行せず、general
+    Send/thread-safe-resource前提がscheduleされるまでexternal cancel resourceを公開しない。
+76. SQLite `BusyTimeoutNs` はstreamed `next` 中も有効で、exhaustion/error/Drop時に
+    connection reuse前のpackage-tracked prior valueへrestoreする。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 
