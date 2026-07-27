@@ -9760,26 +9760,39 @@ impl<'a> MoveCheck<'a> {
                 // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
                 // check below (same diagnostic; the field write has no index expr to span, so it
                 // points at the RHS instead).
-                Stmt::AssignField { root, path, value } => {
+                Stmt::AssignField {
+                    root,
+                    path,
+                    value,
+                    drop_old,
+                } => {
                     self.check_borrow_use(*root, value.span);
                     if whole_moved(moved, *root) {
                         let name = &self.f.locals[*root as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), value.span);
                     }
+                    let was_moved = path
+                        .first()
+                        .is_some_and(|field| field_moved(moved, *root, *field));
                     let self_assign = matches!(
                         &value.kind,
                         ExprKind::Field { root: source, path: source_path }
                             if source == root && source_path == path
                     );
                     self.expr(value, moved, true, true);
+                    let consumed_by_rhs = path.first().is_some_and(|field| {
+                        field_moved(moved, *root, *field) && !was_moved
+                    });
+                    drop_old.set(self.is_move_ty(value.ty) && !consumed_by_rhs);
+                    // The assignment installs a live replacement even when its RHS moved out of
+                    // this same field through a transparent wrapper or consuming call.
+                    if let [field] = path.as_slice() {
+                        moved.remove(&MovedKey::Field(*root, *field));
+                    }
                     // `v.field = v.field` is the field analogue of `s = s`: it preserves the
                     // value and ownership instead of leaving the destination marked moved. MIR
                     // emits no code for this exact place identity, so do not invalidate borrows.
-                    if self_assign {
-                        if let [field] = path.as_slice() {
-                            moved.remove(&MovedKey::Field(*root, *field));
-                        }
-                    } else if self.is_move_ty(value.ty) {
+                    if !self_assign && self.is_move_ty(value.ty) {
                         self.invalidate_owner(*root);
                     }
                 }
@@ -11585,7 +11598,12 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                     Place::Field { root, path, ty } => {
                         let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignField { root, path, value: v });
+                        stmts.push(Stmt::AssignField {
+                            root,
+                            path,
+                            value: v,
+                            drop_old: std::cell::Cell::new(false),
+                        });
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));

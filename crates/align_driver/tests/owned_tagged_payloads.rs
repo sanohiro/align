@@ -131,9 +131,12 @@ fn field_self_assignment_preserves_value_and_ownership() {
     }
     let src = format!(
         "{DECL}\
+         fn pass(detail: Option<string>) -> Option<string> = detail\n\
          fn main() -> i32 {{\n\
            mut v := Item {{ detail: Some(\"hello\".clone()), n: 7 }}\n\
            v.detail = v.detail\n\
+           v.detail = {{ v.detail }}\n\
+           v.detail = pass(v.detail)\n\
            s := v.detail else {{ return 90 }}\n\
            return (v.n + s.len()) as i32\n\
          }}\n"
@@ -142,7 +145,7 @@ fn field_self_assignment_preserves_value_and_ownership() {
     assert_eq!(
         mir.matches("drop_value").count(),
         0,
-        "exact field self-assignment must be an ownership-preserving no-op:\n{mir}"
+        "direct and wrapped field ownership transfers must not drop the destination:\n{mir}"
     );
     assert_eq!(
         build_and_run("owned-option-field-self-assign", &src)

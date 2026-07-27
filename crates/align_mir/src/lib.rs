@@ -2725,7 +2725,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 None => b.set_drop_flag(*local, drop_new.get()),
             }
         }
-        hir::Stmt::AssignField { root, path, value } => {
+        hir::Stmt::AssignField {
+            root,
+            path,
+            value,
+            drop_old,
+        } => {
             // Like whole-local `s = s`, exact field self-assignment preserves the value and its
             // ownership. Dropping the destination before reloading the identical RHS would read
             // freed storage; storing and then nulling the identical source would erase it.
@@ -2750,18 +2755,27 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                         DropPlan::Option(ref payload)
                             if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
                     ));
-            if drop_old_field {
+            if !drop_old_field {
+                store_value_at(b, *root, &mut path.clone(), value);
+                return;
+            }
+            // Assignment evaluates the RHS before mutating the destination. Capture it first so
+            // borrows of the old field remain valid during evaluation and a consuming RHS can
+            // transfer that exact ownership back into the destination.
+            let replacement = lower_expr(b, value);
+            if b.is_terminated() {
+                return;
+            }
+            if drop_old.get() {
                 let old = b.fresh_value(leaf_ty);
                 b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
                 b.push(Stmt::DropValue(Operand::Value(old)));
             }
-            store_value_at(b, *root, &mut path.clone(), value);
-            // Null the RHS's moved source *after* the store — `store_value_at` lowers `value`
-            // internally, so nulling a variable RHS beforehand would store null. (The old value was
-            // already freed above, before the overwrite.)
-            if drop_old_field {
-                null_moved_source(b, value);
-            }
+            // The replacement is already captured, so clear its old source before the store. This
+            // ordering is essential when source and destination are the same place through a
+            // transparent wrapper: clearing after the store would erase the replacement.
+            null_moved_source(b, value);
+            b.push(Stmt::StoreField(*root, path.clone(), replacement));
         }
         hir::Stmt::AssignIndex { base, index, value } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
