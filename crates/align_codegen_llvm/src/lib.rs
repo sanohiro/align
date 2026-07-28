@@ -708,19 +708,32 @@ fn build_module<'c>(
         DebugCtx { dib, file, subty, scope }
     });
 
-    // Struct layouts → LLVM struct types, indexed by struct id. Two phases so a **nested** struct
-    // field (`Struct(id)`) can reference another struct's type: first create every struct as a named
-    // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
-    let struct_types: Vec<StructType<'c>> =
-        program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
+    // Struct layouts → LLVM struct types, indexed by struct id. Origin-specific generic instances
+    // share one source-visible nominal LLVM type: their function fields have the same closure ABI,
+    // while keeping distinct HIR ids preserves precise effect analysis.
+    let mut struct_types_by_source = HashMap::new();
+    let struct_types: Vec<StructType<'c>> = program
+        .structs
+        .iter()
+        .map(|s| {
+            *struct_types_by_source
+                .entry(s.source_name.as_str())
+                .or_insert_with(|| ctx.opaque_struct_type(&s.source_name))
+        })
+        .collect();
     // Sum-type layouts → named tagged structs `{ i32 tag, <every variant's payload flattened> }`.
     // Create every enum opaque first, then set the bodies, mirroring structs. This lets the closed
     // builtin `Error` enum be a payload of pkg.web's middleware verdict without admitting general
     // recursive enum graphs in sema.
+    let mut enum_types_by_source = HashMap::new();
     let enum_types: Vec<StructType<'c>> = program
         .enums
         .iter()
-        .map(|e| ctx.opaque_struct_type(&e.name))
+        .map(|e| {
+            *enum_types_by_source
+                .entry(e.source_name.as_str())
+                .or_insert_with(|| ctx.opaque_struct_type(&e.source_name))
+        })
         .collect();
     // Concrete nested `Option` / `Result` values need their own named recursive-capable aggregate
     // type. Create every shell before any body so a tagged payload can refer to another tagged
@@ -731,7 +744,11 @@ fn build_module<'c>(
         .enumerate()
         .map(|(id, _)| ctx.opaque_struct_type(&format!("align.tagged.{id}")))
         .collect();
+    let mut completed_enum_types = HashSet::new();
     for (e, et) in program.enums.iter().zip(&enum_types) {
+        if !completed_enum_types.insert(e.source_name.as_str()) {
+            continue;
+        }
         let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
         for v in &e.variants {
             for &s in &v.payload {
@@ -797,7 +814,11 @@ fn build_module<'c>(
             )
         })
         .collect();
+    let mut completed_struct_types = HashSet::new();
     for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
+        if !completed_struct_types.insert(s.source_name.as_str()) {
+            continue;
+        }
         set_struct_body(
             ctx,
             *st,
@@ -3192,6 +3213,102 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             _ => Ok(()),
         }
     }
+    fn source_abi_key(
+        ty: Ty,
+        program: &Program,
+        tagged_active: &mut Vec<u32>,
+    ) -> Result<String, CodegenError> {
+        let scalar = |value, tagged_active: &mut Vec<u32>| {
+            source_abi_key(scalar_to_ty(value), program, tagged_active)
+        };
+        Ok(match ty {
+            Ty::Struct(id) => format!(
+                "S{}",
+                program
+                    .structs
+                    .get(id as usize)
+                    .ok_or_else(|| CodegenError::Lowering(format!(
+                        "source ABI key refers to missing struct type id {id}"
+                    )))?
+                    .source_name
+            ),
+            Ty::Enum(id) => format!(
+                "E{}",
+                program
+                    .enums
+                    .get(id as usize)
+                    .ok_or_else(|| CodegenError::Lowering(format!(
+                        "source ABI key refers to missing sum type id {id}"
+                    )))?
+                    .source_name
+            ),
+            Ty::Fn(_) => "FnClosure".to_string(),
+            Ty::Tagged(id) => {
+                if tagged_active.contains(&id) {
+                    return Err(CodegenError::Lowering(format!(
+                        "recursive nested tagged type id {id} survived into a source ABI key"
+                    )));
+                }
+                let tagged = program.tagged_types.get(id as usize).ok_or_else(|| {
+                    CodegenError::Lowering(format!(
+                        "source ABI key refers to missing nested tagged type id {id}"
+                    ))
+                })?;
+                tagged_active.push(id);
+                let key = match *tagged {
+                    hir::TaggedType::Option(payload) => {
+                        format!("O{}", scalar(payload, tagged_active)?)
+                    }
+                    hir::TaggedType::Result(ok, err) => format!(
+                        "R{}_{}",
+                        scalar(ok, tagged_active)?,
+                        scalar(err, tagged_active)?
+                    ),
+                };
+                tagged_active.pop();
+                key
+            }
+            Ty::Option(payload) => format!("O{}", scalar(payload, tagged_active)?),
+            Ty::Result(ok, err) => format!(
+                "R{}_{}",
+                scalar(ok, tagged_active)?,
+                scalar(err, tagged_active)?
+            ),
+            Ty::Box(payload) => format!("B{}", scalar(payload, tagged_active)?),
+            Ty::Slice(payload) => format!("V{}", scalar(payload, tagged_active)?),
+            Ty::DynArray(payload) => format!("D{}", scalar(payload, tagged_active)?),
+            Ty::Array(payload, count) => {
+                format!("A{count}_{}", scalar(payload, tagged_active)?)
+            }
+            Ty::Task(payload) => format!("K{}", scalar(payload, tagged_active)?),
+            Ty::StructArray(id, count) => format!(
+                "A{count}_{}",
+                source_abi_key(Ty::Struct(id), program, tagged_active)?
+            ),
+            Ty::DynStructArray(id, layout) => format!(
+                "D{layout:?}_{}",
+                source_abi_key(Ty::Struct(id), program, tagged_active)?
+            ),
+            Ty::Soa(id) => format!(
+                "Q{}",
+                source_abi_key(Ty::Struct(id), program, tagged_active)?
+            ),
+            Ty::Tuple(id) => {
+                let tuple = program.tuples.get(id as usize).ok_or_else(|| {
+                    CodegenError::Lowering(format!(
+                        "source ABI key refers to missing tuple type id {id}"
+                    ))
+                })?;
+                let mut key = String::from("T");
+                for &elem in &tuple.elems {
+                    key.push('_');
+                    key.push_str(&scalar(elem, tagged_active)?);
+                }
+                key
+            }
+            other => format!("{other:?}"),
+        })
+    }
 
     // Validate every retained entry, including an otherwise-unused corrupt one from a decoded
     // artifact. Production lowering removes unused valid entries, so rejecting extra invalid state
@@ -3221,6 +3338,50 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             for &payload in &variant.payload {
                 check_scalar(payload, program, &mut Vec::new())?;
             }
+        }
+    }
+    let mut struct_source_shapes = HashMap::new();
+    for def in &program.structs {
+        let mut shape = format!("align={:?};c_repr={};", def.align, def.c_repr);
+        for field in &def.fields {
+            shape.push_str(&field.name);
+            shape.push(':');
+            shape.push_str(&source_abi_key(field.ty, program, &mut Vec::new())?);
+            shape.push(';');
+        }
+        if let Some(previous) = struct_source_shapes.insert(def.source_name.as_str(), shape.clone())
+            && previous != shape
+        {
+            return Err(CodegenError::Lowering(format!(
+                "struct source identity `{}` has inconsistent origin-specific ABI shapes",
+                def.source_name
+            )));
+        }
+    }
+    let mut enum_source_shapes = HashMap::new();
+    for def in &program.enums {
+        let mut shape = String::new();
+        for variant in &def.variants {
+            shape.push_str(&variant.name);
+            shape.push('@');
+            shape.push_str(&variant.field_base.to_string());
+            for &payload in &variant.payload {
+                shape.push(':');
+                shape.push_str(&source_abi_key(
+                    scalar_to_ty(payload),
+                    program,
+                    &mut Vec::new(),
+                )?);
+            }
+            shape.push(';');
+        }
+        if let Some(previous) = enum_source_shapes.insert(def.source_name.as_str(), shape.clone())
+            && previous != shape
+        {
+            return Err(CodegenError::Lowering(format!(
+                "sum source identity `{}` has inconsistent origin-specific ABI shapes",
+                def.source_name
+            )));
         }
     }
     for tuple in &program.tuples {
@@ -12981,6 +13142,42 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_origin_specific_source_nominals_fail_closed() {
+        let defs = vec![
+            StructDef {
+                name: "Holder$origin0".to_string(),
+                source_name: "Holder$fn_i64_i64".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "callback".to_string(),
+                    ty: Ty::Fn(0),
+                }],
+                align: None,
+                c_repr: false,
+            },
+            StructDef {
+                name: "Holder$origin1".to_string(),
+                source_name: "Holder$fn_i64_i64".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "callback".to_string(),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                }],
+                align: None,
+                c_repr: false,
+            },
+        ];
+        let err = codegen_program(vec![], vec![], vec![], defs, vec![], vec![])
+            .expect_err("one source nominal identity must not alias inconsistent LLVM bodies");
+        assert!(
+            err.to_string()
+                .contains("inconsistent origin-specific ABI shapes"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn malformed_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
@@ -13201,6 +13398,7 @@ mod tests {
         let struct_cycle = program(
             vec![StructDef {
                 name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
                 fields: vec![align_sema::FieldDef {
                     name: "next".to_string(),
                     ty: Ty::Tagged(0),
@@ -13215,6 +13413,7 @@ mod tests {
             vec![],
             vec![hir::EnumDef {
                 name: "Cycle".to_string(),
+                source_name: "Cycle".to_string(),
                 variants: vec![hir::EnumVariant {
                     name: "Next".to_string(),
                     payload: vec![Scalar::Tagged(0)],
@@ -13366,6 +13565,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let struct_def = StructDef {
             name: "P".to_string(),
+            source_name: "P".to_string(),
             fields: vec![align_sema::FieldDef { name: "x".to_string(), ty: i64_ty }],
             align: None,
             c_repr: false,
@@ -14000,6 +14200,7 @@ mod tests {
         // `check_union_decodable` is what admits only one-payload variants.
         let enum_def = EnumDef {
             name: "C".to_string(),
+            source_name: "C".to_string(),
             variants: vec![
                 align_sema::hir::EnumVariant { name: "R".to_string(), payload: vec![], field_base: 1 },
                 align_sema::hir::EnumVariant { name: "G".to_string(), payload: vec![], field_base: 1 },
@@ -14226,6 +14427,7 @@ mod tests {
 
         let row = StructDef {
             name: "Row".to_string(),
+            source_name: "Row".to_string(),
             fields: vec![
                 align_sema::hir::FieldDef { name: "tiny".to_string(), ty: Ty::Int(IntTy { bits: 8, signed: false }) },
                 align_sema::hir::FieldDef { name: "wide".to_string(), ty: i64_ty },
@@ -14274,6 +14476,7 @@ mod tests {
         fn sdef(name: &str, c_repr: bool, fields: &[Ty]) -> StructDef {
             StructDef {
                 name: name.to_string(),
+                source_name: name.to_string(),
                 fields: fields
                     .iter()
                     .enumerate()
@@ -14409,7 +14612,11 @@ mod tests {
                     v
                 })
                 .collect();
-            align_sema::hir::EnumDef { name: name.to_string(), variants }
+            align_sema::hir::EnumDef {
+                name: name.to_string(),
+                source_name: name.to_string(),
+                variants,
+            }
         }
         let enums = vec![
             edef("EScalar", &[&[sc_int(32, true)], &[align_sema::Scalar::Bool]]), // { i32, i32, i8 }

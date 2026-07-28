@@ -1509,9 +1509,17 @@ serialization, mangling, LLVM validation, and malformed-input tests. Interface a
 fingerprints are id-free and structural. The internal semantic monomorph key additionally retains a
 concrete function-value origin discriminator: same-signature values have independent inferred
 effect cells, and deduplicating a Pure and Impure origin would make the selected generic
-struct/sum/function HIR read the wrong cell. Splitting any one layer or either summary into a
-separately mergeable PR would temporarily permit two incompatible identities or require a
-compatibility path that this pre-release repository forbids.
+struct/sum/function HIR read the wrong cell. A generic struct/sum therefore records two names:
+the origin-aware internal analysis name and an id-free source nominal name. Source equality,
+diagnostics, and LLVM named-type reuse use the latter; generic-function analysis keys use the
+former. Every pair sharing a source nominal name must have the same recursively id-free ABI shape
+or codegen rejects it before creating LLVM types. This prevents an inferred
+`Holder { callback: f }` from becoming incompatible with `Holder<fn(T) -> R>` while retaining
+separate Pure/Impure cells. Reassignment, field replacement, and control-flow joins into an
+origin-aware generic aggregate join the affected private effect cells; an explicitly annotated
+source-only aggregate has no concrete target and remains fail-closed `Unknown`. Splitting any one
+layer or either summary into a separately mergeable PR would temporarily permit two incompatible
+identities or require a compatibility path that this pre-release repository forbids.
 
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the

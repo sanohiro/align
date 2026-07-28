@@ -193,7 +193,12 @@ pub struct TupleDef {
 
 #[derive(Clone, Debug)]
 pub struct EnumDef {
+    /// Origin-aware internal identity. Generic instances that differ only in a concrete function
+    /// value's inferred effect origin remain distinct for analysis.
     pub name: String,
+    /// Source-visible nominal identity. Function-value origins are erased, while parameter modes
+    /// and return provenance remain structural parts of the type.
+    pub source_name: String,
     /// Variants in declaration order; the index is the tag.
     pub variants: Vec<EnumVariant>,
 }
@@ -211,7 +216,12 @@ pub struct EnumVariant {
 
 #[derive(Clone, Debug)]
 pub struct StructDef {
+    /// Origin-aware internal identity. Generic instances that differ only in a concrete function
+    /// value's inferred effect origin remain distinct for analysis.
     pub name: String,
+    /// Source-visible nominal identity. Codegen and source compatibility use this name so a fresh
+    /// internal function-value origin cannot split one declared generic nominal type.
+    pub source_name: String,
     /// Fields in declaration order; the position is the field index used by MIR/codegen.
     pub fields: Vec<FieldDef>,
     /// A declared over-alignment in bytes (`align(N) Node { … }`, for GPU/DMA/page-aligned

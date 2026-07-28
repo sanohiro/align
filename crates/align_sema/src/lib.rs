@@ -3348,12 +3348,28 @@ pub fn check_program_with_effects(
     // tables grow.
     let mut structs: Vec<StructDef> = struct_decls
         .iter()
-        .map(|(m, e, s)| StructDef { name: mangle_fn(m, *e, &s.name.name), fields: Vec::new(), align: None, c_repr: false })
+        .map(|(m, e, s)| {
+            let name = mangle_fn(m, *e, &s.name.name);
+            StructDef {
+                source_name: name.clone(),
+                name,
+                fields: Vec::new(),
+                align: None,
+                c_repr: false,
+            }
+        })
         .collect();
     let mut struct_mono: HashMap<String, u32> = HashMap::new();
     let mut enums: Vec<hir::EnumDef> = enum_decls
         .iter()
-        .map(|(m, e, ed)| hir::EnumDef { name: mangle_fn(m, *e, &ed.name.name), variants: Vec::new() })
+        .map(|(m, e, ed)| {
+            let name = mangle_fn(m, *e, &ed.name.name);
+            hir::EnumDef {
+                source_name: name.clone(),
+                name,
+                variants: Vec::new(),
+            }
+        })
         .collect();
     let mut enum_mono: HashMap<String, u32> = HashMap::new();
     // Resolution context for type-declaration passes (0b/0c, templates): a bare field/payload type
@@ -3387,6 +3403,7 @@ pub fn check_program_with_effects(
     enum_ids.insert("Error".to_string(), error_enum_id);
     enums.push(hir::EnumDef {
         name: "Error".to_string(),
+        source_name: "Error".to_string(),
         variants: vec![
             hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
             hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
@@ -3416,6 +3433,7 @@ pub fn check_program_with_effects(
         struct_ids.insert("argon2_params".to_string(), structs.len() as u32);
         structs.push(StructDef {
             name: "argon2_params".to_string(),
+            source_name: "argon2_params".to_string(),
             fields: vec![
                 FieldDef { name: "m_cost".to_string(), ty: i64_field },
                 FieldDef { name: "t_cost".to_string(), ty: i64_field },
@@ -3437,6 +3455,7 @@ pub fn check_program_with_effects(
         enum_ids.insert("json.kind".to_string(), json_kind_id);
         enums.push(hir::EnumDef {
             name: "json.kind".to_string(),
+            source_name: "json.kind".to_string(),
             variants: ["Object", "Array", "Str", "Number", "Bool", "Null", "Missing"]
                 .into_iter()
                 .map(|v| hir::EnumVariant { name: v.to_string(), payload: Vec::new(), field_base: 1 })
@@ -3452,6 +3471,7 @@ pub fn check_program_with_effects(
         struct_ids.insert("regex_match".to_string(), structs.len() as u32);
         structs.push(StructDef {
             name: "regex_match".to_string(),
+            source_name: "regex_match".to_string(),
             fields: vec![
                 FieldDef { name: "start".to_string(), ty: i64_field },
                 FieldDef { name: "end".to_string(), ty: i64_field },
@@ -3591,7 +3611,14 @@ pub fn check_program_with_effects(
         }
         // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
         // alloca / struct-array element). `None` = the type's natural alignment.
-        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: s.align, c_repr: s.c_repr };
+        let name = mangle_fn(module, *_is_entry, &s.name.name);
+        structs[i] = StructDef {
+            source_name: name.clone(),
+            name,
+            fields,
+            align: s.align,
+            c_repr: s.c_repr,
+        };
     }
 
     // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
@@ -3744,7 +3771,12 @@ pub fn check_program_with_effects(
             variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
             field_base += n;
         }
-        enums[i] = hir::EnumDef { name: mangle_fn(module, *_is_entry, &e.name.name), variants };
+        let name = mangle_fn(module, *_is_entry, &e.name.name);
+        enums[i] = hir::EnumDef {
+            source_name: name.clone(),
+            name,
+            variants,
+        };
     }
 
     // Pass 0c-2: enum-field acyclicity. A struct field may now be a sum type (J1b), and an enum embeds
@@ -4945,21 +4977,56 @@ impl EffectScan<'_> {
                     self.expr(init);
                     if self.known_effects.is_some() {
                         self.set_local_effect(*local, self.fn_value_effect(init), false);
+                        self.join_concrete_struct_effects(*local, init);
                     }
                 }
                 Stmt::Assign { local, value, .. } => {
                     self.expr(value);
                     if self.known_effects.is_some() {
                         self.set_local_effect(*local, self.fn_value_effect(value), true);
+                        self.join_concrete_struct_effects(*local, value);
                     }
                 }
-                Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
-                Stmt::AssignIndex { base, index, value }
-                | Stmt::AssignElemField { base, index, value, .. }
-                | Stmt::AssignElem { base, index, value, .. } => {
+                Stmt::AssignField { root, path, value } => {
+                    self.expr(value);
+                    if self.known_effects.is_some() {
+                        self.join_concrete_struct_field_effect(*root, path, value);
+                    }
+                }
+                Stmt::LetTuple { init, .. } => self.expr(init),
+                Stmt::AssignIndex { base, index, value } => {
                     self.mark_view_write(*base);
                     self.expr(index);
                     self.expr(value);
+                }
+                Stmt::AssignElemField {
+                    base,
+                    index,
+                    path,
+                    struct_id,
+                    value,
+                    ..
+                } => {
+                    self.mark_view_write(*base);
+                    self.expr(index);
+                    self.expr(value);
+                    if self.known_effects.is_some() {
+                        self.join_concrete_struct_id_field_effect(*struct_id, path, value);
+                    }
+                }
+                Stmt::AssignElem {
+                    base,
+                    index,
+                    struct_id,
+                    value,
+                    ..
+                } => {
+                    self.mark_view_write(*base);
+                    self.expr(index);
+                    self.expr(value);
+                    if self.known_effects.is_some() {
+                        self.join_concrete_struct_id_effects(*struct_id, value);
+                    }
                 }
                 Stmt::AssignVecLane { value, .. } => self.expr(value),
                 Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.expr(e),
@@ -5024,6 +5091,156 @@ impl EffectScan<'_> {
         let Ty::Fn(fid) = local.ty else { return };
         let Some(ft) = self.fn_types.get(fid as usize) else { return };
         ft.effect.set(if join { ft.effect.get().join(incoming) } else { incoming });
+    }
+
+    fn projected_fn_effect(&self, expr: &Expr, path: &[u32]) -> FnEffect {
+        let Some((&field, rest)) = path.split_first() else {
+            return self.fn_value_effect(expr);
+        };
+        match &expr.kind {
+            ExprKind::StructLit { fields, .. } => fields
+                .get(field as usize)
+                .map(|value| self.projected_fn_effect(value, rest))
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::Local(local) => {
+                let Some(mut ty) = self.locals.get(*local as usize).map(|local| local.ty) else {
+                    return FnEffect::Unknown;
+                };
+                for &index in path {
+                    let Ty::Struct(id) = ty else {
+                        return FnEffect::Unknown;
+                    };
+                    let Some(field) = self
+                        .structs
+                        .get(id as usize)
+                        .and_then(|def| def.fields.get(index as usize))
+                    else {
+                        return FnEffect::Unknown;
+                    };
+                    ty = field.ty;
+                }
+                self.type_effect(ty)
+            }
+            ExprKind::If { then, els, .. } => self
+                .block_projected_fn_effect(then, path)
+                .join(self.block_projected_fn_effect(els, path)),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .map(|arm| self.projected_fn_effect(&arm.body, path))
+                .reduce(FnEffect::join)
+                .unwrap_or(FnEffect::Unknown),
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::Unsafe(block)
+            | ExprKind::TaskGroup(block) => self.block_projected_fn_effect(block, path),
+            _ => FnEffect::Unknown,
+        }
+    }
+
+    fn block_projected_fn_effect(&self, block: &Block, path: &[u32]) -> FnEffect {
+        block
+            .value
+            .as_deref()
+            .map(|value| self.projected_fn_effect(value, path))
+            .unwrap_or(FnEffect::Unknown)
+    }
+
+    fn join_concrete_struct_effects(&self, local: LocalId, incoming: &Expr) {
+        let Some(Ty::Struct(id)) = self.locals.get(local as usize).map(|local| local.ty) else {
+            return;
+        };
+        self.join_concrete_struct_id_effects(id, incoming);
+    }
+
+    fn join_concrete_struct_id_effects(&self, id: u32, incoming: &Expr) {
+        let Some(def) = self.structs.get(id as usize) else {
+            return;
+        };
+        // A source annotation has no concrete target and stays Unknown. Only an inferred,
+        // origin-aware instance may accumulate precise targets in its private FnTy cells.
+        if def.name == def.source_name {
+            return;
+        }
+        for (index, field) in def.fields.iter().enumerate() {
+            self.join_concrete_field_effect(
+                field.ty,
+                incoming,
+                &mut vec![index as u32],
+            );
+        }
+    }
+
+    fn join_concrete_struct_field_effect(
+        &self,
+        root: LocalId,
+        field_path: &[u32],
+        incoming: &Expr,
+    ) {
+        let Some(mut ty) = self.locals.get(root as usize).map(|local| local.ty) else {
+            return;
+        };
+        self.join_concrete_type_field_effect(&mut ty, field_path, incoming);
+    }
+
+    fn join_concrete_struct_id_field_effect(
+        &self,
+        struct_id: u32,
+        field_path: &[u32],
+        incoming: &Expr,
+    ) {
+        let mut ty = Ty::Struct(struct_id);
+        self.join_concrete_type_field_effect(&mut ty, field_path, incoming);
+    }
+
+    fn join_concrete_type_field_effect(
+        &self,
+        ty: &mut Ty,
+        field_path: &[u32],
+        incoming: &Expr,
+    ) {
+        for &index in field_path {
+            let Ty::Struct(id) = *ty else {
+                return;
+            };
+            let Some(def) = self.structs.get(id as usize) else {
+                return;
+            };
+            if def.name == def.source_name {
+                return;
+            }
+            let Some(field) = def.fields.get(index as usize) else {
+                return;
+            };
+            *ty = field.ty;
+        }
+        self.join_concrete_field_effect(*ty, incoming, &mut Vec::new());
+    }
+
+    fn join_concrete_field_effect(&self, ty: Ty, incoming: &Expr, path: &mut Vec<u32>) {
+        match ty {
+            Ty::Fn(id) => {
+                let Some(function) = self.fn_types.get(id as usize) else {
+                    return;
+                };
+                function
+                    .effect
+                    .set(function.effect.get().join(self.projected_fn_effect(incoming, path)));
+            }
+            Ty::Struct(id) => {
+                let Some(def) = self.structs.get(id as usize) else {
+                    return;
+                };
+                if def.name == def.source_name {
+                    return;
+                }
+                for (index, field) in def.fields.iter().enumerate() {
+                    path.push(index as u32);
+                    self.join_concrete_field_effect(field.ty, incoming, path);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn consume_fn_value(&mut self, expr: &Expr) {
@@ -11977,6 +12194,58 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn source_ty_matches(&self, a: Ty, b: Ty) -> bool {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Ty::Fn(aid), Ty::Fn(bid)) => self
+                .fn_types
+                .get(aid as usize)
+                .zip(self.fn_types.get(bid as usize))
+                .is_some_and(|(a, b)| a == b),
+            (Ty::Struct(aid), Ty::Struct(bid)) => self
+                .structs
+                .get(aid as usize)
+                .zip(self.structs.get(bid as usize))
+                .is_some_and(|(a, b)| a.source_name == b.source_name),
+            (Ty::Enum(aid), Ty::Enum(bid)) => self
+                .enums
+                .get(aid as usize)
+                .zip(self.enums.get(bid as usize))
+                .is_some_and(|(a, b)| a.source_name == b.source_name),
+            (Ty::Option(a), Ty::Option(b))
+            | (Ty::Box(a), Ty::Box(b))
+            | (Ty::Slice(a), Ty::Slice(b))
+            | (Ty::DynArray(a), Ty::DynArray(b))
+            | (Ty::Task(a), Ty::Task(b)) => self.source_scalar_matches(a, b),
+            (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
+                self.source_scalar_matches(a_ok, b_ok)
+                    && self.source_scalar_matches(a_err, b_err)
+            }
+            (Ty::Array(a, an), Ty::Array(b, bn))
+            | (Ty::Vec(a, an), Ty::Vec(b, bn))
+            | (Ty::Mask(a, an), Ty::Mask(b, bn)) => {
+                an == bn && self.source_scalar_matches(a, b)
+            }
+            (Ty::StructArray(a, an), Ty::StructArray(b, bn)) => {
+                an == bn && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
+            }
+            (Ty::DynStructArray(a, al), Ty::DynStructArray(b, bl)) => {
+                al == bl && self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
+            }
+            (Ty::Soa(a), Ty::Soa(b)) => {
+                self.source_ty_matches(Ty::Struct(a), Ty::Struct(b))
+            }
+            _ => false,
+        }
+    }
+
+    fn source_scalar_matches(&self, a: Scalar, b: Scalar) -> bool {
+        a == b || self.source_ty_matches(scalar_to_ty(a), scalar_to_ty(b))
+    }
+
     /// Unify two types, returning the resolved type. Pushes a diagnostic on mismatch.
     fn unify(&mut self, a: Ty, b: Ty, span: Span) -> Ty {
         let (a, b) = (self.resolve(a), self.resolve(b));
@@ -12004,19 +12273,9 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Ty::FloatVar(v1)
             }
-            // The effect bit is inferred internal information, not source-level type syntax. Two
-            // function values are compatible when their callable signatures match; the value-flow
-            // pass later joins their effects in the destination local's function type.
-            (Ty::Fn(aid), Ty::Fn(bid))
-                if self
-                    .fn_types
-                    .get(aid as usize)
-                    .zip(self.fn_types.get(bid as usize))
-                    .is_some_and(|(a, b)| a == b) =>
-            {
-                Ty::Fn(aid)
-            }
-            _ if a == b => a,
+            // Inferred function-value effects and their origin-specific generic nominal instances
+            // are internal facts. Written signature facts remain exact source identity.
+            _ if self.source_ty_matches(a, b) => a,
             _ => {
                 self.diags.error(
                     format!("type mismatch: {} vs {}", self.ty_display(a), self.ty_display(b)),
@@ -12033,8 +12292,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`).
     fn ty_display(&self, ty: Ty) -> String {
         match ty {
-            Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.name.clone()).unwrap_or_else(|| ty_name(ty)),
-            Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.name.clone()).unwrap_or_else(|| ty_name(ty)),
+            Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
+            Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.source_name.clone()).unwrap_or_else(|| ty_name(ty)),
             Ty::Option(s) => format!("Option<{}>", self.scalar_display(s)),
             Ty::Result(o, e) => format!(
                 "Result<{}, {}>",
@@ -22959,14 +23218,13 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Whether a value of type `got` satisfies an expected payload/field type `expected`. Exact type
-    /// identity, EXCEPT function values compare **by signature, not by `fn_types` id**: each `fn`
-    /// expression interns a fresh `FnTy` (its inferred effect bit / origin differ), so two
-    /// `fn(i64) -> i64` values are interchangeable though their ids differ. Mirrors [`unify`]'s
-    /// `Ty::Fn` arm — the one place a bare `!=` on resolved types is wrong for a fn value.
+    /// identity, except inferred function-value origins and the generic nominal instances that
+    /// contain them compare by their recursively source-visible signature. Mirrors [`unify`];
+    /// effect-origin ids are analysis facts, not written type syntax.
     fn payload_ty_matches(&self, got: Ty, expected: Ty) -> bool {
         let got = self.resolve(got);
         let expected = self.resolve(expected);
-        if got == expected {
+        if self.source_ty_matches(got, expected) {
             return true;
         }
         match (got, expected) {
@@ -22978,28 +23236,8 @@ impl<'a, 't> Checker<'a, 't> {
                 got,
                 expand_tagged_ty(expected, self.tagged_types),
             ),
-            (Ty::Option(a), Ty::Option(b)) => {
-                self.payload_scalar_matches(a, b)
-            }
-            (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
-                self.payload_scalar_matches(a_ok, b_ok)
-                    && self.payload_scalar_matches(a_err, b_err)
-            }
-            (Ty::Fn(aid), Ty::Fn(bid)) => self
-                .fn_types
-                .get(aid as usize)
-                .zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| a == b),
             _ => false,
         }
-    }
-
-    fn payload_scalar_matches(&self, got: Scalar, expected: Scalar) -> bool {
-        got == expected
-            || matches!(got, Scalar::Tagged(_))
-                && self.payload_ty_matches(scalar_to_ty(got), scalar_to_ty(expected))
-            || matches!(expected, Scalar::Tagged(_))
-                && self.payload_ty_matches(scalar_to_ty(got), scalar_to_ty(expected))
     }
 
     /// `Type.Variant(args)` — construct a sum-type value with a payload. Checks the argument count
@@ -24851,6 +25089,30 @@ fn mangle_mono(
     s
 }
 
+/// Source-visible counterpart of [`mangle_mono`]. Concrete function-value effect origins are
+/// erased, but all written signature facts remain structural identity.
+fn mangle_mono_source(
+    name: &str,
+    args: &[Ty],
+    tagged_types: &[hir::TaggedType],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    fn_types: &[hir::FnTy],
+) -> String {
+    let mut s = name.to_string();
+    for a in args {
+        s.push('$');
+        s.push_str(&source_ty_mangle(
+            *a,
+            tagged_types,
+            structs,
+            enums,
+            fn_types,
+        ));
+    }
+    s
+}
+
 /// A compact, identifier-safe spelling of a concrete type for use in a mangled symbol name.
 fn ty_mangle(
     ty: Ty,
@@ -24859,12 +25121,35 @@ fn ty_mangle(
     enums: &[hir::EnumDef],
     fn_types: &[hir::FnTy],
 ) -> String {
+    ty_mangle_impl(ty, tagged_types, structs, enums, fn_types, true)
+}
+
+fn source_ty_mangle(
+    ty: Ty,
+    tagged_types: &[hir::TaggedType],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    fn_types: &[hir::FnTy],
+) -> String {
+    ty_mangle_impl(ty, tagged_types, structs, enums, fn_types, false)
+}
+
+fn ty_mangle_impl(
+    ty: Ty,
+    tagged_types: &[hir::TaggedType],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    fn_types: &[hir::FnTy],
+    include_fn_origin: bool,
+) -> String {
+    #[allow(clippy::too_many_arguments)]
     fn key(
         ty: Ty,
         tagged_types: &[hir::TaggedType],
         structs: &[StructDef],
         enums: &[hir::EnumDef],
         fn_types: &[hir::FnTy],
+        include_fn_origin: bool,
         tagged_visiting: &mut HashSet<u32>,
         fn_visiting: &mut HashSet<u32>,
     ) -> String {
@@ -24877,6 +25162,7 @@ fn ty_mangle(
                 structs,
                 enums,
                 fn_types,
+                include_fn_origin,
                 tagged_visiting,
                 fn_visiting,
             )
@@ -24884,11 +25170,25 @@ fn ty_mangle(
         match ty {
             Ty::Struct(id) => structs.get(id as usize).map_or_else(
                 || "S_invalid".to_string(),
-                |s| format!("S{}_{}", s.name.len(), s.name),
+                |s| {
+                    let name = if include_fn_origin {
+                        &s.name
+                    } else {
+                        &s.source_name
+                    };
+                    format!("S{}_{}", name.len(), name)
+                },
             ),
             Ty::Enum(id) => enums.get(id as usize).map_or_else(
                 || "E_invalid".to_string(),
-                |e| format!("E{}_{}", e.name.len(), e.name),
+                |e| {
+                    let name = if include_fn_origin {
+                        &e.name
+                    } else {
+                        &e.source_name
+                    };
+                    format!("E{}_{}", name.len(), name)
+                },
             ),
             Ty::Tagged(id) if tagged_visiting.insert(id) => {
                 let result = match tagged_types.get(id as usize) {
@@ -24941,6 +25241,7 @@ fn ty_mangle(
                     structs,
                     enums,
                     fn_types,
+                    include_fn_origin,
                     tagged_visiting,
                     fn_visiting
                 )
@@ -24954,6 +25255,7 @@ fn ty_mangle(
                         structs,
                         enums,
                         fn_types,
+                        include_fn_origin,
                         tagged_visiting,
                         fn_visiting
                     )
@@ -24967,6 +25269,7 @@ fn ty_mangle(
                     structs,
                     enums,
                     fn_types,
+                    include_fn_origin,
                     tagged_visiting,
                     fn_visiting
                 )
@@ -25019,14 +25322,20 @@ fn ty_mangle(
                                 roots(params, captures)
                             }
                         };
+                        let origin = if include_fn_origin {
+                            id.to_string()
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "F{id}_{params}_{}_b{borrow}_r{region}",
+                            "F{origin}_{params}_{}_b{borrow}_r{region}",
                             key(
                                 function.ret,
                                 tagged_types,
                                 structs,
                                 enums,
                                 fn_types,
+                                include_fn_origin,
                                 tagged_visiting,
                                 fn_visiting
                             )
@@ -25046,6 +25355,7 @@ fn ty_mangle(
         structs,
         enums,
         fn_types,
+        include_fn_origin,
         &mut HashSet::new(),
         &mut HashSet::new(),
     )
@@ -26317,6 +26627,8 @@ fn instantiate_struct(
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
     }
+    let source_name =
+        mangle_mono_source(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
         let fty = subst_param_ty(f.ty, args, cx.tagged_types);
@@ -26329,7 +26641,13 @@ fn instantiate_struct(
         fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
     }
     let id = cx.structs.len() as u32;
-    cx.structs.push(StructDef { name: mangled.clone(), fields, align: tmpl.align, c_repr: tmpl.c_repr });
+    cx.structs.push(StructDef {
+        name: mangled.clone(),
+        source_name,
+        fields,
+        align: tmpl.align,
+        c_repr: tmpl.c_repr,
+    });
     cx.struct_mono.insert(mangled, id);
     id
 }
@@ -26380,6 +26698,8 @@ fn instantiate_enum(
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
     }
+    let source_name =
+        mangle_mono_source(name, args, cx.tagged_types, cx.structs, cx.enums, cx.fn_types);
     let mut variants = Vec::with_capacity(tmpl.variants.len());
     for v in &tmpl.variants {
         let payload: Vec<Scalar> = v
@@ -26406,7 +26726,11 @@ fn instantiate_enum(
         variants.push(hir::EnumVariant { name: v.name.clone(), payload, field_base: v.field_base });
     }
     let id = cx.enums.len() as u32;
-    cx.enums.push(hir::EnumDef { name: mangled.clone(), variants });
+    cx.enums.push(hir::EnumDef {
+        name: mangled.clone(),
+        source_name,
+        variants,
+    });
     cx.enum_mono.insert(mangled, id);
     id
 }
@@ -28172,6 +28496,7 @@ mod tests {
         let structs = vec![
             StructDef {
                 name: "Inner".to_string(),
+                source_name: "Inner".to_string(),
                 fields: vec![FieldDef {
                     name: "detail".to_string(),
                     ty: Ty::Option(Scalar::String),
@@ -28181,6 +28506,7 @@ mod tests {
             },
             StructDef {
                 name: "Outer".to_string(),
+                source_name: "Outer".to_string(),
                 fields: vec![FieldDef {
                     name: "inner".to_string(),
                     ty: Ty::Struct(0),
@@ -28211,6 +28537,7 @@ mod tests {
     fn drop_plan_fails_closed_on_cycles_and_missing_ids() {
         let cyclic = vec![StructDef {
             name: "Node".to_string(),
+            source_name: "Node".to_string(),
             fields: vec![FieldDef {
                 name: "next".to_string(),
                 ty: Ty::Option(Scalar::Struct(0)),
@@ -28226,6 +28553,7 @@ mod tests {
 
         let missing_nested = vec![StructDef {
             name: "Broken".to_string(),
+            source_name: "Broken".to_string(),
             fields: vec![FieldDef {
                 name: "value".to_string(),
                 ty: Ty::Option(Scalar::Struct(99)),
@@ -28239,6 +28567,7 @@ mod tests {
         );
         let missing_enum_payload = vec![hir::EnumDef {
             name: "BrokenEnum".to_string(),
+            source_name: "BrokenEnum".to_string(),
             variants: vec![hir::EnumVariant {
                 name: "Value".to_string(),
                 payload: vec![Scalar::Struct(99)],
@@ -28255,6 +28584,7 @@ mod tests {
     fn drop_plan_shares_repeated_subgraphs() {
         let mut structs = vec![StructDef {
             name: "S0".to_string(),
+            source_name: "S0".to_string(),
             fields: vec![FieldDef {
                 name: "copy".to_string(),
                 ty: Ty::Int(IntTy {
@@ -28269,6 +28599,7 @@ mod tests {
             let child = (depth - 1) as u32;
             structs.push(StructDef {
                 name: format!("S{depth}"),
+                source_name: format!("S{depth}"),
                 fields: vec![
                     FieldDef {
                         name: "left".to_string(),
@@ -28301,6 +28632,7 @@ mod tests {
     fn drop_plan_handles_a_deep_linear_nominal_chain() {
         let mut structs = vec![StructDef {
             name: "S0".to_string(),
+            source_name: "S0".to_string(),
             fields: vec![FieldDef {
                 name: "copy".to_string(),
                 ty: Ty::Bool,
@@ -28311,6 +28643,7 @@ mod tests {
         for depth in 1..512 {
             structs.push(StructDef {
                 name: format!("S{depth}"),
+                source_name: format!("S{depth}"),
                 fields: vec![FieldDef {
                     name: "next".to_string(),
                     ty: Ty::Struct((depth - 1) as u32),
@@ -28341,19 +28674,45 @@ mod tests {
             ty_mangle(Ty::Fn(1), &[], &[], &[], &origins),
             "concrete function-value origins need distinct semantic monomorphs so later effect refinement cannot alias their cells"
         );
+        assert_eq!(
+            source_ty_mangle(Ty::Fn(0), &[], &[], &[], &origins),
+            source_ty_mangle(Ty::Fn(1), &[], &[], &[], &origins),
+            "source-visible function types erase inferred effect origins"
+        );
         let mangle_signature = |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[function]);
+        let source_mangle_signature =
+            |function| source_ty_mangle(Ty::Fn(0), &[], &[], &[], &[function]);
         assert_ne!(
             mangle_signature(by_value.clone()),
             mangle_signature(function(ast::ParamMode::Out, hir::ReturnBorrowSummary::None)),
             "parameter mode is monomorph signature identity"
         );
         assert_ne!(
-            mangle_signature(by_value),
+            source_mangle_signature(by_value.clone()),
+            source_mangle_signature(function(
+                ast::ParamMode::Out,
+                hir::ReturnBorrowSummary::None
+            )),
+            "parameter mode remains source-visible signature identity"
+        );
+        assert_ne!(
+            mangle_signature(by_value.clone()),
             mangle_signature(function(
                 ast::ParamMode::ByValue,
                 hir::ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] },
             )),
             "return provenance is monomorph signature identity"
+        );
+        assert_ne!(
+            source_mangle_signature(by_value),
+            source_mangle_signature(function(
+                ast::ParamMode::ByValue,
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![0],
+                    captures: vec![]
+                },
+            )),
+            "return provenance remains source-visible signature identity"
         );
     }
 }

@@ -460,6 +460,133 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn generic_fn_wrapper_matches_an_explicit_source_signature() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn use(h: Holder<fn(i64) -> i64>, x: i64) -> i64 = h.callback(x)
+fn main() -> i32 {
+  first := Holder { callback: quiet }
+  second := Holder { callback: quiet }
+  return (use(first, 20) + use(second, 20)) as i32
+}
+";
+    assert!(
+        !check_errs("generic-fn-wrapper-source-signature", src),
+        "an inferred concrete function origin must retain the source-visible generic nominal identity"
+    );
+    assert_eq!(
+        build_and_run("generic-fn-wrapper-source-signature", src)
+            .status
+            .code(),
+        Some(42)
+    );
+    let option = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn use(maybe: Option<Holder<fn(i64) -> i64>>, x: i64) -> i64 {
+  holder := maybe else { return 0 }
+  return holder.callback(x)
+}
+fn main() -> i32 {
+  holder := Holder { callback: quiet }
+  return use(Some(holder), 41) as i32
+}
+";
+    assert_eq!(
+        build_and_run("generic-fn-wrapper-source-signature-option", option)
+            .status
+            .code(),
+        Some(42),
+        "source nominal compatibility must recurse through aggregate payloads"
+    );
+}
+
+#[test]
+fn reassigned_generic_fn_wrapper_joins_effect_origins() {
+    let src = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut holder := Holder { callback: quiet }
+  if x > 0 { holder = Holder { callback: loud } }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-reassigned-generic-fn-wrapper", src),
+        "assigning another concrete origin into a generic wrapper must join its effect"
+    );
+    let field = src.replace(
+        "if x > 0 { holder = Holder { callback: loud } }",
+        "holder.callback = loud",
+    );
+    assert!(
+        check_errs("parmap-reassigned-generic-fn-field", &field),
+        "assigning another concrete origin into a generic wrapper field must join its effect"
+    );
+    let joined = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  holder := if x > 0 {
+    Holder { callback: quiet }
+  } else {
+    Holder { callback: loud }
+  }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-joined-generic-fn-wrapper", joined),
+        "joining concrete origins into a generic wrapper value must join their effects"
+    );
+    let array_field = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut holders := [Holder { callback: quiet }]
+  holders[0].callback = loud
+  return holders[0].callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-reassigned-generic-fn-array-field", array_field),
+        "assigning another concrete origin into a generic wrapper array field must join its effect"
+    );
+}
+
+#[test]
 fn extern_fn_type_effect_is_impure_through_indirection() {
     let src = "\
 extern \"C\" fn abs(x: i32) -> i32

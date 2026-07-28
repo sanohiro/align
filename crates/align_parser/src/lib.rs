@@ -1812,7 +1812,12 @@ impl<'a> Parser<'a> {
             self.expect(&TokKind::LParen, "'('");
             let mut params = Vec::new();
             while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
-                let mode = if self.eat_ident_keyword("out") {
+                // `out` is a weak keyword. Consume it as a mode only when another type starts
+                // after it; otherwise `fn(out) -> T` continues to name the by-value type `out`.
+                let has_out_mode = matches!(self.peek(), TokKind::Ident(name) if name == "out")
+                    && matches!(self.peek_at(1), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
+                let mode = if has_out_mode {
+                    self.bump();
                     ParamMode::Out
                 } else {
                     ParamMode::ByValue
@@ -1991,6 +1996,31 @@ mod tests {
         let FnBody::Block(b) = &fd.body else { panic!() };
         let Stmt::Let { init, .. } = &b.stmts[0] else { panic!() };
         assert!(matches!(init.kind, ExprKind::StructLit { .. }), "init should be a struct literal");
+    }
+
+    #[test]
+    fn function_type_out_mode_preserves_the_weak_keyword_as_a_type_name() {
+        let (f, err) = parse(
+            "out { value: i64 }\nfn apply(value: fn(out) -> i64, sink: fn(out out) -> i64) -> i64 = 0\n",
+        );
+        assert!(!err);
+        let Item::Fn(fd) = &f.items[1] else { panic!("expected function") };
+        let Type::Fn { params: value_params, .. } = &fd.params[0].ty else {
+            panic!("expected function type")
+        };
+        assert_eq!(value_params[0].mode, ParamMode::ByValue);
+        assert!(matches!(
+            &value_params[0].ty,
+            Type::Named { path, .. } if path.segments[0].name == "out"
+        ));
+        let Type::Fn { params: sink_params, .. } = &fd.params[1].ty else {
+            panic!("expected function type")
+        };
+        assert_eq!(sink_params[0].mode, ParamMode::Out);
+        assert!(matches!(
+            &sink_params[0].ty,
+            Type::Named { path, .. } if path.segments[0].name == "out"
+        ));
     }
 
     #[test]
