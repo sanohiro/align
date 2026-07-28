@@ -74,6 +74,10 @@ pub struct Program {
     pub structs: Vec<StructDef>,
     /// Sum-type definitions, indexed by the id carried in [`crate::Ty::Enum`].
     pub enums: Vec<EnumDef>,
+    /// Interned nested builtin tagged payloads (`Option` / `Result`). HIR may retain unreachable
+    /// generic-template entries containing `Scalar::Param`; MIR lowering publishes only the
+    /// reachable concrete canonical closure.
+    pub tagged_types: Vec<TaggedType>,
     /// Anonymous tuple types, indexed by the id carried in [`crate::Ty::Tuple`]. Interned
     /// (deduplicated by element list) during checking, so `(i64, i64)` is one entry.
     pub tuples: Vec<TupleDef>,
@@ -89,6 +93,12 @@ pub struct Program {
     /// default object stays byte-identical — populated only when checking a unit against
     /// interface-only dependencies.
     pub imported_fns: Vec<ImportedFn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaggedType {
+    Option(crate::Scalar),
+    Result(crate::Scalar, crate::Scalar),
 }
 
 /// A cross-unit `pub` function declaration (M15 S2): its mangled symbol plus its signature, with no

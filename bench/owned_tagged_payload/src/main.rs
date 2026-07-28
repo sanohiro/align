@@ -18,6 +18,10 @@ extern "C" {
     fn tagged_recursive_decode_error(reps: i64) -> i64;
     fn tagged_recursive_else(reps: i64) -> i64;
     fn tagged_recursive_map_err(reps: i64) -> i64;
+    fn tagged_nested_none(reps: i64) -> i64;
+    fn tagged_nested_some(reps: i64) -> i64;
+    fn tagged_nested_decode(reps: i64) -> i64;
+    fn tagged_nested_native(reps: i64) -> i64;
     fn tagged_multi_both(reps: i64) -> i64;
     fn tagged_multi_wildcard(reps: i64) -> i64;
     fn tagged_multi_early_try(reps: i64) -> i64;
@@ -36,7 +40,7 @@ fn measure(kernel: Kernel, reps: i64) -> (i64, i64, Duration, i64) {
 
 fn main() {
     let reps = 1_000_000;
-    let rows: [(&str, Kernel, i64, Option<i64>); 17] = [
+    let rows: [(&str, Kernel, i64, Option<i64>); 21] = [
         ("scalar", scalar_rows, 0, None),
         ("none", tagged_none, 0, None),
         ("some", tagged_some, reps, None),
@@ -80,6 +84,25 @@ fn main() {
             tagged_recursive_map_err,
             reps,
             Some(reps * 4),
+        ),
+        ("nested-none", tagged_nested_none, 0, Some(reps * 2)),
+        (
+            "nested-some",
+            tagged_nested_some,
+            reps * 2,
+            Some(reps * 7),
+        ),
+        (
+            "nested-decode",
+            tagged_nested_decode,
+            reps,
+            Some(reps * 6),
+        ),
+        (
+            "nested-native",
+            tagged_nested_native,
+            reps * 2,
+            Some(reps * 7),
         ),
         (
             "multi-both",

@@ -1172,9 +1172,9 @@ L1b-c  tagged-in-tagged type representation and exact Result<Option<Output>, DbE
 ```
 
 L1b-a established direct recursively Move payloads. L1b-b admits multiple Move payloads only after
-partial construction and mixed-provenance rules close. Nested `Option`/`Result` payloads remain
-fail-closed until L1b-c removes that diagnostic after type representation, generic
-substitution, HIR/MIR, LLVM layout, interface round-trip, and malformed-interface validation agree.
+partial construction and mixed-provenance rules close. L1b-c admits nested `Option`/`Result`
+payloads after type representation, generic substitution, HIR/MIR, LLVM layout, interface
+round-trip, and malformed-interface validation agree.
 Arbitrary new Move-element collection layouts, resources, and borrowed-parameter modes remain in
 their later milestones. L1b-a may slightly exceed 1,000 total added-plus-removed lines because the
 safe vertical unit must remove obsolete sema rejection paths, add MIR ownership, add LLVM recursive
@@ -1205,6 +1205,118 @@ including the closure-matrix regressions and benchmark rows.
 Author-side closure requires every applicable row to point to both code and a passing test before
 preflight. A review finding reopens its entire row and all other consumers of the same ownership
 fact; it is not closed by patching only the reported expression.
+
+### 8.4 L1b-c tagged type representation and author plan
+
+L1b-c keeps `Ty` and `Scalar` compact and `Copy`. It does not make either recursively heap-owned.
+The exact internal record is:
+
+```text
+TaggedTypeId = u32
+
+TaggedType
+  Option => payload: Scalar
+  Result => ok: Scalar, err: Scalar
+
+Scalar::Tagged(TaggedTypeId)
+Ty::Tagged(TaggedTypeId)
+
+HIR Program
+  tagged_types: sequence<TaggedType>
+
+MIR Program
+  tagged_types: sequence<TaggedType>  # concrete, reachable, structurally ordered
+```
+
+`Ty::Option` and `Ty::Result` remain the ordinary outer type forms. `Scalar::Tagged(id)` is used
+only when one of those forms is itself a scalar payload. `Ty::Tagged(id)` is the reversible
+scalar-to-type view of that payload; semantic comparison and display expand it through the owning
+program's `tagged_types` table.
+
+There is exactly one structural tagged interner in one sema universe. It admits no duplicate entry,
+so raw `TaggedTypeId` equality is semantic equality only inside that universe; the existing derived
+`Ty`/`Scalar` equality remains valid there. No raw id is compared across whole-program, producer, or
+consumer universes. Cross-universe identity is always the existing id-free recursive `IType`.
+Display, diagnostics, and monomorph symbol keys are table-aware and render a complete structural
+type; they never print or mangle a raw tagged id.
+
+Generic templates may temporarily reference `Scalar::Param` inside a tagged entry. Substitution
+recursively substitutes the complete reachable tagged shape, interns the concrete result, and
+leaves no `Param` or template-only tagged entry reachable from a monomorphized signature or HIR
+expression. Before MIR lowering, the compiler computes the closure of tagged entries reachable from
+every `Ty`/`Scalar` occurrence in concrete function signatures, locals, expressions and their
+type-bearing child records, captures, stages, struct/sum/tuple/function types, extern/imported
+declarations, and other HIR program fields. It rejects a reachable `Param`, missing id, or cycle;
+derives an injective id-free ADT key for every reachable entry; sorts by that key; and remaps every
+reachable `Scalar::Tagged`/`Ty::Tagged` reference into one compact concrete MIR table. The key uses
+fixed tags for builtin leaves and fully qualified nominal identities plus recursively encoded
+generic arguments for struct/sum leaves; it never uses display text, mangled text, or local nominal
+ids. Unreachable template entries are not copied to MIR and therefore cannot affect layout or cache
+identity. Programs with the same complete reachable tagged set produce the same MIR table and ids
+regardless of generic instantiation or source-resolution order.
+
+The interface format remains its existing recursive, id-free `IType` tree. A producer never writes
+`TaggedTypeId` into an interface. A consumer reparses the public source-shaped type and rebuilds its
+local sema table. Whole-program and per-unit compilations need not assign the same raw id when their
+complete reachable sets differ; they must reconstruct the same id-free structural type, LLVM
+layout, ABI, and behavior for their shared public surface. MIR's structural codegen-input hash
+includes its own complete canonical table in order; an omitted or changed entry cannot hit a stale
+object.
+
+LLVM predeclares one opaque struct per tagged entry, then assigns the existing Option or Result body
+using the already-created struct, enum, and tagged type tables. `Scalar::Tagged(id)` lowers to that
+identified struct. This preserves the current Option/Result field order, tag width, alignment, and
+by-value ABI; it does not disguise a nested tagged value as a user sum or change the user-sum
+non-union layout.
+
+The exact acceptance fixture is:
+
+```align
+Output {
+  text: string,
+  note: Option<string>,
+}
+
+NativeError {
+  code: Option<string>,
+  message: string,
+}
+
+DbError {
+  Native(NativeError),
+  Decode(string),
+}
+
+fn run(...) -> Result<Option<Output>, DbError>
+```
+
+`Ok(None)` allocates no output or error payload. `Ok(Some(Output { ... }))` owns the two live
+`string` leaves selected by the fixture, and `Err` owns only the active `DbError` arm. Heap-owned,
+arena-owned non-escaping, and path-dependent ownership cases use this same shape.
+
+The L1b-c author pass closes this matrix before preflight:
+
+| Consumer | Required L1b-c change | Evidence |
+|---|---|---|
+| type resolution | intern nested `Option`/`Result` payloads; preserve the exact written type and deterministic diagnostics | declaration/signature tests for nested Option, Result, and both arms |
+| equality, inference, display, and symbol identity | canonical interning makes raw ids equal only within one sema universe; render and mangle expanded structural shapes; never expose `tagged#N` | same shape reached in different resolution orders, function-type interning, generic mono symbols, and mismatch diagnostics |
+| generic substitution | recursively substitute and re-intern tagged entries; reject reachable unresolved parameters before MIR | used and unused generic nested tags, different instantiation orders, generic function, and generic sum tests |
+| concrete MIR closure | scan every HIR type-bearing node including expression-only temporaries, collect reachable concrete entries, injective structural-key sort, compact/remap every occurrence, and omit unused template entries | exact table assertions, expression-only nested tags, order-independence, and structural codegen-hash tests |
+| cycle and table validation | reject source cycles, missing/out-of-range ids, tagged cycles, reachable unresolved parameters, duplicate/noncanonical entries, and unreachable MIR entries before codegen | sema graph tests and malformed-MIR/codegen tests |
+| ownership classification | recurse through tagged entries for Move, Drop, and borrow provenance | DropPlan and region-analysis tests |
+| ownership mode | carry definite/maybe individual allocation through every nested tag; preserve all-heap/all-arena behavior and reject nested path-dependent return ownership at the L2 boundary | heap, arena, and path-dependent `Result<Option<Output>, DbError>` cases |
+| HIR/MIR construction and transfer | preserve the existing source-nulling, partial construction, `match`, `else`, `?`, and `map_err` rules through nested tags | exact `Result<Option<Output>, DbError>` runtime cases and MIR assertions |
+| LLVM layout and Drop | use the existing Option/Result ABI at every level and tag-test every nested Drop | LLVM layout/tag assertions and allocation/free parity |
+| physical-classifier closure | handle tagged types explicitly in LLVM scalar/ABI/layout, size/alignment, field permutation, capture/env ABI, allocation provenance, and cleanup-bit classification; keep FFI, box, array, JSON, print, sort, and hash boundaries fail-closed; no catch-all may lower Tagged to i32 | classifier unit tests plus malformed/out-of-range CodegenError tests |
+| interface and cache identity | rebuild ids from id-free interface types; reject bad nested arity/name/cycles before MIR; include canonical tagged definitions in structural MIR identity | whole/per-unit executable parity with an unrelated extra tagged type in another unit, interface-only corruption/rebuild, and hash-change tests |
+| stale assumptions | remove the L1b-c rejection and sweep old tests, diagnostics, comments, and plans that say nested tagged payloads are unsupported | repository search recorded in the PR |
+| scope boundary | retain rejection of recursive inline types, arbitrary Move-element collections, and L2 dynamic path-selected return ownership | negative owner regressions |
+
+This vertical is allowed to exceed the usual 1,000 changed-hand-written-line expectation only if
+the final diff shows that separating the table from its validation, structural cache identity, or
+LLVM/Drop consumers would create an accepted-but-unsound intermediate compiler. If the author pass
+cannot close all rows in one bounded change, revise this section and split L1b-c before admitting
+the source type.
 
 ## 9. MIR and ABI ownership
 

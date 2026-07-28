@@ -248,15 +248,14 @@ Partial Move-leaf replacement fails closed without an exact drop-old lowering, a
 field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
 larger Move leaves. L1b is split by the authoritative §8.3 closure matrix into three independently
 mergeable PRs: L1b-a (#668) admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b
-adds multiple Move payload partial construction and uniform ownership; L1b-c owns tagged-in-tagged
-type representation and the exact `Result<Option<Output>, DbError>` acceptance. L1b-b is the
-current implementation slice and keeps nested tagged payloads fail-closed for L1b-c. Dynamic
+adds multiple Move payload partial construction and uniform ownership (#669); L1b-c is the current
+implementation slice and adds tagged-in-tagged type representation plus the exact
+`Result<Option<Output>, DbError>` acceptance. Dynamic
 path-selected return cleanup bits remain L2; L1b accepts only values proven free-standing by the
 current ABI rules. Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. The remaining required order is L1b Move tagged payloads
-through Result, L2 borrow
-summaries, L3 package-defined/dependent
+variants before L1a–L7 are complete. The remaining required order is L2 borrow summaries,
+L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
 L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
 `RegionPlain` bound. No safe driver begins before L1a–L7 are complete. L2 includes contextual

@@ -11,7 +11,8 @@ tag-guard count. L1b rows cover the allocation-free `Ok` hot path plus recursive
 errors through `match`, discarded `else`, and `map_err`; every constructed nested owned leaf must
 have one matching free. L1b-b rows cover a live variant with two owned payloads, intact wildcard
 discard through the enum's tag-switched Drop, and partial construction whose second payload exits
-through `?`.
+through `?`. L1b-c rows use the exact `Result<Option<Output>, DbError>` shape and separately measure
+`Ok(None)`, `Ok(Some(Output))`, decode-error, and native-error paths.
 
 ```text
 bench/owned_tagged_payload/run.sh [native|baseline]

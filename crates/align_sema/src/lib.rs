@@ -98,6 +98,10 @@ pub enum Scalar {
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
     Enum(u32),
+    /// A nested builtin tagged payload. The id indexes `Program::tagged_types`; the referenced
+    /// entry is an `Option` or `Result` shape. Keeping only the id preserves the compact, `Copy`
+    /// representation while allowing e.g. `Result<Option<Output>, DbError>`.
+    Tagged(u32),
     /// A `soa<Struct>` view payload (the struct's id) — a `{ptr,len}` borrow over a column-major
     /// buffer, **Copy, not Move** but **region-tracked** (like [`Scalar::Str`]: it borrows arena
     /// storage, never dropped). Lets `Result<soa<T>, Error>` carry a decoded soa — the result type
@@ -305,6 +309,9 @@ pub enum Ty {
     Option(Scalar),
     /// `Result<T, E>`; both payloads are concrete scalars (M2 restriction).
     Result(Scalar, Scalar),
+    /// The type view of [`Scalar::Tagged`]. Sema expands this through the owning tagged-type table
+    /// for inference/display; MIR/codegen use the same table for layout and recursive Drop.
+    Tagged(u32),
     /// `box<T>` — an owning heap pointer to a scalar (a Move type). M3.
     Box(Scalar),
     /// `array<T>` of a fixed length — contiguous scalars. M4 (length known from the
@@ -678,6 +685,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
         // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
         Ty::Enum(id) => Some(Scalar::Enum(id)),
+        Ty::Tagged(id) => Some(Scalar::Tagged(id)),
         // A generic type parameter as an Option/Result payload (4c-3, template mode only).
         Ty::Param(i) => Some(Scalar::Param(i)),
         _ => None,
@@ -720,6 +728,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Str => Ty::Str,
         Scalar::Slice(elem) => Ty::Slice(prim_to_scalar(elem)),
         Scalar::Enum(id) => Ty::Enum(id),
+        Scalar::Tagged(id) => Ty::Tagged(id),
         Scalar::Soa(id) => Ty::Soa(id),
         Scalar::JsonDoc => Ty::JsonDoc,
         Scalar::Param(i) => Ty::Param(i),
@@ -744,6 +753,31 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
     }
 }
 
+/// Expand the reversible type view of a nested tagged payload. Other types pass through unchanged.
+/// Missing ids stay `Ty::Error`, so malformed tables fail closed before a physical classifier can
+/// silently choose a fallback representation.
+pub fn expand_tagged_ty(ty: Ty, tagged_types: &[hir::TaggedType]) -> Ty {
+    match ty {
+        Ty::Tagged(id) => match tagged_types.get(id as usize) {
+            Some(hir::TaggedType::Option(payload)) => Ty::Option(*payload),
+            Some(hir::TaggedType::Result(ok, err)) => Ty::Result(*ok, *err),
+            None => Ty::Error,
+        },
+        other => other,
+    }
+}
+
+fn intern_tagged_type(tagged_types: &mut Vec<hir::TaggedType>, tagged: hir::TaggedType) -> u32 {
+    tagged_types
+        .iter()
+        .position(|entry| *entry == tagged)
+        .unwrap_or_else(|| {
+            let id = tagged_types.len();
+            tagged_types.push(tagged);
+            id
+        }) as u32
+}
+
 /// Whether a staged `par_map` can enter the range-kernel path. The source and every intermediate
 /// value must be a Copy value whose range-kernel ABI is already defined (primitive scalar, `str`,
 /// a borrowed `slice`, or a Copy struct). A borrowed `slice` is an input-only range value for
@@ -754,35 +788,57 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
 /// and other layouts stay sequential. Keep this predicate shared by effect
 /// checking and MIR lowering so a stage is never admitted to the parallel kernel without the
 /// matching Pure and ownership boundaries.
-fn par_map_kernel_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)
-        || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums)))
+fn par_map_kernel_value(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    matches!(
+        ty,
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
+    ) || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums, tagged_types)))
 }
 
-fn par_map_kernel_input_value(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
-    par_map_kernel_value(ty, structs, enums) || matches!(ty, Ty::Slice(_))
+fn par_map_kernel_input_value(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    par_map_kernel_value(ty, structs, enums, tagged_types) || matches!(ty, Ty::Slice(_))
 }
 
-pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+pub fn par_map_staged_parallelizable(
+    source: Ty,
+    stages: &[hir::Stage],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     let mut elem = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
         Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_input_value(elem, structs, enums) || stages.is_empty() {
+    if !par_map_kernel_input_value(elem, structs, enums, tagged_types) || stages.is_empty() {
         return false;
     }
     for stage in stages {
         match stage.kind {
             hir::StageKind::Map { .. } => {
-                if !par_map_kernel_input_value(elem, structs, enums) || !par_map_kernel_value(stage.out_ty, structs, enums) {
+                if !par_map_kernel_input_value(elem, structs, enums, tagged_types)
+                    || !par_map_kernel_value(stage.out_ty, structs, enums, tagged_types)
+                {
                     return false;
                 }
                 elem = stage.out_ty;
             }
             hir::StageKind::Where { .. } => {
-                if !par_map_kernel_input_value(elem, structs, enums) || stage.out_ty != elem {
+                if !par_map_kernel_input_value(elem, structs, enums, tagged_types)
+                    || stage.out_ty != elem
+                {
                     return false;
                 }
             }
@@ -821,17 +877,23 @@ pub fn par_map_staged_parallelizable(source: Ty, stages: &[hir::Stage], structs:
 /// callable path. Keep this predicate shared with MIR and
 /// ownership analysis so the runtime's individually allocated output is never mistaken for arena
 /// storage (or vice versa).
-pub fn par_map_parallelizable(source: Ty, stages: &[hir::Stage], structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+pub fn par_map_parallelizable(
+    source: Ty,
+    stages: &[hir::Stage],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     let source_value = match source {
         Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
         Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_input_value(source_value, structs, enums) {
+    if !par_map_kernel_input_value(source_value, structs, enums, tagged_types) {
         return false;
     }
-    stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums)
+    stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums, tagged_types)
 }
 
 /// Whether the owned array produced by the range-kernel `par_map` path contains only values that
@@ -938,12 +1000,36 @@ impl DropPlan {
             DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
         }
     }
+
+    /// Whether every recursively embedded definition exists and the complete by-value graph is
+    /// acyclic. Codegen uses this on decoded/hand-built MIR before layout recursion; sema reports
+    /// the source-facing cycle diagnostic earlier for ordinary programs.
+    pub fn is_valid(&self) -> bool {
+        match self {
+            DropPlan::Invalid => false,
+            DropPlan::None | DropPlan::Leaf(_) => true,
+            DropPlan::Struct { fields, .. } => {
+                fields.iter().all(|(_, plan)| plan.is_valid())
+            }
+            DropPlan::Option(payload) => payload.is_valid(),
+            DropPlan::Result { ok, err } => ok.is_valid() && err.is_valid(),
+            DropPlan::Enum { variants, .. } => variants
+                .iter()
+                .flatten()
+                .all(|plan| plan.is_valid()),
+        }
+    }
 }
 
 /// Build the recursive Drop plan after named definitions have been resolved. The returned plan is
 /// finite for every valid Align type; inline recursive definitions produce [`DropPlan::Invalid`]
 /// rather than recursing or panicking.
-pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropPlan {
+pub fn drop_plan(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> DropPlan {
     // Keep traversal state sparse. `drop_plan` is queried from per-expression analyses, and most
     // roots are primitive or touch only a small nominal subgraph; zeroing four vectors sized to
     // every definition on every query made those common classifications quadratic in program
@@ -953,29 +1039,70 @@ pub fn drop_plan(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> DropP
     let mut enum_cache = HashMap::new();
     let mut struct_active = HashSet::new();
     let mut enum_active = HashSet::new();
+    let mut tagged_active = HashSet::new();
+    let mut tagged_cache = HashMap::new();
     drop_plan_rec(
         ty,
         structs,
         enums,
+        tagged_types,
         &mut struct_active,
         &mut enum_active,
+        &mut tagged_active,
         &mut struct_cache,
         &mut enum_cache,
+        &mut tagged_cache,
     )
     .as_ref()
     .clone()
 }
 
+// The recursive classifier deliberately keeps the three definition tables, three active sets,
+// and three memo tables as separate axes; bundling them would hide which graph owns each id.
+#[allow(clippy::too_many_arguments)]
 fn drop_plan_rec(
     ty: Ty,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
     struct_active: &mut HashSet<u32>,
     enum_active: &mut HashSet<u32>,
+    tagged_active: &mut HashSet<u32>,
     struct_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
     enum_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
+    tagged_cache: &mut HashMap<u32, std::sync::Arc<DropPlan>>,
 ) -> std::sync::Arc<DropPlan> {
     match ty {
+        Ty::Tagged(id) => {
+            if let Some(plan) = tagged_cache.get(&id) {
+                return plan.clone();
+            }
+            if !tagged_active.insert(id) {
+                return std::sync::Arc::new(DropPlan::Invalid);
+            }
+            let Some(expanded) = tagged_types.get(id as usize).map(|tagged| match *tagged {
+                hir::TaggedType::Option(payload) => Ty::Option(payload),
+                hir::TaggedType::Result(ok, err) => Ty::Result(ok, err),
+            }) else {
+                tagged_active.remove(&id);
+                return std::sync::Arc::new(DropPlan::Invalid);
+            };
+            let plan = drop_plan_rec(
+                expanded,
+                structs,
+                enums,
+                tagged_types,
+                struct_active,
+                enum_active,
+                tagged_active,
+                struct_cache,
+                enum_cache,
+                tagged_cache,
+            );
+            tagged_active.remove(&id);
+            tagged_cache.insert(id, plan.clone());
+            plan
+        }
         Ty::Struct(id) => {
             if let Some(plan) = struct_cache.get(&id) {
                 return plan.clone();
@@ -998,10 +1125,13 @@ fn drop_plan_rec(
                             field.ty,
                             structs,
                             enums,
+                            tagged_types,
                             struct_active,
                             enum_active,
+                            tagged_active,
                             struct_cache,
                             enum_cache,
+                            tagged_cache,
                         ),
                     )
                 })
@@ -1022,29 +1152,38 @@ fn drop_plan_rec(
             scalar_to_ty(payload),
             structs,
             enums,
+            tagged_types,
             struct_active,
             enum_active,
+            tagged_active,
             struct_cache,
             enum_cache,
+            tagged_cache,
         ))),
         Ty::Result(ok, err) => std::sync::Arc::new(DropPlan::Result {
             ok: drop_plan_rec(
                 scalar_to_ty(ok),
                 structs,
                 enums,
+                tagged_types,
                 struct_active,
                 enum_active,
+                tagged_active,
                 struct_cache,
                 enum_cache,
+                tagged_cache,
             ),
             err: drop_plan_rec(
                 scalar_to_ty(err),
                 structs,
                 enums,
+                tagged_types,
                 struct_active,
                 enum_active,
+                tagged_active,
                 struct_cache,
                 enum_cache,
+                tagged_cache,
             ),
         }),
         Ty::Enum(id) => {
@@ -1070,10 +1209,13 @@ fn drop_plan_rec(
                                 scalar_to_ty(*payload),
                                 structs,
                                 enums,
+                                tagged_types,
                                 struct_active,
                                 enum_active,
+                                tagged_active,
                                 struct_cache,
                                 enum_cache,
+                                tagged_cache,
                             )
                         })
                         .collect()
@@ -1153,15 +1295,30 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
 /// currently-dead" spirit as the tuple arm. Recursion terminates: a struct without a `box`
 /// indirection cannot contain itself (rejected at declaration), and `box` fields are scalars, never
 /// slices.
-fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+fn ty_mentions_slice(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     match ty {
         Ty::Slice(_) => true,
-        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples),
-        Ty::Result(o, e) => {
-            ty_mentions_slice(scalar_to_ty(o), structs, tuples) || ty_mentions_slice(scalar_to_ty(e), structs, tuples)
+        Ty::Tagged(id) => {
+            ty_mentions_slice(expand_tagged_ty(Ty::Tagged(id), tagged_types), structs, tuples, tagged_types)
         }
-        Ty::Tuple(id) => tuples[id as usize].elems.iter().any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples)),
-        Ty::Struct(id) => structs[id as usize].fields.iter().any(|f| ty_mentions_slice(f.ty, structs, tuples)),
+        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples, tagged_types),
+        Ty::Result(o, e) => {
+            ty_mentions_slice(scalar_to_ty(o), structs, tuples, tagged_types)
+                || ty_mentions_slice(scalar_to_ty(e), structs, tuples, tagged_types)
+        }
+        Ty::Tuple(id) => tuples[id as usize]
+            .elems
+            .iter()
+            .any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples, tagged_types)),
+        Ty::Struct(id) => structs[id as usize]
+            .fields
+            .iter()
+            .any(|f| ty_mentions_slice(f.ty, structs, tuples, tagged_types)),
         // The remaining types do not contain a `slice` payload in the current type model. Keep the
         // list exhaustive so a future aggregate cannot bypass escape checking by default.
         Ty::Int(_)
@@ -1237,7 +1394,13 @@ fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) ->
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
 /// same recursive classification when deciding whether an indexed result retains a synthetic
 /// temporary owner or can release it immediately after a scalar load.
-pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
+pub fn ty_may_borrow(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     match ty {
         Ty::Str
         | Ty::Slice(_)
@@ -1256,24 +1419,49 @@ pub fn ty_may_borrow(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], en
         | Ty::DictEncoded(..)
         | Ty::DynSliceArray(_)
         | Ty::Fn(_) => true,
-        Ty::Array(s, _) | Ty::DynArray(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
+        Ty::Tagged(id) => ty_may_borrow(
+            expand_tagged_ty(Ty::Tagged(id), tagged_types),
+            structs,
+            tuples,
+            enums,
+            tagged_types,
+        ),
+        Ty::Array(s, _) | Ty::DynArray(s) => {
+            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
+        }
         Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Struct(id) => structs
             .get(id as usize)
-            .is_some_and(|s| s.fields.iter().any(|f| ty_may_borrow(f.ty, structs, tuples, enums))),
-        Ty::Option(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
+            .is_some_and(|s| {
+                s.fields
+                    .iter()
+                    .any(|f| ty_may_borrow(f.ty, structs, tuples, enums, tagged_types))
+            }),
+        Ty::Option(s) => {
+            ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types)
+        }
         Ty::Result(ok, err) => {
-            ty_may_borrow(scalar_to_ty(ok), structs, tuples, enums)
-                || ty_may_borrow(scalar_to_ty(err), structs, tuples, enums)
+            ty_may_borrow(scalar_to_ty(ok), structs, tuples, enums, tagged_types)
+                || ty_may_borrow(scalar_to_ty(err), structs, tuples, enums, tagged_types)
         }
         Ty::Tuple(id) => tuples
             .get(id as usize)
-            .is_some_and(|t| t.elems.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums))),
+            .is_some_and(|t| {
+                t.elems.iter().any(|s| {
+                    ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
+                })
+            }),
         // A sum type may borrow iff a variant payload does (J1: a `str`-view / `str`-bearing-struct
         // payload — `Content.Text(view)` borrows the view's storage, so its owner must stay live).
         Ty::Enum(id) => enums
             .get(id as usize)
-            .is_some_and(|e| e.variants.iter().any(|v| v.payload.iter().any(|s| ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums)))),
-        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums),
+            .is_some_and(|e| {
+                e.variants.iter().any(|v| {
+                    v.payload.iter().any(|s| {
+                        ty_may_borrow(scalar_to_ty(*s), structs, tuples, enums, tagged_types)
+                    })
+                })
+            }),
+        Ty::Task(s) => ty_may_borrow(scalar_to_ty(s), structs, tuples, enums, tagged_types),
         _ => false,
     }
 }
@@ -1303,21 +1491,33 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// owns storage (`array<string>`); that shape has a separate element-drop model and must not be
 /// copied as one aggregate even though `ty_is_move` deliberately does not classify the fixed array
 /// slot as a heap-owning value.
-pub fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    ty_is_move(ty, structs, tuples, enums)
+pub fn ty_capture_is_move(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    ty_is_move(ty, structs, tuples, enums, tagged_types)
         || matches!(
             ty,
             Ty::Array(s, _)
                 if s.is_move()
-                    || matches!(s, Scalar::Struct(id) if struct_is_move(id, structs, enums))
-                    || matches!(s, Scalar::Enum(id) if enum_is_move(id, structs, enums))
+                    || matches!(s, Scalar::Struct(id) if struct_is_move(id, structs, enums, tagged_types))
+                    || matches!(s, Scalar::Enum(id) if enum_is_move(id, structs, enums, tagged_types))
+                    || matches!(s, Scalar::Tagged(id) if drop_plan(Ty::Tagged(id), structs, enums, tagged_types).needs_drop())
         )
 }
 
 /// Whether struct `id` has a recursive Drop plan. The canonical plan is cycle-safe and fail-closed
 /// for malformed definitions; the definition-validation pass emits the user-facing diagnostic.
-pub fn struct_is_move(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
-    drop_plan(Ty::Struct(id), structs, enums).needs_drop()
+pub fn struct_is_move(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    drop_plan(Ty::Struct(id), structs, enums, tagged_types).needs_drop()
 }
 
 /// Whether sum type `id` is a **Move** type — any variant carries an owned (Move) payload, so its
@@ -1326,8 +1526,13 @@ pub fn struct_is_move(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) ->
 /// stays **Copy** (and may still be region-tracked through borrowed fields).
 ///
 /// Uses the same canonical recursive Drop plan as structs, `Option`, and `Result`.
-pub fn enum_is_move(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
-    drop_plan(Ty::Enum(id), structs, enums).needs_drop()
+pub fn enum_is_move(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    drop_plan(Ty::Enum(id), structs, enums, tagged_types).needs_drop()
 }
 
 /// Byte threshold for the **huge struct copy** lint (`draft.md` §16): a struct passed/returned **by
@@ -1373,7 +1578,13 @@ fn align_up(n: u64, a: u64) -> u64 {
 /// field type (e.g. a `vecN<T>` field, 16-byte aligned) added to `is_field_ok` without updating
 /// **both** functions — fails loudly. Scalars top out at 64-bit (no `i128`/`f128`), so no field is
 /// wider than 8-byte aligned today.
-fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+fn ty_size_align(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    visiting: &mut Vec<u32>,
+) -> (u64, u64) {
     match ty {
         Ty::Int(it) => {
             let b = (it.bits / 8).max(1) as u64;
@@ -1386,20 +1597,37 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting
         Ty::Bool => (1, 1),
         Ty::Char => (4, 4),
         Ty::Unit => (0, 1),
-        Ty::Struct(id) => struct_size_align(id, structs, enums, visiting),
+        Ty::Tagged(id) => ty_size_align(
+            expand_tagged_ty(Ty::Tagged(id), tagged_types),
+            structs,
+            enums,
+            tagged_types,
+            visiting,
+        ),
+        Ty::Struct(id) => struct_size_align(id, structs, enums, tagged_types, visiting),
         // A sum type lowers to codegen's non-union tagged struct `{ i32 tag, <every variant's payload
         // flattened in variant order> }` (`enum_types`), natural alignment, **declaration order** (not
         // reordered — unlike a struct). Must stay the exact dual of codegen's `field_abi_align`/
         // `enum_types` (pinned by `layout_parity`). J1b: an enum is a valid struct field.
-        Ty::Enum(id) => enum_size_align(id, structs, enums, visiting),
+        Ty::Enum(id) => enum_size_align(id, structs, enums, tagged_types, visiting),
         // `Option<T>` lowers to the LLVM `{ i8 tag, T payload }` (option_struct_type): tag at 0, the
         // payload at its own alignment, size padded to that alignment. Must stay the exact dual of
         // codegen's `field_abi_align`/`option_struct_type` (pinned by `layout_parity`).
         Ty::Option(s) => {
-            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, enums, visiting);
+            let (psz, pal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
             let pal = pal.max(1);
             let payload_off = align_up(1, pal); // tag is i8; payload starts at its alignment
             (align_up(payload_off + psz, pal), pal)
+        }
+        Ty::Result(ok, err) => {
+            let (ok_size, ok_align) =
+                ty_size_align(scalar_to_ty(ok), structs, enums, tagged_types, visiting);
+            let (err_size, err_align) =
+                ty_size_align(scalar_to_ty(err), structs, enums, tagged_types, visiting);
+            let align = ok_align.max(err_align).max(1);
+            let ok_offset = align_up(1, ok_align.max(1));
+            let err_offset = align_up(ok_offset + ok_size, err_align.max(1));
+            (align_up(err_offset + err_size, align), align)
         }
         // A **bare 8-byte pointer** field: every Move handle, plus the Copy `http_headers` view whose
         // representation IS one. Codegen lowers all of them to a plain `ptr` (`scalar_type`'s pointer
@@ -1422,7 +1650,13 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef], visiting
 /// keeps declaration order. An `align(N)` over-alignment pads the reported *size* up to `N` (a tight
 /// array stride), but the reported *alignment* stays natural — the over-alignment lives at the
 /// storage seam (`type_align`), not in the aggregate type. Cycle-safe.
-fn struct_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+fn struct_size_align(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    visiting: &mut Vec<u32>,
+) -> (u64, u64) {
     if visiting.contains(&id) {
         return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
     }
@@ -1435,7 +1669,7 @@ fn struct_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], vis
         .fields
         .iter()
         .map(|f| {
-            let (fsz, fal) = ty_size_align(f.ty, structs, enums, visiting);
+            let (fsz, fal) = ty_size_align(f.ty, structs, enums, tagged_types, visiting);
             (fsz, fal.max(1))
         })
         .collect();
@@ -1470,7 +1704,13 @@ fn struct_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], vis
 /// padding. The exact dual of codegen's `enum_types` construction + `field_abi_align`'s `Ty::Enum`
 /// arm (pinned by `layout_parity`). Cycle-safe through the shared struct `visiting` set (a payload
 /// struct that loops back stops there; such a graph is rejected by `struct_acyclic` regardless).
-fn enum_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+fn enum_size_align(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    visiting: &mut Vec<u32>,
+) -> (u64, u64) {
     let Some(def) = enums.get(id as usize) else {
         return (4, 4); // an unresolved enum id — size as a bare tag (defensive; reported elsewhere)
     };
@@ -1479,7 +1719,7 @@ fn enum_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visit
     let mut align = 4u64;
     for v in &def.variants {
         for &s in &v.payload {
-            let (fsz, fal) = ty_size_align(scalar_to_ty(s), structs, enums, visiting);
+            let (fsz, fal) = ty_size_align(scalar_to_ty(s), structs, enums, tagged_types, visiting);
             let fal = fal.max(1);
             size = align_up(size, fal) + fsz;
             align = align.max(fal);
@@ -1493,8 +1733,13 @@ fn enum_size_align(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visit
 /// [`struct_size_align`] for the cross-crate layout-parity test in `align_codegen_llvm`, which checks
 /// this against the real LLVM ABI size/alignment so the two hand-written layout computations
 /// (`ty_size_align` here, `field_abi_align` there) can never silently drift.
-pub fn struct_abi_layout(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> (u64, u64) {
-    struct_size_align(id, structs, enums, &mut Vec::new())
+pub fn struct_abi_layout(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> (u64, u64) {
+    struct_size_align(id, structs, enums, tagged_types, &mut Vec::new())
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
@@ -1528,11 +1773,12 @@ fn ty_is_move(
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
 ) -> bool {
-    drop_plan(ty, structs, enums).needs_drop()
+    drop_plan(ty, structs, enums, tagged_types).needs_drop()
         || ty_tuple_is_move(ty, tuples)
         // A fixed array of Move structs owns every element recursively.
-        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums))
+        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -1617,19 +1863,31 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
-fn is_owned_droppable(ty: Ty, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+fn is_owned_droppable(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    (!matches!(ty, Ty::Box(_) | Ty::Task(_)) && drop_plan(ty, structs, enums).needs_drop())
+    (!matches!(ty, Ty::Box(_) | Ty::Task(_))
+        && drop_plan(ty, structs, enums, tagged_types).needs_drop())
         // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
-        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums))
+        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
 /// sema/MIR boundary predicate: free-standing owned values and Move tuples get path-local cleanup;
 /// arena-only `box`/`Task` values do not.
-pub fn needs_drop_flag(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef]) -> bool {
-    is_owned_droppable(ty, structs, enums) || ty_tuple_is_move(ty, tuples)
+pub fn needs_drop_flag(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    is_owned_droppable(ty, structs, enums, tagged_types) || ty_tuple_is_move(ty, tuples)
 }
 
 /// The **single** decision about which wrappers a borrow sees straight through to the value inside.
@@ -3082,6 +3340,7 @@ pub fn check_program_with_effects(
     // grow with monomorph instances of generic structs / sum types; `*_mono` dedup them by name.
     let mut tuples: Vec<hir::TupleDef> = Vec::new();
     let mut fn_types: Vec<hir::FnTy> = Vec::new();
+    let mut tagged_types: Vec<hir::TaggedType> = Vec::new();
     // Reserve a fixed slot per concrete struct / enum (its `*_ids` index), filled in Pass 0b/0c.
     // Monomorph instances are appended *after* these, so a concrete def's id stays valid as the
     // tables grow.
@@ -3224,6 +3483,7 @@ pub fn check_program_with_effects(
                     enum_mono: &mut enum_mono,
                     tuples: &mut tuples,
                     fn_types: &mut fn_types,
+                    tagged_types: &mut tagged_types,
                 }
             };
         }
@@ -3251,7 +3511,14 @@ pub fn check_program_with_effects(
                 let mut payload = Vec::with_capacity(v.payload.len());
                 for t in &v.payload {
                     let ty = resolve_type(t, build_cx!(module), &tparams, diags);
-                    match ty_to_scalar(ty) {
+                    match scalar_arg(
+                        ty,
+                        "variant payload",
+                        true,
+                        &mut tagged_types,
+                        t.span(),
+                        diags,
+                    ) {
                         Some(s) => payload.push(s),
                         None if ty != Ty::Error => diags.error(
                             format!("variant payloads must be a scalar or a type parameter for now, got {}", ty_name(ty)),
@@ -3287,6 +3554,7 @@ pub fn check_program_with_effects(
                 enum_mono: &mut enum_mono,
                 tuples: &mut tuples,
                 fn_types: &mut fn_types,
+                tagged_types: &mut tagged_types,
             }
         };
     }
@@ -3302,7 +3570,7 @@ pub fn check_program_with_effects(
             // nested-struct shape is checked structurally here; that it is scalar-only + acyclic is
             // validated in pass 0b-2, once all struct fields are populated). Slice/option/box/Move
             // fields are still rejected.
-            if !is_field_ok(ty) {
+            if !is_field_ok(ty, &tagged_types) {
                 diags.error(
                     format!("struct fields must be a primitive scalar, str, or a plain struct for now, got {}", ty_name(ty)),
                     f.span,
@@ -3347,29 +3615,41 @@ pub fn check_program_with_effects(
             }
             // The nested-struct checks apply to a direct `Struct` field AND an `Option<Struct>` field:
             // both embed the struct **inline**, so both need the acyclic + no-`align(N)` guarantees.
-            let nested = match fty {
-                Ty::Struct(nid) | Ty::Option(Scalar::Struct(nid)) => nid,
-                _ => continue,
-            };
+            let mut nested_types = Vec::new();
+            collect_inline_struct_ids(fty, &tagged_types, &mut nested_types);
+            if nested_types.is_empty() {
+                continue;
+            }
             // An `align(N)` struct embedded as a field is not honored yet — embedding needs the
             // struct's size padded up to its alignment (deferred), so the over-alignment would be
             // silently dropped. Reject it cleanly rather than mislead (only a standalone value is
             // over-aligned today).
-            if structs[nested as usize].align.is_some() {
-                diags.error(
-                    format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nested as usize].name),
-                    f.span,
-                );
+            for &nested in &nested_types {
+                if structs[nested as usize].align.is_some() {
+                    diags.error(
+                        format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nested as usize].name),
+                        f.span,
+                    );
+                }
             }
             // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
             // depth 1, `Node { next: Node }` or `Node { next: Option<Node> }`) is detected. Enum
             // payloads aren't resolved yet (that is pass 0c), so cycles running *through* an enum field
             // are checked separately after 0c (see the enum-field acyclicity pass below).
-            if !struct_acyclic(nested, &structs, &enums, &mut vec![i as u32]) {
-                diags.error(
-                    format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
-                    f.span,
-                );
+            for nested in nested_types {
+                if !struct_acyclic(
+                    nested,
+                    &structs,
+                    &enums,
+                    &tagged_types,
+                    &mut vec![i as u32],
+                ) {
+                    diags.error(
+                        format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
+                        f.span,
+                    );
+                    break;
+                }
             }
         }
     }
@@ -3439,6 +3719,15 @@ pub fn check_program_with_effects(
                     // pkg.web middleware's short-circuit verdict. A response builder is an owned
                     // opaque handle; the enum's tag-switched drop calls its null-safe free routine.
                     Ty::ResponseBuilder => payload.push(Scalar::ResponseBuilder),
+                    Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
+                        &mut tagged_types,
+                        hir::TaggedType::Option(value),
+                    ))),
+                    Ty::Result(ok, err) => payload.push(Scalar::Tagged(intern_tagged_type(
+                        &mut tagged_types,
+                        hir::TaggedType::Result(ok, err),
+                    ))),
+                    Ty::Tagged(id) => payload.push(Scalar::Tagged(id)),
                     // A sum payload is embedded inline. The combined struct/enum acyclicity pass
                     // below rejects direct and indirect recursive layouts before codegen.
                     Ty::Enum(id) => payload.push(Scalar::Enum(id)),
@@ -3467,11 +3756,17 @@ pub fn check_program_with_effects(
         let Some(enum_field) = structs[i]
             .fields
             .iter()
-            .find(|f| matches!(f.ty, Ty::Enum(_) | Ty::Option(Scalar::Enum(_))))
+            .find(|f| ty_contains_inline_enum(f.ty, &tagged_types))
         else {
             continue;
         };
-        if !struct_acyclic(i as u32, &structs, &enums, &mut Vec::new()) {
+        if !struct_acyclic(
+            i as u32,
+            &structs,
+            &enums,
+            &tagged_types,
+            &mut Vec::new(),
+        ) {
             let span = decl.2.fields.iter().find(|sf| sf.name.name == enum_field.name).map_or(decl.2.span, |sf| sf.span);
             diags.error(
                 format!("struct field '{}' is recursive through a sum type — a struct cannot contain itself without a `box` indirection", enum_field.name),
@@ -3487,7 +3782,7 @@ pub fn check_program_with_effects(
     // Enum-in-enum is legal in L1b, but both values are embedded inline. Reject direct and mutual
     // recursive sum layouts before LLVM type bodies are constructed.
     for (i, (_module, _is_entry, decl)) in enum_decls.iter().enumerate() {
-        if !enum_acyclic(i as u32, &structs, &enums) {
+        if !enum_acyclic(i as u32, &structs, &enums, &tagged_types) {
             diags.error(
                 format!(
                     "sum type '{}' is recursive — a sum type cannot contain itself without a `box` indirection",
@@ -3988,7 +4283,34 @@ pub fn check_program_with_effects(
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&mangled].bounds.clone();
         let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table, &type_table, mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&empty_imports), &const_table);
+        let mut cx = Checker::new(
+            diags,
+            &sigs,
+            &struct_ids,
+            &enum_ids,
+            &mut enums,
+            &enum_templates,
+            &mut enum_mono,
+            error_enum_id,
+            &mut structs,
+            &struct_templates,
+            &mut struct_mono,
+            &mut tuples,
+            &mut fn_types,
+            &mut tagged_types,
+            tparams,
+            bounds,
+            Vec::new(),
+            imported,
+            module.to_string(),
+            &mod_table,
+            &type_table,
+            mod_table
+                .get(module)
+                .map(|i| &i.user_imports)
+                .unwrap_or(&empty_imports),
+            &const_table,
+        );
         let mut checked = cx.check_fn(f);
         checked.name = mangled;
         let lifted = std::mem::take(&mut cx.lifted);
@@ -4021,16 +4343,45 @@ pub fn check_program_with_effects(
     // rewrote every call target to the mangled name, so nothing else needs renaming.
     let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some((oname, targs)) = worklist.pop_front() {
-        let mangled = mangle_mono(&oname, &targs);
+        let mangled = mangle_mono(&oname, &targs, &tagged_types, &structs, &enums);
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
         }
         let Some(&(tmpl_module, decl)) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
-        let imported = mod_builtin_imports.get(tmpl_module).unwrap_or(&empty_imports);
-        let user_imported = mod_table.get(tmpl_module).map(|i| &i.user_imports).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported, &const_table);
+        let imported = mod_builtin_imports
+            .get(tmpl_module)
+            .unwrap_or(&empty_imports);
+        let user_imported = mod_table
+            .get(tmpl_module)
+            .map(|i| &i.user_imports)
+            .unwrap_or(&empty_imports);
+        let mut cx = Checker::new(
+            diags,
+            &sigs,
+            &struct_ids,
+            &enum_ids,
+            &mut enums,
+            &enum_templates,
+            &mut enum_mono,
+            error_enum_id,
+            &mut structs,
+            &struct_templates,
+            &mut struct_mono,
+            &mut tuples,
+            &mut fn_types,
+            &mut tagged_types,
+            tparams,
+            bounds,
+            targs,
+            imported,
+            tmpl_module.to_string(),
+            &mod_table,
+            &type_table,
+            user_imported,
+            &const_table,
+        );
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.extend(cx.instantiations);
@@ -4059,7 +4410,9 @@ pub fn check_program_with_effects(
     // by the enclosing sum.
     for (eid, def) in enums.iter().enumerate() {
         let mut span = None;
-        if eid >= enum_decls.len() && !enum_acyclic(eid as u32, &structs, &enums) {
+        if eid >= enum_decls.len()
+            && !enum_acyclic(eid as u32, &structs, &enums, &tagged_types)
+        {
             diags.error(
                 format!(
                     "sum type '{}' is recursive after generic substitution — a sum type cannot contain itself without a `box` indirection",
@@ -4074,7 +4427,7 @@ pub fn check_program_with_effects(
                     Scalar::DynStructArray(id) => *id,
                     _ => continue,
                 };
-                if !struct_is_move(struct_id, &structs, &enums) {
+                if !struct_is_move(struct_id, &structs, &enums, &tagged_types) {
                     continue;
                 }
                 let source_span = *span.get_or_insert_with(|| {
@@ -4098,15 +4451,33 @@ pub fn check_program_with_effects(
         }
     }
 
-    let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types, imported_fns };
+    let mut program = Program {
+        fns,
+        externs,
+        link_libs,
+        structs,
+        enums,
+        tagged_types,
+        tuples,
+        fn_types,
+        imported_fns,
+    };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
     // holds a `str` element) while iterating `&mut fns`.
-    let Program { fns, tuples, structs, enums, .. } = &mut program;
+    let Program {
+        fns,
+        tuples,
+        structs,
+        enums,
+        tagged_types,
+        ..
+    } = &mut program;
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
     let enums: &[hir::EnumDef] = enums;
+    let tagged_types: &[hir::TaggedType] = tagged_types;
     for f in fns.iter_mut() {
         MoveCheck {
             f,
@@ -4114,6 +4485,7 @@ pub fn check_program_with_effects(
             tuples,
             structs,
             enums,
+            tagged_types,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
@@ -4128,6 +4500,7 @@ pub fn check_program_with_effects(
                 tuples,
                 structs,
                 enums,
+                tagged_types,
                 state: EscapeState::default(),
                 drop_region: std::collections::HashMap::new(),
                 drop_individual: std::collections::HashMap::new(),
@@ -4150,7 +4523,10 @@ pub fn check_program_with_effects(
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| is_owned_droppable(l.ty, structs, enums) || ty_tuple_is_move(l.ty, tuples))
+            .filter(|l| {
+                is_owned_droppable(l.ty, structs, enums, tagged_types)
+                    || ty_tuple_is_move(l.ty, tuples)
+            })
             .map(|l| l.id)
             .collect();
         let individual: Vec<LocalId> = drops
@@ -4320,6 +4696,7 @@ fn refine_fn_value_types(
             externs: &externs,
             structs: &program.structs,
             enums: &program.enums,
+            tagged_types: &program.tagged_types,
         };
         scan.block(&f.body);
     }
@@ -4371,6 +4748,7 @@ fn compute_effect_sets(
             externs: &externs,
             structs: &program.structs,
             enums: &program.enums,
+            tagged_types: &program.tagged_types,
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -4487,6 +4865,7 @@ struct EffectScan<'a> {
     externs: &'a std::collections::HashSet<&'a str>,
     structs: &'a [StructDef],
     enums: &'a [hir::EnumDef],
+    tagged_types: &'a [hir::TaggedType],
 }
 
 impl EffectScan<'_> {
@@ -5209,7 +5588,7 @@ impl EffectScan<'_> {
                 // AoS projection, field-filter, and recognised invariant string-filter stages add
                 // no callable effect; filtered forms use stable compaction. SoA and aggregate
                 // layouts remain sequential, while `chunks` is a borrowed-slice source shape.
-                if par_map_staged_parallelizable(source.ty, stages, self.structs, self.enums) {
+                if par_map_staged_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types) {
                     for stage in stages {
                         if let StageKind::Map { func, .. } | StageKind::Where { func, .. } = &stage.kind {
                             self.parmaps.push((func.clone(), e.span));
@@ -5612,6 +5991,8 @@ struct EscapeCheck<'a> {
     /// Enum defs (to decide whether a `Ty::Enum` is region-tracked — true iff a variant payload is;
     /// J1's `str`-view / `str`-bearing-struct payloads).
     enums: &'a [hir::EnumDef],
+    /// Interned nested Option/Result payloads.
+    tagged_types: &'a [hir::TaggedType],
     /// Region and local-backed-slice provenance at the current control-flow point.
     state: EscapeState,
     /// Region used to classify each owned local's function-wide cleanup. Unlike `state`, this keeps
@@ -5650,7 +6031,7 @@ impl<'a> EscapeCheck<'a> {
     fn check(&mut self) {
         for &param in &self.f.params {
             if self.f.locals.get(param as usize).is_some_and(|local| {
-                is_owned_droppable(local.ty, self.structs, self.enums)
+                is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
                     || ty_tuple_is_move(local.ty, self.tuples)
             }) {
                 // A by-value Move parameter has already crossed the call boundary and is owned by
@@ -5806,8 +6187,13 @@ impl<'a> EscapeCheck<'a> {
     /// aggregate region/cleanup bit cannot hide mixed heap and arena members; bound locals use the
     /// path-sensitive ownership fact joined in [`EscapeState`].
     fn call_transfer_contains_arena_owned(&mut self, e: &Expr, depth: u32) -> bool {
-        if !needs_drop_flag(e.ty, self.structs, self.tuples, self.enums)
-            || matches!(e.ty, Ty::DynSliceArray(_))
+        if !needs_drop_flag(
+            e.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) || matches!(e.ty, Ty::DynSliceArray(_))
         {
             return false;
         }
@@ -5910,6 +6296,7 @@ impl<'a> EscapeCheck<'a> {
             self.structs,
             self.tuples,
             self.enums,
+            self.tagged_types,
         ) {
             return false;
         }
@@ -5957,7 +6344,13 @@ impl<'a> EscapeCheck<'a> {
         let mut owned_parts = 0;
         let mut expected: Option<(bool, bool)> = None;
         for part in parts {
-            if !needs_drop_flag(part.ty, self.structs, self.tuples, self.enums) {
+            if !needs_drop_flag(
+                part.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
                 continue;
             }
             owned_parts += 1;
@@ -6050,6 +6443,9 @@ impl<'a> EscapeCheck<'a> {
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
+            Ty::Tagged(id) => {
+                self.tracks_region(expand_tagged_ty(Ty::Tagged(id), self.tagged_types))
+            }
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
             // An owned `array<response>` is escape-checked in the same lane as every owned collection.
             // It borrows nothing, so its `region_of` is explicitly `Static` — the check passes and
@@ -6182,66 +6578,98 @@ impl<'a> EscapeCheck<'a> {
             true
         } else {
             match &e.kind {
-            // A callee cannot return arena-owned storage across its function boundary, even when
-            // `region_of(Call)` is shortened by an arena-borrowing argument.
-            ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
-            ExprKind::OptionSome(inner)
-            | ExprKind::ResultOk(inner)
-            | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner)
-            | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
-            // `map_err` passes the Ok payload through and a callee-produced Move error is always
-            // free-standing. The source therefore determines whether every owning runtime variant
-            // is individual; MIR carries the selected variant's exact bit.
-            ExprKind::ResultMapErr { result, .. } => self.drop_is_individual(result, depth),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_is_individual(value, depth)),
-            ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
-                .value
-                .as_ref()
-                .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
-            // A value-carrying branch is statically individual only when every continuing arm is.
-            // Each arm is still recorded separately below, so MIR can select its exact constant or
-            // a moved local's runtime flag alongside the selected value.
-            ExprKind::If { then, els, .. } => {
-                let then_individual = then
+                // A callee cannot return arena-owned storage across its function boundary, even when
+                // `region_of(Call)` is shortened by an arena-borrowing argument.
+                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => true,
+                ExprKind::OptionSome(inner)
+                | ExprKind::ResultOk(inner)
+                | ExprKind::ResultErr(inner)
+                | ExprKind::Try(inner)
+                | ExprKind::TaskGet(inner) => self.drop_is_individual(inner, depth),
+                // `map_err` passes the Ok payload through and a callee-produced Move error is always
+                // free-standing. The source therefore determines whether every owning runtime variant
+                // is individual; MIR carries the selected variant's exact bit.
+                ExprKind::ResultMapErr { result, .. } => self.drop_is_individual(result, depth),
+                ExprKind::Block(block) | ExprKind::Unsafe(block) => block
                     .value
                     .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth));
-                let else_individual = els
+                    .is_none_or(|value| self.drop_is_individual(value, depth)),
+                ExprKind::Arena(block) | ExprKind::TaskGroup(block) => block
                     .value
                     .as_ref()
-                    .is_none_or(|value| self.drop_is_individual(value, depth));
-                then_individual && else_individual
-            }
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .all(|arm| self.drop_is_individual(&arm.body, depth)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
-            }
-            // One aggregate slot has one cleanup bit. Determine it only from directly owned
-            // members: borrowed members may shorten Region but do not affect allocation mode. The
-            // separate mixed-mode diagnostic rejects the case where this conjunction would lose
-            // a free-standing member.
-            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
-                .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
-                .all(|part| self.drop_is_individual(part, depth)),
-            ExprKind::EnumValue { payload, .. } => payload
-                .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
-                .all(|part| self.drop_is_individual(part, depth)),
-            ExprKind::StructLit { fields, .. } => fields
-                .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
-                .all(|part| self.drop_is_individual(part, depth)),
-            ExprKind::ArrayParMap { source, stages, .. }
-                if par_map_parallelizable(source.ty, stages, self.structs, self.enums)
-                    && par_map_result_is_plain_primitive(e.ty) => true,
-            _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
+                    .is_none_or(|value| self.drop_is_individual(value, depth + 1)),
+                // A value-carrying branch is statically individual only when every continuing arm is.
+                // Each arm is still recorded separately below, so MIR can select its exact constant or
+                // a moved local's runtime flag alongside the selected value.
+                ExprKind::If { then, els, .. } => {
+                    let then_individual = then
+                        .value
+                        .as_ref()
+                        .is_none_or(|value| self.drop_is_individual(value, depth));
+                    let else_individual = els
+                        .value
+                        .as_ref()
+                        .is_none_or(|value| self.drop_is_individual(value, depth));
+                    then_individual && else_individual
+                }
+                ExprKind::Match { arms, .. } => arms
+                    .iter()
+                    .all(|arm| self.drop_is_individual(&arm.body, depth)),
+                ExprKind::ElseUnwrap { opt, fallback } => {
+                    self.drop_is_individual(opt, depth) && self.drop_is_individual(fallback, depth)
+                }
+                // One aggregate slot has one cleanup bit. Determine it only from directly owned
+                // members: borrowed members may shorten Region but do not affect allocation mode. The
+                // separate mixed-mode diagnostic rejects the case where this conjunction would lose
+                // a free-standing member.
+                ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
+                    .iter()
+                    .filter(|part| {
+                        needs_drop_flag(
+                            part.ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                    })
+                    .all(|part| self.drop_is_individual(part, depth)),
+                ExprKind::EnumValue { payload, .. } => payload
+                    .iter()
+                    .filter(|part| {
+                        needs_drop_flag(
+                            part.ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                    })
+                    .all(|part| self.drop_is_individual(part, depth)),
+                ExprKind::StructLit { fields, .. } => fields
+                    .iter()
+                    .filter(|part| {
+                        needs_drop_flag(
+                            part.ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                    })
+                    .all(|part| self.drop_is_individual(part, depth)),
+                ExprKind::ArrayParMap { source, stages, .. }
+                    if par_map_parallelizable(
+                        source.ty,
+                        stages,
+                        self.structs,
+                        self.enums,
+                        self.tagged_types,
+                    ) && par_map_result_is_plain_primitive(e.ty) =>
+                {
+                    true
+                }
+                _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
             }
         };
         // The same syntax node can be replayed at more than one CFG state. Retain the conservative
@@ -6281,6 +6709,7 @@ impl<'a> EscapeCheck<'a> {
                         self.structs,
                         self.tuples,
                         self.enums,
+                        self.tagged_types,
                     ))
             }
             ExprKind::Block(block) | ExprKind::Unsafe(block) => block
@@ -6309,15 +6738,39 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => elems
                 .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .filter(|part| {
+                    needs_drop_flag(
+                        part.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                })
                 .all(|part| self.drop_may_be_individual(part, depth)),
             ExprKind::EnumValue { payload, .. } => payload
                 .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .filter(|part| {
+                    needs_drop_flag(
+                        part.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                })
                 .all(|part| self.drop_may_be_individual(part, depth)),
             ExprKind::StructLit { fields, .. } => fields
                 .iter()
-                .filter(|part| needs_drop_flag(part.ty, self.structs, self.tuples, self.enums))
+                .filter(|part| {
+                    needs_drop_flag(
+                        part.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                })
                 .all(|part| self.drop_may_be_individual(part, depth)),
             _ => !matches!(self.region_of(e, depth), Region::Arena(_)),
         }
@@ -6328,7 +6781,7 @@ impl<'a> EscapeCheck<'a> {
     /// rides an aggregate; the region itself comes from `region_of`. Delegates to the shared
     /// [`ty_mentions_slice`] (which also covers `Ty::Struct` defensively).
     fn mentions_slice(&self, ty: Ty) -> bool {
-        ty_mentions_slice(ty, self.structs, self.tuples)
+        ty_mentions_slice(ty, self.structs, self.tuples, self.tagged_types)
     }
 
     /// Whether a compiler-generated local carries a slice-bearing type. Keep the lookup checked:
@@ -6345,7 +6798,13 @@ impl<'a> EscapeCheck<'a> {
     /// control-flow expression that may select one are frame-capped so a derived view cannot escape
     /// and dangle when the hidden owner is dropped.
     fn unbound_owned_temporary(&self, e: &Expr) -> bool {
-        if !needs_drop_flag(e.ty, self.structs, self.tuples, self.enums) {
+        if !needs_drop_flag(
+            e.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
             return false;
         }
         match &e.kind {
@@ -6496,7 +6955,7 @@ impl<'a> EscapeCheck<'a> {
             // checked `par_map` result is primitive), so it is freely returnable and individually
             // dropped. Unsupported shapes use the arena-aware sequential collector below.
             ExprKind::ArrayParMap { source, stages, .. }
-                if par_map_parallelizable(source.ty, stages, self.structs, self.enums)
+                if par_map_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types)
                     && par_map_result_is_plain_primitive(e.ty) => Region::Static,
             ExprKind::ArrayParMap { .. } => self.allocation_region(e),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
@@ -6583,7 +7042,7 @@ impl<'a> EscapeCheck<'a> {
                 let r = elems
                     .iter()
                     .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth)));
-                if matches!(e.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums)) {
+                if matches!(e.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums, self.tagged_types)) {
                     r.shorter(Region::Frame)
                 } else {
                     r
@@ -7368,7 +7827,7 @@ impl<'a> EscapeCheck<'a> {
         match s {
             Stmt::Let { local, init } => {
                 self.decl_depth.insert(*local, depth);
-                if is_owned_droppable(init.ty, self.structs, self.enums)
+                if is_owned_droppable(init.ty, self.structs, self.enums, self.tagged_types)
                     || ty_tuple_is_move(init.ty, self.tuples)
                 {
                     let individual = self.drop_is_individual(init, depth);
@@ -7386,7 +7845,8 @@ impl<'a> EscapeCheck<'a> {
                     // region — it can't be *returned* (freed when the function returns), but it stays
                     // valid for the rest of the frame. `region_of` would infer `Static` from the
                     // individually heap-owned strings; cap it at `Frame` so the return check fires.
-                    if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums)) {
+                    if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums, self.tagged_types))
+                    {
                         r = r.shorter(Region::Frame);
                     }
                     self.state.region.insert(*local, r);
@@ -7407,10 +7867,30 @@ impl<'a> EscapeCheck<'a> {
             // element slot; recurse into the index/value for nested escapes, and — when the element
             // is region-tracked (a `str` element) — reject storing a shorter-lived value into the
             // longer-lived array (the `Assign`/`AssignField` region rule, extended to elements).
-            Stmt::AssignIndex { base, index: _, value }
-            | Stmt::AssignElemField { base, index: _, value, .. }
-            | Stmt::AssignElem { base, index: _, value, .. } => {
-                if needs_drop_flag(value.ty, self.structs, self.tuples, self.enums) {
+            Stmt::AssignIndex {
+                base,
+                index: _,
+                value,
+            }
+            | Stmt::AssignElemField {
+                base,
+                index: _,
+                value,
+                ..
+            }
+            | Stmt::AssignElem {
+                base,
+                index: _,
+                value,
+                ..
+            } => {
+                if needs_drop_flag(
+                    value.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
                     let old_individual = self.state.individual.get(base).copied().unwrap_or(true);
                     let old_may_individual = self
                         .state
@@ -7445,7 +7925,7 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Assign { local, value, drop_new, .. } => {
                 // Record allocation provenance separately from escape Region: region-free Move
                 // resources and owned call results are individual, while arena allocations are not.
-                if is_owned_droppable(value.ty, self.structs, self.enums)
+                if is_owned_droppable(value.ty, self.structs, self.enums, self.tagged_types)
                     || ty_tuple_is_move(value.ty, self.tuples)
                 {
                     let individual = self.drop_is_individual(value, depth);
@@ -7488,7 +7968,13 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::AssignField { root, value, .. } => {
-                if needs_drop_flag(value.ty, self.structs, self.tuples, self.enums) {
+                if needs_drop_flag(
+                    value.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
                     let old_individual = self.state.individual.get(root).copied().unwrap_or(true);
                     let old_may_individual = self
                         .state
@@ -7538,15 +8024,10 @@ impl<'a> EscapeCheck<'a> {
                 let individual = self.drop_is_individual(init, depth);
                 let may_individual = self.drop_may_be_individual(init, depth);
                 for local in locals.iter().flatten() {
-                    if self
-                        .f
-                        .locals
-                        .get(*local as usize)
-                        .is_some_and(|l| {
-                            is_owned_droppable(l.ty, self.structs, self.enums)
-                                || ty_tuple_is_move(l.ty, self.tuples)
-                        })
-                    {
+                    if self.f.locals.get(*local as usize).is_some_and(|l| {
+                        is_owned_droppable(l.ty, self.structs, self.enums, self.tagged_types)
+                            || ty_tuple_is_move(l.ty, self.tuples)
+                    }) {
                         self.drop_individual.insert(*local, individual);
                         self.state.individual.insert(*local, individual);
                         self.state.individual_may.insert(*local, may_individual);
@@ -7596,15 +8077,10 @@ impl<'a> EscapeCheck<'a> {
             self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
         for binding in bindings {
             self.decl_depth.insert(*binding, depth);
-            if self
-                .f
-                .locals
-                .get(*binding as usize)
-                .is_some_and(|local| {
-                    is_owned_droppable(local.ty, self.structs, self.enums)
-                        || ty_tuple_is_move(local.ty, self.tuples)
-                })
-            {
+            if self.f.locals.get(*binding as usize).is_some_and(|local| {
+                is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
+                    || ty_tuple_is_move(local.ty, self.tuples)
+            }) {
                 self.drop_individual.insert(*binding, individual);
                 self.state.individual.insert(*binding, individual);
                 self.state.individual_may.insert(*binding, may_individual);
@@ -7807,7 +8283,13 @@ impl<'a> EscapeCheck<'a> {
                 // explicit call. Result slots carry one cleanup-provenance bit, so a non-
                 // individual result must fail closed even when its runtime variant may be `Ok`.
                 if let Ty::Result(_, err) = result.ty
-                    && needs_drop_flag(scalar_to_ty(err), self.structs, self.tuples, self.enums)
+                    && needs_drop_flag(
+                        scalar_to_ty(err),
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
                 {
                     self.push_flow_op(EscapeFlowOp::CallTransfer(result, depth));
                 }
@@ -8373,7 +8855,13 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
-        if needs_drop_flag(e.ty, self.structs, self.tuples, self.enums) {
+        if needs_drop_flag(
+            e.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
             self.push_flow_op(EscapeFlowOp::DropProvenance(e, depth));
         }
     }
@@ -9130,6 +9618,8 @@ struct MoveCheck<'a> {
     structs: &'a [StructDef],
     /// Enum defs — so a `str`-bearing sum type is recognised as borrow-carrying (`ty_may_borrow`).
     enums: &'a [hir::EnumDef],
+    /// Interned nested Option/Result payloads.
+    tagged_types: &'a [hir::TaggedType],
     /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
     /// every `break` bound to that loop; their union is the move state after the loop (code past a
     /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
@@ -9303,7 +9793,7 @@ impl<'a> MoveCheck<'a> {
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple
     /// or Move struct.
     fn is_move_ty(&self, ty: Ty) -> bool {
-        ty_is_move(ty, self.structs, self.tuples, self.enums)
+        ty_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types)
     }
 
     fn is_move(&self, id: LocalId) -> bool {
@@ -9320,16 +9810,23 @@ impl<'a> MoveCheck<'a> {
         match self.f.locals.get(id as usize).map(|l| l.ty) {
             Some(ty) if self.is_move_ty(ty) => true,
             Some(Ty::Array(Scalar::String, _)) => true,
-            Some(Ty::StructArray(sid, _)) => struct_is_move(sid, self.structs, self.enums),
+            Some(Ty::StructArray(sid, _)) => {
+                struct_is_move(sid, self.structs, self.enums, self.tagged_types)
+            }
             _ => false,
         }
     }
 
     fn local_may_borrow(&self, id: LocalId) -> bool {
-        self.f
-            .locals
-            .get(id as usize)
-            .is_some_and(|l| ty_may_borrow(l.ty, self.structs, self.tuples, self.enums))
+        self.f.locals.get(id as usize).is_some_and(|l| {
+            ty_may_borrow(
+                l.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+        })
     }
 
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
@@ -9348,7 +9845,13 @@ impl<'a> MoveCheck<'a> {
     fn temp_owner_root(&self, e: &Expr) -> Option<BorrowRoot> {
         let depth = self.loop_iter_drops.len() as u32;
         (depth > 0
-            && needs_drop_flag(e.ty, self.structs, self.tuples, self.enums)
+            && needs_drop_flag(
+                e.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
             && may_need_synthetic_owner(e))
         .then_some(BorrowRoot::IterTemp(depth))
     }
@@ -9443,7 +9946,13 @@ impl<'a> MoveCheck<'a> {
     /// through `storage_roots`, while a materializing/moving arm routes through `borrow_sources`.
     fn borrow_sources(&self, e: &Expr) -> BorrowRoots {
         let mut roots = BorrowRoots::new();
-        if !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums) {
+        if !ty_may_borrow(
+            e.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
             return roots;
         }
         if let Some(stages) = pipeline_stages(&e.kind) {
@@ -9538,7 +10047,7 @@ impl<'a> MoveCheck<'a> {
                 let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
                     s.fields
                         .iter()
-                        .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums))
+                        .any(|f| ty_may_borrow(f.ty, self.structs, self.tuples, self.enums, self.tagged_types))
                 });
                 if borrows_input {
                     self.storage_roots(input)
@@ -9550,7 +10059,13 @@ impl<'a> MoveCheck<'a> {
             // `str` view (or a `str`-bearing object) — then its live view is rooted in the input;
             // a scalar-only union borrows nothing.
             ExprKind::JsonDecodeUnion { input, enum_id } => {
-                if ty_may_borrow(Ty::Enum(*enum_id), self.structs, self.tuples, self.enums) {
+                if ty_may_borrow(
+                    Ty::Enum(*enum_id),
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
                     self.storage_roots(input)
                 } else {
                     BorrowRoots::new()
@@ -9759,7 +10274,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RegexCaptures { .. } | ExprKind::RegexGroupCount { .. }
             | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. } => {
                 debug_assert!(
-                    !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums),
+                    !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums, self.tagged_types),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
                      now may borrow — give it a real provenance arm instead of letting it report \
                      'borrows nothing'",
@@ -9799,10 +10314,15 @@ impl<'a> MoveCheck<'a> {
     /// is actually freed. A local outside this set is never dropped early, so views into it stay
     /// live.
     fn is_dropped_local(&self, id: LocalId) -> bool {
-        self.f
-            .locals
-            .get(id as usize)
-            .is_some_and(|l| needs_drop_flag(l.ty, self.structs, self.tuples, self.enums))
+        self.f.locals.get(id as usize).is_some_and(|l| {
+            needs_drop_flag(
+                l.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+        })
     }
 
     /// End the borrow generation of everything a `loop` iteration frees: the owned locals its body
@@ -10186,10 +10706,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Field { root, path } if path.len() == 1 => {
                 let field = path[0];
                 if e.ty == Ty::String
-                    || (matches!(e.ty, Ty::Option(_))
-                        && drop_plan(e.ty, self.structs, self.enums).needs_drop())
+                    || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+                        && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
+                            .needs_drop())
                     || is_move_handle(e.ty)
-                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums))
+                    || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types))
                 {
                     self.invalidate_owner(*root);
                     moved.insert(MovedKey::Field(*root, field));
@@ -10275,10 +10796,11 @@ impl<'a> MoveCheck<'a> {
                         self.diags.error(msg, e.span);
                     } else if consuming
                         && (e.ty == Ty::String
-                            || (matches!(e.ty, Ty::Option(_))
-                                && drop_plan(e.ty, self.structs, self.enums).needs_drop())
+                            || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+                                && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
+                                    .needs_drop())
                             || is_move_handle(e.ty)
-                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums)))
+                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
                         // A partial move of a depth-1 owned `string`/`Option<Move>` field (`n := u.name`,
                         // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
@@ -10683,7 +11205,8 @@ impl<'a> MoveCheck<'a> {
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
-                let consuming = is_owned_droppable(e.ty, self.structs, self.enums);
+                let consuming =
+                    is_owned_droppable(e.ty, self.structs, self.enums, self.tagged_types);
                 self.expr(inner, moved, consuming, consuming);
             }
             ExprKind::Wait => {}
@@ -11164,6 +11687,8 @@ struct Checker<'a, 't> {
     tuples: &'t mut Vec<hir::TupleDef>,
     /// The shared `Ty::Fn` interner (function-value types). Same lifetime as `tuples`.
     fn_types: &'t mut Vec<hir::FnTy>,
+    /// The shared nested Option/Result payload interner.
+    tagged_types: &'t mut Vec<hir::TaggedType>,
     // Integer/float inference variables. `*_vars[i]` is the binding for the *root* of var
     // `i`; `*_parent[i]` is its union-find parent (self when `i` is a root). Linking two
     // unconstrained vars (rather than dropping one) means a later constraint on either
@@ -11293,6 +11818,7 @@ impl<'a, 't> Checker<'a, 't> {
         struct_mono: &'t mut HashMap<String, u32>,
         tuples: &'t mut Vec<hir::TupleDef>,
         fn_types: &'t mut Vec<hir::FnTy>,
+        tagged_types: &'t mut Vec<hir::TaggedType>,
         type_params: Vec<String>,
         param_bounds: Vec<Bound>,
         mono_args: Vec<Ty>,
@@ -11326,6 +11852,7 @@ impl<'a, 't> Checker<'a, 't> {
             struct_mono,
             tuples,
             fn_types,
+            tagged_types,
             int_vars: Vec::new(),
             int_parent: Vec::new(),
             float_vars: Vec::new(),
@@ -11397,6 +11924,7 @@ impl<'a, 't> Checker<'a, 't> {
                     None => Ty::FloatVar(r),
                 }
             }
+            Ty::Tagged(id) => expand_tagged_ty(Ty::Tagged(id), self.tagged_types),
             other => other,
         }
     }
@@ -11471,7 +11999,12 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.name.clone()).unwrap_or_else(|| ty_name(ty)),
             Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.name.clone()).unwrap_or_else(|| ty_name(ty)),
             Ty::Option(s) => format!("Option<{}>", self.scalar_display(s)),
-            Ty::Result(o, e) => format!("Result<{}, {}>", self.scalar_display(o), self.scalar_display(e)),
+            Ty::Result(o, e) => format!(
+                "Result<{}, {}>",
+                self.scalar_display(o),
+                self.scalar_display(e)
+            ),
+            Ty::Tagged(_) => self.ty_display(expand_tagged_ty(ty, self.tagged_types)),
             Ty::Box(s) => format!("box<{}>", self.scalar_display(s)),
             Ty::Task(s) => format!("Task<{}>", self.scalar_display(s)),
             Ty::Array(s, n) => format!("array<{}>[{n}]", self.scalar_display(s)),
@@ -11597,9 +12130,9 @@ impl<'a, 't> Checker<'a, 't> {
         // Monomorph mode: substitute the concrete type arguments into the (generic) signature so
         // the param locals and return type are concrete — no `Ty::Param` reaches the body.
         if !self.mono_args.is_empty() {
-            ret = subst_param_ty(ret, &self.mono_args);
+            ret = subst_param_ty(ret, &self.mono_args, self.tagged_types);
             for t in &mut param_tys {
-                *t = subst_param_ty(*t, &self.mono_args);
+                *t = subst_param_ty(*t, &self.mono_args, self.tagged_types);
             }
         }
         if f.name.name == "main" {
@@ -11657,8 +12190,9 @@ impl<'a, 't> Checker<'a, 't> {
             // The struct name for the message — `.get()` (not direct indexing) so a stray id can
             // never panic; `sz > 0` already implies the struct exists (a missing one sizes to 0).
             let enums = &self.enums;
+            let tagged_types = &self.tagged_types;
             let huge = |structs: &[StructDef], id: u32, visiting: &mut Vec<u32>| {
-                let (sz, _) = struct_size_align(id, structs, enums, visiting);
+                let (sz, _) = struct_size_align(id, structs, enums, tagged_types, visiting);
                 (sz > HUGE_STRUCT_BYTES)
                     .then(|| structs.get(id as usize).map(|d| (sz, d.name.clone())))
                     .flatten()
@@ -11863,8 +12397,18 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bind it to a fresh hidden local so it joins the normal drop path
                                 // (freed once at scope exit, or bulk-freed if arena-regioned). A
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
-                                None if is_owned_droppable(ety, self.structs, self.enums) => {
-                                    locals.push(Some(self.declare(&format!("_drop{i}"), ety, false)));
+                                None if is_owned_droppable(
+                                    ety,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_types,
+                                ) =>
+                                {
+                                    locals.push(Some(self.declare(
+                                        &format!("_drop{i}"),
+                                        ety,
+                                        false,
+                                    )));
                                 }
                                 None => locals.push(None),
                             }
@@ -11950,7 +12494,7 @@ impl<'a, 't> Checker<'a, 't> {
                         // L1a owned leaves. Gate the final leaf here (not while recursively
                         // resolving the receiver), so `outer.inner.name = …` can still reach its
                         // supported `string` leaf through an intermediate Move struct.
-                        if drop_plan(ty, self.structs, self.enums).needs_drop()
+                        if drop_plan(ty, self.structs, self.enums, self.tagged_types).needs_drop()
                             && !matches!(ty, Ty::String | Ty::Option(Scalar::String))
                         {
                             self.diags.error(
@@ -12039,13 +12583,14 @@ impl<'a, 't> Checker<'a, 't> {
             enum_mono: self.enum_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
+            tagged_types: self.tagged_types,
         };
         let ty = resolve_type(t, &mut cx, &self.type_params, self.diags);
         // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
         if self.mono_args.is_empty() {
             ty
         } else {
-            subst_param_ty(ty, &self.mono_args)
+            subst_param_ty(ty, &self.mono_args, self.tagged_types)
         }
     }
 
@@ -12130,7 +12675,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // only — a **Move** struct (Slice 4b: the lowering drops the old element's owned
                 // fields, then moves the new value in). Still deferred: a soa of *owned* columns
                 // (per-column drop), and a str-view struct into a *fixed* array.
-                let is_move = struct_is_move(sid, self.structs, self.enums);
+                let is_move = struct_is_move(sid, self.structs, self.enums, self.tagged_types);
                 if !(pod || str_view() || (!soa && is_move)) {
                     // In the error block: either `soa` is true (an owned-column soa — neither the POD
                     // nor the str field set matched), or `soa` is false with a non-POD, non-Move
@@ -12251,7 +12796,7 @@ impl<'a, 't> Checker<'a, 't> {
                 if !soa
                     && !is_dyn
                     && leaf_ty != Ty::String
-                    && drop_plan(leaf_ty, self.structs, self.enums).needs_drop()
+                    && drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
                 {
                     self.diags.error(
                         format!(
@@ -12692,8 +13237,14 @@ impl<'a, 't> Checker<'a, 't> {
         let err = |s: Span| Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span: s };
         // `None` builtin: its Option type comes from context.
         if single_name(p) == Some("None") {
-            return match expected {
-                Some(Ty::Option(s)) => Expr { kind: ExprKind::OptionNone, ty: Ty::Option(s), span },
+            return match expected.map(|ty| {
+                expand_tagged_ty(self.resolve(ty), self.tagged_types)
+            }) {
+                Some(Ty::Option(s)) => Expr {
+                    kind: ExprKind::OptionNone,
+                    ty: Ty::Option(s),
+                    span,
+                },
                 _ => {
                     self.diags
                         .error("cannot infer the Option type of `None` here (add an annotation)".to_string(), span);
@@ -13020,6 +13571,7 @@ impl<'a, 't> Checker<'a, 't> {
             enum_mono: self.enum_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
+            tagged_types: self.tagged_types,
         };
         instantiate_struct(name, tmpl, args, &mut cx, span, self.diags)
     }
@@ -13162,7 +13714,7 @@ impl<'a, 't> Checker<'a, 't> {
                     // A `Param` field applies no coercion (its type is being inferred); a concrete
                     // field checks against its declared type.
                     let declared = tmpl.fields[idx].ty;
-                    let ce = if ty_mentions_param(declared) {
+                    let ce = if ty_mentions_param(declared, self.tagged_types) {
                         self.check_expr(&fi.value, None)
                     } else {
                         self.check_expr(&fi.value, Some(declared))
@@ -13928,7 +14480,7 @@ impl<'a, 't> Checker<'a, 't> {
             let declared = param_tys[i];
             // A position mentioning a type parameter applies no coercion (the type is unknown), so
             // check the argument unconstrained; a fully concrete parameter checks against it.
-            let ce = if ty_mentions_param(declared) {
+            let ce = if ty_mentions_param(declared, self.tagged_types) {
                 self.reject_bare_array_value(a, None, "a generic argument");
                 self.check_expr(a, None)
             } else {
@@ -13950,7 +14502,7 @@ impl<'a, 't> Checker<'a, 't> {
         // can still infer its type from the call's context (the 4c-1 return-context behavior).
         let mut nested = vec![false; type_params.len()];
         for t in param_tys.iter().chain(std::iter::once(&ret)) {
-            mark_nested_params(*t, &mut nested);
+            mark_nested_params(*t, &mut nested, self.tagged_types);
         }
         for (p, &is_nested) in nested.iter().enumerate() {
             if !is_nested {
@@ -13976,7 +14528,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        let result_ty = subst_param_ty(ret, &type_args);
+        let result_ty = subst_param_ty(ret, &type_args, self.tagged_types);
         self.constrain(result_ty, expected, span);
         // The type arguments are kept (still possibly inference variables) and finalized in
         // `finalize_expr`, which then records the instantiation and rewrites `func` to the
@@ -13992,6 +14544,20 @@ impl<'a, 't> Checker<'a, 't> {
         let a = self.resolve(actual);
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
+            (Ty::Tagged(_), _) => self.match_param(
+                expand_tagged_ty(declared, self.tagged_types),
+                a,
+                subst,
+                span,
+                bind_only,
+            ),
+            (_, Ty::Tagged(_)) => self.match_param(
+                declared,
+                expand_tagged_ty(a, self.tagged_types),
+                subst,
+                span,
+                bind_only,
+            ),
             (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
             (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
                 self.match_scalar_param(dok, aok, subst, span, bind_only);
@@ -14015,6 +14581,16 @@ impl<'a, 't> Checker<'a, 't> {
     fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
         if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
+        } else if matches!(declared, Scalar::Tagged(_))
+            || matches!(actual, Scalar::Tagged(_))
+        {
+            self.match_param(
+                scalar_to_ty(declared),
+                scalar_to_ty(actual),
+                subst,
+                span,
+                bind_only,
+            );
         } else if !bind_only {
             self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
         }
@@ -14205,12 +14781,14 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'Some' takes 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let inner_expected = match expected {
+        let inner_expected = match expected.map(|ty| {
+            expand_tagged_ty(self.resolve(ty), self.tagged_types)
+        }) {
             Some(Ty::Option(s)) => Some(scalar_to_ty(s)),
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
-        let scalar = self.payload_scalar(arg.ty, "Option payload", args[0].span);
+        let scalar = self.payload_scalar(arg.ty, "Option payload", true, args[0].span);
         let ty = Ty::Option(scalar);
         self.constrain(ty, expected, span);
         Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty, span }
@@ -14220,9 +14798,20 @@ impl<'a, 't> Checker<'a, 't> {
     /// reporting non-scalar payloads (M2 restriction). `what` names the position being checked
     /// (`"Option payload"` / `"array element"` / …) — it used to say "Option payload" for every
     /// caller, which mislabelled an array literal's element as a payload.
-    fn payload_scalar(&mut self, ty: Ty, what: &str, span: Span) -> Scalar {
+    fn payload_scalar(&mut self, ty: Ty, what: &str, allow_tagged: bool, span: Span) -> Scalar {
         let f = self.finalize(ty);
-        match ty_to_scalar(f) {
+        let scalar = ty_to_scalar(f).or_else(|| match (allow_tagged, f) {
+            (true, Ty::Option(payload)) => Some(Scalar::Tagged(intern_tagged_type(
+                self.tagged_types,
+                hir::TaggedType::Option(payload),
+            ))),
+            (true, Ty::Result(ok, err)) => Some(Scalar::Tagged(intern_tagged_type(
+                self.tagged_types,
+                hir::TaggedType::Result(ok, err),
+            ))),
+            _ => None,
+        });
+        match scalar {
             Some(s) => s,
             None => {
                 if f == Ty::HttpHeaders {
@@ -15587,8 +16176,12 @@ impl<'a, 't> Checker<'a, 't> {
         // transparently through `Result`/`Option`/tuple/struct wrappers so an `array<Option<slice>>`
         // / `array<Result<slice, Error>>` can't smuggle an arena view past the direct-slice guard
         // (both are also blocked by the composite-payload rule below — this is defense in depth).
-        if ty_mentions_slice(self.resolve(elem_ty), self.structs, self.tuples)
-            && !matches!(self.resolve(elem_ty), Ty::Struct(_))
+        if ty_mentions_slice(
+            self.resolve(elem_ty),
+            self.structs,
+            self.tuples,
+            self.tagged_types,
+        ) && !matches!(self.resolve(elem_ty), Ty::Struct(_))
         {
             self.diags.error(
                 format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
@@ -15601,7 +16194,7 @@ impl<'a, 't> Checker<'a, 't> {
         // droppable `StructArray`, so admitting it would leak each element's buffer. Reject cleanly —
         // a Move enum is used as a single value for now.
         if let Ty::Enum(id) = self.resolve(elem_ty)
-            && enum_is_move(id, self.structs, self.enums)
+            && enum_is_move(id, self.structs, self.enums, self.tagged_types)
         {
             self.diags.error(
                 format!("`{}` cannot be an array element yet — a Move sum type's per-element drop is a later slice; use it as a single value", self.ty_display(elem_ty)),
@@ -15635,7 +16228,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let scalar = match self.resolve(elem_ty) {
             Ty::Fn(fid) => Scalar::Fn(fid),
-            other => self.payload_scalar(other, "array element", span),
+            other => self.payload_scalar(other, "array element", false, span),
         };
         Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar), pooled: false }, ty: Ty::Array(scalar, n), span }
     }
@@ -15773,7 +16366,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut capture_ops = Vec::new();
         for (cname, pid, enc_id) in &captured {
             let ty = locals[*pid as usize].ty;
-            if ty_capture_is_move(ty, self.structs, self.tuples, self.enums) {
+            if ty_capture_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
                 self.diags.error(
                     format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)"),
                     span,
@@ -15872,7 +16465,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// Move value would let the callee drop storage that the source pipeline still owns.
     fn reject_move_pipeline_call_arg(&mut self, ty: Ty, label: &str, role: &str, span: Span) -> bool {
         let ty = self.resolve(ty);
-        if !ty_is_move(ty, self.structs, self.tuples, self.enums) {
+        if !ty_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
             return false;
         }
         self.diags.error(
@@ -16135,7 +16728,13 @@ impl<'a, 't> Checker<'a, 't> {
                         return None;
                     }
                     let (func, ret, captures) = self.resolve_stage_fn(&sf, elem, false)?;
-                    if ty_is_move(ret, self.structs, self.tuples, self.enums) {
+                    if ty_is_move(
+                        ret,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) {
                         self.diags.error(
                             "'map' cannot produce a Move element until pipeline iteration cleanup is implemented"
                                 .to_string(),
@@ -16718,7 +17317,9 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             }
-            Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums) => Ty::DynStructArray(id, Layout::Aos),
+            Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums, self.tagged_types) => {
+                Ty::DynStructArray(id, Layout::Aos)
+            }
             Ty::Struct(id) => {
                 self.diags.error(
                     format!("'to_array' cannot collect Move struct '{}' (its fields need per-element drop)", self.structs[id as usize].name),
@@ -17838,7 +18439,7 @@ impl<'a, 't> Checker<'a, 't> {
         // annotation path is guarded in `resolve_type`, but inference here must reject the same
         // set or codegen's `scalar_bytes` hits `unreachable!`): a Move scalar (`string`/`array`),
         // a `Struct` (codegen can't size a struct box), or a `str` view (not boxable).
-        let scalar = self.payload_scalar(arg.ty, "`heap.new` payload", args[0].span);
+        let scalar = self.payload_scalar(arg.ty, "`heap.new` payload", false, args[0].span);
         let reject = match scalar {
             _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
             Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
@@ -18828,8 +19429,8 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::UdpSocket
                 | Ty::Child
         ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
-            && drop_plan(elem, self.structs, self.enums).needs_drop())
-            || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs, self.enums))
+            && drop_plan(elem, self.structs, self.enums, self.tagged_types).needs_drop())
+            || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs, self.enums, self.tagged_types))
         {
             self.diags.error(
                 format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
@@ -18892,7 +19493,7 @@ impl<'a, 't> Checker<'a, 't> {
                         | Ty::UdpSocket
                         | Ty::Child
                 ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
-                    && drop_plan(elem, self.structs, self.enums).needs_drop())
+                    && drop_plan(elem, self.structs, self.enums, self.tagged_types).needs_drop())
                 {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
@@ -22056,7 +22657,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Fail closed for every other Move leaf. A runtime element index cannot record which
         // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
         // both the result and the array owning the same payload.
-        if drop_plan(leaf_ty, self.structs, self.enums).needs_drop() {
+        if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop() {
             self.diags.error(
                 format!(
                     "reading a Move-type field {} out of an array element is not supported yet",
@@ -22129,13 +22730,24 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'{name}' takes 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let (ok_exp, err_exp) = match expected {
+        let (ok_exp, err_exp) = match expected.map(|ty| {
+            expand_tagged_ty(self.resolve(ty), self.tagged_types)
+        }) {
             Some(Ty::Result(o, e)) => (Some(scalar_to_ty(o)), Some(scalar_to_ty(e))),
             _ => (None, None),
         };
         let is_ok = name == "Ok";
         let arg = self.check_expr(&args[0], if is_ok { ok_exp } else { err_exp });
-        let arg_scalar = self.payload_scalar(arg.ty, if is_ok { "Result ok payload" } else { "Result err payload" }, args[0].span);
+        let arg_scalar = self.payload_scalar(
+            arg.ty,
+            if is_ok {
+                "Result ok payload"
+            } else {
+                "Result err payload"
+            },
+            true,
+            args[0].span,
+        );
 
         // The other arm's scalar must be known from context; otherwise we cannot form
         // a complete Result type (M2 limitation).
@@ -22293,12 +22905,41 @@ impl<'a, 't> Checker<'a, 't> {
     /// `Ty::Fn` arm — the one place a bare `!=` on resolved types is wrong for a fn value.
     fn payload_ty_matches(&self, got: Ty, expected: Ty) -> bool {
         let got = self.resolve(got);
+        let expected = self.resolve(expected);
         if got == expected {
             return true;
         }
-        matches!((got, expected), (Ty::Fn(aid), Ty::Fn(bid))
-            if self.fn_types.get(aid as usize).zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret))
+        match (got, expected) {
+            (Ty::Tagged(_), _) => self.payload_ty_matches(
+                expand_tagged_ty(got, self.tagged_types),
+                expected,
+            ),
+            (_, Ty::Tagged(_)) => self.payload_ty_matches(
+                got,
+                expand_tagged_ty(expected, self.tagged_types),
+            ),
+            (Ty::Option(a), Ty::Option(b)) => {
+                self.payload_scalar_matches(a, b)
+            }
+            (Ty::Result(a_ok, a_err), Ty::Result(b_ok, b_err)) => {
+                self.payload_scalar_matches(a_ok, b_ok)
+                    && self.payload_scalar_matches(a_err, b_err)
+            }
+            (Ty::Fn(aid), Ty::Fn(bid)) => self
+                .fn_types
+                .get(aid as usize)
+                .zip(self.fn_types.get(bid as usize))
+                .is_some_and(|(a, b)| a.params == b.params && a.ret == b.ret),
+            _ => false,
+        }
+    }
+
+    fn payload_scalar_matches(&self, got: Scalar, expected: Scalar) -> bool {
+        got == expected
+            || matches!(got, Scalar::Tagged(_))
+                && self.payload_ty_matches(scalar_to_ty(got), scalar_to_ty(expected))
+            || matches!(expected, Scalar::Tagged(_))
+                && self.payload_ty_matches(scalar_to_ty(got), scalar_to_ty(expected))
     }
 
     /// `Type.Variant(args)` — construct a sum-type value with a payload. Checks the argument count
@@ -22350,6 +22991,7 @@ impl<'a, 't> Checker<'a, 't> {
             enum_mono: self.enum_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
+            tagged_types: self.tagged_types,
         };
         instantiate_enum(name, tmpl, args, &mut cx, span, self.diags)
     }
@@ -22376,13 +23018,27 @@ impl<'a, 't> Checker<'a, 't> {
         for (a, &ps) in args.iter().zip(&payload) {
             // A `Param` payload applies no coercion (its type is inferred); a concrete one checks
             // against its declared scalar.
-            let ce = if matches!(ps, Scalar::Param(_)) {
+            let mentions_param =
+                ty_mentions_param(scalar_to_ty(ps), self.tagged_types);
+            let ce = if mentions_param {
                 self.check_expr(a, None)
             } else {
                 self.check_expr(a, Some(scalar_to_ty(ps)))
             };
-            if let Scalar::Param(p) = ps {
-                self.bind_param(p, ce.ty, &mut subst, a.span);
+            if mentions_param {
+                let actual = self.payload_scalar(
+                    ce.ty,
+                    "variant payload",
+                    true,
+                    a.span,
+                );
+                self.match_scalar_param(
+                    ps,
+                    actual,
+                    &mut subst,
+                    a.span,
+                    false,
+                );
             }
             checked.push(ce);
         }
@@ -22441,7 +23097,7 @@ impl<'a, 't> Checker<'a, 't> {
         // double-free. Reject the nested-place case cleanly (defer, like a nested `string`-field move);
         // a bare local and a depth-1 field both null correctly and stay allowed. A binding-less match
         // (`Or`/`_` patterns only) moves nothing, so it is fine at any depth.
-        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums))
+        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_types))
             && matches!(&s.kind, ExprKind::Field { path, .. } if path.len() > 1)
             && arms.iter().any(|a| matches!(&a.pattern, ast::MatchPattern::Variant { bindings, .. } if !bindings.is_empty()))
         {
@@ -22882,7 +23538,7 @@ impl<'a, 't> Checker<'a, 't> {
                     let abstract_call = type_args.iter().any(|t| matches!(t, Ty::Param(_)));
                     if !abstract_call && !type_args.contains(&Ty::Error) {
                         // Resolve a nested-`Param` result type (`Option<T>` → `Option<i32>`).
-                        recomputed = Some(subst_param_ty(cur_ty, type_args));
+                        recomputed = Some(subst_param_ty(cur_ty, type_args, self.tagged_types));
                         // Each concrete type argument must satisfy its parameter's bound.
                         if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
@@ -22895,7 +23551,13 @@ impl<'a, 't> Checker<'a, 't> {
                             }
                         }
                         self.instantiations.push((func.clone(), type_args.clone()));
-                        *func = mangle_mono(func, type_args);
+                        *func = mangle_mono(
+                            func,
+                            type_args,
+                            self.tagged_types,
+                            self.structs,
+                            self.enums,
+                        );
                     }
                 }
             }
@@ -23837,6 +24499,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Char => "char".to_string(),
         Ty::Option(s) => format!("Option<{}>", scalar_name(s)),
         Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
+        Ty::Tagged(_) => "<nested tagged type>".to_string(),
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::Vec(s, n) => format!("vec{n}<{}>", scalar_name(s)),
@@ -23962,27 +24625,58 @@ fn is_numeric_literal(e: &Expr) -> bool {
 /// a type parameter in a **bare** position (never nested inside `Option`/`array`/a tuple — `Scalar`
 /// can't hold a `Param`), so this is a single top-level replacement. Used by both call-result typing
 /// and monomorphization.
-fn subst_param_ty(ty: Ty, args: &[Ty]) -> Ty {
+fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Ty {
     // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
     // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their
     // element via an interner or `PrimScalar` and are not supported in a nested generic position yet.
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
-        Ty::Option(s) => Ty::Option(subst_scalar(s, args)),
-        Ty::Result(o, e) => Ty::Result(subst_scalar(o, args), subst_scalar(e, args)),
-        Ty::Box(s) => Ty::Box(subst_scalar(s, args)),
-        Ty::Slice(s) => Ty::Slice(subst_scalar(s, args)),
-        Ty::Array(s, n) => Ty::Array(subst_scalar(s, args), n),
-        Ty::Task(s) => Ty::Task(subst_scalar(s, args)),
+        Ty::Option(s) => Ty::Option(subst_scalar(s, args, tagged_types)),
+        Ty::Result(o, e) => {
+            let o = subst_scalar(o, args, tagged_types);
+            let e = subst_scalar(e, args, tagged_types);
+            Ty::Result(o, e)
+        }
+        Ty::Tagged(id) => scalar_to_ty(subst_scalar(Scalar::Tagged(id), args, tagged_types)),
+        Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
+        Ty::Slice(s) => Ty::Slice(subst_scalar(s, args, tagged_types)),
+        Ty::Array(s, n) => Ty::Array(subst_scalar(s, args, tagged_types), n),
+        Ty::Task(s) => Ty::Task(subst_scalar(s, args, tagged_types)),
         other => other,
     }
 }
 
 /// Substitute a `Scalar::Param(i)` with the scalar form of `args[i]` (a generic enum's variant
 /// payload, or a composite payload). A non-`Param` scalar is unchanged.
-fn subst_scalar(s: Scalar, args: &[Ty]) -> Scalar {
+fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Scalar {
     match s {
-        Scalar::Param(i) => ty_to_scalar(args.get(i as usize).copied().unwrap_or(Ty::Error)).unwrap_or(s),
+        Scalar::Param(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
+            Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Option(payload),
+            )),
+            Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Result(ok, err),
+            )),
+            ty => ty_to_scalar(ty).unwrap_or(s),
+        },
+        Scalar::Tagged(id) => {
+            let Some(tagged) = tagged_types.get(id as usize).copied() else {
+                return s;
+            };
+            let concrete = match tagged {
+                hir::TaggedType::Option(payload) => {
+                    hir::TaggedType::Option(subst_scalar(payload, args, tagged_types))
+                }
+                hir::TaggedType::Result(ok, err) => {
+                    let ok = subst_scalar(ok, args, tagged_types);
+                    let err = subst_scalar(err, args, tagged_types);
+                    hir::TaggedType::Result(ok, err)
+                }
+            };
+            Scalar::Tagged(intern_tagged_type(tagged_types, concrete))
+        }
         other => other,
     }
 }
@@ -23993,64 +24687,204 @@ fn subst_scalar(s: Scalar, args: &[Ty]) -> Scalar {
 /// Mark every type parameter that appears **nested** in a composite (not a bare `Ty::Param`):
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
-fn mark_nested_params(ty: Ty, nested: &mut [bool]) {
-    let mut mark = |s: Scalar| {
-        if let Scalar::Param(p) = s {
-            nested[p as usize] = true;
+fn mark_nested_params(ty: Ty, nested: &mut [bool], tagged_types: &[hir::TaggedType]) {
+    fn mark_scalar(
+        scalar: Scalar,
+        nested: &mut [bool],
+        tagged_types: &[hir::TaggedType],
+        visiting: &mut HashSet<u32>,
+    ) {
+        match scalar {
+            Scalar::Param(p) => {
+                if let Some(slot) = nested.get_mut(p as usize) {
+                    *slot = true;
+                }
+            }
+            Scalar::Tagged(id) if visiting.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => {
+                            mark_scalar(payload, nested, tagged_types, visiting);
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            mark_scalar(ok, nested, tagged_types, visiting);
+                            mark_scalar(err, nested, tagged_types, visiting);
+                        }
+                    }
+                }
+                visiting.remove(&id);
+            }
+            _ => {}
         }
-    };
+    }
+    let mut visiting = HashSet::new();
     match ty {
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => mark(s),
-        Ty::Result(o, e) => {
-            mark(o);
-            mark(e);
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
+            mark_scalar(s, nested, tagged_types, &mut visiting);
         }
+        Ty::Result(o, e) => {
+            mark_scalar(o, nested, tagged_types, &mut visiting);
+            mark_scalar(e, nested, tagged_types, &mut visiting);
+        }
+        Ty::Tagged(id) => mark_scalar(Scalar::Tagged(id), nested, tagged_types, &mut visiting),
         _ => {}
     }
 }
 
-fn ty_mentions_param(ty: Ty) -> bool {
+fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    fn scalar_mentions(
+        scalar: Scalar,
+        tagged_types: &[hir::TaggedType],
+        visiting: &mut HashSet<u32>,
+    ) -> bool {
+        match scalar {
+            Scalar::Param(_) => true,
+            Scalar::Tagged(id) if visiting.insert(id) => {
+                let mentions = tagged_types
+                    .get(id as usize)
+                    .is_some_and(|tagged| match *tagged {
+                        hir::TaggedType::Option(payload) => {
+                            scalar_mentions(payload, tagged_types, visiting)
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            scalar_mentions(ok, tagged_types, visiting)
+                                || scalar_mentions(err, tagged_types, visiting)
+                        }
+                    });
+                visiting.remove(&id);
+                mentions
+            }
+            _ => false,
+        }
+    }
+    let mut visiting = HashSet::new();
     match ty {
         Ty::Param(_) => true,
-        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => matches!(s, Scalar::Param(_)),
-        Ty::Result(o, e) => matches!(o, Scalar::Param(_)) || matches!(e, Scalar::Param(_)),
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => {
+            scalar_mentions(s, tagged_types, &mut visiting)
+        }
+        Ty::Result(ok, err) => {
+            scalar_mentions(ok, tagged_types, &mut visiting)
+                || scalar_mentions(err, tagged_types, &mut visiting)
+        }
+        Ty::Tagged(id) => scalar_mentions(Scalar::Tagged(id), tagged_types, &mut visiting),
         _ => false,
     }
 }
 
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
 /// (`pick` with `[i32]` → `pick$i32`). Deterministic and collision-free across instantiations.
-fn mangle_mono(name: &str, args: &[Ty]) -> String {
+fn mangle_mono(
+    name: &str,
+    args: &[Ty],
+    tagged_types: &[hir::TaggedType],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+) -> String {
     let mut s = name.to_string();
     for a in args {
         s.push('$');
-        s.push_str(&ty_mangle(*a));
+        s.push_str(&ty_mangle(*a, tagged_types, structs, enums));
     }
     s
 }
 
 /// A compact, identifier-safe spelling of a concrete type for use in a mangled symbol name.
-fn ty_mangle(ty: Ty) -> String {
-    ty_name(ty).chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+fn ty_mangle(
+    ty: Ty,
+    tagged_types: &[hir::TaggedType],
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+) -> String {
+    fn key(
+        ty: Ty,
+        tagged_types: &[hir::TaggedType],
+        structs: &[StructDef],
+        enums: &[hir::EnumDef],
+        visiting: &mut HashSet<u32>,
+    ) -> String {
+        let scalar = |s: Scalar, visiting: &mut HashSet<u32>| {
+            key(scalar_to_ty(s), tagged_types, structs, enums, visiting)
+        };
+        match ty {
+            Ty::Struct(id) => structs.get(id as usize).map_or_else(
+                || "S_invalid".to_string(),
+                |s| format!("S{}_{}", s.name.len(), s.name),
+            ),
+            Ty::Enum(id) => enums.get(id as usize).map_or_else(
+                || "E_invalid".to_string(),
+                |e| format!("E{}_{}", e.name.len(), e.name),
+            ),
+            Ty::Tagged(id) if visiting.insert(id) => {
+                let result = match tagged_types.get(id as usize) {
+                    Some(hir::TaggedType::Option(payload)) => {
+                        format!("O_{}", scalar(*payload, visiting))
+                    }
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        format!("R_{}_{}", scalar(*ok, visiting), scalar(*err, visiting))
+                    }
+                    None => "T_invalid".to_string(),
+                };
+                visiting.remove(&id);
+                result
+            }
+            Ty::Tagged(_) => "T_cycle".to_string(),
+            Ty::Option(payload) => format!("O_{}", scalar(payload, visiting)),
+            Ty::Result(ok, err) => {
+                format!("R_{}_{}", scalar(ok, visiting), scalar(err, visiting))
+            }
+            Ty::Box(payload) => format!("B_{}", scalar(payload, visiting)),
+            Ty::Array(payload, n) => format!("A{n}_{}", scalar(payload, visiting)),
+            Ty::Slice(payload) => format!("V_{}", scalar(payload, visiting)),
+            Ty::DynArray(payload) => format!("D_{}", scalar(payload, visiting)),
+            Ty::Task(payload) => format!("K_{}", scalar(payload, visiting)),
+            Ty::StructArray(id, n) => format!(
+                "A{n}_{}",
+                key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+            ),
+            Ty::DynStructArray(id, _) => {
+                format!(
+                    "D_{}",
+                    key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+                )
+            }
+            Ty::Soa(id) => format!(
+                "Q_{}",
+                key(Ty::Struct(id), tagged_types, structs, enums, visiting)
+            ),
+            other => ty_name(other),
+        }
+    }
+    key(ty, tagged_types, structs, enums, &mut HashSet::new())
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 /// A composite type argument must resolve to a concrete scalar in M2.
-fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+fn scalar_arg(
+    ty: Ty,
+    what: &str,
+    allow_param: bool,
+    tagged_types: &mut Vec<hir::TaggedType>,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<Scalar> {
     // A generic type parameter is a valid payload only where 4c-3 supports it (`Option`/`Result`);
     // `box`/`slice`/`array` over a `T` are not supported yet, so reject `Param` there.
     if matches!(ty, Ty::Param(_)) && !allow_param {
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
         return None;
     }
-    if allow_param && matches!(ty, Ty::Option(_) | Ty::Result(..)) {
-        diags.error(
-            format!(
-                "{what} cannot be nested {} yet — tagged-in-tagged payload representation is implemented in L1b-c",
-                ty_name(ty)
-            ),
-            span,
-        );
-        return None;
+    if allow_param {
+        let tagged = match ty {
+            Ty::Option(payload) => Some(hir::TaggedType::Option(payload)),
+            Ty::Result(ok, err) => Some(hir::TaggedType::Result(ok, err)),
+            _ => None,
+        };
+        if let Some(tagged) = tagged {
+            return Some(Scalar::Tagged(intern_tagged_type(tagged_types, tagged)));
+        }
     }
     // An owned I/O handle (`reader`/`writer`) is bound to exactly one local and closes its fd once
     // at that binding's `Drop`. It may ride in an `Option`/`Result` payload (`fs.open`/`fs.create`
@@ -24103,10 +24937,16 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
 /// (`{fn_ptr, env_ptr}`), already represented by `Scalar::Fn`; keeping them out of `ty_to_scalar`
 /// preserves the narrower Option/Result/box payload surface while allowing homogeneous callback
 /// lists such as pkg.web middleware.
-fn collection_scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+fn collection_scalar_arg(
+    ty: Ty,
+    what: &str,
+    tagged_types: &mut Vec<hir::TaggedType>,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<Scalar> {
     match ty {
         Ty::Fn(fid) => Some(Scalar::Fn(fid)),
-        _ => scalar_arg(ty, what, false, span, diags),
+        _ => scalar_arg(ty, what, false, tagged_types, span, diags),
     }
 }
 
@@ -24199,6 +25039,7 @@ struct TyCx<'a> {
     enum_mono: &'a mut HashMap<String, u32>,
     tuples: &'a mut Vec<hir::TupleDef>,
     fn_types: &'a mut Vec<hir::FnTy>,
+    tagged_types: &'a mut Vec<hir::TaggedType>,
 }
 
 fn resolve_type(
@@ -24506,7 +25347,7 @@ fn resolve_type(
             // a box payload must be a true primitive scalar: codegen can't size a struct box, and
             // a Move payload (`string`) has no `box` drop story. Reject both with a clean
             // diagnostic (else `box<string>`/`box<Struct>` would type-check then panic in codegen).
-            match scalar_arg(inner, "box payload", false, span, diags) {
+            match scalar_arg(inner, "box payload", false, cx.tagged_types, span, diags) {
                 Some(Scalar::Struct(_)) => {
                     diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), span);
                     Ty::Error
@@ -24535,7 +25376,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "Option payload", true, span, diags) {
+            match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -24548,7 +25389,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match collection_scalar_arg(inner, "slice element", span, diags) {
+            match collection_scalar_arg(inner, "slice element", cx.tagged_types, span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
@@ -24610,7 +25451,13 @@ fn resolve_type(
                     Ty::Error
                 }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-                _ => match collection_scalar_arg(inner, "array element", span, diags) {
+                _ => match collection_scalar_arg(
+                    inner,
+                    "array element",
+                    cx.tagged_types,
+                    span,
+                    diags,
+                ) {
                     Some(s) => Ty::DynArray(s),
                     None => Ty::Error,
                 },
@@ -24628,8 +25475,15 @@ fn resolve_type(
                 }
             };
             match (
-                scalar_arg(ok, "Result ok payload", true, span, diags),
-                scalar_arg(err, "Result err payload", true, span, diags),
+                scalar_arg(ok, "Result ok payload", true, cx.tagged_types, span, diags),
+                scalar_arg(
+                    err,
+                    "Result err payload",
+                    true,
+                    cx.tagged_types,
+                    span,
+                    diags,
+                ),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
@@ -24645,7 +25499,14 @@ fn resolve_type(
                         return Ty::Error;
                     }
                 };
-                return match scalar_arg(inner, "vector element", false, span, diags) {
+                return match scalar_arg(
+                    inner,
+                    "vector element",
+                    false,
+                    cx.tagged_types,
+                    span,
+                    diags,
+                ) {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Vec(s, n),
                     Some(_) => {
                         diags.error("a vector element must be a numeric scalar (an int or float)".to_string(), span);
@@ -24664,7 +25525,8 @@ fn resolve_type(
                         return Ty::Error;
                     }
                 };
-                return match scalar_arg(inner, "mask element", false, span, diags) {
+                return match scalar_arg(inner, "mask element", false, cx.tagged_types, span, diags)
+                {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Mask(s, n),
                     Some(_) => {
                         diags.error("a mask element must be a numeric scalar (it mirrors the compared `vecN<T>`)".to_string(), span);
@@ -24772,7 +25634,7 @@ fn http_headers_placement_error(what: &str) -> String {
 
 /// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
 /// `string`, or a nested struct.
-fn is_field_ok(ty: Ty) -> bool {
+fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, a **nested struct**
     // (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass), or an
     // **`Option<T>`** whose payload is itself a valid field type (scalar / `str` / `string` / nested
@@ -24818,7 +25680,22 @@ fn is_field_ok(ty: Ty) -> bool {
         Ty::Fn(_) => true,
         // The payload is a `Scalar`; it must itself be a legal field type (an `Option<array<T>>` is
         // rejected until array-in-Option lands, matching the direct-field rule).
-        Ty::Option(s) => is_field_ok(scalar_to_ty(s)),
+        Ty::Option(s) => is_field_ok(scalar_to_ty(s), tagged_types),
+        Ty::Result(ok, err) => {
+            is_field_ok(scalar_to_ty(ok), tagged_types)
+                && is_field_ok(scalar_to_ty(err), tagged_types)
+        }
+        Ty::Tagged(id) => tagged_types
+            .get(id as usize)
+            .is_some_and(|entry| match *entry {
+                hir::TaggedType::Option(payload) => {
+                    is_field_ok(scalar_to_ty(payload), tagged_types)
+                }
+                hir::TaggedType::Result(ok, err) => {
+                    is_field_ok(scalar_to_ty(ok), tagged_types)
+                        && is_field_ok(scalar_to_ty(err), tagged_types)
+                }
+            }),
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
         // `choices: array<Choice>` shape. The element restriction (non-owned: scalar / `str`-view
         // struct, no `array<string>`/`array<Move-struct>`/nested arrays) is enforced at declaration
@@ -24828,24 +25705,123 @@ fn is_field_ok(ty: Ty) -> bool {
     }
 }
 
+fn collect_inline_struct_ids(
+    ty: Ty,
+    tagged_types: &[hir::TaggedType],
+    output: &mut Vec<u32>,
+) {
+    fn visit(
+        ty: Ty,
+        tagged_types: &[hir::TaggedType],
+        active: &mut Vec<u32>,
+        output: &mut Vec<u32>,
+    ) {
+        match ty {
+            Ty::Struct(id) => {
+                if !output.contains(&id) {
+                    output.push(id);
+                }
+            }
+            Ty::Option(payload) => {
+                visit(scalar_to_ty(payload), tagged_types, active, output)
+            }
+            Ty::Result(ok, err) => {
+                visit(scalar_to_ty(ok), tagged_types, active, output);
+                visit(scalar_to_ty(err), tagged_types, active, output);
+            }
+            Ty::Tagged(id) if !active.contains(&id) => {
+                let Some(entry) = tagged_types.get(id as usize) else {
+                    return;
+                };
+                active.push(id);
+                match *entry {
+                    hir::TaggedType::Option(payload) => {
+                        visit(scalar_to_ty(payload), tagged_types, active, output)
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        visit(scalar_to_ty(ok), tagged_types, active, output);
+                        visit(scalar_to_ty(err), tagged_types, active, output);
+                    }
+                }
+                active.pop();
+            }
+            _ => {}
+        }
+    }
+    visit(ty, tagged_types, &mut Vec::new(), output);
+}
+
+fn ty_contains_inline_enum(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    fn visit(
+        ty: Ty,
+        tagged_types: &[hir::TaggedType],
+        active: &mut Vec<u32>,
+    ) -> bool {
+        match ty {
+            Ty::Enum(_) => true,
+            Ty::Option(payload) => {
+                visit(scalar_to_ty(payload), tagged_types, active)
+            }
+            Ty::Result(ok, err) => {
+                visit(scalar_to_ty(ok), tagged_types, active)
+                    || visit(scalar_to_ty(err), tagged_types, active)
+            }
+            Ty::Tagged(id) if !active.contains(&id) => {
+                let Some(entry) = tagged_types.get(id as usize) else {
+                    return false;
+                };
+                active.push(id);
+                let found = match *entry {
+                    hir::TaggedType::Option(payload) => {
+                        visit(scalar_to_ty(payload), tagged_types, active)
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        visit(scalar_to_ty(ok), tagged_types, active)
+                            || visit(scalar_to_ty(err), tagged_types, active)
+                    }
+                };
+                active.pop();
+                found
+            }
+            _ => false,
+        }
+    }
+    visit(ty, tagged_types, &mut Vec::new())
+}
+
 /// Whether struct `id`'s complete inline layout graph is acyclic. Structs, Options, Results, and
 /// sums embed their children; heap-backed arrays and handles are leaves. `visiting` is retained for
 /// the pre-enum struct pass, while the shared walker also tracks enum nodes once their table exists.
-fn struct_acyclic(id: u32, structs: &[StructDef], enums: &[hir::EnumDef], visiting: &mut Vec<u32>) -> bool {
+fn struct_acyclic(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    visiting: &mut Vec<u32>,
+) -> bool {
     type_graph_acyclic(
         Ty::Struct(id),
         structs,
         enums,
+        tagged_types,
         visiting,
+        &mut Vec::new(),
         &mut Vec::new(),
     )
 }
 
-fn enum_acyclic(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+fn enum_acyclic(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     type_graph_acyclic(
         Ty::Enum(id),
         structs,
         enums,
+        tagged_types,
+        &mut Vec::new(),
         &mut Vec::new(),
         &mut Vec::new(),
     )
@@ -24855,8 +25831,10 @@ fn type_graph_acyclic(
     ty: Ty,
     structs: &[StructDef],
     enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
     struct_path: &mut Vec<u32>,
     enum_path: &mut Vec<u32>,
+    tagged_path: &mut Vec<u32>,
 ) -> bool {
     match ty {
         Ty::Struct(id) => {
@@ -24868,7 +25846,17 @@ fn type_graph_acyclic(
             let ok = def
                 .fields
                 .iter()
-                .all(|field| type_graph_acyclic(field.ty, structs, enums, struct_path, enum_path));
+                .all(|field| {
+                    type_graph_acyclic(
+                        field.ty,
+                        structs,
+                        enums,
+                        tagged_types,
+                        struct_path,
+                        enum_path,
+                        tagged_path,
+                    )
+                });
             struct_path.pop();
             ok
         }
@@ -24884,8 +25872,10 @@ fn type_graph_acyclic(
                         scalar_to_ty(*payload),
                         structs,
                         enums,
+                        tagged_types,
                         struct_path,
                         enum_path,
+                        tagged_path,
                     )
                 })
             });
@@ -24896,23 +25886,70 @@ fn type_graph_acyclic(
             scalar_to_ty(payload),
             structs,
             enums,
+            tagged_types,
             struct_path,
             enum_path,
+            tagged_path,
         ),
         Ty::Result(ok, err) => {
             type_graph_acyclic(
                 scalar_to_ty(ok),
                 structs,
                 enums,
+                tagged_types,
                 struct_path,
                 enum_path,
+                tagged_path,
             ) && type_graph_acyclic(
                 scalar_to_ty(err),
                 structs,
                 enums,
+                tagged_types,
                 struct_path,
                 enum_path,
+                tagged_path,
             )
+        }
+        Ty::Tagged(id) => {
+            if tagged_path.contains(&id) {
+                return false;
+            }
+            let Some(entry) = tagged_types.get(id as usize) else {
+                return false;
+            };
+            tagged_path.push(id);
+            let ok = match *entry {
+                hir::TaggedType::Option(payload) => type_graph_acyclic(
+                    scalar_to_ty(payload),
+                    structs,
+                    enums,
+                    tagged_types,
+                    struct_path,
+                    enum_path,
+                    tagged_path,
+                ),
+                hir::TaggedType::Result(ok, err) => {
+                    type_graph_acyclic(
+                        scalar_to_ty(ok),
+                        structs,
+                        enums,
+                        tagged_types,
+                        struct_path,
+                        enum_path,
+                        tagged_path,
+                    ) && type_graph_acyclic(
+                        scalar_to_ty(err),
+                        structs,
+                        enums,
+                        tagged_types,
+                        struct_path,
+                        enum_path,
+                        tagged_path,
+                    )
+                }
+            };
+            tagged_path.pop();
+            ok
         }
         _ => true,
     }
@@ -24947,7 +25984,12 @@ pub fn union_shape_class(s: Scalar) -> Option<u8> {
     }
 }
 
-fn enum_payload_ok(s: Scalar, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
+fn enum_payload_ok(
+    s: Scalar,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     match s {
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
@@ -24957,7 +25999,64 @@ fn enum_payload_ok(s: Scalar, structs: &[StructDef], enums: &[hir::EnumDef]) -> 
         // deferred, `array<Move-struct>` likewise.
         Scalar::DynArray(PrimScalar::String) => false,
         Scalar::DynArray(_) => true,
-        Scalar::DynStructArray(id) => structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums)),
+        Scalar::DynStructArray(id) => structs
+            .get(id as usize)
+            .is_some_and(|_| !struct_is_move(id, structs, enums, tagged_types)),
+        Scalar::Tagged(id) => {
+            fn concrete(
+                scalar: Scalar,
+                structs: &[StructDef],
+                enums: &[hir::EnumDef],
+                tagged_types: &[hir::TaggedType],
+                active: &mut std::collections::HashSet<u32>,
+            ) -> bool {
+                match scalar {
+                    Scalar::Param(_) => false,
+                    Scalar::Struct(id)
+                    | Scalar::DynStructArray(id)
+                    | Scalar::Soa(id) => structs.get(id as usize).is_some(),
+                    Scalar::Enum(id) => enums.get(id as usize).is_some(),
+                    Scalar::Tagged(id) => {
+                        if !active.insert(id) {
+                            return false;
+                        }
+                        let valid = match tagged_types.get(id as usize) {
+                            Some(hir::TaggedType::Option(payload)) => {
+                                concrete(
+                                    *payload,
+                                    structs,
+                                    enums,
+                                    tagged_types,
+                                    active,
+                                )
+                            }
+                            Some(hir::TaggedType::Result(ok, err)) => {
+                                concrete(*ok, structs, enums, tagged_types, active)
+                                    && concrete(
+                                        *err,
+                                        structs,
+                                        enums,
+                                        tagged_types,
+                                        active,
+                                    )
+                            }
+                            None => false,
+                        };
+                        active.remove(&id);
+                        valid
+                    }
+                    _ => true,
+                }
+            }
+
+            concrete(
+                Scalar::Tagged(id),
+                structs,
+                enums,
+                tagged_types,
+                &mut std::collections::HashSet::new(),
+            )
+        }
         _ => false,
     }
 }
@@ -24965,15 +26064,22 @@ fn enum_payload_ok(s: Scalar, structs: &[StructDef], enums: &[hir::EnumDef]) -> 
 /// Monomorphize a generic struct: substitute its template fields with `args`, intern a concrete
 /// `StructDef` into `cx.structs` (deduped by mangled name), and return its id. Shared by
 /// `resolve_type` (a `Pair<i32>` type) and the generic struct-literal path (`Pair { a, b }`).
-fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut TyCx, span: Span, diags: &mut Diagnostics) -> u32 {
-    let mangled = mangle_mono(name, args);
+fn instantiate_struct(
+    name: &str,
+    tmpl: &StructTemplate,
+    args: &[Ty],
+    cx: &mut TyCx,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> u32 {
+    let mangled = mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums);
     if let Some(&id) = cx.struct_mono.get(&mangled) {
         return id;
     }
     let mut fields = Vec::with_capacity(tmpl.fields.len());
     for f in &tmpl.fields {
-        let fty = subst_param_ty(f.ty, args);
-        if !is_field_ok(fty) {
+        let fty = subst_param_ty(f.ty, args, cx.tagged_types);
+        if !is_field_ok(fty, cx.tagged_types) {
             diags.error(
                 format!("field '{}' of '{name}' resolves to {}, which is not a valid struct field type yet", f.name, ty_name(fty)),
                 span,
@@ -25004,7 +26110,10 @@ fn resolve_generic_args(name: &str, kind: &str, args: &[ast::Type], n_params: us
     if arg_tys.contains(&Ty::Error) {
         return None;
     }
-    if arg_tys.iter().any(|t| ty_mentions_param(*t)) {
+    if arg_tys
+        .iter()
+        .any(|t| ty_mentions_param(*t, cx.tagged_types))
+    {
         diags.error(
             format!("instantiating a generic {kind} with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
             span,
@@ -25017,14 +26126,25 @@ fn resolve_generic_args(name: &str, kind: &str, args: &[ast::Type], n_params: us
 /// Monomorphize a generic sum type: substitute its variant payloads with `args`, intern a concrete
 /// `EnumDef` into `cx.enums` (deduped by mangled name), and return its id. The enum analogue of
 /// [`instantiate_struct`].
-fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx, span: Span, diags: &mut Diagnostics) -> u32 {
-    let mangled = mangle_mono(name, args);
+fn instantiate_enum(
+    name: &str,
+    tmpl: &EnumTemplate,
+    args: &[Ty],
+    cx: &mut TyCx,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> u32 {
+    let mangled = mangle_mono(name, args, cx.tagged_types, cx.structs, cx.enums);
     if let Some(&id) = cx.enum_mono.get(&mangled) {
         return id;
     }
     let mut variants = Vec::with_capacity(tmpl.variants.len());
     for v in &tmpl.variants {
-        let payload: Vec<Scalar> = v.payload.iter().map(|&s| subst_scalar(s, args)).collect();
+        let payload: Vec<Scalar> = v
+            .payload
+            .iter()
+            .map(|&s| subst_scalar(s, args, cx.tagged_types))
+            .collect();
         for &p in &payload {
             // The substituted payload must obey the SAME rule as a non-generic enum in Pass 0c.
             // Direct recursively Move payloads are legal and derive the same DropPlan/region facts;
@@ -25033,7 +26153,7 @@ fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx,
             // slot while an early monomorph is cached. Validate those graph-dependent shapes once
             // all type and function-driven monomorphization is complete.
             if !matches!(p, Scalar::Struct(_) | Scalar::DynStructArray(_))
-                && !enum_payload_ok(p, cx.structs, cx.enums)
+                && !enum_payload_ok(p, cx.structs, cx.enums, cx.tagged_types)
             {
                 diags.error(
                     format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
@@ -26827,7 +27947,7 @@ mod tests {
                 c_repr: false,
             },
         ];
-        let plan = drop_plan(Ty::Struct(1), &structs, &[]);
+        let plan = drop_plan(Ty::Struct(1), &structs, &[], &[]);
         assert!(plan.needs_drop());
         let DropPlan::Struct { fields, .. } = plan else {
             panic!("outer plan must be a struct");
@@ -26856,8 +27976,11 @@ mod tests {
             align: None,
             c_repr: false,
         }];
-        assert!(drop_plan(Ty::Struct(0), &cyclic, &[]).needs_drop());
-        assert_eq!(drop_plan(Ty::Struct(99), &cyclic, &[]), DropPlan::Invalid);
+        assert!(drop_plan(Ty::Struct(0), &cyclic, &[], &[]).needs_drop());
+        assert_eq!(
+            drop_plan(Ty::Struct(99), &cyclic, &[], &[]),
+            DropPlan::Invalid
+        );
 
         let missing_nested = vec![StructDef {
             name: "Broken".to_string(),
@@ -26869,7 +27992,7 @@ mod tests {
             c_repr: false,
         }];
         assert!(
-            drop_plan(Ty::Struct(0), &missing_nested, &[]).needs_drop(),
+            drop_plan(Ty::Struct(0), &missing_nested, &[], &[]).needs_drop(),
             "a missing nested struct ID must fail closed without panicking"
         );
         let missing_enum_payload = vec![hir::EnumDef {
@@ -26881,7 +28004,7 @@ mod tests {
             }],
         }];
         assert!(
-            drop_plan(Ty::Enum(0), &[], &missing_enum_payload).needs_drop(),
+            drop_plan(Ty::Enum(0), &[], &missing_enum_payload, &[]).needs_drop(),
             "a missing enum payload struct ID must fail closed without panicking"
         );
     }
@@ -26918,7 +28041,7 @@ mod tests {
                 c_repr: false,
             });
         }
-        let plan = drop_plan(Ty::Struct(39), &structs, &[]);
+        let plan = drop_plan(Ty::Struct(39), &structs, &[], &[]);
         assert!(
             !plan.needs_drop(),
             "Copy repeated subgraphs must use the cached nominal classification"
@@ -26955,7 +28078,7 @@ mod tests {
             });
         }
         assert!(
-            !drop_plan(Ty::Struct(511), &structs, &[]).needs_drop(),
+            !drop_plan(Ty::Struct(511), &structs, &[], &[]).needs_drop(),
             "ID-indexed visitation must classify a deep Copy chain without path scans"
         );
     }
