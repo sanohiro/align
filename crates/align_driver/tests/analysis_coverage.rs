@@ -503,6 +503,43 @@ fn main() -> i32 {
         Some(42),
         "source nominal compatibility must recurse through aggregate payloads"
     );
+    let array = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn main() -> i32 {
+  holders := [
+    Holder { callback: quiet },
+    Holder { callback: quiet },
+  ]
+  return holders[1].callback(41) as i32
+}
+";
+    assert_eq!(
+        build_and_run("generic-fn-wrapper-source-signature-array", array)
+            .status
+            .code(),
+        Some(42),
+        "a struct array must accept elements with one source nominal identity"
+    );
+    let slice = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn use(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+fn main() -> i32 {
+  holders := [
+    Holder { callback: quiet },
+    Holder { callback: quiet },
+  ]
+  return (use(holders) + 40) as i32
+}
+";
+    assert_eq!(
+        build_and_run("generic-fn-wrapper-source-signature-slice", slice)
+            .status
+            .code(),
+        Some(42),
+        "a source-compatible generic struct array must borrow as its declared slice type"
+    );
 }
 
 #[test]
@@ -583,6 +620,30 @@ fn main() -> Result<(), Error> {
     assert!(
         check_errs("parmap-reassigned-generic-fn-array-field", array_field),
         "assigning another concrete origin into a generic wrapper array field must join its effect"
+    );
+    let array_literal = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  holders := [
+    Holder { callback: quiet },
+    Holder { callback: loud },
+  ]
+  return holders[0].callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-joined-generic-fn-array-literal", array_literal),
+        "source-compatible generic wrapper array elements must join their concrete effects"
     );
 }
 

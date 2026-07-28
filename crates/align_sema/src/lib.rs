@@ -5146,10 +5146,24 @@ impl EffectScan<'_> {
     }
 
     fn join_concrete_struct_effects(&self, local: LocalId, incoming: &Expr) {
-        let Some(Ty::Struct(id)) = self.locals.get(local as usize).map(|local| local.ty) else {
+        let Some(ty) = self.locals.get(local as usize).map(|local| local.ty) else {
             return;
         };
-        self.join_concrete_struct_id_effects(id, incoming);
+        match ty {
+            Ty::Struct(id) => self.join_concrete_struct_id_effects(id, incoming),
+            Ty::StructArray(id, _) => {
+                if let ExprKind::ArrayLit { elems, .. } = &incoming.kind {
+                    for elem in elems {
+                        self.join_concrete_struct_id_effects(id, elem);
+                    }
+                } else {
+                    // Fixed arrays are normally initialized by a literal. Preserve a fail-closed
+                    // fallback if another HIR producer is added before it gets precise projection.
+                    self.join_concrete_struct_id_effects(id, incoming);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn join_concrete_struct_id_effects(&self, id: u32, incoming: &Expr) {
@@ -14973,7 +14987,9 @@ impl<'a, 't> Checker<'a, 't> {
         // `slice<Struct>` by the same borrow: the element type matches, and the AoS buffer is what a
         // `{ptr,len}` view already points at. Without this a route TABLE could not be passed to a
         // dispatcher by borrow at all — only moved.
-        let struct_arr_match = matches!((e.ty, ps), (Ty::StructArray(aid, _), Scalar::Struct(pid)) if aid == pid);
+        let struct_arr_match = matches!((e.ty, ps),
+            (Ty::StructArray(aid, _), Scalar::Struct(pid))
+                if self.source_ty_matches(Ty::Struct(aid), Ty::Struct(pid)));
         if struct_arr_match {
             if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
                 self.diags.error(
@@ -14986,7 +15002,8 @@ impl<'a, 't> Checker<'a, 't> {
             return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
         }
         let dyn_struct_match = matches!((e.ty, ps),
-            (Ty::DynStructArray(aid, Layout::Aos), Scalar::Struct(pid)) if aid == pid);
+            (Ty::DynStructArray(aid, Layout::Aos), Scalar::Struct(pid))
+                if self.source_ty_matches(Ty::Struct(aid), Ty::Struct(pid)));
         let dyn_scalar_match = matches!(e.ty, Ty::DynArray(es)
             if self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)));
         if dyn_struct_match || dyn_scalar_match {
@@ -16448,7 +16465,12 @@ impl<'a, 't> Checker<'a, 't> {
                 if let Ty::Struct(id) = lit.ty {
                     match sid {
                         None => sid = Some(id),
-                        Some(prev) if prev != id => {
+                        Some(prev)
+                            if !self.source_ty_matches(
+                                Ty::Struct(prev),
+                                Ty::Struct(id),
+                            ) =>
+                        {
                             self.diags.error("array elements must be the same struct type".to_string(), e.span);
                         }
                         _ => {}
