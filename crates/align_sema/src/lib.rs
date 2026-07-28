@@ -24650,9 +24650,17 @@ fn subst_param_ty(ty: Ty, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) 
 /// payload, or a composite payload). A non-`Param` scalar is unchanged.
 fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>) -> Scalar {
     match s {
-        Scalar::Param(i) => {
-            ty_to_scalar(args.get(i as usize).copied().unwrap_or(Ty::Error)).unwrap_or(s)
-        }
+        Scalar::Param(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
+            Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Option(payload),
+            )),
+            Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Result(ok, err),
+            )),
+            ty => ty_to_scalar(ty).unwrap_or(s),
+        },
         Scalar::Tagged(id) => {
             let Some(tagged) = tagged_types.get(id as usize).copied() else {
                 return s;
@@ -25994,7 +26002,61 @@ fn enum_payload_ok(
         Scalar::DynStructArray(id) => structs
             .get(id as usize)
             .is_some_and(|_| !struct_is_move(id, structs, enums, tagged_types)),
-        Scalar::Tagged(id) => tagged_types.get(id as usize).is_some(),
+        Scalar::Tagged(id) => {
+            fn concrete(
+                scalar: Scalar,
+                structs: &[StructDef],
+                enums: &[hir::EnumDef],
+                tagged_types: &[hir::TaggedType],
+                active: &mut std::collections::HashSet<u32>,
+            ) -> bool {
+                match scalar {
+                    Scalar::Param(_) => false,
+                    Scalar::Struct(id)
+                    | Scalar::DynStructArray(id)
+                    | Scalar::Soa(id) => structs.get(id as usize).is_some(),
+                    Scalar::Enum(id) => enums.get(id as usize).is_some(),
+                    Scalar::Tagged(id) => {
+                        if !active.insert(id) {
+                            return false;
+                        }
+                        let valid = match tagged_types.get(id as usize) {
+                            Some(hir::TaggedType::Option(payload)) => {
+                                concrete(
+                                    *payload,
+                                    structs,
+                                    enums,
+                                    tagged_types,
+                                    active,
+                                )
+                            }
+                            Some(hir::TaggedType::Result(ok, err)) => {
+                                concrete(*ok, structs, enums, tagged_types, active)
+                                    && concrete(
+                                        *err,
+                                        structs,
+                                        enums,
+                                        tagged_types,
+                                        active,
+                                    )
+                            }
+                            None => false,
+                        };
+                        active.remove(&id);
+                        valid
+                    }
+                    _ => true,
+                }
+            }
+
+            concrete(
+                Scalar::Tagged(id),
+                structs,
+                enums,
+                tagged_types,
+                &mut std::collections::HashSet::new(),
+            )
+        }
         _ => false,
     }
 }

@@ -1607,6 +1607,47 @@ fn generic_struct_and_sum_substitute_nested_tagged_payloads() {
 }
 
 #[test]
+fn generic_function_and_sum_accept_tagged_type_arguments() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Envelope<T> { Value(Option<Result<T, string>>), Empty }\n",
+        "fn wrap<T>(value: T) -> Result<Option<T>, string> = Ok(Some(value))\n",
+        "fn main() -> i32 {\n",
+        "  first: Option<i64> := Some(7)\n",
+        "  wrapped: Result<Option<Option<i64>>, string> := wrap(first)\n",
+        "  payload: Option<Result<Option<i64>, string>> := Some(Ok(Some(5)))\n",
+        "  envelope := Envelope.Value(payload)\n",
+        "  a := match wrapped {\n",
+        "    Ok(outer) => match outer {\n",
+        "      Some(inner) => match inner { Some(value) => value, None => 90 },\n",
+        "      None => 91,\n",
+        "    },\n",
+        "    Err(message) => 92,\n",
+        "  }\n",
+        "  b := match envelope {\n",
+        "    Value(outer) => match outer {\n",
+        "      Some(result) => match result {\n",
+        "        Ok(inner) => match inner { Some(value) => value, None => 93 },\n",
+        "        Err(message) => 94,\n",
+        "      },\n",
+        "      None => 95,\n",
+        "    },\n",
+        "    Empty => 96,\n",
+        "  }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(
+        build_and_run("generic-tagged-type-arguments", src)
+            .status
+            .code(),
+        Some(12)
+    );
+}
+
+#[test]
 fn nested_tagged_table_changes_codegen_identity() {
     let src = concat!(
         "fn nested() -> Result<Option<i64>, bool> = Ok(Some(1))\n",
