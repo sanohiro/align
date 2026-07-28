@@ -1502,6 +1502,55 @@ belongs to a later slice.
 | L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
 | L2e | Contextually accept `borrow mut`; complete existing `Out` and new `BorrowMut` under one all-peer recursive exclusivity engine; implement generation invalidation, writable Copy/Move replacement, drop-old/cleanup-bit update, and Pure exclusive-state shaping | Full L2 surface | all-peer alias matrix, stale-view rejection, changed/unchanged pointee Drop counts, effect matrix, and per-unit parity |
 
+L2a is one intentionally unsplit vertical PR even when its hand-written diff exceeds roughly 1,000
+lines. Parameter modes and both summary records participate in one function-signature identity and
+must change atomically across AST/HIR/MIR, whole-program and per-unit lowering, interface
+serialization, mangling, LLVM validation, and malformed-input tests. Interface and physical ABI
+fingerprints are id-free and structural. The internal semantic monomorph key additionally retains a
+concrete function-value origin discriminator: same-signature values have independent inferred
+effect cells, and deduplicating a Pure and Impure origin would make the selected generic
+struct/sum/function HIR read the wrong cell. A generic struct/sum therefore records two names:
+the origin-aware internal analysis name and an id-free source nominal name. Source equality,
+diagnostics, and LLVM named-type reuse use the latter; generic-function analysis keys use the
+former. Every pair sharing a source nominal name must have the same recursively id-free ABI shape
+or codegen rejects it before creating LLVM types. This prevents an inferred
+`Holder { callback: f }` from becoming incompatible with `Holder<fn(T) -> R>` while retaining
+separate Pure/Impure cells. Reassignment, field replacement, control-flow joins, and
+source-compatible fixed or dynamic struct-array formation and materialization into an origin-aware
+generic aggregate join the affected private effect cells. An explicitly annotated source aggregate
+has no intrinsic concrete target: private function parameter, return, local, and loop-result
+boundaries therefore use function- or expression-owned projection cells and join every reachable
+same-program producer. A closed-world boundary may become `Pure` only after all of those producers
+are known. An exportable callback-bearing parameter remains seeded `Unknown` while building its
+interface effect summary, regardless of provider-local call sites, because a dependent unit may pass
+an unseen callback. Each export is solved independently so its Unknown input cannot contaminate an
+unrelated Pure export through a shared private helper; producer-owned exported returns may retain
+their inferred origin. Splitting any
+one layer or either summary into a separately mergeable PR would temporarily permit two incompatible
+identities or require a compatibility path that this pre-release repository forbids. Every callable
+signature consumer—including indirect calls, named stages, and terminals—compares recursive
+source-visible identity rather than origin-specific internal ids. Pipeline stage and terminal
+boundaries join the effective element, accumulator, mapped-result, and capture producers into the
+same per-function parameter cells as an explicit call. A direct `Result.map_err` likewise transfers
+the error producer into the converter parameter and its converter result back into the mapped error
+origin. Static indirect and `map_err` targets also enter the named call graph, so open-world
+reachability validates any parallel boundary inside them. L2a does not retain a named target after
+a function value is bound, moved, or joined:
+an indirect call or `map_err` with a callback-bearing actual remains legal in sequential code but
+fails closed when its enclosing function must prove `Pure`. The same unresolved dispatch is rejected
+when reachable from an exportable callback-bearing root if it carries a callback-bearing actual or
+the erased target can be an internally constructed function value. The latter covers zero-argument
+closures whose captures feed an internal parallel boundary even when unrelated side effects make
+both the closed and open-world effects `Impure`; a direct external callback parameter or parameter
+field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
+provenance through function-value joins.
+Every `?` occurrence joins only its operand's `Result.Err` projection into the enclosing function's
+`Result.Err` return boundary before control returns early; its `Ok` projection continues through the
+ordinary expression and explicit/implicit return paths.
+Pattern bindings select the corresponding source projection: user sums use their variant/payload
+ordinal, while builtin `Option.Some`, `Result.Ok`, and `Result.Err` use their distinct tagged
+projections. Pure and Impure origins therefore survive the same match-binding path.
+
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the
 cleanup ABI for every such signature in the same change that implements it. Interface decode rejects
@@ -1517,7 +1566,7 @@ current type restrictions admit that form.
 
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
-| Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, equality, mangling, structural cache identity, and ABI fingerprints | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
+| Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
 | Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None` | duplicate, unsorted, out-of-range, or exported capture roots reject before consumer-visible side effects | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b | recursively walk scalar, struct, tuple, fixed-array, tagged, and function-value returns; preserve exact parameter/capture roots through assignment, move, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, and explicit/implicit/early return | unresolved higher-order targets use all compatible roots; incompatible joins and escaping unbound captures reject | L3 adds resource/dependent roots; L4 adds explicit region owners |

@@ -375,7 +375,18 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 // which importer triggered the parse — and so safe to cache and share.
                 let d_tdeps = transitive(d, &direct_deps);
                 let d_tdep_refs: Vec<&str> = d_tdeps.iter().map(|s| s.as_str()).collect();
-                let source = align_interface::summary_to_source(dep_summary, &d_tdep_refs);
+                let source = match align_interface::summary_to_source(dep_summary, &d_tdep_refs) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let fid =
+                            source_map.add_file(format!("<interface:{d}>"), String::new());
+                        diags.error(
+                            format!("cannot import interface `{d}`: {error}"),
+                            align_span::Span::new(fid, 0, 0),
+                        );
+                        continue;
+                    }
+                };
                 // Parse the synthesized surface with the real parser (one resolution path). Synthesized
                 // source is compiler-internal and always well-formed; its parse diagnostics are discarded.
                 let mut sink = Diagnostics::new();

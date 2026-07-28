@@ -159,9 +159,27 @@ pub struct TypeParam {
 
 #[derive(Clone, Debug)]
 pub struct Param {
-    pub is_out: bool,
+    pub mode: ParamMode,
     pub name: Ident,
     pub ty: Type,
+}
+
+/// Function parameter ownership/access mode. L2a represents every settled mode end to end while
+/// the parser still produces only [`ByValue`](ParamMode::ByValue) and the already-shipped
+/// [`Out`](ParamMode::Out). `Borrow` and `BorrowMut` remain reserved until their complete semantic
+/// slices land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParamMode {
+    ByValue,
+    Out,
+    Borrow,
+    BorrowMut,
+}
+
+impl ParamMode {
+    pub fn is_out(self) -> bool {
+        matches!(self, ParamMode::Out)
+    }
 }
 
 /// One arm of a `match`: `pattern => body`.
@@ -207,9 +225,17 @@ pub enum Type {
     Named { path: Path, args: Vec<Type>, span: Span },
     /// `(T, U, ...)` — an anonymous product type (arity ≥ 2; `()` is unit, `(T)` is grouping).
     Tuple { elems: Vec<Type>, span: Span },
-    /// `fn(T, U) -> R` — a function-value type (a higher-order-function parameter, e.g.
-    /// `fn apply(f: fn(i64) -> i64, x: i64) -> i64`). `ret` is the return type.
-    Fn { params: Vec<Type>, ret: Box<Type>, span: Span },
+    /// `fn(T, out U) -> R` — a function-value type with an explicit mode per parameter (a
+    /// higher-order-function parameter, e.g. `fn apply(f: fn(i64) -> i64, x: i64) -> i64`).
+    /// `ret` is the return type.
+    Fn { params: Vec<FnTypeParam>, ret: Box<Type>, span: Span },
+}
+
+/// One positional parameter entry in a function-value type.
+#[derive(Clone, Debug)]
+pub struct FnTypeParam {
+    pub mode: ParamMode,
+    pub ty: Type,
 }
 
 impl Type {

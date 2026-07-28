@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    build_summaries, deserialize, serialize, DecodeError, Effect, IType, InterfaceSummary, FORMAT_VERSION,
+    build_summaries, deserialize, encode_interface_surface, serialize, validate_for_import,
+    DecodeError, Effect, Hash128, IType, ImportCompatibilityError, InterfaceSummary, ParamMode,
+    ReturnBorrowSummary, ReturnRegionSummary, FORMAT_VERSION,
 };
 
 /// One in-memory source module for a test program.
@@ -37,7 +39,12 @@ fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
         .map(|(u, ast)| align_sema::Module { path: u.path.to_string(), file: ast, is_entry: u.is_entry, interface_only: false })
         .collect();
     let hir = align_sema::check_program(&modules, &mut diags);
-    assert!(!diags.has_errors(), "program should type-check");
+    let messages: Vec<&str> =
+        diags.iter().map(|diagnostic| diagnostic.message.as_str()).collect();
+    assert!(
+        !diags.has_errors(),
+        "program should type-check: {messages:?}"
+    );
     let mir = align_mir::lower_program(&hir);
     let sources: HashMap<String, String> =
         units.iter().map(|u| (u.path.to_string(), u.src.clone())).collect();
@@ -51,6 +58,10 @@ fn one(src: impl Into<String>) -> Vec<InterfaceSummary> {
 
 fn find<'a>(sums: &'a [InterfaceSummary], unit: &str) -> &'a InterfaceSummary {
     sums.iter().find(|s| s.unit == unit).unwrap_or_else(|| panic!("no unit `{unit}`"))
+}
+
+fn rehash(summary: &mut InterfaceSummary) {
+    summary.interface_hash = Hash128::of(&encode_interface_surface(summary));
 }
 
 // ---- 1. determinism -----------------------------------------------------------------------------
@@ -150,6 +161,331 @@ fn split_c_effect_flip_pure_to_impure_changes_interface() {
         find(&v1, "lib").interface_hash,
         find(&v2, "lib").interface_hash,
         "a Pure->Impure effect flip must change the interface hash"
+    );
+}
+
+#[test]
+fn exportable_callback_parameters_remain_open_world_in_effect_summaries() {
+    let main = "import lib\nfn main() -> i32 = 0\n";
+    let lib_src = "\
+module lib
+pub Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+pub fn apply(callback: fn(i64) -> i64, x: i64) -> i64 {
+  return callback(x)
+}
+fn helper(
+  holder: Holder<fn(i64) -> i64>,
+  x: i64,
+) -> i64 {
+  return holder.callback(x)
+}
+pub fn apply_holder(
+  holder: Holder<fn(i64) -> i64>,
+  x: i64,
+) -> i64 {
+  return helper(holder, x)
+}
+pub fn fixed(x: i64) -> i64 {
+  return helper(Holder { callback: quiet }, x)
+}
+fn seed_direct() -> i64 = apply(quiet, 1)
+fn seed_holder() -> i64 {
+  return apply_holder(Holder { callback: quiet }, 1)
+}
+";
+    let sums = summaries(&[
+        unit("main", true, main),
+        unit("lib", false, lib_src),
+    ]);
+    let lib_summary = find(&sums, "lib");
+    for name in ["apply", "apply_holder"] {
+        assert_eq!(
+            lib_summary
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing exported function `{name}`"))
+                .effect,
+            Effect::Unknown,
+            "an exportable callback-bearing parameter must stay open-world even when provider-local calls pass only Pure values"
+        );
+    }
+    assert_eq!(
+        lib_summary
+            .fns
+            .iter()
+            .find(|function| function.name == "fixed")
+            .expect("missing exported function `fixed`")
+            .effect,
+        Effect::Pure,
+        "one open-world export must not contaminate an unrelated export that reaches the same private helper with a fixed Pure callback"
+    );
+
+    let mut external_effects = HashMap::new();
+    external_effects.insert(
+        "lib$apply".to_string(),
+        align_sema::FnEffect::Unknown,
+    );
+    let consumer = "\
+import lib
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 = lib.apply(loud, x)
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let mut diags = align_diag::Diagnostics::new();
+    let lib_tokens = align_lexer::tokenize(0, lib_src, &mut diags);
+    let lib_file = align_parser::parse_file(lib_tokens, &mut diags);
+    let consumer_tokens =
+        align_lexer::tokenize(1, consumer, &mut diags);
+    let consumer_file =
+        align_parser::parse_file(consumer_tokens, &mut diags);
+    assert!(
+        !diags.has_errors(),
+        "provider and consumer fixtures must parse before effect checking"
+    );
+    let modules = [
+        align_sema::Module {
+            path: "lib".to_string(),
+            file: &lib_file,
+            is_entry: false,
+            interface_only: true,
+        },
+        align_sema::Module {
+            path: "main".to_string(),
+            file: &consumer_file,
+            is_entry: true,
+            interface_only: false,
+        },
+    ];
+    align_sema::check_program_with_effects(
+        &modules,
+        &external_effects,
+        &mut diags,
+    );
+    assert!(
+        diags.has_errors(),
+        "a dependent must reject an Impure callback passed through the provider's Unknown effect summary under par_map"
+    );
+}
+
+#[test]
+fn exportable_internal_parallel_boundaries_are_open_world() {
+    let main = "import lib\nfn main() -> i32 = 0\n";
+    let provider = "\
+module lib
+pub Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn apply(holder: Holder<fn(i64) -> i64>) -> i64 {
+  return holder.callback(1)
+}
+pub fn run(
+  holders: array<Holder<fn(i64) -> i64>>,
+) -> Result<(), Error> {
+  ys := holders.par_map(apply)
+  return Ok(())
+}
+fn provider_use() -> Result<(), Error> {
+  holders: array<Holder<fn(i64) -> i64>> :=
+    [Holder { callback: quiet }].to_array()
+  return run(holders)
+}
+";
+
+    let check = |provider: &str| {
+        let mut diags = align_diag::Diagnostics::new();
+        let main_tokens =
+            align_lexer::tokenize(0, main, &mut diags);
+        let main_file =
+            align_parser::parse_file(main_tokens, &mut diags);
+        let provider_tokens =
+            align_lexer::tokenize(1, provider, &mut diags);
+        let provider_file =
+            align_parser::parse_file(provider_tokens, &mut diags);
+        assert!(
+            !diags.has_errors(),
+            "open-world parallel fixtures must parse before checking"
+        );
+        let modules = [
+            align_sema::Module {
+                path: "main".to_string(),
+                file: &main_file,
+                is_entry: true,
+                interface_only: false,
+            },
+            align_sema::Module {
+                path: "lib".to_string(),
+                file: &provider_file,
+                is_entry: false,
+                interface_only: false,
+            },
+        ];
+        align_sema::check_program(&modules, &mut diags);
+        diags.has_errors()
+    };
+
+    assert!(
+        check(provider),
+        "an exportable body must reject an internal par_map whose callback origin can come from an unseen caller"
+    );
+    let private = provider.replace("pub fn run(", "fn run(");
+    assert!(
+        !check(&private),
+        "the same private closed-world body must retain provider-local Pure precision"
+    );
+}
+
+#[test]
+fn exportable_callback_dispatch_cannot_hide_a_parallel_boundary() {
+    let main = "import lib\nfn main() -> i32 = 0\n";
+    let provider = "\
+module lib
+pub Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn apply(holder: Holder<fn(i64) -> i64>) -> i64 {
+  return holder.callback(1)
+}
+fn helper(
+  holders: array<Holder<fn(i64) -> i64>>,
+) -> Result<(), Error> {
+  ys := holders.par_map(apply)
+  return Ok(())
+}
+fn seed() -> Result<(), Error> {
+  holders: array<Holder<fn(i64) -> i64>> :=
+    [Holder { callback: quiet }].to_array()
+  return helper(holders)
+}
+pub fn run(
+  holders: array<Holder<fn(i64) -> i64>>,
+) -> Result<(), Error> {
+  indirect := helper
+  return indirect(holders)
+}
+";
+
+    let check = |provider: &str| {
+        let mut diags = align_diag::Diagnostics::new();
+        let main_tokens =
+            align_lexer::tokenize(0, main, &mut diags);
+        let main_file =
+            align_parser::parse_file(main_tokens, &mut diags);
+        let provider_tokens =
+            align_lexer::tokenize(1, provider, &mut diags);
+        let provider_file =
+            align_parser::parse_file(provider_tokens, &mut diags);
+        assert!(
+            !diags.has_errors(),
+            "open-world indirect-dispatch fixtures must parse before checking"
+        );
+        let modules = [
+            align_sema::Module {
+                path: "main".to_string(),
+                file: &main_file,
+                is_entry: true,
+                interface_only: false,
+            },
+            align_sema::Module {
+                path: "lib".to_string(),
+                file: &provider_file,
+                is_entry: false,
+                interface_only: false,
+            },
+        ];
+        align_sema::check_program(&modules, &mut diags);
+        diags
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == align_diag::Severity::Error
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !check(provider).is_empty(),
+        "an exported callback-bearing root must not hide a possible internal parallel boundary behind unresolved dispatch"
+    );
+    let private = provider.replace("pub fn run(", "fn run(");
+    let private_diagnostics = check(&private);
+    assert!(
+        private_diagnostics.is_empty(),
+        "the same unresolved dispatch remains legal in a private closed-world function when every parallel target is known Pure: {private_diagnostics:?}"
+    );
+
+    let captured = "\
+module lib
+pub Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn apply(holder: Holder<fn(i64) -> i64>) -> i64 {
+  return holder.callback(1)
+}
+pub fn run(holder: Holder<fn(i64) -> i64>) -> i64 {
+  dispatch := fn {
+    print(0)
+    holders: array<Holder<fn(i64) -> i64>> :=
+      [holder].to_array()
+    ys := holders.par_map(apply)
+    ys.sum()
+  }
+  return dispatch()
+}
+fn provider_use() -> i64 {
+  return run(Holder { callback: quiet })
+}
+";
+    assert!(
+        !check(captured).is_empty(),
+        "a zero-argument indirect closure must not hide an internal parallel boundary affected by an open-world capture"
+    );
+    let private_captured =
+        captured.replace("pub fn run(", "fn run(");
+    let private_captured_diagnostics = check(&private_captured);
+    assert!(
+        private_captured_diagnostics.is_empty(),
+        "the same captured closure remains precise for a private closed-world caller: {private_captured_diagnostics:?}"
+    );
+
+    let map_err_provider = "\
+module lib
+pub Wrap<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn apply(wrap: Wrap<fn(i64) -> i64>) -> i64 {
+  return wrap.callback(1)
+}
+fn convert(wrap: Wrap<fn(i64) -> i64>) -> Error {
+  wraps: array<Wrap<fn(i64) -> i64>> :=
+    [wrap].to_array()
+  ys := wraps.par_map(apply)
+  return Error.Invalid
+}
+pub fn run(
+  result: Result<i64, Wrap<fn(i64) -> i64>>,
+) -> Result<i64, Error> {
+  return result.map_err(convert)
+}
+fn provider_use() -> Result<i64, Error> {
+  result: Result<i64, Wrap<fn(i64) -> i64>> :=
+    Err(Wrap { callback: quiet })
+  return run(result)
+}
+";
+    assert!(
+        !check(map_err_provider).is_empty(),
+        "a static map_err converter must be in named reachability when it contains an internal parallel boundary"
+    );
+    let private_map_err =
+        map_err_provider.replace("pub fn run(", "fn run(");
+    let private_map_err_diagnostics = check(&private_map_err);
+    assert!(
+        private_map_err_diagnostics.is_empty(),
+        "the same map_err converter remains precise for a private closed-world caller: {private_map_err_diagnostics:?}"
     );
 }
 
@@ -265,10 +601,135 @@ fn out_param_marker_is_recorded() {
     let sums = one("pub fn put(out dst: slice<i64>, k: i64) {\n  dst[k] = 42\n}\nfn main() -> i32 = 0\n");
     let put = find(&sums, "main").fns.iter().find(|f| f.name == "put").unwrap();
     assert_eq!(put.params.len(), 2);
-    assert!(put.params[0].is_out, "first param is `out`");
-    assert!(!put.params[1].is_out, "second param is not `out`");
+    assert_eq!(put.params[0].mode, ParamMode::Out);
+    assert_eq!(put.params[1].mode, ParamMode::ByValue);
+    assert_eq!(put.return_borrow, ReturnBorrowSummary::None);
+    assert_eq!(put.return_region, ReturnRegionSummary::None);
     // And the out-param's type survived.
     assert!(matches!(&put.params[0].ty, IType::Named { path, .. } if path == "slice"));
+}
+
+#[test]
+fn parameter_mode_and_return_summaries_have_canonical_codec_identity() {
+    let base = one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n");
+    let mut mode = base[0].clone();
+    mode.fns[0].params[0].mode = ParamMode::Out;
+    rehash(&mut mode);
+    assert_ne!(base[0].interface_hash, mode.interface_hash, "parameter mode is hash identity");
+
+    let mut roots = base[0].clone();
+    roots.fns[0].return_borrow =
+        ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] };
+    rehash(&mut roots);
+    assert_ne!(base[0].interface_hash, roots.interface_hash, "return-borrow roots are hash identity");
+    assert_ne!(mode.interface_hash, roots.interface_hash, "mode and summary encode independently");
+    let decoded = deserialize(&serialize(&roots)).expect("known canonical summary tag round-trips");
+    assert_eq!(decoded, roots);
+    assert_eq!(
+        validate_for_import(&decoded),
+        Err(ImportCompatibilityError::UnsupportedReturnBorrow),
+        "codec recognition must not enable L2b semantics"
+    );
+}
+
+#[test]
+fn known_future_parameter_mode_round_trips_but_semantic_import_rejects() {
+    for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
+        let mut summary =
+            one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+        summary.fns[0].params[0].mode = mode;
+        rehash(&mut summary);
+        let decoded = deserialize(&serialize(&summary)).expect("known future mode tag round-trips");
+        assert_eq!(decoded, summary);
+        assert_eq!(
+            validate_for_import(&decoded),
+            Err(ImportCompatibilityError::UnsupportedParamMode(mode))
+        );
+    }
+}
+
+#[test]
+fn malformed_return_roots_fail_closed_during_decode() {
+    let mut duplicate =
+        one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    duplicate.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![0, 0], captures: vec![] };
+    rehash(&mut duplicate);
+    assert_eq!(
+        deserialize(&serialize(&duplicate)),
+        Err(DecodeError::InvalidSummary("parameter roots must be strictly increasing"))
+    );
+
+    let mut out_of_range = duplicate.clone();
+    out_of_range.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![1], captures: vec![] };
+    rehash(&mut out_of_range);
+    assert_eq!(
+        deserialize(&serialize(&out_of_range)),
+        Err(DecodeError::InvalidSummary("parameter root is outside the signature"))
+    );
+
+    let mut capture = duplicate;
+    capture.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![], captures: vec![0] };
+    rehash(&mut capture);
+    assert_eq!(
+        deserialize(&serialize(&capture)),
+        Err(DecodeError::InvalidSummary(
+            "capture roots are forbidden in exported interfaces"
+        ))
+    );
+
+    let mut empty = capture;
+    empty.fns[0].return_region =
+        ReturnRegionSummary::Roots { params: vec![], captures: vec![] };
+    rehash(&mut empty);
+    assert_eq!(
+        deserialize(&serialize(&empty)),
+        Err(DecodeError::InvalidSummary(
+            "an empty root set must use the canonical None tag"
+        ))
+    );
+}
+
+#[test]
+fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
+    let summary =
+        one("pub fn inspect(out value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    let surface = encode_interface_surface(&summary);
+    let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    assert_eq!(
+        hex,
+        "02000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000000000000000000000000000000"
+    );
+
+    let mut artifact = serialize(&summary);
+    let mode_offset = 4 // format
+        + 4 + summary.unit.len()
+        + 4 // fn sequence
+        + 4 + summary.fns[0].name.len()
+        + 4 // type-parameter sequence
+        + 4; // parameter sequence
+    artifact[mode_offset] = 0xff;
+    assert_eq!(
+        deserialize(&artifact),
+        Err(DecodeError::BadTag { what: "parameter mode", tag: 0xff })
+    );
+
+    // This one-function surface ends with the function's borrow tag, region tag, effect, generic
+    // body option, then the three empty top-level type/const sequences (16 bytes total).
+    let mut bad_borrow = serialize(&summary);
+    bad_borrow[surface.len() - 16] = 0xff;
+    assert_eq!(
+        deserialize(&bad_borrow),
+        Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
+    );
+    let mut bad_region = serialize(&summary);
+    bad_region[surface.len() - 15] = 0xff;
+    assert_eq!(
+        deserialize(&bad_region),
+        Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
+    );
 }
 
 // ---- 5. capability set ---------------------------------------------------------------------------
