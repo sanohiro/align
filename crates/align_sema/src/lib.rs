@@ -4740,6 +4740,24 @@ fn refine_fn_value_types(
     external_effects: &std::collections::HashMap<String, FnEffect>,
 ) {
     let externs: std::collections::HashSet<&str> = program.externs.iter().map(|e| e.name.as_str()).collect();
+    let named_param_types: std::collections::HashMap<&str, Vec<Ty>> = program
+        .fns
+        .iter()
+        .map(|function| {
+            let params = function
+                .params
+                .iter()
+                .map(|local| {
+                    function
+                        .locals
+                        .get(*local as usize)
+                        .map(|local| local.ty)
+                        .unwrap_or(Ty::Error)
+                })
+                .collect();
+            (function.name.as_str(), params)
+        })
+        .collect();
     // Recompute local joins from their declarations on every iteration; this permits a target to
     // improve from Unknown to Pure after its own indirect calls have been refined.
     for f in &program.fns {
@@ -4760,6 +4778,8 @@ fn refine_fn_value_types(
             parmaps: Vec::new(),
             locals: &f.locals,
             fn_types: &program.fn_types,
+            return_ty: f.ret,
+            named_param_types: Some(&named_param_types),
             known_effects: Some(known),
             external_effects,
             externs: &externs,
@@ -4768,6 +4788,9 @@ fn refine_fn_value_types(
             tagged_types: &program.tagged_types,
         };
         scan.block(&f.body);
+        if let Some(value) = f.body.value.as_deref() {
+            scan.join_return_effects(value);
+        }
     }
 }
 
@@ -4812,6 +4835,8 @@ fn compute_effect_sets(
             parmaps: Vec::new(),
             locals: &f.locals,
             fn_types: &program.fn_types,
+            return_ty: f.ret,
+            named_param_types: None,
             known_effects: no_known_effects,
             external_effects,
             externs: &externs,
@@ -4927,6 +4952,14 @@ struct EffectScan<'a> {
     parmaps: Vec<(String, Span)>,
     locals: &'a [Local],
     fn_types: &'a [hir::FnTy],
+    /// The enclosing function's return type. Explicit and implicit returns join concrete callback
+    /// origins into it during refinement, so a direct call never selects only one runtime branch.
+    return_ty: Ty,
+    /// Concrete parameter types of same-program named callees. Generic monomorphs may accept
+    /// source-compatible arguments with distinct callback origins; the callee's private cells join
+    /// every such actual at the call boundary.
+    named_param_types:
+        Option<&'a std::collections::HashMap<&'a str, Vec<Ty>>>,
     /// Present only during the type-refinement walk. The ordinary effect scan consumes the settled
     /// `FnTy` bits and never propagates effects merely from taking a function's address.
     known_effects: Option<&'a std::collections::HashMap<String, FnEffect>>,
@@ -4935,6 +4968,20 @@ struct EffectScan<'a> {
     structs: &'a [StructDef],
     enums: &'a [hir::EnumDef],
     tagged_types: &'a [hir::TaggedType],
+}
+
+/// One source-value projection on the path to a concrete function-valued leaf.  Unlike the former
+/// struct-field-only `u32` path, this distinguishes tagged variants: an absent payload is not an
+/// unknown callback and must not poison another live variant, while a malformed/unresolvable path
+/// still fails closed to [`FnEffect::Unknown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FnEffectProjection {
+    StructField(u32),
+    EnumPayload { variant: u32, index: u32 },
+    OptionSome,
+    ResultOk,
+    ResultErr,
+    ArrayElement,
 }
 
 impl EffectScan<'_> {
@@ -4977,14 +5024,14 @@ impl EffectScan<'_> {
                     self.expr(init);
                     if self.known_effects.is_some() {
                         self.set_local_effect(*local, self.fn_value_effect(init), false);
-                        self.join_concrete_struct_effects(*local, init);
+                        self.join_concrete_type_effects(*local, init);
                     }
                 }
                 Stmt::Assign { local, value, .. } => {
                     self.expr(value);
                     if self.known_effects.is_some() {
                         self.set_local_effect(*local, self.fn_value_effect(value), true);
-                        self.join_concrete_struct_effects(*local, value);
+                        self.join_concrete_type_effects(*local, value);
                     }
                 }
                 Stmt::AssignField { root, path, value } => {
@@ -5029,7 +5076,13 @@ impl EffectScan<'_> {
                     }
                 }
                 Stmt::AssignVecLane { value, .. } => self.expr(value),
-                Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.expr(e),
+                Stmt::Return(Some(e)) => {
+                    self.expr(e);
+                    if self.known_effects.is_some() {
+                        self.join_return_effects(e);
+                    }
+                }
+                Stmt::Break(Some(e)) | Stmt::Expr(e) => self.expr(e),
                 Stmt::Return(None) | Stmt::Break(None) => {}
             }
         }
@@ -5093,83 +5146,220 @@ impl EffectScan<'_> {
         ft.effect.set(if join { ft.effect.get().join(incoming) } else { incoming });
     }
 
-    fn projected_fn_effect(&self, expr: &Expr, path: &[u32]) -> FnEffect {
-        let Some((&field, rest)) = path.split_first() else {
-            return self.fn_value_effect(expr);
-        };
-        match &expr.kind {
-            ExprKind::StructLit { fields, .. } => fields
-                .get(field as usize)
-                .map(|value| self.projected_fn_effect(value, rest))
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::ArrayLit { elems, .. } => elems
-                .iter()
-                .map(|value| self.projected_fn_effect(value, path))
-                .reduce(FnEffect::join)
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::ArrayToArray { source, stages, .. } if stages.is_empty() => {
-                self.projected_fn_effect(source, path)
-            }
-            ExprKind::Local(local) => {
-                let Some(mut ty) = self.locals.get(*local as usize).map(|local| local.ty) else {
-                    return FnEffect::Unknown;
-                };
-                ty = match ty {
-                    Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                        Ty::Struct(id)
-                    }
-                    other => other,
-                };
-                for &index in path {
-                    let Ty::Struct(id) = ty else {
-                        return FnEffect::Unknown;
-                    };
-                    let Some(field) = self
-                        .structs
-                        .get(id as usize)
-                        .and_then(|def| def.fields.get(index as usize))
-                    else {
-                        return FnEffect::Unknown;
-                    };
-                    ty = field.ty;
-                }
-                self.type_effect(ty)
-            }
-            ExprKind::If { then, els, .. } => self
-                .block_projected_fn_effect(then, path)
-                .join(self.block_projected_fn_effect(els, path)),
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .map(|arm| self.projected_fn_effect(&arm.body, path))
-                .reduce(FnEffect::join)
-                .unwrap_or(FnEffect::Unknown),
-            ExprKind::Block(block)
-            | ExprKind::Arena(block)
-            | ExprKind::Unsafe(block)
-            | ExprKind::TaskGroup(block) => self.block_projected_fn_effect(block, path),
-            _ => FnEffect::Unknown,
+    fn join_return_effects(&self, incoming: &Expr) {
+        self.join_concrete_effects(
+            self.return_ty,
+            incoming,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+    }
+
+    fn join_optional_effect(
+        left: Option<FnEffect>,
+        right: Option<FnEffect>,
+    ) -> Option<FnEffect> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.join(right)),
+            (Some(effect), None) | (None, Some(effect)) => Some(effect),
+            (None, None) => None,
         }
     }
 
-    fn block_projected_fn_effect(&self, block: &Block, path: &[u32]) -> FnEffect {
+    /// Resolve a projection against a value's origin-aware type. Constructors below provide more
+    /// precise expression-level routing, while locals and opaque expression forms use this table.
+    /// A path/type disagreement is an internal loss of provenance and therefore returns Unknown.
+    fn projected_type_effect(
+        &self,
+        ty: Ty,
+        path: &[FnEffectProjection],
+    ) -> Option<FnEffect> {
+        let Some((projection, rest)) = path.split_first() else {
+            return Some(self.type_effect(ty));
+        };
+        let ty = expand_tagged_ty(ty, self.tagged_types);
+        let next = match (ty, *projection) {
+            (Ty::Struct(id), FnEffectProjection::StructField(index)) => self
+                .structs
+                .get(id as usize)
+                .and_then(|def| def.fields.get(index as usize))
+                .map(|field| field.ty),
+            (
+                Ty::Enum(id),
+                FnEffectProjection::EnumPayload { variant, index },
+            ) => self
+                .enums
+                .get(id as usize)
+                .and_then(|def| def.variants.get(variant as usize))
+                .and_then(|variant| variant.payload.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
+            (Ty::Option(payload), FnEffectProjection::OptionSome) => {
+                Some(scalar_to_ty(payload))
+            }
+            (Ty::Result(ok, _), FnEffectProjection::ResultOk) => {
+                Some(scalar_to_ty(ok))
+            }
+            (Ty::Result(_, err), FnEffectProjection::ResultErr) => {
+                Some(scalar_to_ty(err))
+            }
+            (Ty::StructArray(id, _), FnEffectProjection::ArrayElement)
+            | (Ty::DynStructArray(id, _), FnEffectProjection::ArrayElement) => {
+                Some(Ty::Struct(id))
+            }
+            (Ty::Array(payload, _), FnEffectProjection::ArrayElement)
+            | (Ty::DynArray(payload), FnEffectProjection::ArrayElement)
+            | (Ty::Slice(payload), FnEffectProjection::ArrayElement) => {
+                Some(scalar_to_ty(payload))
+            }
+            _ => None,
+        };
+        match next {
+            Some(next) => self.projected_type_effect(next, rest),
+            None => Some(FnEffect::Unknown),
+        }
+    }
+
+    /// Effect at one function-valued leaf of `expr`. `None` means this runtime variant has no such
+    /// payload; `Some(Unknown)` means the payload exists but its origin cannot be proved.
+    fn projected_fn_effect(
+        &self,
+        expr: &Expr,
+        path: &[FnEffectProjection],
+    ) -> Option<FnEffect> {
+        let Some((projection, rest)) = path.split_first() else {
+            return Some(self.fn_value_effect(expr));
+        };
+        match (&expr.kind, *projection) {
+            (
+                ExprKind::StructLit { fields, .. },
+                FnEffectProjection::StructField(field),
+            ) => fields
+                .get(field as usize)
+                .map(|value| self.projected_fn_effect(value, rest))
+                .unwrap_or(Some(FnEffect::Unknown)),
+            (
+                ExprKind::EnumValue {
+                    variant,
+                    payload,
+                    ..
+                },
+                FnEffectProjection::EnumPayload {
+                    variant: projected_variant,
+                    index,
+                },
+            ) => {
+                if *variant != projected_variant {
+                    None
+                } else {
+                    payload
+                        .get(index as usize)
+                        .map(|value| self.projected_fn_effect(value, rest))
+                        .unwrap_or(Some(FnEffect::Unknown))
+                }
+            }
+            (ExprKind::OptionSome(value), FnEffectProjection::OptionSome)
+            | (ExprKind::ResultOk(value), FnEffectProjection::ResultOk)
+            | (ExprKind::ResultErr(value), FnEffectProjection::ResultErr) => {
+                self.projected_fn_effect(value, rest)
+            }
+            (ExprKind::OptionNone, FnEffectProjection::OptionSome) => None,
+            (ExprKind::ResultOk(_), FnEffectProjection::ResultErr)
+            | (ExprKind::ResultErr(_), FnEffectProjection::ResultOk) => None,
+            (ExprKind::ArrayLit { elems, .. }, FnEffectProjection::ArrayElement) => {
+                elems
+                    .iter()
+                    .map(|value| self.projected_fn_effect(value, rest))
+                    .fold(None, Self::join_optional_effect)
+            }
+            (
+                ExprKind::ArrayToArray { source, stages, .. },
+                FnEffectProjection::ArrayElement,
+            ) if stages.is_empty() => self.projected_fn_effect(source, path),
+            (ExprKind::Index { recv, .. }, _) => {
+                let mut wrapped = Vec::with_capacity(path.len() + 1);
+                wrapped.push(FnEffectProjection::ArrayElement);
+                wrapped.extend_from_slice(path);
+                self.projected_fn_effect(recv, &wrapped)
+            }
+            (ExprKind::ElseUnwrap { opt, fallback }, _) => {
+                let success = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(FnEffectProjection::OptionSome),
+                    Ty::Result(..) => Some(FnEffectProjection::ResultOk),
+                    _ => None,
+                };
+                let from_success = success
+                    .map(|success| {
+                        let mut wrapped = Vec::with_capacity(path.len() + 1);
+                        wrapped.push(success);
+                        wrapped.extend_from_slice(path);
+                        self.projected_fn_effect(opt, &wrapped)
+                    })
+                    .unwrap_or(Some(FnEffect::Unknown));
+                let from_fallback = (!hir_expr_diverges(fallback))
+                    .then(|| self.projected_fn_effect(fallback, path))
+                    .flatten();
+                Self::join_optional_effect(from_success, from_fallback)
+            }
+            (ExprKind::Try(result), _) => {
+                let mut wrapped = Vec::with_capacity(path.len() + 1);
+                wrapped.push(FnEffectProjection::ResultOk);
+                wrapped.extend_from_slice(path);
+                self.projected_fn_effect(result, &wrapped)
+            }
+            (ExprKind::Call { .. }, _) => {
+                self.projected_type_effect(expr.ty, path)
+            }
+            (ExprKind::Local(local), _) => self
+                .locals
+                .get(*local as usize)
+                .map(|local| self.projected_type_effect(local.ty, path))
+                .unwrap_or(Some(FnEffect::Unknown)),
+            (ExprKind::If { then, els, .. }, _) => Self::join_optional_effect(
+                self.block_projected_fn_effect(then, path),
+                self.block_projected_fn_effect(els, path),
+            ),
+            (ExprKind::Match { arms, .. }, _) => arms
+                .iter()
+                .map(|arm| self.projected_fn_effect(&arm.body, path))
+                .fold(None, Self::join_optional_effect),
+            (
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::Unsafe(block)
+                | ExprKind::TaskGroup(block),
+                _,
+            ) => self.block_projected_fn_effect(block, path),
+            // Transforming pipelines and indirect calls do not yet carry recursive return-origin
+            // summaries (L2b). Reading their result type here could select one syntactic origin
+            // even when another runtime path produced the value, so every unhandled producer fails
+            // closed. Same-program direct calls are handled above after their explicit returns and
+            // concrete call arguments have joined the callee's private effect cells.
+            _ => Some(FnEffect::Unknown),
+        }
+    }
+
+    fn block_projected_fn_effect(
+        &self,
+        block: &Block,
+        path: &[FnEffectProjection],
+    ) -> Option<FnEffect> {
         block
             .value
             .as_deref()
-            .map(|value| self.projected_fn_effect(value, path))
-            .unwrap_or(FnEffect::Unknown)
+            .and_then(|value| self.projected_fn_effect(value, path))
     }
 
-    fn join_concrete_struct_effects(&self, local: LocalId, incoming: &Expr) {
+    fn join_concrete_type_effects(&self, local: LocalId, incoming: &Expr) {
         let Some(ty) = self.locals.get(local as usize).map(|local| local.ty) else {
             return;
         };
-        match ty {
-            Ty::Struct(id) => self.join_concrete_struct_id_effects(id, incoming),
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                self.join_concrete_struct_id_effects(id, incoming);
-            }
-            _ => {}
-        }
+        self.join_concrete_effects(
+            ty,
+            incoming,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
     }
 
     fn join_concrete_struct_id_effects(&self, id: u32, incoming: &Expr) {
@@ -5182,10 +5372,11 @@ impl EffectScan<'_> {
             return;
         }
         for (index, field) in def.fields.iter().enumerate() {
-            self.join_concrete_field_effect(
+            self.join_concrete_effects(
                 field.ty,
                 incoming,
-                &mut vec![index as u32],
+                &mut vec![FnEffectProjection::StructField(index as u32)],
+                &mut vec![Ty::Struct(id)],
             );
         }
     }
@@ -5233,34 +5424,133 @@ impl EffectScan<'_> {
             };
             *ty = field.ty;
         }
-        self.join_concrete_field_effect(*ty, incoming, &mut Vec::new());
+        self.join_concrete_effects(
+            *ty,
+            incoming,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
     }
 
-    fn join_concrete_field_effect(&self, ty: Ty, incoming: &Expr, path: &mut Vec<u32>) {
-        match ty {
-            Ty::Fn(id) => {
-                let Some(function) = self.fn_types.get(id as usize) else {
-                    return;
-                };
+    fn join_concrete_effects(
+        &self,
+        ty: Ty,
+        incoming: &Expr,
+        path: &mut Vec<FnEffectProjection>,
+        visiting: &mut Vec<Ty>,
+    ) {
+        let ty = expand_tagged_ty(ty, self.tagged_types);
+        if let Ty::Fn(id) = ty {
+            let Some(function) = self.fn_types.get(id as usize) else {
+                return;
+            };
+            if let Some(incoming) = self.projected_fn_effect(incoming, path) {
                 function
                     .effect
-                    .set(function.effect.get().join(self.projected_fn_effect(incoming, path)));
+                    .set(function.effect.get().join(incoming));
             }
+            return;
+        }
+        if !matches!(
+            ty,
+            Ty::Struct(_)
+                | Ty::Enum(_)
+                | Ty::Option(_)
+                | Ty::Result(..)
+                | Ty::StructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Array(..)
+                | Ty::DynArray(_)
+                | Ty::Slice(_)
+        ) {
+            return;
+        }
+        if visiting.contains(&ty) {
+            return;
+        }
+        visiting.push(ty);
+        match ty {
             Ty::Struct(id) => {
                 let Some(def) = self.structs.get(id as usize) else {
+                    visiting.pop();
                     return;
                 };
                 if def.name == def.source_name {
+                    visiting.pop();
                     return;
                 }
                 for (index, field) in def.fields.iter().enumerate() {
-                    path.push(index as u32);
-                    self.join_concrete_field_effect(field.ty, incoming, path);
+                    path.push(FnEffectProjection::StructField(index as u32));
+                    self.join_concrete_effects(field.ty, incoming, path, visiting);
                     path.pop();
                 }
             }
+            Ty::Enum(id) => {
+                let Some(def) = self.enums.get(id as usize) else {
+                    visiting.pop();
+                    return;
+                };
+                if def.name == def.source_name {
+                    visiting.pop();
+                    return;
+                }
+                for (variant_index, variant) in def.variants.iter().enumerate() {
+                    for (payload_index, payload) in variant.payload.iter().enumerate() {
+                        path.push(FnEffectProjection::EnumPayload {
+                            variant: variant_index as u32,
+                            index: payload_index as u32,
+                        });
+                        self.join_concrete_effects(
+                            scalar_to_ty(*payload),
+                            incoming,
+                            path,
+                            visiting,
+                        );
+                        path.pop();
+                    }
+                }
+            }
+            Ty::Option(payload) => {
+                path.push(FnEffectProjection::OptionSome);
+                self.join_concrete_effects(
+                    scalar_to_ty(payload),
+                    incoming,
+                    path,
+                    visiting,
+                );
+                path.pop();
+            }
+            Ty::Result(ok, err) => {
+                path.push(FnEffectProjection::ResultOk);
+                self.join_concrete_effects(scalar_to_ty(ok), incoming, path, visiting);
+                path.pop();
+                path.push(FnEffectProjection::ResultErr);
+                self.join_concrete_effects(
+                    scalar_to_ty(err),
+                    incoming,
+                    path,
+                    visiting,
+                );
+                path.pop();
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                path.push(FnEffectProjection::ArrayElement);
+                self.join_concrete_effects(Ty::Struct(id), incoming, path, visiting);
+                path.pop();
+            }
+            Ty::Array(payload, _) | Ty::DynArray(payload) | Ty::Slice(payload) => {
+                path.push(FnEffectProjection::ArrayElement);
+                self.join_concrete_effects(
+                    scalar_to_ty(payload),
+                    incoming,
+                    path,
+                    visiting,
+                );
+                path.pop();
+            }
             _ => {}
         }
+        visiting.pop();
     }
 
     fn consume_fn_value(&mut self, expr: &Expr) {
@@ -5329,6 +5619,20 @@ impl EffectScan<'_> {
                 for a in args {
                     self.expr(a);
                 }
+                if self.known_effects.is_some()
+                    && let Some(params) = self
+                        .named_param_types
+                        .and_then(|functions| functions.get(func.as_str()))
+                {
+                    for (param, arg) in params.iter().zip(args) {
+                        self.join_concrete_effects(
+                            *param,
+                            arg,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        );
+                    }
+                }
             }
             // Taking a function's address has no observable effect. During refinement, record the
             // target's inferred effect in this concrete value's `FnTy`; invocation sites below
@@ -5357,6 +5661,19 @@ impl EffectScan<'_> {
                 self.consume_fn_value(callee);
                 for a in args {
                     self.expr(a);
+                }
+                if self.known_effects.is_some()
+                    && let Ty::Fn(fid) = callee.ty
+                    && let Some(function) = self.fn_types.get(fid as usize)
+                {
+                    for ((_, param), arg) in function.params.iter().zip(args) {
+                        self.join_concrete_effects(
+                            scalar_to_ty(*param),
+                            arg,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        );
+                    }
                 }
             }
             // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
@@ -12224,7 +12541,16 @@ impl<'a, 't> Checker<'a, 't> {
                 .fn_types
                 .get(aid as usize)
                 .zip(self.fn_types.get(bid as usize))
-                .is_some_and(|(a, b)| a == b),
+                .is_some_and(|(a, b)| {
+                    a.params.len() == b.params.len()
+                        && a.params.iter().zip(&b.params).all(
+                            |((a_mode, a_ty), (b_mode, b_ty))| {
+                                a_mode == b_mode
+                                    && self.source_scalar_matches(*a_ty, *b_ty)
+                            },
+                        )
+                        && self.source_ty_matches(a.ret, b.ret)
+                }),
             (Ty::Struct(aid), Ty::Struct(bid)) => self
                 .structs
                 .get(aid as usize)

@@ -669,6 +669,245 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn tagged_generic_fn_wrappers_join_effect_origins() {
+    let option = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut maybe := Some(Holder { callback: quiet })
+  if x > 0 { maybe = Some(Holder { callback: loud }) }
+  holder := maybe else { return x }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-reassigned-option-fn-wrapper", option)
+            .contains("has an observable side effect"),
+        "Option reassignment must join a nested callback's concrete effects"
+    );
+
+    let nested_option = option
+        .replace(
+            "mut maybe := Some(Holder { callback: quiet })",
+            "mut maybe := Some(Some(Holder { callback: quiet }))",
+        )
+        .replace(
+            "maybe = Some(Holder { callback: loud })",
+            "maybe = Some(Some(Holder { callback: loud }))",
+        )
+        .replace(
+            "holder := maybe else { return x }",
+            "inner := maybe else { return x }\n  holder := inner else { return x }",
+        );
+    assert!(
+        check_diagnostics(
+            "parmap-reassigned-nested-option-fn-wrapper",
+            &nested_option,
+        )
+        .contains("has an observable side effect"),
+        "nested tagged payloads must recursively join callback effects"
+    );
+
+    let impure_fallback = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut maybe := Some(Holder { callback: quiet })
+  if x < 0 { maybe = None }
+  holder := maybe else { Holder { callback: loud } }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-option-impure-fallback-fn-wrapper", impure_fallback)
+            .contains("has an observable side effect"),
+        "a non-diverging else fallback must join its callback effect with the success payload"
+    );
+
+    let result = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn wrap<T>(value: T) -> Result<T, Error> = Ok(value)
+fn worker(x: i64) -> i64 {
+  mut result := wrap(Holder { callback: quiet })
+  if x > 0 { result = wrap(Holder { callback: loud }) }
+  holder := result else { return x }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-reassigned-result-fn-wrapper", result)
+            .contains("has an observable side effect"),
+        "Result reassignment must join a nested callback's concrete effects"
+    );
+
+    let sum = "\
+Holder<T> { callback: T }
+Choice<T> { Some(T), None }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  mut choice := Choice.Some(Holder { callback: quiet })
+  if x > 0 { choice = Choice.Some(Holder { callback: loud }) }
+  return match choice {
+    Some(holder) => holder.callback(x),
+    None => x,
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-reassigned-sum-fn-wrapper", sum)
+            .contains("has an observable side effect"),
+        "a generic sum reassignment must join the selected payload's callback effects"
+    );
+}
+
+#[test]
+fn pure_tagged_unwraps_preserve_nested_fn_effects() {
+    let option = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn worker(x: i64) -> i64 {
+  mut maybe := Some(Holder { callback: quiet })
+  if x < 0 { maybe = None }
+  holder := maybe else { return x }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-option-unwrapped-fn-wrapper", option),
+        "an absent Option payload must not turn its known-Pure success callback into Unknown"
+    );
+
+    let result = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn wrap<T>(value: T) -> Result<T, Error> = Ok(value)
+fn through(x: i64) -> Result<i64, Error> {
+  mut result := wrap(Holder { callback: quiet })
+  if x < 0 { result = Err(error(1)) }
+  holder := result?
+  return Ok(holder.callback(x))
+}
+fn worker(x: i64) -> i64 {
+  result := through(x)
+  return result else { return x }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-pure-result-try-fn-wrapper", result),
+        "`?` and Result else-unwrap must preserve a known-Pure nested callback"
+    );
+}
+
+#[test]
+fn nested_fn_signatures_compare_by_source_identity() {
+    let src = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn main() -> i32 {
+  make: fn() -> Holder<fn(i64) -> i64> := fn {
+    holder := Holder { callback: quiet }
+    holder
+  }
+  holder := make()
+  return holder.callback(41) as i32
+}
+";
+    assert!(
+        !check_errs("nested-fn-signature-source-identity", src),
+        "a function signature must compare nested generic aggregates by source identity"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("nested-fn-signature-source-identity", src)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn generic_calls_join_source_compatible_argument_effect_origins() {
+    let src = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn choose<T>(first: T, second: T, take_second: bool) -> T {
+  if take_second { return second }
+  return first
+}
+fn worker(x: i64) -> i64 {
+  holder := choose(
+    Holder { callback: quiet },
+    Holder { callback: loud },
+    x > 0,
+  )
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-generic-call-joined-fn-wrapper", src)
+            .contains("has an observable side effect"),
+        "one generic monomorph must join every source-compatible actual argument, not keep the first callback origin"
+    );
+}
+
+#[test]
 fn extern_fn_type_effect_is_impure_through_indirection() {
     let src = "\
 extern \"C\" fn abs(x: i32) -> i32
