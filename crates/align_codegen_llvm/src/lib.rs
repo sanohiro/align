@@ -3118,6 +3118,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
         for &ty in f.slots.iter().chain(&f.value_tys) {
             check_ty(ty, &program.tagged_types)?;
         }
+        for ty in align_mir::function_embedded_types(f) {
+            check_ty(ty, &program.tagged_types)?;
+        }
     }
     for ext in &program.externs {
         check_ty(ext.ret, &program.tagged_types)?;
@@ -12717,6 +12720,49 @@ mod tests {
         };
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a missing nested tagged id must fail closed");
+        assert!(
+            err.to_string().contains("nested tagged type id 7 is missing"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_embedded_nested_tagged_id_is_a_codegen_error_not_a_panic() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![Ty::Fn(0)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::Closure {
+                            lifted: "unused".to_string(),
+                            captures: vec![],
+                            capture_tys: vec![Ty::Tagged(7)],
+                        },
+                    )],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tagged_types: vec![],
+            tuples: vec![],
+        };
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("an embedded missing nested tagged id must fail closed");
         assert!(
             err.to_string().contains("nested tagged type id 7 is missing"),
             "unexpected diagnostic: {err}"

@@ -1557,6 +1557,99 @@ fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, pe
 /// Reduce the sema interner to the concrete MIR-reachable closure and assign ids from an
 /// id-independent structural key. Sema may retain unused generic-template entries; they must not
 /// perturb MIR, ABI, or cache identity.
+/// Every type stored inside a function body rather than its signature, slot table, or SSA value
+/// table. Canonical tagged-type closure and the codegen malformed-MIR validator share this list so
+/// a closure, indirect call, task, or parallel-stage ABI cannot retain an unchecked raw tagged id.
+pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
+    fn push_stage(types: &mut Vec<Ty>, stage: &ParMapStage) {
+        types.extend(stage.capture_tys.iter().copied());
+        types.push(stage.elem_in);
+        types.push(stage.elem_out);
+    }
+
+    let mut types = Vec::new();
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::StoreConstArray { elem, .. } | Stmt::VecStore { elem, .. } => {
+                    types.push(*elem)
+                }
+                Stmt::Let(_, rv) => match rv {
+                    Rvalue::Cast { from, to, .. } => {
+                        types.push(*from);
+                        types.push(*to);
+                    }
+                    Rvalue::IntArith { int_ty, .. } | Rvalue::MathOp { ty: int_ty, .. } => {
+                        types.push(*int_ty)
+                    }
+                    Rvalue::Closure { capture_tys, .. } => {
+                        types.extend(capture_tys.iter().copied())
+                    }
+                    Rvalue::CallIndirect {
+                        param_tys, ret_ty, ..
+                    } => {
+                        types.extend(param_tys.iter().copied());
+                        types.push(*ret_ty);
+                    }
+                    Rvalue::SpawnTask {
+                        capture_tys, r, ..
+                    } => {
+                        types.extend(capture_tys.iter().copied());
+                        types.push(*r);
+                    }
+                    Rvalue::MakeVec { elem, .. }
+                    | Rvalue::VecExtract { elem, .. }
+                    | Rvalue::VecSumWhere { elem, .. }
+                    | Rvalue::VecDot { elem, .. }
+                    | Rvalue::VecMinMax { elem, .. }
+                    | Rvalue::VecSum { elem, .. }
+                    | Rvalue::VecLoad { elem, .. }
+                    | Rvalue::ArenaAlloc { elem, .. }
+                    | Rvalue::HeapAllocBuf { elem, .. }
+                    | Rvalue::Chunks { elem, .. }
+                    | Rvalue::SubSlice { elem, .. }
+                    | Rvalue::ConstArray { elem, .. }
+                    | Rvalue::JsonDecodeArray { elem, .. }
+                    | Rvalue::RandShuffle { elem, .. }
+                    | Rvalue::RandSample { elem, .. }
+                    | Rvalue::JsonDecodeScalar { scalar: elem, .. }
+                    | Rvalue::JsonDocAsScalar { scalar: elem, .. }
+                    | Rvalue::BytesRead { scalar: elem, .. }
+                    | Rvalue::BufferPut { scalar: elem, .. }
+                    | Rvalue::ArrayBuilderPush { scalar: elem, .. } => types.push(*elem),
+                    Rvalue::ParMapParallel {
+                        stages,
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        ..
+                    } => {
+                        for stage in stages {
+                            push_stage(&mut types, stage);
+                        }
+                        types.extend(capture_tys.iter().copied());
+                        types.push(*elem_in);
+                        types.push(*elem_out);
+                    }
+                    Rvalue::ParMapReduce {
+                        capture_tys,
+                        elem_in,
+                        elem_out,
+                        ..
+                    } => {
+                        types.extend(capture_tys.iter().copied());
+                        types.push(*elem_in);
+                        types.push(*elem_out);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    types
+}
+
 fn canonicalize_tagged_types(program: &mut Program) {
     if program.tagged_types.is_empty() {
         return;
@@ -1624,6 +1717,9 @@ fn canonicalize_tagged_types(program: &mut Program) {
     for f in &program.fns {
         collect_ty(f.ret, &program.tagged_types, &mut reachable);
         for &ty in f.slots.iter().chain(&f.value_tys) {
+            collect_ty(ty, &program.tagged_types, &mut reachable);
+        }
+        for ty in function_embedded_types(f) {
             collect_ty(ty, &program.tagged_types, &mut reachable);
         }
     }
@@ -11850,7 +11946,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_tagged_canonicalization_keeps_expression_temporaries_and_drops_templates() {
+    fn nested_tagged_canonicalization_keeps_embedded_types_and_drops_templates() {
         let i32_ty = Ty::Int(IntTy {
             bits: 32,
             signed: true,
@@ -11862,13 +11958,20 @@ mod tests {
                 ret: i32_ty,
                 slots: vec![],
                 slot_align: vec![],
-                // This tag exists only on an SSA temporary: no signature, slot, or nominal type
-                // reaches it. The closure scan must still retain it.
-                value_tys: vec![Ty::Tagged(1)],
+                // This tag exists only in a closure's embedded capture ABI: no signature, slot,
+                // SSA value, or nominal type reaches it. The closure scan must still retain it.
+                value_tys: vec![Ty::Fn(0)],
                 blocks: vec![Block {
                     id: 0,
-                    stmts: vec![],
-                    stmt_lines: vec![],
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::Closure {
+                            lifted: "unused".to_string(),
+                            captures: vec![],
+                            capture_tys: vec![Ty::Tagged(1)],
+                        },
+                    )],
+                    stmt_lines: vec![(0, 0)],
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
@@ -11902,9 +12005,18 @@ mod tests {
                 }),
                 Scalar::Bool,
             )],
-            "the expression-only inner Result must survive while the unused generic template is omitted"
+            "the embedded closure ABI Result must survive while the unused generic template is omitted"
         );
-        assert_eq!(program.fns[0].value_tys, vec![Ty::Tagged(0)]);
+        let Stmt::Let(
+            _,
+            Rvalue::Closure {
+                capture_tys, ..
+            },
+        ) = &program.fns[0].blocks[0].stmts[0]
+        else {
+            panic!("expected the closure fixture");
+        };
+        assert_eq!(capture_tys, &vec![Ty::Tagged(0)]);
         assert!(tagged_types_are_canonical(&program));
     }
 
