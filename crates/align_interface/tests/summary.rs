@@ -689,6 +689,30 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
         Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
         "owned builtin handles must not be mistaken for generic nominal types"
     );
+
+    for builtin in ["Error", "argon2_params", "regex_match"] {
+        let mut builtin_root = non_borrowing_root.clone();
+        builtin_root.fns[0].params[0].ty = IType::Named {
+            path: builtin.to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            validate_for_import(&builtin_root),
+            Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+            "compiler-known non-borrowing builtin parameter `{builtin}` must reject provenance"
+        );
+
+        let mut builtin_return = non_borrowing_return.clone();
+        builtin_return.fns[0].ret = IType::Named {
+            path: builtin.to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            validate_for_import(&builtin_return),
+            Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType),
+            "compiler-known non-borrowing builtin return `{builtin}` must reject provenance"
+        );
+    }
 }
 
 #[test]

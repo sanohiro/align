@@ -13389,9 +13389,19 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             ExprKind::Try(i) => {
                 // L2b-a1 preserves the conservative flattened Result provenance. L2b-a2 splits
-                // the implicit Err return edge from the continuing Ok projection.
+                // the implicit Err return edge from the continuing Ok projection. Do not attach
+                // that flattened union to a return type that cannot carry any borrow: the operand's
+                // Ok payload may borrow even though the propagated Err and enclosing return do not.
                 self.expr(i, moved, true, true);
-                self.return_roots.extend(self.borrow_sources(i));
+                if ty_may_borrow(
+                    self.f.ret,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    self.return_roots.extend(self.borrow_sources(i));
+                }
             }
             // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
             // str/int arg). `builder()` is a leaf.

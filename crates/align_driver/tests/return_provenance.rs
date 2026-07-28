@@ -36,6 +36,10 @@ pub fn propagate(value: Result<str, Error>, fallback: str) -> Result<str, Error>
   selected := value?
   return Ok(fallback)
 }
+pub fn consume_try_success(value: Result<str, Error>) -> Result<i64, Error> {
+  selected := value?
+  return Ok(selected.len())
+}
 pub fn choose(first: str, second: str, take_first: bool) -> str {
   value := if take_first { Choice.First(first) } else { Choice.Second(second) }
   return match value {
@@ -81,6 +85,11 @@ pub fn choose(first: str, second: str, take_first: bool) -> str {
         find("propagate").return_borrow,
         roots(&[0, 1], &[]),
         "L2b-a1 conservatively flattens the implicit Err edge and continuing Ok value"
+    );
+    assert_eq!(
+        find("consume_try_success").return_borrow,
+        ReturnBorrowSummary::None,
+        "a borrowing Ok payload must not put provenance on a non-borrowing Result return"
     );
     assert_eq!(
         find("choose").return_borrow,

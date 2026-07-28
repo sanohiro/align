@@ -1560,9 +1560,11 @@ physical ABI.
 L2b-a1 cannot split producer inference from interface validation, direct-call consumption, and
 whole/per-unit parity: shipping a non-empty public summary without any one of those seams would
 either ignore the fact in one compilation mode or trust an unvalidated artifact.
-Every `?` occurrence joins only its operand's `Result.Err` projection into the enclosing function's
-`Result.Err` return boundary before control returns early; its `Ok` projection continues through the
-ordinary expression and explicit/implicit return paths.
+Through L2b-a1, a `?` occurrence conservatively joins its flattened operand roots into the
+enclosing function only when that function's return type can recursively carry a borrow; its `Ok`
+projection continues through the ordinary expression and explicit/implicit return paths. L2b-a2
+replaces that early-edge union with only the operand's `Result.Err` projection at the enclosing
+function's `Result.Err` return boundary.
 Pattern bindings select the corresponding source projection: user sums use their variant/payload
 ordinal, while builtin `Option.Some`, `Result.Ok`, and `Result.Err` use their distinct tagged
 projections. Pure and Impure origins therefore survive the same match-binding path.
@@ -1594,7 +1596,7 @@ current type restrictions admit that form.
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
 | Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, or roots inconsistent with resolved parameter/return types reject before consumer-visible side effects | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
-| Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
+| Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; an a1 `?` edge may union the flattened operand roots only when the enclosing return type can recursively carry a borrow, so a borrow-capable `Ok` payload cannot put provenance on a scalar/error-only return; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject; semantic import rejects provenance on every compiler-known non-borrowing builtin (`Error`, `argon2_params`, and `regex_match`) before per-unit checking | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
 | Closure/function-value provenance | L2b-b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
 | Cleanup ABI formation | L2c | Copy returns record `None`; every recursively Move return records `DynamicBit` in `FnTy`, named/imported signatures, MIR, interface, mangling, cache identity, and LLVM ABI | metadata/type disagreement, missing bit, extra bit, unknown tag, and caller/callee fingerprint mismatch reject | none |
 | Cleanup-bit production | L2c | normal expression return, explicit return, `if`, `match`, `else`, `?`, `map_err`, branch/loop join, and early exit forward the selected path-local bit and clear a moved source exactly once | malformed MIR bit source/destination, missing local, invalid tag, and uninitialized/duplicate transfer reject without panic | L4 adds explicit-region clear-bit values |
@@ -1612,7 +1614,7 @@ their first owning slice and remain cumulative gates afterward.
 | Slice | Exact owner tests | Exact benchmark command and required rows |
 |---|---|---|
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
-| L2b-a1 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a1 | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-a2 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
 | L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |

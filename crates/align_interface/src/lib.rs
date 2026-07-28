@@ -889,9 +889,8 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
                         .any(|arg| visit(arg, summary, visiting, bindings)),
                     "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
                     | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
-                    | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind" => {
-                        false
-                    }
+                    | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
+                    | "Error" | "argon2_params" | "regex_match" => false,
                     "()" | "bool" | "char" | "string" | "i8" | "i16" | "i32" | "i64"
                     | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "raw" => false,
                     _ => {
