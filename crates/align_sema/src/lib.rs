@@ -1000,6 +1000,25 @@ impl DropPlan {
             DropPlan::Result { ok, err } => ok.needs_drop() || err.needs_drop(),
         }
     }
+
+    /// Whether every recursively embedded definition exists and the complete by-value graph is
+    /// acyclic. Codegen uses this on decoded/hand-built MIR before layout recursion; sema reports
+    /// the source-facing cycle diagnostic earlier for ordinary programs.
+    pub fn is_valid(&self) -> bool {
+        match self {
+            DropPlan::Invalid => false,
+            DropPlan::None | DropPlan::Leaf(_) => true,
+            DropPlan::Struct { fields, .. } => {
+                fields.iter().all(|(_, plan)| plan.is_valid())
+            }
+            DropPlan::Option(payload) => payload.is_valid(),
+            DropPlan::Result { ok, err } => ok.is_valid() && err.is_valid(),
+            DropPlan::Enum { variants, .. } => variants
+                .iter()
+                .flatten()
+                .all(|plan| plan.is_valid()),
+        }
+    }
 }
 
 /// Build the recursive Drop plan after named definitions have been resolved. The returned plan is

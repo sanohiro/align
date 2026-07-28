@@ -3105,6 +3105,18 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     // does not narrow a valid program.
     for id in 0..program.tagged_types.len() {
         check_scalar(Scalar::Tagged(id as u32), program, &mut Vec::new())?;
+        if !drop_plan(
+            Ty::Tagged(id as u32),
+            &program.structs,
+            &program.enums,
+            &program.tagged_types,
+        )
+        .is_valid()
+        {
+            return Err(CodegenError::Lowering(format!(
+                "nested tagged type id {id} has a missing or recursive by-value definition"
+            )));
+        }
     }
     for def in &program.structs {
         for field in &def.fields {
@@ -12866,6 +12878,76 @@ mod tests {
             assert!(
                 err.to_string().contains(expected),
                 "unexpected diagnostic: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_cross_table_tagged_cycles_are_codegen_errors_not_panics() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let program = |structs, enums, tagged_types| Program {
+            fns: vec![Function {
+                name: "main".to_string(),
+                params: vec![],
+                ret: i32_ty,
+                slots: vec![],
+                slot_align: vec![],
+                value_tys: vec![Ty::Tagged(0)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs,
+            enums,
+            tagged_types,
+            tuples: vec![],
+        };
+        let struct_cycle = program(
+            vec![StructDef {
+                name: "Cycle".to_string(),
+                fields: vec![align_sema::FieldDef {
+                    name: "next".to_string(),
+                    ty: Ty::Tagged(0),
+                }],
+                align: None,
+                c_repr: false,
+            }],
+            vec![],
+            vec![hir::TaggedType::Option(Scalar::Struct(0))],
+        );
+        let enum_cycle = program(
+            vec![],
+            vec![hir::EnumDef {
+                name: "Cycle".to_string(),
+                variants: vec![hir::EnumVariant {
+                    name: "Next".to_string(),
+                    payload: vec![Scalar::Tagged(0)],
+                    field_base: 1,
+                }],
+            }],
+            vec![hir::TaggedType::Option(Scalar::Enum(0))],
+        );
+        for (name, malformed) in [("struct", struct_cycle), ("sum", enum_cycle)] {
+            let err = emit_llvm_ir(
+                &malformed,
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+            .expect_err("a cross-table nested tagged cycle must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("missing or recursive by-value definition"),
+                "{name} cycle produced an unexpected diagnostic: {err}"
             );
         }
     }
