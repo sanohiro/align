@@ -1057,6 +1057,9 @@ pub fn drop_plan(
     .clone()
 }
 
+// The recursive classifier deliberately keeps the three definition tables, three active sets,
+// and three memo tables as separate axes; bundling them would hide which graph owns each id.
+#[allow(clippy::too_many_arguments)]
 fn drop_plan_rec(
     ty: Ty,
     structs: &[StructDef],
