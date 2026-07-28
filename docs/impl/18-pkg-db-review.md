@@ -482,16 +482,18 @@ idea is rejected.
 - **Classification:** ownership or soundness risk; prerequisite feature missing.
 - **Problematic design location:** L2's fail-closed return-provenance rule for an unresolved
   function target.
-- **Current Align constraint:** a by-value Move input may itself contain views, a dependent
-  resource, or another value carrying owner/region provenance.
-- **Actual failure:** an indirect identity such as `fn(Child) -> Child` could omit the input's
-  parent generation from its result summary, allowing the parent to be invalidated while the
-  returned child remains live.
+- **Current Align constraint:** a by-value input may itself contain views or another value carrying
+  owner/region provenance. L3 later adds dependent resources to that same class.
+- **Actual failure:** an indirect identity over an existing recursively view-bearing aggregate
+  could omit the input owner from its result summary, allowing the owner to be invalidated while
+  the result remains live. After L3, `fn(Child) -> Child` has the same failure mode for its parent
+  generation.
 - **Recommendation:** recursively snapshot every compatible input's embedded owner/region roots
   before ordinary move/null, including by-value Move inputs, and attach their conservative union
   to the indirect result. Continue to reject a result that would expose a bare view of a dying
   owner.
-- **v1 impact:** soundness blocker for L2 and function values.
+- **v1 impact:** L2b soundness blocker for existing function values; L3 must extend the completed
+  walker and tests to dependent children.
 
 ### F30 — resource Drop-hook examples used an unresolvable relative path
 
@@ -846,14 +848,16 @@ idea is rejected.
 
 - **Classification:** ownership or soundness risk; prerequisite feature gap.
 - **Problematic design location:** `ReturnBorrowSummary`/`ReturnRegionSummary` parameter-only model.
-- **Current Align constraint:** a zero-argument closure may return a captured `str`,
-  `resource_ref`, or region-owned value; parameter indices cannot name its environment owner.
+- **Current Align constraint:** a zero-argument closure may return a captured `str` or slice;
+  parameter indices cannot name its environment owner. L3 adds `resource_ref`, and L4 adds
+  explicitly region-owned values, to the same capture-root model.
 - **Actual failure:** an indirect result could outlive the closure environment or captured owner,
   especially after a function-value join or move.
 - **Recommendation:** concrete closure targets carry sorted target-relative capture-slot roots;
   indirect calls resolve them through the selected environment, and roots travel with moved
   function values. Named interfaces export only resolved parameter roots.
-- **v1 impact:** L2 soundness blocker for Query-local shaping helpers and general closures.
+- **v1 impact:** L2b soundness blocker for existing closures; L3 and L4 must extend the completed
+  capture-root engine and tests when their new types land.
 
 ### F57 — mutable-borrow replacement wording suppressed required Drop
 
@@ -1425,8 +1429,9 @@ idea is rejected.
     bind/decode from the fixed integer/float/bool/text/bytea subset, SQLSTATE error, driver
     restriction, explicit configured ephemeral/local server,
     and a non-skippable provisioned CI gate for merge/release.
-20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, L7, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
-    D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
+20. **Small PR order:** L1a, L1b, L2a, L2b, L2c, L2d, L2e, L3, L4, L5, L6, L7, D0, D1, D2, D3,
+    D4, D5, D6, D7, D8, D9, D10, D11, D12, then D13–D14. Each owns only the tests and benchmark
+    rail listed below.
 
 ## 4. Required specification revisions
 

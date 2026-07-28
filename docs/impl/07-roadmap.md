@@ -3510,7 +3510,7 @@ SQLite or PostgreSQL driver vertical. The design of record and exact PR acceptan
 
 ```text
 L1a recursive DropPlan framework + Option<string> fields — complete
-L1b Move sum/Option/Result payload completion
+L1b Move sum/Option/Result payload completion — complete
 L2a parameter-mode and borrow/region-summary representation and interface identity
 L2b recursive parameter/capture return provenance and function-value joins
 L2c cleanup-ABI record and dynamic bit for recursively Move returns
