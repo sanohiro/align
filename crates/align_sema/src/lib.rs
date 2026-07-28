@@ -4795,6 +4795,7 @@ fn refine_fn_value_types(
             tuples: &program.tuples,
             tagged_types: &program.tagged_types,
             loop_result_tys: Vec::new(),
+            initialized_capture_params: std::collections::HashSet::new(),
         };
         scan.block(&f.body);
         if let Some(value) = f.body.value.as_deref() {
@@ -4854,6 +4855,7 @@ fn compute_effect_sets(
             tuples: &program.tuples,
             tagged_types: &program.tagged_types,
             loop_result_tys: Vec::new(),
+            initialized_capture_params: std::collections::HashSet::new(),
         };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
@@ -4983,6 +4985,10 @@ struct EffectScan<'a> {
     /// Result types of the lexically enclosing loops. A `break value` joins only the innermost
     /// entry, so nested-loop exits cannot contaminate an outer loop's callback origins.
     loop_result_tys: Vec<Ty>,
+    /// Direct `Fn` capture parameters are fresh Unknown cells. Their first concrete capture
+    /// initializes the cell; later closure constructions join into it. This distinguishes the
+    /// uninitialized sentinel from a real Unknown capture, which must remain fail-closed.
+    initialized_capture_params: std::collections::HashSet<u32>,
 }
 
 /// One source-value projection on the path to a concrete function-valued leaf.  Unlike the former
@@ -5014,6 +5020,60 @@ impl EffectScan<'_> {
         }
     }
 
+    /// Join a lifted lambda's concrete capture operands into its trailing synthetic parameters.
+    /// Explicit lambda parameters precede captures in HIR, so suffix alignment is the capture ABI.
+    fn join_named_capture_effects(&mut self, name: &str, captures: &[Expr]) {
+        if self.known_effects.is_none() || captures.is_empty() {
+            return;
+        }
+        let Some(params) = self
+            .named_param_types
+            .and_then(|functions| functions.get(name))
+        else {
+            return;
+        };
+        let Some(first_capture) = params.len().checked_sub(captures.len()) else {
+            return;
+        };
+        for (param, capture) in params[first_capture..].iter().zip(captures) {
+            if let Ty::Fn(id) = *param
+                && let Some(function) = self.fn_types.get(id as usize)
+            {
+                let incoming = self.fn_value_effect(capture);
+                if self.initialized_capture_params.insert(id) {
+                    function.effect.set(incoming);
+                } else {
+                    function.effect.set(function.effect.get().join(incoming));
+                }
+                continue;
+            }
+            self.join_concrete_effects(
+                *param,
+                capture,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    fn join_node_capture_effects(&mut self, kind: &ExprKind) {
+        match kind {
+            ExprKind::ArrayReduce { func, captures, .. }
+            | ExprKind::ArrayScan { func, captures, .. }
+            | ExprKind::ArrayPartition { func, captures, .. }
+            | ExprKind::ArrayParMap { func, captures, .. }
+            | ExprKind::ArrayAnyAll { func, captures, .. } => {
+                self.join_named_capture_effects(func, captures);
+            }
+            ExprKind::ArraySortBy {
+                key_func,
+                captures,
+                ..
+            } => self.join_named_capture_effects(key_func, captures),
+            _ => {}
+        }
+    }
+
     fn stage_funcs(&mut self, stages: &[Stage]) {
         for s in stages {
             match &s.kind {
@@ -5024,6 +5084,7 @@ impl EffectScan<'_> {
                     for c in captures {
                         self.expr(c);
                     }
+                    self.join_named_capture_effects(func, captures);
                 }
                 // No lifted function (the whole point of hoisting): the needle is an expression
                 // evaluated once before the loop, so walk it for any call edge / effect it contains.
@@ -5056,7 +5117,30 @@ impl EffectScan<'_> {
                         self.join_concrete_struct_field_effect(*root, path, value);
                     }
                 }
-                Stmt::LetTuple { init, .. } => self.expr(init),
+                Stmt::LetTuple { locals, init, .. } => {
+                    self.expr(init);
+                    if self.known_effects.is_some() {
+                        for (index, local) in locals.iter().enumerate() {
+                            let Some(ty) = local
+                                .and_then(|local| {
+                                    self.locals
+                                        .get(local as usize)
+                                        .map(|local| local.ty)
+                                })
+                            else {
+                                continue;
+                            };
+                            self.join_concrete_effects(
+                                ty,
+                                init,
+                                &mut vec![FnEffectProjection::TupleElement(
+                                    index as u32,
+                                )],
+                                &mut Vec::new(),
+                            );
+                        }
+                    }
+                }
                 Stmt::AssignIndex { base, index, value } => {
                     self.mark_view_write(*base);
                     self.expr(index);
@@ -5768,6 +5852,7 @@ impl EffectScan<'_> {
         for c in node_captures(&e.kind) {
             self.expr(c);
         }
+        self.join_node_capture_effects(&e.kind);
         match &e.kind {
             // Observable side effects.
             ExprKind::Call { func, args, .. } => {
@@ -5815,6 +5900,7 @@ impl EffectScan<'_> {
                 for c in captures {
                     self.expr(c);
                 }
+                self.join_named_capture_effects(lifted, captures);
             }
             ExprKind::CallFnValue { callee, args } => {
                 self.expr(callee);
@@ -6470,6 +6556,28 @@ impl EffectScan<'_> {
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
                 for a in arms {
+                    if self.known_effects.is_some()
+                        && let [variant] = a.variants.as_slice()
+                    {
+                        for (index, binding) in a.bindings.iter().enumerate() {
+                            let Some(ty) = self
+                                .locals
+                                .get(*binding as usize)
+                                .map(|local| local.ty)
+                            else {
+                                continue;
+                            };
+                            self.join_concrete_effects(
+                                ty,
+                                scrutinee,
+                                &mut vec![FnEffectProjection::EnumPayload {
+                                    variant: *variant,
+                                    index: index as u32,
+                                }],
+                                &mut Vec::new(),
+                            );
+                        }
+                    }
                     self.expr(&a.body);
                 }
             }

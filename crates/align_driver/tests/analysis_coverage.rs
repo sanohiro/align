@@ -1127,12 +1127,11 @@ fn loud(x: i64) -> i64 {
   return x
 }
 fn worker(x: i64) -> i64 {
-  pair := if x < 0 {
+  (holders, ignored) := if x < 0 {
     ([Holder { callback: quiet }].to_array(), 0)
   } else {
     ([Holder { callback: loud }].to_array(), 0)
   }
-  (holders, ignored) := pair
   return holders[0].callback(x + ignored)
 }
 fn main() -> Result<(), Error> {
@@ -1145,6 +1144,112 @@ fn main() -> Result<(), Error> {
         check_diagnostics("parmap-joined-tuple-callback-aggregate", joined)
             .contains("has an observable side effect"),
         "tuple joins and destructuring must retain every nested callback effect origin"
+    );
+
+    let matched = "\
+Holder<T> { callback: T }
+Choice<T> { Some(T), None }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  return match if x < 0 {
+    Choice.Some(Holder { callback: quiet })
+  } else {
+    Choice.Some(Holder { callback: loud })
+  } {
+    Some(holder) => holder.callback(x),
+    None => x,
+  }
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_diagnostics("parmap-direct-match-binding-callback", matched)
+            .contains("has an observable side effect"),
+        "match payload bindings must join every direct scrutinee callback origin"
+    );
+    let pure_match = matched.replace(
+        "Choice.Some(Holder { callback: loud })",
+        "Choice.Some(Holder { callback: quiet })",
+    );
+    assert!(
+        !check_errs("parmap-pure-direct-match-binding-callback", &pure_match),
+        "matching direct known-Pure origins must remain Pure"
+    );
+}
+
+#[test]
+fn lifted_callback_captures_join_concrete_origins() {
+    let direct = "\
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  f := quiet
+  g := fn y: i64 {
+    h := f
+    h(y)
+  }
+  return g(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let direct_diagnostics =
+        check_diagnostics("parmap-pure-direct-fn-capture", direct);
+    assert!(
+        direct_diagnostics.is_empty(),
+        "a lifted lambda must receive the known-Pure origin of a direct function capture:\n{direct_diagnostics}"
+    );
+    let impure_direct = direct.replace("f := quiet", "f := loud");
+    assert!(
+        check_diagnostics("parmap-impure-direct-fn-capture", &impure_direct)
+            .contains("has an observable side effect"),
+        "an Impure direct function capture must remain Impure in the lifted lambda"
+    );
+
+    let pipeline = "\
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn worker(x: i64) -> i64 {
+  f := quiet
+  return [x].map(fn y { h := f; h(y) }).sum()
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let pipeline_diagnostics =
+        check_diagnostics("parmap-pure-pipeline-fn-capture", pipeline);
+    assert!(
+        pipeline_diagnostics.is_empty(),
+        "a pipeline's lifted function must receive a known-Pure direct capture:\n{pipeline_diagnostics}"
+    );
+    let impure_pipeline = pipeline.replace("f := quiet", "f := loud");
+    assert!(
+        check_diagnostics(
+            "parmap-impure-pipeline-fn-capture",
+            &impure_pipeline,
+        )
+        .contains("has an observable side effect"),
+        "a pipeline's lifted function must retain an Impure direct capture"
     );
 }
 
@@ -1195,17 +1300,12 @@ fn main() -> Result<(), Error> {
 #[test]
 fn unknown_higher_order_effect_rejected_in_par_map() {
     let src = "\
-fn loud(x: i64) -> i64 {
-  print(x)
-  return x
-}
 fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)
-fn main() -> Result<(), Error> {
-  f := loud
+pub fn run(f: fn(i64) -> i64) -> i64 {
   ys := [1, 2, 3].par_map(fn x { apply(f, x) })
-  print(ys.sum())
-  return Ok(())
+  return ys.sum()
 }
+fn main() -> i32 = 0
 ";
     let diagnostics = check_diagnostics("parmap-hof-unknown-effect", src);
     assert!(
