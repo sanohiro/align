@@ -3421,12 +3421,36 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             )));
         }
     }
-    for def in &program.structs {
+    for (id, def) in program.structs.iter().enumerate() {
+        if !drop_plan(
+            Ty::Struct(id as u32),
+            &program.structs,
+            &program.enums,
+            &program.tagged_types,
+        )
+        .is_valid()
+        {
+            return Err(CodegenError::Lowering(format!(
+                "struct type id {id} has a missing or recursive by-value definition"
+            )));
+        }
         for field in &def.fields {
             check_ty(field.ty, program)?;
         }
     }
-    for def in &program.enums {
+    for (id, def) in program.enums.iter().enumerate() {
+        if !drop_plan(
+            Ty::Enum(id as u32),
+            &program.structs,
+            &program.enums,
+            &program.tagged_types,
+        )
+        .is_valid()
+        {
+            return Err(CodegenError::Lowering(format!(
+                "sum type id {id} has a missing or recursive by-value definition"
+            )));
+        }
         for variant in &def.variants {
             for &payload in &variant.payload {
                 check_scalar(payload, program, &mut Vec::new())?;

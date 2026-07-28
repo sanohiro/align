@@ -842,7 +842,56 @@ fn semantic_import_validates_nested_function_type_summaries() {
     };
     assert_eq!(
         validate_for_import(&summary),
-        Err(align_interface::ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature)
+    );
+}
+
+#[test]
+fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
+    let mut generic =
+        one("pub fn identity<T>(value: T) -> T = value\nfn main() -> i32 = 0\n").remove(0);
+    generic.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    generic.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&generic),
+        Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature),
+        "generic template roots have no imported side-channel before L2b-b"
+    );
+
+    let mut recursive = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    recursive.fns[0].params[0].ty = IType::Named {
+        path: "Wrapper".to_string(),
+        args: vec![IType::Named {
+            path: "T".to_string(),
+            args: vec![],
+        }],
+    };
+    assert_eq!(
+        validate_for_import(&recursive),
+        Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "an unresolved self-binding must reject without recursively overflowing"
+    );
+
+    let mut wrong_arity = recursive;
+    wrong_arity.fns[0].params[0].ty = IType::Named {
+        path: "Wrapper".to_string(),
+        args: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&wrong_arity),
+        Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "a malformed local generic application must fail closed"
     );
 }
 

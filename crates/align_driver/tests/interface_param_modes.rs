@@ -7,6 +7,7 @@ use common::*;
 use align_ast::ParamMode;
 use align_interface::{IType, ReturnBorrowSummary, ReturnRegionSummary};
 use align_mir::{Rvalue, Stmt};
+use align_sema::{FieldDef, StructDef, Ty};
 
 const LIB: &str = "\
 module buffer
@@ -273,6 +274,32 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         .expect_err("provenance on scalar parameter and return types must fail");
     assert!(
         error.contains("cannot borrow"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut cyclic_mir = scalar_mir.clone();
+    let cycle_id = cyclic_mir.structs.len() as u32;
+    cyclic_mir.structs.push(StructDef {
+        name: "MalformedCycle".to_string(),
+        source_name: "MalformedCycle".to_string(),
+        fields: vec![FieldDef {
+            name: "next".to_string(),
+            ty: Ty::Struct(cycle_id),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    let scalar = cyclic_mir
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "scalar")
+        .expect("scalar MIR");
+    scalar.ret = Ty::Struct(cycle_id);
+    scalar.slots[scalar.params[0] as usize] = Ty::Struct(cycle_id);
+    let error = emit_llvm_ir(&cyclic_mir, BuildTarget::Baseline, false, &[], false)
+        .expect_err("recursive MIR type graphs must fail before provenance classification");
+    assert!(
+        error.contains("missing or recursive by-value definition"),
         "unexpected diagnostic: {error}"
     );
 

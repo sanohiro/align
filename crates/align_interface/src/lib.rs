@@ -698,6 +698,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryRootCannotBorrow(u32),
     ReturnSummaryCaptureRoot,
     ReturnSummaryDisagreement,
+    ReturnSummaryOnUnsupportedSignature,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
@@ -730,6 +731,12 @@ impl std::fmt::Display for ImportCompatibilityError {
                     "return-borrow and return-region summaries disagree in the L2b-a1 interface"
                 )
             }
+            ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature => {
+                write!(
+                    f,
+                    "return provenance is not enabled on generic or nested function-value signatures"
+                )
+            }
         }
     }
 }
@@ -739,11 +746,12 @@ impl std::error::Error for ImportCompatibilityError {}
 fn validate_import_param(
     param: &IParam,
     summary: &InterfaceSummary,
+    type_params: &[ITypeParam],
 ) -> Result<(), ImportCompatibilityError> {
     if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
         return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
     }
-    validate_import_type(&param.ty, summary)
+    validate_import_type(&param.ty, summary, type_params)
 }
 
 fn validate_import_summaries(
@@ -752,6 +760,8 @@ fn validate_import_summaries(
     borrow: &ReturnBorrowSummary,
     region: &ReturnRegionSummary,
     summary: &InterfaceSummary,
+    type_params: &[ITypeParam],
+    allow_return_roots: bool,
 ) -> Result<(), ImportCompatibilityError> {
     let summaries_agree = match (borrow, region) {
         (ReturnBorrowSummary::None, ReturnRegionSummary::None) => true,
@@ -770,6 +780,12 @@ fn validate_import_summaries(
     if !summaries_agree {
         return Err(ImportCompatibilityError::ReturnSummaryDisagreement);
     }
+    if !allow_return_roots
+        && (!matches!(borrow, ReturnBorrowSummary::None)
+            || !matches!(region, ReturnRegionSummary::None))
+    {
+        return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+    }
     for roots in [
         match borrow {
             ReturnBorrowSummary::None => None,
@@ -787,7 +803,7 @@ fn validate_import_summaries(
     .into_iter()
     .flatten()
     {
-        if !itype_may_borrow(ret, summary, &mut Vec::new()) {
+        if !itype_may_borrow(ret, summary, type_params, &mut Vec::new()) {
             return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
         }
         if !roots.1.is_empty() {
@@ -796,7 +812,9 @@ fn validate_import_summaries(
         for &index in roots.0 {
             if !params
                 .get(index as usize)
-                .is_some_and(|param| itype_may_borrow(&param.ty, summary, &mut Vec::new()))
+                .is_some_and(|param| {
+                    itype_may_borrow(&param.ty, summary, type_params, &mut Vec::new())
+                })
             {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
@@ -807,15 +825,22 @@ fn validate_import_summaries(
     Ok(())
 }
 
-fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<String>) -> bool {
+fn itype_may_borrow(
+    ty: &IType,
+    summary: &InterfaceSummary,
+    type_params: &[ITypeParam],
+    visiting: &mut Vec<String>,
+) -> bool {
     fn substitute(
         ty: &IType,
-        bindings: &[(String, IType)],
+        bindings: &[(String, IType, usize)],
         resolving: &mut Vec<String>,
     ) -> IType {
         match ty {
             IType::Named { path, args } if args.is_empty() => {
-                let Some((_, bound)) = bindings.iter().rev().find(|(name, _)| name == path) else {
+                let Some((_, bound, _)) =
+                    bindings.iter().rev().find(|(name, _, _)| name == path)
+                else {
                     return ty.clone();
                 };
                 if resolving.contains(path) {
@@ -862,8 +887,9 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
     fn visit(
         ty: &IType,
         summary: &InterfaceSummary,
+        type_params: &[ITypeParam],
         visiting: &mut Vec<String>,
-        bindings: &mut Vec<(String, IType)>,
+        bindings: &mut Vec<(String, IType, usize)>,
     ) -> bool {
         let is_local_nominal = |path: &str, name: &str| {
             path == name || path == format!("{}.{}", summary.unit, name)
@@ -871,22 +897,29 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
         match ty {
             IType::Tuple(elements) => elements
                 .iter()
-                .any(|element| visit(element, summary, visiting, bindings)),
+                .any(|element| visit(element, summary, type_params, visiting, bindings)),
             IType::Fn { .. } => true,
             IType::Named { path, args } => {
                 if args.is_empty()
-                    && let Some((_, bound)) =
-                        bindings.iter().rev().find(|(name, _)| name == path)
+                    && let Some((_, bound, outer_len)) =
+                        bindings.iter().rev().find(|(name, _, _)| name == path)
                 {
                     let bound = bound.clone();
-                    return visit(&bound, summary, visiting, bindings);
+                    let mut outer_bindings = bindings[..*outer_len].to_vec();
+                    return visit(
+                        &bound,
+                        summary,
+                        type_params,
+                        visiting,
+                        &mut outer_bindings,
+                    );
                 }
                 match path.as_str() {
                     "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
                     | "json.doc" | "json.scanner" => true,
                     "Option" | "Result" | "array" => args
                         .iter()
-                        .any(|arg| visit(arg, summary, visiting, bindings)),
+                        .any(|arg| visit(arg, summary, type_params, visiting, bindings)),
                     "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
                     | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
                     | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind"
@@ -912,7 +945,7 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
                             .find(|definition| is_local_nominal(path, &definition.name));
                         let result = if let Some(definition) = from_struct {
                             if definition.type_params.len() != args.len() {
-                                true
+                                false
                             } else {
                                 let resolved_args = args
                                     .iter()
@@ -927,11 +960,21 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
                                         .iter()
                                         .zip(resolved_args)
                                         .map(|(parameter, argument)| {
-                                            (parameter.name.clone(), argument)
+                                            (
+                                                parameter.name.clone(),
+                                                argument,
+                                                binding_base,
+                                            )
                                         }),
                                 );
                                 let result = definition.fields.iter().any(|(_, field)| {
-                                    visit(field, summary, visiting, bindings)
+                                    visit(
+                                        field,
+                                        summary,
+                                        type_params,
+                                        visiting,
+                                        bindings,
+                                    )
                                 });
                                 bindings.truncate(binding_base);
                                 result
@@ -942,7 +985,7 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
                             .find(|definition| is_local_nominal(path, &definition.name))
                         {
                             if definition.type_params.len() != args.len() {
-                                true
+                                false
                             } else {
                                 let resolved_args = args
                                     .iter()
@@ -957,21 +1000,36 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
                                         .iter()
                                         .zip(resolved_args)
                                         .map(|(parameter, argument)| {
-                                            (parameter.name.clone(), argument)
+                                            (
+                                                parameter.name.clone(),
+                                                argument,
+                                                binding_base,
+                                            )
                                         }),
                                 );
                                 let result = definition.variants.iter().any(|(_, payload)| {
                                     payload.iter().any(|value| {
-                                        visit(value, summary, visiting, bindings)
+                                        visit(
+                                            value,
+                                            summary,
+                                            type_params,
+                                            visiting,
+                                            bindings,
+                                        )
                                     })
                                 });
                                 bindings.truncate(binding_base);
                                 result
                             }
                         } else {
-                            // A generic parameter or imported nominal type may carry a view.
-                            // Accept it here; its defining interface performs the concrete check.
-                            true
+                            // A declared generic parameter or a qualified imported nominal may
+                            // carry a view. An unresolved bare name is malformed at this boundary;
+                            // treating it as borrow-capable could hide a recursive substitution
+                            // such as `Wrapper<T>` in a non-generic signature.
+                            type_params
+                                .iter()
+                                .any(|parameter| parameter.name == path.as_str())
+                                || path.contains('.')
                         };
                         visiting.pop();
                         result
@@ -980,22 +1038,29 @@ fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<S
             }
         }
     }
-    visit(ty, summary, visiting, &mut Vec::new())
+    visit(
+        ty,
+        summary,
+        type_params,
+        visiting,
+        &mut Vec::new(),
+    )
 }
 
 fn validate_import_type(
     ty: &IType,
     summary: &InterfaceSummary,
+    type_params: &[ITypeParam],
 ) -> Result<(), ImportCompatibilityError> {
     match ty {
         IType::Named { args, .. } => {
             for arg in args {
-                validate_import_type(arg, summary)?;
+                validate_import_type(arg, summary, type_params)?;
             }
         }
         IType::Tuple(elems) => {
             for elem in elems {
-                validate_import_type(elem, summary)?;
+                validate_import_type(elem, summary, type_params)?;
             }
         }
         IType::Fn {
@@ -1005,10 +1070,18 @@ fn validate_import_type(
             return_region,
         } => {
             for param in params {
-                validate_import_param(param, summary)?;
+                validate_import_param(param, summary, type_params)?;
             }
-            validate_import_type(ret, summary)?;
-            validate_import_summaries(params, ret, return_borrow, return_region, summary)?;
+            validate_import_type(ret, summary, type_params)?;
+            validate_import_summaries(
+                params,
+                ret,
+                return_borrow,
+                return_region,
+                summary,
+                type_params,
+                false,
+            )?;
         }
     }
     Ok(())
@@ -1022,32 +1095,34 @@ pub fn validate_for_import(
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
         for param in &function.params {
-            validate_import_param(param, summary)?;
+            validate_import_param(param, summary, &function.type_params)?;
         }
-        validate_import_type(&function.ret, summary)?;
+        validate_import_type(&function.ret, summary, &function.type_params)?;
         validate_import_summaries(
             &function.params,
             &function.ret,
             &function.return_borrow,
             &function.return_region,
             summary,
+            &function.type_params,
+            function.type_params.is_empty(),
         )?;
     }
     for structure in &summary.structs {
         for (_, ty) in &structure.fields {
-            validate_import_type(ty, summary)?;
+            validate_import_type(ty, summary, &structure.type_params)?;
         }
     }
     for enumeration in &summary.enums {
         for (_, payload) in &enumeration.variants {
             for ty in payload {
-                validate_import_type(ty, summary)?;
+                validate_import_type(ty, summary, &enumeration.type_params)?;
             }
         }
     }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
-            validate_import_type(ty, summary)?;
+            validate_import_type(ty, summary, &[])?;
         }
     }
     Ok(())
