@@ -1807,7 +1807,11 @@ malformed artifact/interfaceはpanicやfail-openではなくdiagnosticでfail cl
 ```text
 L1a recursive DropPlan framework + Option<string> field
 L1b Move sum/Option/Result payload completion
-L2  contextual borrow mode + Copy mutation + Fn mode/joined provenance + interface summary
+L2a parameter modeとborrow/region summaryの表現およびinterface identity
+L2b recursive parameter/capture return provenanceとfunction-value join
+L2c cleanup ABI recordとrecursively Move returnのdynamic bit
+L2d reusable Move ownerへのshared borrow
+L2e borrow mut/out、all-peer alias、Copy/Move replacement、Pure shaping
 L3  opaque/dependent resource + linkable Drop thunk + resource_ref/native view
 L4  named arena region + clone_in
 L5  deterministic tagged file/inline input + one-item Query/command identity/artifact

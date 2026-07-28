@@ -400,7 +400,7 @@ idea is rejected.
 - **Recommendation:** define `Fn` with mode/type entries, effect, and both return-provenance
   summaries end to end. Exact mode equality and the direct-call ABI apply to bindings, joins,
   interfaces, indirect calls, and codegen; summary joins are detailed in F26.
-- **v1 impact:** blocker for sound L2; must ship in the L2 prerequisite PR.
+- **v1 impact:** blocker for sound L2; must ship in the L2 sequence before borrow syntax is exposed.
 
 ### F23 — `out: region` conflicts with out-parameter parsing
 
@@ -448,7 +448,8 @@ idea is rejected.
 - **Recommendation:** concrete `Fn`/`FnTy` carries both summaries. Function-value joins union
   compatible parameter-index sets and preserve target-relative capture roots as completed by F56;
   unresolved higher-order parameters use every compatible view/region input.
-- **v1 impact:** soundness blocker for L2 and indirect calls; mandatory in the L2 PR.
+- **v1 impact:** soundness blocker for L2 and indirect calls; mandatory before the first borrowed
+  function value is exposed.
 
 ### F27 — inline SQL needs a deterministic non-file source identity
 
@@ -481,16 +482,18 @@ idea is rejected.
 - **Classification:** ownership or soundness risk; prerequisite feature missing.
 - **Problematic design location:** L2's fail-closed return-provenance rule for an unresolved
   function target.
-- **Current Align constraint:** a by-value Move input may itself contain views, a dependent
-  resource, or another value carrying owner/region provenance.
-- **Actual failure:** an indirect identity such as `fn(Child) -> Child` could omit the input's
-  parent generation from its result summary, allowing the parent to be invalidated while the
-  returned child remains live.
+- **Current Align constraint:** a by-value input may itself contain views or another value carrying
+  owner/region provenance. L3 later adds dependent resources to that same class.
+- **Actual failure:** an indirect identity over an existing recursively view-bearing aggregate
+  could omit the input owner from its result summary, allowing the owner to be invalidated while
+  the result remains live. After L3, `fn(Child) -> Child` has the same failure mode for its parent
+  generation.
 - **Recommendation:** recursively snapshot every compatible input's embedded owner/region roots
   before ordinary move/null, including by-value Move inputs, and attach their conservative union
   to the indirect result. Continue to reject a result that would expose a bare view of a dying
   owner.
-- **v1 impact:** soundness blocker for L2 and function values.
+- **v1 impact:** L2b soundness blocker for existing function values; L3 must extend the completed
+  walker and tests to dependent children.
 
 ### F30 — resource Drop-hook examples used an unresolvable relative path
 
@@ -845,14 +848,16 @@ idea is rejected.
 
 - **Classification:** ownership or soundness risk; prerequisite feature gap.
 - **Problematic design location:** `ReturnBorrowSummary`/`ReturnRegionSummary` parameter-only model.
-- **Current Align constraint:** a zero-argument closure may return a captured `str`,
-  `resource_ref`, or region-owned value; parameter indices cannot name its environment owner.
+- **Current Align constraint:** a zero-argument closure may return a captured `str` or slice;
+  parameter indices cannot name its environment owner. L3 adds `resource_ref`, and L4 adds
+  explicitly region-owned values, to the same capture-root model.
 - **Actual failure:** an indirect result could outlive the closure environment or captured owner,
   especially after a function-value join or move.
 - **Recommendation:** concrete closure targets carry sorted target-relative capture-slot roots;
   indirect calls resolve them through the selected environment, and roots travel with moved
   function values. Named interfaces export only resolved parameter roots.
-- **v1 impact:** L2 soundness blocker for Query-local shaping helpers and general closures.
+- **v1 impact:** L2b soundness blocker for existing closures; L3 and L4 must extend the completed
+  capture-root engine and tests when their new types land.
 
 ### F57 — mutable-borrow replacement wording suppressed required Drop
 
@@ -1424,8 +1429,9 @@ idea is rejected.
     bind/decode from the fixed integer/float/bool/text/bytea subset, SQLSTATE error, driver
     restriction, explicit configured ephemeral/local server,
     and a non-skippable provisioned CI gate for merge/release.
-20. **Small PR order:** L1a, L1b, L2, L3, L4, L5, L6, L7, D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
-    D10, D11, D12, then D13–D14. Each owns only the tests and benchmark rail listed below.
+20. **Small PR order:** L1a, L1b, L2a, L2b, L2c, L2d, L2e, L3, L4, L5, L6, L7, D0, D1, D2, D3,
+    D4, D5, D6, D7, D8, D9, D10, D11, D12, then D13–D14. Each owns only the tests and benchmark
+    rail listed below.
 
 ## 4. Required specification revisions
 
@@ -1543,9 +1549,13 @@ documents:
 |---|---|---|---|
 | L1a | Recursive DropPlan framework; `Option<string>` fields | `owned_tagged_payloads`, analysis coverage | tagged construct/pass/drop |
 | L1b | Move sum/Option/Result completion | `?`/`else`/`match`/join cleanup | no-allocation `Ok`, error cleanup |
-| L2 | contextual borrow modes, Copy mutation/drop-old, Fn parameter/capture provenance, Move-return cleanup ABI | all-peer alias matrix, nested-view selectors, captured/joined direct/indirect, cleanup-bit per-unit parity | borrowed-call, return ABI, and interface-size cost |
-| L3 | resource/ref, linkable Drop thunk, dependent child/native view, root-only raw transfer | exact MIR, cross-unit Drop, invalid pointer/escape/projection | resource/ref/view overhead and IR |
-| L4 | named arena `region`, `clone_in` | all escape paths and module propagation | named versus anonymous arena |
+| L2a | parameter-mode and borrow/region-summary records across HIR/MIR/interface/ABI identity; existing behavior only | codec/hash goldens, corrupt summaries, exhaustive consumer audit | interface size and decode cost |
+| L2b | recursive parameter/capture return provenance for existing values and function-value joins | nested-view selectors, captured/joined direct/indirect/imported matrix | summary size and inference cost |
+| L2c | cleanup-ABI record plus dynamic bit for recursively Move direct/indirect/imported returns | codec/hash goldens, None/Some/Err control-path parity, ABI mismatch rejection | return ABI cost |
+| L2d | shared `borrow` mode over Move owners | reusable owner, move rejection, returned-view lifetime, function-value/import parity | borrowed-call cost |
+| L2e | `borrow mut`, unified Out/BorrowMut exclusivity, Copy/Move mutation, drop-old, Pure shaping | recursive alias/stale-view/drop-count/effect matrix | exclusive-call cost |
+| L3 | resource/ref, linkable Drop thunk, dependent child/native view, root-only raw transfer | exact MIR, cross-unit Drop, invalid pointer/escape/projection, all-peer resource aliases, captured/joined refs, dependent identity provenance | resource/ref/view overhead and IR |
+| L4 | named arena `region`, `clone_in` | all escape paths, module propagation, captured/joined region-owned values | named versus anonymous arena |
 | L5 | tagged file/inline/checked-metadata inputs, structural Query/command artifacts, QueryMeta descriptor/thunk skeletons | cache/path/inline-span/same-path-type-edit/metadata-create-change-delete/runtime-plan/golden/reproducibility matrix | cold/warm producer/consumer rebuild and metadata thunk |
 | L6 | region `RegionPlain` builder | copy count, no heap, current-row rejection | push/freeze throughput and bytes |
 | L7 | nested generic package applications and closed `RegionPlain` bound | inference/substitution, mono/interface parity, bound negatives, no dictionaries | compile time, interface/mono size, code size |

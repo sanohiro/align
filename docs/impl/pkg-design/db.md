@@ -3096,13 +3096,17 @@ errors.
 
 ### L1a–L7 — mandatory Align library-boundary prerequisites
 
-Land the eight PRs specified in
+Land the ordered milestones and closed slices specified in
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md), in order:
 
 ```text
 L1a recursive DropPlan framework + Option<string> fields
 L1b Move sum/Option/Result payload completion
-L2  contextual borrow modes + Copy mutation + Fn modes/joined provenance + interface summaries
+L2a parameter-mode and borrow/region-summary representation and interface identity
+L2b recursive parameter/capture return provenance and function-value joins
+L2c cleanup-ABI record and dynamic bit for recursively Move returns
+L2d shared borrow over reusable Move owners
+L2e borrow mut/out, all-peer aliases, Copy/Move replacement, and Pure shaping
 L3  package-defined opaque/dependent Move resource + linkable Drop thunk + resource_ref/native views
 L4  named arena binding + region + clone_in
 L5  deterministic tagged file/inline inputs + one-item Query/command identity + artifacts/descriptors

@@ -5,9 +5,10 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-28. `main` includes the shipped wave through #668.
+_Last updated: 2026-07-28. `main` includes the shipped wave through #670.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
-#668 admits one direct recursively Move payload per tagged arm.
+#668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
+#670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -86,6 +87,9 @@ facts must live in this repository.
 #662  measure-only chunks header allocation probe
 #664  parallelize compiler-recognised invariant string filters
 #667  recursive Drop plans and Option<string> owned fields
+#668  direct recursive Move tagged payloads
+#669  multiple Move payload partial construction
+#670  nested tagged payload representation and exact pkg.db L1b shape
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -246,15 +250,18 @@ canonical recursive Drop plan and sound `Option<string>` struct fields are imple
 tag-tested Drop, move/null handling, focused analysis coverage, and an alloc-count benchmark.
 Partial Move-leaf replacement fails closed without an exact drop-old lowering, and fixed-array
 field reads admit only Copy leaves or a borrowed `string` view; replace the whole struct/element for
-larger Move leaves. L1b is split by the authoritative §8.3 closure matrix into three independently
-mergeable PRs: L1b-a (#668) admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b
-adds multiple Move payload partial construction and uniform ownership (#669); L1b-c is the current
-implementation slice and adds tagged-in-tagged type representation plus the exact
-`Result<Option<Output>, DbError>` acceptance. Dynamic
+larger Move leaves. L1b is complete through the authoritative §8.3 closure matrix: L1b-a (#668)
+admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b (#669) adds multiple Move
+payload partial construction and uniform ownership; L1b-c (#670) adds tagged-in-tagged type
+representation plus the exact `Result<Option<Output>, DbError>` acceptance. Dynamic
 path-selected return cleanup bits remain L2; L1b accepts only values proven free-standing by the
 current ABI rules. Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. The remaining required order is L2 borrow summaries,
+variants before L1a–L7 are complete. L2 is implemented as five closed slices so no incomplete
+borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b return
+provenance, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow, then L2e
+mutable borrow/out and all-peer
+exclusivity. The remaining required order is L2,
 L3 package-defined/dependent
 resources, L4 named region capability, L5 deterministic static inputs/Query/command artifacts, and
 L6 the region plain-struct builder, then L7 nested generic package APIs and the closed
