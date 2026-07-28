@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
+align_driver = { path = "../../crates/align_driver" }
 align_interface = { path = "../../crates/align_interface" }
+align_span = { path = "../../crates/align_span" }
 
 [workspace]

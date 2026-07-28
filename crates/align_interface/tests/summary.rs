@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    build_summaries, deserialize, encode_interface_surface, serialize, validate_for_import,
-    DecodeError, Effect, Hash128, IType, ImportCompatibilityError, InterfaceSummary, ParamMode,
-    ReturnBorrowSummary, ReturnRegionSummary, FORMAT_VERSION,
+    DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ImportCompatibilityError,
+    InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
+    deserialize, encode_interface_surface, serialize, validate_for_import,
 };
 
 /// One in-memory source module for a test program.
@@ -611,24 +611,214 @@ fn out_param_marker_is_recorded() {
 
 #[test]
 fn parameter_mode_and_return_summaries_have_canonical_codec_identity() {
-    let base = one("pub fn inspect(value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n");
+    let base = one(
+        "pub fn inspect(first: slice<i64>, second: slice<i64>) -> slice<i64> = first\nfn main() -> i32 = 0\n",
+    );
+    assert_eq!(
+        base[0].fns[0].return_borrow,
+        ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+        "the producer records the selected parameter root"
+    );
     let mut mode = base[0].clone();
     mode.fns[0].params[0].mode = ParamMode::Out;
     rehash(&mut mode);
     assert_ne!(base[0].interface_hash, mode.interface_hash, "parameter mode is hash identity");
 
     let mut roots = base[0].clone();
-    roots.fns[0].return_borrow =
-        ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] };
+    roots.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![1],
+        captures: vec![],
+    };
+    roots.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![1],
+        captures: vec![],
+    };
     rehash(&mut roots);
-    assert_ne!(base[0].interface_hash, roots.interface_hash, "return-borrow roots are hash identity");
+    assert_ne!(base[0].interface_hash, roots.interface_hash, "return roots are hash identity");
     assert_ne!(mode.interface_hash, roots.interface_hash, "mode and summary encode independently");
     let decoded = deserialize(&serialize(&roots)).expect("known canonical summary tag round-trips");
     assert_eq!(decoded, roots);
     assert_eq!(
         validate_for_import(&decoded),
-        Err(ImportCompatibilityError::UnsupportedReturnBorrow),
-        "codec recognition must not enable L2b semantics"
+        Ok(()),
+        "L2b consumes canonical return summaries"
+    );
+}
+
+#[test]
+fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
+    let mut non_borrowing_return =
+        one("pub fn inspect(value: str) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
+    non_borrowing_return.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    non_borrowing_return.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_return),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut non_borrowing_root =
+        one("pub fn inspect(value: i64) -> str = \"fixed\"\nfn main() -> i32 = 0\n").remove(0);
+    non_borrowing_root.fns[0].return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    non_borrowing_root.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_root),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0))
+    );
+
+    non_borrowing_root.fns[0].params[0].ty = IType::Named {
+        path: "buffer".to_string(),
+        args: vec![],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_root),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "owned builtin handles must not be mistaken for generic nominal types"
+    );
+}
+
+#[test]
+fn semantic_import_rejects_disagreeing_l2b_a1_summaries() {
+    let mut summary =
+        one("pub fn inspect(value: str) -> str = value\nfn main() -> i32 = 0\n").remove(0);
+    summary.fns[0].return_region = ReturnRegionSummary::None;
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::ReturnSummaryDisagreement)
+    );
+}
+
+#[test]
+fn semantic_import_does_not_resolve_foreign_qualified_nominals_as_local() {
+    let mut summary = one(
+        "pub Payload { value: i64 }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let foreign = IType::Named {
+        path: "dep.Payload".to_string(),
+        args: vec![],
+    };
+    summary.fns[0].params[0].ty = foreign.clone();
+    summary.fns[0].ret = foreign;
+    assert_eq!(
+        validate_for_import(&summary),
+        Ok(()),
+        "an unresolved foreign nominal remains conservatively borrow-capable even when this interface defines a scalar local type with the same bare name"
+    );
+}
+
+#[test]
+fn semantic_import_substitutes_local_generic_nominal_arguments() {
+    let mut base = one(
+        "pub Wrapper<T> { value: T }\n\
+         pub Choice<T> { Some(T), None }\n\
+         pub fn identity(value: str) -> str = value\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let wrapper = base
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    let mut inner = wrapper.clone();
+    inner.name = "Inner".to_string();
+    let mut outer = wrapper;
+    outer.name = "Outer".to_string();
+    outer.fields[0].1 = IType::Named {
+        path: "Inner".to_string(),
+        args: vec![IType::Named {
+            path: "T".to_string(),
+            args: vec![],
+        }],
+    };
+    base.structs.extend([inner, outer]);
+    let named = |path: &str, argument: &str| IType::Named {
+        path: path.to_string(),
+        args: vec![IType::Named {
+            path: argument.to_string(),
+            args: vec![],
+        }],
+    };
+
+    let mut scalar_parameter = base.clone();
+    scalar_parameter.fns[0].params[0].ty = named("Wrapper", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_parameter),
+        Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0))
+    );
+
+    let mut scalar_struct_return = base.clone();
+    scalar_struct_return.fns[0].ret = named("Wrapper", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_struct_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut scalar_enum_return = base.clone();
+    scalar_enum_return.fns[0].ret = named("Choice", "i64");
+    assert_eq!(
+        validate_for_import(&scalar_enum_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut nested_scalar_return = base.clone();
+    nested_scalar_return.fns[0].ret = named("Outer", "i64");
+    assert_eq!(
+        validate_for_import(&nested_scalar_return),
+        Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
+    );
+
+    let mut borrowing = base;
+    borrowing.fns[0].params[0].ty = named("Outer", "str");
+    borrowing.fns[0].ret = named("Choice", "str");
+    assert_eq!(validate_for_import(&borrowing), Ok(()));
+}
+
+#[test]
+fn semantic_import_validates_nested_function_type_summaries() {
+    let mut summary = one("pub Holder { value: i64 }\nfn main() -> i32 = 0\n").remove(0);
+    summary.structs[0].fields[0].1 = IType::Fn {
+        params: vec![IParam {
+            mode: ParamMode::ByValue,
+            ty: IType::Named {
+                path: "str".to_string(),
+                args: vec![],
+            },
+        }],
+        ret: Box::new(IType::Named {
+            path: "i64".to_string(),
+            args: vec![],
+        }),
+        return_borrow: ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+        return_region: ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        },
+    };
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
     );
 }
 

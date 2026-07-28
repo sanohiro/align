@@ -302,6 +302,22 @@ pub fn build_summaries_with_effects(
         .into_iter()
         .map(|(k, v)| (k, v.into()))
         .collect();
+    let return_provenance: HashMap<&str, (&ReturnBorrowSummary, &ReturnRegionSummary)> = program
+        .fns
+        .iter()
+        .map(|function| {
+            (
+                function.name.as_str(),
+                (&function.return_borrow, &function.return_region),
+            )
+        })
+        .chain(program.imported_fns.iter().map(|function| {
+            (
+                function.name.as_str(),
+                (&function.return_borrow, &function.return_region),
+            )
+        }))
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
 
@@ -331,6 +347,15 @@ pub fn build_summaries_with_effects(
                             // Fail-closed: a non-generic pub fn missing from the effect map is Impure.
                             effects.get(&canonical).copied().unwrap_or(Effect::Impure)
                         };
+                        let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
+                        let (return_borrow, return_region) = if is_generic {
+                            (ReturnBorrowSummary::None, ReturnRegionSummary::None)
+                        } else {
+                            return_provenance
+                                .get(canonical.as_str())
+                                .map(|(borrow, region)| ((*borrow).clone(), (*region).clone()))
+                                .unwrap_or((ReturnBorrowSummary::None, ReturnRegionSummary::None))
+                        };
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -343,8 +368,8 @@ pub fn build_summaries_with_effects(
                                 })
                                 .collect(),
                             ret: convert_ret(&fd.ret),
-                            return_borrow: ReturnBorrowSummary::None,
-                            return_region: ReturnRegionSummary::None,
+                            return_borrow,
+                            return_region,
                             effect,
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -562,10 +587,11 @@ fn partition_impl_hashes(
 // The seam between the whole-program checker and per-unit checking is deliberately narrow: rather
 // than a second resolver over summaries, an imported unit's `InterfaceSummary` is rendered back to
 // Align source and re-parsed by the EXISTING parser into an `ast::File`, then fed to
-// `align_sema::check_program_with_effects` as an interface-only `Module`. Every table-building and
-// resolution pass in sema is thus reused unchanged — one resolution code path. Generic templates and
-// const values are stored as source text in the summary (they MUST be re-parsed regardless), so
-// render-to-source unifies the whole reconstruction into a single `parse_file` call in the driver.
+// `align_sema::check_program_with_interface_facts` as an interface-only `Module`. Every
+// table-building and resolution pass in sema is thus reused unchanged — one resolution code path.
+// Generic templates and const values are stored as source text in the summary (they MUST be
+// re-parsed regardless), so render-to-source unifies the whole reconstruction into a single
+// `parse_file` call in the driver.
 
 /// Render a UTF-8 type reference back to source. Every summary type is `Named`/`Tuple`/`Fn` (see
 /// [`convert_type`]); a named type with args is `path<a, b>`, the unit type is its sentinel `()`.
@@ -663,14 +689,15 @@ fn render_enum(e: &IEnumDef) -> String {
     out
 }
 
-/// A decoded interface may contain mode/summary tags reserved for a later compiler slice. The
-/// codec recognizes those stable tags, but an L2a consumer rejects their semantics before
-/// reconstructing or checking imported source.
+/// A decoded interface may contain parameter-mode tags reserved for later compiler slices. L2b
+/// consumes canonical return summaries, while `Borrow`/`BorrowMut` remain disabled until L2d/L2e.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportCompatibilityError {
     UnsupportedParamMode(ParamMode),
-    UnsupportedReturnBorrow,
-    UnsupportedReturnRegion,
+    ReturnSummaryOnNonBorrowingType,
+    ReturnSummaryRootCannotBorrow(u32),
+    ReturnSummaryCaptureRoot,
+    ReturnSummaryDisagreement,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
@@ -679,11 +706,29 @@ impl std::fmt::Display for ImportCompatibilityError {
             ImportCompatibilityError::UnsupportedParamMode(mode) => {
                 write!(f, "interface parameter mode {mode:?} is not supported by this compiler slice")
             }
-            ImportCompatibilityError::UnsupportedReturnBorrow => {
-                write!(f, "non-empty return-borrow interface summaries require L2b")
+            ImportCompatibilityError::ReturnSummaryOnNonBorrowingType => {
+                write!(
+                    f,
+                    "interface return provenance is present on a return type that cannot borrow"
+                )
             }
-            ImportCompatibilityError::UnsupportedReturnRegion => {
-                write!(f, "non-empty return-region interface summaries require L2b")
+            ImportCompatibilityError::ReturnSummaryRootCannotBorrow(index) => {
+                write!(
+                    f,
+                    "interface return provenance parameter root {index} names a type that cannot supply a borrow"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryCaptureRoot => {
+                write!(
+                    f,
+                    "an exported interface signature cannot contain a capture-root return summary"
+                )
+            }
+            ImportCompatibilityError::ReturnSummaryDisagreement => {
+                write!(
+                    f,
+                    "return-borrow and return-region summaries disagree in the L2b-a1 interface"
+                )
             }
         }
     }
@@ -691,36 +736,267 @@ impl std::fmt::Display for ImportCompatibilityError {
 
 impl std::error::Error for ImportCompatibilityError {}
 
-fn validate_import_param(param: &IParam) -> Result<(), ImportCompatibilityError> {
+fn validate_import_param(
+    param: &IParam,
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
     if matches!(param.mode, ParamMode::Borrow | ParamMode::BorrowMut) {
         return Err(ImportCompatibilityError::UnsupportedParamMode(param.mode));
     }
-    validate_import_type(&param.ty)
+    validate_import_type(&param.ty, summary)
 }
 
 fn validate_import_summaries(
+    params: &[IParam],
+    ret: &IType,
     borrow: &ReturnBorrowSummary,
     region: &ReturnRegionSummary,
+    summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
-    if !matches!(borrow, ReturnBorrowSummary::None) {
-        return Err(ImportCompatibilityError::UnsupportedReturnBorrow);
+    let summaries_agree = match (borrow, region) {
+        (ReturnBorrowSummary::None, ReturnRegionSummary::None) => true,
+        (
+            ReturnBorrowSummary::Roots {
+                params: borrow_params,
+                captures: borrow_captures,
+            },
+            ReturnRegionSummary::Roots {
+                params: region_params,
+                captures: region_captures,
+            },
+        ) => borrow_params == region_params && borrow_captures == region_captures,
+        _ => false,
+    };
+    if !summaries_agree {
+        return Err(ImportCompatibilityError::ReturnSummaryDisagreement);
     }
-    if !matches!(region, ReturnRegionSummary::None) {
-        return Err(ImportCompatibilityError::UnsupportedReturnRegion);
+    for roots in [
+        match borrow {
+            ReturnBorrowSummary::None => None,
+            ReturnBorrowSummary::Roots { params, captures } => {
+                Some((params.as_slice(), captures.as_slice()))
+            }
+        },
+        match region {
+            ReturnRegionSummary::None => None,
+            ReturnRegionSummary::Roots { params, captures } => {
+                Some((params.as_slice(), captures.as_slice()))
+            }
+        },
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !itype_may_borrow(ret, summary, &mut Vec::new()) {
+            return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
+        }
+        if !roots.1.is_empty() {
+            return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
+        }
+        for &index in roots.0 {
+            if !params
+                .get(index as usize)
+                .is_some_and(|param| itype_may_borrow(&param.ty, summary, &mut Vec::new()))
+            {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn validate_import_type(ty: &IType) -> Result<(), ImportCompatibilityError> {
+fn itype_may_borrow(ty: &IType, summary: &InterfaceSummary, visiting: &mut Vec<String>) -> bool {
+    fn substitute(
+        ty: &IType,
+        bindings: &[(String, IType)],
+        resolving: &mut Vec<String>,
+    ) -> IType {
+        match ty {
+            IType::Named { path, args } if args.is_empty() => {
+                let Some((_, bound)) = bindings.iter().rev().find(|(name, _)| name == path) else {
+                    return ty.clone();
+                };
+                if resolving.contains(path) {
+                    return ty.clone();
+                }
+                resolving.push(path.clone());
+                let substituted = substitute(bound, bindings, resolving);
+                resolving.pop();
+                substituted
+            }
+            IType::Named { path, args } => IType::Named {
+                path: path.clone(),
+                args: args
+                    .iter()
+                    .map(|argument| substitute(argument, bindings, resolving))
+                    .collect(),
+            },
+            IType::Tuple(elements) => IType::Tuple(
+                elements
+                    .iter()
+                    .map(|element| substitute(element, bindings, resolving))
+                    .collect(),
+            ),
+            IType::Fn {
+                params,
+                ret,
+                return_borrow,
+                return_region,
+            } => IType::Fn {
+                params: params
+                    .iter()
+                    .map(|parameter| IParam {
+                        mode: parameter.mode,
+                        ty: substitute(&parameter.ty, bindings, resolving),
+                    })
+                    .collect(),
+                ret: Box::new(substitute(ret, bindings, resolving)),
+                return_borrow: return_borrow.clone(),
+                return_region: return_region.clone(),
+            },
+        }
+    }
+
+    fn visit(
+        ty: &IType,
+        summary: &InterfaceSummary,
+        visiting: &mut Vec<String>,
+        bindings: &mut Vec<(String, IType)>,
+    ) -> bool {
+        let is_local_nominal = |path: &str, name: &str| {
+            path == name || path == format!("{}.{}", summary.unit, name)
+        };
+        match ty {
+            IType::Tuple(elements) => elements
+                .iter()
+                .any(|element| visit(element, summary, visiting, bindings)),
+            IType::Fn { .. } => true,
+            IType::Named { path, args } => {
+                if args.is_empty()
+                    && let Some((_, bound)) =
+                        bindings.iter().rev().find(|(name, _)| name == path)
+                {
+                    let bound = bound.clone();
+                    return visit(&bound, summary, visiting, bindings);
+                }
+                match path.as_str() {
+                    "str" | "slice" | "soa" | "reader" | "writer" | "http_headers"
+                    | "json.doc" | "json.scanner" => true,
+                    "Option" | "Result" | "array" => args
+                        .iter()
+                        .any(|arg| visit(arg, summary, visiting, bindings)),
+                    "box" | "buffer" | "array_builder" | "file" | "rng" | "regex"
+                    | "captures" | "tcp_conn" | "tcp_listener" | "udp_socket" | "child"
+                    | "http_request_ctx" | "response_builder" | "http_stream" | "json.kind" => {
+                        false
+                    }
+                    "()" | "bool" | "char" | "string" | "i8" | "i16" | "i32" | "i64"
+                    | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "raw" => false,
+                    _ => {
+                        if path
+                            .strip_prefix("vec")
+                            .or_else(|| path.strip_prefix("mask"))
+                            .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"))
+                        {
+                            return false;
+                        }
+                        let visit_key = render_itype(ty);
+                        if visiting.contains(&visit_key) {
+                            return false;
+                        }
+                        visiting.push(visit_key);
+                        let from_struct = summary
+                            .structs
+                            .iter()
+                            .find(|definition| is_local_nominal(path, &definition.name));
+                        let result = if let Some(definition) = from_struct {
+                            if definition.type_params.len() != args.len() {
+                                true
+                            } else {
+                                let resolved_args = args
+                                    .iter()
+                                    .map(|argument| {
+                                        substitute(argument, bindings, &mut Vec::new())
+                                    })
+                                    .collect::<Vec<_>>();
+                                let binding_base = bindings.len();
+                                bindings.extend(
+                                    definition
+                                        .type_params
+                                        .iter()
+                                        .zip(resolved_args)
+                                        .map(|(parameter, argument)| {
+                                            (parameter.name.clone(), argument)
+                                        }),
+                                );
+                                let result = definition.fields.iter().any(|(_, field)| {
+                                    visit(field, summary, visiting, bindings)
+                                });
+                                bindings.truncate(binding_base);
+                                result
+                            }
+                        } else if let Some(definition) = summary
+                            .enums
+                            .iter()
+                            .find(|definition| is_local_nominal(path, &definition.name))
+                        {
+                            if definition.type_params.len() != args.len() {
+                                true
+                            } else {
+                                let resolved_args = args
+                                    .iter()
+                                    .map(|argument| {
+                                        substitute(argument, bindings, &mut Vec::new())
+                                    })
+                                    .collect::<Vec<_>>();
+                                let binding_base = bindings.len();
+                                bindings.extend(
+                                    definition
+                                        .type_params
+                                        .iter()
+                                        .zip(resolved_args)
+                                        .map(|(parameter, argument)| {
+                                            (parameter.name.clone(), argument)
+                                        }),
+                                );
+                                let result = definition.variants.iter().any(|(_, payload)| {
+                                    payload.iter().any(|value| {
+                                        visit(value, summary, visiting, bindings)
+                                    })
+                                });
+                                bindings.truncate(binding_base);
+                                result
+                            }
+                        } else {
+                            // A generic parameter or imported nominal type may carry a view.
+                            // Accept it here; its defining interface performs the concrete check.
+                            true
+                        };
+                        visiting.pop();
+                        result
+                    }
+                }
+            }
+        }
+    }
+    visit(ty, summary, visiting, &mut Vec::new())
+}
+
+fn validate_import_type(
+    ty: &IType,
+    summary: &InterfaceSummary,
+) -> Result<(), ImportCompatibilityError> {
     match ty {
         IType::Named { args, .. } => {
             for arg in args {
-                validate_import_type(arg)?;
+                validate_import_type(arg, summary)?;
             }
         }
         IType::Tuple(elems) => {
             for elem in elems {
-                validate_import_type(elem)?;
+                validate_import_type(elem, summary)?;
             }
         }
         IType::Fn {
@@ -730,42 +1006,49 @@ fn validate_import_type(ty: &IType) -> Result<(), ImportCompatibilityError> {
             return_region,
         } => {
             for param in params {
-                validate_import_param(param)?;
+                validate_import_param(param, summary)?;
             }
-            validate_import_type(ret)?;
-            validate_import_summaries(return_borrow, return_region)?;
+            validate_import_type(ret, summary)?;
+            validate_import_summaries(params, ret, return_borrow, return_region, summary)?;
         }
     }
     Ok(())
 }
 
-/// Validate that a decoded interface uses only the L2a-enabled semantic subset. This is distinct
-/// from codec validation: known future tags round-trip canonically but must not enable their ABI.
+/// Validate that a decoded interface uses only the currently enabled semantic subset. Codec
+/// validation has already proved canonical return summaries; this gate still rejects later borrow
+/// parameter modes before reconstructing imported source.
 pub fn validate_for_import(
     summary: &InterfaceSummary,
 ) -> Result<(), ImportCompatibilityError> {
     for function in &summary.fns {
         for param in &function.params {
-            validate_import_param(param)?;
+            validate_import_param(param, summary)?;
         }
-        validate_import_type(&function.ret)?;
-        validate_import_summaries(&function.return_borrow, &function.return_region)?;
+        validate_import_type(&function.ret, summary)?;
+        validate_import_summaries(
+            &function.params,
+            &function.ret,
+            &function.return_borrow,
+            &function.return_region,
+            summary,
+        )?;
     }
     for structure in &summary.structs {
         for (_, ty) in &structure.fields {
-            validate_import_type(ty)?;
+            validate_import_type(ty, summary)?;
         }
     }
     for enumeration in &summary.enums {
         for (_, payload) in &enumeration.variants {
             for ty in payload {
-                validate_import_type(ty)?;
+                validate_import_type(ty, summary)?;
             }
         }
     }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
-            validate_import_type(ty)?;
+            validate_import_type(ty, summary)?;
         }
     }
     Ok(())
@@ -866,4 +1149,27 @@ pub fn summary_effects(
         m.insert(canonical, e);
     }
     m
+}
+
+/// The cross-unit return-provenance seeds an importer needs, keyed by canonical (mangled) function
+/// name. Generic functions are excluded because their bodies are instantiated in the consumer and
+/// their summaries are inferred there.
+pub fn summary_return_provenance(
+    summary: &InterfaceSummary,
+    is_entry: bool,
+) -> align_sema::ExternalReturnProvenance {
+    let mut facts = HashMap::new();
+    for function in &summary.fns {
+        if function.generic_body.is_some() {
+            continue;
+        }
+        facts.insert(
+            mangle(&summary.unit, is_entry, &function.name),
+            (
+                function.return_borrow.clone(),
+                function.return_region.clone(),
+            ),
+        );
+    }
+    facts
 }

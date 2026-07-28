@@ -5,10 +5,12 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-07-28. `main` includes the shipped wave through #670.
+_Last updated: 2026-07-29. `main` includes the shipped wave through #672.
 #667 adds the canonical recursive Drop plan and sound `Option<string>` fields;
 #668 admits one direct recursively Move payload per tagged arm; #669 admits multiple Move payloads;
 #670 completes nested tagged payload representation and the exact pkg.db L1b acceptance shape.
+#672 carries L2a parameter modes and explicit empty return-provenance facts through AST, HIR, MIR,
+interfaces, caches, and separate compilation without enabling the borrow ABI.
 #653 adds stable compaction for callable primitive-scalar `where` stages before
 `par_map`; #654 adds a measure-first task-group record probe without changing
 production behavior. The width/stride probe now covers scalar fused and
@@ -90,6 +92,7 @@ facts must live in this repository.
 #668  direct recursive Move tagged payloads
 #669  multiple Move payload partial construction
 #670  nested tagged payload representation and exact pkg.db L1b shape
+#672  L2a parameter modes and return-provenance representation
 ```
 
 #639 fixes Unit-call values across direct, indirect, pipeline, and per-unit
@@ -255,11 +258,14 @@ admits one direct existing-`Scalar` Move payload per tagged arm; L1b-b (#669) ad
 payload partial construction and uniform ownership; L1b-c (#670) adds tagged-in-tagged type
 representation plus the exact `Result<Option<Output>, DbError>` acceptance. Dynamic
 path-selected return cleanup bits remain L2; L1b accepts only values proven free-standing by the
-current ABI rules. Do not begin a
+current ABI rules. L2a is complete in #672. L2b is split into L2b-a1 named/direct/imported
+parameter-root inference with conservative aggregate and indirect unions, L2b-a2 exact aggregate
+and control projection, and L2b-b closure/capture/function-value provenance. Do not begin a
 SQLite/PostgreSQL driver or add database-named compiler
-variants before L1a–L7 are complete. L2 is implemented as five closed slices so no incomplete
-borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b return
-provenance, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow, then L2e
+variants before L1a–L7 are complete. L2 is implemented as seven closed slices so no incomplete
+borrow surface is exposed: L2a parameter-mode and provenance-summary representation, L2b-a1/a2/b
+return-provenance slices, L2c cleanup-ABI record plus dynamic Move-return bit, L2d shared borrow,
+then L2e
 mutable borrow/out and all-peer
 exclusivity. The remaining required order is L2,
 L3 package-defined/dependent

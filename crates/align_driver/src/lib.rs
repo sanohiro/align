@@ -367,6 +367,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         // reusing (or populating) `interface_ast_cache` so each dependency is rendered and parsed
         // exactly once across the whole bottom-up walk, not once per importer.
         let mut external_effects: HashMap<String, align_sema::FnEffect> = HashMap::new();
+        let mut external_return_provenance = align_sema::ExternalReturnProvenance::new();
         for d in &tdeps {
             let Some(dep_summary) = summaries.get(d) else { continue };
             if !interface_ast_cache.contains_key(d) {
@@ -396,6 +397,10 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 interface_ast_cache.insert(d.clone(), ast);
             }
             external_effects.extend(align_interface::summary_effects(dep_summary, false));
+            external_return_provenance.extend(align_interface::summary_return_provenance(
+                dep_summary,
+                false,
+            ));
         }
 
         let mut modules: Vec<align_sema::Module> = tdeps
@@ -417,7 +422,12 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         });
 
         let mut u_diags = Diagnostics::new();
-        let program = align_sema::check_program_with_effects(&modules, &external_effects, &mut u_diags);
+        let program = align_sema::check_program_with_interface_facts(
+            &modules,
+            &external_effects,
+            &external_return_provenance,
+            &mut u_diags,
+        );
         let had_errors = u_diags.has_errors();
         for d in u_diags.iter() {
             diags.push(d.clone());

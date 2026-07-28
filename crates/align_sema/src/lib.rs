@@ -3167,18 +3167,31 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     check_program_with_effects(modules, &HashMap::new(), diags)
 }
 
-/// M15 S1b per-unit checking: like [`check_program`], but any [`Module::interface_only`] module is a
-/// dependency reconstructed from its already-checked interface summary, and `external_effects` carries
-/// the 3-valued effect bit (keyed by **canonical / mangled** name) of every imported non-generic
-/// `pub` function. A cross-unit call to a function not present in the checked program (i.e. an
-/// interface-only dependency's non-generic `pub` fn) takes its effect from `external_effects`;
-/// **fail-closed** — a call target absent from the map is treated as `Impure` **and** unknown-indirect,
-/// so it is rejected at a `par_map`/parallel boundary and never optimistically Pure. Generic imported
-/// functions are NOT in `external_effects`: their monomorphs are instantiated into this program and
-/// their effects recomputed from the instantiated body.
+/// The imported return-provenance facts of non-generic public functions, keyed by canonical
+/// (mangled) name. The interface codec validates every root before constructing this map.
+pub type ExternalReturnProvenance =
+    std::collections::HashMap<String, (hir::ReturnBorrowSummary, hir::ReturnRegionSummary)>;
+
+/// M15 S1b compatibility entry point. L2b callers that reconstruct interface-only dependencies use
+/// [`check_program_with_interface_facts`] so imported return provenance is preserved as well.
 pub fn check_program_with_effects(
     modules: &[Module],
     external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) -> Program {
+    check_program_with_interface_facts(modules, external_effects, &HashMap::new(), diags)
+}
+
+/// Per-unit checking with semantic facts that synthesized interface source cannot express.
+///
+/// `external_effects` carries each imported non-generic public function's 3-valued effect bit.
+/// `external_return_provenance` carries its exact return-borrow and return-region roots. Both maps
+/// use canonical names. Generic imported functions are absent because their bodies are instantiated
+/// in the consumer and their facts are inferred from those bodies.
+pub fn check_program_with_interface_facts(
+    modules: &[Module],
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    external_return_provenance: &ExternalReturnProvenance,
     diags: &mut Diagnostics,
 ) -> Program {
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
@@ -4152,6 +4165,16 @@ pub fn check_program_with_effects(
         );
     }
 
+    // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
+    // facts after signature collection. The driver supplies the complete transitive fact map, so
+    // entries outside the modules visible to this check are intentionally ignored.
+    for (name, (return_borrow, return_region)) in external_return_provenance {
+        if let Some(sig) = sigs.get_mut(name) {
+            sig.return_borrow = return_borrow.clone();
+            sig.return_region = return_region.clone();
+        }
+    }
+
     // Extern (`extern "C"`) declarations: resolve + FFI-validate each foreign signature, register it
     // in `sigs` under its bare C symbol (never mangled — a C symbol is global), make it resolvable
     // from every module (like a builtin), and collect it for codegen's external-declaration pass.
@@ -4538,6 +4561,31 @@ pub fn check_program_with_effects(
         fn_types,
         imported_fns,
     };
+    infer_return_provenance(&mut program, external_return_provenance);
+    let named_return_borrow: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.return_borrow.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_borrow.clone())),
+        )
+        .collect();
+    let named_return_region: std::collections::HashMap<String, hir::ReturnRegionSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.return_region.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_region.clone())),
+        )
+        .collect();
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -4558,6 +4606,7 @@ pub fn check_program_with_effects(
         MoveCheck {
             f,
             diags,
+            named_return_borrow: &named_return_borrow,
             tuples,
             structs,
             enums,
@@ -4565,14 +4614,18 @@ pub fn check_program_with_effects(
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_roots: std::collections::HashMap::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
+            return_roots: BorrowRoots::new(),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
             let mut ec = EscapeCheck {
                 f,
                 diags,
+                named_return_region: &named_return_region,
                 tuples,
                 structs,
                 enums,
@@ -4626,6 +4679,113 @@ pub fn check_program_with_effects(
     // `external_effects`; FFI and absent targets fail closed.
     check_parallelism(&mut program, external_effects, diags);
     program
+}
+
+fn summary_from_roots(roots: &BorrowRoots) -> hir::ReturnBorrowSummary {
+    let mut params = Vec::new();
+    for root in roots {
+        match root {
+            BorrowRoot::Param(index) => params.push(*index),
+            BorrowRoot::Local(_) | BorrowRoot::IterTemp(_) => {}
+        }
+    }
+    if params.is_empty() {
+        hir::ReturnBorrowSummary::None
+    } else {
+        hir::ReturnBorrowSummary::Roots {
+            params,
+            captures: Vec::new(),
+        }
+    }
+}
+
+fn borrow_to_region_summary(summary: &hir::ReturnBorrowSummary) -> hir::ReturnRegionSummary {
+    match summary {
+        hir::ReturnBorrowSummary::None => hir::ReturnRegionSummary::None,
+        hir::ReturnBorrowSummary::Roots { params, captures } => hir::ReturnRegionSummary::Roots {
+            params: params.clone(),
+            captures: captures.clone(),
+        },
+    }
+}
+
+fn is_lifted_lambda_name(name: &str) -> bool {
+    name.rsplit_once("$lambda").is_some_and(|(_, ordinal)| {
+        !ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Infer the L2b-a1 named-function parameter roots before the ordinary move/escape diagnostic pass.
+/// Calls form a finite may-lattice over sorted root sets, so recursive functions converge
+/// monotonically. Aggregate projections deliberately remain flattened until L2b-a2; capture roots
+/// and function-value targets belong to L2b-b. The existing exhaustive borrow-provenance walker
+/// remains the single expression classifier.
+fn infer_return_provenance(
+    program: &mut Program,
+    external_return_provenance: &ExternalReturnProvenance,
+) {
+    let mut named: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), hir::ReturnBorrowSummary::None))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .filter(|function| external_return_provenance.contains_key(&function.name))
+                .map(|function| (function.name.clone(), function.return_borrow.clone())),
+        )
+        .collect();
+
+    loop {
+        let mut next = named.clone();
+        let mut changed = false;
+        for function in &program.fns {
+            // Lifted lambda parameters append captures after explicit arguments. Treating those
+            // slots as ordinary named parameters would publish the wrong domain and disagree with
+            // the closure's explicit-parameter signature. L2b-b infers both domains atomically.
+            if is_lifted_lambda_name(&function.name) {
+                continue;
+            }
+            let mut sink = Diagnostics::new();
+            let roots = MoveCheck {
+                f: function,
+                diags: &mut sink,
+                named_return_borrow: &named,
+                tuples: &program.tuples,
+                structs: &program.structs,
+                enums: &program.enums,
+                tagged_types: &program.tagged_types,
+                loop_breaks: Vec::new(),
+                borrows: BorrowState::default(),
+                loop_borrow_breaks: Vec::new(),
+                loop_value_breaks: Vec::new(),
+                loop_value_roots: std::collections::HashMap::new(),
+                loop_iter_drops: Vec::new(),
+                arena_depth: 0,
+                return_roots: BorrowRoots::new(),
+            }
+            .check();
+            let summary = summary_from_roots(&roots);
+            if next.get(&function.name) != Some(&summary) {
+                next.insert(function.name.clone(), summary);
+                changed = true;
+            }
+        }
+        named = next;
+        if !changed {
+            break;
+        }
+    }
+
+    for function in &mut program.fns {
+        let summary = named
+            .get(&function.name)
+            .cloned()
+            .unwrap_or(hir::ReturnBorrowSummary::None);
+        function.return_region = borrow_to_region_summary(&summary);
+        function.return_borrow = summary;
+    }
 }
 
 /// Effect/purity inference + the rule that a `par_map` function must be **Pure** (`draft.md` §11,
@@ -4836,9 +4996,18 @@ fn infer_fn_type_effects(
                 continue; // a function-typed parameter has no statically known target
             }
             let Ty::Fn(fid) = local.ty else { continue };
-            let Some(ft) = fn_types.get(fid as usize) else { continue };
-            let (params, ret) = (ft.params.clone(), ft.ret);
+            let Some(ft) = fn_types.get(fid as usize) else {
+                continue;
+            };
+            let (params, ret, return_borrow, return_region) = (
+                ft.params.clone(),
+                ft.ret,
+                ft.return_borrow.clone(),
+                ft.return_region.clone(),
+            );
             let fresh = fresh_fn_type(fn_types, params, ret, FnEffect::Unknown);
+            fn_types[fresh as usize].return_borrow = return_borrow;
+            fn_types[fresh as usize].return_region = return_region;
             local.ty = Ty::Fn(fresh);
         }
     }
@@ -7124,7 +7293,7 @@ impl EffectScan<'_> {
                     }
                 }
                 // A bound/moved function value no longer identifies the named parameter boundary
-                // that must receive a callback-bearing actual. Until L2b carries joined target
+                // that must receive a callback-bearing actual. Until L2b-b carries joined target
                 // roots through function values, such an invocation is legal sequentially but
                 // cannot prove the enclosing function Pure for `par_map`.
                 if target.is_none() {
@@ -8161,6 +8330,8 @@ impl<'a> EscapeFlowCfg<'a> {
 struct EscapeCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Settled same-program/imported return-region summaries for direct calls.
+    named_return_region: &'a std::collections::HashMap<String, hir::ReturnRegionSummary>,
     /// Tuple defs (to decide whether a `Ty::Tuple` is region-tracked — true iff an element is).
     tuples: &'a [hir::TupleDef],
     /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
@@ -9067,6 +9238,46 @@ impl<'a> EscapeCheck<'a> {
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
+    fn mapped_return_region(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> Region {
+        let hir::ReturnRegionSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return Region::Static;
+        };
+        let mut region = Region::Static;
+        for &index in params {
+            if let Some(value) = args.get(index as usize) {
+                region = region.shorter(self.region_of(value, depth));
+            }
+        }
+        region
+    }
+
+    fn mapped_return_slice_is_local(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+    ) -> bool {
+        let hir::ReturnRegionSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return false;
+        };
+        params.iter().any(|&index| {
+            args.get(index as usize)
+                .is_some_and(|value| self.slice_is_local(value))
+        })
+    }
+
     fn region_of(&self, e: &Expr, depth: u32) -> Region {
         match &e.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
@@ -9402,7 +9613,9 @@ impl<'a> EscapeCheck<'a> {
             // zero-argument closure can return an arena capture after that arena is freed.
             ExprKind::CallFnValue { callee, args } => args.iter().fold(
                 self.region_of(callee, depth),
-                |acc, a| acc.shorter(self.region_of(a, depth)),
+                |region, arg| {
+                    region.shorter(self.region_of(arg, depth))
+                },
             ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
@@ -9418,12 +9631,19 @@ impl<'a> EscapeCheck<'a> {
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
             // `f(arena_str)` out of the arena slips the escape check → use-after-free of the
-            // freed buffer. A function that does *not* return a borrow of its args is
-            // over-restricted here; precise per-fn "returns a borrow of arg i" inference is a
-            // later slice. Non-tracked args (ints, literals) are `Static` and don't shorten.
-            ExprKind::Call { args, .. } => args
-                .iter()
-                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
+            // freed buffer. L2b-a1 maps only the named function's settled parameter roots.
+            // Non-tracked args (ints, literals) are `Static` and don't shorten.
+            ExprKind::Call { func, args, .. } => self
+                .named_return_region
+                .get(func)
+                .map_or_else(
+                    || {
+                        args.iter().fold(Region::Static, |region, arg| {
+                            region.shorter(self.region_of(arg, depth))
+                        })
+                    },
+                    |summary| self.mapped_return_region(summary, args, depth),
+                ),
             // A `loop` yields one of its `break` values (scattered as `Stmt::Break` in the body, not
             // reachable from this node). Each is escape-checked directly (`check_break_escape`), which
             // requires a `break` value to be `Static` — so the loop's value is provably `Static` here.
@@ -9677,10 +9897,17 @@ impl<'a> EscapeCheck<'a> {
             // local-backed check is the one that catches its escape).
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } | ExprKind::HttpCtxBody { .. } => true,
             ExprKind::Local(p) => self.state.local_backed_slice.contains(p),
-            ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::Call { func, args, .. } => self
+                .named_return_region
+                .get(func)
+                .map_or_else(
+                    || args.iter().any(|arg| self.slice_is_local(arg)),
+                    |summary| self.mapped_return_slice_is_local(summary, args),
+                ),
             ExprKind::ArrayZip { sources, .. } => sources.iter().any(|a| self.slice_is_local(a)),
             ExprKind::CallFnValue { callee, args } => {
-                self.slice_is_local(callee) || args.iter().any(|a| self.slice_is_local(a))
+                self.slice_is_local(callee)
+                    || args.iter().any(|arg| self.slice_is_local(arg))
             }
             ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
@@ -11787,6 +12014,9 @@ fn hir_expr_diverges(e: &Expr) -> bool {
 struct MoveCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Settled same-program/imported return summaries for mapping call results back to their exact
+    /// caller-side inputs. The map is recomputed to a fixpoint before the diagnostic pass.
+    named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
     /// Tuple defs — so a Move tuple (one with an owned element) is recognised as a Move type and
     /// its consumption (pass / destructure / return) is tracked for use-after-move.
     tuples: &'a [hir::TupleDef],
@@ -11806,6 +12036,10 @@ struct MoveCheck<'a> {
     borrows: BorrowState,
     /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
     loop_borrow_breaks: Vec<Vec<BorrowState>>,
+    /// Roots carried by value-bearing `break` edges for each active loop.
+    loop_value_breaks: Vec<BorrowRoots>,
+    /// Settled value roots of each walked loop expression, keyed by source span.
+    loop_value_roots: std::collections::HashMap<Span, BorrowRoots>,
     /// Per-iteration owned locals of each enclosing `loop` (innermost last) — the locals MIR drops
     /// at that loop's back-edge and at every `break` bound to it. A `break` edge ends their borrow
     /// generation exactly as the back-edge does.
@@ -11825,6 +12059,8 @@ struct MoveCheck<'a> {
     /// `task_group` value cannot escape its block at all). Pinned by
     /// `borrow_liveness.rs::a_template_returned_out_of_a_task_group_in_a_loop_is_rejected`.
     arena_depth: u32,
+    /// Symbolic parameter roots observed on explicit, implicit, and `?` return edges.
+    return_roots: BorrowRoots,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -11850,6 +12086,8 @@ enum BorrowRoot {
     /// loop's body). Depth is all the identity needed: every temporary at a given depth is freed by
     /// the same two edges — that loop's back-edge and its `break`s.
     IterTemp(u32),
+    /// Source-visible parameter whose embedded view provenance reaches the return.
+    Param(u32),
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
@@ -11958,13 +12196,27 @@ fn clear_moved(moved: &mut MovedSet, id: LocalId) {
 }
 
 impl<'a> MoveCheck<'a> {
-    fn check(mut self) {
+    fn check(mut self) -> BorrowRoots {
+        for (position, &local) in self.f.params.iter().enumerate() {
+            if !self.local_may_borrow(local) {
+                continue;
+            }
+            self.borrows
+                .sources
+                .entry(local)
+                .or_default()
+                .insert(BorrowRoot::Param(position as u32));
+        }
         let mut moved: MovedSet = std::collections::HashSet::new();
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
         let ret_is_move = self.is_move_ty(self.f.ret);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
+        if let Some(value) = &self.f.body.value {
+            self.return_roots.extend(self.borrow_sources(value));
+        }
+        self.return_roots
     }
 
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple
@@ -12144,6 +12396,27 @@ impl<'a> MoveCheck<'a> {
         roots
     }
 
+    fn map_summary_roots<'b>(
+        &self,
+        summary: &hir::ReturnBorrowSummary,
+        args: impl std::ops::Fn(u32) -> Option<&'b Expr>,
+    ) -> BorrowRoots {
+        let hir::ReturnBorrowSummary::Roots {
+            params,
+            captures: _,
+        } = summary
+        else {
+            return BorrowRoots::new();
+        };
+        let mut roots = BorrowRoots::new();
+        for &index in params {
+            if let Some(value) = args(index) {
+                roots.extend(self.borrow_sources(value));
+            }
+        }
+        roots
+    }
+
     fn borrow_sources_inner(&self, e: &Expr) -> BorrowRoots {
         let union = |parts: Vec<&Expr>| {
             let mut roots = BorrowRoots::new();
@@ -12192,7 +12465,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayDictEncode { base, .. }
             | ExprKind::IndexField { base, .. }
             | ExprKind::Field { root: base, .. } => self.local_storage_roots(*base),
-            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
+            ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
             // Chunks are views into the source slots themselves. The materializing transforms below
             // instead copy view values into fresh storage, so they inherit only the source value's
             // already-flattened provenance, not ownership of its array header.
@@ -12260,13 +12534,24 @@ impl<'a> MoveCheck<'a> {
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
             // past the input's liveness is caught.
             ExprKind::JsonScan { input, .. } => self.storage_roots(input),
-            ExprKind::Call { args, .. } => {
-                let mut roots = BorrowRoots::new();
-                for arg in args {
-                    roots.extend(self.borrow_sources(arg));
-                }
-                roots
-            }
+            ExprKind::Call { func, args, .. } => self
+                .named_return_borrow
+                .get(func)
+                .map_or_else(
+                    || {
+                        let mut roots = BorrowRoots::new();
+                        for arg in args {
+                            roots.extend(self.borrow_sources(arg));
+                        }
+                        roots
+                    },
+                    |summary| {
+                        self.map_summary_roots(
+                            summary,
+                            |index| args.get(index as usize),
+                        )
+                    },
+                ),
             ExprKind::CallFnValue { callee, args } => {
                 let mut roots = self.borrow_sources(callee);
                 for arg in args {
@@ -12356,7 +12641,14 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
-            ExprKind::ElseUnwrap { opt, fallback } => union(vec![opt, fallback]),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                union(vec![opt, fallback])
+            }
+            ExprKind::Loop { .. } => self
+                .loop_value_roots
+                .get(&e.span)
+                .cloned()
+                .unwrap_or_default(),
             // ── The remaining forms record NO provenance, and the list is EXHAUSTIVE: there is no
             // `_` tail, so a new `ExprKind` cannot silently inherit "borrows nothing" — which is
             // precisely how `template` above (and `EnumValue`, and `RandSample`) escaped this pass.
@@ -12366,10 +12658,8 @@ impl<'a> MoveCheck<'a> {
             //   environment (a capturing `Closure` is handled above); a `Reader`/`Writer` opened here
             //   OWNS its fd (`c.reader()`/`.buffered()`, which do borrow, are handled above);
             //   `fs.read_*_view` returns an mmap view bound to the enclosing arena, whose lifetime
-            //   the escape check enforces via `region_of`; a `loop`'s value is provably `Static`
-            //   (`check_break_escape` rejects breaking a view of local storage out of the loop);
-            //   `OptionNone` carries no payload.
-            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone | ExprKind::Loop { .. }
+            //   the escape check enforces via `region_of`; `OptionNone` carries no payload.
+            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::FsReadFileView { .. }
             | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
@@ -12461,7 +12751,6 @@ impl<'a> MoveCheck<'a> {
             }
         }
     }
-
     fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
         let roots = if self.local_may_borrow(local) {
             self.borrow_sources(value)
@@ -12514,6 +12803,7 @@ impl<'a> MoveCheck<'a> {
             // Deeper temporaries are already dead — an inner loop's own edges ended them — but
             // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
+            BorrowRoot::Param(_) => false,
         });
     }
 
@@ -12557,6 +12847,11 @@ impl<'a> MoveCheck<'a> {
                 // escapes. All three are generic; none is template-specific.
                 "use of invalidated borrow '{borrower}': it borrows a temporary value created inside the loop, which is dropped at the end of that iteration; give the storage a longer life — bind the owned value to a local declared outside the loop, `.clone()` it into one, or allocate it in an `arena` that encloses the loop — and borrow that instead"
             ),
+            // Parameter roots outlive this frame and are never inserted into `invalid`.
+            // Keep the malformed-state fallback diagnostic-only and fail closed.
+            (BorrowRoot::Param(_), _) => format!(
+                "use of invalidated borrow '{borrower}': its external provenance ended unexpectedly"
+            ),
         };
         self.diags.error(msg, span);
     }
@@ -12569,6 +12864,7 @@ impl<'a> MoveCheck<'a> {
         &mut self,
         body: &Block,
         body_locals: &std::ops::Range<LocalId>,
+        span: Span,
         moved: &mut MovedSet,
     ) {
         let entry = moved.clone();
@@ -12588,10 +12884,12 @@ impl<'a> MoveCheck<'a> {
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
+        self.loop_value_breaks.push(BorrowRoots::new());
         self.borrows = entry_borrows.clone();
         self.block(body, &mut probe, false, false);
         self.loop_breaks.pop();
         self.loop_borrow_breaks.pop();
+        self.loop_value_breaks.pop();
         let mut probe_borrows = self.borrows.clone();
         Self::invalidate_iteration_drops(&mut probe_borrows, &drops, depth);
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
@@ -12619,9 +12917,11 @@ impl<'a> MoveCheck<'a> {
                 let mut probe_state = &entry | &back_edge;
                 self.loop_breaks.push(Vec::new());
                 self.loop_borrow_breaks.push(Vec::new());
+                self.loop_value_breaks.push(BorrowRoots::new());
                 self.block(body, &mut probe_state, false, false);
                 self.loop_breaks.pop();
                 self.loop_borrow_breaks.pop();
+                self.loop_value_breaks.pop();
                 let mut end = self.borrows.clone();
                 Self::invalidate_iteration_drops(&mut end, &drops, depth);
                 let next = BorrowState::join(&head, &BorrowState::join(&entry_borrows, &end));
@@ -12637,12 +12937,22 @@ impl<'a> MoveCheck<'a> {
         self.borrows = fixed_borrows;
         self.loop_breaks.push(Vec::new());
         self.loop_borrow_breaks.push(Vec::new());
+        self.loop_value_breaks.push(BorrowRoots::new());
         self.block(body, &mut body_state, false, false);
         let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
         let borrow_breaks = self
             .loop_borrow_breaks
             .pop()
             .expect("loop borrow-break frame balanced");
+        let value_roots = self
+            .loop_value_breaks
+            .pop()
+            .expect("loop value-break frame balanced");
+        if value_roots.is_empty() {
+            self.loop_value_roots.remove(&span);
+        } else {
+            self.loop_value_roots.insert(span, value_roots);
+        }
         self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
@@ -12766,7 +13076,13 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
                 Stmt::AssignVecLane { value, .. } => self.expr(value, moved, false, false),
-                Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
+                Stmt::Return(Some(e)) => {
+                    self.expr(e, moved, true, true);
+                    // Control expressions establish match-arm payload bindings while they are
+                    // walked. Query after that walk so an explicit `return match ...` observes the
+                    // same binding provenance as a trailing match expression.
+                    self.return_roots.extend(self.borrow_sources(e));
+                }
                 Stmt::Return(None) => {}
                 // `break e` moves `e` out of the loop, exactly like `return` moves a value out of the
                 // function (a direct, consuming move site). Then snapshot the move state for the
@@ -12774,6 +13090,10 @@ impl<'a> MoveCheck<'a> {
                 Stmt::Break(value) => {
                     if let Some(e) = value {
                         self.expr(e, moved, true, true);
+                        let roots = self.borrow_sources(e);
+                        if let Some(frame) = self.loop_value_breaks.last_mut() {
+                            frame.extend(roots);
+                        }
                     }
                     if let Some(frame) = self.loop_breaks.last_mut() {
                         frame.push(moved.clone());
@@ -13063,8 +13383,16 @@ impl<'a> MoveCheck<'a> {
                     self.expr(f, moved, true, true);
                 }
             }
-            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
+            ExprKind::OptionSome(i)
+            | ExprKind::ResultOk(i)
+            | ExprKind::ResultErr(i)
+            | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
+            ExprKind::Try(i) => {
+                // L2b-a1 preserves the conservative flattened Result provenance. L2b-a2 splits
+                // the implicit Err return edge from the continuing Ok projection.
+                self.expr(i, moved, true, true);
+                self.return_roots.extend(self.borrow_sources(i));
+            }
             // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
             // str/int arg). `builder()` is a leaf.
             ExprKind::BuilderToString(i) => self.expr(i, moved, true, true),
@@ -13250,7 +13578,9 @@ impl<'a> MoveCheck<'a> {
             // Extracted into an `#[inline(never)]` helper so its large locals — a `Diagnostics` sink
             // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
             // chain would otherwise overflow the stack; see `expr_depth` test).
-            ExprKind::Loop { body, body_locals, .. } => self.loop_moves(body, body_locals, moved),
+            ExprKind::Loop { body, body_locals, .. } => {
+                self.loop_moves(body, body_locals, e.span, moved)
+            }
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.

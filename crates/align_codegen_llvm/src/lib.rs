@@ -3053,18 +3053,36 @@ fn build_module<'c>(
 /// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
 /// `CodegenError`, never an out-of-bounds panic or the scalar `i32` fallback.
 fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
-    fn check_signature_facts(
-        owner: &str,
-        param_count: usize,
-        modes: &[align_ast::ParamMode],
-        borrow: &hir::ReturnBorrowSummary,
-        region: &hir::ReturnRegionSummary,
+    struct SignatureFacts<'a> {
+        owner: &'a str,
+        modes: &'a [align_ast::ParamMode],
+        param_types: &'a [Ty],
+        ret: Ty,
+        borrow: &'a hir::ReturnBorrowSummary,
+        region: &'a hir::ReturnRegionSummary,
         allow_out: bool,
+        allow_return_roots: bool,
+    }
+
+    fn check_signature_facts(
+        facts: SignatureFacts<'_>,
+        program: &Program,
     ) -> Result<(), CodegenError> {
-        if modes.len() != param_count {
+        let SignatureFacts {
+            owner,
+            modes,
+            param_types,
+            ret,
+            borrow,
+            region,
+            allow_out,
+            allow_return_roots,
+        } = facts;
+        if modes.len() != param_types.len() {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has {} parameter modes for {param_count} parameters",
-                modes.len()
+                "{owner} has {} parameter modes for {} parameters",
+                modes.len(),
+                param_types.len()
             )));
         }
         for mode in modes {
@@ -3083,15 +3101,94 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 }
             }
         }
-        if !matches!(borrow, hir::ReturnBorrowSummary::None) {
+        let validate_summary =
+            |kind: &str, params: &[u32], captures: &[u32]| -> Result<(), CodegenError> {
+                if params.is_empty() && captures.is_empty() {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has a non-canonical empty {kind} root set"
+                    )));
+                }
+                if params.windows(2).any(|pair| pair[0] >= pair[1])
+                    || captures.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has unsorted or duplicate {kind} roots"
+                    )));
+                }
+                if params
+                    .iter()
+                    .any(|root| *root as usize >= param_types.len())
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has an out-of-range {kind} parameter root"
+                    )));
+                }
+                if !captures.is_empty() {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} has {kind} capture roots before L2b-b"
+                    )));
+                }
+                Ok(())
+            };
+        if let hir::ReturnBorrowSummary::Roots { params, captures } = borrow {
+            validate_summary("return-borrow", params, captures)?;
+        }
+        if let hir::ReturnRegionSummary::Roots { params, captures } = region {
+            validate_summary("return-region", params, captures)?;
+        }
+        let summaries_agree = match (borrow, region) {
+            (hir::ReturnBorrowSummary::None, hir::ReturnRegionSummary::None) => true,
+            (
+                hir::ReturnBorrowSummary::Roots {
+                    params: borrow_params,
+                    captures: borrow_captures,
+                },
+                hir::ReturnRegionSummary::Roots {
+                    params: region_params,
+                    captures: region_captures,
+                },
+            ) => borrow_params == region_params && borrow_captures == region_captures,
+            _ => false,
+        };
+        if !summaries_agree {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has return-borrow roots before L2b"
+                "{owner} has disagreeing return-borrow and return-region roots in L2b-a1"
             )));
         }
-        if !matches!(region, hir::ReturnRegionSummary::None) {
+        if !allow_return_roots
+            && (!matches!(borrow, hir::ReturnBorrowSummary::None)
+                || !matches!(region, hir::ReturnRegionSummary::None))
+        {
             return Err(CodegenError::Lowering(format!(
-                "{owner} has return-region roots before L2b"
+                "{owner} has return roots before function-value provenance lands in L2b-b"
             )));
+        }
+        if let hir::ReturnBorrowSummary::Roots { params, .. } = borrow {
+            if !align_sema::ty_may_borrow(
+                ret,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                return Err(CodegenError::Lowering(format!(
+                    "{owner} has return provenance on type {ret:?}, which cannot borrow"
+                )));
+            }
+            for &root in params {
+                let ty = param_types[root as usize];
+                if !align_sema::ty_may_borrow(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ) {
+                    return Err(CodegenError::Lowering(format!(
+                        "{owner} return provenance root {root} has type {ty:?}, which cannot supply a borrow"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -3114,34 +3211,30 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     fn named_signature<'a>(
         program: &'a Program,
         name: &str,
-    ) -> Option<(
-        usize,
-        &'a [align_ast::ParamMode],
-        &'a hir::ReturnBorrowSummary,
-        &'a hir::ReturnRegionSummary,
-    )> {
+    ) -> Option<(Vec<Ty>, Ty, &'a [align_ast::ParamMode])> {
         if let Some(function) = program.fns.iter().find(|function| function.name == name) {
             return Some((
-                function.params.len(),
+                function
+                    .params
+                    .iter()
+                    .map(|slot| function.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>()?,
+                function.ret,
                 &function.param_modes,
-                &function.return_borrow,
-                &function.return_region,
             ));
         }
         if let Some(function) = program.imported_fns.iter().find(|function| function.name == name) {
             return Some((
-                function.params.len(),
+                function.params.clone(),
+                function.ret,
                 &function.param_modes,
-                &function.return_borrow,
-                &function.return_region,
             ));
         }
         program.externs.iter().find(|function| function.name == name).map(|function| {
             (
-                function.params.len(),
+                function.params.clone(),
+                function.ret,
                 function.param_modes.as_slice(),
-                &function.return_borrow,
-                &function.return_region,
             )
         })
     }
@@ -3403,12 +3496,17 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         check_signature_facts(
-            &format!("function `{}`", f.name),
-            f.params.len(),
-            &f.param_modes,
-            &f.return_borrow,
-            &f.return_region,
-            true,
+            SignatureFacts {
+                owner: &format!("function `{}`", f.name),
+                modes: &f.param_modes,
+                param_types: &param_types,
+                ret: f.ret,
+                borrow: &f.return_borrow,
+                region: &f.return_region,
+                allow_out: true,
+                allow_return_roots: true,
+            },
+            program,
         )?;
         check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
         check_ty(f.ret, program)?;
@@ -3425,7 +3523,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 };
                 match rvalue {
                     Rvalue::FnAddr { name, signature } => {
-                        let Some((count, modes, borrow, region)) =
+                        let Some((param_types, ret, modes)) =
                             named_signature(program, name)
                         else {
                             return Err(CodegenError::Lowering(format!(
@@ -3433,17 +3531,22 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                             )));
                         };
                         check_signature_facts(
-                            "function address",
-                            count,
-                            &signature.param_modes,
-                            &signature.return_borrow,
-                            &signature.return_region,
-                            false,
+                            SignatureFacts {
+                                owner: "function address",
+                                modes: &signature.param_modes,
+                                param_types: &param_types,
+                                ret,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                allow_out: false,
+                                allow_return_roots: false,
+                            },
+                            program,
                         )?;
-                        if signature.param_modes != modes
-                            || &signature.return_borrow != borrow
-                            || &signature.return_region != region
-                        {
+                        // L2b-a1 deliberately leaves function-value return summaries at `None`;
+                        // indirect calls retain the all-compatible-input fallback. L2b-b attaches
+                        // target-relative roots and restores exact summary equality here.
+                        if signature.param_modes != modes {
                             return Err(CodegenError::Lowering(format!(
                                 "function address signature facts disagree with target `{name}`"
                             )));
@@ -3506,18 +3609,33 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
+                        let target_explicit_tys = target.params[..explicit]
+                            .iter()
+                            .map(|slot| {
+                                target.slots.get(*slot as usize).copied().ok_or_else(|| {
+                                    CodegenError::Lowering(format!(
+                                        "closure `{lifted}` target parameter slot {slot} is missing"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
                         if target_capture_tys != *capture_tys {
                             return Err(CodegenError::Lowering(format!(
                                 "closure `{lifted}` capture types disagree with its target"
                             )));
                         }
                         check_signature_facts(
-                            "closure",
-                            explicit,
-                            &signature.param_modes,
-                            &signature.return_borrow,
-                            &signature.return_region,
-                            false,
+                            SignatureFacts {
+                                owner: "closure",
+                                modes: &signature.param_modes,
+                                param_types: &target_explicit_tys,
+                                ret: target.ret,
+                                borrow: &signature.return_borrow,
+                                region: &signature.return_region,
+                                allow_out: false,
+                                allow_return_roots: false,
+                            },
+                            program,
                         )?;
                         if signature.param_modes != target_modes
                             || signature.return_borrow != target.return_borrow
@@ -3530,15 +3648,21 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                     }
                     Rvalue::CallIndirect {
                         param_tys,
+                        ret_ty,
                         signature,
                         ..
                     } => check_signature_facts(
-                        "indirect call",
-                        param_tys.len(),
-                        &signature.param_modes,
-                        &signature.return_borrow,
-                        &signature.return_region,
-                        false,
+                        SignatureFacts {
+                            owner: "indirect call",
+                            modes: &signature.param_modes,
+                            param_types: param_tys,
+                            ret: *ret_ty,
+                            borrow: &signature.return_borrow,
+                            region: &signature.return_region,
+                            allow_out: false,
+                            allow_return_roots: false,
+                        },
+                        program,
                     )?,
                     _ => {}
                 }
@@ -3547,12 +3671,17 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     }
     for ext in &program.externs {
         check_signature_facts(
-            &format!("extern function `{}`", ext.name),
-            ext.params.len(),
-            &ext.param_modes,
-            &ext.return_borrow,
-            &ext.return_region,
-            false,
+            SignatureFacts {
+                owner: &format!("extern function `{}`", ext.name),
+                modes: &ext.param_modes,
+                param_types: &ext.params,
+                ret: ext.ret,
+                borrow: &ext.return_borrow,
+                region: &ext.return_region,
+                allow_out: false,
+                allow_return_roots: false,
+            },
+            program,
         )?;
         check_mode_types(&format!("extern function `{}`", ext.name), &ext.param_modes, &ext.params)?;
         check_ty(ext.ret, program)?;
@@ -3562,12 +3691,17 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
     }
     for import in &program.imported_fns {
         check_signature_facts(
-            &format!("imported function `{}`", import.name),
-            import.params.len(),
-            &import.param_modes,
-            &import.return_borrow,
-            &import.return_region,
-            true,
+            SignatureFacts {
+                owner: &format!("imported function `{}`", import.name),
+                modes: &import.param_modes,
+                param_types: &import.params,
+                ret: import.ret,
+                borrow: &import.return_borrow,
+                region: &import.return_region,
+                allow_out: true,
+                allow_return_roots: true,
+            },
+            program,
         )?;
         check_mode_types(
             &format!("imported function `{}`", import.name),

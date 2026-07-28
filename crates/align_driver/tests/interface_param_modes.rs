@@ -197,8 +197,42 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         "unexpected diagnostic: {error}"
     );
 
-    let mut premature_roots = buffer.mir.clone();
-    let put = premature_roots
+    let mut malformed_roots = buffer.mir.clone();
+    let put = malformed_roots
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "buffer$put")
+        .expect("put MIR");
+    put.return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![99],
+        captures: vec![],
+    };
+    let error = emit_llvm_ir(&malformed_roots, BuildTarget::Baseline, false, &[], false)
+        .expect_err("out-of-range roots must fail");
+    assert!(
+        error.contains("out-of-range return-borrow parameter root"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut premature_capture = buffer.mir.clone();
+    let put = premature_capture
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "buffer$put")
+        .expect("put MIR");
+    put.return_region = ReturnRegionSummary::Roots {
+        params: vec![],
+        captures: vec![0],
+    };
+    let error = emit_llvm_ir(&premature_capture, BuildTarget::Baseline, false, &[], false)
+        .expect_err("capture roots must remain disabled until L2b-b");
+    assert!(
+        error.contains("capture roots before L2b-b"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut disagreeing_roots = buffer.mir.clone();
+    let put = disagreeing_roots
         .fns
         .iter_mut()
         .find(|function| function.name == "buffer$put")
@@ -207,10 +241,62 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![0],
         captures: vec![],
     };
-    let error = emit_llvm_ir(&premature_roots, BuildTarget::Baseline, false, &[], false)
-        .expect_err("premature roots must fail");
+    let error = emit_llvm_ir(&disagreeing_roots, BuildTarget::Baseline, false, &[], false)
+        .expect_err("L2b-a1 borrow/region disagreement must fail");
     assert!(
-        error.contains("before L2b"),
+        error.contains("disagreeing return-borrow and return-region roots"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut source_map = SourceMap::new();
+    let checked = check(
+        &mut source_map,
+        "malformed-scalar-summary.align",
+        "fn scalar(value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
+    );
+    assert!(!checked.diags.has_errors());
+    let mut scalar_mir = lower_to_mir(&checked.hir);
+    let scalar = scalar_mir
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "scalar")
+        .expect("scalar MIR");
+    scalar.return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    scalar.return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    let error = emit_llvm_ir(&scalar_mir, BuildTarget::Baseline, false, &[], false)
+        .expect_err("provenance on scalar parameter and return types must fail");
+    assert!(
+        error.contains("cannot borrow"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut source_map = SourceMap::new();
+    let checked = check(
+        &mut source_map,
+        "malformed-extern-summary.align",
+        "extern \"C\" fn inspect(value: str) -> i32\nfn main() -> i32 = 0\n",
+    );
+    assert!(!checked.diags.has_errors());
+    let mut extern_mir = lower_to_mir(&checked.hir);
+    let inspect = extern_mir.externs.first_mut().expect("extern MIR");
+    inspect.return_borrow = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    inspect.return_region = ReturnRegionSummary::Roots {
+        params: vec![0],
+        captures: vec![],
+    };
+    let error = emit_llvm_ir(&extern_mir, BuildTarget::Baseline, false, &[], false)
+        .expect_err("unanalyzed extern roots must retain the conservative fallback");
+    assert!(
+        error.contains("function-value provenance lands in L2b-b"),
         "unexpected diagnostic: {error}"
     );
 }
@@ -265,7 +351,7 @@ fn main() -> i32 = apply(increment, 41) as i32
     );
     assert!(saw_indirect, "indirect call must carry signature facts");
 
-    let mut malformed = mir;
+    let mut malformed = mir.clone();
     'functions: for function in &mut malformed.fns {
         for block in &mut function.blocks {
             for statement in &mut block.stmts {
@@ -280,6 +366,31 @@ fn main() -> i32 = apply(increment, 41) as i32
         .expect_err("function address arity mismatch must fail");
     assert!(
         error.contains("parameter modes") || error.contains("disagree"),
+        "unexpected diagnostic: {error}"
+    );
+
+    let mut premature_roots = mir;
+    'functions: for function in &mut premature_roots.fns {
+        for block in &mut function.blocks {
+            for statement in &mut block.stmts {
+                if let Stmt::Let(_, Rvalue::FnAddr { signature, .. }) = statement {
+                    signature.return_borrow = ReturnBorrowSummary::Roots {
+                        params: vec![0],
+                        captures: vec![],
+                    };
+                    signature.return_region = ReturnRegionSummary::Roots {
+                        params: vec![0],
+                        captures: vec![],
+                    };
+                    break 'functions;
+                }
+            }
+        }
+    }
+    let error = emit_llvm_ir(&premature_roots, BuildTarget::Baseline, false, &[], false)
+        .expect_err("function-value roots must remain deferred until L2b-b");
+    assert!(
+        error.contains("function-value provenance lands in L2b-b"),
         "unexpected diagnostic: {error}"
     );
 }

@@ -1490,14 +1490,16 @@ Scope:
 - interface codec/hash support;
 - per-unit parity.
 
-L2 ships through five closed implementation slices. A slice may add dormant representation or
+L2 ships through seven closed implementation slices. A slice may add dormant representation or
 tighten existing provenance, but it must not accept source syntax whose complete safety contract
 belongs to a later slice.
 
 | Slice | Exact closure | Public exposure at merge | Required gate |
 |---|---|---|---|
 | L2a | Replace `is_out`/bare parameter-type lists with `ParamMode`; add span-free return-borrow and return-region records to `FnTy`, named/imported signatures, HIR/MIR, interface codecs, hashes, and ABI fingerprints | Existing `ByValue` and `Out` behavior only; `borrow` and `borrow mut` remain identifiers outside parameter-mode lookahead and are rejected as modes | codec byte/hash goldens, corrupt-tag rejection, whole/per-unit identity, and an exhaustive consumer audit |
-| L2b | Infer recursive parameter/capture roots for existing by-value views and view-bearing aggregates; preserve them across named functions, closures, function-value joins/moves, synthetic selectors, direct/indirect/imported calls, and unresolved higher-order targets | No new borrow mode; existing programs only gain fail-closed lifetime rejection where provenance was previously lost | direct/indirect/imported/captured/joined nested-view matrix and summary-size evidence |
+| L2b-a1 | Infer parameter roots for named functions and preserve conservative flattened roots across recursion, direct/imported calls, control flow, and interfaces | No new borrow mode; aggregate projections and indirect calls retain all-compatible-input unions | scalar direct/imported matrix, semantic interface validation, and summary-inference size/time evidence |
+| L2b-a2 | Refine named summaries through struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, branch/loop, and synthetic-selector projections | No new borrow mode; indirect calls retain the pre-L2b all-compatible-input fallback | direct/imported nested-view projection matrix and per-unit parity |
+| L2b-b | Extend the same inference to capture roots, closures, function-value joins/moves, direct/indirect targets, and unresolved higher-order fallback | Complete L2b behavior; no borrow mode | indirect/captured/joined nested-view matrix, malformed capture-domain rejection, and indirect-return evidence |
 | L2c | Add `ReturnCleanupAbi` to function and interface identity and implement `DynamicBit` for every recursively Move direct, indirect, and imported return; forward the selected bit on every return edge and store it in the caller slot | No borrow syntax; metadata and physical ABI land atomically before borrowed mutation can construct path-selected values | codec/hash goldens, `Result<Option<MoveStruct>, Error>` None/Some/Err matrix, ABI mismatch rejection, per-unit parity, and return-cost evidence |
 | L2d | Contextually accept shared `borrow`, preserve the mode in function types/interfaces, pass non-null caller storage, prohibit callee move/drop, and apply the completed return-root summaries | Shared borrow only; `borrow mut` remains unavailable and shared borrowing Copy is rejected as redundant | reusable Move owner, move-from-borrow rejection, returned-view invalidation, function-value/import parity |
 | L2e | Contextually accept `borrow mut`; complete existing `Out` and new `BorrowMut` under one all-peer recursive exclusivity engine; implement generation invalidation, writable Copy/Move replacement, drop-old/cleanup-bit update, and Pure exclusive-state shaping | Full L2 surface | all-peer alias matrix, stale-view rejection, changed/unchanged pointee Drop counts, effect matrix, and per-unit parity |
@@ -1544,6 +1546,20 @@ closures whose captures feed an internal parallel boundary even when unrelated s
 both the closed and open-world effects `Impure`; a direct external callback parameter or parameter
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
 provenance through function-value joins.
+
+L2b is implemented as three independently sound vertical PRs. L2b-a1 owns named/direct/imported
+parameter-root inference, semantic interface validation, and whole/per-unit parity while retaining
+flattened all-compatible-input unions for aggregates, indirect calls, and unanalyzed extern
+targets. L2b-a2 refines named
+aggregate/control projections without weakening that fallback. L2b-b then adds
+target-relative capture roots and function-value target sets, validates the explicit-parameter and
+capture domains in MIR, removes the now-obsolete unresolved-internal-target effect restriction, and
+closes the indirect/captured benchmark row. This split keeps each hand-written diff near the
+repository review bound; none of these PRs exposes `borrow` syntax or depends on an incomplete
+physical ABI.
+L2b-a1 cannot split producer inference from interface validation, direct-call consumption, and
+whole/per-unit parity: shipping a non-empty public summary without any one of those seams would
+either ignore the fact in one compilation mode or trust an unvalidated artifact.
 Every `?` occurrence joins only its operand's `Result.Err` projection into the enclosing function's
 `Result.Err` return boundary before control returns early; its `Ok` projection continues through the
 ordinary expression and explicit/implicit return paths.
@@ -1556,6 +1572,15 @@ imported, and function-value signature even when their values are `None`; L2c th
 cleanup ABI for every such signature in the same change that implements it. Interface decode rejects
 unknown mode/summary/cleanup tags, unsorted or duplicate root indices, capture roots in exported
 named signatures, out-of-range roots, and a cleanup ABI inconsistent with the resolved return type.
+Through L2b-a1, borrow and region summaries are the same canonical parameter-root set because both
+facts come from the same flattened provenance walker; interface import and MIR validation reject a
+disagreement, a root whose parameter type cannot borrow, or provenance on a non-borrowing return
+type. A foreign qualified nominal never resolves by bare-name suffix to a definition in the current
+interface; local generic definitions substitute every actual argument before recursive capability
+checking, including same-name nested parameters. Unresolved imported or generic nominals remain
+conservatively borrow-capable. An imported exact `None` is trusted only when the caller supplies a
+validated external-provenance record; compatibility-API omissions and unanalyzed extern targets
+retain the all-compatible-input fallback.
 Before L2d, semantic import rejects a decoded `Borrow` mode; before L2e it rejects `BorrowMut`.
 Recognizing a codec tag does not enable its source or imported-call semantics. No slice reconstructs
 ownership from region provenance.
@@ -1567,10 +1592,10 @@ current type restrictions admit that form.
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
 | Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
-| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None` | duplicate, unsorted, out-of-range, or exported capture roots reject before consumer-visible side effects | L2b computes non-empty roots |
+| Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None`; L2b-a1 requires the two records to agree | duplicate, unsorted, out-of-range, exported capture roots, borrow/region disagreement, or roots inconsistent with resolved parameter/return types reject before consumer-visible side effects | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
-| Existing return provenance | L2b | recursively walk scalar, struct, tuple, fixed-array, tagged, and function-value returns; preserve exact parameter/capture roots through assignment, move, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, and explicit/implicit/early return | unresolved higher-order targets use all compatible roots; incompatible joins and escaping unbound captures reject | L3 adds resource/dependent roots; L4 adds explicit region owners |
-| Closure/function-value provenance | L2b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
+| Existing return provenance | L2b-a1/a2 | a1 preserves conservative flattened parameter roots through recursion, assignment, control flow, explicit/implicit/early return, and direct/imported calls; a2 recursively refines struct, tuple, fixed-array, tagged, `else`, `?`, `map_err`, and branch/loop projections | indirect/unresolved higher-order targets retain all compatible roots; incompatible joins reject | L2b-b adds function-value/capture roots; L3 adds resource/dependent roots; L4 adds explicit region owners |
+| Closure/function-value provenance | L2b-b | zero-argument and parameterized closures, synthetic selectors, target joins, environment moves, direct and indirect calls retain selected target-relative roots | environment/owner death, stale generation, out-of-range capture slot, and interface capture root reject | L3/L4 extend the same walker with their types |
 | Cleanup ABI formation | L2c | Copy returns record `None`; every recursively Move return records `DynamicBit` in `FnTy`, named/imported signatures, MIR, interface, mangling, cache identity, and LLVM ABI | metadata/type disagreement, missing bit, extra bit, unknown tag, and caller/callee fingerprint mismatch reject | none |
 | Cleanup-bit production | L2c | normal expression return, explicit return, `if`, `match`, `else`, `?`, `map_err`, branch/loop join, and early exit forward the selected path-local bit and clear a moved source exactly once | malformed MIR bit source/destination, missing local, invalid tag, and uninitialized/duplicate transfer reject without panic | L4 adds explicit-region clear-bit values |
 | Cleanup-bit consumption | L2c | all call forms store the returned bit in the caller result slot; move-out/null, reassignment drop-old, wildcard discard, and scope/early cleanup consult that bit exactly once | no caller may infer the bit from type, tag, or region; ABI mismatch fails before call emission | L2e reuses the same slot through mutable replacement |
@@ -1587,7 +1612,9 @@ their first owning slice and remain cumulative gates afterward.
 | Slice | Exact owner tests | Exact benchmark command and required rows |
 |---|---|---|
 | L2a | `cargo test -p align_interface --test summary`; `cargo test -p align_driver --test fn_values --test out_params --test interface_param_modes` | `bench/library_boundary/run.sh interface`: `interface-size`, `decode-throughput` |
-| L2b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
+| L2b-a1 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-a2 | `cargo test -p align_driver --test return_provenance --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference` |
+| L2b-b | `cargo test -p align_driver --test return_provenance --test fn_values --test per_unit` | `bench/library_boundary/run.sh provenance`: `summary-inference`, `indirect-return` |
 | L2c | `cargo test -p align_driver --test move_return_cleanup --test owned_tagged_payloads --test per_unit_codegen` | `bench/library_boundary/run.sh move-return`: `copy-return-control`, `move-return-none`, `move-return-some`, `move-return-err` |
 | L2d | `cargo test -p align_driver --test borrowed_params shared_`; `cargo test -p align_driver --test return_provenance` | `bench/library_boundary/run.sh shared-borrow`: `by-value-call-control`, `shared-borrow-call` |
 | L2e | `cargo test -p align_driver --test borrowed_params exclusive_`; `cargo test -p align_driver --test out_params --test analysis_coverage` | `bench/library_boundary/run.sh exclusive-borrow`: `exclusive-copy-control`, `exclusive-copy-call`, `exclusive-move-replace` |
