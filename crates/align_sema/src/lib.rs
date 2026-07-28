@@ -25020,7 +25020,7 @@ fn ty_mangle(
                             }
                         };
                         format!(
-                            "F_{params}_{}_b{borrow}_r{region}",
+                            "F{id}_{params}_{}_b{borrow}_r{region}",
                             key(
                                 function.ret,
                                 tagged_types,
@@ -28326,7 +28326,7 @@ mod tests {
     }
 
     #[test]
-    fn function_type_mangling_is_structural_and_includes_l2a_signature_facts() {
+    fn function_type_mangling_preserves_effect_origin_and_l2a_signature_facts() {
         let function = |mode, borrow| hir::FnTy {
             params: vec![(mode, Scalar::Int(IntTy { bits: 64, signed: true }))],
             ret: Ty::Int(IntTy { bits: 64, signed: true }),
@@ -28334,18 +28334,26 @@ mod tests {
             return_region: hir::ReturnRegionSummary::None,
             effect: std::cell::Cell::new(FnEffect::Pure),
         };
-        let functions = vec![
-            function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None),
-            function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None),
-            function(ast::ParamMode::Out, hir::ReturnBorrowSummary::None),
-            function(
+        let by_value = function(ast::ParamMode::ByValue, hir::ReturnBorrowSummary::None);
+        let origins = vec![by_value.clone(), by_value.clone()];
+        assert_ne!(
+            ty_mangle(Ty::Fn(0), &[], &[], &[], &origins),
+            ty_mangle(Ty::Fn(1), &[], &[], &[], &origins),
+            "concrete function-value origins need distinct semantic monomorphs so later effect refinement cannot alias their cells"
+        );
+        let mangle_signature = |function| ty_mangle(Ty::Fn(0), &[], &[], &[], &[function]);
+        assert_ne!(
+            mangle_signature(by_value.clone()),
+            mangle_signature(function(ast::ParamMode::Out, hir::ReturnBorrowSummary::None)),
+            "parameter mode is monomorph signature identity"
+        );
+        assert_ne!(
+            mangle_signature(by_value),
+            mangle_signature(function(
                 ast::ParamMode::ByValue,
                 hir::ReturnBorrowSummary::Roots { params: vec![0], captures: vec![] },
-            ),
-        ];
-        let mangle = |id| ty_mangle(Ty::Fn(id), &[], &[], &[], &functions);
-        assert_eq!(mangle(0), mangle(1), "interner ids and effect cells are not ABI identity");
-        assert_ne!(mangle(0), mangle(2), "parameter mode is ABI identity");
-        assert_ne!(mangle(0), mangle(3), "return provenance is ABI identity");
+            )),
+            "return provenance is monomorph signature identity"
+        );
     }
 }

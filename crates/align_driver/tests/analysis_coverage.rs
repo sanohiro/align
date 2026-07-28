@@ -425,6 +425,41 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn generic_fn_wrapper_keeps_same_signature_effect_origins_distinct() {
+    let pure = "\
+Holder<T> { callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn quiet_worker(x: i64) -> i64 {
+  holder := Holder { callback: quiet }
+  return holder.callback(x)
+}
+fn loud_worker(x: i64) -> i64 {
+  holder := Holder { callback: loud }
+  return holder.callback(x)
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(quiet_worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        !check_errs("parmap-generic-fn-wrapper-pure", pure),
+        "an unrelated Impure wrapper with the same source signature must not poison the Pure origin"
+    );
+
+    let impure = pure.replace("par_map(quiet_worker)", "par_map(loud_worker)");
+    assert!(
+        check_errs("parmap-generic-fn-wrapper-impure", &impure),
+        "a generic wrapper must not reuse a same-signature Pure field type for an Impure function value"
+    );
+}
+
+#[test]
 fn extern_fn_type_effect_is_impure_through_indirection() {
     let src = "\
 extern \"C\" fn abs(x: i32) -> i32

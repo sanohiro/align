@@ -193,7 +193,10 @@ fn lambda_captures_lower_to_extra_call_args() {
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(text.contains("fn main$lambda0(_0: i64, _1: i64)"), "lambda should take the element + the capture:\n{text}");
+    assert!(
+        text.contains("fn main$lambda0(ByValue _0: i64, ByValue _1: i64)"),
+        "lambda should take the element + the capture with explicit parameter modes:\n{text}"
+    );
 }
 
 #[test]

@@ -1505,9 +1505,13 @@ belongs to a later slice.
 L2a is one intentionally unsplit vertical PR even when its hand-written diff exceeds roughly 1,000
 lines. Parameter modes and both summary records participate in one function-signature identity and
 must change atomically across AST/HIR/MIR, whole-program and per-unit lowering, interface
-serialization, structural mangling, LLVM validation, and malformed-input tests. Splitting any one
-layer or either summary into a separately mergeable PR would temporarily permit two incompatible
-signature identities or require a compatibility path that this pre-release repository forbids.
+serialization, mangling, LLVM validation, and malformed-input tests. Interface and physical ABI
+fingerprints are id-free and structural. The internal semantic monomorph key additionally retains a
+concrete function-value origin discriminator: same-signature values have independent inferred
+effect cells, and deduplicating a Pure and Impure origin would make the selected generic
+struct/sum/function HIR read the wrong cell. Splitting any one layer or either summary into a
+separately mergeable PR would temporarily permit two incompatible identities or require a
+compatibility path that this pre-release repository forbids.
 
 The field-presence rule is exhaustive: L2a records both provenance summaries for every named,
 imported, and function-value signature even when their values are `None`; L2c then records the
@@ -1524,7 +1528,7 @@ current type restrictions admit that form.
 
 | Surface | Owner | Required positive closure | Required negative/fail-closed closure | Later extension |
 |---|---|---|---|---|
-| Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, equality, mangling, structural cache identity, and ABI fingerprints | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
+| Signature formation | L2a | `ByValue` and existing `Out` are preserved in AST-to-HIR, named/imported signatures, `FnTy`, MIR, rendering, source equality, id-free ABI/interface fingerprints, and monomorph keys combining the structural signature with concrete effect-origin identity | unknown modes, arity mismatch, and mode/type disagreement never default to `ByValue` | L2d admits `Borrow`; L2e admits `BorrowMut` |
 | Provenance record formation | L2a | every named/imported/function-value signature contains canonical sorted parameter-root borrow and region summaries, including explicit `None` | duplicate, unsorted, out-of-range, or exported capture roots reject before consumer-visible side effects | L2b computes non-empty roots |
 | Interface codec/hash | L2a | mode plus borrow/region summaries have independent byte/hash goldens and producer/consumer parity | truncated, trailing, unknown-tag, unsupported-known-mode, and semantic inconsistency cases reject | L2c adds cleanup ABI atomically |
 | Existing return provenance | L2b | recursively walk scalar, struct, tuple, fixed-array, tagged, and function-value returns; preserve exact parameter/capture roots through assignment, move, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, and explicit/implicit/early return | unresolved higher-order targets use all compatible roots; incompatible joins and escaping unbound captures reject | L3 adds resource/dependent roots; L4 adds explicit region owners |
