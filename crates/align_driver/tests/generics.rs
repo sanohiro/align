@@ -354,10 +354,10 @@ fn generic_enum_payload_follows_the_non_generic_rule() {
     // `str`-bearing *plain-data* struct payload is ACCEPTED (mirrors `enum_match::str_field_struct_payload_accepted`).
     let ok = "Named { s: str }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Named { s: \"hi\" })\n  return 0\n}\n";
     assert!(!check_errs("gen-enum-str-struct-ok", ok));
-    // A **Move** struct payload (owns a `string`) is still rejected — an enum payload is not dropped
-    // recursively, so an owned field would leak (that is J2), and the generic path enforces it too.
-    let bad = "Owned { s: string }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Owned { s: \"hi\".clone() })\n  return 0\n}\n";
-    assert!(check_errs("gen-enum-move-struct-bad", bad));
+    // L1b recursively drops a concrete Move struct payload after substitution, so the generic path
+    // follows the same acceptance rule as a non-generic sum.
+    let owned = "Owned { s: string }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Owned { s: \"hi\".clone() })\n  return 0\n}\n";
+    assert!(!check_errs("gen-enum-move-struct", owned));
 }
 
 #[test]

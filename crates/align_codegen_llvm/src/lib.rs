@@ -9980,12 +9980,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(())
     }
 
-    /// Tag-switched drop of a **Move** sum type (J2): load the i32 tag, switch on it, and for each
-    /// variant carrying an owned payload free that payload's buffer or opaque handle. A variant
-    /// whose payload is a scalar / `str` / plain-struct owns nothing and falls through (the `else`
-    /// continue block). Every
-    /// owned array is a `{ptr,len}` freed by its field-0 pointer; an owned handle uses its matching
-    /// runtime free function. Null-safe: an unconstructed / moved-out enum
+    /// Tag-switched drop of a **Move** sum type (J2/L1b): load the i32 tag, switch on it, and
+    /// recursively drop every owned payload field in the active variant. Copy scalars, `str` views,
+    /// and recursively non-Move structs require no case. Owned strings, arrays, handles, structs,
+    /// and nested sums all use the canonical pointer-based dispatcher. Null-safe: an unconstructed / moved-out enum
     /// was zeroed by `DropFlagInit`, so the tag reads 0 and a variant-0 owned payload frees `null`.
     /// `base` is the pointer to the in-memory enum aggregate (`{ i32 tag, payloads… }`).
     fn drop_enum(&self, base: inkwell::values::PointerValue<'c>, enum_id: u32) -> Result<(), CodegenError> {

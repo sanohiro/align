@@ -1171,9 +1171,9 @@ L1b-b  multiple Move payloads, partial construction, and uniform ownership mode
 L1b-c  tagged-in-tagged type representation and exact Result<Option<Output>, DbError>
 ```
 
-L1b-a fails closed on multiple Move payloads in one user-sum variant and on nested
-`Option`/`Result` payloads. L1b-b removes the first diagnostic only after partial construction and
-mixed-provenance rules close. L1b-c removes the second after type representation, generic
+L1b-a established direct recursively Move payloads. L1b-b admits multiple Move payloads only after
+partial construction and mixed-provenance rules close. Nested `Option`/`Result` payloads remain
+fail-closed until L1b-c removes that diagnostic after type representation, generic
 substitution, HIR/MIR, LLVM layout, interface round-trip, and malformed-interface validation agree.
 Arbitrary new Move-element collection layouts, resources, and borrowed-parameter modes remain in
 their later milestones. L1b-a may slightly exceed 1,000 total added-plus-removed lines because the
@@ -1184,7 +1184,7 @@ including the closure-matrix regressions and benchmark rows.
 
 | Contract path | Required implementation | Owner regression |
 |---|---|---|
-| type formation | L1b-a admits direct Move struct/sum/string payloads already representable by `Scalar`; combined struct/sum inline cycles, multiple Move payloads, nested tagged payloads, and unsupported Move-element collections fail closed. L1b-b/L1b-c remove their respective diagnostics. | sema declaration and generic-monomorph tests |
+| type formation | L1b-a admits direct Move struct/sum/string payloads already representable by `Scalar`; L1b-b admits multiple Move payloads. Combined struct/sum inline cycles, nested tagged payloads, and unsupported Move-element collections fail closed until their owning slices. | sema declaration and generic-monomorph tests |
 | classification | Derive one finite recursive `DropPlan`; container is Move iff an active payload may be Move | sema DropPlan unit tests |
 | leaf closure | One dispatcher covers owned string, flat allocation, opaque Move handle, nested Move struct, nested Move enum, and every already-supported deep collection leaf; any unimplemented leaf is rejected during type formation | dispatcher unit tests plus one runtime representative per leaf class |
 | construction / move-in | Move one payload into `Some`, `Ok`, `Err`, or a user variant and clear the source cleanup bit | MIR source-nulling tests plus runtime use-after-move cases |

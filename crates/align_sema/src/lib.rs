@@ -3375,9 +3375,10 @@ pub fn check_program_with_effects(
     }
 
     // Pass 0c: resolve concrete enum variant payloads (structs are now known) into the reserved
-    // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads are
-    // primitive scalars (S1b) or a plain-data struct (S2). Monomorph instances of generic sum types
-    // append after the reserved slots, so a concrete enum's id stays valid.
+    // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads may
+    // include direct recursively Move strings, structs, sums, and supported owned arrays. Monomorph
+    // instances of generic sum types append after the reserved slots, so a concrete enum's id stays
+    // valid.
     for (i, (module, _is_entry, e)) in enum_decls.iter().enumerate() {
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
@@ -4068,34 +4069,6 @@ pub fn check_program_with_effects(
             );
         }
         for variant in &def.variants {
-            let move_payloads = variant
-                .payload
-                .iter()
-                .filter(|payload| {
-                    drop_plan(
-                        scalar_to_ty(**payload),
-                        &structs,
-                        &enums,
-                    )
-                    .needs_drop()
-                })
-                .count();
-            if move_payloads > 1 {
-                let source_span = *span.get_or_insert_with(|| {
-                    if eid < enum_decls.len() {
-                        enum_decls[eid].2.span
-                    } else {
-                        resolved_enum_span(&def.name)
-                    }
-                });
-                diags.error(
-                    format!(
-                        "variant '{}' has multiple Move payloads; partial construction and uniform ownership for that shape are implemented in L1b-b",
-                        variant.name
-                    ),
-                    source_span,
-                );
-            }
             for payload in &variant.payload {
                 let struct_id = match payload {
                     Scalar::DynStructArray(id) => *id,
@@ -18488,12 +18461,13 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Validate that sum type `enum_id` is **union-decodable** (JSON completeness J1b): every variant
-    /// carries exactly one payload, each payload maps to a JSON shape class (str/number/bool/object),
+    /// carries exactly one payload, each payload maps to a JSON shape class (str/number/bool/object/array),
     /// and the classes are **pairwise distinct** — so the value's first structural byte selects the
     /// variant unambiguously (O(1) dispatch, no backtracking). An object (struct) payload must itself
     /// be json-decodable (its fields recurse). Reports every offending variant and returns false.
-    /// `null` is deliberately not a class (absence belongs to `Option`); an owned `array` payload is
-    /// J2 (an enum cannot hold one yet, so it surfaces here as "no shape class").
+    /// `null` is deliberately not a class (absence belongs to `Option`). A supported
+    /// `array<Struct>` payload maps to Array; scalar-element owned arrays remain valid language
+    /// payloads but have no JSON-union descriptor arm and fail this package-specific check.
     fn check_union_decodable(&mut self, enum_id: u32, span: Span, dir: JsonDir) -> bool {
         let Some(ed) = self.enums.get(enum_id as usize) else { return false };
         let name = ed.name.clone();
@@ -24948,13 +24922,13 @@ fn type_graph_acyclic(
 /// enclosing tag-switched Drop recurses through their canonical DropPlan. Owned-element arrays
 /// remain excluded until their per-element deep-free contract is admitted for sum payloads.
 /// The JSON **shape class** a union variant's single payload scalar maps to — `Str`(0) / `Number`(1)
-/// / `Bool`(2) / `Object`(3) — or `None` if it has none (a `char`, or an owned collection; an
-/// `array` payload is J2 and an enum cannot hold one yet). The index order matches the runtime
+/// / `Bool`(2) / `Object`(3) / `Array`(4) — or `None` if its supported payload has no JSON union
+/// descriptor arm (for example `char` or a scalar-element owned array). The index order matches the runtime
 /// `json_shape_class` first-byte dispatch (JSON completeness J1b). `pub` so codegen fills the
 /// [`JsonUnion`] `class_to_arm` table from the same one source of truth.
 /// The number of JSON shape classes a union's `class_to_arm` table indexes — `Str`/`Number`/`Bool`/
-/// `Object`/`Array` (5). Must equal the runtime `JSON_SHAPE_CLASSES`; `Array` (index 4) is J2 (an
-/// enum cannot hold an owned array payload yet), so it is always `-1` in a J1b descriptor.
+/// `Object`/`Array` (5). Must equal the runtime `JSON_SHAPE_CLASSES`; a supported
+/// `DynStructArray` payload occupies `Array`, while scalar-element arrays have no descriptor arm.
 pub const JSON_SHAPE_CLASSES: usize = 5;
 
 pub fn union_shape_class(s: Scalar) -> Option<u8> {
@@ -25052,11 +25026,9 @@ fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx,
     for v in &tmpl.variants {
         let payload: Vec<Scalar> = v.payload.iter().map(|&s| subst_scalar(s, args)).collect();
         for &p in &payload {
-            // The substituted payload must be a valid sum-type payload — the SAME rule a non-generic
-            // enum enforces in Pass 0c: a primitive scalar or a plain-data struct (no `str` field).
-            // Without this, `Opt<string>` / `Opt<StructWithStrField>` would slip through, putting a
-            // Move/region-tracked value in an enum that is neither dropped nor region-tracked
-            // (use-after-free / leak).
+            // The substituted payload must obey the SAME rule as a non-generic enum in Pass 0c.
+            // Direct recursively Move payloads are legal and derive the same DropPlan/region facts;
+            // unsupported collection layouts must still fail closed after substitution.
             // Struct ownership can depend on an enum definition that is still a reserved empty
             // slot while an early monomorph is cached. Validate those graph-dependent shapes once
             // all type and function-driven monomorphization is complete.
